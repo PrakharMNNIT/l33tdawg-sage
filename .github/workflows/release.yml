@@ -217,7 +217,7 @@ jobs:
           go test ./... -count=1 -race
 
   v119-fault-gates:
-    name: v11.9 Multi-Process Fault Gates
+    name: Consensus Fault Gates
     needs: test
     uses: ./.github/workflows/v11.9-fault-gates.yml
     with:

@@ -1,4 +1,6 @@
-name: v11.9 Fault Gates
+# The filename stays versioned for compatibility with existing workflow callers.
+# This is a permanent consensus safety suite, not a v11.9-only release check.
+name: Consensus Fault Gates
 
 on:
   workflow_call:

@@ -92,6 +92,10 @@ test('release actions stay pinned to immutable commits', () => {
 
 test('metadata, source, race, frontend, and fault checks converge before packaging', () => {
   assert.match(workflow, /concurrency:\n  group: sage-release-publication\n  cancel-in-progress: false/);
+  assert.match(job('v119-fault-gates'), /name: Consensus Fault Gates/);
+  assert.match(ciJob('v119-fault-gates'), /name: Consensus Fault Gates/);
+  assert.match(faultWorkflow, /name: Consensus Fault Gates/);
+  assert.doesNotMatch(faultWorkflow, /name: v11\.9 Fault Gates/);
   assert.match(job('release-metadata'), /GITHUB_REF_TYPE.*tag/);
   assert.match(job('release-metadata'), /refs\/remotes\/origin\/main/);
   assert.match(job('release-metadata'), /merge-base --is-ancestor/);

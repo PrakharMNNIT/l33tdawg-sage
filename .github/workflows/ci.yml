@@ -49,7 +49,7 @@ jobs:
           go test ./... -v -count=1 -race
 
   v119-fault-gates:
-    name: v11.9 Multi-Process Fault Gates
+    name: Consensus Fault Gates
     # Deliberately NOT `needs: test`. Nothing here consumes a test output --
     # there is no needs.test.* reference anywhere in this file -- so the edge
     # only serialized two independent suites and left the runner idle for the
