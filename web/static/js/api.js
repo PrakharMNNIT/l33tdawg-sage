@@ -276,7 +276,9 @@ export async function disableLedger(passphrase) {
 
 export async function fetchAgents() {
     const res = await fetch(`${API_BASE}/v1/dashboard/network/agents`);
-    return res.json();
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || `Could not load agents (${res.status})`);
+    return data;
 }
 
 export async function fetchAgent(id) {

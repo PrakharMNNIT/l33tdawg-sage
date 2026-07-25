@@ -10,6 +10,13 @@ const mriPageSource = await readFile(new URL('../web/static/mri.html', import.me
 const federationRouteSource = await readFile(new URL('../web/static/js/federation-route-state.js', import.meta.url), 'utf8');
 const traySource = await readFile(new URL('../cmd/sage-tray/main.swift', import.meta.url), 'utf8');
 const { MRI_LAYOUT, mriBrainstemBias, mriDepthForAge, mriVerticalPosition } = await import('../web/static/js/mri-layout.js');
+const fedPipeHelperSource = appSource.slice(
+    appSource.indexOf('function normalizeFedPipeContactGrant('),
+    appSource.indexOf('function fedFriendlyLocalAgentLabel(')
+);
+const { normalizeFedPipeContactGrant, mergeFedPipeContactGrant } = new Function(
+    `${fedPipeHelperSource}; return { normalizeFedPipeContactGrant, mergeFedPipeContactGrant };`
+)();
 
 test('Access Controls is a first-class sidebar route', () => {
     assert.match(appSource, /hash === '\/access'\) setPage\('access'\)/);
@@ -517,6 +524,53 @@ test('federation agent contacts stay administrative and default-off', () => {
     assert.match(panel, /role="switch"/);
     assert.match(panel, /contact\.contact_id/,
         'acceptance mutations must use the opaque contact identity');
+    assert.match(panel, /fetchAgents\(\)/,
+        'the local agent picker must use CEREBRUM’s friendly agent directory');
+    assert.match(panel, /<select id=\$\{`fed-agent-picker-/,
+        'operators must choose a local agent from a name-friendly dropdown');
+    assert.match(panel, /Choose an agent by name…/);
+    assert.doesNotMatch(panel, /64-character agent ID|exact agent ID/,
+        'raw agent hashes must not be required by the federation UI');
+    assert.match(panel, /fedPipeContactsGet\(chain, false, agentID\)/,
+        'the friendly selection must still resolve through the exact authorization identity');
+    assert.match(appSource, /function mergeFedPipeContactGrant\(base, targeted = \[\]\)/);
+    assert.match(appSource, /grant\.agreement_id \|\| grant\.agreementId/,
+        'normalized grants must retain their agreement binding');
+    assert.match(appSource, /exact\.contacts\.find\(candidate => candidate\.agent_id === agentID\)/,
+        'targeted responses may extend the bounded sample only for their requested identity');
+    assert.match(panel, /pinnedLocalAgentIDsRef/);
+    assert.match(panel, /\.\.\.pinnedAgentIDs\.map\(agentID => fedPipeContactsGet\(chain, false, agentID\)\)/,
+        'selected out-of-sample contacts must be revalidated by exact identity');
+    assert.match(panel, /const merged = mergeFedPipeContactGrant\(result\.local_contacts, targeted\)[\s\S]*setLocalPipeContacts\(merged\)/,
+        'each background poll must rebuild from the authoritative bounded sample');
+    assert.match(appSource, /const maxPinnedFedPipeContacts = 4;/,
+        'exact-agent background revalidation must remain strictly bounded');
+    assert.match(apiSource, /if \(!res\.ok\) throw new Error\(data\?\.error/,
+        'agent-directory HTTP failures must reject instead of masquerading as an empty directory');
+    assert.match(panel, /fetchAgents\(\)\.then\([\s\S]*setLocalAgentDirectory/,
+        'manual Refresh must retry the friendly agent directory');
+    assert.match(panel, /fed-agent-lookup-status" role="status" aria-live="polite"/,
+        'exact-agent access checks must be visibly announced');
+    assert.match(panel, /added\. Work requests are Off until you enable them/,
+        'successful exact-agent checks must announce both insertion and safe default-off consent');
+    assert.match(panel, /pinnedLocalAgentGenerationRef/,
+        'older polls must not overwrite an agent selected while they were in flight');
+    assert.match(panel, /pinnedGeneration === pinnedLocalAgentGenerationRef\.current/,
+        'poll and manual refresh commits must be generation-bound');
+    assert.match(panel, /const lookupGeneration = pinnedLocalAgentGenerationRef\.current \+ 1;[\s\S]*fedPipeContactsGet\(chain, false, agentID\);[\s\S]*if \(lookupGeneration !== pinnedLocalAgentGenerationRef\.current\)/,
+        'exact-agent lookup responses must not publish after a newer contact projection wins');
+    assert.match(panel, /const mutationGeneration = pinnedLocalAgentGenerationRef\.current \+ 1;[\s\S]*fedPipeContactSet[\s\S]*if \(mutationGeneration !== pinnedLocalAgentGenerationRef\.current\) return;/,
+        'contact mutation responses must not publish after a newer projection wins');
+    assert.match(panel, /pipeContactMutationRef\.current = true;[\s\S]*finally \{[\s\S]*pipeContactMutationRef\.current = false;/,
+        'background projections must be excluded throughout a contact mutation');
+    assert.match(panel, /const contactGeneration = pinnedLocalAgentGenerationRef\.current;[\s\S]*fedPipeContactsGet\(chain, false\);[\s\S]*if \(contactGeneration === pinnedLocalAgentGenerationRef\.current\)/,
+        'the post-policy-save refresh must not overwrite a newer contact mutation');
+    assert.doesNotMatch(panel, /\}\s*setLocalPipeContactsKnown\(true\);\s*if \(result\.remote_known/,
+        'a stale poll must not mark a newer failed contact projection as known');
+    assert.match(panel, /check access<\/option>/,
+        'directory options must disclose that shared-domain eligibility is not known until selection');
+    assert.match(panel, /Up to four newly selected agents outside the recent list/,
+        'the bounded exact-revalidation behavior must be explained beside the picker');
     assert.match(panel, /contact\.address \|\| contact\.handle/,
         'the primary copy action must prefer the exact single-peer route');
     assert.match(panel, /Copy address/);
@@ -532,7 +586,7 @@ test('federation agent contacts stay administrative and default-off', () => {
 		'cleanup warnings must stay beside the local Save controls and suppress the green success toast');
 	assert.match(panel, /copy_alignment_pending === true/,
 		'permission loads must surface a durable Copy/RBAC alignment retry');
-	assert.match(panel, /disabled=\$\{\(!dirty && !alignmentPending\) \|\| busy\}[\s\S]*Retry copy alignment/,
+	assert.match(panel, /disabled=\$\{\(!dirty && !alignmentPending\) \|\| busy \|\| !!pipeContactBusy \|\| pipeContactLookupBusy\}[\s\S]*Retry copy alignment/,
 		'a pure alignment retry must remain actionable after reload');
 	assert.match(panel, /response\.policy_replaced !== false/,
 		'a pure alignment retry must not reset unchanged agent acceptance switches');
@@ -546,6 +600,74 @@ test('federation agent contacts stay administrative and default-off', () => {
         'pause feedback must cover every suspended federation capability');
     assert.doesNotMatch(panel, /Send message|Compose message|Message body/,
         'the federation panel must not grow a human chat composer');
+});
+
+test('federation contact projection drops stale exact contacts and keeps only revalidated extensions', () => {
+    const contact = (agentID, contactID) => ({ agent_id: agentID, contact_id: contactID });
+    const grant = (contacts, agreement = 'agreement-a') => ({
+        agreement_id: agreement,
+        contacts,
+    });
+
+    const normalized = normalizeFedPipeContactGrant(grant([contact('base', 'base-1')]));
+    assert.equal(normalizeFedPipeContactGrant(normalized).agreementId, 'agreement-a',
+        'normalization must be idempotent for the agreement binding');
+
+    const selected = mergeFedPipeContactGrant(
+        grant([contact('base', 'base-1')]),
+        [{ agentID: 'selected', grant: grant([contact('base', 'base-1'), contact('selected', 'selected-1')]) }]
+    );
+    assert.deepEqual(selected.contacts.map(item => item.agent_id).sort(), ['base', 'selected']);
+
+    const selectedRevoked = mergeFedPipeContactGrant(
+        grant([contact('base', 'base-1'), contact('selected', 'stale-selected')]),
+        [{ agentID: 'selected', grant: grant([contact('base', 'base-1')]) }]
+    );
+    assert.deepEqual(selectedRevoked.contacts.map(item => item.agent_id), ['base'],
+        'a targeted response that no longer contains the selected agent must remove it');
+
+    const authoritativeEmpty = mergeFedPipeContactGrant(grant([]), []);
+    assert.deepEqual(authoritativeEmpty.contacts, [],
+        'an authoritative empty bounded poll must remain empty');
+
+    const changedAgreement = mergeFedPipeContactGrant(
+        grant([contact('base', 'base-2')], 'agreement-b'),
+        [{ agentID: 'selected', grant: grant([contact('selected', 'stale')], 'agreement-a') }]
+    );
+    assert.deepEqual(changedAgreement.contacts.map(item => item.agent_id), ['base'],
+        'an exact lookup from a prior agreement must not extend the current projection');
+});
+
+test('access-control bulk actions stay scoped and saves expose consensus progress', () => {
+    const matrix = appSource.slice(appSource.indexOf('function DomainAccessMatrix('), appSource.indexOf('// --- Activity Tab ---'));
+    const network = appSource.slice(appSource.indexOf('function NetworkPage('), appSource.indexOf('// PAGE_LABELS'));
+
+    assert.match(matrix, /filtered\.forEach\(d =>/,
+        'filtered bulk controls must change only the rows the operator can see');
+    assert.doesNotMatch(matrix, /allDomains\.forEach\(d =>/,
+        'a filtered bulk action must never silently change every domain');
+    assert.match(matrix, /Read visible/);
+    assert.match(matrix, /Write visible/);
+    assert.match(matrix, /Revoke visible/);
+    assert.match(network, /if \(accessSavingRef\.current\) return;/,
+        'repeated clicks must not start duplicate on-chain save requests');
+    assert.match(network, /accessSavingRef\.current = true;[\s\S]*finally \{[\s\S]*accessSavingRef\.current = false;/,
+        'the duplicate-submit guard must cover the full asynchronous save');
+    assert.match(network, /Applying access on-chain…/);
+    assert.match(network, /disabled=\$\{!accessDirty \|\| accessSaving\}/);
+    assert.match(network, /\$\{accessSaving \? 'Saving…' : 'Save'\}/);
+    assert.match(matrix, /function DomainAccessMatrix\(\{ domains, domainAccess, onChange, onAddDomain, disabled, busy = false \}\)/);
+    assert.match(matrix, /disabled=\$\{busy\}/,
+        'access controls must be frozen while their on-chain snapshot is being saved');
+    assert.match(network, /if \(accessSavingRef\.current\) \{[\s\S]*Wait for Save to finish before switching agents/,
+        'operators must not switch agents while an earlier agent save is still in flight');
+    assert.match(network, /class="agent-tab[^"]*" disabled=\$\{accessSaving\}/,
+        'tabs must not discard or replace access state during an in-flight save');
+    assert.match(network, /busy=\$\{accessSaving\}/);
+    assert.match(network, /setAccessDirty\(failed\.length > 0\)/,
+        'partial on-chain failures must leave Save enabled for reconciliation');
+    assert.match(network, /On-chain access needs attention/,
+        'a stored dashboard snapshot must not be mislabeled as merely unsaved when consensus reconciliation failed');
 });
 
 test('federation keeps temporary pause separate from permanent revocation and makes peer revocation recoverable', () => {

@@ -51,6 +51,32 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.13.3
+
+**CEREBRUM now manages federated agent contacts by name and keeps access
+changes bounded to what the operator can actually see.** The federation panel
+replaces raw 64-character agent-ID entry with the active local agent directory,
+then verifies the chosen identity against current shared-domain access before
+showing its default-off work-request switch.
+
+- **Friendly selection, exact authorization.** Names, registered names, and
+  providers are shown for humans while every request still carries the exact
+  agent and opaque contact identities. Exact out-of-sample contacts are
+  revalidated through a bounded background projection and disappear promptly
+  after access, availability, agreement, or consent changes.
+- **Visible means visible.** Access Control bulk actions now affect only the
+  filtered domain rows on screen. Their labels say so explicitly, preventing a
+  six-row search result from silently launching changes across the full domain
+  catalog.
+- **Honest on-chain save state.** Duplicate saves, mid-save agent switching,
+  and edits to a submitted snapshot are blocked while consensus work is in
+  flight. Partial grant failures keep retry available and are not mislabeled as
+  saved; directory, lookup, and reconciliation failures remain actionable.
+
+This release changes no SAGE consensus rule, AppHash input, transaction type,
+key encoding, fork target, or application version. App-v20 and the v11.9
+rollout boundary are unchanged; existing chains upgrade in place. SDK 11.13.3.
+
 ## What's New in v11.13.2
 
 **This corrective release completes shared-domain federated recipient
@@ -664,7 +690,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.2`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.3`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

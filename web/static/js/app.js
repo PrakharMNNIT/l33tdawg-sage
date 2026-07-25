@@ -32,7 +32,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.13.2';
+const SAGE_VERSION = 'v11.13.3';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -7629,7 +7629,7 @@ function DeployProgress({ currentPhase, status, error }) {
 }
 
 // --- Domain Access Matrix ---
-function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disabled }) {
+function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disabled, busy = false }) {
     const [filter, setFilter] = useState('');
     const [newDomain, setNewDomain] = useState('');
     // Merge externally-passed domains with any custom-added domains in domainAccess
@@ -7645,7 +7645,10 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
     };
     const bulkSet = (field, val) => {
         const upd = { ...domainAccess };
-        allDomains.forEach(d => {
+        // Bulk actions follow the visible, filtered rows. Applying "All Read"
+        // to every domain while the operator is reviewing six search results
+        // can otherwise launch hundreds of unintended on-chain transactions.
+        filtered.forEach(d => {
             upd[d] = { ...(upd[d] || { read: false, write: false }), [field]: val };
             if (field === 'write' && val) upd[d].read = true;
             if (field === 'read' && !val) upd[d].write = false;
@@ -7664,21 +7667,21 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
     if (disabled) return html`<div class="domain-matrix"><div class="domain-matrix-empty" style="color:var(--accent);">Admins have full access to all domains.</div></div>`;
 
     return html`
-        <div class="domain-matrix">
+        <div class="domain-matrix" aria-busy=${busy}>
             <div class="domain-matrix-header">
                 <input class="domain-matrix-search" type="text" placeholder="Filter domains..." value=${filter}
-                    onInput=${e => setFilter(e.target.value)} onClick=${e => e.stopPropagation()} />
+                    onInput=${e => setFilter(e.target.value)} onClick=${e => e.stopPropagation()} disabled=${busy} />
                 <div class="domain-matrix-bulk">
-                    <button onClick=${e => { e.stopPropagation(); bulkSet('read', true); }}>All Read</button>
-                    <button onClick=${e => { e.stopPropagation(); bulkSet('write', true); }}>All Write</button>
-                    <button onClick=${e => { e.stopPropagation(); bulkSet('read', false); }}>Revoke All</button>
+                    <button disabled=${busy} onClick=${e => { e.stopPropagation(); bulkSet('read', true); }}>Read visible</button>
+                    <button disabled=${busy} onClick=${e => { e.stopPropagation(); bulkSet('write', true); }}>Write visible</button>
+                    <button disabled=${busy} onClick=${e => { e.stopPropagation(); bulkSet('read', false); }}>Revoke visible</button>
                 </div>
             </div>
             <div class="domain-matrix-add" onClick=${e => e.stopPropagation()}>
                 <input class="domain-matrix-search" type="text" placeholder="Add new domain tag..."
                     value=${newDomain} onInput=${e => setNewDomain(e.target.value)}
-                    onKeyDown=${e => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }} />
-                <button class="domain-add-btn" onClick=${handleAddDomain} disabled=${!newDomain.trim()}>+ Add</button>
+                    onKeyDown=${e => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }} disabled=${busy} />
+                <button class="domain-add-btn" onClick=${handleAddDomain} disabled=${busy || !newDomain.trim()}>+ Add</button>
             </div>
             <div class="domain-matrix-columns"><span>Domain</span><span style="text-align:center;">Read</span><span style="text-align:center;">Write</span></div>
             <div class="domain-matrix-body">
@@ -7694,10 +7697,10 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
                             ${isCustom ? html`<span style="font-size:10px;color:var(--text-muted);margin-left:6px;">new</span>` : ''}
                         </div>
                         <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()}>
-                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow read access to ${domain}`} checked=${a.read} onChange=${() => toggle(domain, 'read')} /><span class="toggle-slider"></span></label>
+                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow read access to ${domain}`} checked=${a.read} disabled=${busy} onChange=${() => toggle(domain, 'read')} /><span class="toggle-slider"></span></label>
                         </div>
                         <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()}>
-                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow write access to ${domain}`} checked=${a.write} onChange=${() => toggle(domain, 'write')} /><span class="toggle-slider"></span></label>
+                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow write access to ${domain}`} checked=${a.write} disabled=${busy} onChange=${() => toggle(domain, 'write')} /><span class="toggle-slider"></span></label>
                         </div>
                     </div>`;
                 })}
@@ -7847,6 +7850,8 @@ function NetworkPage({ sse, accessMode = false }) {
     const [editDomainAccess, setEditDomainAccess] = useState({});
     const [accessDirty, setAccessDirty] = useState(false);
     const [accessSaved, setAccessSaved] = useState(false);
+    const [accessSaving, setAccessSaving] = useState(false);
+    const accessSavingRef = useRef(false);
     const [accessFailures, setAccessFailures] = useState([]);
     const [editVisibleAgents, setEditVisibleAgents] = useState('');
     // Edit mode state
@@ -8039,6 +8044,10 @@ function NetworkPage({ sse, accessMode = false }) {
     }, []);
 
     const toggleExpand = useCallback((agent) => {
+        if (accessSavingRef.current) {
+            showToast('Access changes are still being applied. Wait for Save to finish before switching agents.', 'warning');
+            return;
+        }
         if (expandedId === agent.agent_id) {
             setExpandedId(null); setEditing(false);
         } else {
@@ -8064,9 +8073,13 @@ function NetworkPage({ sse, accessMode = false }) {
     }, [expandedId, accessMode]);
 
     const handleAccessSave = useCallback(async (agentId, adminOverride = false) => {
+        if (accessSavingRef.current) return;
         const arr = Object.entries(editDomainAccess)
             .filter(([_, v]) => v.read || v.write)
             .map(([domain, p]) => ({ domain, read: p.read, write: p.write }));
+        accessSavingRef.current = true;
+        setAccessSaving(true);
+        setAccessSaved(false);
         try {
             const overrideConfirmations = adminOverride
                 ? accessFailures.filter(f => f.override_ready).map(f => ({
@@ -8130,10 +8143,18 @@ function NetworkPage({ sse, accessMode = false }) {
                 showToast('Access saved.', 'success');
             }
             loadAgents();
-            setAccessDirty(false);
-            setAccessSaved(true);
-            setTimeout(() => setAccessSaved(false), 2000);
-        } catch (e) { showToast('Failed to save access: ' + e.message, 'error'); }
+            // The dashboard snapshot may have been stored even when consensus
+            // rejected one or more grants. Keep Save actionable until every
+            // requested on-chain permission reconciles successfully.
+            setAccessDirty(failed.length > 0);
+            setAccessSaved(failed.length === 0);
+            if (failed.length === 0) setTimeout(() => setAccessSaved(false), 2000);
+        } catch (e) {
+            showToast('Failed to save access: ' + e.message, 'error');
+        } finally {
+            accessSavingRef.current = false;
+            setAccessSaving(false);
+        }
     }, [editRole, editClearance, editDomainAccess, editVisibleAgents, accessFailures, loadAgents]);
 
     const handleAdminAccessOverride = useCallback(async (agent) => {
@@ -8657,9 +8678,9 @@ function NetworkPage({ sse, accessMode = false }) {
                             <div class="agent-expanded ${isExpanded ? 'open' : ''}">
                                 ${isExpanded && html`<div class="agent-expanded-inner">
                                     <div class="agent-tab-bar" role="tablist">
-                                        <button class="agent-tab ${expandedTab === 'overview' ? 'active' : ''}" onClick=${e => { e.stopPropagation(); setExpandedTab('overview'); setEditing(false); }}>Overview</button>
-                                        <button class="agent-tab ${expandedTab === 'access' ? 'active' : ''}" onClick=${e => { e.stopPropagation(); setExpandedTab('access'); setEditing(false); }}>Access Control</button>
-                                        <button class="agent-tab ${expandedTab === 'activity' ? 'active' : ''}" onClick=${e => { e.stopPropagation(); setExpandedTab('activity'); setEditing(false); }}>Activity</button>
+                                        <button class="agent-tab ${expandedTab === 'overview' ? 'active' : ''}" disabled=${accessSaving} onClick=${e => { e.stopPropagation(); setExpandedTab('overview'); setEditing(false); }}>Overview</button>
+                                        <button class="agent-tab ${expandedTab === 'access' ? 'active' : ''}" disabled=${accessSaving} onClick=${e => { e.stopPropagation(); setExpandedTab('access'); setEditing(false); }}>Access Control</button>
+                                        <button class="agent-tab ${expandedTab === 'activity' ? 'active' : ''}" disabled=${accessSaving} onClick=${e => { e.stopPropagation(); setExpandedTab('activity'); setEditing(false); }}>Activity</button>
                                     </div>
 
                                     ${expandedTab === 'overview' && html`
@@ -8738,6 +8759,7 @@ function NetworkPage({ sse, accessMode = false }) {
                                                 domainAccess=${editDomainAccess}
                                                 onChange=${(v) => { setEditDomainAccess(v); setAccessDirty(true); }}
                                                 disabled=${editRole === 'admin'}
+                                                busy=${accessSaving}
                                             />
                                             ${accessFailures.length > 0 && html`
                                                 <div style="margin-top:12px;padding:12px 14px;border:1px solid rgba(245,158,11,.35);border-radius:10px;background:rgba(245,158,11,.08);" onClick=${e => e.stopPropagation()}>
@@ -8780,6 +8802,7 @@ function NetworkPage({ sse, accessMode = false }) {
                                             <div class="access-section-title">Clearance Level <${HelpTip} text="5 tiers from Guest (0) to Top Secret (4). Determines the sensitivity of memories this agent can access." /></div>
                                             <div class="clearance-row" onClick=${e => e.stopPropagation()}>
                                                 <input type="range" min="0" max="4" value=${editClearance}
+                                                    disabled=${accessSaving}
                                                     onInput=${e => { setEditClearance(parseInt(e.target.value)); setAccessDirty(true); }} />
                                                 <span class="clearance-label">${CLEARANCE_LABELS[editClearance]}</span>
                                             </div>
@@ -8788,6 +8811,7 @@ function NetworkPage({ sse, accessMode = false }) {
                                             <div onClick=${e => e.stopPropagation()}>
                                                 <input class="wizard-input" style="font-family:var(--mono,monospace);font-size:13px;"
                                                     placeholder='* (all agents visible)' value=${editVisibleAgents}
+                                                    disabled=${accessSaving}
                                                     onInput=${e => { setEditVisibleAgents(e.target.value); setAccessDirty(true); }} />
                                                 <div style="color:var(--text-muted);font-size:12px;margin-top:4px;">
                                                     Use <code>*</code> or leave empty for full visibility. Use a JSON array like <code>["agentId1","agentId2"]</code> to restrict.
@@ -8795,9 +8819,16 @@ function NetworkPage({ sse, accessMode = false }) {
                                             </div>
 
                                             <div class="access-save-bar" onClick=${e => e.stopPropagation()}>
-                                                ${accessDirty ? html`<span class="access-dirty">Unsaved changes</span>` : ''}
+                                                ${accessSaving
+                                                    ? html`<span class="access-saving" role="status" aria-live="polite">Applying access on-chain…</span>`
+                                                    : (accessFailures.length > 0
+                                                        ? html`<span class="access-dirty">On-chain access needs attention</span>`
+                                                        : (accessDirty ? html`<span class="access-dirty">Unsaved changes</span>` : ''))}
                                                 ${accessSaved ? html`<span class="access-saved">Saved</span>` : ''}
-                                                <button class="btn btn-primary" onClick=${() => handleAccessSave(agent.agent_id)} disabled=${!accessDirty}>Save</button>
+                                                <button class="btn btn-primary" onClick=${() => handleAccessSave(agent.agent_id)}
+                                                    disabled=${!accessDirty || accessSaving} aria-busy=${accessSaving}>
+                                                    ${accessSaving ? 'Saving…' : 'Save'}
+                                                </button>
                                             </div>
                                         </div>
                                     `}
@@ -12965,10 +12996,45 @@ function normalizeFedPipeContactGrant(value) {
     const contacts = Array.isArray(grant.contacts) ? grant.contacts.filter(contact => contact && contact.agent_id) : [];
     return {
         version: Number(grant.version || 0),
+        agreementId: String(grant.agreement_id || grant.agreementId || ''),
         revision: String(grant.revision || ''),
         paused: grant.paused === true,
         contacts,
     };
+}
+
+// The ordinary endpoint is an authoritative but bounded sample. Exact agent
+// lookups may extend it, but only for the explicitly requested identities.
+// Rebuilding from the latest base on every poll makes a revoked or ineligible
+// selected contact disappear instead of preserving stale authorization UI.
+function mergeFedPipeContactGrant(base, targeted = []) {
+    const next = normalizeFedPipeContactGrant(base);
+    const contacts = new Map(next.contacts.map(contact => [contact.agent_id, contact]));
+    targeted.forEach(entry => {
+        const agentID = String(entry && entry.agentID || '');
+        const exact = normalizeFedPipeContactGrant(entry && entry.grant);
+        if (!agentID) return;
+        if (next.agreementId && exact.agreementId && next.agreementId !== exact.agreementId) return;
+        // The exact response is authoritative for this identity, including
+        // absence after an access or availability revoke.
+        contacts.delete(agentID);
+        const contact = exact.contacts.find(candidate => candidate.agent_id === agentID);
+        if (contact) contacts.set(agentID, contact);
+    });
+    return { ...next, contacts: Array.from(contacts.values()) };
+}
+
+const maxPinnedFedPipeContacts = 4;
+
+function fedFriendlyLocalAgentLabel(agent) {
+    const name = String(agent && (agent.name || agent.registered_name) || 'Unnamed agent').trim();
+    const details = [];
+    const registeredName = String(agent && agent.registered_name || '').trim();
+    const provider = String(agent && agent.provider || '').trim();
+    if (registeredName && registeredName !== name) details.push(registeredName);
+    if (provider && provider !== name && provider !== registeredName) details.push(provider);
+    if (agent && agent.agent_id) details.push(String(agent.agent_id).slice(0, 8));
+    return details.length ? `${name} · ${details.join(' · ')}` : name;
 }
 
 // FedPermissionsPanel keeps identity/trust separate from ongoing authorization.
@@ -12992,8 +13058,14 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 	const [remotePipeKnown, setRemotePipeKnown] = useState(false);
 	const [pipeContactBusy, setPipeContactBusy] = useState('');
 	const [pipeContactErr, setPipeContactErr] = useState('');
-	const [pipeContactLookupID, setPipeContactLookupID] = useState('');
+	const [localAgentDirectory, setLocalAgentDirectory] = useState(null);
+	const [localAgentDirectoryErr, setLocalAgentDirectoryErr] = useState('');
+	const [selectedLocalAgentID, setSelectedLocalAgentID] = useState('');
 	const [pipeContactLookupBusy, setPipeContactLookupBusy] = useState(false);
+	const [pipeContactLookupStatus, setPipeContactLookupStatus] = useState('');
+	const pinnedLocalAgentIDsRef = useRef(new Set());
+	const pinnedLocalAgentGenerationRef = useRef(0);
+	const pipeContactMutationRef = useRef(false);
 	const [copiedContact, setCopiedContact] = useState('');
     const [subscribeSaved, setSubscribeSaved] = useState([]);
     const [subscribeDraft, setSubscribeDraft] = useState([]);
@@ -13014,12 +13086,13 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
         setSyncErr('');
         setSyncSaveErr('');
         const load = async () => {
-            const [catalogResult, permissionsResult, syncResult, syncStatusResult, pipeContactsResult] = await Promise.allSettled([
+            const [catalogResult, permissionsResult, syncResult, syncStatusResult, pipeContactsResult, agentsResult] = await Promise.allSettled([
                 fedShareableDomains(),
                 fedPermissionsGet(chain, false),
                 fedSyncGet(chain),
                 fedSyncStatus(chain),
 				fedPipeContactsGet(chain, false),
+				fetchAgents(),
             ]);
             if (!live) return;
             const errors = [];
@@ -13066,6 +13139,13 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 				setRemotePipeContacts(null); setRemotePipeKnown(false);
 				setPipeContactErr('Agent contacts are temporarily unavailable.');
 			}
+			if (agentsResult.status === 'fulfilled') {
+				setLocalAgentDirectory(Array.isArray(agentsResult.value && agentsResult.value.agents) ? agentsResult.value.agents : []);
+				setLocalAgentDirectoryErr('');
+			} else {
+				setLocalAgentDirectory([]);
+				setLocalAgentDirectoryErr('Could not load friendly agent names. Refresh this connection to try again.');
+			}
             setErr(errors.length ? `Couldn't load ${errors.join('; ')}` : '');
         };
         load();
@@ -13102,11 +13182,16 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
         let live = true;
         let timer = null;
         const poll = async () => {
-            const [catalogResult, permissionsResult, pipeContactsResult] = await Promise.allSettled([
+            const pinnedAgentIDs = Array.from(pinnedLocalAgentIDsRef.current);
+            const pinnedGeneration = pinnedLocalAgentGenerationRef.current;
+            const results = await Promise.allSettled([
                 fedShareableDomains(),
                 fedPermissionsGet(chain, false),
 				fedPipeContactsGet(chain, false),
+				...pinnedAgentIDs.map(agentID => fedPipeContactsGet(chain, false, agentID)),
             ]);
+            const [catalogResult, permissionsResult, pipeContactsResult] = results;
+            const targetedResults = results.slice(3);
             if (!live) return;
             if (catalogResult.status === 'fulfilled') setCatalog(fedCatalogMap(catalogResult.value));
             if (permissionsResult.status === 'fulfilled') {
@@ -13120,13 +13205,30 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
             }
 			if (pipeContactsResult.status === 'fulfilled') {
 				const result = pipeContactsResult.value || {};
-				setLocalPipeContacts(normalizeFedPipeContactGrant(result.local_contacts));
-				setLocalPipeContactsKnown(true);
+				const targeted = pinnedAgentIDs.flatMap((agentID, index) => {
+					const targetedResult = targetedResults[index];
+					return targetedResult && targetedResult.status === 'fulfilled'
+						? [{ agentID, grant: targetedResult.value && targetedResult.value.local_contacts }]
+						: [];
+				});
+				if (pinnedGeneration === pinnedLocalAgentGenerationRef.current && !pipeContactMutationRef.current) {
+					const baseAgentIDs = new Set(normalizeFedPipeContactGrant(result.local_contacts).contacts.map(contact => contact.agent_id));
+					const merged = mergeFedPipeContactGrant(result.local_contacts, targeted);
+					pinnedLocalAgentIDsRef.current = new Set(targeted
+						.filter(entry => !baseAgentIDs.has(entry.agentID)
+							&& normalizeFedPipeContactGrant(entry.grant).contacts.some(contact => contact.agent_id === entry.agentID))
+						.map(entry => entry.agentID));
+					pinnedLocalAgentGenerationRef.current += 1;
+					setLocalPipeContacts(merged);
+					setLocalPipeContactsKnown(true);
+					setPipeContactErr(targetedResults.some(targetedResult => targetedResult.status === 'rejected')
+						? 'Some selected agent contacts could not be rechecked and were hidden. Choose the agent again to retry.'
+						: '');
+				}
 				if (result.remote_known === true) {
 					setRemotePipeContacts(result.remote_contacts ? normalizeFedPipeContactGrant(result.remote_contacts) : normalizeFedPipeContactGrant(null));
 					setRemotePipeKnown(true);
 				}
-				setPipeContactErr('');
 			}
             if (live) timer = setTimeout(poll, 8000);
         };
@@ -13211,6 +13313,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     };
 
     const save = async () => {
+        if (pipeContactMutationRef.current || pipeContactLookupBusy) return;
         const enabledWorkRequests = localPipeContacts && Array.isArray(localPipeContacts.contacts)
             ? localPipeContacts.contacts.filter(contact => contact && contact.accepting === true).length
             : 0;
@@ -13245,16 +13348,25 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                     ...current,
                     contacts: current.contacts.map(contact => ({ ...contact, accepting: false })),
                 } : current);
+                pinnedLocalAgentIDsRef.current = new Set();
+                pinnedLocalAgentGenerationRef.current += 1;
+                const contactGeneration = pinnedLocalAgentGenerationRef.current;
                 try {
                     const latestContacts = await fedPipeContactsGet(chain, false);
-                    setLocalPipeContacts(normalizeFedPipeContactGrant(latestContacts && latestContacts.local_contacts));
-					setLocalPipeContactsKnown(true);
-                    setRemotePipeContacts(latestContacts && latestContacts.remote_contacts ? normalizeFedPipeContactGrant(latestContacts.remote_contacts) : null);
-                    setRemotePipeKnown(latestContacts && latestContacts.remote_known === true);
-                    setPipeContactErr('');
+                    if (contactGeneration === pinnedLocalAgentGenerationRef.current) {
+                        setLocalPipeContacts(normalizeFedPipeContactGrant(latestContacts && latestContacts.local_contacts));
+						setLocalPipeContactsKnown(true);
+                        setRemotePipeContacts(latestContacts && latestContacts.remote_contacts ? normalizeFedPipeContactGrant(latestContacts.remote_contacts) : null);
+                        setRemotePipeKnown(latestContacts && latestContacts.remote_known === true);
+                        setPipeContactErr('');
+                        pinnedLocalAgentGenerationRef.current += 1;
+                    }
                 } catch (_) {
-					setLocalPipeContactsKnown(false);
-                    setPipeContactErr('Domains were saved and work-request switches were reset. Refresh to load the latest agent contacts.');
+					if (contactGeneration === pinnedLocalAgentGenerationRef.current) {
+						setLocalPipeContactsKnown(false);
+                        setPipeContactErr('Domains were saved and work-request switches were reset. Refresh to load the latest agent contacts.');
+                        pinnedLocalAgentGenerationRef.current += 1;
+					}
                 }
             }
 			if (warnings.length > 0) {
@@ -13293,42 +13405,88 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     };
 
 	const togglePipeContact = async contact => {
-		if (!contact || !contact.agent_id || !contact.contact_id) return;
+		if (!contact || !contact.agent_id || !contact.contact_id || busy || pipeContactMutationRef.current) return;
 		const next = contact.accepting !== true;
+		pipeContactMutationRef.current = true;
+		const mutationGeneration = pinnedLocalAgentGenerationRef.current + 1;
+		pinnedLocalAgentGenerationRef.current = mutationGeneration;
 		setPipeContactBusy(contact.contact_id); setPipeContactErr('');
 		try {
 			const response = await fedPipeContactSet(chain, contact.agent_id, contact.contact_id, next);
-			setLocalPipeContacts(normalizeFedPipeContactGrant(response && response.local_contacts));
+			if (mutationGeneration !== pinnedLocalAgentGenerationRef.current) return;
+			pinnedLocalAgentGenerationRef.current += 1;
+			setLocalPipeContacts(current => mergeFedPipeContactGrant(current, [{
+				agentID: contact.agent_id,
+				grant: response && response.local_contacts,
+			}]));
 			setLocalPipeContactsKnown(true);
 			showToast(`${next ? 'Allowed' : 'Stopped'} work requests for ${contact.display_name || contact.handle || 'agent'}`, 'success');
 		} catch (e) {
-			setPipeContactErr(String(e.message || e));
+			const actionError = String(e.message || e);
+			if (mutationGeneration !== pinnedLocalAgentGenerationRef.current) return;
 			try {
-				const latest = await fedPipeContactsGet(chain, false);
-				setLocalPipeContacts(normalizeFedPipeContactGrant(latest && latest.local_contacts));
+				const latest = await fedPipeContactsGet(chain, false, contact.agent_id);
+				if (mutationGeneration !== pinnedLocalAgentGenerationRef.current) return;
+				pinnedLocalAgentGenerationRef.current += 1;
+				setLocalPipeContacts(current => mergeFedPipeContactGrant(current, [{
+					agentID: contact.agent_id,
+					grant: latest && latest.local_contacts,
+				}]));
 				setLocalPipeContactsKnown(true);
 				setRemotePipeContacts(latest && latest.remote_contacts ? normalizeFedPipeContactGrant(latest.remote_contacts) : null);
 				setRemotePipeKnown(latest && latest.remote_known === true);
 			} catch (_) { /* the original actionable error remains visible */ }
+			setPipeContactErr(actionError);
+		} finally {
+			pipeContactMutationRef.current = false;
+			setPipeContactBusy('');
 		}
-		setPipeContactBusy('');
 	};
 
-	const findLocalPipeContact = async event => {
-		event && event.preventDefault();
-		const agentID = String(pipeContactLookupID || '').trim().toLowerCase();
-		if (!/^[0-9a-f]{64}$/.test(agentID)) {
-			setPipeContactErr('Enter the exact 64-character agent ID to review that local agent’s shared-domain inbox.');
-			return;
-		}
-		setPipeContactLookupBusy(true); setPipeContactErr('');
+	const chooseLocalPipeContact = async event => {
+		const agentID = String(event && event.target && event.target.value || '').trim().toLowerCase();
+		setSelectedLocalAgentID(agentID);
+		if (!agentID) return;
+		// Invalidate any older poll/Refresh snapshot before this exact lookup
+		// can publish a new row or an actionable failure.
+		const lookupGeneration = pinnedLocalAgentGenerationRef.current + 1;
+		pinnedLocalAgentGenerationRef.current = lookupGeneration;
+		const selectedAgent = (Array.isArray(localAgentDirectory) ? localAgentDirectory : [])
+			.find(agent => agent && agent.agent_id === agentID);
+		const selectedName = selectedAgent ? fedFriendlyLocalAgentLabel(selectedAgent).split(' · ')[0] : 'That agent';
+		setPipeContactLookupBusy(true); setPipeContactLookupStatus(`Checking ${selectedName}'s shared-domain access…`); setPipeContactErr('');
 		try {
 			const result = await fedPipeContactsGet(chain, false, agentID);
-			setLocalPipeContacts(normalizeFedPipeContactGrant(result && result.local_contacts));
+			if (lookupGeneration !== pinnedLocalAgentGenerationRef.current) {
+				setPipeContactLookupStatus('Agent access changed while SAGE was checking. Choose the agent again.');
+				return;
+			}
+			const targeted = normalizeFedPipeContactGrant(result && result.local_contacts);
+			if (!targeted.contacts.some(contact => contact.agent_id === agentID)) {
+				setPipeContactLookupStatus('');
+				setPipeContactErr(`${selectedName} cannot receive work requests through this connection yet. Share a domain and grant that agent access to it, then try again.`);
+				return;
+			}
+			// Accepted/recent contacts naturally enter the bounded base sample.
+			// Retain only a few newly selected out-of-sample contacts meanwhile,
+			// keeping background exact revalidation strictly bounded.
+			let evictedSelection = false;
+			while (pinnedLocalAgentIDsRef.current.size >= maxPinnedFedPipeContacts) {
+				const oldest = pinnedLocalAgentIDsRef.current.values().next().value;
+				pinnedLocalAgentIDsRef.current.delete(oldest);
+				evictedSelection = true;
+			}
+			pinnedLocalAgentIDsRef.current.add(agentID);
+			pinnedLocalAgentGenerationRef.current += 1;
+			setLocalPipeContacts(current => mergeFedPipeContactGrant(current, [{ agentID, grant: targeted }]));
 			setLocalPipeContactsKnown(true);
+			setPipeContactLookupStatus(`${selectedName} added. Work requests are Off until you enable them.${evictedSelection ? ' The oldest unenabled selection was hidden to keep background checks bounded.' : ''}`);
 		} catch (e) {
+			if (lookupGeneration !== pinnedLocalAgentGenerationRef.current) return;
+			setPipeContactLookupStatus('');
 			setPipeContactErr(String(e.message || e));
 		} finally {
+			setSelectedLocalAgentID('');
 			setPipeContactLookupBusy(false);
 		}
 	};
@@ -13351,13 +13509,20 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     const refresh = async () => {
         setRefreshing(true); setSyncErr(''); setSyncSaveErr('');
         try {
-			const [catalogResponse, permissionResponse, syncResponse, syncStatusResponse, pipeContactsResponse, peerStatusResponse] = await Promise.all([
+			const pinnedAgentIDs = Array.from(pinnedLocalAgentIDsRef.current);
+			const pinnedGeneration = pinnedLocalAgentGenerationRef.current;
+			const [catalogResponse, permissionResponse, syncResponse, syncStatusResponse, pipeContactsResponse, peerStatusResponse, agentsResult, targetedResults] = await Promise.all([
                 fedShareableDomains(),
                 fedPermissionsGet(chain, false),
                 fedSyncGet(chain),
                 fedSyncStatus(chain),
 				fedPipeContactsGet(chain, false),
                 fedPeerStatus(chain),
+				fetchAgents().then(
+					value => ({ ok: true, value }),
+					error => ({ ok: false, error })
+				),
+				Promise.allSettled(pinnedAgentIDs.map(agentID => fedPipeContactsGet(chain, false, agentID))),
             ]);
             setCatalog(fedCatalogMap(catalogResponse));
             setAlignmentPending(permissionResponse.copy_alignment_pending === true);
@@ -13372,9 +13537,31 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                 const local = normalizeFedPermissionList(permissionResponse.local_permissions);
                 setSaved(local); setDraft(local);
             }
-			setLocalPipeContacts(normalizeFedPipeContactGrant(pipeContactsResponse && pipeContactsResponse.local_contacts));
-			setLocalPipeContactsKnown(true);
-			setPipeContactErr('');
+			const targeted = pinnedAgentIDs.flatMap((agentID, index) => {
+				const targetedResult = targetedResults[index];
+				return targetedResult && targetedResult.status === 'fulfilled'
+					? [{ agentID, grant: targetedResult.value && targetedResult.value.local_contacts }]
+					: [];
+			});
+			if (pinnedGeneration === pinnedLocalAgentGenerationRef.current && !pipeContactMutationRef.current) {
+				const baseAgentIDs = new Set(normalizeFedPipeContactGrant(pipeContactsResponse && pipeContactsResponse.local_contacts).contacts.map(contact => contact.agent_id));
+				setLocalPipeContacts(mergeFedPipeContactGrant(pipeContactsResponse && pipeContactsResponse.local_contacts, targeted));
+				pinnedLocalAgentIDsRef.current = new Set(targeted
+					.filter(entry => !baseAgentIDs.has(entry.agentID)
+						&& normalizeFedPipeContactGrant(entry.grant).contacts.some(contact => contact.agent_id === entry.agentID))
+					.map(entry => entry.agentID));
+				pinnedLocalAgentGenerationRef.current += 1;
+				setLocalPipeContactsKnown(true);
+				setPipeContactErr(targetedResults.some(targetedResult => targetedResult.status === 'rejected')
+					? 'Some selected agent contacts could not be rechecked and were hidden. Choose the agent again to retry.'
+					: '');
+			}
+			if (agentsResult.ok) {
+				setLocalAgentDirectory(Array.isArray(agentsResult.value && agentsResult.value.agents) ? agentsResult.value.agents : []);
+				setLocalAgentDirectoryErr('');
+			} else {
+				setLocalAgentDirectoryErr('Could not load friendly agent names. Refresh this connection to try again.');
+			}
             if (peerStatusResponse && peerStatusResponse.reachable === true) {
                 if (peerStatusResponse.peer_rbac_grant) {
                     setRemote(normalizeFedPermissionList(peerStatusResponse.peer_rbac_grant.domains));
@@ -13397,6 +13584,10 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     };
     const localAgentContacts = localPipeContacts && Array.isArray(localPipeContacts.contacts) ? localPipeContacts.contacts : [];
 	const remoteAgentContacts = remotePipeContacts && Array.isArray(remotePipeContacts.contacts) ? remotePipeContacts.contacts : [];
+	const shownLocalAgentIDs = new Set(localAgentContacts.map(contact => contact.agent_id));
+	const localAgentOptions = (Array.isArray(localAgentDirectory) ? localAgentDirectory : [])
+		.filter(agent => agent && agent.agent_id && agent.status === 'active' && !agent.removed_at && !shownLocalAgentIDs.has(agent.agent_id))
+		.sort((a, b) => fedFriendlyLocalAgentLabel(a).localeCompare(fedFriendlyLocalAgentLabel(b)));
 	const showOutgoing = roleKnown;
     const outboxCounts = syncStatus && syncStatus.outbox_counts && typeof syncStatus.outbox_counts === 'object'
         ? syncStatus.outbox_counts
@@ -13447,15 +13638,20 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 				<div class="fed-agent-column">
 					<h5>Agents on this SAGE</h5>
 					<p class="muted">Allow ${peerName}'s SAGE to send a work request to a specific local agent. New contacts start off. Changing the shared domain list resets enabled switches to Off.</p>
-					<form class="fed-agent-lookup" onSubmit=${findLocalPipeContact}>
-						<label for=${`fed-agent-lookup-${chain}`}>Find another local agent by exact agent ID</label>
-						<div class="fed-agent-lookup-row">
-							<input id=${`fed-agent-lookup-${chain}`} value=${pipeContactLookupID}
-								placeholder="64-character agent ID" aria-label="Exact local agent ID"
-								onInput=${e => setPipeContactLookupID(e.target.value)} />
-							<button class="btn" type="submit" disabled=${pipeContactLookupBusy}>${pipeContactLookupBusy ? 'Finding…' : 'Find agent'}</button>
-						</div>
-					</form>
+					<div class="fed-agent-picker">
+						<label for=${`fed-agent-picker-${chain}`}>Add a local agent</label>
+						<select id=${`fed-agent-picker-${chain}`} value=${selectedLocalAgentID}
+							disabled=${busy || !!pipeContactBusy || pipeContactLookupBusy || localAgentDirectory === null || localAgentOptions.length === 0}
+							aria-busy=${pipeContactLookupBusy}
+							aria-describedby=${`fed-agent-picker-help-${chain}`}
+							onChange=${chooseLocalPipeContact}>
+							<option value="">${pipeContactLookupBusy ? 'Checking agent access…' : (localAgentDirectory === null ? 'Loading agents…' : (localAgentOptions.length ? 'Choose an agent by name…' : 'All available agents are shown'))}</option>
+							${localAgentOptions.map(agent => html`<option value=${agent.agent_id} key=${agent.agent_id}>${fedFriendlyLocalAgentLabel(agent)} · check access</option>`)}
+						</select>
+						<span id=${`fed-agent-picker-help-${chain}`} class="muted">This is the active-agent directory. Choose a friendly name and SAGE will verify shared-domain access before adding it. Up to four newly selected agents outside the recent list stay visible while their access is rechecked.</span>
+						${pipeContactLookupStatus && html`<span class="fed-agent-lookup-status" role="status" aria-live="polite">${pipeContactLookupStatus}</span>`}
+					</div>
+					${localAgentDirectoryErr && html`<div class="fed-agent-directory-error muted" role="status">${localAgentDirectoryErr}</div>`}
 					${localPipeContacts === null && html`<div class="fed-agent-empty muted">Loading local agents…</div>`}
 					${localPipeContacts !== null && localAgentContacts.length === 0 && html`<div class="fed-agent-empty muted">Share a domain, then grant an active local agent access to make its inbox available here.</div>`}
 					${localAgentContacts.map(contact => {
@@ -13472,7 +13668,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 								<input type="checkbox" role="switch"
 									aria-label=${`Allow work requests from ${peerName} to ${contact.display_name || contact.agent_id}`}
 									checked=${contact.accepting === true}
-									disabled=${contact.available === false || !contact.contact_id || pipeContactBusy === contact.contact_id}
+									disabled=${busy || contact.available === false || !contact.contact_id || !!pipeContactBusy}
 									onChange=${() => togglePipeContact(contact)} />
 							</label>
 						</div>`;
@@ -13545,7 +13741,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
             </div>
             ${err && html`<div class="fed-err fed-perm-error" role="alert">${err}</div>`}
             <div class="fed-perm-actions">
-                <button class="btn btn-primary" disabled=${(!dirty && !alignmentPending) || busy} onClick=${save}>${busy ? 'Saving…' : (!dirty && alignmentPending ? 'Retry copy alignment' : 'Save what I share')}</button>
+                <button class="btn btn-primary" disabled=${(!dirty && !alignmentPending) || busy || !!pipeContactBusy || pipeContactLookupBusy} onClick=${save}>${busy ? 'Saving…' : (!dirty && alignmentPending ? 'Retry copy alignment' : 'Save what I share')}</button>
                 <span class="muted">${dirty ? 'Unsaved permission changes' : (alignmentPending ? 'Copy delivery needs retry' : 'Saved')}</span>
             </div>
         </section>` : html`<section class="fed-perm-section fed-guest-share-back">
@@ -13559,7 +13755,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                     <h4>${peerName} → this SAGE</h4>
                     <p>${peerName} independently controls what this SAGE may consume. When Copy is offered, choose whether to retain synchronized local memories here.</p>
                 </div>
-                <button class="btn" disabled=${refreshing} onClick=${refresh}>${refreshing ? 'Refreshing…' : 'Refresh'}</button>
+                <button class="btn" disabled=${refreshing || busy || !!pipeContactBusy || pipeContactLookupBusy} onClick=${refresh}>${refreshing ? 'Refreshing…' : 'Refresh'}</button>
             </div>
             ${syncErr && html`<div class="fed-err fed-perm-error" role="alert">${syncErr}</div>`}
             <div class="fed-copy-provenance">

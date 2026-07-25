@@ -497,13 +497,24 @@ test.describe('Add Agent Wizard — Step 2: Permissions', () => {
     });
 
     test('domain matrix bulk operations work', async ({ page }) => {
-        // Click "All Read" button
-        const allReadBtn = page.locator('.domain-matrix-bulk button').filter({ hasText: 'All Read' });
-        if (await allReadBtn.isVisible()) {
-            await allReadBtn.click();
-            // All read checkboxes in the matrix body should be checked
-            // (Only if there are domains)
-        }
+        const rows = page.locator('.domain-matrix-row');
+        const rowCount = await rows.count();
+        test.skip(rowCount < 2, 'needs at least two domains to prove filtering');
+        const firstDomain = (await rows.first().locator('.domain-matrix-domain').innerText()).trim().split(/\s+/).pop();
+        const hiddenRow = rows.nth(1);
+        const hiddenRead = hiddenRow.locator('input[type="checkbox"]').first();
+        const hiddenBefore = await hiddenRead.isChecked();
+
+        await page.locator('.domain-matrix-header input').fill(firstDomain);
+        const visibleRows = page.locator('.domain-matrix-row:visible');
+        await expect(visibleRows).toHaveCount(1);
+        await page.getByRole('button', { name: 'Read visible' }).click();
+        await expect(visibleRows.first().locator('input[type="checkbox"]').first()).toBeChecked();
+        expect(await hiddenRead.isChecked()).toBe(hiddenBefore);
+
+        await page.getByRole('button', { name: 'Revoke visible' }).click();
+        await expect(visibleRows.first().locator('input[type="checkbox"]').first()).not.toBeChecked();
+        expect(await hiddenRead.isChecked()).toBe(hiddenBefore);
     });
 });
 
