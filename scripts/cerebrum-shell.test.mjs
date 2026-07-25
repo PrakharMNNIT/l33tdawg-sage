@@ -648,7 +648,18 @@ test('access-control bulk actions stay scoped and saves expose consensus progres
         'a filtered bulk action must never silently change every domain');
     assert.match(matrix, /Read visible/);
     assert.match(matrix, /Write visible/);
+    assert.match(matrix, /Modify visible/);
     assert.match(matrix, /Revoke visible/);
+    assert.match(matrix, /field === 'modify' && upd\.modify[\s\S]*upd\.read = true;[\s\S]*upd\.write = true;/,
+        'Modify must be a monotonic level-3 tier that includes Read and Write');
+    assert.match(matrix, /field === 'write' && !upd\.write\) upd\.modify = false;/,
+        'removing Write must also remove Modify');
+    assert.match(matrix, /field === 'read' && !upd\.read[\s\S]*upd\.write = false;[\s\S]*upd\.modify = false;/,
+        'removing Read must also remove higher permission tiers');
+    assert.match(matrix, /isReservedSharedDomain\(d\)/,
+        'bulk Modify must skip reserved shared domains that cannot carry level-3 grants');
+    assert.match(matrix, /sharedModifyUnavailable[\s\S]*Shared domains support read\/write but cannot carry a level-3 Modify grant/,
+        'reserved shared-domain rows must explain why Modify is unavailable');
     assert.match(network, /if \(accessSavingRef\.current\) return;/,
         'repeated clicks must not start duplicate on-chain save requests');
     assert.match(network, /accessSavingRef\.current = true;[\s\S]*finally \{[\s\S]*accessSavingRef\.current = false;/,
@@ -656,7 +667,7 @@ test('access-control bulk actions stay scoped and saves expose consensus progres
     assert.match(network, /Applying access on-chain…/);
     assert.match(network, /disabled=\$\{!accessDirty \|\| accessSaving\}/);
     assert.match(network, /\$\{accessSaving \? 'Saving…' : 'Save'\}/);
-    assert.match(matrix, /function DomainAccessMatrix\(\{ domains, domainAccess, onChange, onAddDomain, disabled, busy = false \}\)/);
+    assert.match(matrix, /function DomainAccessMatrix\(\{ domains, domainAccess, onChange, onAddDomain, disabled, busy = false, allowModify = true \}\)/);
     assert.match(matrix, /disabled=\$\{busy\}/,
         'access controls must be frozen while their on-chain snapshot is being saved');
     assert.match(network, /if \(accessSavingRef\.current\) \{[\s\S]*Wait for Save to finish before switching agents/,
@@ -668,6 +679,14 @@ test('access-control bulk actions stay scoped and saves expose consensus progres
         'partial on-chain failures must leave Save enabled for reconciliation');
     assert.match(network, /On-chain access needs attention/,
         'a stored dashboard snapshot must not be mislabeled as merely unsaved when consensus reconciliation failed');
+    assert.match(network, /f\.level === 3 \? 'Read \+ write \+ modify'/,
+        'level-3 admin confirmation must describe Modify rather than removal');
+    assert.doesNotMatch(network, /disabled=\$\{editRole === 'admin'\}/,
+        'an admin still needs explicit level-3 grants, so its access matrix must remain editable');
+    const addAgent = appSource.slice(appSource.indexOf('function AddAgentWizard('), appSource.indexOf('// PAGE_LABELS'));
+    assert.match(addAgent, /allowModify=\$\{false\}/);
+    assert.match(addAgent, /Level-3 Modify grants can be assigned after this agent is registered/,
+        'agent creation must not promise an unenforced Modify grant');
 });
 
 test('federation keeps temporary pause separate from permanent revocation and makes peer revocation recoverable', () => {

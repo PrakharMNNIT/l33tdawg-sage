@@ -3106,7 +3106,7 @@ input[type="range"]::-moz-range-thumb {
 .domain-add-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .domain-matrix-row.custom { background: rgba(6, 182, 212, 0.04); }
 .domain-matrix-columns {
-    display: grid; grid-template-columns: 1fr 70px 70px; padding: 8px 16px;
+    display: grid; grid-template-columns: minmax(0, 1fr) 70px 70px 70px; padding: 8px 16px;
     background: var(--bg-deep); border-bottom: 1px solid var(--border);
     font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px;
     color: var(--text-muted); font-weight: 600;
@@ -3118,12 +3118,12 @@ input[type="range"]::-moz-range-thumb {
 .domain-matrix-body::-webkit-scrollbar { width: 6px; }
 .domain-matrix-body::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 3px; }
 .domain-matrix-row {
-    display: grid; grid-template-columns: 1fr 70px 70px; padding: 10px 16px;
+    display: grid; grid-template-columns: minmax(0, 1fr) 70px 70px 70px; padding: 10px 16px;
     align-items: center; border-bottom: 1px solid var(--border); transition: background 0.15s;
 }
 .domain-matrix-row:last-child { border-bottom: none; }
 .domain-matrix-row:hover { background: var(--bg-elevated); }
-.domain-matrix-domain { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 500; color: var(--text); }
+.domain-matrix-domain { min-width: 0; display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 500; color: var(--text); overflow-wrap: anywhere; }
 .domain-matrix-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .domain-matrix-toggle { display: flex; justify-content: center; }
 .domain-matrix-empty, .domain-matrix-no-results {
@@ -3229,6 +3229,17 @@ input[type="range"]::-moz-range-thumb {
     .domain-matrix-bulk button { flex: 1 1 auto; }
     .domain-matrix-search { width: 100%; }
     .activity-stats-row { flex-wrap: wrap; }
+}
+
+@media (max-width: 560px) {
+    .domain-matrix-columns,
+    .domain-matrix-row {
+        grid-template-columns: minmax(0, 1fr) repeat(3, 48px);
+        padding-left: 8px;
+        padding-right: 8px;
+    }
+    .domain-matrix-columns { font-size: 8px; letter-spacing: 0; }
+    .domain-matrix-domain { font-size: 11px; gap: 5px; }
 }
 
 /* Wizard overlay */

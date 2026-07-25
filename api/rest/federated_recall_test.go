@@ -671,6 +671,26 @@ func TestFederatedContactAuthorizationRechecksCurrentLocalACL(t *testing.T) {
 	assert.Empty(t, response.AllowedContacts, "a revoked chain must not remain visible through an MCP cache hit")
 }
 
+func TestCheckDomainAccessTreatsModifyAsMonotonicReadWritePolicy(t *testing.T) {
+	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = badger.CloseBadger() })
+	const callerID = "modify-policy-agent"
+	require.NoError(t, badger.RegisterAgent(callerID, "modifier", "member", "", "test", "", 2))
+	require.NoError(t, badger.SetAgentPermission(
+		callerID,
+		2,
+		`[{"domain":"research","modify":true}]`,
+		"*",
+		"",
+		"",
+	))
+
+	assert.NoError(t, checkDomainAccess(context.Background(), nil, badger, callerID, "research", "read"))
+	assert.NoError(t, checkDomainAccess(context.Background(), nil, badger, callerID, "research", "write"))
+	assert.Error(t, checkDomainAccess(context.Background(), nil, badger, callerID, "finance", "read"))
+}
+
 func TestFederationAvailableMetadataIsNarrowedToCallerSubtree(t *testing.T) {
 	contacts := []federation.PipeContact{{
 		AgentID: "owner", ContactID: "operator-token", Accepting: true,

@@ -2794,8 +2794,31 @@ func (h *DashboardHandler) handleHealth(w http.ResponseWriter, r *http.Request) 
 			chain["chain_id"] = cometStatus.Result.NodeInfo.Network
 			chain["moniker"] = cometStatus.Result.NodeInfo.Moniker
 			chain["voting_power"] = cometStatus.Result.ValidatorInfo.VotingPower
+			// Fallback only: Comet freezes node_info.protocol_version.app at
+			// handshake time, so it stays stale when an in-process fork activates.
+			// /abci_info below is the live application-owned version.
 			chain["app_version"] = cometStatus.Result.NodeInfo.ProtocolVersion.App
 			chain["app_hash"] = cometStatus.Result.SyncInfo.LatestAppHash
+		}
+	}
+	// Read live app-version chain truth from the application. Comet's /status
+	// NodeInfo value does not advance until the process restarts, which made
+	// Overview show v20 after app-v21 had already activated on-chain.
+	abciReq, _ := http.NewRequestWithContext(r.Context(), "GET", cometRPC+"/abci_info", nil)
+	if abciResp, abciErr := cometClient.Do(abciReq); abciErr == nil {
+		defer abciResp.Body.Close()
+		var abciInfo struct {
+			Result struct {
+				Response struct {
+					AppVersion string `json:"app_version"`
+				} `json:"response"`
+			} `json:"result"`
+		}
+		if abciResp.StatusCode >= http.StatusOK && abciResp.StatusCode < http.StatusMultipleChoices {
+			if decErr := json.NewDecoder(abciResp.Body).Decode(&abciInfo); decErr == nil &&
+				abciInfo.Result.Response.AppVersion != "" {
+				chain["app_version"] = abciInfo.Result.Response.AppVersion
+			}
 		}
 	}
 	// Mempool stats — unconfirmed tx count + total bytes. Same dial/timeout

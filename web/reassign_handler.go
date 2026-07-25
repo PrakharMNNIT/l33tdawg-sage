@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -107,15 +108,66 @@ func overrideOwnedDomain(expected *adminOverrideExpectation) string {
 	return expected.OwnedDomain
 }
 
-// domainAccessEntry is one row of the read/write matrix blob.
+// domainAccessEntry is one row of the read/write/modify matrix blob.
 type domainAccessEntry struct {
 	Domain string `json:"domain"`
 	Read   bool   `json:"read"`
 	Write  bool   `json:"write"`
+	Modify bool   `json:"modify,omitempty"`
+}
+
+// normalizeDomainAccessBlob makes the monotonic permission ladder explicit in
+// persisted policy. This keeps REST policy checks and on-chain grant levels in
+// agreement even when a non-UI caller submits only {"modify":true}.
+func normalizeDomainAccessBlob(blob string) (string, error) {
+	if strings.TrimSpace(blob) == "" {
+		return "", nil
+	}
+	var entries []domainAccessEntry
+	if err := json.Unmarshal([]byte(blob), &entries); err != nil {
+		return "", err
+	}
+	for i := range entries {
+		entries[i].Domain = strings.TrimSpace(entries[i].Domain)
+		if entries[i].Modify {
+			entries[i].Write = true
+			entries[i].Read = true
+		} else if entries[i].Write {
+			entries[i].Read = true
+		}
+	}
+	normalized, err := json.Marshal(entries)
+	if err != nil {
+		return "", err
+	}
+	return string(normalized), nil
+}
+
+// validateDomainAccessBlob rejects a level-3 request for shared domains before
+// the advisory matrix is persisted. Shared domains deliberately have no owner
+// grant slot in consensus, so accepting modify:true here would leave the
+// dashboard showing a permission that can never be enforced. isSharedDomain
+// checks both the reserved names and the on-chain shared_domain:<name>
+// sentinel, which the browser cannot know about reliably.
+func (h *DashboardHandler) validateDomainAccessBlob(blob string) error {
+	if strings.TrimSpace(blob) == "" {
+		return nil
+	}
+	var entries []domainAccessEntry
+	if err := json.Unmarshal([]byte(blob), &entries); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		domain := strings.TrimSpace(entry.Domain)
+		if entry.Modify && h.isSharedDomain(domain) {
+			return fmt.Errorf("shared domain %q cannot receive level-3 Modify access", domain)
+		}
+	}
+	return nil
 }
 
 // parseDomainAccessLevels parses the matrix blob into domain -> desired grant
-// level: write=2 (read+write), read-only=1 (read), neither=0 (no access).
+// level: modify=3, write=2 (read+write), read-only=1, neither=0.
 // Empty blob => empty map (no domains configured). Malformed => nil (caller
 // must not touch grants on a parse failure).
 func parseDomainAccessLevels(blob string) map[string]int {
@@ -133,6 +185,8 @@ func parseDomainAccessLevels(blob string) map[string]int {
 			continue
 		}
 		switch {
+		case e.Modify:
+			out[d] = 3
 		case e.Write:
 			out[d] = 2
 		case e.Read:
@@ -211,6 +265,16 @@ func (h *DashboardHandler) reconcileDomainGrants(granteeID, oldBlob, newBlob str
 // the dashboard must not reject a flow consensus explicitly supports.
 func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override *adminOverrideExpectation) grantResult {
 	if h.isSharedDomain(domain) {
+		if level >= 3 {
+			return grantResult{
+				Domain: domain,
+				Action: "skip",
+				Level:  level,
+				OK:     false,
+				Code:   "shared_modify_unsupported",
+				Error:  "shared domains allow read/write without a direct grant, but modify requires an owned domain and a real level-3 grant",
+			}
+		}
 		// Shared domains need no direct grant. The AgentSetPermission tx carrying
 		// DomainAccess is the only policy update required for this matrix row.
 		return grantResult{Domain: domain, Action: "shared", Level: level, OK: true}
@@ -283,7 +347,7 @@ func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override
 			GranterID:           signerID,
 			GranteeID:           granteeID,
 			Domain:              domain,
-			Level:               uint8(level), // #nosec G115 -- level is 1 or 2
+			Level:               uint8(level), // #nosec G115 -- validated matrix level is 1-3
 			ExpectedOwnerID:     overrideOwnerID(override),
 			ExpectedOwnedDomain: overrideOwnedDomain(override),
 		},
@@ -384,8 +448,9 @@ func (h *DashboardHandler) isSharedDomain(domain string) bool {
 // mirrorDomainAccessSet updates an agent's off-chain DomainAccess blob so the
 // Agents access-matrix reflects an on-chain grant change made elsewhere (e.g. a
 // domain reassignment). present=false removes the domain from the blob;
-// present=true sets it to read+write. Best-effort mirror maintenance only - the
-// on-chain grant keys remain authoritative.
+// present=true reflects the level-3 owner grant as read+write+modify.
+// Best-effort mirror maintenance only - the on-chain grant keys remain
+// authoritative.
 func (h *DashboardHandler) mirrorDomainAccessSet(ctx context.Context, agentStore store.AgentStore, agentID, domain string, present bool) {
 	ag, err := agentStore.GetAgent(ctx, agentID)
 	if err != nil || ag == nil {
@@ -403,7 +468,7 @@ func (h *DashboardHandler) mirrorDomainAccessSet(ctx context.Context, agentStore
 		if e.Domain == domain {
 			found = true
 			if present {
-				e.Read, e.Write = true, true
+				e.Read, e.Write, e.Modify = true, true, true
 				out = append(out, e)
 			}
 			continue
@@ -411,7 +476,7 @@ func (h *DashboardHandler) mirrorDomainAccessSet(ctx context.Context, agentStore
 		out = append(out, e)
 	}
 	if present && !found {
-		out = append(out, domainAccessEntry{Domain: domain, Read: true, Write: true})
+		out = append(out, domainAccessEntry{Domain: domain, Read: true, Write: true, Modify: true})
 	}
 	blob, mErr := json.Marshal(out)
 	if mErr != nil {
@@ -421,28 +486,49 @@ func (h *DashboardHandler) mirrorDomainAccessSet(ctx context.Context, agentStore
 	_ = agentStore.UpdateAgent(ctx, ag)
 }
 
-// cancelActiveProposal best-effort cancels the just-created governance proposal
-// (signed as the admin proposer, the only party engine.Cancel allows) so a
-// failure after a successful propose does not leave gov:active set - which would
-// block a retry AND all other governance until the proposal expires. Ignores
-// errors: if the proposal already executed and cleared gov:active, there is
-// nothing to cancel.
-func (h *DashboardHandler) cancelActiveProposal(proposalID string) {
-	if h.AdminSigningKey == nil {
+// cancelActiveProposal best-effort cancels the just-created governance proposal.
+// Before app-v20 the admin proposer signs directly; afterward the validator is
+// the outer proposer/canceller and the admin supplies the request-bound proof.
+// This prevents a failed step from leaving gov:active occupied until expiry.
+// Errors are ignored: if execution already cleared gov:active, there is nothing
+// to cancel.
+func (h *DashboardHandler) cancelActiveProposal(proposalID string, proposerKey ed25519.PrivateKey, postAppV20 bool) {
+	if len(proposerKey) != ed25519.PrivateKeySize {
 		return
 	}
 	cancelTx := &tx.ParsedTx{
 		Type:      tx.TxTypeGovCancel,
 		GovCancel: &tx.GovCancel{ProposalID: proposalID},
 	}
-	_, _, _, _ = h.signAndBroadcastCommit(cancelTx, h.AdminSigningKey)
+	if postAppV20 {
+		validatorID, governanceDomain, err := h.dashboardGovernanceAuthorizationContext()
+		if err != nil {
+			return
+		}
+		proofBody, err := json.Marshal(struct {
+			ValidatorID      string `json:"validator_id"`
+			GovernanceDomain string `json:"governance_domain"`
+			ProposalID       string `json:"proposal_id"`
+		}{
+			ValidatorID:      validatorID,
+			GovernanceDomain: governanceDomain,
+			ProposalID:       proposalID,
+		})
+		if err != nil ||
+			embedDashboardGovernanceProof(cancelTx, h.AdminSigningKey, http.MethodPost, "/v1/governance/cancel", proofBody) != nil {
+			return
+		}
+	}
+	_, _, _, _ = h.signAndBroadcastCommit(cancelTx, proposerKey)
 }
 
 // handleReassignDomainOwnership performs the RBAC domain-ownership transfer
 // A->B on-chain, in strict commit-confirmed order:
 //
-//  1. GovPropose(domain_reassign)         signed as the operator/admin key.
-//     On a single validator this self-passes to Executed in the same block.
+//  1. GovPropose(domain_reassign)         authorized by the operator/admin.
+//     After app-v20 the validator signs the outer tx and the operator supplies
+//     the request-bound proof. On a single validator the proposal self-passes
+//     to Executed in the same block.
 //  2. DomainReassign(domain -> B)         signed as admin; flips owner and
 //     purges ALL grants on the domain.
 //  3. AccessGrant(B, level 3)             signed AS B (the new owner) so B can
@@ -452,6 +538,9 @@ func (h *DashboardHandler) cancelActiveProposal(proposalID string) {
 // commit-confirmed so consensus rejections surface honestly.
 func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.requireDashboardGovernanceOperator(w, r) {
+			return
+		}
 		if h.CometBFTRPC == "" {
 			writeError(w, http.StatusServiceUnavailable, "CometBFT consensus not configured")
 			return
@@ -529,6 +618,7 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 
 		adminKey := h.AdminSigningKey
 		adminID := agentIDForKey(adminKey)
+		postAppV20 := h.AppV20ActiveFn != nil && h.AppV20ActiveFn()
 
 		// Step 1: propose. Payload is the DomainReassign body the executing tx
 		// must reproduce byte-for-byte (parity check).
@@ -542,16 +632,57 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 			fail(http.StatusInternalServerError, "propose", "encode payload: "+mErr.Error())
 			return
 		}
+		reason := fmt.Sprintf("dashboard: reassign domain %q to %s", req.Domain, shortID(req.TargetAgentID))
 		proposeTx := &tx.ParsedTx{
 			Type: tx.TxTypeGovPropose,
 			GovPropose: &tx.GovPropose{
 				Operation: tx.GovOpDomainReassign,
 				TargetID:  req.Domain,
-				Reason:    fmt.Sprintf("dashboard: reassign domain %q to %s", req.Domain, shortID(req.TargetAgentID)),
+				Reason:    reason,
 				Payload:   payload,
 			},
 		}
-		proposeHash, height, _, pErr := h.signAndBroadcastCommit(proposeTx, adminKey)
+		proposerKey := adminKey
+		proposerID := adminID
+		if postAppV20 {
+			validatorID, governanceDomain, contextErr := h.dashboardGovernanceAuthorizationContext()
+			if contextErr != nil {
+				fail(http.StatusServiceUnavailable, "propose", contextErr.Error())
+				return
+			}
+			proofBody, proofBodyErr := json.Marshal(struct {
+				ValidatorID      string `json:"validator_id"`
+				GovernanceDomain string `json:"governance_domain"`
+				Operation        string `json:"operation"`
+				TargetID         string `json:"target_id"`
+				Reason           string `json:"reason"`
+				Payload          string `json:"payload"`
+			}{
+				ValidatorID:      validatorID,
+				GovernanceDomain: governanceDomain,
+				Operation:        "domain_reassign",
+				TargetID:         req.Domain,
+				Reason:           reason,
+				Payload:          base64.StdEncoding.EncodeToString(payload),
+			})
+			if proofBodyErr != nil {
+				fail(http.StatusInternalServerError, "propose", "encode governance authorization: "+proofBodyErr.Error())
+				return
+			}
+			if proofErr := embedDashboardGovernanceProof(
+				proposeTx,
+				adminKey,
+				http.MethodPost,
+				"/v1/governance/propose",
+				proofBody,
+			); proofErr != nil {
+				fail(http.StatusInternalServerError, "propose", "authorize governance transaction: "+proofErr.Error())
+				return
+			}
+			proposerKey = h.SigningKey
+			proposerID = validatorID
+		}
+		proposeHash, height, _, pErr := h.signAndBroadcastCommit(proposeTx, proposerKey)
 		if pErr != nil {
 			fail(http.StatusBadGateway, "propose", pErr.Error())
 			return
@@ -559,9 +690,10 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 		steps = append(steps, reassignStep{Name: "propose", TxHash: proposeHash, OK: true})
 
 		// Step 2: the executing tx references the proposal by its DETERMINISTIC
-		// id (proposerID = admin key's agent id, height = the propose block),
-		// NOT the propose tx hash.
-		proposalID := governance.ComputeProposalID(adminID, height, governance.OpDomainReassign, req.Domain)
+		// id (effective proposer identity + propose block height), NOT the
+		// proposal transaction hash. Before app-v20 the proposer is the admin;
+		// after app-v20 it is the validator carrying the operator proof.
+		proposalID := governance.ComputeProposalID(proposerID, height, governance.OpDomainReassign, req.Domain)
 
 		// Step 3: cast the validator's accept vote. The admin proposer auto-votes
 		// at propose time, but the admin key is NOT in the validator set, so that
@@ -573,7 +705,7 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 		// it is cast and Executed once the vote block commits. Skip when the admin
 		// proposer IS the validator (its auto-vote already counts; a second vote
 		// would be rejected as a duplicate).
-		if adminID != agentIDForKey(h.SigningKey) {
+		if proposerID != agentIDForKey(h.SigningKey) {
 			voteTx := &tx.ParsedTx{
 				Type: tx.TxTypeGovVote,
 				GovVote: &tx.GovVote{
@@ -585,7 +717,7 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 			if vErr != nil {
 				// Clear the dangling active proposal so a retry and other
 				// governance are not blocked until it expires.
-				h.cancelActiveProposal(proposalID)
+				h.cancelActiveProposal(proposalID, proposerKey, postAppV20)
 				fail(http.StatusBadGateway, "vote", vErr.Error())
 				return
 			}
@@ -608,7 +740,7 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 		if rErr != nil {
 			// If the proposal already executed, this is a no-op; otherwise it
 			// clears the dangling active proposal.
-			h.cancelActiveProposal(proposalID)
+			h.cancelActiveProposal(proposalID, proposerKey, postAppV20)
 			fail(http.StatusBadGateway, "reassign", rErr.Error())
 			return
 		}

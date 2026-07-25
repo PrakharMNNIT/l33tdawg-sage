@@ -112,6 +112,10 @@ func handleGetAgent(agentStore store.AgentStore) http.HandlerFunc {
 
 func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.isCEREBRUMOperatorRequest(r) {
+			writeError(w, http.StatusForbidden, "only the authenticated local node operator may create agents")
+			return
+		}
 		var req struct {
 			Name         string `json:"name"`
 			Role         string `json:"role"`
@@ -129,6 +133,16 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 			writeError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
+		normalizedDomainAccess, normalizeErr := normalizeDomainAccessBlob(req.DomainAccess)
+		if normalizeErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid domain access policy")
+			return
+		}
+		if err := h.validateDomainAccessBlob(normalizedDomainAccess); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.DomainAccess = normalizedDomainAccess
 		if req.Name == "" {
 			writeError(w, http.StatusBadRequest, "name is required")
 			return
@@ -311,6 +325,22 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 			writeError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
+		// Permission-bearing fields are node-operator policy, not agent
+		// self-service. A valid agent signature proves only possession of that
+		// agent's key; allowing it through here would make the dashboard's admin
+		// key sign arbitrary self-elevation (clearance/org/domain/visibility)
+		// or let one agent rewrite another agent's policy.
+		sensitivePolicyChange := req.Role != nil ||
+			req.Clearance != nil ||
+			req.OrgID != nil ||
+			req.DeptID != nil ||
+			req.DomainAccess != nil ||
+			req.VisibleAgents != nil ||
+			len(req.AdminOverride) > 0
+		if sensitivePolicyChange && !h.isCEREBRUMOperatorRequest(r) {
+			writeError(w, http.StatusForbidden, "agent permissions may only be changed by the authenticated local node operator")
+			return
+		}
 		overrides := make(map[string]adminOverrideExpectation, len(req.AdminOverride))
 		if len(req.AdminOverride) > 0 {
 			// The genesis key is a human/operator capability. A cryptographically
@@ -327,7 +357,7 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 				expected.Domain = strings.TrimSpace(expected.Domain)
 				expected.OwnerID = strings.TrimSpace(expected.OwnerID)
 				expected.OwnedDomain = strings.TrimSpace(expected.OwnedDomain)
-				if expected.Domain == "" || expected.OwnerID == "" || expected.OwnedDomain == "" || expected.Level < 0 || expected.Level > 2 {
+				if expected.Domain == "" || expected.OwnerID == "" || expected.OwnedDomain == "" || expected.Level < 0 || expected.Level > 3 {
 					writeError(w, http.StatusBadRequest, "invalid administrator override confirmation")
 					return
 				}
@@ -373,7 +403,17 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 			existing.DeptID = *req.DeptID
 		}
 		if req.DomainAccess != nil {
-			existing.DomainAccess = *req.DomainAccess
+			normalizedDomainAccess, normalizeErr := normalizeDomainAccessBlob(*req.DomainAccess)
+			if normalizeErr != nil {
+				writeError(w, http.StatusBadRequest, "invalid domain access policy")
+				return
+			}
+			if err := h.validateDomainAccessBlob(normalizedDomainAccess); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			*req.DomainAccess = normalizedDomainAccess
+			existing.DomainAccess = normalizedDomainAccess
 		}
 		if req.P2PAddress != nil {
 			existing.P2PAddress = *req.P2PAddress

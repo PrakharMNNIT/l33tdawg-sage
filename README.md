@@ -51,6 +51,25 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.13.5
+
+**CEREBRUM now shows the live consensus app version and makes level-3 Modify
+grants explicit.** Overview reads CometBFT's live ABCI application version,
+instead of presenting a stale status-cache value after an upgrade. The domain
+access matrix now has Read, Write, and Modify levels, with a server-enforced
+permission ladder and real owner-signed level-3 grants on Save. Shared domains
+remain read/write-only by design; CEREBRUM rejects Modify before it can display
+an unenforceable permission, including dynamically shared domains.
+
+- **Safer RBAC administration.** Only a local CEREBRUM operator can create an
+  agent or change its security-critical access policy. Signed agents cannot
+  self-elevate through the dashboard's admin/validator credentials.
+- **App-v20 governance compatibility.** Domain reassignment and cancellation
+  use the canonical governance proof shape once the app-v20 gate is active,
+  while older chains retain their legacy transaction compatibility.
+
+SDK 11.13.5.
+
 ## What's New in v11.13.4
 
 **Challenges now respect corroborated knowledge, and clients can inspect the
@@ -725,7 +744,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.4`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.5`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

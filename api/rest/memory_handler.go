@@ -272,6 +272,7 @@ func checkDomainAccess(ctx context.Context, agentStore store.AgentStore, badgerS
 					Domain string `json:"domain"`
 					Read   bool   `json:"read"`
 					Write  bool   `json:"write"`
+					Modify bool   `json:"modify"`
 				}
 				if err := json.Unmarshal([]byte(onChainAgent.DomainAccess), &access); err != nil {
 					return fmt.Errorf("agent domain access policy is invalid")
@@ -279,10 +280,10 @@ func checkDomainAccess(ctx context.Context, agentStore store.AgentStore, badgerS
 				if len(access) > 0 {
 					for _, a := range access {
 						if federation.DomainAllowed([]string{a.Domain}, domain) {
-							if action == "read" && a.Read {
+							if action == "read" && (a.Read || a.Modify) {
 								return nil
 							}
-							if action == "write" && a.Write {
+							if action == "write" && (a.Write || a.Modify) {
 								return nil
 							}
 							return fmt.Errorf("agent does not have %s access to domain '%s'", action, domain)
@@ -323,6 +324,7 @@ func checkDomainAccess(ctx context.Context, agentStore store.AgentStore, badgerS
 		Domain string `json:"domain"`
 		Read   bool   `json:"read"`
 		Write  bool   `json:"write"`
+		Modify bool   `json:"modify"`
 	}
 	if err := json.Unmarshal([]byte(agent.DomainAccess), &access); err != nil {
 		return fmt.Errorf("agent domain access policy is invalid")
@@ -334,10 +336,10 @@ func checkDomainAccess(ctx context.Context, agentStore store.AgentStore, badgerS
 
 	for _, a := range access {
 		if federation.DomainAllowed([]string{a.Domain}, domain) {
-			if action == "read" && a.Read {
+			if action == "read" && (a.Read || a.Modify) {
 				return nil
 			}
-			if action == "write" && a.Write {
+			if action == "write" && (a.Write || a.Modify) {
 				return nil
 			}
 			return fmt.Errorf("agent does not have %s access to domain '%s'", action, domain)

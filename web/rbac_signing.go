@@ -97,18 +97,28 @@ func broadcastTxCommitWeb(cometRPC string, txBytes []byte) (hash string, height 
 	return result.Result.Hash, result.Result.Height, result.Result.TxResult.Log, nil
 }
 
-// signAndBroadcastCommit stamps the nonce for the signing key, embeds that
-// key's agent proof, signs the envelope with the same key, encodes, and
-// broadcasts commit-confirmed. The signing key is BOTH the envelope signer and
-// the embedded agent proof, so ABCI derives one consistent sender identity from
-// it (that is what the admin gate on GovPropose/DomainReassign and the owner
-// gate on AccessGrant/AccessRevoke each check).
+// signAndBroadcastCommit stamps the nonce, adds the legacy same-key proof for
+// non-governance RBAC transactions, signs the envelope, encodes it, and waits
+// for commit. Governance callers either supply a modern request-bound operator
+// proof before calling this helper or intentionally use the proofless direct
+// compatibility lane.
 func (h *DashboardHandler) signAndBroadcastCommit(ptx *tx.ParsedTx, key ed25519.PrivateKey) (hash string, height int64, txLog string, err error) {
 	ptx.Nonce = tx.MonotonicNonce(key)
 	if ptx.Timestamp.IsZero() {
 		ptx.Timestamp = time.Now()
 	}
-	embedDashboardAgentProof(ptx, key)
+	// Direct governance is authorized by the outer operator/validator signature
+	// and deliberately carries no HTTP-agent proof. App-v20+ treats any proof
+	// material on governance as a modern request-bound proof (8-byte request
+	// nonce + canonical request body). The generic legacy dashboard proof lacks
+	// those fields and is therefore correctly rejected. Keep the legacy same-key
+	// proof for non-governance RBAC transactions, whose consensus path still
+	// accepts it.
+	switch ptx.Type {
+	case tx.TxTypeGovPropose, tx.TxTypeGovVote, tx.TxTypeGovCancel:
+	default:
+		embedDashboardAgentProof(ptx, key)
+	}
 	if signErr := tx.SignTx(ptx, key); signErr != nil {
 		return "", 0, "", fmt.Errorf("sign tx: %w", signErr)
 	}

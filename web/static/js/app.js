@@ -32,7 +32,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.13.4';
+const SAGE_VERSION = 'v11.13.5';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -7563,7 +7563,7 @@ const CLEARANCE_LABELS = ['Public', 'Internal', 'Confidential', 'Secret', 'Top S
 // tab renders it read-only (no editable selector) to avoid reporting a "Saved"
 // that never reaches consensus.
 const ROLE_META = {
-    admin: { name: 'Admin', desc: 'Full access. Can manage agents and network settings.' },
+    admin: { name: 'Admin', desc: 'Manages agents and network settings. Modify still requires a domain level-3 grant.' },
     member: { name: 'Member', desc: 'Read/write within allowed domains. Cannot manage agents.' },
     observer: { name: 'Observer', desc: 'Read-only. Can view memories but cannot submit.' },
 };
@@ -7629,7 +7629,13 @@ function DeployProgress({ currentPhase, status, error }) {
 }
 
 // --- Domain Access Matrix ---
-function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disabled, busy = false }) {
+const isReservedSharedDomain = domain => {
+    const value = String(domain || '').trim().toLowerCase();
+    return value === 'general' || value === 'self' || value === 'meta'
+        || value.startsWith('sage-');
+};
+
+function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disabled, busy = false, allowModify = true }) {
     const [filter, setFilter] = useState('');
     const [newDomain, setNewDomain] = useState('');
     // Merge externally-passed domains with any custom-added domains in domainAccess
@@ -7637,10 +7643,18 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
     const filtered = allDomains.filter(d => !filter || d.toLowerCase().includes(filter.toLowerCase()));
 
     const toggle = (domain, field) => {
-        const cur = domainAccess[domain] || { read: false, write: false };
+        const cur = domainAccess[domain] || { read: false, write: false, modify: false };
         const upd = { ...cur, [field]: !cur[field] };
+        if (field === 'modify' && upd.modify) {
+            upd.read = true;
+            upd.write = true;
+        }
         if (field === 'write' && upd.write) upd.read = true;
-        if (field === 'read' && !upd.read) upd.write = false;
+        if (field === 'write' && !upd.write) upd.modify = false;
+        if (field === 'read' && !upd.read) {
+            upd.write = false;
+            upd.modify = false;
+        }
         onChange({ ...domainAccess, [domain]: upd });
     };
     const bulkSet = (field, val) => {
@@ -7649,9 +7663,18 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
         // to every domain while the operator is reviewing six search results
         // can otherwise launch hundreds of unintended on-chain transactions.
         filtered.forEach(d => {
-            upd[d] = { ...(upd[d] || { read: false, write: false }), [field]: val };
+            if (field === 'modify' && isReservedSharedDomain(d)) return;
+            upd[d] = { ...(upd[d] || { read: false, write: false, modify: false }), [field]: val };
+            if (field === 'modify' && val) {
+                upd[d].read = true;
+                upd[d].write = true;
+            }
             if (field === 'write' && val) upd[d].read = true;
-            if (field === 'read' && !val) upd[d].write = false;
+            if (field === 'write' && !val) upd[d].modify = false;
+            if (field === 'read' && !val) {
+                upd[d].write = false;
+                upd[d].modify = false;
+            }
         });
         onChange(upd);
     };
@@ -7659,12 +7682,12 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
         const cleaned = newDomain.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '-');
         if (!cleaned) return;
         // Add with read+write enabled
-        onChange({ ...domainAccess, [cleaned]: { read: true, write: true } });
+        onChange({ ...domainAccess, [cleaned]: { read: true, write: true, modify: false } });
         if (onAddDomain) onAddDomain(cleaned);
         setNewDomain('');
     };
 
-    if (disabled) return html`<div class="domain-matrix"><div class="domain-matrix-empty" style="color:var(--accent);">Admins have full access to all domains.</div></div>`;
+    if (disabled) return html`<div class="domain-matrix"><div class="domain-matrix-empty" style="color:var(--accent);">This role's broad read/write policy is applied at registration. Assign explicit level-3 Modify grants later from Access Controls.</div></div>`;
 
     return html`
         <div class="domain-matrix" aria-busy=${busy}>
@@ -7674,6 +7697,7 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
                 <div class="domain-matrix-bulk">
                     <button disabled=${busy} onClick=${e => { e.stopPropagation(); bulkSet('read', true); }}>Read visible</button>
                     <button disabled=${busy} onClick=${e => { e.stopPropagation(); bulkSet('write', true); }}>Write visible</button>
+                    ${allowModify && html`<button disabled=${busy} onClick=${e => { e.stopPropagation(); bulkSet('modify', true); }}>Modify visible</button>`}
                     <button disabled=${busy} onClick=${e => { e.stopPropagation(); bulkSet('read', false); }}>Revoke visible</button>
                 </div>
             </div>
@@ -7683,13 +7707,14 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
                     onKeyDown=${e => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }} disabled=${busy} />
                 <button class="domain-add-btn" onClick=${handleAddDomain} disabled=${busy || !newDomain.trim()}>+ Add</button>
             </div>
-            <div class="domain-matrix-columns"><span>Domain</span><span style="text-align:center;">Read</span><span style="text-align:center;">Write</span></div>
+            <div class="domain-matrix-columns"><span>Domain</span><span style="text-align:center;">Read</span><span style="text-align:center;">Write</span><span style="text-align:center;">Modify</span></div>
             <div class="domain-matrix-body">
                 ${filtered.length === 0 && allDomains.length > 0 ? html`<div class="domain-matrix-no-results">No domains matching "${filter}"</div>` : ''}
                 ${allDomains.length === 0 ? html`<div class="domain-matrix-empty">No domains yet. Add one above or they'll appear as memories are submitted.</div>` : ''}
                 ${filtered.map(domain => {
-                    const a = domainAccess[domain] || { read: false, write: false };
+                    const a = domainAccess[domain] || { read: false, write: false, modify: false };
                     const isCustom = !domains.includes(domain);
+                    const sharedModifyUnavailable = isReservedSharedDomain(domain);
                     return html`<div class="domain-matrix-row ${isCustom ? 'custom' : ''}" key=${domain}>
                         <div class="domain-matrix-domain">
                             <span class="domain-matrix-dot" style="background:${getDomainColor(domain)};"></span>
@@ -7701,6 +7726,9 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
                         </div>
                         <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()}>
                             <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow write access to ${domain}`} checked=${a.write} disabled=${busy} onChange=${() => toggle(domain, 'write')} /><span class="toggle-slider"></span></label>
+                        </div>
+                        <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()} title=${sharedModifyUnavailable ? 'Shared domains support read/write but cannot carry a level-3 Modify grant.' : ''}>
+                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow modify access to ${domain}`} checked=${a.modify} disabled=${busy || !allowModify || (sharedModifyUnavailable && !a.modify)} onChange=${() => toggle(domain, 'modify')} /><span class="toggle-slider"></span></label>
                         </div>
                     </div>`;
                 })}
@@ -8066,7 +8094,7 @@ function NetworkPage({ sse, accessMode = false }) {
             let parsed = {};
             try {
                 const arr = JSON.parse(agent.domain_access || '[]');
-                arr.forEach(e => { parsed[e.domain] = { read: !!e.read, write: !!e.write }; });
+                arr.forEach(e => { parsed[e.domain] = { read: !!e.read, write: !!e.write, modify: !!e.modify }; });
             } catch (e) {}
             setEditDomainAccess(parsed);
         }
@@ -8075,8 +8103,8 @@ function NetworkPage({ sse, accessMode = false }) {
     const handleAccessSave = useCallback(async (agentId, adminOverride = false) => {
         if (accessSavingRef.current) return;
         const arr = Object.entries(editDomainAccess)
-            .filter(([_, v]) => v.read || v.write)
-            .map(([domain, p]) => ({ domain, read: p.read, write: p.write }));
+            .filter(([_, v]) => v.read || v.write || v.modify)
+            .map(([domain, p]) => ({ domain, read: p.read, write: p.write, modify: p.modify }));
         accessSavingRef.current = true;
         setAccessSaving(true);
         setAccessSaved(false);
@@ -8163,7 +8191,7 @@ function NetworkPage({ sse, accessMode = false }) {
         const ownership = eligible.map(f => {
             const owner = agents.find(a => a.agent_id === f.owner_id);
             const ownerLabel = owner?.name || 'Unknown agent';
-            const levelLabel = f.level === 2 ? 'Read + write' : f.level === 1 ? 'Read' : 'Remove access';
+            const levelLabel = f.level === 3 ? 'Read + write + modify' : f.level === 2 ? 'Read + write' : f.level === 1 ? 'Read' : 'Remove access';
             const ancestor = f.owned_domain && f.owned_domain !== f.domain ? ` (owned through ${f.owned_domain})` : '';
             return `${f.domain} — ${levelLabel}\nOriginal owner: ${ownerLabel} (${f.owner_id})${ancestor}`;
         }).join('\n');
@@ -8753,12 +8781,11 @@ function NetworkPage({ sse, accessMode = false }) {
                                                 Role is set at registration and cannot be changed here.
                                             </div>
 
-                                            <div class="access-section-title">Domain Access <${HelpTip} text="Control which knowledge domains this agent can read from and write to. The domain owner normally authorizes the change. For an agent installed on this computer, the genesis admin can explicitly override access without changing the original owner or memory authorship." /></div>
+                                            <div class="access-section-title">Domain Access <${HelpTip} text="Control which knowledge domains this agent can read, write, or modify. Modify is level 3 and includes permission to challenge/deprecate or reinstate memories. The domain owner normally authorizes the change. For an agent installed on this computer, the genesis admin can explicitly override access without changing the original owner or memory authorship." /></div>
                                             <${DomainAccessMatrix}
                                                 domains=${allDomains}
                                                 domainAccess=${editDomainAccess}
                                                 onChange=${(v) => { setEditDomainAccess(v); setAccessDirty(true); }}
-                                                disabled=${editRole === 'admin'}
                                                 busy=${accessSaving}
                                             />
                                             ${accessFailures.length > 0 && html`
@@ -8767,12 +8794,13 @@ function NetworkPage({ sse, accessMode = false }) {
                                                     ${accessFailures.map(f => {
                                                         const owner = agents.find(a => a.agent_id === f.owner_id);
                                                         const ownerName = owner?.name || 'Unknown agent';
-                                                        const levelLabel = f.level === 2 ? 'Read + write' : f.level === 1 ? 'Read' : 'Remove access';
+                                                        const levelLabel = f.level === 3 ? 'Read + write + modify' : f.level === 2 ? 'Read + write' : f.level === 1 ? 'Read' : 'Remove access';
                                                         const reason = f.code === 'owner_key_unavailable' ? 'The owner key is not available here.'
                                                             : f.code === 'owner_access' ? 'This agent owns the domain; transfer ownership before removing its access.'
                                                             : f.code === 'override_not_active' ? 'Administrator override requires app-v18 activation.'
                                                             : f.code === 'owner_changed' ? 'Ownership changed after confirmation; review the current owner and try again.'
                                                             : f.code === 'admin_key_unavailable' ? 'The genesis admin key is unavailable on this node.'
+                                                            : f.code === 'shared_modify_unsupported' ? 'Shared domains allow read/write, but Modify requires an owned domain and a real level-3 grant.'
                                                             : 'The network did not confirm this change. Try again or check Network health.';
                                                         return html`<div style="font-size:12px;color:var(--text-muted);margin:8px 0;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,.06);">
                                                             <div><strong style="color:var(--text);">${f.domain}</strong> · ${levelLabel}</div>
@@ -9059,8 +9087,8 @@ function AddAgentWizard({ onClose, onCreated }) {
         setError(null);
         try {
             const daArr = Object.entries(domainAccess)
-                .filter(([_, v]) => v.read || v.write)
-                .map(([domain, p]) => ({ domain, read: p.read, write: p.write }));
+                .filter(([_, v]) => v.read || v.write || v.modify)
+                .map(([domain, p]) => ({ domain, read: p.read, write: p.write, modify: p.modify }));
             const res = await createAgent({
                 name, role, avatar, boot_bio: bio,
                 clearance, domain_access: JSON.stringify(daArr),
@@ -9181,7 +9209,9 @@ function AddAgentWizard({ onClose, onCreated }) {
                                 domainAccess=${domainAccess}
                                 onChange=${setDomainAccess}
                                 disabled=${role === 'admin'}
+                                allowModify=${false}
                             />
+                            ${role !== 'admin' && html`<div style="color:var(--text-muted);font-size:11px;margin-top:5px;">Level-3 Modify grants can be assigned after this agent is registered, under Access Controls.</div>`}
                         </div>
                         <div class="wizard-field">
                             <label>Clearance Level <${HelpTip} text="Determines what sensitivity level of memories this agent can access. Higher clearance = access to more classified knowledge." /></label>
@@ -9225,7 +9255,7 @@ function AddAgentWizard({ onClose, onCreated }) {
                             <div class="summary-row"><span class="label">Role</span><span class="value" style="text-transform:capitalize;">${role}</span></div>
                             <div class="summary-row"><span class="label">Avatar</span><span class="value">${avatar}</span></div>
                             <div class="summary-row"><span class="label">Clearance</span><span class="value">${CLEARANCE_LABELS[clearance]}</span></div>
-                            <div class="summary-row"><span class="label">Domains</span><span class="value">${role === 'admin' ? 'All (admin)' : (() => { const c = Object.values(domainAccess).filter(v => v.read || v.write).length; return c > 0 ? c + ' domain' + (c !== 1 ? 's' : '') : 'None'; })()}</span></div>
+                            <div class="summary-row"><span class="label">Domains</span><span class="value">${role === 'admin' ? 'All (admin)' : (() => { const c = Object.values(domainAccess).filter(v => v.read || v.write || v.modify).length; return c > 0 ? c + ' domain' + (c !== 1 ? 's' : '') : 'None'; })()}</span></div>
                             <div class="summary-row"><span class="label">Connect</span><span class="value">${connectMethod === 'local' ? 'Local Project' : connectMethod === 'bundle' ? 'Bundle Download' : 'LAN Pairing'}</span></div>
                         </div>
 

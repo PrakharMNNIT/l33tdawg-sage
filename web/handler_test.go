@@ -1558,6 +1558,7 @@ func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 	require.NoError(t, err)
 	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-permission-1", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1566,6 +1567,95 @@ func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 	require.NotNil(t, captured.AgentSetPermission)
 	assert.Equal(t, []byte(adminPub), captured.AgentPubKey, "permission tx must carry genesis admin proof")
 	assert.NotEqual(t, validatorKey.Public(), captured.AgentPubKey, "validator key is not the RBAC admin")
+}
+
+func TestHandleUpdateAgent_PermissionsRejectSignedAgentWithoutOverride(t *testing.T) {
+	h, s := newTestHandler(t)
+	r := testRouter(h)
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: "agent-policy-target", Name: "Target", Role: "member", Status: "active", Clearance: 1, CreatedAt: time.Now().UTC(),
+	}))
+	_, callerKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	body, err := json.Marshal(map[string]any{
+		"clearance":     4,
+		"domain_access": `[{"domain":"everything","read":true,"write":true}]`,
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-policy-target", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://localhost:8080")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Host = "localhost:8080"
+	signAgentRequest(t, req, callerKey, body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	after, err := s.GetAgent(context.Background(), "agent-policy-target")
+	require.NoError(t, err)
+	assert.Equal(t, 1, after.Clearance)
+	assert.Empty(t, after.DomainAccess, "rejected signed-agent update must not mutate local policy")
+}
+
+func TestHandleCreateAgentRejectsSignedAgentWithoutSideEffects(t *testing.T) {
+	h, s := newTestHandler(t)
+	r := testRouter(h)
+	_, callerKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	body, err := json.Marshal(map[string]any{
+		"name":          "self-elevated-agent",
+		"role":          "member",
+		"clearance":     4,
+		"domain_access": `[{"domain":"*","read":true,"write":true,"modify":true}]`,
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/network/agents", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://localhost:8080")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Host = "localhost:8080"
+	signAgentRequest(t, req, callerKey, body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	agents, err := s.ListAgents(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, agents, "rejected create must not persist or mint an agent")
+}
+
+func TestDomainAccessRejectsModifyForDynamicallySharedDomain(t *testing.T) {
+	h, s := newTestHandler(t)
+	shared := newGrantTestBadger(t)
+	require.NoError(t, shared.SetState("shared_domain:community-updates", []byte{1}))
+	h.BadgerStore = shared
+	r := testRouter(h)
+
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: "dynamic-shared-target", Name: "Target", Role: "member", Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+	body := []byte(`{"domain_access":"[{\"domain\":\"community-updates\",\"read\":true,\"write\":true,\"modify\":true}]"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/dynamic-shared-target", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(req)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	agent, err := s.GetAgent(context.Background(), "dynamic-shared-target")
+	require.NoError(t, err)
+	assert.Empty(t, agent.DomainAccess, "rejected level-3 shared request must not be persisted")
+
+	createReq := httptest.NewRequest(http.MethodPost, "/v1/dashboard/network/agents", bytes.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(createReq)
+	createW := httptest.NewRecorder()
+	r.ServeHTTP(createW, createReq)
+	assert.Equal(t, http.StatusBadRequest, createW.Code, createW.Body.String())
+	agents, err := s.ListAgents(context.Background())
+	require.NoError(t, err)
+	assert.Len(t, agents, 1, "rejected create must not persist an agent")
 }
 
 func TestHandleUpdateAgent_AdminOverrideRejectsSignedAgent(t *testing.T) {

@@ -1,8 +1,11 @@
 package web
 
 import (
+	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/l33tdawg/sage/internal/governance"
 	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 )
@@ -73,7 +77,7 @@ func TestGrantAs_UnownedDomainUsesGenesisAdmin(t *testing.T) {
 	assert.Equal(t, uint8(1), captured.AccessGrant.Level)
 }
 
-func TestGrantAs_ChildDomainUsesOwningAncestor(t *testing.T) {
+func TestGrantAs_ChildDomainUsesOwningAncestorForModifyLevel(t *testing.T) {
 	bs := newGrantTestBadger(t)
 	_, ownerKey, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
@@ -92,7 +96,7 @@ func TestGrantAs_ChildDomainUsesOwningAncestor(t *testing.T) {
 			return ownerKey, id == ownerID
 		},
 	}
-	result := h.grantAs("research.eurorack", "agent-b", 2, nil)
+	result := h.grantAs("research.eurorack", "agent-b", 3, nil)
 
 	require.True(t, result.OK, result.Error)
 	assert.Equal(t, int32(1), calls.Load())
@@ -100,6 +104,7 @@ func TestGrantAs_ChildDomainUsesOwningAncestor(t *testing.T) {
 	require.NotNil(t, captured.AccessGrant)
 	assert.Equal(t, ownerID, captured.AccessGrant.GranterID)
 	assert.Equal(t, "research.eurorack", captured.AccessGrant.Domain)
+	assert.Equal(t, uint8(3), captured.AccessGrant.Level)
 }
 
 func TestGrantAs_SharedDomainNeedsNoOwnerTransaction(t *testing.T) {
@@ -112,6 +117,18 @@ func TestGrantAs_SharedDomainNeedsNoOwnerTransaction(t *testing.T) {
 	assert.True(t, result.OK)
 	assert.Equal(t, "shared", result.Action)
 	assert.Zero(t, calls.Load())
+}
+
+func TestGrantAs_SharedDomainRejectsFakeModifySuccess(t *testing.T) {
+	bs := newGrantTestBadger(t)
+	h := &DashboardHandler{BadgerStore: bs, CometBFTRPC: "http://unused.invalid"}
+
+	for _, domain := range []string{"general", "sage-project"} {
+		result := h.grantAs(domain, "agent-b", 3, nil)
+		assert.False(t, result.OK, domain)
+		assert.Equal(t, "shared_modify_unsupported", result.Code, domain)
+		assert.Equal(t, 3, result.Level, domain)
+	}
 }
 
 func TestGrantAs_UnownedDomainWithoutAdminKeyIsActionable(t *testing.T) {
@@ -245,8 +262,222 @@ func TestReconcileDomainGrants_OverrideOnlyDomainRetriesFailedRevoke(t *testing.
 	assert.Equal(t, "research.retry", captured.AccessRevoke.ExpectedOwnedDomain)
 }
 
-func TestParseDomainAccessLevels_WriteMapsToConsensusLevelTwo(t *testing.T) {
-	levels := parseDomainAccessLevels(`[{"domain":"research.write","read":true,"write":true},{"domain":"research.read","read":true,"write":false}]`)
+func TestParseDomainAccessLevelsMapsReadWriteAndModifyTiers(t *testing.T) {
+	levels := parseDomainAccessLevels(`[{"domain":"research.modify","read":true,"write":true,"modify":true},{"domain":"research.write","read":true,"write":true},{"domain":"research.read","read":true,"write":false}]`)
+	assert.Equal(t, 3, levels["research.modify"])
 	assert.Equal(t, 2, levels["research.write"])
 	assert.Equal(t, 1, levels["research.read"])
+}
+
+func TestNormalizeDomainAccessBlobMakesPermissionLadderExplicit(t *testing.T) {
+	normalized, err := normalizeDomainAccessBlob(
+		`[{"domain":" research.modify ","read":false,"write":false,"modify":true},{"domain":"research.write","read":false,"write":true}]`,
+	)
+	require.NoError(t, err)
+
+	var entries []domainAccessEntry
+	require.NoError(t, json.Unmarshal([]byte(normalized), &entries))
+	require.Len(t, entries, 2)
+	assert.Equal(t, domainAccessEntry{
+		Domain: "research.modify",
+		Read:   true,
+		Write:  true,
+		Modify: true,
+	}, entries[0])
+	assert.Equal(t, domainAccessEntry{
+		Domain: "research.write",
+		Read:   true,
+		Write:  true,
+	}, entries[1])
+}
+
+func TestReassignDomainOwnershipRejectsAuthenticatedNonOperator(t *testing.T) {
+	h, agentStore := newTestHandler(t)
+	var broadcasts atomic.Int32
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		broadcasts.Add(1)
+		http.Error(w, "must not broadcast", http.StatusInternalServerError)
+	}))
+	t.Cleanup(rpc.Close)
+	h.CometBFTRPC = rpc.URL
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/dashboard/network/reassign-domain-ownership",
+		bytes.NewReader([]byte(`{"source_agent_id":"source","target_agent_id":"target","domain":"quiettype-pages"}`)),
+	)
+	markLocalDashboardRequest(req)
+	req = req.WithContext(context.WithValue(req.Context(), verifiedDashboardAgentKey{}, "signed-member-agent"))
+	resp := httptest.NewRecorder()
+
+	h.handleReassignDomainOwnership(agentStore)(resp, req)
+
+	assert.Equal(t, http.StatusForbidden, resp.Code, resp.Body.String())
+	assert.Zero(t, broadcasts.Load())
+}
+
+func TestReassignDomainOwnershipRejectsUnauthenticatedRequest(t *testing.T) {
+	h, agentStore := newTestHandler(t)
+	var broadcasts atomic.Int32
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		broadcasts.Add(1)
+		http.Error(w, "must not broadcast", http.StatusInternalServerError)
+	}))
+	t.Cleanup(rpc.Close)
+	h.CometBFTRPC = rpc.URL
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/dashboard/network/reassign-domain-ownership",
+		bytes.NewReader([]byte(`{"source_agent_id":"source","target_agent_id":"target","domain":"quiettype-pages"}`)),
+	)
+	resp := httptest.NewRecorder()
+
+	h.handleReassignDomainOwnership(agentStore)(resp, req)
+
+	assert.Equal(t, http.StatusForbidden, resp.Code, resp.Body.String())
+	assert.Zero(t, broadcasts.Load())
+}
+
+func TestReassignDomainOwnershipPostAppV20UsesChainBoundOperatorProof(t *testing.T) {
+	h, agentStore := newTestHandler(t)
+	badgerStore := newGrantTestBadger(t)
+	_, adminKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	_, validatorKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	_, targetKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	sourceID := agentIDForKey(adminKey)
+	validatorID := agentIDForKey(validatorKey)
+	targetID := agentIDForKey(targetKey)
+	require.NoError(t, badgerStore.RegisterDomain("quiettype-pages", sourceID, "", 1))
+	require.NoError(t, agentStore.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: targetID,
+		Name:    "quiettype-agent",
+		Role:    "member",
+		Status:  "active",
+	}))
+
+	var captured []*tx.ParsedTx
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
+		encoded, decodeErr := hex.DecodeString(raw)
+		require.NoError(t, decodeErr)
+		parsed, decodeErr := tx.DecodeTx(encoded)
+		require.NoError(t, decodeErr)
+		captured = append(captured, parsed)
+		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0,"log":"purged 1 grants"},"hash":"ABC123","height":"42"}}`)
+	}))
+	t.Cleanup(rpc.Close)
+
+	h.BadgerStore = badgerStore
+	h.CometBFTRPC = rpc.URL
+	h.AdminSigningKey = adminKey
+	h.SigningKey = validatorKey
+	h.AppV20ActiveFn = func() bool { return true }
+	h.GovernanceDomainFn = func() string { return dashboardTestGovernanceDomain }
+	h.ValidatorCountFn = func() int { return 1 }
+	h.ResolveAgentKeyFn = func(id string) (ed25519.PrivateKey, bool) {
+		if id == targetID {
+			return targetKey, true
+		}
+		return nil, false
+	}
+
+	body := []byte(fmt.Sprintf(
+		`{"source_agent_id":%q,"target_agent_id":%q,"domain":"quiettype-pages"}`,
+		sourceID,
+		targetID,
+	))
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/dashboard/network/reassign-domain-ownership",
+		bytes.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(req)
+	resp := httptest.NewRecorder()
+
+	h.handleReassignDomainOwnership(agentStore)(resp, req)
+
+	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &result))
+	assert.Equal(t, "ok", result["status"])
+	require.Len(t, captured, 3, "single-validator post-app-v20 propose auto-votes; only propose, reassign, and grant broadcast")
+
+	propose := captured[0]
+	require.Equal(t, tx.TxTypeGovPropose, propose.Type)
+	assert.Equal(t, []byte(validatorKey.Public().(ed25519.PublicKey)), []byte(propose.PublicKey))
+	assert.Equal(t, []byte(adminKey.Public().(ed25519.PublicKey)), []byte(propose.AgentPubKey))
+	assert.Len(t, propose.AgentNonce, 8)
+	assert.True(t, bytes.HasPrefix(propose.AgentRequest, []byte("POST /v1/governance/propose\n")))
+	var proofBody map[string]any
+	require.NoError(t, json.Unmarshal(
+		propose.AgentRequest[len("POST /v1/governance/propose\n"):],
+		&proofBody,
+	))
+	assert.Equal(t, validatorID, proofBody["validator_id"])
+	assert.Equal(t, dashboardTestGovernanceDomain, proofBody["governance_domain"])
+	assert.Equal(t, "domain_reassign", proofBody["operation"])
+	assert.Equal(t, "quiettype-pages", proofBody["target_id"])
+
+	reassign := captured[1]
+	require.Equal(t, tx.TxTypeDomainReassign, reassign.Type)
+	assert.Equal(t, []byte(adminKey.Public().(ed25519.PublicKey)), []byte(reassign.PublicKey))
+	assert.Equal(
+		t,
+		governance.ComputeProposalID(validatorID, 42, governance.OpDomainReassign, "quiettype-pages"),
+		reassign.DomainReassign.ProposalID,
+	)
+
+	grant := captured[2]
+	require.Equal(t, tx.TxTypeAccessGrant, grant.Type)
+	assert.Equal(t, []byte(targetKey.Public().(ed25519.PublicKey)), []byte(grant.PublicKey))
+	assert.Equal(t, targetID, grant.AccessGrant.GranteeID)
+	assert.Equal(t, uint8(3), grant.AccessGrant.Level)
+}
+
+func TestCancelActiveProposalPostAppV20UsesChainBoundOperatorProof(t *testing.T) {
+	_, adminKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	_, validatorKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	validatorID := agentIDForKey(validatorKey)
+
+	var captured *tx.ParsedTx
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
+		encoded, decodeErr := hex.DecodeString(raw)
+		require.NoError(t, decodeErr)
+		captured, decodeErr = tx.DecodeTx(encoded)
+		require.NoError(t, decodeErr)
+		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ABC123","height":"43"}}`)
+	}))
+	t.Cleanup(rpc.Close)
+
+	h := &DashboardHandler{
+		AdminSigningKey:    adminKey,
+		SigningKey:         validatorKey,
+		CometBFTRPC:        rpc.URL,
+		GovernanceDomainFn: func() string { return dashboardTestGovernanceDomain },
+	}
+	h.cancelActiveProposal("proposal-123", validatorKey, true)
+
+	require.NotNil(t, captured)
+	require.Equal(t, tx.TxTypeGovCancel, captured.Type)
+	assert.Equal(t, []byte(validatorKey.Public().(ed25519.PublicKey)), []byte(captured.PublicKey))
+	assert.Equal(t, []byte(adminKey.Public().(ed25519.PublicKey)), []byte(captured.AgentPubKey))
+	assert.Len(t, captured.AgentNonce, 8)
+	assert.True(t, bytes.HasPrefix(captured.AgentRequest, []byte("POST /v1/governance/cancel\n")))
+
+	var proofBody map[string]any
+	require.NoError(t, json.Unmarshal(
+		captured.AgentRequest[len("POST /v1/governance/cancel\n"):],
+		&proofBody,
+	))
+	assert.Equal(t, validatorID, proofBody["validator_id"])
+	assert.Equal(t, dashboardTestGovernanceDomain, proofBody["governance_domain"])
+	assert.Equal(t, "proposal-123", proofBody["proposal_id"])
 }
