@@ -616,7 +616,7 @@ func TestChallengeV21PrefixScansKeepColonTuplesIsolated(t *testing.T) {
 		memoryID:       challengeV21AgentA,
 		nestedMemoryID: challengeV21AgentB,
 	} {
-		_, err := bs.OpenChallengeV21(OpenChallengeV21Input{
+		_, openErr := bs.OpenChallengeV21(OpenChallengeV21Input{
 			MemoryID:            id,
 			OpenerID:            opener,
 			Domain:              "sage.colon",
@@ -628,7 +628,7 @@ func TestChallengeV21PrefixScansKeepColonTuplesIsolated(t *testing.T) {
 			Electorate:          []string{opener},
 			EvidenceHash:        challengeV21TestHash("evidence-" + id),
 		})
-		require.NoError(t, err)
+		require.NoError(t, openErr)
 	}
 	voters, truncated, err := bs.ListChallengeVotersV21UpTo(memoryID, 10)
 	require.NoError(t, err)

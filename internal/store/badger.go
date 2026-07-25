@@ -3224,8 +3224,8 @@ func canonicalCorroboratorCountV21InTxn(txn *badger.Txn, memoryID string, electo
 // first limit identities in canonical key order; callers may use that stable
 // prefix as a bounded committee but must not describe it as the complete set.
 func (s *BadgerStore) ListCanonicalCorroboratorsV21UpTo(memoryID, excludedAgent string, limit int) (agents []string, overLimit bool, err error) {
-	if err := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); err != nil {
-		return nil, false, err
+	if validationErr := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); validationErr != nil {
+		return nil, false, validationErr
 	}
 	if limit <= 0 {
 		return nil, false, errors.New("canonical corroborator limit must be positive")
@@ -3688,8 +3688,8 @@ func (s *BadgerStore) GetChallengeVoteV21(memoryID, agentID string) (*ChallengeV
 // bounded exactly like canonical corroborator listing; overLimit means callers
 // must not treat the returned slice as complete.
 func (s *BadgerStore) ListChallengeVotersV21UpTo(memoryID string, limit int) (agents []string, overLimit bool, err error) {
-	if err := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); err != nil {
-		return nil, false, err
+	if validationErr := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); validationErr != nil {
+		return nil, false, validationErr
 	}
 	if limit <= 0 {
 		return nil, false, errors.New("challenge voter limit must be positive")

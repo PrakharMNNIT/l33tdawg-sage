@@ -61,9 +61,9 @@ func (app *SageApp) RebuildScopedProjection(ctx context.Context) (int, error) {
 			if !ok {
 				return errors.New("off-chain store cannot persist evidence projection completeness")
 			}
-			existed, err := provenance.HasMemoryProjection(ctx, content.MemoryID)
-			if err != nil {
-				return fmt.Errorf("check existing projection: %w", err)
+			existed, projectionErr := provenance.HasMemoryProjection(ctx, content.MemoryID)
+			if projectionErr != nil {
+				return fmt.Errorf("check existing projection: %w", projectionErr)
 			}
 			if err := projection.InsertMemory(ctx, record); err != nil {
 				return fmt.Errorf("insert projection: %w", err)

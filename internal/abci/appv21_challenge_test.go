@@ -196,8 +196,8 @@ func TestAppV21EightCorroboratorsRequireNineDistinctChallengers(t *testing.T) {
 	for i := 0; i < len(corroborators)-1; i++ {
 		result = app.processMemoryChallenge(makeMemoryChallengeTx(t, corroborators[i], memoryID, "endorse"), int64(11+i), time.Unix(int64(101+i), 0))
 		require.Zero(t, result.Code, result.Log)
-		_, status, err := app.badgerStore.GetMemoryHash(memoryID)
-		require.NoError(t, err)
+		_, status, getErr := app.badgerStore.GetMemoryHash(memoryID)
+		require.NoError(t, getErr)
 		assert.Equal(t, string(memory.StatusChallenged), status)
 	}
 	result = app.processMemoryChallenge(makeMemoryChallengeTx(t, corroborators[7], memoryID, "decisive"), 18, time.Unix(108, 0))
