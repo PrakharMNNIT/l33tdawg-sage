@@ -13121,7 +13121,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                 fedPermissionsGet(chain, false),
                 fedSyncGet(chain),
                 fedSyncStatus(chain),
-				fedPipeContactsGet(chain, false),
+				fedPipeContactsGet(chain, true),
 				fetchAgents(),
             ]);
             if (!live) return;
@@ -13486,16 +13486,45 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 		const selectedName = selectedAgent ? fedFriendlyLocalAgentLabel(selectedAgent).split(' · ')[0] : 'That agent';
 		setPipeContactLookupBusy(true); setPipeContactLookupStatus(`Checking ${selectedName}'s shared-domain access…`); setPipeContactErr('');
 		try {
-			const result = await fedPipeContactsGet(chain, false, agentID);
+			let result = await fedPipeContactsGet(chain, false, agentID);
 			if (lookupGeneration !== pinnedLocalAgentGenerationRef.current) {
 				setPipeContactLookupStatus('Agent access changed while SAGE was checking. Choose the agent again.');
 				return;
 			}
-			const targeted = normalizeFedPipeContactGrant(result && result.local_contacts);
+			let targeted = normalizeFedPipeContactGrant(result && result.local_contacts);
 			if (!targeted.contacts.some(contact => contact.agent_id === agentID)) {
-				setPipeContactLookupStatus('');
-				setPipeContactErr(`${selectedName} cannot receive work requests through this connection yet. Share a domain and grant that agent access to it, then try again.`);
-				return;
+				const ownedDomains = normalizeFedDomainList(result && result.agent_owned_shareable_domains);
+				if (ownedDomains.length === 0) {
+					setPipeContactLookupStatus('');
+					setPipeContactErr(`${selectedName} does not own a local domain that this connection can share.`);
+					return;
+				}
+				if (!await showConfirmation(
+					`Sharing ${selectedName} will add ${ownedDomains.length} owned ${ownedDomains.length === 1 ? 'domain' : 'domains'} to this connection.${dirty ? ' Your pending domain changes will be saved too.' : ''}`,
+					{ title: 'Share agent and domains?', confirmLabel: 'Share agent', tone: 'primary' }
+				)) return;
+				setPipeContactLookupStatus(`Sharing ${ownedDomains.length} ${ownedDomains.length === 1 ? 'owned domain' : 'owned domains'} for ${selectedName}…`);
+				const nextPermissions = normalizeFedPermissionList([
+					...fedPermissionSnapshot(draft),
+					...ownedDomains.map(domain => ({ domain, read: true })),
+				]);
+				const response = await fedPermissionsSet(chain, nextPermissions);
+				const updatedPermissions = normalizeFedPermissionList(
+					Array.isArray(response && response.local_permissions) ? response.local_permissions : nextPermissions
+				);
+				setSaved(updatedPermissions); setDraft(updatedPermissions);
+				setAlignmentPending(false);
+				if (Array.isArray(response && response.remote_permissions)) setRemote(normalizeFedPermissionList(response.remote_permissions));
+				if (Object.prototype.hasOwnProperty.call(response || {}, 'remote_known')) setRemoteKnown(response.remote_known === true);
+				if (Object.prototype.hasOwnProperty.call(response || {}, 'remote_paused')) setRemotePaused(response.remote_paused === true);
+				result = await fedPipeContactsGet(chain, false, agentID);
+				targeted = normalizeFedPipeContactGrant(result && result.local_contacts);
+				if (!targeted.contacts.some(contact => contact.agent_id === agentID)) {
+					setPipeContactLookupStatus('');
+					setPipeContactErr(`${selectedName}'s domains were shared, but its contact did not become available. Refresh the connection and try again.`);
+					return;
+				}
+				showToast(`${selectedName} and ${ownedDomains.length} ${ownedDomains.length === 1 ? 'owned domain' : 'owned domains'} are now shared with ${peerName}`, 'success');
 			}
 			// Accepted/recent contacts naturally enter the bounded base sample.
 			// Retain only a few newly selected out-of-sample contacts meanwhile,

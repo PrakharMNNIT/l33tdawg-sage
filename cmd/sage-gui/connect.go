@@ -146,6 +146,10 @@ func claudeDesktopConfigPath() (string, error) {
 // Returns "created" when the file did not previously exist, "merged" when an
 // existing config was updated.
 func mergeMCPServerConfig(path, execPath, sageHome, provider string) (string, error) {
+	return mergeMCPServerConfigWithIdentity(path, execPath, sageHome, provider, "")
+}
+
+func mergeMCPServerConfigWithIdentity(path, execPath, sageHome, provider, identityOverride string) (string, error) {
 	action := "created"
 	config := map[string]any{}
 
@@ -164,6 +168,10 @@ func mergeMCPServerConfig(path, execPath, sageHome, provider string) (string, er
 	if !ok {
 		servers = map[string]any{}
 	}
+	identityPath := configuredJSONMCPIdentityPath(config, path, sageHome, provider)
+	if strings.TrimSpace(identityOverride) != "" {
+		identityPath = filepath.Clean(expandTilde(identityOverride))
+	}
 	servers["sage"] = map[string]any{
 		"command": execPath,
 		"args":    []string{"mcp"},
@@ -171,7 +179,7 @@ func mergeMCPServerConfig(path, execPath, sageHome, provider string) (string, er
 			"SAGE_HOME":          sageHome,
 			"SAGE_PROVIDER":      provider,
 			"SAGE_API_URL":       mcpConfigAPIURL,
-			"SAGE_IDENTITY_PATH": mcpIdentityPath(path, sageHome, provider),
+			"SAGE_IDENTITY_PATH": identityPath,
 			"SAGE_PROJECT":       mcpProjectName(path, sageHome, provider),
 		},
 	}
@@ -195,9 +203,37 @@ func mergeMCPServerConfig(path, execPath, sageHome, provider string) (string, er
 func mcpIdentityPath(configPath, sageHome, provider string) string {
 	projectDir := mcpProjectDir(configPath, sageHome, provider)
 	if projectDir != "" {
-		return filepath.Join(projectAgentDir(sageHome, projectDir), "agent.key")
+		return filepath.Join(providerProjectAgentDir(sageHome, projectDir, provider), "agent.key")
 	}
 	return filepath.Join(sageHome, "agents", "global-"+sanitizeDirName(provider), "agent.key")
+}
+
+// configuredJSONMCPIdentityPath keeps a caller's explicit key path stable
+// during config self-heal. Older configs without one use the legacy project
+// key when it exists, then new provider-specific paths on fresh installs.
+func configuredJSONMCPIdentityPath(config map[string]any, configPath, sageHome, provider string) string {
+	if servers, ok := config["mcpServers"].(map[string]any); ok {
+		if sage, ok := servers["sage"].(map[string]any); ok {
+			if env, ok := sage["env"].(map[string]any); ok {
+				if path, ok := env["SAGE_IDENTITY_PATH"].(string); ok {
+					return existingIdentityOrDefault(path, sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+				}
+			}
+		}
+	}
+	return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+}
+
+func mcpConfigIdentityPath(configPath, sageHome, provider string) string {
+	data, err := readBoundedConfig(configPath, 1<<20)
+	if err != nil {
+		return mcpIdentityPath(configPath, sageHome, provider)
+	}
+	var config map[string]any
+	if json.Unmarshal(data, &config) != nil {
+		return mcpIdentityPath(configPath, sageHome, provider)
+	}
+	return configuredJSONMCPIdentityPath(config, configPath, sageHome, provider)
 }
 
 func mcpProjectDir(configPath, sageHome, provider string) string {

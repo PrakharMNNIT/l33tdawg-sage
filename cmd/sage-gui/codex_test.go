@@ -65,6 +65,10 @@ func TestRunCodexInstall_WritesAllArtifacts(t *testing.T) {
 		data, readErr := os.ReadFile(path)
 		require.NoError(t, readErr, "hook script %s must exist", name)
 		assert.NotContains(t, string(data), "__SAGE_GUI_BIN__", "script %s placeholder must be substituted", name)
+		if hookUsesDirectWriteIdentity(name) {
+			assert.Contains(t, string(data), `SAGE_PROVIDER="codex"`, "script %s must use the Codex identity", name)
+			assert.Contains(t, string(data), codexConfigIdentityPath(filepath.Join(projectDir, ".codex", "config.toml"), sageHome, "codex"), "script %s must use the configured identity", name)
+		}
 	}
 
 	// AGENTS.md

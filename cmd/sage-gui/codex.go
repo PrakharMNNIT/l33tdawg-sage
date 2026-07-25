@@ -96,6 +96,7 @@ func installCodexConfig(projectDir, sageHome, execPath string) ([]web.ConnectFil
 		return files, cfgErr
 	}
 	files = append(files, web.ConnectFile{Path: configPath, Action: configAction})
+	identityPath := codexConfigIdentityPath(configPath, sageHome, "codex")
 
 	// 2. .codex/hooks.json — hook lifecycle wiring. Codex doesn't expand env
 	// vars in hook commands, so we bake the absolute hook dir path in.
@@ -110,7 +111,7 @@ func installCodexConfig(projectDir, sageHome, execPath string) ([]web.ConnectFil
 
 	// 3. .codex/hooks/sage-*.sh — same templates as Claude side.
 	for name, tpl := range hookScriptSet() {
-		content := strings.ReplaceAll(tpl, "__SAGE_GUI_BIN__", execPath)
+		content := renderHookScript(tpl, execPath, "codex", identityPath)
 		path := filepath.Join(hookDir, name)
 		if writeErr := safeWriteFile(path, []byte(content), 0755); writeErr != nil { //nolint:gosec // hook scripts must be executable
 			return files, fmt.Errorf("write %s: %w", name, writeErr)
@@ -137,6 +138,10 @@ func installCodexConfig(projectDir, sageHome, execPath string) ([]web.ConnectFil
 // Codex's documented schema (mcp_servers.<name> table with command, args,
 // and env subtable).
 func codexSageConfigBlock(configPath, binPath, sageHome, provider string) string {
+	return codexSageConfigBlockWithIdentity(configPath, binPath, sageHome, provider, mcpIdentityPath(configPath, sageHome, provider))
+}
+
+func codexSageConfigBlockWithIdentity(configPath, binPath, sageHome, provider, identityPath string) string {
 	return fmt.Sprintf(`[mcp_servers.sage]
 command = %s
 args = ["mcp"]
@@ -147,7 +152,7 @@ SAGE_PROVIDER = %s
 SAGE_API_URL = %s
 SAGE_IDENTITY_PATH = %s
 SAGE_PROJECT = %s
-`, tomlString(binPath), tomlString(sageHome), tomlString(provider), tomlString(mcpConfigAPIURL), tomlString(mcpIdentityPath(configPath, sageHome, provider)), tomlString(mcpProjectName(configPath, sageHome, provider)))
+`, tomlString(binPath), tomlString(sageHome), tomlString(provider), tomlString(mcpConfigAPIURL), tomlString(identityPath), tomlString(mcpProjectName(configPath, sageHome, provider)))
 }
 
 func tomlString(value string) string {
@@ -174,11 +179,10 @@ func mergeCodexConfig(path, binPath, sageHome string) (string, error) {
 }
 
 func mergeCodexConfigForProvider(path, binPath, sageHome, provider string) (string, error) {
-	sageBlock := codexSageConfigBlock(path, binPath, sageHome, provider)
-
 	existing, err := readBoundedConfig(path, 1<<20)
 	if err != nil {
 		if os.IsNotExist(err) {
+			sageBlock := codexSageConfigBlock(path, binPath, sageHome, provider)
 			if writeErr := safeWriteFile(path, []byte(sageBlock), 0600); writeErr != nil {
 				return "", fmt.Errorf("write codex config: %w", writeErr)
 			}
@@ -190,6 +194,7 @@ func mergeCodexConfigForProvider(path, binPath, sageHome, provider string) (stri
 	if parseErr := toml.Unmarshal(existing, &parsed); parseErr != nil {
 		return "", fmt.Errorf("existing Codex config is invalid TOML; fix it before connecting SAGE: %w", parseErr)
 	}
+	sageBlock := codexSageConfigBlockWithIdentity(path, binPath, sageHome, provider, configuredTOMLMCPIdentityPath(parsed, path, sageHome, provider))
 
 	// Remove only semantic [mcp_servers.sage] tables (including quoted keys and
 	// descendants) while preserving every unrelated byte. Header recognition is
@@ -221,6 +226,41 @@ func mergeCodexConfigForProvider(path, binPath, sageHome, provider string) (stri
 		return "", fmt.Errorf("write codex config: %w", writeErr)
 	}
 	return "merged", nil
+}
+
+func configuredTOMLMCPIdentityPath(parsed any, configPath, sageHome, provider string) string {
+	config, ok := parsed.(map[string]any)
+	if !ok {
+		return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+	}
+	servers, ok := config["mcp_servers"].(map[string]any)
+	if !ok {
+		return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+	}
+	sage, ok := servers["sage"].(map[string]any)
+	if !ok {
+		return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+	}
+	env, ok := sage["env"].(map[string]any)
+	if !ok {
+		return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+	}
+	if path, ok := env["SAGE_IDENTITY_PATH"].(string); ok {
+		return existingIdentityOrDefault(path, sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+	}
+	return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+}
+
+func codexConfigIdentityPath(configPath, sageHome, provider string) string {
+	existing, err := readBoundedConfig(configPath, 1<<20)
+	if err != nil {
+		return mcpIdentityPath(configPath, sageHome, provider)
+	}
+	var parsed any
+	if toml.Unmarshal(existing, &parsed) != nil {
+		return mcpIdentityPath(configPath, sageHome, provider)
+	}
+	return configuredTOMLMCPIdentityPath(parsed, configPath, sageHome, provider)
 }
 
 func readBoundedConfig(path string, limit int64) ([]byte, error) {
@@ -443,7 +483,11 @@ func installAgentsMD(projectDir string) error {
 //   - .codex/hooks/*.sh references a stale binary path
 //   - .codex/config.toml references a stale binary path
 //   - .codex/hooks.json missing (legacy installs predate it)
-func selfHealCodex(projectDir, sageHome string) {
+func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
+	identityOverride := ""
+	if len(identityOverrides) > 0 {
+		identityOverride = identityOverrides[0]
+	}
 	codexDir := filepath.Join(projectDir, ".codex")
 	if _, err := os.Stat(codexDir); os.IsNotExist(err) {
 		return // No .codex/ — user hasn't run `sage-gui codex install` here.
@@ -458,6 +502,11 @@ func selfHealCodex(projectDir, sageHome string) {
 	}
 
 	hookDir := filepath.Join(codexDir, "hooks")
+	configPath := filepath.Join(codexDir, "config.toml")
+	identityPath := codexConfigIdentityPath(configPath, sageHome, "codex")
+	if identityOverride != "" {
+		identityPath = identityOverride
+	}
 	needsRewrite := false
 	hasBinRef := false
 
@@ -473,10 +522,12 @@ func selfHealCodex(projectDir, sageHome string) {
 			if strings.Contains(string(data), binPath) {
 				hasBinRef = true
 			}
+			if hookUsesDirectWriteIdentity(name) && (!strings.Contains(string(data), `SAGE_PROVIDER="codex"`) || !strings.Contains(string(data), identityPath)) {
+				needsRewrite = true
+			}
 		}
 	}
 
-	configPath := filepath.Join(codexDir, "config.toml")
 	if data, readErr := os.ReadFile(configPath); readErr != nil {
 		needsRewrite = true
 	} else if !strings.Contains(string(data), binPath) {
@@ -498,7 +549,7 @@ func selfHealCodex(projectDir, sageHome string) {
 	}
 
 	for name, tpl := range hookScriptSet() {
-		content := strings.ReplaceAll(tpl, "__SAGE_GUI_BIN__", binPath)
+		content := renderHookScript(tpl, binPath, "codex", identityPath)
 		path := filepath.Join(hookDir, name)
 		if writeErr := os.WriteFile(path, []byte(content), 0755); writeErr != nil { //nolint:gosec // hook scripts must be executable
 			fmt.Fprintf(os.Stderr, "SAGE: codex self-heal write %s: %v\n", name, writeErr)
@@ -506,7 +557,7 @@ func selfHealCodex(projectDir, sageHome string) {
 		}
 	}
 
-	if writeErr := writeCodexConfig(configPath, binPath, sageHome); writeErr != nil {
+	if _, writeErr := mergeCodexConfig(configPath, binPath, sageHome); writeErr != nil {
 		fmt.Fprintf(os.Stderr, "SAGE: codex self-heal config: %v\n", writeErr)
 		return
 	}

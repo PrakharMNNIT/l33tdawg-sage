@@ -220,7 +220,7 @@ func loadHookSeed() ([]byte, error) {
 	}
 
 	if cwd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, filepath.Join(projectAgentDir(SageHome(), cwd), "agent.key"))
+		candidates = append(candidates, filepath.Join(providerProjectAgentDir(SageHome(), cwd, os.Getenv("SAGE_PROVIDER")), "agent.key"))
 	}
 	candidates = append(candidates, filepath.Join(SageHome(), "agent.key"))
 

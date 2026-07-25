@@ -70,6 +70,7 @@ func TestFederatedPipeContactDashboardReadAndMutation(t *testing.T) {
 
 	agentID := strings.Repeat("ab", 32)
 	contactID := strings.Repeat("cd", 32)
+	require.NoError(t, bs.RegisterDomain("agent-owned", agentID, "", 1))
 	driver := &pipeContactContractDriver{
 		local: &federation.PipeContactGrant{Version: federation.PipeContactVersion, Revision: "local", Contacts: []federation.PipeContact{{
 			AgentID: agentID, ContactID: contactID, DisplayName: "tii-sentinel", Available: true,
@@ -81,6 +82,7 @@ func TestFederatedPipeContactDashboardReadAndMutation(t *testing.T) {
 	h := NewDashboardHandler(ss, "test")
 	h.BadgerStore = bs
 	h.Federation = driver
+	h.NodeOperatorAgentID = agentID
 
 	getReq := withFederationChain(httptest.NewRequest(http.MethodGet,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/pipe-contacts", nil), "chain-peer")
@@ -117,6 +119,11 @@ func TestFederatedPipeContactDashboardReadAndMutation(t *testing.T) {
 	h.handleFedPipeContactsGet(targetRR, targetReq)
 	require.Equal(t, http.StatusOK, targetRR.Code, targetRR.Body.String())
 	require.Equal(t, 1, driver.targetCalls, "a recipient outside the default sample is resolved by exact agent ID")
+	var targetBody struct {
+		AgentOwnedDomains []string `json:"agent_owned_shareable_domains"`
+	}
+	require.NoError(t, json.NewDecoder(targetRR.Body).Decode(&targetBody))
+	require.Equal(t, []string{"agent-owned"}, targetBody.AgentOwnedDomains)
 	var localOnlyBody struct {
 		Local       *federation.PipeContactGrant `json:"local_contacts"`
 		RemoteKnown bool                         `json:"remote_known"`

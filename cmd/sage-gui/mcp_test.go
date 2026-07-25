@@ -205,8 +205,9 @@ func TestSelfHeal_DoesNotRewriteCurrentHooks(t *testing.T) {
 
 	hookDir := filepath.Join(projectDir, ".claude", "hooks")
 	require.NoError(t, os.MkdirAll(hookDir, 0755))
+	identityPath := mcpIdentityPath(filepath.Join(projectDir, ".mcp.json"), sageHome, "claude-code")
 	for name, tpl := range hookScriptSet() {
-		content := strings.ReplaceAll(tpl, "__SAGE_GUI_BIN__", binPath)
+		content := renderHookScript(tpl, binPath, "claude-code", identityPath)
 		require.NoError(t, os.WriteFile(filepath.Join(hookDir, name), []byte(content), 0755))
 	}
 
@@ -227,7 +228,7 @@ func TestSelfHeal_RewritesStaleBinaryPath(t *testing.T) {
 	// Plant scripts referencing a stale path (a leftover from an old install location).
 	staleBin := "/old/path/to/sage-gui"
 	for name, tpl := range hookScriptSet() {
-		content := strings.ReplaceAll(tpl, "__SAGE_GUI_BIN__", staleBin)
+		content := renderHookScript(tpl, staleBin, "claude-code", mcpIdentityPath(filepath.Join(projectDir, ".mcp.json"), sageHome, "claude-code"))
 		require.NoError(t, os.WriteFile(filepath.Join(hookDir, name), []byte(content), 0755))
 	}
 

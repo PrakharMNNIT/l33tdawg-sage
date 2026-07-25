@@ -142,13 +142,43 @@ func TestProjectMCPConfigsUseDistinctStableIdentityAndProjectName(t *testing.T) 
 
 	identityA := mcpIdentityPath(configA, sageHome, "codex")
 	identityB := mcpIdentityPath(configB, sageHome, "codex")
+	claudeIdentityA := mcpIdentityPath(configA, sageHome, "claude-code")
 	require.NotEqual(t, identityA, identityB, "same folder name in different projects must not share a key")
+	require.NotEqual(t, identityA, claudeIdentityA, "Codex and Claude Code in one project must not share a key")
 	require.Equal(t, "synth-lab", mcpProjectName(configA, sageHome, "codex"))
 	require.Equal(t, "synth-lab", mcpProjectName(configB, sageHome, "codex"))
 
 	block := codexSageConfigBlock(configA, "/Applications/SAGE.app/Contents/MacOS/sage-gui", sageHome, "codex")
 	assert.Contains(t, block, `SAGE_IDENTITY_PATH = "`+identityA+`"`)
 	assert.Contains(t, block, `SAGE_PROJECT = "synth-lab"`)
+}
+
+func TestLegacyClaudeIdentityIsPreservedWhileCodexSplitsDuringMCPConfigRefresh(t *testing.T) {
+	sageHome := t.TempDir()
+	project := filepath.Join(t.TempDir(), "tii-sage")
+	mcpPath := filepath.Join(project, ".mcp.json")
+	require.NoError(t, os.MkdirAll(project, 0755))
+	legacyPath := legacyProjectAgentPath(sageHome, project)
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacyPath), 0700))
+	require.NoError(t, os.WriteFile(legacyPath, []byte("legacy-key"), 0600))
+	require.NoError(t, os.WriteFile(mcpPath, []byte(`{"mcpServers":{"sage":{"command":"old"}}}`), 0600))
+
+	_, err := mergeMCPServerConfig(mcpPath, "/bin/sage-gui", sageHome, "claude-code")
+	require.NoError(t, err)
+	data, err := os.ReadFile(mcpPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), legacyPath)
+
+	codexPath := filepath.Join(project, ".codex", "config.toml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(codexPath), 0755))
+	require.NoError(t, os.WriteFile(codexPath, []byte("[mcp_servers.sage]\ncommand = \"old\"\n"), 0600))
+	_, err = mergeCodexConfigForProvider(codexPath, "/bin/sage-gui", sageHome, "codex")
+	require.NoError(t, err)
+	data, err = os.ReadFile(codexPath)
+	require.NoError(t, err)
+	codexPathAfterRefresh := mcpIdentityPath(codexPath, sageHome, "codex")
+	assert.NotEqual(t, legacyPath, codexPathAfterRefresh)
+	assert.Contains(t, string(data), codexPathAfterRefresh)
 }
 
 func TestSelfHealKnownMCPConfigs_IsolatedNodeCannotTouchGlobalCodexEndpoint(t *testing.T) {

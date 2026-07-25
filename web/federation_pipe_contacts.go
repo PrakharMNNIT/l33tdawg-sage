@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -45,6 +46,7 @@ func (h *DashboardHandler) handleFedPipeContactsGet(w http.ResponseWriter, r *ht
 	}
 
 	requestedAgentID := strings.TrimSpace(r.URL.Query().Get("agent_id"))
+	ownedShareableDomains := []string(nil)
 	var (
 		local *federation.PipeContactGrant
 		err   error
@@ -56,6 +58,9 @@ func (h *DashboardHandler) handleFedPipeContactsGet(w http.ResponseWriter, r *ht
 			return
 		}
 		local, err = targetDriver.LocalPipeContactsForAgent(r.Context(), chain, requestedAgentID)
+		if err == nil {
+			ownedShareableDomains, err = h.federatedAgentOwnedShareableDomains(r.Context(), requestedAgentID)
+		}
 	} else {
 		local, err = driver.LocalPipeContacts(r.Context(), chain)
 	}
@@ -74,11 +79,37 @@ func (h *DashboardHandler) handleFedPipeContactsGet(w http.ResponseWriter, r *ht
 		}
 	}
 	fedWriteJSON(w, http.StatusOK, map[string]any{
-		"remote_chain_id": chain,
-		"local_contacts":  local,
-		"remote_contacts": remote,
-		"remote_known":    remoteKnown,
+		"remote_chain_id":               chain,
+		"local_contacts":                local,
+		"remote_contacts":               remote,
+		"remote_known":                  remoteKnown,
+		"agent_owned_shareable_domains": ownedShareableDomains,
 	})
+}
+
+// federatedAgentOwnedShareableDomains gives the local operator the domains a
+// selected local agent owns and may therefore bring into this connection. The
+// owner topology stays local; the peer only receives the resulting policy.
+func (h *DashboardHandler) federatedAgentOwnedShareableDomains(ctx context.Context, agentID string) ([]string, error) {
+	if h.BadgerStore == nil {
+		return nil, errors.New("on-chain domain RBAC is unavailable")
+	}
+	catalog, err := h.federationShareableDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	owned := make([]string, 0)
+	for _, entry := range catalog {
+		if !entry.CanShare {
+			continue
+		}
+		owner, _, resolveErr := h.BadgerStore.ResolveOwningAncestor(entry.Domain)
+		if resolveErr == nil && strings.EqualFold(owner, agentID) {
+			owned = append(owned, entry.Domain)
+		}
+	}
+	sort.Strings(owned)
+	return owned, nil
 }
 
 // handleFedPipeContactsPut changes one default-off inbound work-request

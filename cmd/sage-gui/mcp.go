@@ -40,6 +40,9 @@ const sageSessionStartTemplate = `#!/bin/bash
 SAGE_HOME="${SAGE_HOME:-$HOME/.sage}"
 MODE=$(cat "$SAGE_HOME/memory_mode" 2>/dev/null || echo "full")
 SAGE_GUI_BIN="${SAGE_GUI_BIN:-__SAGE_GUI_BIN__}"
+SAGE_PROVIDER="__SAGE_PROVIDER__"
+SAGE_IDENTITY_PATH="__SAGE_IDENTITY_PATH__"
+export SAGE_PROVIDER SAGE_IDENTITY_PATH
 
 if [ "$MODE" = "on-demand" ]; then
     echo "SAGE is in on-demand mode. Use sage_recall to retrieve memories and sage_reflect to save learnings. No automatic memory calls will be made."
@@ -66,6 +69,9 @@ const sageSessionEndTemplate = `#!/bin/bash
 SAGE_HOME="${SAGE_HOME:-$HOME/.sage}"
 MODE=$(cat "$SAGE_HOME/memory_mode" 2>/dev/null || echo "full")
 SAGE_GUI_BIN="${SAGE_GUI_BIN:-__SAGE_GUI_BIN__}"
+SAGE_PROVIDER="__SAGE_PROVIDER__"
+SAGE_IDENTITY_PATH="__SAGE_IDENTITY_PATH__"
+export SAGE_PROVIDER SAGE_IDENTITY_PATH
 
 if [ "$MODE" = "on-demand" ]; then
     exit 0
@@ -131,14 +137,6 @@ func runMCP() error {
 		return fmt.Errorf("create SAGE home: %w", err)
 	}
 
-	// Self-heal: patch hooks and CLAUDE.md on every MCP start.
-	// This ensures existing users get updated hook scripts (with memory mode
-	// support) and CLAUDE.md after upgrading, without needing to re-run
-	// `sage-gui mcp install`. Runs silently — output goes to stderr only.
-	if projectDir, err := os.Getwd(); err == nil {
-		selfHealProject(projectDir, home)
-	}
-
 	// === IDENTITY RESOLUTION (highest priority first) ===
 	// 1. SAGE_IDENTITY_PATH (matches SDK AgentIdentity.default())
 	// 2. SAGE_AGENT_KEY (kept for backward compatibility)
@@ -158,15 +156,11 @@ func runMCP() error {
 		projectDir, err := os.Getwd()
 		if err != nil {
 			// Fallback to legacy shared key
-			keyPath = filepath.Join(home, "agent.key")
+			keyPath = existingIdentityOrDefault("", home, "", os.Getenv("SAGE_PROVIDER"))
 			fmt.Fprintf(os.Stderr, "INFO: Identity resolved via default ~/.sage/agent.key\n")
 		} else {
 			projectName = filepath.Base(projectDir)
-			agentDir := projectAgentDir(home, projectDir)
-			if mkErr := os.MkdirAll(agentDir, 0700); mkErr != nil {
-				return fmt.Errorf("create agent dir: %w", mkErr)
-			}
-			keyPath = filepath.Join(agentDir, "agent.key")
+			keyPath = existingIdentityOrDefault("", home, projectDir, os.Getenv("SAGE_PROVIDER"))
 			fmt.Fprintf(os.Stderr, "INFO: Identity resolved via per-project agents/: %s\n", keyPath)
 		}
 	}
@@ -194,22 +188,76 @@ func runMCP() error {
 	if projectName != "" {
 		server.SetProject(projectName)
 	}
+	// Self-heal only after resolving the active identity: generated lifecycle
+	// hooks must sign as the same agent as this MCP session.
+	if projectDir, cwdErr := os.Getwd(); cwdErr == nil {
+		selfHealProject(projectDir, home, os.Getenv("SAGE_PROVIDER"), keyPath)
+	}
 	return server.Run(context.Background())
 }
 
-// projectAgentDir returns a per-project directory for agent keys.
-// Format: ~/.sage/agents/<basename>-<short-hash>/
-// The short hash ensures uniqueness when two projects share a folder name
-// (e.g., ~/work/myapp and ~/personal/myapp).
-func projectAgentDir(sageHome, projectDir string) string {
+// providerProjectAgentDir gives each MCP client provider an independent
+// identity inside the same project. The historical projectAgentDir path did
+// not include the provider, so opening the same checkout with Claude Code and
+// Codex silently reused one Ed25519 key and whichever client last renamed it
+// appeared as the other. Keep the provider in both the readable directory name
+// and the hash input: two providers can now work on one checkout without
+// sharing an agent ID, while similarly named checkouts remain distinct.
+func providerProjectAgentDir(sageHome, projectDir, provider string) string {
+	absPath, err := filepath.Abs(projectDir)
+	if err != nil {
+		absPath = projectDir
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		provider = "agent"
+	}
+	hash := sha256.Sum256([]byte(provider + "\x00" + absPath))
+	shortHash := hex.EncodeToString(hash[:])[:8]
+	name := sanitizeDirName(filepath.Base(absPath))
+	return filepath.Join(sageHome, "agents", name+"-"+sanitizeDirName(provider)+"-"+shortHash)
+}
+
+// legacyProjectAgentPath is the identity location used before provider-aware
+// isolation. It is retained only to preserve an existing canonical identity
+// during upgrade; fresh projects always use providerProjectAgentDir.
+func legacyProjectAgentPath(sageHome, projectDir string) string {
 	absPath, err := filepath.Abs(projectDir)
 	if err != nil {
 		absPath = projectDir
 	}
 	hash := sha256.Sum256([]byte(absPath))
-	shortHash := hex.EncodeToString(hash[:])[:8]
 	name := sanitizeDirName(filepath.Base(absPath))
-	return filepath.Join(sageHome, "agents", name+"-"+shortHash)
+	return filepath.Join(sageHome, "agents", name+"-"+hex.EncodeToString(hash[:])[:8], "agent.key")
+}
+
+func existingIdentityOrDefault(explicitPath, sageHome, projectDir, provider string) string {
+	if strings.TrimSpace(explicitPath) != "" {
+		return filepath.Clean(expandTilde(explicitPath))
+	}
+	if projectDir != "" {
+		legacy := legacyProjectAgentPath(sageHome, projectDir)
+		// The historical location was shared by every project installer, so it
+		// cannot represent both providers after migration. Preserve it for a
+		// legacy Claude config (or honor an explicit path for either provider),
+		// but make an implicit legacy Codex config mint a provider-specific key
+		// rather than recreating the collision. Operators who need the old key
+		// on Codex can pin it explicitly with SAGE_IDENTITY_PATH first.
+		if strings.EqualFold(strings.TrimSpace(provider), "claude-code") {
+			if _, err := os.Stat(legacy); err == nil {
+				return legacy
+			}
+		}
+		if strings.EqualFold(strings.TrimSpace(provider), "claude-desktop") {
+			return legacy
+		}
+		return filepath.Join(providerProjectAgentDir(sageHome, projectDir, provider), "agent.key")
+	}
+	legacy := filepath.Join(sageHome, "agent.key")
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+	return filepath.Join(sageHome, "agents", "global-"+sanitizeDirName(provider), "agent.key")
 }
 
 // sanitizeDirName makes a string safe for use as a directory name.
@@ -319,6 +367,7 @@ func runMCPInstall() error {
 // endpoint can report exactly what changed.
 func installClaudeCodeConfig(projectDir, sageHome, execPath, claimToken string) ([]web.ConnectFile, error) {
 	var files []web.ConnectFile
+	mcpPath := filepath.Join(projectDir, ".mcp.json")
 
 	// === IDENTITY PATH (highest priority first) ===
 	// Matches runMCP() and the SDK: SAGE_IDENTITY_PATH wins, else a per-project
@@ -333,11 +382,10 @@ func installClaudeCodeConfig(projectDir, sageHome, execPath, claimToken string) 
 			}
 		}
 	} else {
-		agentDir := projectAgentDir(sageHome, projectDir)
-		if mkErr := os.MkdirAll(agentDir, 0700); mkErr != nil {
+		keyPath = mcpConfigIdentityPath(mcpPath, sageHome, "claude-code")
+		if mkErr := os.MkdirAll(filepath.Dir(keyPath), 0700); mkErr != nil {
 			return files, fmt.Errorf("create agent dir: %w", mkErr)
 		}
-		keyPath = filepath.Join(agentDir, "agent.key")
 	}
 
 	// If a claim token was supplied, adopt the pre-configured identity. When
@@ -349,8 +397,7 @@ func installClaudeCodeConfig(projectDir, sageHome, execPath, claimToken string) 
 	}
 
 	// .mcp.json — merge the sage stdio server, preserving any other servers.
-	mcpPath := filepath.Join(projectDir, ".mcp.json")
-	action, mcpErr := mergeMCPServerConfig(mcpPath, execPath, sageHome, "claude-code")
+	action, mcpErr := mergeMCPServerConfigWithIdentity(mcpPath, execPath, sageHome, "claude-code", keyPath)
 	if mcpErr != nil {
 		return files, mcpErr
 	}
@@ -359,7 +406,7 @@ func installClaudeCodeConfig(projectDir, sageHome, execPath, claimToken string) 
 	// .claude/settings.json + hook scripts (best-effort).
 	settingsPath := filepath.Join(projectDir, ".claude", "settings.json")
 	settingsAction := fileAction(settingsPath)
-	if hookErr := installClaudeHooks(projectDir); hookErr != nil {
+	if hookErr := installClaudeHooks(projectDir, sageHome); hookErr != nil {
 		fmt.Fprintf(os.Stderr, "⚠ Could not install Claude Code hooks: %v\n", hookErr)
 		fmt.Fprintln(os.Stderr, "  SAGE will still work, but memory persistence may be less reliable.")
 	} else {
@@ -389,7 +436,7 @@ func installClaudeCodeConfig(projectDir, sageHome, execPath, claimToken string) 
 // invoking the install — the session-start/session-end scripts shell out
 // to that path for signed REST calls. Falling back to a $PATH lookup would
 // break for users who installed sage-gui outside the standard locations.
-func installClaudeHooks(projectDir string) error {
+func installClaudeHooks(projectDir, sageHome string) error {
 	hookDir := filepath.Join(projectDir, ".claude", "hooks")
 	if err := os.MkdirAll(hookDir, 0755); err != nil {
 		return fmt.Errorf("create hooks dir: %w", err)
@@ -403,8 +450,9 @@ func installClaudeHooks(projectDir string) error {
 		binPath = resolved
 	}
 
+	identityPath := mcpConfigIdentityPath(filepath.Join(projectDir, ".mcp.json"), sageHome, "claude-code")
 	for name, tpl := range hookScriptSet() {
-		content := strings.ReplaceAll(tpl, "__SAGE_GUI_BIN__", binPath)
+		content := renderHookScript(tpl, binPath, "claude-code", identityPath)
 		path := filepath.Join(hookDir, name)
 		if writeErr := os.WriteFile(path, []byte(content), 0755); writeErr != nil { //nolint:gosec // hook scripts must be executable
 			return fmt.Errorf("write %s: %w", name, writeErr)
@@ -447,6 +495,19 @@ func hookScriptSet() map[string]string {
 	}
 }
 
+func renderHookScript(template, binPath, provider, identityPath string) string {
+	content := strings.ReplaceAll(template, "__SAGE_GUI_BIN__", shellDoubleQuote(binPath))
+	content = strings.ReplaceAll(content, "__SAGE_PROVIDER__", shellDoubleQuote(provider))
+	return strings.ReplaceAll(content, "__SAGE_IDENTITY_PATH__", shellDoubleQuote(identityPath))
+}
+
+func shellDoubleQuote(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	value = strings.ReplaceAll(value, "$", `\$`)
+	return strings.ReplaceAll(value, "`", "\\`")
+}
+
 // healHooks brings a project's .claude/hooks/ + .claude/settings.json up to
 // the current installer's 5-script direct-write set.
 //
@@ -460,7 +521,7 @@ func hookScriptSet() map[string]string {
 // sage-gui by replacing it in place, but also by installing a new version
 // in a different location (e.g. ~/go/bin → /usr/local/bin). The hooks need
 // to follow whichever copy is actually running.
-func healHooks(projectDir, hookDir string) error {
+func healHooks(projectDir, hookDir, identityPath string) error {
 	binPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("find sage-gui binary: %w", err)
@@ -468,7 +529,6 @@ func healHooks(projectDir, hookDir string) error {
 	if resolved, symErr := filepath.EvalSymlinks(binPath); symErr == nil {
 		binPath = resolved
 	}
-
 	expected := hookScriptSet()
 	needsRewrite := false
 	hasBinRef := false
@@ -483,6 +543,9 @@ func healHooks(projectDir, hookDir string) error {
 		anyScriptExisted = true
 		if strings.Contains(string(data), binPath) {
 			hasBinRef = true
+		}
+		if hookUsesDirectWriteIdentity(name) && (!strings.Contains(string(data), `SAGE_PROVIDER="claude-code"`) || !strings.Contains(string(data), identityPath)) {
+			needsRewrite = true
 		}
 	}
 
@@ -500,7 +563,7 @@ func healHooks(projectDir, hookDir string) error {
 	}
 
 	for name, tpl := range expected {
-		content := strings.ReplaceAll(tpl, "__SAGE_GUI_BIN__", binPath)
+		content := renderHookScript(tpl, binPath, "claude-code", identityPath)
 		path := filepath.Join(hookDir, name)
 		if writeErr := os.WriteFile(path, []byte(content), 0755); writeErr != nil { //nolint:gosec // hook scripts must be executable
 			return fmt.Errorf("write %s: %w", name, writeErr)
@@ -531,6 +594,10 @@ func healHooks(projectDir, hookDir string) error {
 		fmt.Fprintf(os.Stderr, "SAGE: refreshed Claude Code hook scripts\n")
 	}
 	return nil
+}
+
+func hookUsesDirectWriteIdentity(name string) bool {
+	return name == "sage-session-start.sh" || name == "sage-session-end.sh"
 }
 
 // mcpHasSage reports whether .mcp.json in projectDir registers a "sage" server.
@@ -822,7 +889,18 @@ func claimAgentIdentity(sageHome, token, keyPath string) error {
 //   - Current installs whose direct-write scripts reference a stale
 //     __SAGE_GUI_BIN__ path (e.g. user upgraded sage-gui to a new location)
 //     get re-templated.
-func selfHealProject(projectDir, sageHome string) {
+func selfHealProject(projectDir, sageHome string, active ...string) {
+	activeProvider, activeIdentityPath := "", ""
+	if len(active) > 0 {
+		activeProvider = active[0]
+	}
+	if len(active) > 1 {
+		activeIdentityPath = active[1]
+	}
+	claudeIdentityPath := mcpConfigIdentityPath(filepath.Join(projectDir, ".mcp.json"), sageHome, "claude-code")
+	if strings.EqualFold(activeProvider, "claude-code") && activeIdentityPath != "" {
+		claudeIdentityPath = activeIdentityPath
+	}
 	hookDir := filepath.Join(projectDir, ".claude", "hooks")
 	hookDirExists := true
 	if _, err := os.Stat(hookDir); os.IsNotExist(err) {
@@ -831,7 +909,7 @@ func selfHealProject(projectDir, sageHome string) {
 
 	switch {
 	case hookDirExists:
-		if err := healHooks(projectDir, hookDir); err != nil {
+		if err := healHooks(projectDir, hookDir, claudeIdentityPath); err != nil {
 			fmt.Fprintf(os.Stderr, "SAGE: hook self-heal: %v\n", err)
 		}
 	case mcpHasSage(projectDir):
@@ -841,11 +919,15 @@ func selfHealProject(projectDir, sageHome string) {
 		// new hook contract just by restarting the agent session.
 		if err := os.MkdirAll(hookDir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "SAGE: create hooks dir: %v\n", err)
-		} else if err := healHooks(projectDir, hookDir); err != nil {
+		} else if err := healHooks(projectDir, hookDir, claudeIdentityPath); err != nil {
 			fmt.Fprintf(os.Stderr, "SAGE: install hooks: %v\n", err)
 		}
 	}
-	selfHealCodex(projectDir, sageHome)
+	codexIdentityPath := ""
+	if strings.EqualFold(activeProvider, "codex") {
+		codexIdentityPath = activeIdentityPath
+	}
+	selfHealCodex(projectDir, sageHome, codexIdentityPath)
 
 	// Ensure CLAUDE.md has the SAGE section
 	mdPath := filepath.Join(projectDir, "CLAUDE.md")

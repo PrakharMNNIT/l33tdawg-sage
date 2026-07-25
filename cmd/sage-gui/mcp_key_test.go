@@ -39,3 +39,15 @@ func TestLoadOrGenerateKeyConcurrentFirstLaunchUsesOneIdentity(t *testing.T) {
 	}
 	require.Len(t, unique, 1)
 }
+
+func TestProviderProjectAgentDirSeparatesProvidersInOneCheckout(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(t.TempDir(), "tii-sage")
+	claudePath := providerProjectAgentDir(home, project, "claude-code")
+	codexPath := providerProjectAgentDir(home, project, "codex")
+
+	require.NotEqual(t, claudePath, codexPath, "Claude Code and Codex must never share a project identity path")
+	require.Contains(t, claudePath, "tii-sage-claude-code-")
+	require.Contains(t, codexPath, "tii-sage-codex-")
+	require.Equal(t, claudePath, providerProjectAgentDir(home, project, "CLAUDE-CODE"), "provider spelling must not fork an identity")
+}
