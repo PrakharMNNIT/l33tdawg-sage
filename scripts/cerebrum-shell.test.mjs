@@ -271,6 +271,17 @@ test('governance wizard builds structured canonical quorum scopes', () => {
         'the dashboard must submit structured scope JSON, not recreate the binary codec');
 });
 
+test('chain activity exposes committed RBAC changes and remains usable while empty', () => {
+    const activity = appSource.slice(appSource.indexOf('function ChainActivityLog('), appSource.indexOf('// ============================================================================\n// Health Status Bar'));
+    assert.match(activity, /sse\.on\('access'/);
+    assert.match(activity, /Permissions Updated/);
+    assert.match(activity, /Access Granted/);
+    assert.match(activity, /Access Revoked/);
+    assert.match(activity, /height: \$\{logHeight\}px/);
+    assert.match(activity, /↓ Expand/);
+    assert.match(activity, /aria-label="Resize Chain Activity"/);
+});
+
 test('chain health recognizes app-v21 as the current consensus protocol', () => {
     assert.match(appSource, /const appVerTone = appVer === '21'/);
     assert.match(appSource, /Green when current \(21\)\./);

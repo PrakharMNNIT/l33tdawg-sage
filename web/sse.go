@@ -25,6 +25,10 @@ const (
 	EventUpdate     EventType = "update"
 	EventGovernance EventType = "governance"
 	EventTask       EventType = "task"
+	// EventAccess is emitted only after an RBAC transaction commits. It keeps
+	// Chain Activity an auditable view of enforced permissions, not merely a
+	// memory-operation feed.
+	EventAccess EventType = "access"
 )
 
 // SSEEvent is an event sent to connected dashboard clients.

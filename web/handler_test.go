@@ -1569,6 +1569,49 @@ func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 	assert.NotEqual(t, validatorKey.Public(), captured.AgentPubKey, "validator key is not the RBAC admin")
 }
 
+func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"PERM123","height":"77"}}`)
+	}))
+	defer cometMock.Close()
+
+	h, s := newTestHandler(t)
+	h.CometBFTRPC = cometMock.URL
+	_, validatorKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	h.SigningKey = validatorKey
+	_, adminKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	h.AdminSigningKey = adminKey
+	h.SSE = NewSSEBroadcaster()
+	events := h.SSE.Subscribe()
+	defer h.SSE.Unsubscribe(events)
+	r := testRouter(h)
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: "agent-activity-1", Name: "Activity Agent", Role: "member", Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+
+	body := []byte(`{"clearance":2}`)
+	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-activity-1", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(req)
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
+
+	select {
+	case event := <-events:
+		body := string(event)
+		assert.Contains(t, body, "event: access")
+		assert.Contains(t, body, `"action":"permissions_updated"`)
+		assert.Contains(t, body, `"tx_hash":"PERM123"`)
+		assert.Contains(t, body, `"height":77`)
+	case <-time.After(time.Second):
+		t.Fatal("committed permission update did not emit Chain Activity event")
+	}
+}
+
 func TestHandleUpdateAgent_PermissionsRejectSignedAgentWithoutOverride(t *testing.T) {
 	h, s := newTestHandler(t)
 	r := testRouter(h)

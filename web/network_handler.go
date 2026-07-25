@@ -478,8 +478,12 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 				}
 				if len(h.AdminSigningKey) != ed25519.PrivateKeySize {
 					warnings = append(warnings, "on-chain permission sync failed: genesis admin key unavailable")
-				} else if _, _, _, bErr := h.signAndBroadcastCommit(permTx, h.AdminSigningKey); bErr != nil {
+				} else if txHash, height, _, bErr := h.signAndBroadcastCommit(permTx, h.AdminSigningKey); bErr != nil {
 					warnings = append(warnings, "on-chain permission sync failed: "+bErr.Error())
+				} else {
+					h.emitAccessActivity("permissions_updated", fmt.Sprintf("Permissions updated for %s", existing.Name), "", map[string]any{
+						"agent_id": id, "agent_name": existing.Name, "clearance": clearance, "tx_hash": txHash, "height": height,
+					})
 				}
 			}
 		}

@@ -32,7 +32,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.13.7';
+const SAGE_VERSION = 'v11.13.8';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -6918,6 +6918,7 @@ function ChainActivityLog({ sse }) {
             sse.on('vote', (data) => addEvent('vote', data)),
             sse.on('consensus', (data) => addEvent('consensus', data)),
             sse.on('agent', (data) => addEvent('agent', data)),
+            sse.on('access', (data) => addEvent('access', data)),
             sse.on('connection', (data) => {
                 // Track connection state internally but don't show in chain activity
                 if (data.connected) {
@@ -6944,12 +6945,21 @@ function ChainActivityLog({ sse }) {
         vote: { icon: 'V', color: '#f59e0b', label: 'Consensus Vote' },
         consensus: { icon: 'C', color: '#a78bfa', label: 'Consensus Reached' },
         agent: { icon: 'A', color: '#f472b6', label: 'Agent Activity' },
+        access: { icon: '⊕', color: '#22c55e', label: 'Access Updated' },
         connection: { icon: '*', color: '#8b5cf6', label: 'Connection' },
     };
 
+    function eventLabel(event) {
+        const action = event?.data?.data?.action;
+        if (action === 'permissions_updated') return 'Permissions Updated';
+        if (action === 'access_granted') return 'Access Granted';
+        if (action === 'access_revoked') return 'Access Revoked';
+        return (typeIcons[event?.type] || typeIcons.connection).label;
+    }
+
     return html`
         <div class="chain-activity ${open ? 'open' : ''}">
-            <button class="chain-activity-toggle" onClick=${() => setOpen(!open)}>
+            <button class="chain-activity-toggle" onClick=${() => setOpen(!open)} aria-expanded=${open} title=${open ? 'Collapse Chain Activity' : 'Expand Chain Activity'}>
                 <svg width="12" height="12" viewBox="0 0 12 12" style="transform: rotate(${open ? '180' : '0'}deg); transition: transform 0.2s;">
                     <path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5"/>
                 </svg>
@@ -6957,25 +6967,27 @@ function ChainActivityLog({ sse }) {
                 ${events.length > 0 ? html`<span class="chain-activity-count">${events.length}</span>` : ''}
                 ${!open && events.length > 0 ? html`
                     <span class="chain-activity-latest" style="color: ${(typeIcons[events[0]?.type] || typeIcons.connection).color}">
-                        ${(typeIcons[events[0]?.type] || typeIcons.connection).label}
+                        ${eventLabel(events[0])}
                         — ${formatTs(events[0]?.timestamp)}
                     </span>
                 ` : ''}
+                <span class="chain-activity-expand-hint" aria-hidden="true">${open ? '↑ Collapse' : '↓ Expand'}</span>
             </button>
             ${open && html`
-                <div class="chain-activity-log" style="max-height: ${logHeight}px;">
+                <div class="chain-activity-log" style="height: ${logHeight}px;">
                     ${events.length === 0 ? html`
                         <div class="chain-activity-empty">Waiting for chain events...</div>
                     ` : events.map(ev => {
                         const info = typeIcons[ev.type] || typeIcons.connection;
                         const isExpanded = expandedEvent === ev.id;
-                        const hasDetail = ev.data?.data?.full_content || ev.data?.data?.retrieved;
+                        const accessDetail = ev.type === 'access' ? ev.data?.data : null;
+                        const hasDetail = ev.data?.data?.full_content || ev.data?.data?.retrieved || accessDetail;
                         return html`
                             <div class="chain-event ${isExpanded ? 'expanded' : ''}" key=${ev.id}
                                  onClick=${() => hasDetail && setExpandedEvent(isExpanded ? null : ev.id)}>
                                 <span class="chain-event-icon" style="background: ${info.color}20; color: ${info.color};">${info.icon}</span>
                                 <span class="chain-event-time">${formatTs(ev.timestamp)}</span>
-                                <span class="chain-event-type" style="color: ${info.color};">${info.label}</span>
+                                <span class="chain-event-type" style="color: ${info.color};">${eventLabel(ev)}</span>
                                 <span class="chain-event-detail">
                                     ${ev.data?.memory_id ? html`<code>${ev.data.memory_id.slice(0, 12)}...</code>` : ''}
                                     ${ev.data?.domain ? html`<span class="chain-event-domain">${ev.data.domain}</span>` : ''}
@@ -7008,11 +7020,21 @@ function ChainActivityLog({ sse }) {
                                         </div>
                                     </div>
                                 ` : ''}
+                                ${isExpanded && accessDetail ? html`
+                                    <div class="chain-event-expand" onClick=${(e) => e.stopPropagation()}>
+                                        ${accessDetail.agent_name ? html`<div>Agent: <strong>${accessDetail.agent_name}</strong></div>` : ''}
+                                        ${accessDetail.agent_id ? html`<div>Agent ID: <code>${accessDetail.agent_id}</code></div>` : ''}
+                                        ${accessDetail.owner_id ? html`<div>Authorized by: <code>${accessDetail.owner_id}</code></div>` : ''}
+                                        ${accessDetail.level ? html`<div>Grant level: <strong>${accessDetail.level}</strong></div>` : ''}
+                                        ${accessDetail.height ? html`<div>Block: <strong>#${accessDetail.height}</strong></div>` : ''}
+                                        ${accessDetail.tx_hash ? html`<div>Transaction: <code>${accessDetail.tx_hash}</code></div>` : ''}
+                                    </div>
+                                ` : ''}
                             </div>
                         `;
                     })}
                 </div>
-                <div class="chain-activity-resize-handle"
+                <div class="chain-activity-resize-handle" role="separator" aria-label="Resize Chain Activity" aria-orientation="horizontal" tabIndex="0"
                      onMouseDown=${(e) => {
                          e.preventDefault();
                          e.stopPropagation();
@@ -7041,6 +7063,10 @@ function ChainActivityLog({ sse }) {
                          }
                          document.addEventListener('mousemove', onMove);
                          document.addEventListener('mouseup', onUp);
+                     }} onKeyDown=${(e) => {
+                         if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+                         e.preventDefault();
+                         setLogHeight(h => Math.max(80, Math.min(600, h + (e.key === 'ArrowUp' ? 24 : -24))));
                      }}></div>
             `}
         </div>

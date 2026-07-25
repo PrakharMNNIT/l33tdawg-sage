@@ -51,6 +51,16 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.13.8
+
+**CEREBRUM now records committed permission changes in Chain Activity.** Access
+saves, grants, and revocations show only after their transaction commits, with
+the block and transaction available on expansion. Chain Activity can now be
+resized even when it is empty, and its clear Expand/Collapse control works
+reliably from the header.
+
+SDK 11.13.8.
+
 ## What's New in v11.13.7
 
 **MCP identities are now isolated by client provider, and federation shares an
@@ -755,7 +765,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.7`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.8`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

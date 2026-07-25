@@ -90,6 +90,17 @@ test('release actions stay pinned to immutable commits', () => {
   }
 });
 
+test('Docker preparation retries the BuildKit pull before creating Buildx', () => {
+  const docker = job('docker-image');
+  assert.match(docker, /Warm BuildKit image with bounded retry/);
+  assert.match(docker, /for attempt in 1 2 3/);
+  assert.match(docker, /docker pull moby\/buildkit:buildx-stable-1/);
+  assert.ok(
+    docker.indexOf('Warm BuildKit image with bounded retry') < docker.indexOf('Set up Docker Buildx'),
+    'BuildKit must be warm before Buildx bootstraps it',
+  );
+});
+
 test('metadata, source, race, frontend, and fault checks converge before packaging', () => {
   assert.match(workflow, /concurrency:\n  group: sage-release-publication\n  cancel-in-progress: false/);
   assert.match(job('v119-fault-gates'), /name: Consensus Fault Gates/);

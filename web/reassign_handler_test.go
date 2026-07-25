@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -58,10 +59,13 @@ func TestGrantAs_UnownedDomainUsesGenesisAdmin(t *testing.T) {
 		BadgerStore:     bs,
 		CometBFTRPC:     rpc.URL,
 		AdminSigningKey: adminKey,
+		SSE:             NewSSEBroadcaster(),
 		// Deliberately nil: an unowned domain must not require an owner-key
 		// resolver before consensus has atomically established ownership.
 		ResolveAgentKeyFn: nil,
 	}
+	events := h.SSE.Subscribe()
+	defer h.SSE.Unsubscribe(events)
 	result := h.grantAs("new-research", "agent-b", 1, nil)
 
 	require.True(t, result.OK, result.Error)
@@ -75,6 +79,16 @@ func TestGrantAs_UnownedDomainUsesGenesisAdmin(t *testing.T) {
 	assert.Equal(t, "agent-b", captured.AccessGrant.GranteeID)
 	assert.Equal(t, "new-research", captured.AccessGrant.Domain)
 	assert.Equal(t, uint8(1), captured.AccessGrant.Level)
+	assert.Equal(t, "ABC123", result.TxHash)
+	assert.Equal(t, int64(42), result.Height)
+	select {
+	case event := <-events:
+		assert.Contains(t, string(event), "event: access")
+		assert.Contains(t, string(event), `"action":"access_granted"`)
+		assert.Contains(t, string(event), `"tx_hash":"ABC123"`)
+	case <-time.After(time.Second):
+		t.Fatal("committed access grant did not emit Chain Activity event")
+	}
 }
 
 func TestGrantAs_ChildDomainUsesOwningAncestorForModifyLevel(t *testing.T) {

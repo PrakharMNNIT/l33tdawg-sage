@@ -77,6 +77,8 @@ type grantResult struct {
 	Domain            string `json:"domain"`
 	Action            string `json:"action"` // grant | revoke | shared | skip
 	Level             int    `json:"level,omitempty"`
+	TxHash            string `json:"tx_hash,omitempty"`
+	Height            int64  `json:"height,omitempty"`
 	OK                bool   `json:"ok"`
 	Code              string `json:"code,omitempty"`
 	Error             string `json:"error,omitempty"`
@@ -85,6 +87,19 @@ type grantResult struct {
 	OwnerLocal        bool   `json:"owner_local,omitempty"`
 	OverrideAvailable bool   `json:"override_available,omitempty"`
 	OverrideReady     bool   `json:"override_ready,omitempty"`
+}
+
+// emitAccessActivity publishes only a committed RBAC mutation. The dashboard
+// can therefore show the exact transaction and block which enforced a change.
+func (h *DashboardHandler) emitAccessActivity(action, content, domain string, data map[string]any) {
+	if h.SSE == nil {
+		return
+	}
+	if data == nil {
+		data = make(map[string]any)
+	}
+	data["action"] = action
+	h.SSE.Broadcast(SSEEvent{Type: EventAccess, Domain: domain, Content: content, Data: data})
 }
 
 type adminOverrideExpectation struct {
@@ -352,12 +367,16 @@ func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override
 			ExpectedOwnedDomain: overrideOwnedDomain(override),
 		},
 	}
-	if _, _, _, gErr := h.signAndBroadcastCommit(grantTx, ownerKey); gErr != nil {
+	txHash, height, _, gErr := h.signAndBroadcastCommit(grantTx, ownerKey)
+	if gErr != nil {
 		return grantResult{Domain: domain, Action: "grant", Level: level, OK: false,
 			Code: "grant_rejected", Error: gErr.Error(), OwnerID: owner, OwnedDomain: ownedDomain,
 			OwnerLocal: ownerLocal}
 	}
-	return grantResult{Domain: domain, Action: "grant", Level: level, OK: true,
+	h.emitAccessActivity("access_granted", fmt.Sprintf("Access granted: %s → %s (level %d)", domain, shortID(granteeID), level), domain, map[string]any{
+		"agent_id": granteeID, "owner_id": owner, "level": level, "tx_hash": txHash, "height": height,
+	})
+	return grantResult{Domain: domain, Action: "grant", Level: level, TxHash: txHash, Height: height, OK: true,
 		OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
 }
 
@@ -424,11 +443,15 @@ func (h *DashboardHandler) revokeAs(domain, granteeID string, override *adminOve
 			ExpectedOwnedDomain: overrideOwnedDomain(override),
 		},
 	}
-	if _, _, _, rErr := h.signAndBroadcastCommit(revokeTx, ownerKey); rErr != nil {
+	txHash, height, _, rErr := h.signAndBroadcastCommit(revokeTx, ownerKey)
+	if rErr != nil {
 		return grantResult{Domain: domain, Action: "revoke", OK: false,
 			Code: "revoke_rejected", Error: rErr.Error(), OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
 	}
-	return grantResult{Domain: domain, Action: "revoke", OK: true, OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
+	h.emitAccessActivity("access_revoked", fmt.Sprintf("Access revoked: %s → %s", domain, shortID(granteeID)), domain, map[string]any{
+		"agent_id": granteeID, "owner_id": owner, "tx_hash": txHash, "height": height,
+	})
+	return grantResult{Domain: domain, Action: "revoke", TxHash: txHash, Height: height, OK: true, OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
 }
 
 // isSharedDomain covers both the reserved shared namespace and domains opened
