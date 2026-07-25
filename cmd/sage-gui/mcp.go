@@ -244,7 +244,7 @@ func existingIdentityOrDefault(explicitPath, sageHome, projectDir, provider stri
 		// rather than recreating the collision. Operators who need the old key
 		// on Codex can pin it explicitly with SAGE_IDENTITY_PATH first.
 		if strings.EqualFold(strings.TrimSpace(provider), "claude-code") {
-			if _, err := os.Stat(legacy); err == nil {
+			if _, err := os.Stat(legacy); err == nil { //nolint:gosec // SageHome-derived legacy identity path
 				return legacy
 			}
 		}
@@ -254,7 +254,7 @@ func existingIdentityOrDefault(explicitPath, sageHome, projectDir, provider stri
 		return filepath.Join(providerProjectAgentDir(sageHome, projectDir, provider), "agent.key")
 	}
 	legacy := filepath.Join(sageHome, "agent.key")
-	if _, err := os.Stat(legacy); err == nil {
+	if _, err := os.Stat(legacy); err == nil { //nolint:gosec // SageHome-derived legacy identity path
 		return legacy
 	}
 	return filepath.Join(sageHome, "agents", "global-"+sanitizeDirName(provider), "agent.key")
@@ -383,7 +383,7 @@ func installClaudeCodeConfig(projectDir, sageHome, execPath, claimToken string) 
 		}
 	} else {
 		keyPath = mcpConfigIdentityPath(mcpPath, sageHome, "claude-code")
-		if mkErr := os.MkdirAll(filepath.Dir(keyPath), 0700); mkErr != nil {
+		if mkErr := os.MkdirAll(filepath.Dir(keyPath), 0700); mkErr != nil { //nolint:gosec // resolved from project MCP config or provider-safe default
 			return files, fmt.Errorf("create agent dir: %w", mkErr)
 		}
 	}

@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-07):** **v11.13.5 is the current release.** CEREBRUM now reports the live ABCI app version after an upgrade and gives operators an explicit Read/Write/Modify access matrix. Level-3 Modify policy is normalized and reconciled to real owner-signed grants, while shared domains are honestly read/write-only. Security-critical agent creation and policy changes are local-operator-only, and post-app-v20 domain reassignment uses the canonical governance proof format. Governed app-v21 continues to make challenge resolution corroboration-aware and exposes canonical evidence counts through REST, federation, MCP, and the Python SDK. The complete CI/security/fault matrix remains a mandatory publication invariant, and the native-shell productization bridge remains targeted at v11.11–v11.14.
+**Status (2026-07):** **v11.13.7 is the current release.** MCP identities are isolated by provider, and federation can share a selected agent together with its owned domains after clear operator confirmation. CEREBRUM also reports the live ABCI app version after an upgrade and gives operators an explicit Read/Write/Modify access matrix. The complete CI/security/fault matrix remains a mandatory publication invariant, and the native-shell productization bridge remains targeted at v11.11–v11.14.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 

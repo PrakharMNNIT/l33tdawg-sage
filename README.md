@@ -51,6 +51,17 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.13.7
+
+**MCP identities are now isolated by client provider, and federation shares an
+agent with its owned domains in one guided action.** Claude Code and Codex get
+distinct project keys, while explicit legacy keys remain stable; direct session
+hooks use that exact configured identity too. Federation now loads the peer's
+published contact snapshot when the panel opens. Selecting a local agent can
+add its owned, shareable domains to the connection after one clear confirmation.
+
+SDK 11.13.7.
+
 ## What's New in v11.13.5
 
 **CEREBRUM now shows the live consensus app version and makes level-3 Modify
@@ -744,7 +755,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.5`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.7`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

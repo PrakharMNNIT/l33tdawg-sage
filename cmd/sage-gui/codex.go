@@ -160,14 +160,6 @@ func tomlString(value string) string {
 	return string(encoded)
 }
 
-func writeCodexConfig(path, binPath, sageHome string) error {
-	content := codexSageConfigBlock(path, binPath, sageHome, "codex")
-	if err := safeWriteFile(path, []byte(content), 0600); err != nil {
-		return fmt.Errorf("write codex config: %w", err)
-	}
-	return nil
-}
-
 // mergeCodexConfig writes the sage MCP server into .codex/config.toml while
 // PRESERVING any other [mcp_servers.X] the user already has. Codex config is
 // TOML, so instead of a full parse we strip any existing sage sections
