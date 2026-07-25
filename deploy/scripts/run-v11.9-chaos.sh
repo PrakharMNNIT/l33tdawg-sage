@@ -610,6 +610,25 @@ governance_heartbeat() {
     '{"name":"v11.9-chaos-operator","boot_bio":"bounded live validator lifecycle proof"}'
 }
 
+submit_governance_heartbeat_for_progress() {
+  local label=$1
+  local output
+  # broadcast_tx_commit's server-side 10s response window is not a consensus
+  # oracle. An accepted tx can outlive that response when the killed weighted
+  # validator remains proposer for consecutive rounds. The caller must retain
+  # a bounded committed-height assertion; app-v20 suppresses idle blocks, so
+  # that assertion fails if these submissions never reach consensus.
+  if output=$(governance_heartbeat 2>&1); then
+    return 0
+  fi
+  printf '%s\n' "${output}" >&2
+  if [[ "${output}" == *'HTTP 500:'* && "${output}" == *'"title":"Broadcast error"'* ]]; then
+    echo "${label}: broadcast response indeterminate; requiring bounded committed-height proof" >&2
+    return 0
+  fi
+  return 1
+}
+
 expected_peer_ids() {
   if [ "$#" -eq 0 ]; then
     echo NONE
@@ -829,9 +848,11 @@ restart_pair_and_converge() {
   "${COMPOSE[@]}" kill -s KILL "cometbft${index}" "abci${index}"
   # app-v20 suppresses idle blocks. Two authenticated idempotent operator
   # updates prove the surviving voting power can still commit while the pair is
-  # down, instead of mistaking a quiet chain for progress.
-  governance_heartbeat >/dev/null
-  governance_heartbeat >/dev/null
+  # down, instead of mistaking a quiet chain for progress. Their synchronous
+  # responses may be indeterminate while a killed weighted proposer burns
+  # rounds; the mandatory two-height bound below remains the consensus oracle.
+  submit_governance_heartbeat_for_progress "${label} heartbeat 1"
+  submit_governance_heartbeat_for_progress "${label} heartbeat 2"
   wait_progress "${RPC_PORTS[$progress_port_index]}" "${before}" 2 120
   "${COMPOSE[@]}" start "abci${index}" "cometbft${index}"
   wait_rpc "${RPC_PORTS[$index]}" 120

@@ -60,6 +60,16 @@ function ciJob(id) {
   return next === -1 ? remainder : remainder.slice(0, next);
 }
 
+function shellFunction(source, name) {
+  const marker = `${name}() {\n`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `missing shell function: ${name}`);
+  const remainder = source.slice(start + marker.length);
+  const end = remainder.indexOf('\n}\n');
+  assert.notEqual(end, -1, `unterminated shell function: ${name}`);
+  return remainder.slice(0, end);
+}
+
 function assertNeeds(id, expected) {
   const body = job(id);
   for (const dependency of expected) {
@@ -403,6 +413,12 @@ test('Docker guidance keeps stdio MCP in the running SAGE container', () => {
 });
 
 test('the fresh real-Comet fixture cannot skip historical app forks', () => {
+  const heartbeatSubmission = shellFunction(
+    v119Chaos,
+    'submit_governance_heartbeat_for_progress',
+  );
+  const restartPair = shellFunction(v119Chaos, 'restart_pair_and_converge');
+
   assert.match(
     v119Chaos,
     /for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do/,
@@ -412,6 +428,20 @@ test('the fresh real-Comet fixture cannot skip historical app forks', () => {
   assert.match(
     v119Chaos,
     /restart_pair_and_converge\(\)[\s\S]*?assert_matched_apphash "\$\{label\}" 180[\s\S]*?wait_all_app_version 21 180/,
+  );
+  assert.match(
+    heartbeatSubmission,
+    /output=\$\(governance_heartbeat 2>&1\)[\s\S]*?HTTP 500:[\s\S]*?"title":"Broadcast error"[\s\S]*?broadcast response indeterminate; requiring bounded committed-height proof[\s\S]*?return 0/,
+  );
+  assert.match(heartbeatSubmission, /return 1\s*$/);
+  assert.equal(
+    (restartPair.match(/submit_governance_heartbeat_for_progress/g) || []).length,
+    2,
+    'each stopped pair must receive exactly two bounded progress submissions',
+  );
+  assert.match(
+    restartPair,
+    /submit_governance_heartbeat_for_progress "\$\{label\} heartbeat 1"[\s\S]*?submit_governance_heartbeat_for_progress "\$\{label\} heartbeat 2"[\s\S]*?wait_progress "\$\{RPC_PORTS\[\$progress_port_index\]\}" "\$\{before\}" 2 120/,
   );
   assert.equal(
     (v119Chaos.match(/wait_all_app_version 21 180/g) || []).length,
