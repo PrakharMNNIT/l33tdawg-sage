@@ -590,6 +590,15 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "${KEYCHAIN_PASSWORD}" build.keychain
           rm /tmp/cert.p12
+          # The macOS amd64 image has a tight writable-disk budget. The Go
+          # module/build caches are no longer needed once sage-gui is compiled,
+          # but build-dmg.sh creates the compressed image in the same step.
+          # Inject the cleanup at that exact boundary so hdiutil has room while
+          # the immutable tagged source and resulting application stay intact.
+          perl -0pi -e \
+            's/# Create DMG\n/echo "==> Reclaiming Go caches before DMG assembly..."\ndf -h \/\ngo clean -cache -modcache\ndf -h \/\n\n# Create DMG\n/' \
+            installer/macos/build-dmg.sh
+          grep -q 'Reclaiming Go caches before DMG assembly' installer/macos/build-dmg.sh
           ./installer/macos/build-dmg.sh
 
           if [ "${SAGE_ARCH}" = amd64 ]; then

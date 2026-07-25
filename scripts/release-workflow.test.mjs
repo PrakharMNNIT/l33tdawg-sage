@@ -323,6 +323,17 @@ test('macOS release artifacts must be signed, notarized, stapled, and assessed',
   assert.match(body, /APPLE_CERTIFICATE_BASE64/);
   assert.match(body, /APPLE_CERTIFICATE_PASSWORD/);
   assert.match(body, /NOTARIZE: '1'/);
+  assert.ok(
+    body.includes(
+      String.raw`'s/# Create DMG\n/echo "==> Reclaiming Go caches before DMG assembly..."\ndf -h \/\ngo clean -cache -modcache\ndf -h \/\n\n# Create DMG\n/'`,
+    ),
+    'the runtime patch must reclaim Go caches at the tagged script DMG boundary',
+  );
+  assert.ok(
+    body.indexOf('go clean -cache -modcache') <
+      body.indexOf('./installer/macos/build-dmg.sh'),
+    'the cache-reclamation injection must be installed before the tagged build script runs',
+  );
   assert.match(body, /codesign --verify --deep --strict/);
   assert.match(body, /stapler validate/);
   assert.match(body, /spctl --assess --type execute/);
