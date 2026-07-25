@@ -293,24 +293,61 @@ func TestInsertCorroborationAndGetCorroborations(t *testing.T) {
 	assert.Equal(t, "I confirm this", corrs[0].Evidence)
 }
 
-func TestGetCorroborationCountsAndLinksAmong(t *testing.T) {
+func TestGetEvidenceCountsAndLinksAmong(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
 	for _, id := range []string{"m1", "m2", "m3", "m4"} {
 		require.NoError(t, s.InsertMemory(ctx, testMemory(id, "agent1", "content "+id, "general")))
 	}
-	// m1 corroborated twice, m2 once, m3/m4 zero.
-	require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m1", AgentID: "a2", Evidence: "x", CreatedAt: time.Now().UTC()}))
-	require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m1", AgentID: "a3", Evidence: "y", CreatedAt: time.Now().UTC()}))
-	require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m2", AgentID: "a2", Evidence: "z", CreatedAt: time.Now().UTC()}))
+	now := time.Now().UTC()
+	// m1 has three audit rows from two distinct corroborators; m2 has one.
+	require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m1", AgentID: "a2", Evidence: "x", CreatedAt: now}))
+	require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m1", AgentID: "a2", Evidence: "updated x", CreatedAt: now.Add(time.Second)}))
+	require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m1", AgentID: "a3", Evidence: "y", CreatedAt: now}))
+	require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m2", AgentID: "a2", Evidence: "z", CreatedAt: now}))
+
+	// m1 has three challenge audit rows from two distinct challengers; m2 has one.
+	require.NoError(t, s.InsertChallenge(ctx, &ChallengeEntry{MemoryID: "m1", ChallengerID: "c2", Reason: "first", CreatedAt: now}))
+	require.NoError(t, s.InsertChallenge(ctx, &ChallengeEntry{MemoryID: "m1", ChallengerID: "c2", Reason: "follow-up", CreatedAt: now.Add(time.Second)}))
+	require.NoError(t, s.InsertChallenge(ctx, &ChallengeEntry{MemoryID: "m1", ChallengerID: "c3", Reason: "confirm", CreatedAt: now}))
+	require.NoError(t, s.InsertChallenge(ctx, &ChallengeEntry{MemoryID: "m2", ChallengerID: "c2", Reason: "single", CreatedAt: now}))
 
 	counts, err := s.GetCorroborationCounts(ctx, []string{"m1", "m2", "m3"})
 	require.NoError(t, err)
-	assert.Equal(t, 2, counts["m1"])
+	assert.Equal(t, 2, counts["m1"], "repeat rows from one agent must count once")
 	assert.Equal(t, 1, counts["m2"])
 	_, hasM3 := counts["m3"]
 	assert.False(t, hasM3, "zero-count memories should be absent from the map")
+
+	challengeCounts, err := s.GetChallengeCounts(ctx, []string{"m1", "m2", "m3"})
+	require.NoError(t, err)
+	assert.Equal(t, 2, challengeCounts["m1"], "repeat rows from one challenger must count once")
+	assert.Equal(t, 1, challengeCounts["m2"])
+	_, hasM3Challenge := challengeCounts["m3"]
+	assert.False(t, hasM3Challenge, "zero-count memories should be absent from the map")
+
+	// Canonical recovery fills only missing identities. Existing rich audit rows
+	// are preserved, and rerunning recovery is idempotent.
+	repaired, err := s.EnsureCanonicalEvidenceProjection(ctx, "m1", []string{"a2", "a4"}, []string{"c2", "c4"}, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	repaired, err = s.EnsureCanonicalEvidenceProjection(ctx, "m1", []string{"a2", "a4"}, []string{"c2", "c4"}, now)
+	require.NoError(t, err)
+	assert.False(t, repaired, "rerunning an exact projection is a no-op")
+	counts, err = s.GetCorroborationCounts(ctx, []string{"m1"})
+	require.NoError(t, err)
+	assert.Equal(t, 3, counts["m1"])
+	challengeCounts, err = s.GetChallengeCounts(ctx, []string{"m1"})
+	require.NoError(t, err)
+	assert.Equal(t, 3, challengeCounts["m1"])
+	var existingCorroborationRows, existingChallengeRows int
+	require.NoError(t, s.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM corroborations WHERE memory_id = ? AND agent_id = ?`, "m1", "a2").Scan(&existingCorroborationRows))
+	require.NoError(t, s.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM challenges WHERE memory_id = ? AND challenger_id = ?`, "m1", "c2").Scan(&existingChallengeRows))
+	assert.Equal(t, 2, existingCorroborationRows)
+	assert.Equal(t, 2, existingChallengeRows)
 
 	// Links: m1->m2 and m2->m3 are among the queried set; m1->m4 must be excluded
 	// because m4 is not in the queried (RBAC-visible) set.
@@ -332,9 +369,52 @@ func TestGetCorroborationCountsAndLinksAmong(t *testing.T) {
 	ec, err := s.GetCorroborationCounts(ctx, nil)
 	require.NoError(t, err)
 	assert.Empty(t, ec)
+	ch, err := s.GetChallengeCounts(ctx, nil)
+	require.NoError(t, err)
+	assert.Empty(t, ch)
 	el, err := s.GetLinksAmong(ctx, nil)
 	require.NoError(t, err)
 	assert.Empty(t, el)
+}
+
+func TestEvidenceProjectionCompletenessIsOneWayAndDefaultsComplete(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, s.InsertMemory(ctx, testMemory("m1", "agent1", "content m1", "general")))
+	require.NoError(t, s.InsertMemory(ctx, testMemory("m2", "agent1", "content m2", "general")))
+
+	exists, err := s.HasMemoryProjection(ctx, "m1")
+	require.NoError(t, err)
+	assert.True(t, exists)
+	exists, err = s.HasMemoryProjection(ctx, "missing")
+	require.NoError(t, err)
+	assert.False(t, exists)
+
+	complete, err := s.GetEvidenceProjectionCompleteness(ctx, []string{"m1", "m2"})
+	require.NoError(t, err)
+	assert.True(t, complete["m1"])
+	assert.True(t, complete["m2"], "an absent marker is backward-compatible complete")
+
+	require.NoError(t, s.MarkEvidenceProjectionIncomplete(ctx, "m1"))
+	require.NoError(t, s.MarkEvidenceProjectionIncomplete(ctx, "m1"), "marking is idempotent")
+	now := time.Now().UTC()
+	require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{
+		MemoryID: "m1", AgentID: "later-supporter", Evidence: "new native evidence", CreatedAt: now,
+	}))
+	require.NoError(t, s.InsertChallenge(ctx, &ChallengeEntry{
+		MemoryID: "m1", ChallengerID: "later-challenger", Reason: "new native evidence", CreatedAt: now,
+	}))
+	complete, err = s.GetEvidenceProjectionCompleteness(ctx, []string{"m1", "m2"})
+	require.NoError(t, err)
+	assert.False(t, complete["m1"], "later ordinary writes cannot restore lost lifetime history")
+	assert.True(t, complete["m2"])
+
+	complete, err = EvidenceProjectionCompleteness(ctx, struct{}{}, []string{"legacy"})
+	require.NoError(t, err)
+	assert.True(t, complete["legacy"], "stores without provenance support retain compatibility")
+	complete, err = s.GetEvidenceProjectionCompleteness(ctx, nil)
+	require.NoError(t, err)
+	assert.Empty(t, complete)
 }
 
 func TestGetPendingByDomain(t *testing.T) {

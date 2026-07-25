@@ -53,13 +53,19 @@ func mockSageAPI(t *testing.T) *httptest.Server {
 	mockQueryResults := map[string]any{
 		"results": []map[string]any{
 			{
-				"memory_id":        "mem-123",
-				"content":          "test memory",
-				"domain_tag":       "general",
-				"confidence_score": 0.9,
-				"memory_type":      "observation",
-				"status":           "committed",
-				"created_at":       "2024-01-01T00:00:00Z",
+				"memory_id":                 "mem-123",
+				"content":                   "test memory",
+				"domain_tag":                "general",
+				"confidence_score":          0.9,
+				"corroboration_count":       8,
+				"challenge_count":           2,
+				"evidence_counts_available": true,
+				"challenge_round":           3,
+				"current_challenger_count":  2,
+				"required_challengers":      9,
+				"memory_type":               "observation",
+				"status":                    "committed",
+				"created_at":                "2024-01-01T00:00:00Z",
 			},
 		},
 		"total_count": 1,
@@ -110,7 +116,10 @@ func mockSageAPI(t *testing.T) *httptest.Server {
 	mux.HandleFunc("/v1/memory/", func(w http.ResponseWriter, r *http.Request) {
 		// Handles /v1/memory/{id}/challenge
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "challenged"})
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "deprecated",
+			"tx_hash": "forget-tx-123",
+		})
 	})
 
 	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
@@ -225,6 +234,47 @@ func TestSageRecall(t *testing.T) {
 	assert.Len(t, memories, 1)
 	assert.Equal(t, "mem-123", memories[0]["memory_id"])
 	assert.Equal(t, "test memory", memories[0]["content"])
+	assert.Equal(t, 8, memories[0]["corroboration_count"])
+	assert.Equal(t, 2, memories[0]["challenge_count"])
+	assert.Equal(t, true, memories[0]["evidence_counts_available"])
+	assert.EqualValues(t, 3, memories[0]["challenge_round"])
+	assert.EqualValues(t, 2, memories[0]["current_challenger_count"])
+	assert.EqualValues(t, 9, memories[0]["required_challengers"])
+}
+
+func TestSageRecallPreservesIncompleteEvidenceLowerBounds(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"semantic": true, "provider": "test", "dimension": 3, "ready": true,
+		})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1, 0.2, 0.3}})
+	})
+	mux.HandleFunc("/v1/memory/query", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{{
+				"memory_id": "recovered", "content": "lower bound", "domain_tag": "general",
+				"confidence_score": 0.9, "corroboration_count": 8, "challenge_count": 2,
+				"evidence_counts_available": false, "memory_type": "observation",
+				"status": "committed", "created_at": "2024-01-01T00:00:00Z",
+			}},
+			"total_count": 1,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+
+	result, err := s.toolRecall(context.Background(), map[string]any{"query": "test"})
+	require.NoError(t, err)
+	memories := result.(map[string]any)["memories"].([]map[string]any)
+	require.Len(t, memories, 1)
+	assert.Equal(t, 8, memories[0]["corroboration_count"])
+	assert.Equal(t, 2, memories[0]["challenge_count"])
+	assert.Equal(t, false, memories[0]["evidence_counts_available"])
 }
 
 func TestSageRecall_MissingQuery(t *testing.T) {
@@ -667,7 +717,9 @@ func TestSageForget(t *testing.T) {
 
 	m := result.(map[string]any)
 	assert.Equal(t, "mem-123", m["memory_id"])
-	assert.Equal(t, "challenged", m["status"])
+	assert.Equal(t, "deprecated", m["status"],
+		"one-strike deprecation must not be mislabeled as merely challenged")
+	assert.Equal(t, "forget-tx-123", m["tx_hash"])
 	assert.Equal(t, "outdated info", m["reason"])
 }
 

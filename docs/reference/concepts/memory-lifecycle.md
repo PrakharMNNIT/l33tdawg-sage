@@ -1,8 +1,8 @@
-<!-- Reconciled through SAGE v11.6.1. -->
+<!-- Reconciled through SAGE v11.13.4. -->
 
 # Memory Lifecycle
 
-Verified against code at SAGE v11.6.1.
+Verified against code at SAGE v11.13.4.
 
 ## Overview
 
@@ -97,9 +97,9 @@ Each validator (in personal mode: the single node's own auto-voter; in multi-nod
 
 ### 6. Challenge → Deprecated (or Reinstated)
 
-A committed memory may be challenged via `TxTypeMemoryChallenge`. Chains authorize challenges through the app-v15 domain-access rules: the challenger must be the domain owner or ancestor owner, or hold a level-3 modify grant. Before app-v17 activates (and, after it activates, on any domain with a single modify-verb holder), an authorized challenge is decisive on inclusion.
+A committed memory may be challenged via `TxTypeMemoryChallenge`. Chains authorize challenges through the app-v15 domain-access rules: the challenger must be the domain owner or ancestor owner, or hold a level-3 modify grant. Before app-v17 activates, an authorized challenge is decisive on inclusion. From app-v17 until app-v21, that legacy one-strike outcome also applies to a domain with a single modify-verb holder. Post-app-v21, holder count no longer decides this alone: `k=0` still resolves immediately, while `k>0` parks the memory until `k+1` distinct challengers accrue.
 
-In that one-strike path there is no separate voting round: the challenged memory transitions from `committed` → `deprecated` in the same `processMemoryChallenge` call that includes the tx. app-v17 (below) replaces this with a quorum-scaled two-phase path when the domain has two or more modify-verb holders.
+In a one-strike path there is no separate voting round: the challenged memory transitions from `committed` → `deprecated` in the same `processMemoryChallenge` call that includes the tx. app-v17 (below) replaces this with a quorum-scaled two-phase path when the domain has two or more modify-verb holders; app-v21 supersedes fresh challenge selection with the corroboration-weighted policy documented below.
 
 **app-v16 - domainless-forget remediation.** The deprecation gate keys off the on-chain `memdomain:<memoryID>` record. Legacy memories committed before app-v8.4 never received one, so the gate rejected even the owner's challenge/forget with a generic "no recorded domain" denial (Code 91). app-v16 hardens the gate to split that into two distinct denials — both still DENY (Code 91, no new authorization): a legacy record predating app-v8.4 ("repair via an `OpMemoryDomainRepair` governance proposal") versus a genuinely unknown memory ("no memory record and no recorded domain") (`app.go:3862-3867`). The domained-but-unauthorized case is unchanged (Code 92). To unblock a legacy record, an **`OpMemoryDomainRepair`** governance proposal (`governance.ProposalOp = 6`, app-v16-gated) backfills the missing domain: it is created through the normal admin-gated propose path with a JSON payload of `[{"memory_id":"…","domain":"…"}]`, requires the default **2/3 supermajority** (`ThresholdFor` is fork-unaware, so a new op must not retroactively change quorum — replay parity), and on execution writes `memdomain:` only for a memory that already exists on-chain, has no domain yet, and whose target domain is already registered — idempotent, never overwriting, skipping unknown, already-domained, or unregistered-target IDs (`applyMemoryDomainRepair`, `app.go:7161`). After repair, a normal challenge/forget by an authorized agent deprecates as usual. app-v16 also requires every submit to carry a non-empty `domain_tag` **and persists that domain under app-v16+ rules even when app-v8.4 was never independently activated**, so the domainless state cannot recur on a skip-ahead chain.
 
@@ -112,11 +112,28 @@ In that one-strike path there is no separate voting round: the challenged memory
 
 **`TxTypeMemoryReinstate` (`processMemoryReinstate`)** drives the `challenged → committed` transition now represented in the `validTransitions` map. It is a new dual-gated tx (CheckTx + handler, returning Code 10 "unknown tx type" pre-fork so a non-activated chain replays byte-identically) taking a `challenged` memory back to `committed` and restoring the original content hash captured in the challenge record (the commit and deprecate paths nil that hash, so a reinstate without the record would leave a hash-less husk). Current modify-verb holders may reinstate. The original challenger may **always withdraw** using the AppHash-folded `ChallengerID`, even if their level-3 grant expires or is revoked while the dispute is open. Rejections: Code 94 not-challenged/double-resolve, Code 92 unauthorized. The operation is reachable through REST (`POST /v1/memory/{id}/reinstate`), MCP (`sage_reinstate`), and both Python SDK clients (`reinstate()`).
 
+**app-v21 - corroboration-weighted challenge rounds.** App-v21 is a governed, strict-`>` switch: chains that do not activate it retain the exact `legacy_v17` policy above, and the activation block itself still executes under that legacy policy. A fresh post-v21 challenge over a committed memory snapshots the sorted union of current modify holders (owner/ancestor owners plus live level-3 grantees) and current read-authorized AppHash-covered `corrob:<memory>:<agent>` supporters. New post-v21 corroborations themselves require that same read access, preventing arbitrary signed identities from manufacturing immunity. Only a live modify holder may open the dispute; a snapshotted corroborator may then reverse their support by endorsing that open round. The opener's own corroboration is excluded because their challenge already supersedes that support. If the resulting eligible canonical corroborator count is `k`, deprecation requires `k+1` distinct challengers from the frozen union. Thus `k=0` still deprecates on the first challenge, while an eight-corroborator memory requires nine distinct challengers—even when those supporters do not hold the modify verb.
+
+The encoded electorate is capped at 100 and modify-holder enumeration has a
+separate raw-work bound; more than 100 modify holders use app-v17's bounded
+two-distinct-holder fallback. Supporter selection may examine up to 1,024
+canonical markers within a 2,048 raw-key budget because pre-v21 markers can
+belong to agents who no longer have read access. If that scan truncates before
+the read-authorized electorate is full, the unseen suffix makes `k`
+indeterminate and the challenge fails closed with Code 95. Once the electorate
+is full, all modify holders plus the deterministic canonical supporter prefix
+that fits form a reachable committee; only supporters actually present in that
+frozen committee contribute to `k`.
+
+The round is first-class consensus state: `state:challengev21:<memory>` stores the threshold, prior hash/status, execution height, and frozen electorate; `state:challengeroundv21:<memory>` is monotonic; and `challengevotev21:<memory>:<agent>` records each agent's latest round. Open, endorse, threshold resolution, and reinstate are atomic Badger transactions. Duplicate votes are rejected, grant changes cannot rewrite an open electorate, and only a member of that snapshotted electorate may reinstate. Reinstatement removes the open record while the monotonically increasing round prevents stale votes from leaking into a later dispute. An app-v17 challenge already open at activation always finishes under its original legacy rules.
+
+Memory type, author-supplied confidence, and caller-supplied challenge strength are intentionally **not** threshold inputs in app-v21. Ordinary records do not persist those claims as validator-attested consensus facts, so treating them as immunity or challenge weight would let a caller self-assign protection. A future weighted-evidence revision must first define canonical attestations and fixed-point weights.
+
 **Disputed-but-recallable (off-chain surface).** While parked `challenged`, a memory stays recallable across REST and MCP recall on both SQLite and Postgres, flagged `disputed` in the response with a query-time confidence haircut (the shared `0.8` multiplier, presentation-only, leaving the on-chain status and stored confidence untouched; see `rest-api.md` on `POST /v1/memory/query`). The same multiplier is applied during `min_confidence` admission, preserving the guarantee that every returned `confidence_score` clears the caller's floor. The SQLite mirror carries the challenge metadata, clears it on confirm/reinstate, and its boot-time `ResolveChallengedMemories` sweep is scoped to legacy pre-v17 rows only.
 
 ### 7. Corroborate (does not change status)
 
-`TxTypeMemoryCorroborate` (`processMemoryCorroborate`, `app.go:1166-1188`) writes a `Corroboration` row to PostgreSQL. It does **not** change the memory's status or BadgerDB entry. Confidence is recalculated at query time using the corroboration count (see below).
+`TxTypeMemoryCorroborate` writes a `Corroboration` row to the serving projection and, under app-v10+, one deduplicated `corrob:<memory>:<agent>` marker to AppHash-covered BadgerDB. It does **not** change the memory's lifecycle status. The SQL distinct-agent count drives query-time confidence; the canonical markers are the only corroborations app-v21 may consult during deterministic challenge execution.
 
 ---
 
@@ -129,7 +146,8 @@ In that one-strike path there is no separate voting round: the challenged memory
 | Validator votes                 | BadgerDB (on-chain) | Key `state:vote:<memoryID>:<validatorID>`. Deterministic quorum input.                        |
 | Access grants / domain owners  | BadgerDB (on-chain) | Keys `grant:<domain>:<agentID>`, `domain:<name>`. Written via tx, not REST-only.             |
 | Full content, embedding vector  | PostgreSQL (off-chain) | Written in `Commit`; node-local until replicated by PostgreSQL shared service.              |
-| Corroborations                  | PostgreSQL (off-chain) | Written in `Commit`. Count read at query time for confidence computation.                    |
+| Corroborations                  | BadgerDB marker + SQL audit projection | app-v10+ writes one canonical `corrob:<memory>:<agent>` marker; SQL stores evidence/history and distinct-agent query counts. |
+| Challenge rounds/votes          | BadgerDB (on-chain) + SQL audit projection | app-v21 stores the open threshold/electorate and per-agent round markers; SQL `challenge_count` is lifetime distinct audit evidence, not the current open tally. |
 | **Tags**                        | SQLite/Postgres serving projection; app-v20 scoped copy in BadgerDB | Both SQL backends implement `SetTags`/`GetTags` and OR-filtered recall. Above app-v20 tags are bounded, sorted, and deduplicated in the signed `MemorySubmit`; for a scoped domain they are also stored in the AppHash-covered canonical envelope and restored with the projection. Ordinary-domain tags remain node-local serving metadata. |
 | Embedding vector (supplementary) | Process-local SupplementaryCache → PostgreSQL | Staged in-process pre-broadcast; only the receiving node has it in cache. |
 | Knowledge triples               | PostgreSQL (off-chain) | Staged via SupplementaryCache, flushed in Commit.                                            |
@@ -200,8 +218,9 @@ Combined with decay: a memory with many corroborations decays more slowly in eff
 A memory reaches `deprecated` via these paths:
 
 1. **Quorum failure**: all validators voted, `acceptWeight / totalWeight < 2/3` → deprecated in `checkAndApplyQuorum` (`app.go:3766`).
-2. **Challenge (one-strike)**: a `TxTypeMemoryChallenge` is included in a block → immediately deprecated (`app.go:4011`). No secondary vote. This is the behavior before app-v17 activates, and after activation on any domain with a single modify-verb holder.
+2. **Challenge (one-strike)**: a `TxTypeMemoryChallenge` is included in a block → immediately deprecated (`app.go:4011`). No secondary vote. This is the behavior before app-v17 activates; between app-v17 and app-v21 it also applies to a domain with a single modify-verb holder. Post-app-v21, immediate resolution instead means `k=0` eligible corroborators.
 3. **Challenge confirmed (app-v17 two-phase)**: on a domain with two or more modify-verb holders the first authorized challenge parks the memory `challenged`; a second, *distinct* modify-verb holder's confirming challenge finalizes the deprecation (`app.go:3918-3943`). The original challenger cannot self-confirm.
-4. **Explicit transition**: `ValidTransition(proposed → deprecated)` and `ValidTransition(validated → deprecated)` are also allowed for administrative paths, though no current public tx type drives them directly.
+4. **Corroboration-weighted challenge (app-v21)**: a governed post-v21 chain snapshots current modify holders plus current read-authorized canonical corroborators and requires `k+1` distinct challengers, where `k` is the eligible supporter count excluding the opener. Zero corroborators still resolve immediately; oversized modifier rosters use the bounded app-v17 two-party fallback and oversized supporter rosters use a deterministic bounded committee.
+5. **Explicit transition**: `ValidTransition(proposed → deprecated)` and `ValidTransition(validated → deprecated)` are also allowed for administrative paths, though no current public tx type drives them directly.
 
 Deprecated memories remain in PostgreSQL for audit purposes and are queryable by ID but are excluded from default similarity search results (callers can override with `status_filter`).

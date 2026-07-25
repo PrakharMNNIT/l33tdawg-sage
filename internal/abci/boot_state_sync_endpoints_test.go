@@ -25,11 +25,15 @@ const (
 )
 
 func stateSyncEndpointAuthorizations(t *testing.T, now time.Time) (*statesync.ServingAuthorization, *statesync.ReceivingAuthorization) {
+	return stateSyncEndpointAuthorizationsForVersion(t, now, statesync.RequiredAppVersion)
+}
+
+func stateSyncEndpointAuthorizationsForVersion(t *testing.T, now time.Time, appVersion uint64) (*statesync.ServingAuthorization, *statesync.ReceivingAuthorization) {
 	t.Helper()
 	validatorKey := bytes.Repeat([]byte{0x42}, 32)
 	join := statesync.JoinAuthorizationConfig{
 		ChainID: "sage-state-sync-test", JoiningNodeID: stateSyncJoiner,
-		ValidatorPublicKey: validatorKey, AppVersion: statesync.RequiredAppVersion,
+		ValidatorPublicKey: validatorKey, AppVersion: appVersion,
 		ExpiresAt: now.Add(time.Hour), SnapshotHeightFloor: 40,
 		ValidatorNodeIDs: []string{stateSyncProviderA, stateSyncProviderB},
 		ProviderNodeIDs:  []string{stateSyncProviderA, stateSyncProviderB},
@@ -113,7 +117,7 @@ func TestBootStateSyncServingRequiresExplicitAuthorizationAndUsesPublicCatalog(t
 	publishStateSyncEndpointSnapshot(t, root, 42, 0x21, 1)
 	publishStateSyncEndpointSnapshot(t, root, 43, 0x30, 1)
 
-	app := &bootRuntimeTestApp{}
+	app := &bootRuntimeTestApp{appVersion: statesync.RequiredAppVersion}
 	runtime := newBootRuntimeTestRuntime(t, app)
 	dormant, err := runtime.ListSnapshots(context.Background(), &abcitypes.RequestListSnapshots{})
 	require.NoError(t, err)
@@ -159,13 +163,34 @@ func TestBootStateSyncServingRequiresExplicitAuthorizationAndUsesPublicCatalog(t
 	assert.Empty(t, expired.Snapshots, "expired serving authorization fails closed without destabilizing ABCI")
 }
 
+func TestBootStateSyncServingRejectsAuthorizedSessionVersionMismatch(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	serving, _ := stateSyncEndpointAuthorizationsForVersion(t, now, 21)
+	hash := sha256.Sum256([]byte("v20-serving-state"))
+	runtime := newBootRuntimeTestRuntime(t, &bootRuntimeTestApp{
+		height: 40, appHash: hash[:], appVersion: 20,
+	})
+	controller, err := NewStateSyncServingController(StateSyncServingControllerConfig{
+		Authorization: serving,
+		SnapshotRoot:  t.TempDir(),
+		MaxSnapshotHeight: func(context.Context) (uint64, error) {
+			return 40, nil
+		},
+		Now: func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	err = runtime.ArmStateSyncServing(controller)
+	require.ErrorContains(t, err, "does not match authorized session version 21")
+	assert.Equal(t, BootStateSyncDisabled, runtime.Phase())
+}
+
 func TestBootStateSyncServingLatchesClockRollbackBeforeExpiry(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	clockNow := now
 	serving, _ := stateSyncEndpointAuthorizations(t, now)
 	root := t.TempDir()
 	publishStateSyncEndpointSnapshot(t, root, 42, 0x31, 1)
-	runtime := newBootRuntimeTestRuntime(t, &bootRuntimeTestApp{})
+	runtime := newBootRuntimeTestRuntime(t, &bootRuntimeTestApp{appVersion: statesync.RequiredAppVersion})
 	controller, err := NewStateSyncServingController(StateSyncServingControllerConfig{
 		Authorization: serving, SnapshotRoot: root, Now: func() time.Time { return clockNow },
 		MaxSnapshotHeight: func(context.Context) (uint64, error) { return 42, nil },
@@ -256,6 +281,48 @@ func TestBootStateSyncReceiverAuthorizesProviderAndActivatesSynchronously(t *tes
 	sealed, err := sealBootRuntimeTest(runtime, 42, snapshot.Metadata.AppHash, statesync.RequiredAppVersion, bootRuntimeTestDurableSeal)
 	require.NoError(t, err)
 	require.True(t, sealed)
+	assert.Equal(t, BootStateSyncSealed, runtime.Phase())
+}
+
+func TestBootStateSyncReceiverUsesExactV21AuthorizationVersion(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	_, receiving := stateSyncEndpointAuthorizationsForVersion(t, now, 21)
+	snapshot, chunks := publishStateSyncEndpointSnapshot(t, t.TempDir(), 42, 0x46, 1)
+	oldHash := sha256.Sum256([]byte("old-v21-session-state"))
+	oldApp := &bootRuntimeTestApp{height: 10, appHash: oldHash[:], appVersion: 19}
+	runtime := newBootRuntimeTestRuntime(t, oldApp)
+	newApp := &bootRuntimeTestApp{height: 42, appHash: snapshot.Metadata.AppHash, appVersion: 21}
+
+	controller, err := NewStateSyncReceiverController(StateSyncReceiverControllerConfig{
+		Authorization: receiving,
+		StagingRoot:   t.TempDir(),
+		Now:           func() time.Time { return now },
+		Prepare: stateSyncEndpointPreparer(func(
+			context.Context,
+			*ConsensusBundle,
+			statesync.Metadata,
+			string,
+		) (*ConsensusBundle, error) {
+			return NewConsensusBundleWithCleanup(context.Background(), newApp, newApp.Close)
+		}),
+	})
+	require.NoError(t, err)
+	require.NoError(t, runtime.ArmStateSyncReceiver(controller))
+
+	offered, err := runtime.OfferSnapshot(context.Background(), stateSyncEndpointOffer(snapshot))
+	require.NoError(t, err)
+	require.Equal(t, abcitypes.ResponseOfferSnapshot_ACCEPT, offered.Result)
+	applied, err := runtime.ApplySnapshotChunk(context.Background(), &abcitypes.RequestApplySnapshotChunk{
+		Index: 0, Chunk: chunks[0], Sender: stateSyncProviderA,
+	})
+	require.NoError(t, err)
+	require.Equal(t, abcitypes.ResponseApplySnapshotChunk_ACCEPT, applied.Result)
+	assert.Equal(t, uint64(21), runtime.ExpectedAppVersion(),
+		"activation must use the authorization's exact app version, not the v20 compatibility default")
+
+	sealed, err := sealBootRuntimeTest(runtime, 42, snapshot.Metadata.AppHash, 21, bootRuntimeTestDurableSeal)
+	require.NoError(t, err)
+	assert.True(t, sealed)
 	assert.Equal(t, BootStateSyncSealed, runtime.Phase())
 }
 

@@ -1,4 +1,4 @@
-<!-- Core document reconciled through SAGE v11.13.3, including directional cross-chain peer RBAC and the quorum/state-sync/governance-gateway sections. -->
+<!-- Core document reconciled through SAGE v11.13.4, including directional cross-chain peer RBAC and the quorum/state-sync/governance-gateway sections. -->
 
 # RBAC, Organizations, and Federation
 
@@ -482,11 +482,16 @@ and remains off when neither is set (`cmd/sage-gui/state_sync_config.go`). Both
 roles require a strict locally installed JSON trust root. Its schema binds
 chain ID, joining Comet node ID, the joining node's prospective validator
 Ed25519 public key, app
-version 20, expiry, snapshot floor, existing validator node IDs, and approved
+application version 20 or 21, expiry, snapshot floor, existing validator node
+IDs, and approved
 providers. Provider IDs must exactly equal validator IDs; v1 does not permit a
 preferred subset. The loader rejects files over 64 KiB, symlinks, non-regular or
 group/world-writable modes, open-time replacement, unknown fields, trailing
 JSON, and non-canonical values (`internal/statesync/authorization.go`).
+Every authorization and transfer session is pinned to one exact supported app
+version: a v20 receiver accepts only a v20 image and a v21 receiver accepts only
+a v21 image. This preserves existing v20 sessions while preventing a transfer
+from crossing an application-state-machine boundary.
 
 Authorization and a successful transfer do not grant voting power: the sealed
 receiver remains a non-validator until a separate signed governance action

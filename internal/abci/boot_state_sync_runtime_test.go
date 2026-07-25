@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -219,6 +220,68 @@ func TestBootStateSyncRuntimeHoldsPendingBlockExecutionUntilSeal(t *testing.T) {
 	require.NoError(t, checkTxErr)
 	require.NotNil(t, checkTx)
 	require.Zero(t, checkTx.Code)
+}
+
+func TestBootStateSyncRuntimeSupportsV20AndV21WithExactSessionVersion(t *testing.T) {
+	for _, version := range []uint64{20, 21} {
+		t.Run(fmt.Sprintf("app-v%d", version), func(t *testing.T) {
+			oldHash := sha256.Sum256([]byte("old-versioned-state"))
+			newHash := sha256.Sum256([]byte(fmt.Sprintf("new-versioned-state-%d", version)))
+			runtime := newBootRuntimeTestRuntime(t, &bootRuntimeTestApp{
+				height: 40, appHash: oldHash[:], appVersion: 19,
+			})
+			require.NoError(t, runtime.transitionBootStateSync(BootStateSyncDiscovering))
+			require.NoError(t, runtime.transitionBootStateSync(BootStateSyncAssembling))
+			require.NoError(t, runtime.transitionBootStateSync(BootStateSyncPrepared))
+
+			newApp := &bootRuntimeTestApp{height: 42, appHash: newHash[:], appVersion: version}
+			require.NoError(t, runtime.activatePreparedBundle(42, newHash[:], version, func(*ConsensusBundle) (*ConsensusBundle, error) {
+				return NewConsensusBundleWithCleanup(context.Background(), newApp, newApp.Close)
+			}))
+			assert.Equal(t, version, runtime.ExpectedAppVersion())
+			assert.Equal(t, BootStateSyncPendingComet, runtime.Phase())
+		})
+	}
+
+	t.Run("replacement must match v21 session exactly", func(t *testing.T) {
+		oldHash := sha256.Sum256([]byte("old-exact-version-state"))
+		newHash := sha256.Sum256([]byte("new-exact-version-state"))
+		runtime := newBootRuntimeTestRuntime(t, &bootRuntimeTestApp{
+			height: 40, appHash: oldHash[:], appVersion: 19,
+		})
+		require.NoError(t, runtime.transitionBootStateSync(BootStateSyncDiscovering))
+		require.NoError(t, runtime.transitionBootStateSync(BootStateSyncAssembling))
+		require.NoError(t, runtime.transitionBootStateSync(BootStateSyncPrepared))
+
+		wrongVersionApp := &bootRuntimeTestApp{height: 42, appHash: newHash[:], appVersion: 20}
+		err := runtime.activatePreparedBundle(42, newHash[:], 21, func(*ConsensusBundle) (*ConsensusBundle, error) {
+			return NewConsensusBundleWithCleanup(context.Background(), wrongVersionApp, wrongVersionApp.Close)
+		})
+		assert.ErrorContains(t, err, "does not match trusted snapshot state and app version")
+		assert.Equal(t, int32(1), wrongVersionApp.closeCalls.Load())
+		assert.Equal(t, BootStateSyncFailed, runtime.Phase())
+	})
+
+	for _, version := range []uint64{19, 22} {
+		t.Run(fmt.Sprintf("unsupported-app-v%d", version), func(t *testing.T) {
+			oldHash := sha256.Sum256([]byte("old-unsupported-version-state"))
+			newHash := sha256.Sum256([]byte("new-unsupported-version-state"))
+			runtime := newBootRuntimeTestRuntime(t, &bootRuntimeTestApp{
+				height: 40, appHash: oldHash[:], appVersion: 19,
+			})
+			require.NoError(t, runtime.transitionBootStateSync(BootStateSyncDiscovering))
+			require.NoError(t, runtime.transitionBootStateSync(BootStateSyncAssembling))
+			require.NoError(t, runtime.transitionBootStateSync(BootStateSyncPrepared))
+			called := false
+			err := runtime.activatePreparedBundle(42, newHash[:], version, func(*ConsensusBundle) (*ConsensusBundle, error) {
+				called = true
+				return nil, nil
+			})
+			assert.ErrorContains(t, err, "supported app version 20 or 21")
+			assert.False(t, called)
+			assert.Equal(t, BootStateSyncFailed, runtime.Phase())
+		})
+	}
 }
 
 func TestBootStateSyncRuntimePendingWaitHonorsContextAndFailure(t *testing.T) {

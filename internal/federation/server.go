@@ -870,6 +870,22 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	// Per-record treaty enforcement (defense in depth over the store filter):
 	// domain coverage, committed status, classification ≤ ceiling.
+	recordIDs := make([]string, len(records))
+	for i, rec := range records {
+		recordIDs[i] = rec.MemoryID
+	}
+	corrCounts, corrErr := m.memStore.GetCorroborationCounts(r.Context(), recordIDs)
+	challengeCounts, challengeErr := m.memStore.GetChallengeCounts(r.Context(), recordIDs)
+	if challengeErr != nil {
+		m.logger.Warn().Err(challengeErr).Str("peer", peer.ChainID).Msg("federation challenge counts unavailable")
+	}
+	evidenceComplete, evidenceCompleteErr := store.EvidenceProjectionCompleteness(
+		r.Context(), m.memStore, recordIDs,
+	)
+	if evidenceCompleteErr != nil {
+		m.logger.Warn().Err(evidenceCompleteErr).Str("peer", peer.ChainID).
+			Msg("federation evidence projection completeness unavailable")
+	}
 	results := make([]*MemoryResult, 0, len(records))
 	hidden := 0
 	for _, rec := range records {
@@ -895,13 +911,13 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 			hidden++
 			continue
 		}
-		corrs, corrErr := m.memStore.GetCorroborations(r.Context(), rec.MemoryID)
 		if corrErr != nil && req.MinConfidence > 0 {
 			// Fail closed under a floor: a boost-less (understated) confidence could
 			// wrongly drop this record on the requesting side. Hide rather than mislead.
 			hidden++
 			continue
 		}
+		corrCount := corrCounts[rec.MemoryID]
 		results = append(results, &MemoryResult{
 			MemoryID:           rec.MemoryID,
 			SubmittingAgent:    rec.SubmittingAgent,
@@ -909,12 +925,15 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 			ContentHash:        hex.EncodeToString(rec.ContentHash),
 			MemoryType:         string(rec.MemoryType),
 			DomainTag:          rec.DomainTag,
-			ConfidenceScore:    memory.ComputeConfidenceForRecord(rec, now, len(corrs)),
-			CorroborationCount: len(corrs),
-			Classification:     int(memClass),
-			Status:             string(rec.Status),
-			CreatedAt:          rec.CreatedAt,
-			CommittedAt:        rec.CommittedAt,
+			ConfidenceScore:    memory.ComputeConfidenceForRecord(rec, now, corrCount),
+			CorroborationCount: corrCount,
+			ChallengeCount:     challengeCounts[rec.MemoryID],
+			EvidenceCountsAvailable: corrErr == nil && challengeErr == nil &&
+				evidenceCompleteErr == nil && evidenceComplete[rec.MemoryID],
+			Classification: int(memClass),
+			Status:         string(rec.Status),
+			CreatedAt:      rec.CreatedAt,
+			CommittedAt:    rec.CommittedAt,
 		})
 	}
 	// hidden is logged, NOT returned — see QueryResponse (classification oracle).

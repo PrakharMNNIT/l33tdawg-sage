@@ -153,10 +153,23 @@ type MemoryResult struct {
 	// memory — the multiplier behind the corroboration boost in ConfidenceScore.
 	// Exposing it lets readers distinguish a low score caused by no corroboration
 	// (a fresh, untested belief) from one caused by time decay (a once-solid fact).
-	CorroborationCount int    `json:"corroboration_count"`
-	Classification     int    `json:"classification"`
-	Status             string `json:"status"`
-	// Disputed is true for an app-v17 two-phase-CHALLENGED memory: still live and
+	CorroborationCount int `json:"corroboration_count"`
+	// ChallengeCount is the number of distinct challengers in the off-chain audit
+	// projection for this memory. It is a lifetime evidence count; Status and
+	// Disputed remain authoritative for whether a challenge is currently open.
+	ChallengeCount int `json:"challenge_count"`
+	// EvidenceCountsAvailable is true only when both count queries succeeded and
+	// no durable recovery/repair-incomplete marker was detected. Current servers
+	// always emit this field.
+	EvidenceCountsAvailable bool `json:"evidence_counts_available"`
+	// App-v21 open-round progress is authoritative Badger state. These fields are
+	// absent when there is no currently-open weighted challenge round.
+	ChallengeRound         *uint64 `json:"challenge_round,omitempty"`
+	CurrentChallengerCount *uint32 `json:"current_challenger_count,omitempty"`
+	RequiredChallengers    *uint32 `json:"required_challengers,omitempty"`
+	Classification         int     `json:"classification"`
+	Status                 string  `json:"status"`
+	// Disputed is true for an app-v17/app-v21 CHALLENGED memory: still live and
 	// recallable, but under dispute pending confirm/reinstate. Off-chain surface
 	// signal only — the on-chain status is carried in Status ("challenged"). When
 	// set, ConfidenceScore already reflects the disputed haircut. Personal nodes
@@ -181,22 +194,28 @@ type MemoryResult struct {
 
 // MemoryDetailResponse is a memory record with votes and corroborations.
 type MemoryDetailResponse struct {
-	MemoryID        string                  `json:"memory_id"`
-	SubmittingAgent string                  `json:"submitting_agent"`
-	Content         string                  `json:"content"`
-	ContentHash     string                  `json:"content_hash"`
-	MemoryType      string                  `json:"memory_type"`
-	DomainTag       string                  `json:"domain_tag"`
-	ConfidenceScore float64                 `json:"confidence_score"`
-	Classification  int                     `json:"classification"`
-	Status          string                  `json:"status"`
-	ParentHash      string                  `json:"parent_hash,omitempty"`
-	TaskStatus      string                  `json:"task_status,omitempty"`
-	CreatedAt       time.Time               `json:"created_at"`
-	CommittedAt     *time.Time              `json:"committed_at,omitempty"`
-	Votes           []*store.ValidationVote `json:"votes,omitempty"`
-	Corroborations  []*store.Corroboration  `json:"corroborations,omitempty"`
-	LinkedMemories  []memory.MemoryLink     `json:"linked_memories,omitempty"`
+	MemoryID                string                  `json:"memory_id"`
+	SubmittingAgent         string                  `json:"submitting_agent"`
+	Content                 string                  `json:"content"`
+	ContentHash             string                  `json:"content_hash"`
+	MemoryType              string                  `json:"memory_type"`
+	DomainTag               string                  `json:"domain_tag"`
+	ConfidenceScore         float64                 `json:"confidence_score"`
+	Classification          int                     `json:"classification"`
+	Status                  string                  `json:"status"`
+	ParentHash              string                  `json:"parent_hash,omitempty"`
+	TaskStatus              string                  `json:"task_status,omitempty"`
+	CreatedAt               time.Time               `json:"created_at"`
+	CommittedAt             *time.Time              `json:"committed_at,omitempty"`
+	Votes                   []*store.ValidationVote `json:"votes,omitempty"`
+	Corroborations          []*store.Corroboration  `json:"corroborations,omitempty"`
+	CorroborationCount      int                     `json:"corroboration_count"`
+	ChallengeCount          int                     `json:"challenge_count"`
+	EvidenceCountsAvailable bool                    `json:"evidence_counts_available"`
+	ChallengeRound          *uint64                 `json:"challenge_round,omitempty"`
+	CurrentChallengerCount  *uint32                 `json:"current_challenger_count,omitempty"`
+	RequiredChallengers     *uint32                 `json:"required_challengers,omitempty"`
+	LinkedMemories          []memory.MemoryLink     `json:"linked_memories,omitempty"`
 }
 
 // CometBFT broadcast_tx_commit response structure.
@@ -727,6 +746,84 @@ func (s *Server) corroborationCounts(ctx context.Context, records []*memory.Memo
 	return counts, nil
 }
 
+// challengeCounts batch-fetches lifetime distinct-challenger audit counts for
+// the recall response. A missing map key means zero. Callers retain the error so
+// evidence_counts_available can distinguish projection failure from true zero.
+func (s *Server) challengeCounts(ctx context.Context, records []*memory.MemoryRecord) (map[string]int, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, len(records))
+	for i, rec := range records {
+		ids[i] = rec.MemoryID
+	}
+	counts, err := s.store.GetChallengeCounts(ctx, ids)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("batch challenge count failed")
+		return nil, err
+	}
+	return counts, nil
+}
+
+// evidenceProjectionCompleteness distinguishes a complete native lifetime audit
+// from a recovery-built canonical lower bound. Optional/legacy stores default to
+// complete; production SQLite/Postgres persist one-way incomplete markers.
+func (s *Server) evidenceProjectionCompleteness(ctx context.Context, records []*memory.MemoryRecord) (map[string]bool, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, len(records))
+	for i, rec := range records {
+		ids[i] = rec.MemoryID
+	}
+	complete, err := store.EvidenceProjectionCompleteness(ctx, s.store, ids)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("batch evidence projection completeness failed")
+		return nil, err
+	}
+	return complete, nil
+}
+
+type challengeRoundProgress struct {
+	round    uint64
+	current  uint32
+	required uint32
+}
+
+// challengeRoundProgressFor reads the canonical open app-v21 record for each
+// local result. A legacy challenge or a closed v21 round has no record and
+// therefore emits no progress fields.
+func (s *Server) challengeRoundProgressFor(records []*memory.MemoryRecord) (map[string]challengeRoundProgress, error) {
+	if s.badgerStore == nil || len(records) == 0 {
+		return nil, nil
+	}
+	progress := make(map[string]challengeRoundProgress)
+	for _, rec := range records {
+		open, err := s.badgerStore.GetChallengeRecordV21(rec.MemoryID)
+		if err != nil {
+			s.logger.Warn().Err(err).Str("memory_id", rec.MemoryID).Msg("app-v21 challenge progress unavailable")
+			return nil, err
+		}
+		if open == nil {
+			continue
+		}
+		progress[rec.MemoryID] = challengeRoundProgress{
+			round: open.Round, current: open.ChallengerCount, required: open.RequiredChallengers,
+		}
+	}
+	return progress, nil
+}
+
+func applyChallengeRoundProgress(result *MemoryResult, progress challengeRoundProgress, ok bool) {
+	if !ok {
+		return
+	}
+	round, current, required := progress.round, progress.current, progress.required
+	result.ChallengeRound = &round
+	result.CurrentChallengerCount = &current
+	result.RequiredChallengers = &required
+}
+
 // handleQueryMemory handles POST /v1/memory/query.
 func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	var req QueryMemoryRequest
@@ -840,6 +937,13 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	// instant the store filtered on; classification filtering as before.
 	now := start
 	corrCounts, ccErr := s.corroborationCounts(r.Context(), records)
+	challengeCounts, challengeCountErr := s.challengeCounts(r.Context(), records)
+	evidenceComplete, evidenceCompleteErr := s.evidenceProjectionCompleteness(r.Context(), records)
+	roundProgress, roundProgressErr := s.challengeRoundProgressFor(records)
+	if roundProgressErr != nil {
+		writeProblem(w, http.StatusInternalServerError, "Recall error", "Failed to read challenge progress.")
+		return
+	}
 	if opts.DecayFloor > 0 && ccErr != nil {
 		// Fail closed under a floor: without accurate corroboration counts a boosted
 		// record the store kept could serialize below the floor. (No floor: degrade.)
@@ -899,7 +1003,7 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 		// rec.Status and committed rows are untouched.
 		disputed := markDisputed(rec, &currentConf)
 
-		results = append(results, &MemoryResult{
+		result := &MemoryResult{
 			MemoryID:           rec.MemoryID,
 			SubmittingAgent:    rec.SubmittingAgent,
 			Content:            rec.Content,
@@ -909,13 +1013,19 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 			ConfidenceScore:    currentConf,
 			InitialConfidence:  initialConfidencePtr(rec.ConfidenceScore),
 			CorroborationCount: corrCount,
-			Classification:     int(memClass),
-			Status:             string(rec.Status),
-			Disputed:           disputed,
-			ParentHash:         rec.ParentHash,
-			CreatedAt:          rec.CreatedAt,
-			CommittedAt:        rec.CommittedAt,
-		})
+			ChallengeCount:     challengeCounts[rec.MemoryID],
+			EvidenceCountsAvailable: ccErr == nil && challengeCountErr == nil &&
+				evidenceCompleteErr == nil && evidenceComplete[rec.MemoryID],
+			Classification: int(memClass),
+			Status:         string(rec.Status),
+			Disputed:       disputed,
+			ParentHash:     rec.ParentHash,
+			CreatedAt:      rec.CreatedAt,
+			CommittedAt:    rec.CommittedAt,
+		}
+		progress, hasProgress := roundProgress[rec.MemoryID]
+		applyChallengeRoundProgress(result, progress, hasProgress)
+		results = append(results, result)
 	}
 	// The store enforced the decayed floor over the full candidate set and filled
 	// top_k, so there is nothing to drop or cap here.
@@ -1140,24 +1250,26 @@ func (s *Server) mergeFederatedRecall(r *http.Request, resp *QueryMemoryResponse
 			}
 			coverage.Matched++
 			addRanked(&MemoryResult{
-				MemoryID:           fr.MemoryID,
-				SubmittingAgent:    fr.SubmittingAgent,
-				Content:            fr.Content,
-				ContentHash:        fr.ContentHash,
-				MemoryType:         fr.MemoryType,
-				DomainTag:          fr.DomainTag,
-				ConfidenceScore:    fr.ConfidenceScore,
-				CorroborationCount: fr.CorroborationCount,
-				Classification:     fr.Classification,
-				Status:             fr.Status,
-				CreatedAt:          fr.CreatedAt,
-				CommittedAt:        fr.CommittedAt,
-				SourceChainID:      fr.SourceChainID,
-				SourceKind:         "federated_live",
-				OriginMemoryID:     fr.MemoryID,
-				OriginAgentID:      fr.SubmittingAgent,
-				Foreign:            true,
-				Trust:              "external_untrusted",
+				MemoryID:                fr.MemoryID,
+				SubmittingAgent:         fr.SubmittingAgent,
+				Content:                 fr.Content,
+				ContentHash:             fr.ContentHash,
+				MemoryType:              fr.MemoryType,
+				DomainTag:               fr.DomainTag,
+				ConfidenceScore:         fr.ConfidenceScore,
+				CorroborationCount:      fr.CorroborationCount,
+				ChallengeCount:          fr.ChallengeCount,
+				EvidenceCountsAvailable: fr.EvidenceCountsAvailable,
+				Classification:          fr.Classification,
+				Status:                  fr.Status,
+				CreatedAt:               fr.CreatedAt,
+				CommittedAt:             fr.CommittedAt,
+				SourceChainID:           fr.SourceChainID,
+				SourceKind:              "federated_live",
+				OriginMemoryID:          fr.MemoryID,
+				OriginAgentID:           fr.SubmittingAgent,
+				Foreign:                 true,
+				Trust:                   "external_untrusted",
 			}, 1.0/float64(federationRRFK+peerRank+1), nextOrder)
 			nextOrder++
 		}
@@ -1429,6 +1541,13 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	// store's filter instant.
 	now := start
 	corrCounts, ccErr := s.corroborationCounts(r.Context(), records)
+	challengeCounts, challengeCountErr := s.challengeCounts(r.Context(), records)
+	evidenceComplete, evidenceCompleteErr := s.evidenceProjectionCompleteness(r.Context(), records)
+	roundProgress, roundProgressErr := s.challengeRoundProgressFor(records)
+	if roundProgressErr != nil {
+		writeProblem(w, http.StatusInternalServerError, "Recall error", "Failed to read challenge progress.")
+		return
+	}
 	if opts.DecayFloor > 0 && ccErr != nil {
 		// Fail closed under a floor: without accurate corroboration counts a boosted
 		// record the store kept could serialize below the floor. (No floor: degrade.)
@@ -1477,7 +1596,7 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 		// rec.Status and committed rows are untouched.
 		disputed := markDisputed(rec, &currentConf)
 
-		results = append(results, &MemoryResult{
+		result := &MemoryResult{
 			MemoryID:           rec.MemoryID,
 			SubmittingAgent:    rec.SubmittingAgent,
 			Content:            rec.Content,
@@ -1487,13 +1606,19 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 			ConfidenceScore:    currentConf,
 			InitialConfidence:  initialConfidencePtr(rec.ConfidenceScore),
 			CorroborationCount: corrCount,
-			Classification:     int(memClass),
-			Status:             string(rec.Status),
-			Disputed:           disputed,
-			ParentHash:         rec.ParentHash,
-			CreatedAt:          rec.CreatedAt,
-			CommittedAt:        rec.CommittedAt,
-		})
+			ChallengeCount:     challengeCounts[rec.MemoryID],
+			EvidenceCountsAvailable: ccErr == nil && challengeCountErr == nil &&
+				evidenceCompleteErr == nil && evidenceComplete[rec.MemoryID],
+			Classification: int(memClass),
+			Status:         string(rec.Status),
+			Disputed:       disputed,
+			ParentHash:     rec.ParentHash,
+			CreatedAt:      rec.CreatedAt,
+			CommittedAt:    rec.CommittedAt,
+		}
+		progress, hasProgress := roundProgress[rec.MemoryID]
+		applyChallengeRoundProgress(result, progress, hasProgress)
+		results = append(results, result)
 	}
 	// The store enforced the decayed floor and filled top_k; nothing to cap here.
 
@@ -1676,6 +1801,13 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	// Serialize with task-aware decay, pinned to the store's filter instant.
 	now := start
 	corrCounts, ccErr := s.corroborationCounts(r.Context(), records)
+	challengeCounts, challengeCountErr := s.challengeCounts(r.Context(), records)
+	evidenceComplete, evidenceCompleteErr := s.evidenceProjectionCompleteness(r.Context(), records)
+	roundProgress, roundProgressErr := s.challengeRoundProgressFor(records)
+	if roundProgressErr != nil {
+		writeProblem(w, http.StatusInternalServerError, "Recall error", "Failed to read challenge progress.")
+		return
+	}
 	if opts.DecayFloor > 0 && ccErr != nil {
 		// Fail closed under a floor: without accurate corroboration counts a boosted
 		// record the store kept could serialize below the floor. (No floor: degrade.)
@@ -1724,7 +1856,7 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 		// rec.Status and committed rows are untouched.
 		disputed := markDisputed(rec, &currentConf)
 
-		results = append(results, &MemoryResult{
+		result := &MemoryResult{
 			MemoryID:           rec.MemoryID,
 			SubmittingAgent:    rec.SubmittingAgent,
 			Content:            rec.Content,
@@ -1734,13 +1866,19 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 			ConfidenceScore:    currentConf,
 			InitialConfidence:  initialConfidencePtr(rec.ConfidenceScore),
 			CorroborationCount: corrCount,
-			Classification:     int(memClass),
-			Status:             string(rec.Status),
-			Disputed:           disputed,
-			ParentHash:         rec.ParentHash,
-			CreatedAt:          rec.CreatedAt,
-			CommittedAt:        rec.CommittedAt,
-		})
+			ChallengeCount:     challengeCounts[rec.MemoryID],
+			EvidenceCountsAvailable: ccErr == nil && challengeCountErr == nil &&
+				evidenceCompleteErr == nil && evidenceComplete[rec.MemoryID],
+			Classification: int(memClass),
+			Status:         string(rec.Status),
+			Disputed:       disputed,
+			ParentHash:     rec.ParentHash,
+			CreatedAt:      rec.CreatedAt,
+			CommittedAt:    rec.CommittedAt,
+		}
+		progress, hasProgress := roundProgress[rec.MemoryID]
+		applyChallengeRoundProgress(result, progress, hasProgress)
+		results = append(results, result)
 	}
 	// The store enforced the decayed floor and filled top_k; nothing to cap here.
 
@@ -1853,10 +1991,40 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	votes, _ := s.store.GetVotes(r.Context(), memoryID)
-	corrs, _ := s.store.GetCorroborations(r.Context(), memoryID)
+	corrs, corrRowsErr := s.store.GetCorroborations(r.Context(), memoryID)
+	corrCounts, corrCountErr := s.store.GetCorroborationCounts(r.Context(), []string{memoryID})
+	corrCountAvailable := corrCountErr == nil
+	if corrCountErr != nil && corrRowsErr == nil {
+		// The detail endpoint already has the rows, so retain an accurate distinct
+		// count/confidence boost if the optimized aggregate query is unavailable.
+		distinct := make(map[string]struct{}, len(corrs))
+		for _, corr := range corrs {
+			distinct[corr.AgentID] = struct{}{}
+		}
+		corrCounts = map[string]int{memoryID: len(distinct)}
+		corrCountAvailable = true
+	}
+	challengeCounts, challengeCountErr := s.store.GetChallengeCounts(r.Context(), []string{memoryID})
+	evidenceComplete, evidenceCompleteErr := store.EvidenceProjectionCompleteness(
+		r.Context(), s.store, []string{memoryID},
+	)
+	roundProgress, roundProgressErr := s.challengeRoundProgressFor([]*memory.MemoryRecord{rec})
+	if roundProgressErr != nil {
+		writeProblem(w, http.StatusInternalServerError, "Memory error", "Failed to read challenge progress.")
+		return
+	}
+	progress, hasProgress := roundProgress[memoryID]
+	var challengeRound *uint64
+	var currentChallengerCount, requiredChallengers *uint32
+	if hasProgress {
+		round, current, required := progress.round, progress.current, progress.required
+		challengeRound = &round
+		currentChallengerCount = &current
+		requiredChallengers = &required
+	}
 
 	// Apply confidence decay.
-	currentConf := memory.ComputeConfidenceForRecord(rec, time.Now(), len(corrs))
+	currentConf := memory.ComputeConfidenceForRecord(rec, time.Now(), corrCounts[memoryID])
 
 	// Surface the on-chain classification so GET /v1/memory/{id} matches the
 	// `classification` field the query/search/hybrid responses already return
@@ -1870,20 +2038,27 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, MemoryDetailResponse{
-		MemoryID:        rec.MemoryID,
-		SubmittingAgent: rec.SubmittingAgent,
-		Content:         rec.Content,
-		ContentHash:     hex.EncodeToString(rec.ContentHash),
-		MemoryType:      string(rec.MemoryType),
-		DomainTag:       rec.DomainTag,
-		ConfidenceScore: currentConf,
-		Classification:  int(memClass),
-		Status:          string(rec.Status),
-		ParentHash:      rec.ParentHash,
-		CreatedAt:       rec.CreatedAt,
-		CommittedAt:     rec.CommittedAt,
-		Votes:           votes,
-		Corroborations:  corrs,
+		MemoryID:           rec.MemoryID,
+		SubmittingAgent:    rec.SubmittingAgent,
+		Content:            rec.Content,
+		ContentHash:        hex.EncodeToString(rec.ContentHash),
+		MemoryType:         string(rec.MemoryType),
+		DomainTag:          rec.DomainTag,
+		ConfidenceScore:    currentConf,
+		Classification:     int(memClass),
+		Status:             string(rec.Status),
+		ParentHash:         rec.ParentHash,
+		CreatedAt:          rec.CreatedAt,
+		CommittedAt:        rec.CommittedAt,
+		Votes:              votes,
+		Corroborations:     corrs,
+		CorroborationCount: corrCounts[memoryID],
+		ChallengeCount:     challengeCounts[memoryID],
+		EvidenceCountsAvailable: corrCountAvailable && challengeCountErr == nil &&
+			evidenceCompleteErr == nil && evidenceComplete[memoryID],
+		ChallengeRound:         challengeRound,
+		CurrentChallengerCount: currentChallengerCount,
+		RequiredChallengers:    requiredChallengers,
 	})
 }
 

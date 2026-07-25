@@ -311,6 +311,15 @@ func TestConfigureCometStateSyncReceiver(t *testing.T) {
 	assert.Equal(t, statesync.MaxChunks, comet.MaxSnapshotChunks)
 }
 
+func TestStateSyncServingRequiresExactSupportedSessionVersion(t *testing.T) {
+	for _, version := range []uint64{20, 21} {
+		require.NoError(t, requireExactStateSyncAppVersion(version, version))
+	}
+	require.ErrorContains(t, requireExactStateSyncAppVersion(20, 21), "does not match")
+	require.ErrorContains(t, requireExactStateSyncAppVersion(21, 20), "does not match")
+	require.ErrorContains(t, requireExactStateSyncAppVersion(22, 22), "unsupported")
+}
+
 func TestEnsureStateSyncServingSnapshotReusesExactHeightAndRejectsConflict(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "snapshots")
 	require.NoError(t, os.Mkdir(root, 0o700))
@@ -349,7 +358,7 @@ func TestStateSyncReceivePreparerVerifiesBeforeActivationAndLeavesSealJournal(t 
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = offchain.Close() })
 	receiverPublicKey := cmted25519.GenPrivKey().PubKey().Bytes()
-	prepare := newStateSyncReceivePreparer(dataDir, livePath, offchain, receiverPublicKey, zerolog.Nop())
+	prepare := newStateSyncReceivePreparer(dataDir, livePath, offchain, receiverPublicKey, statesync.RequiredAppVersion, zerolog.Nop())
 	prepared, err := prepare(ctx, metadata, backupPath)
 	require.NoError(t, err)
 	require.NotNil(t, prepared)
@@ -408,7 +417,7 @@ func TestStateSyncReceivePreparerRejectsAlreadyActiveReceiverValidator(t *testin
 	offchain, err := store.NewSQLiteStore(ctx, filepath.Join(dataDir, "projection.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = offchain.Close() })
-	prepare := newStateSyncReceivePreparer(dataDir, livePath, offchain, receiverPublicKey, zerolog.Nop())
+	prepare := newStateSyncReceivePreparer(dataDir, livePath, offchain, receiverPublicKey, statesync.RequiredAppVersion, zerolog.Nop())
 	_, err = prepare(ctx, metadata, backupPath)
 	require.ErrorContains(t, err, "receiver validator key is already active")
 	_, journalErr := os.Lstat(filepath.Join(dataDir, stateSyncActivationJournalName))

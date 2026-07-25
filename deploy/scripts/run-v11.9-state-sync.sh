@@ -12,8 +12,9 @@
 # governed upgrade-delay floor is three blocks instead of 200, and the proposer
 # cooldown is one block instead of 50. It also recognizes a test-only dormant
 # pre-publication pause hook used to place the exact crash below. A fresh
-# provider still performs the real signed auto-advance ceremony through app-v20,
-# at a positive activation height, with the chain-derived governance domain.
+# provider still performs the real signed auto-advance ceremony through app-v21,
+# including app-v20's chain-derived governance domain at a positive activation
+# height.
 # Authorization, quorum, identity, state-sync, P2P, receiver-session,
 # activation, Comet handoff, seal, REST admission, and restart paths are
 # production code.
@@ -761,7 +762,7 @@ write_authorization() {
   "chain_id": "${chain_id}",
   "joining_node_id": "${joining_id}",
   "validator_public_key": "${validator_pubkey}",
-  "app_version": 20,
+  "app_version": 21,
   "expires_at": "${expiry}",
   "snapshot_height_floor": ${floor},
   "validator_node_ids": ["${provider_id}"],
@@ -789,25 +790,26 @@ echo "=== v11.9 integrated authorized state-sync wire gate ==="
 echo "source: ${SOURCE_ID} (both image labels verified before topology start)"
 echo "fixture: one validator provider; observer/receiver/unauthorized peers are distinct non-validator full nodes"
 
-# 1. Drive a fresh real chain through the signed app-v20 ladder.
+# 1. Drive a fresh real chain through the signed app-v21 ladder. The scoped
+# projection installed below still proves app-v20's governance-domain semantics.
 write_provider_personal_config
-cat >"${PROVIDER_HOME}/post-v20.txt" <<'EOF'
-This committed post-app-v20 fixture record proves the provider snapshot is beyond the positive activation height.
+cat >"${PROVIDER_HOME}/post-v21.txt" <<'EOF'
+This committed post-app-v21 fixture record proves the provider snapshot is beyond the positive activation height.
 EOF
 cat >"${PROVIDER_HOME}/advance.txt" <<'EOF'
 This first state-sync eligibility record advances the provider beyond the exported snapshot height.
 
 This second state-sync eligibility record supplies additional committed blocks for the H plus two light-client window.
 EOF
-chmod 0644 "${PROVIDER_HOME}/post-v20.txt" "${PROVIDER_HOME}/advance.txt"
+chmod 0644 "${PROVIDER_HOME}/post-v21.txt" "${PROVIDER_HOME}/advance.txt"
 
 start_sage "${PROVIDER}" "${PROVIDER_HOME}" provider-rpc
 docker network connect --alias provider-p2p "${P2P_NETWORK}" "${PROVIDER}"
 wait_rpc "${PROVIDER}"
 wait_rest "${PROVIDER}"
-wait_app_version "${PROVIDER}" 20
+wait_app_version "${PROVIDER}" 21
 pre_seed_height=$(rpc_height "${PROVIDER}")
-seed_memories "${PROVIDER}" /sage/post-v20.txt
+seed_memories "${PROVIDER}" /sage/post-v21.txt
 wait_height_at_least "${PROVIDER}" "$((pre_seed_height + 1))"
 scoped_memory_id=$(docker exec "${PROVIDER}" ./sage-gui-v119-fixture \
   v119-state-sync-fixture install-scoped-proof)
@@ -859,7 +861,7 @@ wait_convergence "${PROVIDER}" "${OBSERVER}"
 snapshot_height=$(rpc_height "${PROVIDER}")
 snapshot_app_hash=$(rpc_app_hash "${PROVIDER}")
 if [ "${snapshot_height}" -le 1 ]; then
-  echo "ERROR: provider did not reach a positive post-app-v20 snapshot height" >&2
+  echo "ERROR: provider did not reach a positive post-app-v21 snapshot height" >&2
   exit 1
 fi
 if ! is_canonical_hash "${snapshot_app_hash}"; then
@@ -1040,7 +1042,7 @@ while [ "${SECONDS}" -lt "${attack_deadline}" ]; do
     echo "ERROR: unauthorized receiver advanced to height ${attacker_height}" >&2
     exit 1
   fi
-  if docker logs "${ATTACKER}" 2>&1 | grep -F 'authorized state-sync session assembled and app-v20 candidate verified' >/dev/null; then
+  if docker logs "${ATTACKER}" 2>&1 | grep -F 'authorized state-sync session assembled and exact-version candidate verified' >/dev/null; then
     echo "ERROR: unauthorized receiver assembled a state-sync session" >&2
     exit 1
   fi
@@ -1100,7 +1102,7 @@ fi
 # `/abci_info` while the runtime write lease is held: it is expected to wait
 # behind the same gate we are proving.
 pre_publish_evidence=$(docker exec "${RECEIVER}" cat "${PRE_PUBLISH_MARKER}")
-python3 - "${snapshot_height}" "${snapshot_app_hash}" 20 "${pre_publish_evidence}" <<'PY'
+python3 - "${snapshot_height}" "${snapshot_app_hash}" 21 "${pre_publish_evidence}" <<'PY'
 import json
 import sys
 
@@ -1167,8 +1169,8 @@ if rest_ready "${ATTACKER}"; then
   exit 1
 fi
 
-session_line=$(docker logs "${RECEIVER}" 2>&1 | grep -n 'authorized state-sync session assembled and app-v20 candidate verified' | tail -1 | cut -d: -f1)
-session_height=$(docker logs "${RECEIVER}" 2>&1 | grep 'authorized state-sync session assembled and app-v20 candidate verified' | tail -1 | strip_ansi | sed -n 's/.*height=\([0-9][0-9]*\).*/\1/p')
+session_line=$(docker logs "${RECEIVER}" 2>&1 | grep -n 'authorized state-sync session assembled and exact-version candidate verified' | tail -1 | cut -d: -f1)
+session_height=$(docker logs "${RECEIVER}" 2>&1 | grep 'authorized state-sync session assembled and exact-version candidate verified' | tail -1 | strip_ansi | sed -n 's/.*height=\([0-9][0-9]*\).*/\1/p')
 if [ -z "${session_line}" ] || [ "${session_height}" != "${snapshot_height}" ]; then
   echo "ERROR: receiver session height ${session_height:-<unknown>}, want H+2-eligible ${snapshot_height}" >&2
   exit 1
@@ -1196,13 +1198,15 @@ docker exec "${RECEIVER}" ./sage-gui-v119-fixture \
 wait_convergence "${PROVIDER}" "${RECEIVER}"
 assert_nonvalidator "${RECEIVER}"
 receiver_app_version=$(rpc_app_version "${RECEIVER}" 2>/dev/null || true)
+provider_app_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 receiver_app_hash=$(rpc_app_hash "${RECEIVER}" 2>/dev/null || true)
 provider_app_hash=$(rpc_app_hash "${PROVIDER}" 2>/dev/null || true)
-if [ "${receiver_app_version}" != 20 ] ||
+if [ "${receiver_app_version}" != 21 ] ||
+   [ "${provider_app_version}" != 21 ] ||
    ! is_canonical_hash "${receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: restarted receiver did not activate and converge on exact app-v20 provider state" >&2
+  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v21 state" >&2
   exit 1
 fi
 
@@ -1253,20 +1257,22 @@ if [ "$(rpc_peer_ids "${PROVIDER}")" != "${success_receiver_id}" ]; then
 fi
 
 success_receiver_app_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null || true)
+provider_app_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 success_receiver_app_hash=$(rpc_app_hash "${SUCCESS_RECEIVER}" 2>/dev/null || true)
 provider_app_hash=$(rpc_app_hash "${PROVIDER}" 2>/dev/null || true)
-if [ "${success_receiver_app_version}" != 20 ] ||
+if [ "${success_receiver_app_version}" != 21 ] ||
+   [ "${provider_app_version}" != 21 ] ||
    ! is_canonical_hash "${success_receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${success_receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: successful receiver did not publish exact app-v20 provider state" >&2
+  echo "ERROR: successful receiver/provider did not publish exact app-v21 state" >&2
   exit 1
 fi
 
-success_session_line=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep -n 'authorized state-sync session assembled and app-v20 candidate verified' | tail -1 | cut -d: -f1)
+success_session_line=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep -n 'authorized state-sync session assembled and exact-version candidate verified' | tail -1 | cut -d: -f1)
 success_seal_line=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep -n 'authorized validator state-sync activation sealed before service admission' | tail -1 | cut -d: -f1)
 success_ready_line=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep -n 'SAGE Personal ready' | tail -1 | cut -d: -f1)
-success_session_height=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep 'authorized state-sync session assembled and app-v20 candidate verified' | tail -1 | strip_ansi | sed -n 's/.*height=\([0-9][0-9]*\).*/\1/p')
+success_session_height=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep 'authorized state-sync session assembled and exact-version candidate verified' | tail -1 | strip_ansi | sed -n 's/.*height=\([0-9][0-9]*\).*/\1/p')
 success_sealed_height=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep 'authorized validator state-sync activation sealed before service admission' | tail -1 | strip_ansi | sed -n 's/.*height=\([0-9][0-9]*\).*/\1/p')
 if [ -z "${success_session_line}" ] || [ -z "${success_seal_line}" ] || [ -z "${success_ready_line}" ] ||
    [ "${success_session_line}" -ge "${success_seal_line}" ] || [ "${success_seal_line}" -ge "${success_ready_line}" ]; then
@@ -1296,6 +1302,12 @@ seed_memories "${PROVIDER}" /sage/restart.txt
 wait_height_at_least "${PROVIDER}" "$((before_restart_seed + 1))"
 wait_convergence "${PROVIDER}" "${SUCCESS_RECEIVER}"
 assert_nonvalidator "${SUCCESS_RECEIVER}"
+post_restart_provider_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
+post_restart_receiver_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null || true)
+if [ "${post_restart_provider_version}" != 21 ] || [ "${post_restart_receiver_version}" != 21 ]; then
+  echo "ERROR: provider SIGKILL recovery regressed exact app-v21 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
+  exit 1
+fi
 
 if [ "$(rpc_peer_ids "${PROVIDER}")" != "${success_receiver_id}" ]; then
   echo "ERROR: exact authorized provider peer set changed after crash/restart" >&2
@@ -1316,5 +1328,5 @@ for image in "${ABCI_IMAGE}" "${NODE_IMAGE}"; do
 done
 
 echo "=== v11.9 AUTHORIZED STATE-SYNC WIRE GATE PASSED ==="
-echo "PASS: frozen source ${SOURCE_ID}; real signed app-v20 scope+memory; exact projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
+echo "PASS: frozen source ${SOURCE_ID}; governed app-v21 provider; real signed app-v20 scope+memory; exact app-v21 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
 echo "ROLE: receiver is intentionally a synchronized NON-VALIDATOR full node; validator-set admission remains a separate signed governance action"

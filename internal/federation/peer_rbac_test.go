@@ -294,6 +294,54 @@ func TestPeerRBACQueryAuthoritativeDynamicReadAndWrongAgent(t *testing.T) {
 	}
 }
 
+func TestPeerRBACQueryPropagatesRecoveredEvidenceLowerBound(t *testing.T) {
+	m, ss, bs := newDrainTestManager(t)
+	peerID := newPeerOperatorID(t)
+	agreement := configurePeerRBACConnection(
+		t, m, ss, bs, "chain-peer", peerID, "host", []string{"legacy.only"}, 4,
+	)
+	const memoryID = "rbac-recovered-evidence"
+	seedCommitted(t, ss, memoryID, "rbac.shared", "recovered evidence content")
+	if err := bs.SetMemoryClassification(memoryID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ReplacePeerRBACPolicy(context.Background(), "chain-peer", []store.PeerRBACDomainPermission{
+		{Domain: "rbac", Read: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := ss.InsertCorroboration(context.Background(), &store.Corroboration{
+		MemoryID: memoryID, AgentID: "supporter", Evidence: "canonical lower bound", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.InsertChallenge(context.Background(), &store.ChallengeEntry{
+		MemoryID: memoryID, ChallengerID: "challenger", Reason: "canonical lower bound", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.MarkEvidenceProjectionIncomplete(context.Background(), memoryID); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "rbac.shared", "recovered")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("query status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response QueryResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 {
+		t.Fatalf("results=%+v", response.Results)
+	}
+	got := response.Results[0]
+	if got.CorroborationCount != 1 || got.ChallengeCount != 1 || got.EvidenceCountsAvailable {
+		t.Fatalf("recovered evidence response=%+v; numeric counts must remain lower bounds", got)
+	}
+}
+
 func TestIncompleteV3PeerBindingNeverFallsBackToLegacyRead(t *testing.T) {
 	m, ss, bs := newDrainTestManager(t)
 	peerID := newPeerOperatorID(t)

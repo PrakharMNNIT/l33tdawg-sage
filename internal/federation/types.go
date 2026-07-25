@@ -69,19 +69,21 @@ type QueryRequest struct {
 // recall proxy maps 1:1. SourceChainID is stamped by the QUERYING side (the
 // proxy) — a serving peer asserting its own provenance would be self-reported.
 type MemoryResult struct {
-	MemoryID           string     `json:"memory_id"`
-	SubmittingAgent    string     `json:"submitting_agent"`
-	Content            string     `json:"content"`
-	ContentHash        string     `json:"content_hash"`
-	MemoryType         string     `json:"memory_type"`
-	DomainTag          string     `json:"domain_tag"`
-	ConfidenceScore    float64    `json:"confidence_score"`
-	CorroborationCount int        `json:"corroboration_count"`
-	Classification     int        `json:"classification"`
-	Status             string     `json:"status"`
-	CreatedAt          time.Time  `json:"created_at"`
-	CommittedAt        *time.Time `json:"committed_at,omitempty"`
-	SourceChainID      string     `json:"source_chain_id,omitempty"`
+	MemoryID                string     `json:"memory_id"`
+	SubmittingAgent         string     `json:"submitting_agent"`
+	Content                 string     `json:"content"`
+	ContentHash             string     `json:"content_hash"`
+	MemoryType              string     `json:"memory_type"`
+	DomainTag               string     `json:"domain_tag"`
+	ConfidenceScore         float64    `json:"confidence_score"`
+	CorroborationCount      int        `json:"corroboration_count"`
+	ChallengeCount          int        `json:"challenge_count"`
+	EvidenceCountsAvailable bool       `json:"evidence_counts_available"`
+	Classification          int        `json:"classification"`
+	Status                  string     `json:"status"`
+	CreatedAt               time.Time  `json:"created_at"`
+	CommittedAt             *time.Time `json:"committed_at,omitempty"`
+	SourceChainID           string     `json:"source_chain_id,omitempty"`
 }
 
 // QueryResponse is the body returned by POST /fed/v1/query.

@@ -165,11 +165,47 @@ components:
           type: integer
           minimum: 0
           description: >-
-            Number of distinct corroborations backing this memory — the
+            Number of distinct corroborating agent IDs backing this memory — the
             multiplier behind the corroboration boost in confidence_score.
-            Returned on recall paths (/v1/memory/query, /search, /hybrid) so
-            readers can tell a low score caused by no corroboration (a fresh,
-            untested belief) from one caused by time decay (a once-solid fact).
+            Returned on recall paths (/v1/memory/query, /search, /hybrid) and
+            the detail endpoint so readers can tell a low score caused by no
+            corroboration (a fresh, untested belief) from one caused by time
+            decay (a once-solid fact).
+        challenge_count:
+          type: integer
+          minimum: 0
+          description: >-
+            Number of distinct challenger IDs in the off-chain lifetime audit
+            projection. This is evidence history, not an open-vote count.
+        evidence_counts_available:
+          type: boolean
+          description: >-
+            True only when both count queries succeeded and no durable
+            recovery/repair-incomplete marker was detected. It is not an
+            attestation against out-of-band partial SQL audit-table corruption.
+            When false, corroboration_count and challenge_count may still be
+            reconstructed canonical lower bounds after pristine state sync or
+            repair; zero is not proof that no historical evidence existed.
+        challenge_round:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Current app-v21 challenge round; absent when no weighted round is open.
+        current_challenger_count:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Distinct challengers accrued in the current open app-v21 round.
+        required_challengers:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Distinct challengers required to deprecate in the current app-v21 round.
+        disputed:
+          type: boolean
+          description: >-
+            True when the memory remains recallable while challenged. When true,
+            confidence_score already includes the disputed confidence haircut.
         classification:
           type: integer
           minimum: 0
@@ -564,6 +600,10 @@ components:
           type: string
         tx_hash:
           type: string
+        status:
+          type: string
+          enum: [challenged, deprecated]
+          description: Durable post-commit consensus result when available.
 
     ReinstateRequest:
       type: object
@@ -657,6 +697,10 @@ components:
           type: string
         tx_hash:
           type: string
+        status:
+          type: string
+          enum: [challenged, deprecated]
+          description: Durable post-commit consensus result when available.
 
     CorroborateResponse:
       type: object
@@ -2277,7 +2321,11 @@ paths:
   /v1/memory/{memory_id}/reinstate:
     post:
       operationId: reinstateMemory
-      summary: Return an app-v17 two-phase-challenged memory to committed.
+      summary: Return an open challenged memory to committed.
+      description: >-
+        Under app-v21, only an identity in the challenge round's snapshotted
+        electorate may reinstate; later grant churn does not change eligibility.
+        Legacy app-v17 challenges retain their original authorization rules.
       tags:
         - Memory
       parameters:

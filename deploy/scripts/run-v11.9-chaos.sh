@@ -4,8 +4,9 @@
 # CometBFT + ABCI Docker network.
 #
 # Proves, with bounded waits and matched-height AppHash checks:
-#   1. A real signed app-v20 ceremony starts with three genesis validators and
-#      one non-validator process, then adds that process, updates its power,
+#   1. A real signed fork ladder reaches app-v21, including the app-v20
+#      governance-domain ceremony, with three genesis validators and one
+#      non-validator process. It then adds that process, updates its power,
 #      removes a different validator, and proves every H+2 Comet set transition
 #      plus restart persistence/no resurrection.
 #   2. SIGKILL of complete Comet + ABCI process pairs after add, update, and
@@ -836,6 +837,8 @@ restart_pair_and_converge() {
   wait_rpc "${RPC_PORTS[$index]}" 120
   wait_rest "${REST_PORTS[$index]}" 120
   assert_matched_apphash "${label}" 180
+  wait_all_app_version 21 180
+  echo "${label}: all four restarted applications remain on app-v21"
 }
 
 LAST_EXECUTION_HEIGHT=0
@@ -1410,15 +1413,15 @@ if int(response.get("on_chain_height") or 0) <= 0:
     raise SystemExit("operator registration omitted a positive committed height")
 PY
 
-echo "--- driving the real three-validator chain through signed app-v20 governance ---"
+echo "--- driving the real three-validator chain through signed app-v21 governance ---"
 # Fresh fixture stores begin at app-v1. Every fork gate is independent and a
 # skipped version can never be activated after a higher version commits, so the
 # real-process oracle must prove the complete one-at-a-time ladder.
-for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do
   fixture_upgrade "${target}"
   wait_all_app_version "${target}" 240
 done
-assert_matched_apphash "post-app-v20 activation" 180
+assert_matched_apphash "post-app-v21 activation" 180
 
 governance_domain=
 for i in 0 1 2 3; do
@@ -1554,6 +1557,7 @@ for service in cometbft0 cometbft1 cometbft2 cometbft3; do
   remove_partition_firewall "${service}"
 done
 assert_matched_apphash "post-one-validator partition" 180
+wait_all_app_version 21 180
 
 echo "--- fault 2: post-removal stable-IP 2+2 split must halt both live halves ---"
 install_partition_firewall cometbft0 "${COMET_IPS[2]}" "${COMET_IPS[3]}"
@@ -1605,6 +1609,7 @@ governance_heartbeat >/dev/null
 governance_heartbeat >/dev/null
 wait_progress "${RPC_PORTS[0]}" "${halt_end[0]}" 2 120
 assert_matched_apphash "post-majority-partition heal" 180
+wait_all_app_version 21 180
 
 versions=()
 for port in "${RPC_PORTS[@]}"; do
@@ -1612,8 +1617,8 @@ for port in "${RPC_PORTS[@]}"; do
 done
 echo "application versions after fault phases: ${versions[*]}"
 for version in "${versions[@]}"; do
-  if [ "${version}" -ne 20 ]; then
-    echo "ERROR: live validator lifecycle/partition gate ended below app-v20" >&2
+  if [ "${version}" -ne 21 ]; then
+    echo "ERROR: live validator lifecycle/partition gate did not remain on app-v21" >&2
     exit 1
   fi
 done
@@ -1649,6 +1654,6 @@ for image in sage-v119-chaos-abci:local sage-v119-chaos-node:local; do
 done
 
 echo "=== v11.9 REAL MULTI-PROCESS FAULT GATE PASSED ==="
-echo "PASS: frozen source ${SOURCE_ID}; signed app-v20 add/update/remove; exact H+2 validator powers; add/update/remove SIGKILL persistence; removed-key no-resurrection; stable-IP P2P partition/heal; strict post-removal 2+2 halt; exact live block/ABCI height/AppHash convergence"
+echo "PASS: frozen source ${SOURCE_ID}; governed app-v21 activation; signed app-v20-scoped add/update/remove; exact H+2 validator powers; add/update/remove SIGKILL persistence; removed-key no-resurrection; stable-IP P2P partition/heal; strict post-removal 2+2 halt; exact live block/ABCI height/AppHash convergence"
 echo "SCOPE: deploy/scripts/run-v11.9-multiprocess.sh supplies signed app-v20 formation/revision and pinned-ballot semantics"
 echo "STATE SYNC: set V119_REQUIRE_AUTHORIZED_STATE_SYNC=1 to require the integrated authorized provider-to-pristine-full-node transfer"

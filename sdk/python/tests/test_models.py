@@ -47,6 +47,64 @@ def test_memory_record_tolerates_missing_disputed(sample_memory):
     assert record.disputed is None
 
 
+def test_memory_record_parses_distinct_evidence_counts(sample_memory):
+    from sage_sdk.models import MemoryRecord
+
+    record = MemoryRecord(
+        **{
+            **sample_memory,
+            "corroboration_count": 8,
+            "challenge_count": 2,
+            "evidence_counts_available": True,
+            "challenge_round": 4,
+            "current_challenger_count": 3,
+            "required_challengers": 9,
+        }
+    )
+    assert record.corroboration_count == 8
+    assert record.challenge_count == 2
+    assert record.evidence_counts_available is True
+    assert record.challenge_round == 4
+    assert record.current_challenger_count == 3
+    assert record.required_challengers == 9
+
+
+def test_memory_record_defaults_evidence_counts_for_older_servers(sample_memory):
+    from sage_sdk.models import MemoryRecord
+
+    record = MemoryRecord(**sample_memory)
+    assert record.corroboration_count == 0
+    assert record.challenge_count == 0
+    assert record.evidence_counts_available is False
+    assert record.challenge_round is None
+    assert record.current_challenger_count is None
+    assert record.required_challengers is None
+
+
+def test_memory_record_preserves_incomplete_recovery_lower_bounds(sample_memory):
+    from sage_sdk.models import MemoryRecord
+
+    record = MemoryRecord(
+        **{
+            **sample_memory,
+            "corroboration_count": 8,
+            "challenge_count": 2,
+            "evidence_counts_available": False,
+        }
+    )
+    assert record.corroboration_count == 8
+    assert record.challenge_count == 2
+    assert record.evidence_counts_available is False
+
+
+@pytest.mark.parametrize("field", ["corroboration_count", "challenge_count"])
+def test_memory_record_rejects_negative_evidence_counts(sample_memory, field):
+    from sage_sdk.models import MemoryRecord
+
+    with pytest.raises(Exception):
+        MemoryRecord(**{**sample_memory, field: -1})
+
+
 def test_memory_record_parses_linked_memories(sample_memory):
     # The server emits `linked_memories` on the GET /v1/memory/{id} detail
     # response and link_memories() lets a caller write links. The model must

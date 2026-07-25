@@ -435,6 +435,13 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_challenges_memory ON challenges(memory_id);
 
+	-- Presence means the numeric evidence rows are only a reconstructed
+	-- canonical lower bound, not a complete lifetime audit projection. Absence
+	-- preserves backward compatibility for native/existing projections.
+	CREATE TABLE IF NOT EXISTS memory_evidence_projection_incomplete (
+		memory_id TEXT PRIMARY KEY REFERENCES memories(memory_id) ON DELETE CASCADE
+	);
+
 	CREATE TABLE IF NOT EXISTS validator_scores (
 		validator_id   TEXT PRIMARY KEY,
 		weighted_sum   REAL NOT NULL DEFAULT 0,
@@ -2079,6 +2086,164 @@ func (s *SQLiteStore) InsertChallenge(ctx context.Context, challenge *ChallengeE
 		return fmt.Errorf("insert challenge: %w", err)
 	}
 	return nil
+}
+
+// EnsureCanonicalEvidenceProjection restores count-bearing audit rows from
+// AppHash-covered evidence markers without duplicating richer rows already
+// projected during ordinary block execution. It is used by scoped recovery
+// after state sync or projection loss and is safe to rerun.
+func (s *SQLiteStore) EnsureCanonicalEvidenceProjection(
+	ctx context.Context,
+	memoryID string,
+	corroboratorIDs, challengerIDs []string,
+	at time.Time,
+) (bool, error) {
+	createdAt := formatTime(at)
+	repaired := false
+	for _, agentID := range corroboratorIDs {
+		result, err := s.writeExecContext(ctx,
+			`INSERT INTO corroborations (memory_id, agent_id, evidence, created_at)
+			 SELECT ?, ?, ?, ?
+			 WHERE NOT EXISTS (
+				SELECT 1 FROM corroborations WHERE memory_id = ? AND agent_id = ?
+			 )`,
+			memoryID, agentID, "recovered from canonical corroboration marker", createdAt,
+			memoryID, agentID)
+		if err != nil {
+			return repaired, fmt.Errorf("restore canonical corroboration projection: %w", err)
+		}
+		if rows, rowsErr := result.RowsAffected(); rowsErr != nil {
+			return repaired, fmt.Errorf("inspect canonical corroboration repair: %w", rowsErr)
+		} else if rows > 0 {
+			repaired = true
+		}
+	}
+	for _, agentID := range challengerIDs {
+		result, err := s.writeExecContext(ctx,
+			`INSERT INTO challenges (memory_id, challenger_id, reason, evidence, block_height, created_at)
+			 SELECT ?, ?, ?, ?, ?, ?
+			 WHERE NOT EXISTS (
+				SELECT 1 FROM challenges WHERE memory_id = ? AND challenger_id = ?
+			 )`,
+			memoryID, agentID, "recovered from canonical app-v21 challenge marker", "", 0, createdAt,
+			memoryID, agentID)
+		if err != nil {
+			return repaired, fmt.Errorf("restore canonical challenge projection: %w", err)
+		}
+		if rows, rowsErr := result.RowsAffected(); rowsErr != nil {
+			return repaired, fmt.Errorf("inspect canonical challenge repair: %w", rowsErr)
+		} else if rows > 0 {
+			repaired = true
+		}
+	}
+	return repaired, nil
+}
+
+// MarkEvidenceProjectionIncomplete durably records that recovery reconstructed
+// only the canonical lower bound for this memory. ON CONFLICT is intentionally
+// one-way: later native evidence writes cannot silently claim the lost legacy
+// history became complete.
+func (s *SQLiteStore) HasMemoryProjection(ctx context.Context, memoryID string) (bool, error) {
+	var exists bool
+	if err := s.conn.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM memories WHERE memory_id = ?)`,
+		memoryID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check memory projection: %w", err)
+	}
+	return exists, nil
+}
+
+func (s *SQLiteStore) MarkEvidenceProjectionIncomplete(ctx context.Context, memoryID string) error {
+	if _, err := s.writeExecContext(ctx,
+		`INSERT OR IGNORE INTO memory_evidence_projection_incomplete (memory_id) VALUES (?)`,
+		memoryID); err != nil {
+		return fmt.Errorf("mark evidence projection incomplete: %w", err)
+	}
+	return nil
+}
+
+// GetEvidenceProjectionCompleteness returns true when no durable incomplete
+// marker exists. Queries are chunked below SQLite's bound-parameter limit.
+func (s *SQLiteStore) GetEvidenceProjectionCompleteness(ctx context.Context, memoryIDs []string) (map[string]bool, error) {
+	complete := make(map[string]bool, len(memoryIDs))
+	for _, memoryID := range memoryIDs {
+		complete[memoryID] = true
+	}
+	for start := 0; start < len(memoryIDs); start += 900 {
+		end := start + 900
+		if end > len(memoryIDs) {
+			end = len(memoryIDs)
+		}
+		chunk := memoryIDs[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, memoryID := range chunk {
+			placeholders[i] = "?"
+			args[i] = memoryID
+		}
+		rows, err := s.conn.QueryContext(ctx,
+			`SELECT memory_id FROM memory_evidence_projection_incomplete WHERE memory_id IN (`+
+				strings.Join(placeholders, ",")+`)`,
+			args...)
+		if err != nil {
+			return nil, fmt.Errorf("get evidence projection completeness: %w", err)
+		}
+		for rows.Next() {
+			var memoryID string
+			if scanErr := rows.Scan(&memoryID); scanErr != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan evidence projection completeness: %w", scanErr)
+			}
+			complete[memoryID] = false
+		}
+		rowsErr := rows.Err()
+		_ = rows.Close()
+		if rowsErr != nil {
+			return nil, rowsErr
+		}
+	}
+	return complete, nil
+}
+
+// GetChallengeCounts returns the number of distinct challengers recorded for
+// each memory ID. The challenges table is an append-only off-chain audit
+// projection, so this is a lifetime evidence count rather than an open-vote
+// count. Queries are chunked to stay within SQLite's bound-parameter limit.
+func (s *SQLiteStore) GetChallengeCounts(ctx context.Context, memoryIDs []string) (map[string]int, error) {
+	counts := make(map[string]int, len(memoryIDs))
+	for start := 0; start < len(memoryIDs); start += 900 {
+		end := start + 900
+		if end > len(memoryIDs) {
+			end = len(memoryIDs)
+		}
+		chunk := memoryIDs[start:end]
+		ph := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			ph[i] = "?"
+			args[i] = id
+		}
+		rows, err := s.conn.QueryContext(ctx,
+			`SELECT memory_id, COUNT(DISTINCT challenger_id) FROM challenges WHERE memory_id IN (`+strings.Join(ph, ",")+`) GROUP BY memory_id`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("get challenge counts: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			var n int
+			if scanErr := rows.Scan(&id, &n); scanErr != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan challenge count: %w", scanErr)
+			}
+			counts[id] = n
+		}
+		rowsErr := rows.Err()
+		_ = rows.Close()
+		if rowsErr != nil {
+			return nil, rowsErr
+		}
+	}
+	return counts, nil
 }
 
 func (s *SQLiteStore) InsertCorroboration(ctx context.Context, corr *Corroboration) error {
@@ -4368,8 +4533,9 @@ func (s *SQLiteStore) GetLinkedMemories(ctx context.Context, memoryID string) ([
 	return links, rows.Err()
 }
 
-// GetCorroborationCounts returns the corroboration count for each memory ID in a
-// single batched query (chunked to stay within SQLite's bound-parameter limit).
+// GetCorroborationCounts returns the distinct corroborator count for each memory
+// ID in a single batched query (chunked to stay within SQLite's bound-parameter
+// limit).
 func (s *SQLiteStore) GetCorroborationCounts(ctx context.Context, memoryIDs []string) (map[string]int, error) {
 	counts := make(map[string]int, len(memoryIDs))
 	for start := 0; start < len(memoryIDs); start += 900 {
@@ -4385,7 +4551,7 @@ func (s *SQLiteStore) GetCorroborationCounts(ctx context.Context, memoryIDs []st
 			args[i] = id
 		}
 		rows, err := s.conn.QueryContext(ctx,
-			`SELECT memory_id, COUNT(*) FROM corroborations WHERE memory_id IN (`+strings.Join(ph, ",")+`) GROUP BY memory_id`, args...)
+			`SELECT memory_id, COUNT(DISTINCT agent_id) FROM corroborations WHERE memory_id IN (`+strings.Join(ph, ",")+`) GROUP BY memory_id`, args...)
 		if err != nil {
 			return nil, fmt.Errorf("get corroboration counts: %w", err)
 		}

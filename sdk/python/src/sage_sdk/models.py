@@ -58,6 +58,19 @@ class MemoryRecord(BaseModel):
     # Stored (undecayed) confidence, sibling to the decayed confidence_score.
     # None for federated results and pre-11.2 servers that don't emit it.
     initial_confidence: float | None = Field(default=None, ge=0, le=1)
+    # Distinct evidence-agent counts emitted by current recall/detail APIs.
+    # Defaults preserve compatibility with older SAGE servers that omit them.
+    corroboration_count: int = Field(default=0, ge=0)
+    challenge_count: int = Field(default=0, ge=0)
+    # True means both count queries succeeded and no recovery/repair-incomplete
+    # marker was detected. False may still accompany canonical lower bounds
+    # from pristine state sync or repair; zero is then not proof that no
+    # historical evidence existed.
+    evidence_counts_available: bool = False
+    # Present only while an app-v21 corroboration-weighted challenge is open.
+    challenge_round: int | None = Field(default=None, ge=1)
+    current_challenger_count: int | None = Field(default=None, ge=1)
+    required_challengers: int | None = Field(default=None, ge=1)
     status: MemoryStatus
     parent_hash: str | None = None
     task_status: str | None = None

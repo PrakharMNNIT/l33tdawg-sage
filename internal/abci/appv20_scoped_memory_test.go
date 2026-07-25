@@ -308,6 +308,23 @@ func TestAppV20ScopedProjectionRebuildFromCanonicalBadger(t *testing.T) {
 	memoryID := string(result.Data)
 	require.Zero(t, scopedVote(t, app, validators[0], memoryID, tx.VoteDecisionAccept, 3))
 
+	// Canonical evidence survives even when the receiving node begins with a
+	// pristine SQL projection. Open and reinstate a v21 round so the lifetime
+	// voter marker remains while the memory returns to committed.
+	supporter := deterministicScopedAgent(90)
+	require.NoError(t, app.badgerStore.SetCorroborated(memoryID, supporter.id))
+	evidenceHash := sha256.Sum256([]byte("projection recovery challenge"))
+	challengeOutcome, err := app.badgerStore.OpenChallengeV21(store.OpenChallengeV21Input{
+		MemoryID: memoryID, OpenerID: validators[0].id, Domain: domain,
+		ExecutionHeight: 4, ExpectedPriorStatus: string(memory.StatusCommitted),
+		ChallengedStatus: string(memory.StatusChallenged), ResolvedStatus: string(memory.StatusDeprecated),
+		Electorate: []string{validators[0].id, supporter.id}, EvidenceHash: evidenceHash[:],
+	})
+	require.NoError(t, err)
+	require.False(t, challengeOutcome.Resolved)
+	_, err = app.badgerStore.ReinstateChallengeV21(memoryID, string(memory.StatusChallenged))
+	require.NoError(t, err)
+
 	projection, err := store.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "rebuilt.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = projection.Close() })
@@ -320,6 +337,12 @@ func TestAppV20ScopedProjectionRebuildFromCanonicalBadger(t *testing.T) {
 		CreatedAt: time.Unix(1, 0),
 	}))
 	require.NoError(t, projection.SetTags(context.Background(), memoryID, []string{"poisoned"}))
+	require.NoError(t, projection.InsertCorroboration(context.Background(), &store.Corroboration{
+		MemoryID: memoryID, AgentID: supporter.id, Evidence: "native audit row", CreatedAt: time.Unix(300, 0),
+	}))
+	require.NoError(t, projection.InsertChallenge(context.Background(), &store.ChallengeEntry{
+		MemoryID: memoryID, ChallengerID: validators[0].id, Reason: "native audit row", CreatedAt: time.Unix(400, 0),
+	}))
 	app.offchainStore = projection
 	rebuilt, err := app.RebuildScopedProjection(context.Background())
 	require.NoError(t, err)
@@ -342,6 +365,45 @@ func TestAppV20ScopedProjectionRebuildFromCanonicalBadger(t *testing.T) {
 	projectedTags, err := projection.GetTags(context.Background(), memoryID)
 	require.NoError(t, err)
 	assert.Equal(t, submit.MemorySubmit.Tags, projectedTags)
+	corroborationCounts, err := projection.GetCorroborationCounts(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.Equal(t, 1, corroborationCounts[memoryID])
+	challengeCounts, err := projection.GetChallengeCounts(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.Equal(t, 1, challengeCounts[memoryID])
+	completeness, err := projection.GetEvidenceProjectionCompleteness(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.True(t, completeness[memoryID],
+		"routine startup rebuild must preserve an existing native projection's completeness")
+
+	// Re-running recovery must not append synthetic duplicates or inflate counts.
+	rebuilt, err = app.RebuildScopedProjection(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, rebuilt)
+	corroborations, err := projection.GetCorroborations(context.Background(), memoryID)
+	require.NoError(t, err)
+	assert.Len(t, corroborations, 1)
+	challengeCounts, err = projection.GetChallengeCounts(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.Equal(t, 1, challengeCounts[memoryID])
+	completeness, err = projection.GetEvidenceProjectionCompleteness(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.True(t, completeness[memoryID])
+
+	// If the memory row survives but a canonical evidence row does not, startup
+	// recovery repairs the row and atomically downgrades completeness.
+	repairProjection, err := store.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "repair.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = repairProjection.Close() })
+	require.NoError(t, repairProjection.InsertMemory(context.Background(), projected))
+	app.offchainStore = repairProjection
+	rebuilt, err = app.RebuildScopedProjection(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, rebuilt)
+	completeness, err = repairProjection.GetEvidenceProjectionCompleteness(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.False(t, completeness[memoryID], "repairing missing canonical evidence reveals partial projection damage")
+	app.offchainStore = projection
 
 	challenge := app.processMemoryChallenge(makeMemoryChallengeTx(t, validators[0], memoryID, "retire bad knowledge"), 4, time.Unix(400, 0))
 	require.Zero(t, challenge.Code, challenge.Log)
@@ -358,4 +420,85 @@ func TestAppV20ScopedProjectionRebuildFromCanonicalBadger(t *testing.T) {
 	projected, err = projection.GetMemory(context.Background(), memoryID)
 	require.NoError(t, err)
 	assert.Equal(t, memory.StatusDeprecated, projected.Status)
+}
+
+func TestAppV20ScopedProjectionRebuildRestoresCanonicalEvidenceIntoPristineProjection(t *testing.T) {
+	app, validators, domain := setupScopedMemoryApp(t, 1)
+	installScopeForValidators(t, app, "scope-evidence-recovery", domain, 1, scope.StateActive, validators)
+	submit := makeMemorySubmitTx(t, validators[0], domain, "canonical evidence must survive state sync")
+	result := app.processMemorySubmit(submit, 2, time.Unix(200, 0))
+	require.Zero(t, result.Code, result.Log)
+	memoryID := string(result.Data)
+	require.Zero(t, scopedVote(t, app, validators[0], memoryID, tx.VoteDecisionAccept, 3))
+
+	supporter := deterministicScopedAgent(91)
+	require.NoError(t, app.badgerStore.SetCorroborated(memoryID, supporter.id))
+	evidenceHash := sha256.Sum256([]byte("canonical voter survives state sync"))
+	outcome, err := app.badgerStore.OpenChallengeV21(store.OpenChallengeV21Input{
+		MemoryID: memoryID, OpenerID: validators[0].id, Domain: domain,
+		ExecutionHeight: 4, ExpectedPriorStatus: string(memory.StatusCommitted),
+		ChallengedStatus: string(memory.StatusChallenged), ResolvedStatus: string(memory.StatusDeprecated),
+		Electorate: []string{validators[0].id, supporter.id}, EvidenceHash: evidenceHash[:],
+	})
+	require.NoError(t, err)
+	require.False(t, outcome.Resolved)
+	_, err = app.badgerStore.ReinstateChallengeV21(memoryID, string(memory.StatusChallenged))
+	require.NoError(t, err)
+
+	// State-sync receivers have an initialized schema but no application rows
+	// before canonical scoped recovery.
+	projection, err := store.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "pristine.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = projection.Close() })
+	require.NoError(t, projection.RequirePristineStateSyncProjection(context.Background()))
+	app.offchainStore = projection
+	rebuilt, err := app.RebuildScopedProjection(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, rebuilt)
+
+	corroborationCounts, err := projection.GetCorroborationCounts(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.Equal(t, 1, corroborationCounts[memoryID])
+	challengeCounts, err := projection.GetChallengeCounts(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.Equal(t, 1, challengeCounts[memoryID])
+	completeness, err := projection.GetEvidenceProjectionCompleteness(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.False(t, completeness[memoryID],
+		"a pristine recovery only reconstructs canonical lower bounds of lifetime evidence")
+
+	rebuilt, err = app.RebuildScopedProjection(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, rebuilt)
+	completeness, err = projection.GetEvidenceProjectionCompleteness(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.False(t, completeness[memoryID], "the incomplete marker is durable and one-way")
+}
+
+func TestAppV20ScopedProjectionPristineRecoveryWithoutV21ChallengeMarkerReportsIncomplete(t *testing.T) {
+	app, validators, domain := setupScopedMemoryApp(t, 1)
+	installScopeForValidators(t, app, "scope-legacy-evidence", domain, 1, scope.StateActive, validators)
+	submit := makeMemorySubmitTx(t, validators[0], domain, "legacy challenges are not reconstructible")
+	result := app.processMemorySubmit(submit, 2, time.Unix(200, 0))
+	require.Zero(t, result.Code, result.Log)
+	memoryID := string(result.Data)
+	require.Zero(t, scopedVote(t, app, validators[0], memoryID, tx.VoteDecisionAccept, 3))
+
+	// No app-v21 challenge marker exists. A lost pre-v21 challenge audit cannot
+	// be distinguished from a genuine zero, so recovery must expose zero as a
+	// lower bound and mark the lifetime evidence projection incomplete.
+	projection, err := store.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "legacy-pristine.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = projection.Close() })
+	app.offchainStore = projection
+	rebuilt, err := app.RebuildScopedProjection(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, rebuilt)
+
+	challengeCounts, err := projection.GetChallengeCounts(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.Zero(t, challengeCounts[memoryID])
+	completeness, err := projection.GetEvidenceProjectionCompleteness(context.Background(), []string{memoryID})
+	require.NoError(t, err)
+	assert.False(t, completeness[memoryID])
 }

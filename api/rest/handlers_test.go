@@ -3,8 +3,10 @@ package rest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +33,7 @@ import (
 type mockMemoryStore struct {
 	memories       map[string]*memory.MemoryRecord
 	votes          map[string][]*store.ValidationVote
+	challenges     map[string][]*store.ChallengeEntry
 	corroborations map[string][]*store.Corroboration
 	pendingRecords []*memory.MemoryRecord
 	// setTagsCalls captures tag writes per memory_id for test assertions.
@@ -56,14 +59,20 @@ type mockMemoryStore struct {
 	// corrCountErr, when set, makes GetCorroborationCounts fail — used to exercise
 	// the handler's fail-closed-under-a-floor path for the serialized confidence.
 	corrCountErr error
+	// challengeCountErr exercises explicit evidence-count availability signaling.
+	challengeCountErr error
+	// incompleteEvidence marks recovery-built lower-bound projections.
+	incompleteEvidence map[string]bool
 }
 
 func newMockMemoryStore() *mockMemoryStore {
 	return &mockMemoryStore{
-		memories:       make(map[string]*memory.MemoryRecord),
-		votes:          make(map[string][]*store.ValidationVote),
-		corroborations: make(map[string][]*store.Corroboration),
-		setTagsCalls:   make(map[string][]string),
+		memories:           make(map[string]*memory.MemoryRecord),
+		votes:              make(map[string][]*store.ValidationVote),
+		challenges:         make(map[string][]*store.ChallengeEntry),
+		corroborations:     make(map[string][]*store.Corroboration),
+		setTagsCalls:       make(map[string][]string),
+		incompleteEvidence: make(map[string]bool),
 	}
 }
 
@@ -184,8 +193,44 @@ func (m *mockMemoryStore) GetVotes(_ context.Context, memoryID string) ([]*store
 	return m.votes[memoryID], nil
 }
 
-func (m *mockMemoryStore) InsertChallenge(_ context.Context, _ *store.ChallengeEntry) error {
+func (m *mockMemoryStore) InsertChallenge(_ context.Context, challenge *store.ChallengeEntry) error {
+	m.challenges[challenge.MemoryID] = append(m.challenges[challenge.MemoryID], challenge)
 	return nil
+}
+
+func (m *mockMemoryStore) GetChallengeCounts(_ context.Context, ids []string) (map[string]int, error) {
+	if m.challengeCountErr != nil {
+		return nil, m.challengeCountErr
+	}
+	out := make(map[string]int, len(ids))
+	for _, id := range ids {
+		distinct := make(map[string]struct{})
+		for _, challenge := range m.challenges[id] {
+			distinct[challenge.ChallengerID] = struct{}{}
+		}
+		if len(distinct) > 0 {
+			out[id] = len(distinct)
+		}
+	}
+	return out, nil
+}
+
+func (m *mockMemoryStore) HasMemoryProjection(_ context.Context, memoryID string) (bool, error) {
+	_, exists := m.memories[memoryID]
+	return exists, nil
+}
+
+func (m *mockMemoryStore) MarkEvidenceProjectionIncomplete(_ context.Context, memoryID string) error {
+	m.incompleteEvidence[memoryID] = true
+	return nil
+}
+
+func (m *mockMemoryStore) GetEvidenceProjectionCompleteness(_ context.Context, ids []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = !m.incompleteEvidence[id]
+	}
+	return out, nil
 }
 
 func (m *mockMemoryStore) InsertCorroboration(_ context.Context, corr *store.Corroboration) error {
@@ -268,8 +313,12 @@ func (m *mockMemoryStore) GetCorroborationCounts(_ context.Context, ids []string
 	}
 	out := make(map[string]int, len(ids))
 	for _, id := range ids {
-		if n := len(m.corroborations[id]); n > 0 {
-			out[id] = n
+		distinct := make(map[string]struct{})
+		for _, corr := range m.corroborations[id] {
+			distinct[corr.AgentID] = struct{}{}
+		}
+		if len(distinct) > 0 {
+			out[id] = len(distinct)
 		}
 	}
 	return out, nil
@@ -831,10 +880,9 @@ func TestQueryMemory(t *testing.T) {
 	assert.Equal(t, "test-id", resp.Results[0].MemoryID)
 }
 
-// TestQueryMemory_ExposesCorroborationCount verifies recall surfaces the number of
-// corroborations backing a memory — the signal that lets a reader tell a fresh,
-// uncorroborated belief apart from a once-solid fact that has merely decayed.
-func TestQueryMemory_ExposesCorroborationCount(t *testing.T) {
+// TestQueryMemory_ExposesDistinctEvidenceCounts verifies recall surfaces the
+// distinct agents behind both evidence directions.
+func TestQueryMemory_ExposesDistinctEvidenceCounts(t *testing.T) {
 	srv, memStore, _ := newTestServer(t, "")
 
 	memStore.memories["corr-id"] = &memory.MemoryRecord{
@@ -848,10 +896,17 @@ func TestQueryMemory_ExposesCorroborationCount(t *testing.T) {
 		Status:          memory.StatusCommitted,
 		CreatedAt:       time.Now().Add(-24 * time.Hour),
 	}
-	// Two distinct agents corroborate this memory.
+	// Three audit rows, but only two distinct corroborators.
 	memStore.corroborations["corr-id"] = []*store.Corroboration{
 		{MemoryID: "corr-id", AgentID: "agent-2"},
+		{MemoryID: "corr-id", AgentID: "agent-2"},
 		{MemoryID: "corr-id", AgentID: "agent-3"},
+	}
+	// Three audit rows, but only two distinct challengers.
+	memStore.challenges["corr-id"] = []*store.ChallengeEntry{
+		{MemoryID: "corr-id", ChallengerID: "agent-4"},
+		{MemoryID: "corr-id", ChallengerID: "agent-4"},
+		{MemoryID: "corr-id", ChallengerID: "agent-5"},
 	}
 
 	embedding := make([]float32, 1536)
@@ -872,6 +927,117 @@ func TestQueryMemory_ExposesCorroborationCount(t *testing.T) {
 	assert.Equal(t, "corr-id", resp.Results[0].MemoryID)
 	assert.Equal(t, 2, resp.Results[0].CorroborationCount,
 		"recall must surface the corroboration count backing the confidence score")
+	assert.Equal(t, 2, resp.Results[0].ChallengeCount,
+		"recall must surface the lifetime distinct challenger count")
+	assert.True(t, resp.Results[0].EvidenceCountsAvailable)
+}
+
+func TestQueryMemory_ExposesOpenAppV21ChallengeProgress(t *testing.T) {
+	srv, memStore, _ := newTestServer(t, "")
+	const memoryID = "weighted-challenge"
+	memStore.memories[memoryID] = &memory.MemoryRecord{
+		MemoryID: memoryID, SubmittingAgent: "agent-1", Content: "Settled fact under review",
+		ContentHash: []byte{7, 8, 9}, MemoryType: memory.TypeFact, DomainTag: "crypto",
+		ConfidenceScore: 0.9, Status: memory.StatusChallenged, CreatedAt: time.Now(),
+	}
+	bs, err := store.NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, bs.CloseBadger()) })
+	srv.badgerStore = bs
+	openerID := strings.Repeat("a", 64)
+	supporterID := strings.Repeat("b", 64)
+	require.NoError(t, bs.SetMemoryHash(memoryID, []byte("content-hash"), string(memory.StatusCommitted)))
+	require.NoError(t, bs.SetCorroborated(memoryID, supporterID))
+	evidenceHash := sha256.Sum256([]byte("contradicting evidence"))
+	outcome, err := bs.OpenChallengeV21(store.OpenChallengeV21Input{
+		MemoryID: memoryID, OpenerID: openerID, Domain: "crypto", ExecutionHeight: 42,
+		ExpectedPriorStatus: string(memory.StatusCommitted), ChallengedStatus: string(memory.StatusChallenged),
+		ResolvedStatus: string(memory.StatusDeprecated), Electorate: []string{openerID, supporterID},
+		EvidenceHash: evidenceHash[:],
+	})
+	require.NoError(t, err)
+	require.False(t, outcome.Resolved)
+
+	body, err := json.Marshal(QueryMemoryRequest{Embedding: make([]float32, 1536), TopK: 10})
+	require.NoError(t, err)
+	req, _ := signedRequest(t, http.MethodPost, "/v1/memory/query", body)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp QueryMemoryResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.Len(t, resp.Results, 1)
+	require.NotNil(t, resp.Results[0].ChallengeRound)
+	require.NotNil(t, resp.Results[0].CurrentChallengerCount)
+	require.NotNil(t, resp.Results[0].RequiredChallengers)
+	assert.Equal(t, uint64(1), *resp.Results[0].ChallengeRound)
+	assert.Equal(t, uint32(1), *resp.Results[0].CurrentChallengerCount)
+	assert.Equal(t, uint32(2), *resp.Results[0].RequiredChallengers)
+}
+
+func TestQueryMemory_MarksEvidenceCountsUnavailableOnProjectionFailure(t *testing.T) {
+	srv, memStore, _ := newTestServer(t, "")
+	memStore.memories["count-error"] = &memory.MemoryRecord{
+		MemoryID: "count-error", SubmittingAgent: "agent-1", Content: "Evidence unavailable",
+		ContentHash: []byte{1}, MemoryType: memory.TypeFact, DomainTag: "crypto",
+		ConfidenceScore: 0.8, Status: memory.StatusCommitted, CreatedAt: time.Now(),
+	}
+	memStore.challengeCountErr = errors.New("projection unavailable")
+	body, err := json.Marshal(QueryMemoryRequest{Embedding: make([]float32, 1536), TopK: 10})
+	require.NoError(t, err)
+	req, _ := signedRequest(t, http.MethodPost, "/v1/memory/query", body)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp QueryMemoryResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.Len(t, resp.Results, 1)
+	assert.False(t, resp.Results[0].EvidenceCountsAvailable)
+}
+
+func TestRecallSurfacesReportRecoveredCountsAsIncompleteLowerBounds(t *testing.T) {
+	srv, memStore, _ := newTestServer(t, "")
+	const memoryID = "recovered-lower-bound"
+	memStore.memories[memoryID] = &memory.MemoryRecord{
+		MemoryID: memoryID, SubmittingAgent: "agent-1", Content: "Recovered evidence lower bound",
+		ContentHash: []byte{1}, MemoryType: memory.TypeFact, DomainTag: "crypto",
+		ConfidenceScore: 0.8, Status: memory.StatusCommitted, CreatedAt: time.Now(),
+	}
+	memStore.corroborations[memoryID] = []*store.Corroboration{
+		{MemoryID: memoryID, AgentID: "supporter"},
+	}
+	memStore.challenges[memoryID] = []*store.ChallengeEntry{
+		{MemoryID: memoryID, ChallengerID: "challenger"},
+	}
+	memStore.incompleteEvidence[memoryID] = true
+
+	cases := []struct {
+		name string
+		path string
+		body any
+	}{
+		{"query", "/v1/memory/query", QueryMemoryRequest{Embedding: make([]float32, 1536), TopK: 10}},
+		{"search", "/v1/memory/search", SearchMemoryRequest{Query: "recovered", TopK: 10}},
+		{"hybrid", "/v1/memory/hybrid", HybridSearchMemoryRequest{
+			Query: "recovered", Embedding: make([]float32, 1536), TopK: 10,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(tc.body)
+			require.NoError(t, err)
+			req, _ := signedRequest(t, http.MethodPost, tc.path, body)
+			rr := httptest.NewRecorder()
+			srv.Router().ServeHTTP(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+			var resp QueryMemoryResponse
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+			require.Len(t, resp.Results, 1)
+			assert.Equal(t, 1, resp.Results[0].CorroborationCount)
+			assert.Equal(t, 1, resp.Results[0].ChallengeCount)
+			assert.False(t, resp.Results[0].EvidenceCountsAvailable)
+		})
+	}
 }
 
 func TestGetMemory(t *testing.T) {
@@ -891,6 +1057,15 @@ func TestGetMemory(t *testing.T) {
 		Status:          memory.StatusProposed,
 		CreatedAt:       time.Now(),
 	}
+	memStore.corroborations["mem-123"] = []*store.Corroboration{
+		{MemoryID: "mem-123", AgentID: "agent-2"},
+		{MemoryID: "mem-123", AgentID: "agent-2"},
+		{MemoryID: "mem-123", AgentID: "agent-3"},
+	}
+	memStore.challenges["mem-123"] = []*store.ChallengeEntry{
+		{MemoryID: "mem-123", ChallengerID: "agent-4"},
+		{MemoryID: "mem-123", ChallengerID: "agent-4"},
+	}
 
 	rr := httptest.NewRecorder()
 	srv.Router().ServeHTTP(rr, req)
@@ -903,6 +1078,76 @@ func TestGetMemory(t *testing.T) {
 	assert.Equal(t, "mem-123", resp.MemoryID)
 	assert.Equal(t, "observation", resp.MemoryType)
 	assert.Equal(t, hex.EncodeToString([]byte{0xAA, 0xBB}), resp.ContentHash)
+	assert.Equal(t, 2, resp.CorroborationCount)
+	assert.Equal(t, 1, resp.ChallengeCount)
+	assert.True(t, resp.EvidenceCountsAvailable)
+}
+
+func TestGetMemory_DetailFallbackStillHonorsIncompleteProjection(t *testing.T) {
+	srv, memStore, _ := newTestServer(t, "")
+	req, agentID := signedRequest(t, http.MethodGet, "/v1/memory/recovered-detail", nil)
+	memStore.memories["recovered-detail"] = &memory.MemoryRecord{
+		MemoryID: "recovered-detail", SubmittingAgent: agentID, Content: "Recovered detail",
+		ContentHash: []byte{0xAA}, MemoryType: memory.TypeObservation, DomainTag: "vuln_intel",
+		ConfidenceScore: 0.75, Status: memory.StatusCommitted, CreatedAt: time.Now(),
+	}
+	memStore.corroborations["recovered-detail"] = []*store.Corroboration{
+		{MemoryID: "recovered-detail", AgentID: "supporter"},
+		{MemoryID: "recovered-detail", AgentID: "supporter"},
+	}
+	memStore.challenges["recovered-detail"] = []*store.ChallengeEntry{
+		{MemoryID: "recovered-detail", ChallengerID: "challenger"},
+	}
+	memStore.corrCountErr = errors.New("aggregate unavailable")
+	memStore.incompleteEvidence["recovered-detail"] = true
+
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp MemoryDetailResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.Equal(t, 1, resp.CorroborationCount, "detail-row fallback remains a numeric lower bound")
+	assert.Equal(t, 1, resp.ChallengeCount)
+	assert.False(t, resp.EvidenceCountsAvailable,
+		"successful row fallback cannot override durable incomplete provenance")
+}
+
+func TestGetMemory_ExposesOpenAppV21ChallengeProgress(t *testing.T) {
+	srv, memStore, _ := newTestServer(t, "")
+	req, agentID := signedRequest(t, http.MethodGet, "/v1/memory/detail-weighted", nil)
+	memStore.memories["detail-weighted"] = &memory.MemoryRecord{
+		MemoryID: "detail-weighted", SubmittingAgent: agentID, Content: "Detailed disputed memory",
+		ContentHash: []byte{0xCC}, MemoryType: memory.TypeFact, DomainTag: "crypto",
+		ConfidenceScore: 0.9, Status: memory.StatusChallenged, CreatedAt: time.Now(),
+	}
+	bs, err := store.NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, bs.CloseBadger()) })
+	srv.badgerStore = bs
+	openerID := strings.Repeat("a", 64)
+	supporterID := strings.Repeat("b", 64)
+	require.NoError(t, bs.SetMemoryHash("detail-weighted", []byte("content-hash"), string(memory.StatusCommitted)))
+	require.NoError(t, bs.SetCorroborated("detail-weighted", supporterID))
+	evidenceHash := sha256.Sum256([]byte("detail evidence"))
+	_, err = bs.OpenChallengeV21(store.OpenChallengeV21Input{
+		MemoryID: "detail-weighted", OpenerID: openerID, Domain: "crypto", ExecutionHeight: 43,
+		ExpectedPriorStatus: string(memory.StatusCommitted), ChallengedStatus: string(memory.StatusChallenged),
+		ResolvedStatus: string(memory.StatusDeprecated), Electorate: []string{openerID, supporterID},
+		EvidenceHash: evidenceHash[:],
+	})
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp MemoryDetailResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.NotNil(t, resp.ChallengeRound)
+	require.NotNil(t, resp.CurrentChallengerCount)
+	require.NotNil(t, resp.RequiredChallengers)
+	assert.Equal(t, uint64(1), *resp.ChallengeRound)
+	assert.Equal(t, uint32(1), *resp.CurrentChallengerCount)
+	assert.Equal(t, uint32(2), *resp.RequiredChallengers)
 }
 
 func TestGetMemory_NotFound(t *testing.T) {
@@ -974,8 +1219,10 @@ func TestVoteMemory_InvalidDecision(t *testing.T) {
 
 func TestForgetMemory_Success(t *testing.T) {
 	var capturedTxHex string
+	var memStore *mockMemoryStore
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedTxHex = r.URL.Query().Get("tx")
+		memStore.memories["target"].Status = memory.StatusDeprecated
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"result": map[string]interface{}{"code": 0, "hash": "FORGETHASH", "log": ""},
@@ -983,7 +1230,8 @@ func TestForgetMemory_Success(t *testing.T) {
 	}))
 	defer cometMock.Close()
 
-	srv, memStore, _ := newTestServer(t, cometMock.URL)
+	srv, createdStore, _ := newTestServer(t, cometMock.URL)
+	memStore = createdStore
 	memStore.memories["target"] = &memory.MemoryRecord{
 		MemoryID:   "target",
 		MemoryType: memory.TypeObservation,
@@ -1001,7 +1249,42 @@ func TestForgetMemory_Success(t *testing.T) {
 	var resp ForgetResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
 	assert.Equal(t, "FORGETHASH", resp.TxHash)
+	assert.Equal(t, string(memory.StatusDeprecated), resp.Status)
 	assert.NotEmpty(t, capturedTxHex, "broadcast should have been invoked")
+}
+
+func TestForgetMemory_StatusComesFromCanonicalState(t *testing.T) {
+	bs, err := store.NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, bs.CloseBadger()) })
+	require.NoError(t, bs.SetMemoryHash("target", []byte("content-hash"), string(memory.StatusCommitted)))
+
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Simulate the consensus commit while deliberately leaving SQL stale.
+		require.NoError(t, bs.SetMemoryHash("target", nil, string(memory.StatusDeprecated)))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": map[string]interface{}{"code": 0, "hash": "CANONICALHASH", "log": ""},
+		})
+	}))
+	defer cometMock.Close()
+
+	srv, memStore, _ := newTestServer(t, cometMock.URL)
+	srv.badgerStore = bs
+	memStore.memories["target"] = &memory.MemoryRecord{
+		MemoryID: "target", MemoryType: memory.TypeObservation, DomainTag: "general",
+		Status: memory.StatusCommitted, CreatedAt: time.Now(),
+	}
+	body := []byte(`{"reason":"contradicted"}`)
+	req, _ := signedRequest(t, http.MethodPost, "/v1/memory/target/forget", body)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp ForgetResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.Equal(t, string(memory.StatusDeprecated), resp.Status)
+	assert.Equal(t, memory.StatusCommitted, memStore.memories["target"].Status,
+		"fixture proves the SQL fallback would have returned the stale status")
 }
 
 func TestForgetMemory_DefaultReasonWhenOmitted(t *testing.T) {

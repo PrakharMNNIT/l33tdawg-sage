@@ -1,8 +1,8 @@
-Verified against SDK source for SAGE v11.13.3. Package: sage-agent-sdk.
+Verified against SDK source for SAGE v11.13.4. Package: sage-agent-sdk.
 
 # SAGE Python SDK Reference
 
-**Package:** `sage-agent-sdk` **Version:** 11.13.3
+**Package:** `sage-agent-sdk` **Version:** 11.13.4
 **Requires:** Python 3.10+ | httpx ≥ 0.25 | pydantic ≥ 2.0 | PyNaCl ≥ 1.5
 
 ```bash
@@ -369,10 +369,11 @@ forget(
 
 `POST /v1/memory/{memory_id}/forget`
 
-Submits the challenge transaction and waits for commit. On a personal/one-holder
-domain it deprecates immediately; after app-v17 activation on a multi-holder
-domain it may instead park as `challenged` pending confirmation or reinstatement.
-The server substitutes a default reason when none is supplied.
+Submits the challenge transaction and waits for commit. Under legacy/app-v17
+rules a personal/one-holder domain deprecates immediately. Post-app-v21, `k=0`
+still resolves immediately, while `k>0` parks as `challenged` until `k+1`
+distinct challengers accrue—even on a one-holder domain. The server substitutes
+a default reason when none is supplied.
 
 ---
 
@@ -388,9 +389,11 @@ reinstate(
 `POST /v1/memory/{memory_id}/reinstate`
 
 Submits `TxTypeMemoryReinstate` and waits for consensus commit. Requires an
-app-v17-activated chain and an open two-phase challenge. Current modify-verb
-holders may reinstate; the original challenger may always withdraw their own
-challenge. Returns `{"message": ..., "tx_hash": ..., "status": "committed"}`.
+app-v17-activated chain and an open challenge. Legacy app-v17 challenges use
+current modify authorization, with the original challenger always allowed to
+withdraw. An app-v21 weighted round can be reinstated only by an identity in its
+snapshotted electorate. Returns
+`{"message": ..., "tx_hash": ..., "status": "committed"}`.
 
 ---
 
@@ -1228,6 +1231,12 @@ Source: `sdk/python/src/sage_sdk/models.py`
 | `domain_tag` | `str` | |
 | `confidence_score` | `float` | 0–1 |
 | `initial_confidence` | `float \| None` | Stored (undecayed) confidence; `None` for federated results and pre-11.2 servers |
+| `corroboration_count` | `int` | Distinct corroborating agents; defaults to 0 for older servers |
+| `challenge_count` | `int` | Distinct challenger IDs in the lifetime audit projection; defaults to 0 for older servers |
+| `evidence_counts_available` | `bool` | `True` only when both count queries succeeded and no recovery/repair-incomplete marker was detected. When `False`, numeric counts may be lower bounds from pristine state sync or repair and zero is not proof of no evidence. Defaults to `False` for older servers |
+| `challenge_round` | `int \| None` | Current open app-v21 round |
+| `current_challenger_count` | `int \| None` | Distinct challengers accrued in that round |
+| `required_challengers` | `int \| None` | Threshold required to deprecate in that round |
 | `status` | `MemoryStatus` | |
 | `parent_hash` | `str \| None` | |
 | `task_status` | `str \| None` | |

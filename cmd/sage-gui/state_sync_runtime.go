@@ -149,8 +149,8 @@ func armConfiguredStateSync(
 		if info == nil {
 			return errors.New("read state sync provider application state: nil response")
 		}
-		if info.AppVersion != statesync.RequiredAppVersion {
-			return fmt.Errorf("state sync serving requires app version %d, got %d", statesync.RequiredAppVersion, info.AppVersion)
+		if versionErr := requireExactStateSyncAppVersion(info.AppVersion, authorization.AppVersion()); versionErr != nil {
+			return versionErr
 		}
 		if info.LastBlockHeight <= 0 || len(info.LastBlockAppHash) != sha256.Size {
 			return errors.New("state sync serving requires a committed positive-height application state")
@@ -228,6 +228,7 @@ func armConfiguredStateSync(
 			filepath.Join(cfg.DataDir, "badger"),
 			offchain,
 			authorization.ValidatorPublicKey(),
+			authorization.AppVersion(),
 			logger,
 		),
 	})
@@ -244,6 +245,16 @@ func armConfiguredStateSync(
 		Str("staging_dir", base).
 		Int64("trust_height", stateSyncCfg.TrustHeight).
 		Msg("authorized one-shot validator state-sync receiver armed")
+	return nil
+}
+
+func requireExactStateSyncAppVersion(actual, authorized uint64) error {
+	if !statesync.SupportsAppVersion(authorized) {
+		return fmt.Errorf("state sync serving authorization has unsupported app version %d", authorized)
+	}
+	if actual != authorized {
+		return fmt.Errorf("state sync serving application version %d does not match authorized session version %d", actual, authorized)
+	}
 	return nil
 }
 
@@ -788,6 +799,7 @@ func newStateSyncReceivePreparer(
 	liveBadgerPath string,
 	offchain *store.SQLiteStore,
 	receiverValidatorPublicKey []byte,
+	expectedAppVersion uint64,
 	logger zerolog.Logger,
 ) sageabci.StateSyncReceivePreparer {
 	return func(ctx context.Context, metadata statesync.Metadata, statePath string) (*sageabci.StateSyncPreparedActivation, error) {
@@ -825,11 +837,6 @@ func newStateSyncReceivePreparer(
 			_ = os.RemoveAll(preparedPath)
 			return nil, fmt.Errorf("prepare received app-v20 state: %w", rosterErr)
 		}
-		logger.Info().
-			Uint64("height", metadata.Height).
-			Int("chunks", len(metadata.ChunkHashes)).
-			Uint64("backup_bytes", metadata.BackupSize).
-			Msg("authorized state-sync session assembled and app-v20 candidate verified")
 		journal := statesync.ActivationJournal{
 			Phase:          statesync.ActivationPrepared,
 			Height:         metadata.Height,
@@ -873,6 +880,23 @@ func newStateSyncReceivePreparer(
 				if err != nil {
 					return nil, fmt.Errorf("construct activated consensus bundle: %w", err)
 				}
+				if bundle.ExpectedAppVersion() != expectedAppVersion {
+					versionErr := fmt.Errorf(
+						"activated state-sync candidate app version %d does not match authorized session version %d",
+						bundle.ExpectedAppVersion(),
+						expectedAppVersion,
+					)
+					if closeErr := bundle.Close(); closeErr != nil {
+						return nil, errors.Join(versionErr, closeErr)
+					}
+					return nil, versionErr
+				}
+				logger.Info().
+					Uint64("height", metadata.Height).
+					Uint64("app_version", expectedAppVersion).
+					Int("chunks", len(metadata.ChunkHashes)).
+					Uint64("backup_bytes", metadata.BackupSize).
+					Msg("authorized state-sync session assembled and exact-version candidate verified")
 				return bundle, nil
 			},
 			Discard: func() error {

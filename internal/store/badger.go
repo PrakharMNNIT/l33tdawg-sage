@@ -34,12 +34,57 @@ var ErrDomainPathTooDeep = errors.New("domain path exceeds 16 segments")
 // in-memory replay cache, so a Byzantine proposer cannot bypass it.
 var ErrAgentProofReplayed = errors.New("agent proof already consumed")
 
+// ErrChallengeV21PrefixScanLimit means a delimiter-prefix scan exhausted its
+// deterministic raw-key work budget before it could prove a complete or full
+// bounded result. Callers must fail closed; treating the partial set as
+// complete could reduce a corroboration-weighted threshold.
+var ErrChallengeV21PrefixScanLimit = errors.New("app-v21 prefix scan work limit exceeded")
+
 // ErrAccessGrantNotFound distinguishes a genuinely absent exact grant from a
 // storage/corruption failure. Cleanup code must never treat an arbitrary read
 // error as proof that a security-sensitive grant was revoked.
 var ErrAccessGrantNotFound = errors.New("access grant not found")
 
 var agentProofPrefix = []byte("agentproof:")
+
+const canonicalAgentIDHexBytes = 64
+
+func isCanonicalAgentID(agentID string) bool {
+	if len(agentID) != canonicalAgentIDHexBytes {
+		return false
+	}
+	for i := range agentID {
+		c := agentID[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validateCanonicalAgentID(field, agentID string) error {
+	if !isCanonicalAgentID(agentID) {
+		return fmt.Errorf("%s must be a lowercase 64-hex Ed25519 public key", field)
+	}
+	return nil
+}
+
+// canonicalAgentIDFromPrefixedKey returns the exact canonical Ed25519 agent-ID
+// suffix of a delimiter-based Badger key. The exact-length check is
+// load-bearing: a prefix scan for tuple ("memory", "a") must not consume a key
+// for ("memory", "a:b"), whose extra tuple component would otherwise be
+// mistaken for part of the agent ID. Production agent IDs are always
+// lowercase 64-hex strings (auth.PublicKeyToAgentID).
+func canonicalAgentIDFromPrefixedKey(key, prefix []byte) (string, bool) {
+	if len(key) != len(prefix)+canonicalAgentIDHexBytes {
+		return "", false
+	}
+	agentID := string(key[len(prefix):])
+	if !isCanonicalAgentID(agentID) {
+		return "", false
+	}
+	return agentID, true
+}
 
 // A strict post-app-v20 block is one bounded Badger transaction. Limit
 // opportunistic proof-marker GC on a transaction-scoped store so an old marker
@@ -517,6 +562,19 @@ func encodeMemoryHashEntry(contentHash []byte, status string) []byte {
 	return val
 }
 
+func decodeMemoryHashEntry(val []byte) (contentHash []byte, status string, err error) {
+	if len(val) < 4 {
+		return nil, "", fmt.Errorf("invalid memory hash entry")
+	}
+	hashLen := binary.BigEndian.Uint32(val[:4])
+	if uint64(hashLen) > uint64(len(val)-4) {
+		return nil, "", fmt.Errorf("invalid memory hash entry")
+	}
+	contentHash = append([]byte(nil), val[4:4+int(hashLen)]...) // #nosec G115 -- bounded against len(val) above
+	status = string(val[4+int(hashLen):])                       // #nosec G115 -- bounded against len(val) above
+	return contentHash, status, nil
+}
+
 // GetMemoryHash retrieves a memory's on-chain hash and status.
 func (s *BadgerStore) GetMemoryHash(memoryID string) (contentHash []byte, status string, err error) {
 	err = s.view(func(txn *badger.Txn) error {
@@ -526,17 +584,9 @@ func (s *BadgerStore) GetMemoryHash(memoryID string) (contentHash []byte, status
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			if len(val) < 4 {
-				return fmt.Errorf("invalid memory hash entry")
-			}
-			hashLen := binary.BigEndian.Uint32(val[:4])
-			if int(4+hashLen) > len(val) { // #nosec G115 -- hashLen from 4-byte prefix, always fits in int
-				return fmt.Errorf("invalid memory hash entry")
-			}
-			contentHash = make([]byte, hashLen)
-			copy(contentHash, val[4:4+hashLen])
-			status = string(val[4+hashLen:])
-			return nil
+			var decodeErr error
+			contentHash, status, decodeErr = decodeMemoryHashEntry(val)
+			return decodeErr
 		})
 	})
 	if err == badger.ErrKeyNotFound {
@@ -1502,6 +1552,9 @@ func corroborationKey(memoryID, agentID string) []byte {
 // SetCorroborated marks on-chain that agentID has corroborated memoryID. Caller
 // gates on postAppV10Fork so pre-fork blocks never write this key.
 func (s *BadgerStore) SetCorroborated(memoryID, agentID string) error {
+	if err := validateCanonicalAgentID("corroborator agent id", agentID); err != nil {
+		return err
+	}
 	return s.update(func(txn *badger.Txn) error {
 		return s.txnSet(txn, corroborationKey(memoryID, agentID), []byte{1})
 	})
@@ -2473,6 +2526,110 @@ func (s *BadgerStore) ModifyVerbHolders(domain string, blockTime time.Time) ([]s
 	return out, nil
 }
 
+// ModifyVerbHoldersUpTo is the bounded app-v21 form of ModifyVerbHolders.
+// It stops as soon as more than limit distinct effective holders are observed,
+// so a domain with an adversarial grant fan-out cannot turn one challenge into
+// unbounded consensus work. When overLimit is true, holders is nil and callers
+// must use their documented bounded fallback rather than treating the prefix as
+// a complete electorate.
+func (s *BadgerStore) ModifyVerbHoldersUpTo(domain string, blockTime time.Time, limit int) (holders []string, overLimit bool, err error) {
+	if domain == "" {
+		return nil, false, nil
+	}
+	if limit <= 0 {
+		return nil, false, errors.New("modify-holder limit must be positive")
+	}
+	segments := splitDomainSegments(domain)
+	if len(segments) == 0 || len(segments) > 16 {
+		return nil, false, nil
+	}
+	now := blockTime.Unix()
+	set := make(map[string]struct{}, limit+1)
+	rawGrantSteps := 0
+	err = s.view(func(txn *badger.Txn) error {
+		add := func(agentID string) bool {
+			if agentID == "" {
+				return false
+			}
+			set[agentID] = struct{}{}
+			return len(set) > limit
+		}
+		for i := len(segments); i >= 1; i-- {
+			candidate := strings.Join(segments[:i], ".")
+			if candidate == "" || IsSharedDomainName(candidate) {
+				continue
+			}
+
+			if item, getErr := txn.Get(domainKey(candidate)); getErr == nil {
+				exceeded := false
+				if valueErr := item.Value(func(val []byte) error {
+					owner, _, decodeErr := decodeString(val, 0)
+					if decodeErr != nil {
+						return decodeErr
+					}
+					exceeded = add(owner)
+					return nil
+				}); valueErr != nil {
+					return valueErr
+				}
+				if exceeded {
+					overLimit = true
+					return nil
+				}
+			} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
+				return getErr
+			}
+
+			prefix := []byte("grant:" + candidate + ":")
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = true
+			opts.Prefix = prefix
+			it := txn.NewIterator(opts)
+			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+				rawGrantSteps++
+				if rawGrantSteps > maxChallengeV21PrefixScanSteps {
+					it.Close()
+					return ErrChallengeV21PrefixScanLimit
+				}
+				item := it.Item()
+				agentID, canonical := canonicalAgentIDFromPrefixedKey(item.Key(), prefix)
+				if !canonical {
+					continue
+				}
+				activeModify := false
+				if valueErr := item.Value(func(val []byte) error {
+					if len(val) < 9 {
+						return nil
+					}
+					level := val[0]
+					expiresAt := int64(binary.BigEndian.Uint64(val[1:9])) // #nosec G115 -- expiry timestamp fits in int64
+					activeModify = level >= 3 && (expiresAt == 0 || now < expiresAt)
+					return nil
+				}); valueErr != nil {
+					it.Close()
+					return valueErr
+				}
+				if activeModify && add(agentID) {
+					it.Close()
+					overLimit = true
+					return nil
+				}
+			}
+			it.Close()
+		}
+		return nil
+	})
+	if err != nil || overLimit {
+		return nil, overLimit, err
+	}
+	holders = make([]string, 0, len(set))
+	for agentID := range set {
+		holders = append(holders, agentID)
+	}
+	sort.Strings(holders)
+	return holders, false, nil
+}
+
 // --- app-v17 two-phase challenge record ---
 
 // ChallengeRecord is the on-chain record of an OPEN two-phase challenge
@@ -2600,6 +2757,1013 @@ func (s *BadgerStore) GetChallengeRecord(memoryID string) (*ChallengeRecord, err
 // DeleteChallengeRecord removes an open challenge record (on resolution).
 func (s *BadgerStore) DeleteChallengeRecord(memoryID string) error {
 	return s.DeleteState(challengeStateKey(memoryID))
+}
+
+// --- app-v21 corroboration-weighted challenge state ---
+//
+// The app-v17 ChallengeRecord above is deliberately left byte-identical. app-v21
+// uses separate keys and a versioned encoding so a post-upgrade node never has
+// to guess whether an unversioned legacy record contains a newer trailing field.
+
+const (
+	ChallengeRecordV21Version uint8 = 1
+
+	// MaxChallengeElectorateV21 bounds both consensus work and encoded state.
+	// It intentionally matches the app-v20 validator ceiling: a challenge must
+	// not amplify an unbounded grant roster into one unbounded Badger mutation.
+	MaxChallengeElectorateV21 = 100
+
+	// MaxChallengeCorroboratorScanV21 bounds the raw canonical-marker work used
+	// to assemble a read-authorized supporter committee. Historical pre-v21
+	// markers may belong to agents that no longer (or never did) have read
+	// access. Callers must fail closed if this scan truncates before the bounded
+	// electorate is full; a partial filtered result is not a complete zero-k
+	// observation.
+	MaxChallengeCorroboratorScanV21 = 1024
+
+	// maxChallengeV21PrefixScanSteps budgets raw iterator work, including
+	// delimiter-prefix collisions that are skipped as non-members. Counting
+	// only accepted canonical IDs would let nested memory/domain keys create an
+	// unbounded consensus scan.
+	maxChallengeV21PrefixScanSteps = 2048
+
+	maxChallengeV21IdentifierBytes = 512
+	maxChallengeV21StatusBytes     = 64
+	maxChallengeV21HashBytes       = 64
+	maxChallengeV21RecordBytes     = 64 << 10
+)
+
+var (
+	ErrChallengeV21AlreadyOpen     = errors.New("app-v21 challenge already open")
+	ErrChallengeV21NotOpen         = errors.New("app-v21 challenge is not open")
+	ErrChallengeV21AlreadyVoted    = errors.New("app-v21 challenger already voted in this round")
+	ErrChallengeV21NotEligible     = errors.New("app-v21 challenger is not in the snapshotted electorate")
+	ErrChallengeV21StatusMismatch  = errors.New("app-v21 memory status mismatch")
+	ErrChallengeV21ElectorateLimit = errors.New("app-v21 challenge electorate exceeds limit")
+)
+
+var challengeRecordV21Magic = [4]byte{'S', 'C', '2', ChallengeRecordV21Version}
+var challengeVoteV21Magic = [4]byte{'S', 'V', '2', ChallengeRecordV21Version}
+
+// ChallengeRecordV21 is the AppHash-covered state of one open weighted round.
+// Electorate is the sorted, unique snapshot of modify holders plus the bounded
+// committee of canonical, read-authorized corroborators taken at opening.
+// EligibleCorroborators counts canonical corrob: markers in that electorate,
+// excluding the opener (opening a challenge supersedes their prior support).
+type ChallengeRecordV21 struct {
+	Round                 uint64
+	Domain                string
+	ExecutionHeight       int64
+	EligibleCorroborators uint32
+	RequiredChallengers   uint32
+	ChallengerCount       uint32
+	PriorHash             []byte
+	PriorStatus           string
+	Electorate            []string
+}
+
+// ChallengeVoteV21 is the latest round in which an agent challenged a memory.
+// One key per (memory,agent) keeps lifetime distinct-agent state bounded while a
+// later round may safely overwrite the old round marker. Full event history
+// remains in the off-chain challenges audit table.
+type ChallengeVoteV21 struct {
+	Round        uint64
+	Height       int64
+	EvidenceHash []byte
+}
+
+// OpenChallengeV21Input contains every deterministic input needed to either
+// park a weighted challenge or immediately resolve the zero-corroborator case.
+// The store reads and snapshots the prior memory hash/status inside the same
+// Badger transaction; ExpectedPriorStatus prevents a stale caller from opening
+// over a different lifecycle state.
+type OpenChallengeV21Input struct {
+	MemoryID            string
+	OpenerID            string
+	Domain              string
+	ExecutionHeight     int64
+	ExpectedPriorStatus string
+	ChallengedStatus    string
+	ResolvedStatus      string
+	ResolvedHash        []byte
+	Electorate          []string
+	EvidenceHash        []byte
+}
+
+// EndorseChallengeV21Input records one new distinct challenge vote. If that
+// vote reaches RequiredChallengers, the memory transition and open-record
+// removal occur in this same atomic update.
+type EndorseChallengeV21Input struct {
+	MemoryID         string
+	ChallengerID     string
+	ExecutionHeight  int64
+	ChallengedStatus string
+	ResolvedStatus   string
+	ResolvedHash     []byte
+	EvidenceHash     []byte
+}
+
+// ChallengeOutcomeV21 reports the deterministic tally after an open/endorse.
+// Resolved is true when the same atomic write moved the memory to ResolvedStatus.
+type ChallengeOutcomeV21 struct {
+	Record   *ChallengeRecordV21
+	Resolved bool
+}
+
+func challengeRecordV21StateKey(memoryID string) []byte {
+	return stateKey("challengev21:" + memoryID)
+}
+
+func challengeRoundV21StateKey(memoryID string) []byte {
+	return stateKey("challengeroundv21:" + memoryID)
+}
+
+func challengeVoteV21Key(memoryID, agentID string) []byte {
+	return []byte("challengevotev21:" + memoryID + ":" + agentID)
+}
+
+func challengeVoteV21Prefix(memoryID string) []byte {
+	return []byte("challengevotev21:" + memoryID + ":")
+}
+
+func validateChallengeV21String(field, value string, max int, required bool) error {
+	if required && value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if len(value) > max {
+		return fmt.Errorf("%s has %d bytes, limit %d", field, len(value), max)
+	}
+	return nil
+}
+
+func canonicalChallengeElectorateV21(electorate []string) ([]string, error) {
+	if len(electorate) == 0 {
+		return nil, errors.New("app-v21 challenge electorate is empty")
+	}
+	if len(electorate) > MaxChallengeElectorateV21 {
+		return nil, ErrChallengeV21ElectorateLimit
+	}
+	out := append([]string(nil), electorate...)
+	for _, agentID := range out {
+		if err := validateCanonicalAgentID("electorate agent id", agentID); err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(out)
+	write := 0
+	for _, agentID := range out {
+		if write > 0 && out[write-1] == agentID {
+			continue
+		}
+		out[write] = agentID
+		write++
+	}
+	out = out[:write]
+	if len(out) == 0 {
+		return nil, errors.New("app-v21 challenge electorate is empty")
+	}
+	return out, nil
+}
+
+func encodeChallengeRecordV21(rec *ChallengeRecordV21) ([]byte, error) {
+	if err := validateChallengeRecordV21(rec, true); err != nil {
+		return nil, err
+	}
+	size := len(challengeRecordV21Magic) + 8 + 8 + 4 + 4 + 4
+	size += 4 + len(rec.Domain)
+	size += 4 + len(rec.PriorHash)
+	size += 4 + len(rec.PriorStatus)
+	size += 4
+	for _, agentID := range rec.Electorate {
+		size += 4 + len(agentID)
+	}
+	if size > maxChallengeV21RecordBytes {
+		return nil, fmt.Errorf("app-v21 challenge record has %d bytes, limit %d", size, maxChallengeV21RecordBytes)
+	}
+	val := make([]byte, size)
+	copy(val, challengeRecordV21Magic[:])
+	off := len(challengeRecordV21Magic)
+	binary.BigEndian.PutUint64(val[off:off+8], rec.Round)
+	off += 8
+	binary.BigEndian.PutUint64(val[off:off+8], uint64(rec.ExecutionHeight)) // #nosec G115 -- validated non-negative
+	off += 8
+	binary.BigEndian.PutUint32(val[off:off+4], rec.EligibleCorroborators)
+	off += 4
+	binary.BigEndian.PutUint32(val[off:off+4], rec.RequiredChallengers)
+	off += 4
+	binary.BigEndian.PutUint32(val[off:off+4], rec.ChallengerCount)
+	off += 4
+	off = encodeString(val, off, rec.Domain)
+	binary.BigEndian.PutUint32(val[off:off+4], uint32(len(rec.PriorHash))) // #nosec G115 -- bounded above
+	off += 4
+	copy(val[off:off+len(rec.PriorHash)], rec.PriorHash)
+	off += len(rec.PriorHash)
+	off = encodeString(val, off, rec.PriorStatus)
+	binary.BigEndian.PutUint32(val[off:off+4], uint32(len(rec.Electorate))) // #nosec G115 -- capped at 100
+	off += 4
+	for _, agentID := range rec.Electorate {
+		off = encodeString(val, off, agentID)
+	}
+	if off != len(val) {
+		return nil, errors.New("app-v21 challenge record encoding length mismatch")
+	}
+	return val, nil
+}
+
+func decodeChallengeV21String(val []byte, off int, field string, max int, required bool) (string, int, error) {
+	if off < 0 || off+4 > len(val) {
+		return "", 0, fmt.Errorf("invalid app-v21 challenge record: missing %s length", field)
+	}
+	n := binary.BigEndian.Uint32(val[off : off+4])
+	off += 4
+	if uint64(n) > uint64(max) || uint64(n) > uint64(len(val)-off) {
+		return "", 0, fmt.Errorf("invalid app-v21 challenge record: %s length %d", field, n)
+	}
+	out := string(val[off : off+int(n)]) // #nosec G115 -- bounded above
+	if required && out == "" {
+		return "", 0, fmt.Errorf("invalid app-v21 challenge record: %s is empty", field)
+	}
+	return out, off + int(n), nil // #nosec G115 -- bounded above
+}
+
+func decodeChallengeRecordV21(val []byte) (*ChallengeRecordV21, error) {
+	if len(val) > maxChallengeV21RecordBytes {
+		return nil, fmt.Errorf("invalid app-v21 challenge record: %d bytes exceeds limit", len(val))
+	}
+	const fixed = 4 + 8 + 8 + 4 + 4 + 4
+	if len(val) < fixed || !bytes.Equal(val[:4], challengeRecordV21Magic[:]) {
+		return nil, errors.New("invalid app-v21 challenge record: bad version marker")
+	}
+	rec := &ChallengeRecordV21{}
+	off := 4
+	rec.Round = binary.BigEndian.Uint64(val[off : off+8])
+	off += 8
+	rawHeight := binary.BigEndian.Uint64(val[off : off+8])
+	off += 8
+	if rawHeight > math.MaxInt64 {
+		return nil, errors.New("invalid app-v21 challenge record: execution height overflows int64")
+	}
+	rec.ExecutionHeight = int64(rawHeight)
+	rec.EligibleCorroborators = binary.BigEndian.Uint32(val[off : off+4])
+	off += 4
+	rec.RequiredChallengers = binary.BigEndian.Uint32(val[off : off+4])
+	off += 4
+	rec.ChallengerCount = binary.BigEndian.Uint32(val[off : off+4])
+	off += 4
+	var err error
+	rec.Domain, off, err = decodeChallengeV21String(val, off, "domain", maxChallengeV21IdentifierBytes, true)
+	if err != nil {
+		return nil, err
+	}
+	if off+4 > len(val) {
+		return nil, errors.New("invalid app-v21 challenge record: missing prior hash length")
+	}
+	hashLen := binary.BigEndian.Uint32(val[off : off+4])
+	off += 4
+	if hashLen > maxChallengeV21HashBytes || uint64(hashLen) > uint64(len(val)-off) {
+		return nil, fmt.Errorf("invalid app-v21 challenge record: prior hash length %d", hashLen)
+	}
+	rec.PriorHash = append([]byte(nil), val[off:off+int(hashLen)]...) // #nosec G115 -- bounded above
+	off += int(hashLen)                                               // #nosec G115 -- bounded above
+	rec.PriorStatus, off, err = decodeChallengeV21String(val, off, "prior status", maxChallengeV21StatusBytes, true)
+	if err != nil {
+		return nil, err
+	}
+	if off+4 > len(val) {
+		return nil, errors.New("invalid app-v21 challenge record: missing electorate count")
+	}
+	count := binary.BigEndian.Uint32(val[off : off+4])
+	off += 4
+	if count == 0 || count > MaxChallengeElectorateV21 {
+		return nil, fmt.Errorf("invalid app-v21 challenge record: electorate count %d", count)
+	}
+	rec.Electorate = make([]string, 0, int(count))
+	for i := uint32(0); i < count; i++ {
+		var agentID string
+		agentID, off, err = decodeChallengeV21String(val, off, "electorate agent id", maxChallengeV21IdentifierBytes, true)
+		if err != nil {
+			return nil, err
+		}
+		if len(rec.Electorate) > 0 && rec.Electorate[len(rec.Electorate)-1] >= agentID {
+			return nil, errors.New("invalid app-v21 challenge record: electorate is not strictly sorted")
+		}
+		rec.Electorate = append(rec.Electorate, agentID)
+	}
+	if off != len(val) {
+		return nil, errors.New("invalid app-v21 challenge record: trailing bytes")
+	}
+	if err := validateChallengeRecordV21(rec, true); err != nil {
+		return nil, fmt.Errorf("invalid app-v21 challenge record: %w", err)
+	}
+	return rec, nil
+}
+
+func validateChallengeRecordV21(rec *ChallengeRecordV21, requireCanonical bool) error {
+	if rec == nil {
+		return errors.New("app-v21 challenge record is required")
+	}
+	if rec.Round == 0 {
+		return errors.New("app-v21 challenge round must be positive")
+	}
+	if rec.ExecutionHeight < 0 {
+		return errors.New("app-v21 challenge execution height must be non-negative")
+	}
+	if err := validateChallengeV21String("challenge domain", rec.Domain, maxChallengeV21IdentifierBytes, true); err != nil {
+		return err
+	}
+	if err := validateChallengeV21String("prior status", rec.PriorStatus, maxChallengeV21StatusBytes, true); err != nil {
+		return err
+	}
+	if len(rec.PriorHash) > maxChallengeV21HashBytes {
+		return fmt.Errorf("prior hash has %d bytes, limit %d", len(rec.PriorHash), maxChallengeV21HashBytes)
+	}
+	if len(rec.Electorate) == 0 || len(rec.Electorate) > MaxChallengeElectorateV21 {
+		return ErrChallengeV21ElectorateLimit
+	}
+	for i, agentID := range rec.Electorate {
+		if err := validateCanonicalAgentID("electorate agent id", agentID); err != nil {
+			return err
+		}
+		if requireCanonical && i > 0 && rec.Electorate[i-1] >= agentID {
+			return errors.New("app-v21 challenge electorate is not strictly sorted")
+		}
+	}
+	if rec.EligibleCorroborators >= uint32(len(rec.Electorate)) { // #nosec G115 -- electorate capped at 100
+		return errors.New("eligible corroborator count must be smaller than electorate")
+	}
+	if rec.RequiredChallengers != rec.EligibleCorroborators+1 {
+		return errors.New("required challenger count must equal eligible corroborators plus one")
+	}
+	if rec.ChallengerCount == 0 || rec.ChallengerCount >= rec.RequiredChallengers {
+		return errors.New("open challenge count is outside 1..required-1")
+	}
+	return nil
+}
+
+func encodeChallengeVoteV21(vote *ChallengeVoteV21) ([]byte, error) {
+	if vote == nil || vote.Round == 0 || vote.Height < 0 || len(vote.EvidenceHash) != sha256.Size {
+		return nil, errors.New("invalid app-v21 challenge vote")
+	}
+	val := make([]byte, 4+8+8+sha256.Size)
+	copy(val, challengeVoteV21Magic[:])
+	binary.BigEndian.PutUint64(val[4:12], vote.Round)
+	binary.BigEndian.PutUint64(val[12:20], uint64(vote.Height)) // #nosec G115 -- validated non-negative
+	copy(val[20:], vote.EvidenceHash)
+	return val, nil
+}
+
+func decodeChallengeVoteV21(val []byte) (*ChallengeVoteV21, error) {
+	if len(val) != 4+8+8+sha256.Size || !bytes.Equal(val[:4], challengeVoteV21Magic[:]) {
+		return nil, errors.New("invalid app-v21 challenge vote")
+	}
+	rawHeight := binary.BigEndian.Uint64(val[12:20])
+	if rawHeight > math.MaxInt64 {
+		return nil, errors.New("invalid app-v21 challenge vote height")
+	}
+	vote := &ChallengeVoteV21{
+		Round:        binary.BigEndian.Uint64(val[4:12]),
+		Height:       int64(rawHeight),
+		EvidenceHash: append([]byte(nil), val[20:]...),
+	}
+	if vote.Round == 0 {
+		return nil, errors.New("invalid app-v21 challenge vote round")
+	}
+	return vote, nil
+}
+
+func challengeRoundV21InTxn(txn *badger.Txn, memoryID string) (uint64, error) {
+	item, err := txn.Get(challengeRoundV21StateKey(memoryID))
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var round uint64
+	err = item.Value(func(val []byte) error {
+		if len(val) != 8 {
+			return errors.New("invalid app-v21 challenge round")
+		}
+		round = binary.BigEndian.Uint64(val)
+		return nil
+	})
+	return round, err
+}
+
+func challengeRecordV21InTxn(txn *badger.Txn, memoryID string) (*ChallengeRecordV21, error) {
+	item, err := txn.Get(challengeRecordV21StateKey(memoryID))
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var rec *ChallengeRecordV21
+	err = item.Value(func(val []byte) error {
+		var decodeErr error
+		rec, decodeErr = decodeChallengeRecordV21(val)
+		return decodeErr
+	})
+	return rec, err
+}
+
+func challengeVoteV21InTxn(txn *badger.Txn, memoryID, agentID string) (*ChallengeVoteV21, error) {
+	item, err := txn.Get(challengeVoteV21Key(memoryID, agentID))
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var vote *ChallengeVoteV21
+	err = item.Value(func(val []byte) error {
+		var decodeErr error
+		vote, decodeErr = decodeChallengeVoteV21(val)
+		return decodeErr
+	})
+	return vote, err
+}
+
+func memoryHashV21InTxn(txn *badger.Txn, memoryID string) ([]byte, string, error) {
+	item, err := txn.Get(memoryKey(memoryID))
+	if err != nil {
+		return nil, "", err
+	}
+	var contentHash []byte
+	var status string
+	err = item.Value(func(val []byte) error {
+		var decodeErr error
+		contentHash, status, decodeErr = decodeMemoryHashEntry(val)
+		return decodeErr
+	})
+	return contentHash, status, err
+}
+
+func canonicalCorroboratorCountV21InTxn(txn *badger.Txn, memoryID string, electorate []string, excludedAgent string) (uint32, error) {
+	var count uint32
+	for _, agentID := range electorate {
+		if agentID == excludedAgent {
+			continue
+		}
+		_, err := txn.Get(corroborationKey(memoryID, agentID))
+		switch {
+		case err == nil:
+			count++
+		case errors.Is(err, badger.ErrKeyNotFound):
+		default:
+			return 0, err
+		}
+	}
+	return count, nil
+}
+
+// ListCanonicalCorroboratorsV21UpTo returns the sorted AppHash-covered
+// corroborator identities for memoryID, excluding excludedAgent. Iteration is
+// bounded at limit+1 so historical or adversarial fan-out cannot create
+// unbounded FinalizeBlock work. When overLimit is true, agents contains the
+// first limit identities in canonical key order; callers may use that stable
+// prefix as a bounded committee but must not describe it as the complete set.
+func (s *BadgerStore) ListCanonicalCorroboratorsV21UpTo(memoryID, excludedAgent string, limit int) (agents []string, overLimit bool, err error) {
+	if err := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); err != nil {
+		return nil, false, err
+	}
+	if limit <= 0 {
+		return nil, false, errors.New("canonical corroborator limit must be positive")
+	}
+	prefix := []byte("corrob:" + memoryID + ":")
+	rawSteps := 0
+	err = s.view(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = prefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			rawSteps++
+			if rawSteps > maxChallengeV21PrefixScanSteps {
+				return ErrChallengeV21PrefixScanLimit
+			}
+			agentID, canonical := canonicalAgentIDFromPrefixedKey(it.Item().Key(), prefix)
+			if !canonical {
+				continue
+			}
+			if agentID == excludedAgent {
+				continue
+			}
+			if len(agents) == limit {
+				overLimit = true
+				return nil
+			}
+			agents = append(agents, agentID)
+		}
+		return nil
+	})
+	return agents, overLimit, err
+}
+
+// listCanonicalAgentMarkerPage scans at most rawLimit physical keys after the
+// opaque raw-key cursor. Basing the page boundary on raw keys (rather than only
+// valid agent IDs) guarantees progress and bounded work even when a restored
+// database contains malformed legacy keys. The returned cursor must only be
+// passed back to the same prefix scan.
+func (s *BadgerStore) listCanonicalAgentMarkerPage(prefix, after []byte, rawLimit int) (agents []string, next []byte, done bool, err error) {
+	if rawLimit <= 0 {
+		return nil, nil, false, errors.New("canonical marker page limit must be positive")
+	}
+	if rawLimit > maxChallengeV21PrefixScanSteps {
+		return nil, nil, false, fmt.Errorf(
+			"canonical marker page limit %d exceeds maximum %d",
+			rawLimit, maxChallengeV21PrefixScanSteps,
+		)
+	}
+	if len(after) > 0 && !bytes.HasPrefix(after, prefix) {
+		return nil, nil, false, errors.New("canonical marker cursor does not match prefix")
+	}
+	err = s.view(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = prefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		seek := prefix
+		if len(after) > 0 {
+			seek = after
+		}
+		it.Seek(seek)
+		if len(after) > 0 && it.ValidForPrefix(prefix) && bytes.Compare(it.Item().Key(), after) <= 0 {
+			it.Next()
+		}
+
+		rawScanned := 0
+		for it.ValidForPrefix(prefix) && rawScanned < rawLimit {
+			key := it.Item().KeyCopy(nil)
+			next = key
+			rawScanned++
+			if agentID, canonical := canonicalAgentIDFromPrefixedKey(key, prefix); canonical {
+				agents = append(agents, agentID)
+			}
+			it.Next()
+		}
+		done = !it.ValidForPrefix(prefix)
+		if rawScanned == 0 {
+			next = nil
+		}
+		return nil
+	})
+	return agents, next, done, err
+}
+
+// ListCanonicalCorroboratorsV21Page streams AppHash-covered corroborator
+// identities in raw-key pages. It is intended for off-chain recovery, where
+// exact unbounded lifetime sets must be reconstructed without materializing the
+// entire set or doing unbounded work in one Badger transaction.
+func (s *BadgerStore) ListCanonicalCorroboratorsV21Page(memoryID string, after []byte, rawLimit int) (agents []string, next []byte, done bool, err error) {
+	if err := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); err != nil {
+		return nil, nil, false, err
+	}
+	return s.listCanonicalAgentMarkerPage([]byte("corrob:"+memoryID+":"), after, rawLimit)
+}
+
+// CountCanonicalCorroboratorsV21 counts only AppHash-covered corrob: markers
+// belonging to the supplied eligible electorate. Off-chain/legacy SQL rows and
+// outsider corroborators deliberately cannot affect a consensus threshold.
+func (s *BadgerStore) CountCanonicalCorroboratorsV21(memoryID string, electorate []string, excludedAgent string) (uint32, error) {
+	if excludedAgent != "" {
+		if err := validateCanonicalAgentID("excluded agent id", excludedAgent); err != nil {
+			return 0, err
+		}
+	}
+	canonical, err := canonicalChallengeElectorateV21(electorate)
+	if err != nil {
+		return 0, err
+	}
+	var count uint32
+	err = s.view(func(txn *badger.Txn) error {
+		var countErr error
+		count, countErr = canonicalCorroboratorCountV21InTxn(txn, memoryID, canonical, excludedAgent)
+		return countErr
+	})
+	return count, err
+}
+
+func validateOpenChallengeV21Input(in OpenChallengeV21Input) ([]string, error) {
+	for _, candidate := range []struct {
+		field    string
+		value    string
+		max      int
+		required bool
+	}{
+		{"memory id", in.MemoryID, maxChallengeV21IdentifierBytes, true},
+		{"opener id", in.OpenerID, maxChallengeV21IdentifierBytes, true},
+		{"domain", in.Domain, maxChallengeV21IdentifierBytes, true},
+		{"expected prior status", in.ExpectedPriorStatus, maxChallengeV21StatusBytes, true},
+		{"challenged status", in.ChallengedStatus, maxChallengeV21StatusBytes, true},
+		{"resolved status", in.ResolvedStatus, maxChallengeV21StatusBytes, true},
+	} {
+		if err := validateChallengeV21String(candidate.field, candidate.value, candidate.max, candidate.required); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateCanonicalAgentID("opener id", in.OpenerID); err != nil {
+		return nil, err
+	}
+	if in.ExecutionHeight < 0 {
+		return nil, errors.New("app-v21 challenge execution height must be non-negative")
+	}
+	if len(in.ResolvedHash) > maxChallengeV21HashBytes {
+		return nil, fmt.Errorf("resolved hash has %d bytes, limit %d", len(in.ResolvedHash), maxChallengeV21HashBytes)
+	}
+	if len(in.EvidenceHash) != sha256.Size {
+		return nil, errors.New("app-v21 challenge evidence hash must be 32 bytes")
+	}
+	canonical, err := canonicalChallengeElectorateV21(in.Electorate)
+	if err != nil {
+		return nil, err
+	}
+	i := sort.SearchStrings(canonical, in.OpenerID)
+	if i == len(canonical) || canonical[i] != in.OpenerID {
+		return nil, ErrChallengeV21NotEligible
+	}
+	return canonical, nil
+}
+
+// OpenChallengeV21 atomically snapshots the memory, increments its monotonic
+// round, records the opener vote, and either parks the memory or resolves it
+// immediately when no eligible corroborator remains after excluding the opener.
+func (s *BadgerStore) OpenChallengeV21(in OpenChallengeV21Input) (*ChallengeOutcomeV21, error) {
+	electorate, err := validateOpenChallengeV21Input(in)
+	if err != nil {
+		return nil, err
+	}
+	var outcome *ChallengeOutcomeV21
+	err = s.update(func(txn *badger.Txn) error {
+		if existing, getErr := challengeRecordV21InTxn(txn, in.MemoryID); getErr != nil {
+			return getErr
+		} else if existing != nil {
+			return ErrChallengeV21AlreadyOpen
+		}
+		if _, getErr := txn.Get(stateKey(challengeStateKey(in.MemoryID))); getErr == nil {
+			return ErrChallengeV21AlreadyOpen
+		} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
+			return getErr
+		}
+		priorHash, priorStatus, getErr := memoryHashV21InTxn(txn, in.MemoryID)
+		if getErr != nil {
+			return getErr
+		}
+		if priorStatus != in.ExpectedPriorStatus {
+			return fmt.Errorf("%w: got %q, want %q", ErrChallengeV21StatusMismatch, priorStatus, in.ExpectedPriorStatus)
+		}
+		round, getErr := challengeRoundV21InTxn(txn, in.MemoryID)
+		if getErr != nil {
+			return getErr
+		}
+		if round == math.MaxUint64 {
+			return errors.New("app-v21 challenge round overflow")
+		}
+		round++
+		corroborators, countErr := canonicalCorroboratorCountV21InTxn(txn, in.MemoryID, electorate, in.OpenerID)
+		if countErr != nil {
+			return countErr
+		}
+		rec := &ChallengeRecordV21{
+			Round:                 round,
+			Domain:                in.Domain,
+			ExecutionHeight:       in.ExecutionHeight,
+			EligibleCorroborators: corroborators,
+			RequiredChallengers:   corroborators + 1,
+			ChallengerCount:       1,
+			PriorHash:             priorHash,
+			PriorStatus:           priorStatus,
+			Electorate:            electorate,
+		}
+		voteVal, encodeErr := encodeChallengeVoteV21(&ChallengeVoteV21{
+			Round: round, Height: in.ExecutionHeight, EvidenceHash: in.EvidenceHash,
+		})
+		if encodeErr != nil {
+			return encodeErr
+		}
+		roundVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(roundVal, round)
+		resolved := rec.RequiredChallengers == 1
+		targetHash, targetStatus := priorHash, in.ChallengedStatus
+		if resolved {
+			targetHash, targetStatus = in.ResolvedHash, in.ResolvedStatus
+		}
+		if setErr := s.txnSet(txn, memoryKey(in.MemoryID), encodeMemoryHashEntry(targetHash, targetStatus)); setErr != nil {
+			return setErr
+		}
+		if !resolved {
+			recVal, encodeErr := encodeChallengeRecordV21(rec)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if setErr := s.txnSet(txn, challengeRecordV21StateKey(in.MemoryID), recVal); setErr != nil {
+				return setErr
+			}
+		}
+		if setErr := s.txnSet(txn, challengeRoundV21StateKey(in.MemoryID), roundVal); setErr != nil {
+			return setErr
+		}
+		if setErr := s.txnSet(txn, challengeVoteV21Key(in.MemoryID, in.OpenerID), voteVal); setErr != nil {
+			return setErr
+		}
+		outcome = &ChallengeOutcomeV21{Record: rec, Resolved: resolved}
+		return nil
+	})
+	return outcome, err
+}
+
+func countChallengeVotesV21InTxn(txn *badger.Txn, memoryID string, rec *ChallengeRecordV21) (uint32, error) {
+	var count uint32
+	for _, agentID := range rec.Electorate {
+		vote, err := challengeVoteV21InTxn(txn, memoryID, agentID)
+		if err != nil {
+			return 0, err
+		}
+		if vote != nil && vote.Round == rec.Round {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func validateEndorseChallengeV21Input(in EndorseChallengeV21Input) error {
+	for _, candidate := range []struct {
+		field string
+		value string
+	}{
+		{"memory id", in.MemoryID},
+		{"challenger id", in.ChallengerID},
+		{"challenged status", in.ChallengedStatus},
+		{"resolved status", in.ResolvedStatus},
+	} {
+		max := maxChallengeV21IdentifierBytes
+		if strings.Contains(candidate.field, "status") {
+			max = maxChallengeV21StatusBytes
+		}
+		if err := validateChallengeV21String(candidate.field, candidate.value, max, true); err != nil {
+			return err
+		}
+	}
+	if err := validateCanonicalAgentID("challenger id", in.ChallengerID); err != nil {
+		return err
+	}
+	if in.ExecutionHeight < 0 {
+		return errors.New("app-v21 challenge execution height must be non-negative")
+	}
+	if len(in.ResolvedHash) > maxChallengeV21HashBytes {
+		return fmt.Errorf("resolved hash has %d bytes, limit %d", len(in.ResolvedHash), maxChallengeV21HashBytes)
+	}
+	if len(in.EvidenceHash) != sha256.Size {
+		return errors.New("app-v21 challenge evidence hash must be 32 bytes")
+	}
+	return nil
+}
+
+// EndorseChallengeV21 atomically adds a distinct snapshot-member vote. The
+// method re-counts current-round markers before mutation; record/marker drift is
+// treated as consensus-state corruption rather than silently trusting a counter.
+// The threshold-reaching vote also resolves the memory and removes the open
+// record in the same Badger update.
+func (s *BadgerStore) EndorseChallengeV21(in EndorseChallengeV21Input) (*ChallengeOutcomeV21, error) {
+	if err := validateEndorseChallengeV21Input(in); err != nil {
+		return nil, err
+	}
+	var outcome *ChallengeOutcomeV21
+	err := s.update(func(txn *badger.Txn) error {
+		rec, getErr := challengeRecordV21InTxn(txn, in.MemoryID)
+		if getErr != nil {
+			return getErr
+		}
+		if rec == nil {
+			return ErrChallengeV21NotOpen
+		}
+		i := sort.SearchStrings(rec.Electorate, in.ChallengerID)
+		if i == len(rec.Electorate) || rec.Electorate[i] != in.ChallengerID {
+			return ErrChallengeV21NotEligible
+		}
+		_, currentStatus, getErr := memoryHashV21InTxn(txn, in.MemoryID)
+		if getErr != nil {
+			return getErr
+		}
+		if currentStatus != in.ChallengedStatus {
+			return fmt.Errorf("%w: got %q, want %q", ErrChallengeV21StatusMismatch, currentStatus, in.ChallengedStatus)
+		}
+		currentVotes, countErr := countChallengeVotesV21InTxn(txn, in.MemoryID, rec)
+		if countErr != nil {
+			return countErr
+		}
+		if currentVotes != rec.ChallengerCount {
+			return fmt.Errorf("app-v21 challenge vote count mismatch: markers=%d record=%d", currentVotes, rec.ChallengerCount)
+		}
+		existing, getErr := challengeVoteV21InTxn(txn, in.MemoryID, in.ChallengerID)
+		if getErr != nil {
+			return getErr
+		}
+		if existing != nil && existing.Round == rec.Round {
+			return ErrChallengeV21AlreadyVoted
+		}
+		if existing != nil && existing.Round > rec.Round {
+			return errors.New("app-v21 challenge vote round is ahead of open record")
+		}
+		if rec.ChallengerCount >= rec.RequiredChallengers {
+			return errors.New("app-v21 open challenge already reached its threshold")
+		}
+		rec.ChallengerCount++
+		voteVal, encodeErr := encodeChallengeVoteV21(&ChallengeVoteV21{
+			Round: rec.Round, Height: in.ExecutionHeight, EvidenceHash: in.EvidenceHash,
+		})
+		if encodeErr != nil {
+			return encodeErr
+		}
+		resolved := rec.ChallengerCount == rec.RequiredChallengers
+		var recVal []byte
+		if !resolved {
+			recVal, encodeErr = encodeChallengeRecordV21(rec)
+			if encodeErr != nil {
+				return encodeErr
+			}
+		}
+		if setErr := s.txnSet(txn, challengeVoteV21Key(in.MemoryID, in.ChallengerID), voteVal); setErr != nil {
+			return setErr
+		}
+		if resolved {
+			if setErr := s.txnSet(txn, memoryKey(in.MemoryID), encodeMemoryHashEntry(in.ResolvedHash, in.ResolvedStatus)); setErr != nil {
+				return setErr
+			}
+			if deleteErr := s.txnDelete(txn, challengeRecordV21StateKey(in.MemoryID)); deleteErr != nil {
+				return deleteErr
+			}
+		} else if setErr := s.txnSet(txn, challengeRecordV21StateKey(in.MemoryID), recVal); setErr != nil {
+			return setErr
+		}
+		outcome = &ChallengeOutcomeV21{Record: rec, Resolved: resolved}
+		return nil
+	})
+	return outcome, err
+}
+
+// ReinstateChallengeV21 atomically restores the prior hash/status captured at
+// round opening and removes only the open record. The monotonic round and
+// per-agent latest-round markers remain, preventing stale votes from leaking
+// into a later challenge.
+func (s *BadgerStore) ReinstateChallengeV21(memoryID, expectedChallengedStatus string) (*ChallengeRecordV21, error) {
+	if err := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); err != nil {
+		return nil, err
+	}
+	if err := validateChallengeV21String("challenged status", expectedChallengedStatus, maxChallengeV21StatusBytes, true); err != nil {
+		return nil, err
+	}
+	var restored *ChallengeRecordV21
+	err := s.update(func(txn *badger.Txn) error {
+		rec, getErr := challengeRecordV21InTxn(txn, memoryID)
+		if getErr != nil {
+			return getErr
+		}
+		if rec == nil {
+			return ErrChallengeV21NotOpen
+		}
+		_, status, getErr := memoryHashV21InTxn(txn, memoryID)
+		if getErr != nil {
+			return getErr
+		}
+		if status != expectedChallengedStatus {
+			return fmt.Errorf("%w: got %q, want %q", ErrChallengeV21StatusMismatch, status, expectedChallengedStatus)
+		}
+		votes, countErr := countChallengeVotesV21InTxn(txn, memoryID, rec)
+		if countErr != nil {
+			return countErr
+		}
+		if votes != rec.ChallengerCount {
+			return fmt.Errorf("app-v21 challenge vote count mismatch: markers=%d record=%d", votes, rec.ChallengerCount)
+		}
+		if setErr := s.txnSet(txn, memoryKey(memoryID), encodeMemoryHashEntry(rec.PriorHash, rec.PriorStatus)); setErr != nil {
+			return setErr
+		}
+		if deleteErr := s.txnDelete(txn, challengeRecordV21StateKey(memoryID)); deleteErr != nil {
+			return deleteErr
+		}
+		restored = rec
+		return nil
+	})
+	return restored, err
+}
+
+// GetChallengeRecordV21 returns the open weighted challenge, or nil when none
+// is open. Legacy state:challenge: records are intentionally not consulted.
+func (s *BadgerStore) GetChallengeRecordV21(memoryID string) (*ChallengeRecordV21, error) {
+	var rec *ChallengeRecordV21
+	err := s.view(func(txn *badger.Txn) error {
+		var getErr error
+		rec, getErr = challengeRecordV21InTxn(txn, memoryID)
+		return getErr
+	})
+	return rec, err
+}
+
+func (s *BadgerStore) GetChallengeRoundV21(memoryID string) (uint64, error) {
+	var round uint64
+	err := s.view(func(txn *badger.Txn) error {
+		var getErr error
+		round, getErr = challengeRoundV21InTxn(txn, memoryID)
+		return getErr
+	})
+	return round, err
+}
+
+func (s *BadgerStore) GetChallengeVoteV21(memoryID, agentID string) (*ChallengeVoteV21, error) {
+	var vote *ChallengeVoteV21
+	err := s.view(func(txn *badger.Txn) error {
+		var getErr error
+		vote, getErr = challengeVoteV21InTxn(txn, memoryID, agentID)
+		return getErr
+	})
+	return vote, err
+}
+
+// ListChallengeVotersV21UpTo returns the sorted lifetime set of identities with
+// an AppHash-covered app-v21 challenge marker for memoryID. The result is
+// bounded exactly like canonical corroborator listing; overLimit means callers
+// must not treat the returned slice as complete.
+func (s *BadgerStore) ListChallengeVotersV21UpTo(memoryID string, limit int) (agents []string, overLimit bool, err error) {
+	if err := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); err != nil {
+		return nil, false, err
+	}
+	if limit <= 0 {
+		return nil, false, errors.New("challenge voter limit must be positive")
+	}
+	prefix := challengeVoteV21Prefix(memoryID)
+	rawSteps := 0
+	err = s.view(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = prefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			rawSteps++
+			if rawSteps > maxChallengeV21PrefixScanSteps {
+				return ErrChallengeV21PrefixScanLimit
+			}
+			agentID, canonical := canonicalAgentIDFromPrefixedKey(it.Item().Key(), prefix)
+			if !canonical {
+				continue
+			}
+			agents = append(agents, agentID)
+			if len(agents) > limit {
+				agents = nil
+				overLimit = true
+				return nil
+			}
+		}
+		return nil
+	})
+	return agents, overLimit, err
+}
+
+// ListChallengeVotersV21Page streams the lifetime AppHash-covered app-v21
+// challenger identities in bounded raw-key pages for exact off-chain recovery.
+func (s *BadgerStore) ListChallengeVotersV21Page(memoryID string, after []byte, rawLimit int) (agents []string, next []byte, done bool, err error) {
+	if err := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); err != nil {
+		return nil, nil, false, err
+	}
+	return s.listCanonicalAgentMarkerPage(challengeVoteV21Prefix(memoryID), after, rawLimit)
+}
+
+// CountDistinctChallengeVotersV21 returns the lifetime number of distinct agent
+// keys that have challenged this memory. Repeated rounds overwrite a marker and
+// therefore never inflate this count.
+func (s *BadgerStore) CountDistinctChallengeVotersV21(memoryID string) (uint32, error) {
+	if err := validateChallengeV21String("memory id", memoryID, maxChallengeV21IdentifierBytes, true); err != nil {
+		return 0, err
+	}
+	prefix := challengeVoteV21Prefix(memoryID)
+	var count uint32
+	rawSteps := 0
+	err := s.view(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = prefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			rawSteps++
+			if rawSteps > maxChallengeV21PrefixScanSteps {
+				return ErrChallengeV21PrefixScanLimit
+			}
+			if _, canonical := canonicalAgentIDFromPrefixedKey(it.Item().Key(), prefix); !canonical {
+				continue
+			}
+			if count == math.MaxUint32 {
+				return errors.New("app-v21 distinct challenge voter count overflow")
+			}
+			count++
+		}
+		return nil
+	})
+	return count, err
 }
 
 // SetAccessRequest stores an access request in BadgerDB.

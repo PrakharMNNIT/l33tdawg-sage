@@ -70,10 +70,14 @@ async def test_concurrent_queries(async_client, mock_api, sample_query_response)
 async def test_forget_with_reason(async_client, mock_api):
     memory_id = "550e8400-e29b-41d4-a716-446655440000"
     route = mock_api.post(f"/v1/memory/{memory_id}/forget").mock(
-        return_value=httpx.Response(200, json={"message": "Memory forgotten.", "tx_hash": "FORGETHASH"})
+        return_value=httpx.Response(
+            200,
+            json={"message": "Memory forgotten.", "tx_hash": "FORGETHASH", "status": "deprecated"},
+        )
     )
     result = await async_client.forget(memory_id, reason="duplicate")
     assert result["tx_hash"] == "FORGETHASH"
+    assert result["status"] == "deprecated"
     assert route.calls.last.request.read() == b'{"reason":"duplicate"}'
 
 

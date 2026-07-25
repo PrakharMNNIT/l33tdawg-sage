@@ -271,9 +271,9 @@ test('governance wizard builds structured canonical quorum scopes', () => {
         'the dashboard must submit structured scope JSON, not recreate the binary codec');
 });
 
-test('chain health recognizes app-v20 as the current consensus protocol', () => {
-    assert.match(appSource, /const appVerTone = appVer === '20'/);
-    assert.match(appSource, /Green when current \(20\)\./);
+test('chain health recognizes app-v21 as the current consensus protocol', () => {
+    assert.match(appSource, /const appVerTone = appVer === '21'/);
+    assert.match(appSource, /Green when current \(21\)\./);
     assert.doesNotMatch(appSource, /appVer === '15'/);
 });
 

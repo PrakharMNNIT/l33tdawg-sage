@@ -37,6 +37,10 @@ const v119StateSync = readFileSync(
   new URL('../deploy/scripts/run-v11.9-state-sync.sh', import.meta.url),
   'utf8',
 );
+const stateSyncRuntime = readFileSync(
+  new URL('../cmd/sage-gui/state_sync_runtime.go', import.meta.url),
+  'utf8',
+);
 
 function job(id) {
   const marker = `  ${id}:\n`;
@@ -311,6 +315,32 @@ test('the Linux cold gate proves the closed placeholder through the real Comet d
   assert.doesNotMatch(v119StateSync, /busybox nslookup provider-p2p/);
 });
 
+test('the mandatory cold gate transfers one exact app-v21 session', () => {
+  assert.match(
+    faultWorkflow,
+    /name: App-v21 real Comet\/ABCI crash, partition, and state-sync gate/,
+  );
+  assert.match(v119StateSync, /"app_version": 21/);
+  assert.doesNotMatch(v119StateSync, /"app_version": 20/);
+  assert.match(v119StateSync, /wait_app_version "\$\{PROVIDER\}" 21/);
+  assert.match(
+    v119StateSync,
+    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" 21 "\$\{pre_publish_evidence\}"/,
+  );
+  assert.match(v119StateSync, /\[ "\$\{receiver_app_version\}" != 21 \]/);
+  assert.match(v119StateSync, /\[ "\$\{success_receiver_app_version\}" != 21 \]/);
+  assert.equal(
+    (v119StateSync.match(/\[ "\$\{provider_app_version\}" != 21 \]/g) || []).length,
+    2,
+  );
+  assert.match(v119StateSync, /\[ "\$\{post_restart_provider_version\}" != 21 \]/);
+  assert.match(v119StateSync, /\[ "\$\{post_restart_receiver_version\}" != 21 \]/);
+  assert.match(
+    stateSyncRuntime,
+    /Uint64\("app_version", expectedAppVersion\)[\s\S]*?Msg\("authorized state-sync session assembled and exact-version candidate verified"\)/,
+  );
+});
+
 test('Dependabot ignores only incompatible post-v0 go-libp2p versions', () => {
   assert.match(
     dependabot,
@@ -375,9 +405,19 @@ test('Docker guidance keeps stdio MCP in the running SAGE container', () => {
 test('the fresh real-Comet fixture cannot skip historical app forks', () => {
   assert.match(
     v119Chaos,
-    /for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do/,
+    /for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do/,
   );
-  assert.doesNotMatch(v119Chaos, /for target in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do/);
+  assert.doesNotMatch(v119Chaos, /for target in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do/);
+  assert.match(v119Chaos, /\[ "\$\{version\}" -ne 21 \]/);
+  assert.match(
+    v119Chaos,
+    /restart_pair_and_converge\(\)[\s\S]*?assert_matched_apphash "\$\{label\}" 180[\s\S]*?wait_all_app_version 21 180/,
+  );
+  assert.equal(
+    (v119Chaos.match(/wait_all_app_version 21 180/g) || []).length,
+    3,
+    'restart recovery plus both healed partition phases must reassert app-v21',
+  );
 });
 
 test('the real-Comet fixture proves governance-domain binding before the long fork ladder', () => {
@@ -388,7 +428,7 @@ test('the real-Comet fixture proves governance-domain binding before the long fo
   );
   const bindingGate = v119Chaos.lastIndexOf('wait_all_governance_domain_bindings 30');
   const forkLadder = v119Chaos.indexOf(
-    'for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do',
+    'for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do',
   );
   assert.ok(bindingGate >= 0 && bindingGate < forkLadder);
 });

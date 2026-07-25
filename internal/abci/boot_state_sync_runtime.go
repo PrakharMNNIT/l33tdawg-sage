@@ -11,6 +11,8 @@ import (
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/blocksync"
+
+	"github.com/l33tdawg/sage/internal/statesync"
 )
 
 // BootStateSyncPhase is the process-local portion of the one-shot boot state
@@ -434,9 +436,9 @@ func (r *BootStateSyncRuntime) activatePreparedBundleAuthorized(
 		r.setBootStateSyncPhaseLocked(BootStateSyncFailed)
 		return err
 	}
-	if expectedAppVersion != 20 {
+	if !statesync.SupportsAppVersion(expectedAppVersion) {
 		r.setBootStateSyncPhaseLocked(BootStateSyncFailed)
-		return errors.New("state sync activation requires app version 20")
+		return errors.New("state sync activation requires supported app version 20 or 21")
 	}
 	if expectedHeight < r.bundle.expectedHeight ||
 		(expectedHeight == r.bundle.expectedHeight && !bytes.Equal(expectedHash, r.bundle.expectedHash)) ||

@@ -3,6 +3,7 @@ package statesync
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,6 +57,7 @@ func TestStateSyncAuthorizationsBindJoinAndP2PProfile(t *testing.T) {
 	assert.Equal(t, join.ChainID, receiving.ChainID())
 	assert.Equal(t, join.JoiningNodeID, receiving.JoiningNodeID())
 	assert.Equal(t, RequiredAppVersion, receiving.AppVersion())
+	assert.Equal(t, RequiredAppVersion, serving.AppVersion())
 	pubkey := receiving.ValidatorPublicKey()
 	pubkey[0] ^= 0xff
 	assert.Equal(t, join.ValidatorPublicKey, receiving.ValidatorPublicKey(), "validator key accessor returns a private copy")
@@ -73,7 +75,8 @@ func TestStateSyncAuthorizationRejectsIncompleteJoinBindings(t *testing.T) {
 		{name: "chain", mutate: func(c *JoinAuthorizationConfig) { c.ChainID = "../escape" }, want: "chain ID"},
 		{name: "joiner", mutate: func(c *JoinAuthorizationConfig) { c.JoiningNodeID = "short" }, want: "joining node ID"},
 		{name: "validator key", mutate: func(c *JoinAuthorizationConfig) { c.ValidatorPublicKey = []byte("short") }, want: "Ed25519"},
-		{name: "version", mutate: func(c *JoinAuthorizationConfig) { c.AppVersion = 19 }, want: "version 20"},
+		{name: "version below supported set", mutate: func(c *JoinAuthorizationConfig) { c.AppVersion = 19 }, want: "version (20 or 21)"},
+		{name: "version above supported set", mutate: func(c *JoinAuthorizationConfig) { c.AppVersion = 22 }, want: "version (20 or 21)"},
 		{name: "expiry", mutate: func(c *JoinAuthorizationConfig) { c.ExpiresAt = now }, want: "expired"},
 		{name: "floor", mutate: func(c *JoinAuthorizationConfig) { c.SnapshotHeightFloor = 0 }, want: "height floor"},
 		{name: "provider not validator", mutate: func(c *JoinAuthorizationConfig) {
@@ -100,6 +103,27 @@ func TestStateSyncAuthorizationRejectsIncompleteJoinBindings(t *testing.T) {
 			assert.ErrorContains(t, err, tc.want)
 		})
 	}
+}
+
+func TestStateSyncAuthorizationSupportsV20AndV21Exactly(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	for _, version := range []uint64{20, 21} {
+		t.Run(fmt.Sprintf("app-v%d", version), func(t *testing.T) {
+			join, servingProfile, receivingProfile := authorizationTestConfig(now)
+			join.AppVersion = version
+
+			serving, err := NewServingAuthorization(join, servingProfile, now)
+			require.NoError(t, err)
+			receiving, err := NewReceivingAuthorization(join, receivingProfile, now)
+			require.NoError(t, err)
+			assert.Equal(t, version, serving.AppVersion())
+			assert.Equal(t, version, receiving.AppVersion())
+		})
+	}
+	assert.False(t, SupportsAppVersion(19))
+	assert.True(t, SupportsAppVersion(20))
+	assert.True(t, SupportsAppVersion(21))
+	assert.False(t, SupportsAppVersion(22))
 }
 
 func TestStateSyncAuthorizationRejectsUnsafeP2PProfiles(t *testing.T) {

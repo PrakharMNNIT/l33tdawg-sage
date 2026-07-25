@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.13.3.
+Reconciled against internal/mcp for SAGE v11.13.4.
 
 # SAGE MCP Tools Reference
 
@@ -250,7 +250,15 @@ verified configurations).
 - `memories`: includes author/hash/classification plus `source_kind`
   (`local_native`, `federated_live`, or `federated_copy`). Foreign results
   preserve `source_chain_id`, `origin_memory_id`, `origin_agent_id`,
-  `foreign:true`, and `trust:"external_untrusted"`.
+  `foreign:true`, and `trust:"external_untrusted"`. Each result also exposes
+  `corroboration_count` (distinct corroborating agents) and `challenge_count`
+  (distinct challenger IDs in the lifetime audit projection), plus
+  `evidence_counts_available`, which is true only when both queries succeed and
+  no recovery/repair-incomplete marker is present. When false the numeric values
+  may still be canonical lower bounds reconstructed during pristine state sync
+  or repair, and zero is not proof that no historical evidence existed. An open
+  app-v21 round additionally exposes `challenge_round`,
+  `current_challenger_count`, and `required_challengers`.
 - `total_count`: total matching memories.
 - `recall_mode`: which path served the request — `semantic_only` | `hybrid` |
   `keyword_only`.
@@ -272,7 +280,7 @@ preserves concrete peer-RBAC policy and avoids an all-domain metadata probe.
 The local SAGE validates the caller's registered read subtree and clearance
 before delegating. Results from local and remote ranked lists are content/origin
 deduplicated, reciprocal-rank fused, and globally capped by `top_k`.
-Committed memories are returned; an app-v17 two-phase-challenged memory
+Committed memories are returned; an app-v17 or app-v21 challenged memory
 also remains recallable with `disputed: true`, a `[DISPUTED]` content prefix,
 and the shared query-time confidence haircut. The
 `recall_mode`/`semantic_degraded` fields surface silent keyword-only fallback so
@@ -335,10 +343,15 @@ relevant.
 | `reason`    | string | no       | Reason for deprecation. Default: `"deprecated by user"`. |
 
 **Returns:**
-- `memory_id`, `status: "challenged"`, `reason`.
+- `memory_id`, `status`, `reason`, `tx_hash`. `status` is the durable REST
+  result: `deprecated` for a decisive challenge or `challenged` when app-v17
+  parks a multi-holder challenge or app-v21 awaits more challengers.
 
 **Note:** This submits a challenge transaction on-chain; the memory status
-moves to `challenged`, not immediately deleted. Consensus governs final removal.
+is determined by consensus. Personal/one-holder domains deprecate immediately
+under legacy/app-v17 rules. Post-app-v21, `k=0` remains immediate but `k>0`
+moves to `challenged` until `k+1` distinct challengers accrue, regardless of
+holder count.
 
 **REST:** `POST /v1/memory/{memory_id}/challenge`
 
@@ -349,7 +362,7 @@ e.g. an IP address changed, a decision was reversed, or a fact was disproven.
 
 ### sage_reinstate
 
-**Purpose:** Withdraw or resolve an open app-v17 two-phase challenge and move
+**Purpose:** Withdraw or resolve an open challenge and move
 the memory from `challenged` back to `committed`.
 
 **Parameters:**
@@ -362,9 +375,10 @@ the memory from `challenged` back to `committed`.
 **Returns:**
 - `memory_id`, `status: "committed"`, `reason`, `tx_hash`.
 
-The chain must have activated app-v17. A current domain owner/ancestor-owner or
-level-3 modify grantee may reinstate; the original challenger may always
-withdraw their own challenge even if that grant later expired or was revoked.
+The chain must have activated app-v17. Legacy app-v17 challenges use current
+modify authorization, with the original challenger always allowed to withdraw.
+For app-v21 weighted rounds, only the snapshotted electorate may reinstate;
+later grant churn does not alter that set.
 
 **REST:** `POST /v1/memory/{memory_id}/reinstate`
 

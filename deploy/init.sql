@@ -108,6 +108,13 @@ CREATE TABLE IF NOT EXISTS challenges (
 );
 CREATE INDEX IF NOT EXISTS idx_challenges_memory ON challenges(memory_id);
 
+-- Presence means recovery could reconstruct only AppHash-covered evidence, not
+-- the complete historical SQL audit. Absence preserves native projection
+-- compatibility; ordinary evidence writes never remove this marker.
+CREATE TABLE IF NOT EXISTS memory_evidence_projection_incomplete (
+    memory_id UUID PRIMARY KEY REFERENCES memories(memory_id) ON DELETE CASCADE
+);
+
 -- ============================================================
 -- 6. validator_scores
 -- ============================================================

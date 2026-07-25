@@ -14,6 +14,17 @@ import (
 	"github.com/l33tdawg/sage/internal/store"
 )
 
+type canonicalEvidenceProjectionStore interface {
+	EnsureCanonicalEvidenceProjection(
+		ctx context.Context,
+		memoryID string,
+		corroboratorIDs, challengerIDs []string,
+		at time.Time,
+	) (repaired bool, err error)
+}
+
+const scopedRecoveryEvidencePageSize = 256
+
 // RebuildScopedProjection verifies every AppHash-covered scoped envelope and
 // upserts it into the local SQL projection. It performs no consensus write and
 // is safe to rerun after snapshot/state sync or loss of the projection DB.
@@ -46,6 +57,14 @@ func (app *SageApp) RebuildScopedProjection(ctx context.Context) (int, error) {
 		// complete verified replacement, never canonical content with stale
 		// clearance metadata (or the reverse).
 		if err := app.offchainStore.RunInTx(ctx, func(projection store.OffchainStore) error {
+			provenance, ok := projection.(store.EvidenceProjectionCompletenessStore)
+			if !ok {
+				return errors.New("off-chain store cannot persist evidence projection completeness")
+			}
+			existed, err := provenance.HasMemoryProjection(ctx, content.MemoryID)
+			if err != nil {
+				return fmt.Errorf("check existing projection: %w", err)
+			}
 			if err := projection.InsertMemory(ctx, record); err != nil {
 				return fmt.Errorf("insert projection: %w", err)
 			}
@@ -54,6 +73,16 @@ func (app *SageApp) RebuildScopedProjection(ctx context.Context) (int, error) {
 			}
 			if err := projection.SetTags(ctx, content.MemoryID, content.Tags); err != nil {
 				return fmt.Errorf("tag projection: %w", err)
+			}
+			// RebuildScopedProjection also runs on ordinary startup. Only a row
+			// absent before this transaction proves that SQL lifetime history was
+			// lost; existing native projections keep their current provenance.
+			// The marker and new row commit atomically, so a crash before evidence
+			// paging cannot later masquerade as a complete native projection.
+			if !existed {
+				if err := provenance.MarkEvidenceProjectionIncomplete(ctx, content.MemoryID); err != nil {
+					return fmt.Errorf("evidence projection provenance: %w", err)
+				}
 			}
 			projected, err := projection.GetMemory(ctx, content.MemoryID)
 			if err != nil || !recoveredProjectionMatches(projected, record) {
@@ -67,9 +96,96 @@ func (app *SageApp) RebuildScopedProjection(ctx context.Context) (int, error) {
 		}); err != nil {
 			return rebuilt, fmt.Errorf("scoped recovery %q: %w", content.MemoryID, err)
 		}
+		corroboratorCount, err := app.rebuildCanonicalEvidencePages(
+			ctx,
+			content.MemoryID,
+			record.CreatedAt,
+			true,
+			app.badgerStore.ListCanonicalCorroboratorsV21Page,
+		)
+		if err != nil {
+			return rebuilt, fmt.Errorf("scoped recovery %q: canonical corroborators: %w", content.MemoryID, err)
+		}
+		challengerCount, err := app.rebuildCanonicalEvidencePages(
+			ctx,
+			content.MemoryID,
+			record.CreatedAt,
+			false,
+			app.badgerStore.ListChallengeVotersV21Page,
+		)
+		if err != nil {
+			return rebuilt, fmt.Errorf("scoped recovery %q: canonical challengers: %w", content.MemoryID, err)
+		}
+		corroborationCounts, err := app.offchainStore.GetCorroborationCounts(ctx, []string{content.MemoryID})
+		if err != nil || corroborationCounts[content.MemoryID] < corroboratorCount {
+			return rebuilt, fmt.Errorf("scoped recovery %q: corroboration projection verification failed", content.MemoryID)
+		}
+		challengeCounts, err := app.offchainStore.GetChallengeCounts(ctx, []string{content.MemoryID})
+		if err != nil || challengeCounts[content.MemoryID] < challengerCount {
+			return rebuilt, fmt.Errorf("scoped recovery %q: challenge projection verification failed", content.MemoryID)
+		}
 		rebuilt++
 	}
 	return rebuilt, nil
+}
+
+type canonicalEvidencePage func(memoryID string, after []byte, rawLimit int) (agents []string, next []byte, done bool, err error)
+
+func (app *SageApp) rebuildCanonicalEvidencePages(
+	ctx context.Context,
+	memoryID string,
+	at time.Time,
+	corroborations bool,
+	list canonicalEvidencePage,
+) (int, error) {
+	var cursor []byte
+	projectedCount := 0
+	for {
+		agents, next, done, err := list(memoryID, cursor, scopedRecoveryEvidencePageSize)
+		if err != nil {
+			return projectedCount, err
+		}
+		if len(agents) > 0 {
+			if err := app.offchainStore.RunInTx(ctx, func(projection store.OffchainStore) error {
+				evidenceProjection, ok := projection.(canonicalEvidenceProjectionStore)
+				if !ok {
+					return errors.New("off-chain store cannot rebuild canonical evidence projection")
+				}
+				var corroboratorIDs, challengerIDs []string
+				if corroborations {
+					corroboratorIDs = agents
+				} else {
+					challengerIDs = agents
+				}
+				repaired, err := evidenceProjection.EnsureCanonicalEvidenceProjection(
+					ctx, memoryID, corroboratorIDs, challengerIDs, at,
+				)
+				if err != nil {
+					return err
+				}
+				if repaired {
+					provenance, ok := projection.(store.EvidenceProjectionCompletenessStore)
+					if !ok {
+						return errors.New("off-chain store cannot persist evidence projection completeness")
+					}
+					if err := provenance.MarkEvidenceProjectionIncomplete(ctx, memoryID); err != nil {
+						return fmt.Errorf("mark repaired evidence projection incomplete: %w", err)
+					}
+				}
+				return nil
+			}); err != nil {
+				return projectedCount, err
+			}
+			projectedCount += len(agents)
+		}
+		if done {
+			return projectedCount, nil
+		}
+		if len(next) == 0 || bytes.Equal(next, cursor) {
+			return projectedCount, errors.New("canonical evidence page made no progress")
+		}
+		cursor = next
+	}
 }
 
 type verifiedScopedContent struct {

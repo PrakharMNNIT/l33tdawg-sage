@@ -16,14 +16,25 @@ import (
 )
 
 const (
-	// RequiredAppVersion is the only application protocol version accepted by
-	// the first internet state-sync format. It is deliberately not negotiated.
+	// RequiredAppVersion is the original application protocol version supported
+	// by the first internet state-sync format. Keep it as the v20 compatibility
+	// default for existing callers and ceremonies; a join authorization still
+	// pins one exact version for the whole session.
 	RequiredAppVersion        uint64 = 20
 	cometNodeIDBytes                 = 20
 	maxJoinAuthorizationBytes        = 64 << 10
 )
 
 var stateSyncChainIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+
+// SupportsAppVersion reports whether this binary can safely run an internet
+// state-sync ceremony for the exact application protocol version named in the
+// join authorization. This is an allowlist, not version-range negotiation:
+// sender, receiver, replacement application, and Comet must all report the
+// authorization's exact version.
+func SupportsAppVersion(version uint64) bool {
+	return version == RequiredAppVersion || version == 21
+}
 
 // JoinAuthorizationConfig is a trusted, locally installed approval for one
 // validator bootstrapping onto one existing chain. Installation/configuration
@@ -306,6 +317,15 @@ func (authorization *ReceivingAuthorization) AppVersion() uint64 {
 	return authorization.join.appVersion
 }
 
+// AppVersion returns the exact application protocol version pinned by the
+// serving side of this one-shot state-sync authorization.
+func (authorization *ServingAuthorization) AppVersion() uint64 {
+	if authorization == nil || authorization.join == nil {
+		return 0
+	}
+	return authorization.join.appVersion
+}
+
 // ExpiresAt returns the immutable one-shot ceremony deadline.
 func (authorization *ReceivingAuthorization) ExpiresAt() time.Time {
 	if authorization == nil || authorization.join == nil {
@@ -397,8 +417,8 @@ func validateJoinAuthorization(config JoinAuthorizationConfig, now time.Time) (*
 	if len(config.ValidatorPublicKey) != ed25519.PublicKeySize {
 		return nil, errors.New("state sync join authorization requires an Ed25519 validator public key")
 	}
-	if config.AppVersion != RequiredAppVersion {
-		return nil, fmt.Errorf("state sync join authorization requires app version %d", RequiredAppVersion)
+	if !SupportsAppVersion(config.AppVersion) {
+		return nil, fmt.Errorf("state sync join authorization requires a supported app version (%d or 21)", RequiredAppVersion)
 	}
 	if config.ExpiresAt.IsZero() || !now.Before(config.ExpiresAt) {
 		return nil, errors.New("state sync join authorization is expired")

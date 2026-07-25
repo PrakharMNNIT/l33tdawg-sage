@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.13.3. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.13.4. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -145,6 +145,8 @@ Vector similarity search. Requires a precomputed embedding.
       "confidence_score": 0.91,
       "initial_confidence": 0.95,
       "corroboration_count": 2,
+      "challenge_count": 1,
+      "evidence_counts_available": true,
       "classification": 0,
       "status": "committed",
       "parent_hash": "",
@@ -163,7 +165,21 @@ Vector similarity search. Requires a precomputed embedding.
 
 `confidence_score` in the response is the **decayed** value (time decay + corroboration boost applied server-side), not the raw submitted value. `initial_confidence` is the **stored** (undecayed) value — the on-chain confidence set at submission (corroboration never rewrites it) — so a client can see the authoritative floor alongside the decayed score without re-deriving it. It is present for local memories and omitted for federated results (where only the serving peer's already-decayed value is available).
 
-`disputed` (`memory_handler.go`, `json:"disputed,omitempty"`) is present and `true` only for an app-v17 two-phase-**challenged** memory that is still live and recallable while under dispute (set on all three recall paths: query, search, and hybrid). Because it is `omitempty`, its absence means "not disputed," which is why the committed example above omits it. When it is set, `confidence_score` already carries an extra query-time **disputed haircut** (the shared `store.DisputedConfidenceHaircut`, currently a `0.8` multiplier) layered on top of decay and corroboration. The store applies the same multiplier while enforcing `min_confidence`, so a returned result still satisfies the advertised floor after serialization. The haircut is presentation-only: it leaves the on-chain `status` (`challenged`) and the stored confidence untouched, and personal nodes never emit `disputed` at all (a challenge there is a one-strike deprecate, not a two-phase park). A challenged memory's on-chain `status` is `challenged`, already listed among the queryable `status_filter` values above.
+`corroboration_count` is the number of **distinct corroborating agent IDs** and
+feeds the confidence boost. `challenge_count` is the number of **distinct
+challenger IDs** in the off-chain lifetime audit projection. The latter is
+evidence history, not an open-vote count. `evidence_counts_available` is `true`
+only when both count queries succeeded and no durable recovery/repair-incomplete
+marker was detected. It is not a cryptographic attestation against arbitrary
+out-of-band partial SQL audit-table corruption. When `false`, both numeric
+fields may still contain canonical lower bounds reconstructed during pristine
+state sync or repair; in particular, zero is not proof that no historical
+evidence existed. While an app-v21 weighted round is open, `challenge_round`,
+`current_challenger_count`, and
+`required_challengers` expose its authoritative consensus progress. Those three
+fields are absent for closed rounds and legacy app-v17 challenges.
+
+`disputed` (`memory_handler.go`, `json:"disputed,omitempty"`) is present and `true` only for an app-v17 or app-v21 **challenged** memory that is still live and recallable while under dispute (set on all three recall paths: query, search, and hybrid). Because it is `omitempty`, its absence means "not disputed," which is why the committed example above omits it. When it is set, `confidence_score` already carries an extra query-time **disputed haircut** (the shared `store.DisputedConfidenceHaircut`, currently a `0.8` multiplier) layered on top of decay and corroboration. The store applies the same multiplier while enforcing `min_confidence`, so a returned result still satisfies the advertised floor after serialization. The haircut is presentation-only: it leaves the on-chain `status` (`challenged`) and the stored confidence untouched. Under legacy/app-v17 rules a personal one-holder domain resolves immediately, but post-app-v21 that same domain emits `disputed` whenever `k>0`; only `k=0` remains immediate. A challenged memory's on-chain `status` is `challenged`, already listed among the queryable `status_filter` values above.
 
 `min_confidence` is enforced against the **decayed** `confidence_score`, not the stored column. The store applies it over the full candidate set *before* the top-K trim, so: a result returned by a `min_confidence=X` query always satisfies `confidence_score >= X` (including federated results, which are re-checked against the floor on the requesting side); a corroboration-boosted memory whose stored value is below `X` but whose decayed value clears it is still returned; and `top_k` is filled with qualifying records rather than truncated. This full-corpus guarantee holds unconditionally only for `POST /v1/memory/query` on SQLite, whose `QuerySimilar` scans every candidate; on `/v1/memory/search` (FTS), `/v1/memory/hybrid` (via its FTS leaf), and on Postgres deployments the floor is instead evaluated over the top `decayFilterScanCap` (1000) rank/distance-ordered candidates, so a record that would qualify but ranks beyond that pool may not surface. Open tasks are exempt from decay, so an open task is judged by its stored confidence. (Prior to v11.2.0 the floor compared the stored column, which both leaked aged memories below the floor and dropped boosted ones above it.)
 
@@ -248,6 +264,9 @@ Fetch a single memory with votes and corroborations.
   "committed_at": "...",
   "votes": [...],
   "corroborations": [...],
+  "corroboration_count": 2,
+  "challenge_count": 1,
+  "evidence_counts_available": true,
   "linked_memories": [...]
 }
 ```
@@ -330,7 +349,12 @@ Challenge an existing memory. Broadcasts `TxTypeMemoryChallenge`.
 | `reason` | string | yes |
 | `evidence` | string | no |
 
-**Response** (HTTP 200): `{"message": "Challenge submitted successfully.", "tx_hash": "<hex>"}`
+**Response** (HTTP 200): `{"message": "Challenge submitted successfully.", "tx_hash": "<hex>", "status": "challenged|deprecated"}`
+
+`status` reports the durable result after `broadcast_tx_commit`: `deprecated`
+for a decisive one-strike challenge (or a threshold-reaching confirmation), and
+`challenged` when app-v17 parks a first multi-holder challenge or app-v21 still
+requires additional corroboration-weighted challengers.
 
 **Error responses** (deprecation gate; `vote_handler.go:241`, `memory_handler.go:1675-1684`):
 
@@ -354,7 +378,7 @@ Semantic alias for challenge (`vote_handler.go:255-325`). Submits a `TxTypeMemor
 |---|---|---|
 | `reason` | string | no |
 
-**Response** (HTTP 200): `{"message": "Memory forgotten.", "tx_hash": "<hex>"}`
+**Response** (HTTP 200): `{"message": "Memory forgotten.", "tx_hash": "<hex>", "status": "challenged|deprecated"}`
 
 **Error responses:** identical to `/challenge` (same deprecation gate) — `403` not authorized (or a pre-app-v16 legacy reject), `404` unknown memory id, and `409` legacy no-recorded-domain (repair via an `OpMemoryDomainRepair` governance proposal). See the challenge section above.
 
@@ -362,7 +386,7 @@ Semantic alias for challenge (`vote_handler.go:255-325`). Submits a `TxTypeMemor
 
 ### `POST /v1/memory/{memory_id}/reinstate`
 
-Return an open app-v17 two-phase challenge to `committed`. The handler builds
+Return an open challenge to `committed`. The handler builds
 `TxTypeMemoryReinstate`, embeds the authenticated caller proof, and waits for
 `broadcast_tx_commit`; a successful response is durable, not only a mempool
 receipt.
@@ -372,14 +396,15 @@ receipt.
 **Response** (HTTP 200):
 `{"message": "Memory reinstated.", "tx_hash": "<hex>", "status": "committed"}`
 
-The chain must have activated app-v17. Current domain owners/ancestor owners and
-level-3 modify grantees may reinstate. The original challenger may always
-withdraw their own challenge even if the grant that authorized the challenge
-later expired or was revoked.
+The chain must have activated app-v17. For a legacy app-v17 challenge, current
+domain owners/ancestor owners and level-3 modify grantees may reinstate, and the
+original challenger may withdraw even after their grant expires or is revoked.
+For an app-v21 weighted round, only identities in the round's snapshotted
+electorate may reinstate; later grant churn neither adds nor removes eligibility.
 
-**Errors:** `400` when app-v17 is not active, `403` when a non-challenger lacks
-the modify verb, `404` for an unknown memory, and `409` when the memory is not
-currently challenged.
+**Errors:** `400` when app-v17 is not active, `403` when the caller is not
+authorized under the applicable legacy or snapshotted-round rule, `404` for an
+unknown memory, and `409` when the memory is not currently challenged.
 
 ---
 

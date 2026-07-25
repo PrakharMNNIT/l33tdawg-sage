@@ -378,9 +378,10 @@ class AsyncSageClient:
         """Challenge a memory through the user-facing forget endpoint.
 
         Thin wrapper over POST /v1/memory/{id}/forget. The server substitutes
-        a default reason when none is supplied. On app-v17, a memory with
-        multiple modify holders is first parked as challenged; a one-holder
-        memory is deprecated immediately.
+        a default reason when none is supplied. Under app-v17, multiple modify
+        holders park the first challenge while a one-holder memory deprecates
+        immediately. Post-app-v21, k=0 remains immediate; k>0 parks until k+1
+        distinct challengers accrue, even on a one-holder domain.
         """
         req = ForgetRequest(reason=reason)
         resp = await self._request(

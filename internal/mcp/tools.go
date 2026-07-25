@@ -102,7 +102,7 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_reinstate": {
 			Name:        "sage_reinstate",
-			Description: "Withdraw or resolve an open two-phase challenge and return the memory to committed. Requires app-v17 activation; the original challenger may always withdraw, while other callers need the domain modify verb.",
+			Description: "Withdraw or resolve an open challenge and return the memory to committed. Legacy app-v17 challenges use current modify authorization (the original challenger may always withdraw); app-v21 rounds require membership in the snapshotted electorate.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -718,20 +718,31 @@ func (s *Server) toolRecall(ctx context.Context, params map[string]any) (any, er
 			content = disputedContentPrefix + content
 		}
 		entry := map[string]any{
-			"memory_id":           r.MemoryID,
-			"content":             content,
-			"domain":              r.DomainTag,
-			"confidence":          r.ConfidenceScore,
-			"corroboration_count": r.CorroborationCount,
-			"type":                r.MemoryType,
-			"status":              r.Status,
-			"created_at":          r.CreatedAt,
-			"submitting_agent":    r.SubmittingAgent,
-			"content_hash":        r.ContentHash,
-			"classification":      r.Classification,
-			"source_kind":         r.SourceKind,
-			"foreign":             r.Foreign,
-			"trust":               r.Trust,
+			"memory_id":                 r.MemoryID,
+			"content":                   content,
+			"domain":                    r.DomainTag,
+			"confidence":                r.ConfidenceScore,
+			"corroboration_count":       r.CorroborationCount,
+			"challenge_count":           r.ChallengeCount,
+			"evidence_counts_available": r.EvidenceCountsAvailable,
+			"type":                      r.MemoryType,
+			"status":                    r.Status,
+			"created_at":                r.CreatedAt,
+			"submitting_agent":          r.SubmittingAgent,
+			"content_hash":              r.ContentHash,
+			"classification":            r.Classification,
+			"source_kind":               r.SourceKind,
+			"foreign":                   r.Foreign,
+			"trust":                     r.Trust,
+		}
+		if r.ChallengeRound != nil {
+			entry["challenge_round"] = *r.ChallengeRound
+		}
+		if r.CurrentChallengerCount != nil {
+			entry["current_challenger_count"] = *r.CurrentChallengerCount
+		}
+		if r.RequiredChallengers != nil {
+			entry["required_challengers"] = *r.RequiredChallengers
 		}
 		if r.Disputed {
 			entry["disputed"] = true
@@ -770,11 +781,12 @@ func (s *Server) toolRecall(ctx context.Context, params map[string]any) (any, er
 	return out, nil
 }
 
-// disputedContentPrefix marks an app-v17 two-phase-CHALLENGED ("disputed") memory
+// disputedContentPrefix marks an app-v17/app-v21 CHALLENGED ("disputed") memory
 // in recall output so the agent treats it with suspicion instead of as settled
 // fact. The node keeps disputed-but-live memories recallable (they are pending
 // confirm/reinstate) and flags them; we prepend this to the content and surface a
-// `disputed` boolean. Personal nodes never produce disputed memories.
+// `disputed` boolean. Under legacy/app-v17 rules a personal one-holder node
+// resolves immediately; post-app-v21 it can produce a dispute when k>0.
 const disputedContentPrefix = "[DISPUTED] "
 
 // recallResp is the response shape returned by both /v1/memory/query (semantic
@@ -783,24 +795,29 @@ const disputedContentPrefix = "[DISPUTED] "
 // belt-and-braces retry-on-vault-encryption branch in toolRecall.
 type recallResp struct {
 	Results []struct {
-		MemoryID           string  `json:"memory_id"`
-		SubmittingAgent    string  `json:"submitting_agent"`
-		Content            string  `json:"content"`
-		ContentHash        string  `json:"content_hash"`
-		DomainTag          string  `json:"domain_tag"`
-		ConfidenceScore    float64 `json:"confidence_score"`
-		CorroborationCount int     `json:"corroboration_count"`
-		Classification     int     `json:"classification"`
-		MemoryType         string  `json:"memory_type"`
-		Status             string  `json:"status"`
-		Disputed           bool    `json:"disputed,omitempty"`
-		CreatedAt          string  `json:"created_at"`
-		SourceChainID      string  `json:"source_chain_id,omitempty"`
-		SourceKind         string  `json:"source_kind,omitempty"`
-		OriginMemoryID     string  `json:"origin_memory_id,omitempty"`
-		OriginAgentID      string  `json:"origin_agent_id,omitempty"`
-		Foreign            bool    `json:"foreign,omitempty"`
-		Trust              string  `json:"trust,omitempty"`
+		MemoryID                string  `json:"memory_id"`
+		SubmittingAgent         string  `json:"submitting_agent"`
+		Content                 string  `json:"content"`
+		ContentHash             string  `json:"content_hash"`
+		DomainTag               string  `json:"domain_tag"`
+		ConfidenceScore         float64 `json:"confidence_score"`
+		CorroborationCount      int     `json:"corroboration_count"`
+		ChallengeCount          int     `json:"challenge_count"`
+		EvidenceCountsAvailable bool    `json:"evidence_counts_available"`
+		ChallengeRound          *uint64 `json:"challenge_round,omitempty"`
+		CurrentChallengerCount  *uint32 `json:"current_challenger_count,omitempty"`
+		RequiredChallengers     *uint32 `json:"required_challengers,omitempty"`
+		Classification          int     `json:"classification"`
+		MemoryType              string  `json:"memory_type"`
+		Status                  string  `json:"status"`
+		Disputed                bool    `json:"disputed,omitempty"`
+		CreatedAt               string  `json:"created_at"`
+		SourceChainID           string  `json:"source_chain_id,omitempty"`
+		SourceKind              string  `json:"source_kind,omitempty"`
+		OriginMemoryID          string  `json:"origin_memory_id,omitempty"`
+		OriginAgentID           string  `json:"origin_agent_id,omitempty"`
+		Foreign                 bool    `json:"foreign,omitempty"`
+		Trust                   string  `json:"trust,omitempty"`
 	} `json:"results"`
 	TotalCount int                   `json:"total_count"`
 	Federation *recallFederationInfo `json:"federation,omitempty"`
@@ -1383,15 +1400,23 @@ func (s *Server) toolForget(ctx context.Context, params map[string]any) (any, er
 
 	body, _ := json.Marshal(map[string]string{"reason": reason})
 	path := fmt.Sprintf("/v1/memory/%s/challenge", url.PathEscape(memoryID))
-	if err := s.doSignedJSON(ctx, "POST", path, body, nil); err != nil {
+	var resp struct {
+		TxHash string `json:"tx_hash"`
+		Status string `json:"status"`
+	}
+	if err := s.doSignedJSON(ctx, "POST", path, body, &resp); err != nil {
 		return nil, fmt.Errorf("deprecate memory: %w", err)
 	}
 
-	return map[string]any{
+	result := map[string]any{
 		"memory_id": memoryID,
-		"status":    "challenged",
 		"reason":    reason,
-	}, nil
+		"tx_hash":   resp.TxHash,
+	}
+	if resp.Status != "" {
+		result["status"] = resp.Status
+	}
+	return result, nil
 }
 
 func (s *Server) toolReinstate(ctx context.Context, params map[string]any) (any, error) {

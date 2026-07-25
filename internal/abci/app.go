@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -571,6 +573,15 @@ type SageApp struct {
 	// directly, so pre-activation replay remains byte-identical.
 	appV20AppliedHeight int64 // 0 => fork dormant
 
+	// appV21AppliedHeight gates corroboration-weighted challenge rounds. The
+	// activation itself is the governed policy choice: chains that do not
+	// activate app-v21 retain the exact app-v17 lifecycle (one-strike on
+	// single-holder domains, two-phase on multi-holder domains). Post-activation,
+	// a challenge snapshots the eligible modify-holder electorate and protects
+	// only corroborations from that electorate. Strict > keeps the activation
+	// block on the legacy rule and historical replay byte-identical.
+	appV21AppliedHeight int64 // 0 => fork dormant
+
 	// retainBlocks, when > 0, is the number of most-recent blocks Commit asks
 	// CometBFT to keep: ResponseCommit.RetainHeight = height - retainBlocks
 	// (clamped at 0 = keep everything). Pruning is LOCAL and advisory — it never
@@ -737,6 +748,10 @@ const appV19UpgradeName = "app-v19"
 // behavior-empty app-v19 gate and must not reuse app-v18, whose activation has
 // a separate live RBAC-administrator effect.
 const appV20UpgradeName = "app-v20"
+
+// appV21UpgradeName is the canonical governed activation for
+// corroboration-weighted challenge rounds.
+const appV21UpgradeName = "app-v21"
 
 // governanceDelegationDomainStateKey holds the stable, consensus-derived
 // domain that post-app-v20 governance authorizations must sign. It is approved
@@ -1164,6 +1179,13 @@ func (app *SageApp) postAppV20Fork(height int64) bool {
 	return app.appV20AppliedHeight > 0 && height > app.appV20AppliedHeight
 }
 
+// postAppV21Fork is the consensus boundary for corroboration-weighted
+// challenge rounds. The activation block retains app-v17 behavior; app-v21
+// starts at H+1.
+func (app *SageApp) postAppV21Fork(height int64) bool {
+	return app.appV21AppliedHeight > 0 && height > app.appV21AppliedHeight
+}
+
 // postAppV17Rules reports whether app-v17's consensus rules are in force at
 // this height. app-v18 subsumes those additive rules on a skip-ahead chain;
 // historical blocks still collapse to exactly their original gate.
@@ -1173,7 +1195,7 @@ func (app *SageApp) postAppV20Fork(height int64) bool {
 //
 //nolint:unused // C1 mints the empty gate; the first callsites land with C2/C3
 func (app *SageApp) postAppV17Rules(height int64) bool {
-	return app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height)
+	return app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
 }
 
 func (app *SageApp) postAppV18Rules(height int64) bool {
@@ -1190,7 +1212,7 @@ func (app *SageApp) postAppV18Rules(height int64) bool {
 //
 //nolint:unused // behavior-empty gate; no consensus callsite reads it (D adds zero processTx branch)
 func (app *SageApp) postAppV19Rules(height int64) bool {
-	return app.postAppV19Fork(height) || app.postAppV20Fork(height)
+	return app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
 }
 
 // IsAppV17ActiveForNextTx is the REST-side transaction-construction accessor.
@@ -1239,7 +1261,7 @@ func (app *SageApp) IsAppV20ActiveForNextTx() bool {
 // Collapses to exactly postAppV16Fork on every existing chain
 // (appV17AppliedHeight==0), so historical blocks replay byte-identically.
 func (app *SageApp) postAppV16Rules(height int64) bool {
-	return app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height)
+	return app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
 }
 
 // shouldRecordMemoryDomain reports whether a successful submit must persist its
@@ -1268,7 +1290,7 @@ func (app *SageApp) shouldRecordMemoryDomain(height int64) bool {
 // higher gates are 0, so this collapses to exactly postAppV8Fork and historical
 // blocks replay byte-identically.
 func (app *SageApp) postAppV8Rules(height int64) bool {
-	return app.postAppV8Fork(height) || app.postAppV9Fork(height) || app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height)
+	return app.postAppV8Fork(height) || app.postAppV9Fork(height) || app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
 }
 
 // postAppV9Rules reports whether app-v9's consensus rules (consensus-path
@@ -1279,7 +1301,7 @@ func (app *SageApp) postAppV8Rules(height int64) bool {
 // postAppV9Fork on every existing chain (appV10/appV11AppliedHeight==0), so replay
 // is byte-identical.
 func (app *SageApp) postAppV9Rules(height int64) bool {
-	return app.postAppV9Fork(height) || app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height)
+	return app.postAppV9Fork(height) || app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
 }
 
 // postAppV10Rules reports whether app-v10's consensus rules (corroboration
@@ -1291,7 +1313,7 @@ func (app *SageApp) postAppV9Rules(height int64) bool {
 // when app-v11 landed — app-v10 was the highest fork until then and needed no
 // subsumption helper.
 func (app *SageApp) postAppV10Rules(height int64) bool {
-	return app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height)
+	return app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
 }
 
 // postAppV11Rules reports whether app-v11's consensus rules (the per-node
@@ -1302,7 +1324,7 @@ func (app *SageApp) postAppV10Rules(height int64) bool {
 // postAppV11Fork on every existing chain (appV12AppliedHeight==0), so
 // historical blocks replay byte-identically.
 func (app *SageApp) postAppV11Rules(height int64) bool {
-	return app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height)
+	return app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
 }
 
 // postAppV12Rules reports whether app-v12's consensus rule (the FLAWED
@@ -1340,7 +1362,7 @@ func (app *SageApp) postAppV13Rules(height int64) bool {
 // postAppV12Rules/postAppV13Rules — those are mutually-exclusive
 // AppHash-REPLACEMENT rules, deliberately non-subsumed.
 func (app *SageApp) postAppV15Rules(height int64) bool {
-	return app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height)
+	return app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
 }
 
 // refreshAppV9Fork populates appV9AppliedHeight from the persisted upgrade
@@ -1536,6 +1558,63 @@ func (app *SageApp) refreshAppV19Fork() {
 	if rec != nil {
 		app.appV19AppliedHeight = rec.AppliedHeight
 	}
+}
+
+// refreshAppV21Fork restores the corroboration-weighted challenge gate from
+// the canonical applied-upgrade audit. app-v21 must follow an already-valid
+// app-v20 chain, so no additional ceremony marker is required.
+func (app *SageApp) refreshAppV21Fork() error {
+	app.appV21AppliedHeight = 0
+	rec, err := app.badgerStore.GetAppliedUpgrade(appV21UpgradeName)
+	if err != nil {
+		return fmt.Errorf("read applied %s record: %w", appV21UpgradeName, err)
+	}
+	if rec == nil {
+		return nil
+	}
+	if rec.Name != appV21UpgradeName {
+		return fmt.Errorf("applied %s record has name %q", appV21UpgradeName, rec.Name)
+	}
+	if rec.TargetAppVersion != 21 {
+		return fmt.Errorf(
+			"applied %s record has target app version %d, want 21",
+			appV21UpgradeName, rec.TargetAppVersion,
+		)
+	}
+	if rec.AppliedHeight <= 0 {
+		return fmt.Errorf(
+			"applied %s record has non-positive height %d",
+			appV21UpgradeName, rec.AppliedHeight,
+		)
+	}
+	if app.state == nil {
+		return fmt.Errorf("applied %s record cannot be checked without app state", appV21UpgradeName)
+	}
+	// MarkUpgradeApplied runs in FinalizeBlock before Commit advances the
+	// persisted AppState, so exactly state.Height+1 is the only legitimate
+	// ahead-of-state crash window.
+	if app.state.Height < rec.AppliedHeight-1 {
+		return fmt.Errorf(
+			"applied %s height %d is ahead of persisted app height %d",
+			appV21UpgradeName, rec.AppliedHeight, app.state.Height,
+		)
+	}
+	app.appV21AppliedHeight = rec.AppliedHeight
+	return nil
+}
+
+func (app *SageApp) validateAppV21Prerequisite() error {
+	if app.appV21AppliedHeight > 0 && app.appV20AppliedHeight <= 0 {
+		return fmt.Errorf("applied %s requires a valid applied %s predecessor", appV21UpgradeName, appV20UpgradeName)
+	}
+	if app.appV21AppliedHeight > 0 && app.appV21AppliedHeight <= app.appV20AppliedHeight {
+		return fmt.Errorf(
+			"applied %s height %d must be after applied %s height %d",
+			appV21UpgradeName, app.appV21AppliedHeight,
+			appV20UpgradeName, app.appV20AppliedHeight,
+		)
+	}
+	return nil
 }
 
 // validateAppliedAppV20State restores the v11.9 gate and enforces the persisted
@@ -2114,6 +2193,16 @@ func NewSageApp(badgerPath string, postgresURL string, logger zerolog.Logger) (*
 		_ = bs.CloseBadger()
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV21Fork(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV21Prerequisite(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	// Reload persisted validators from BadgerDB (survives restart)
@@ -2178,6 +2267,12 @@ func NewSageAppWithStores(bs *store.BadgerStore, offchain store.OffchainStore, l
 	if invariantErr := app.validateAppliedAppV20State(); invariantErr != nil {
 		// The caller owns both injected stores. Returning an error must not
 		// close process-shared projection or consensus handles behind it.
+		return nil, invariantErr
+	}
+	if invariantErr := app.refreshAppV21Fork(); invariantErr != nil {
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV21Prerequisite(); invariantErr != nil {
 		return nil, invariantErr
 	}
 	app.reconcilePoEForkMonotonicity()
@@ -2258,6 +2353,8 @@ func restoredValidatorInfo(id string, power int64) *validator.ValidatorInfo {
 // 6 <= 7, so the watchdog stops without re-proposing.
 func (app *SageApp) currentAppVersion() uint64 {
 	switch {
+	case app.appV21AppliedHeight > 0:
+		return 21 // app-v21 (corroboration-weighted challenge rounds) — highest gate
 	case app.appV20AppliedHeight > 0:
 		return 20 // app-v20 (v11.9 domain-scoped quorum foundation) — highest gate
 	case app.appV19AppliedHeight > 0:
@@ -2302,13 +2399,13 @@ func (app *SageApp) currentAppVersion() uint64 {
 }
 
 // maxSupportedAppVersion is the highest app version this binary has a compiled
-// fork gate for (currently app-v20). It is the readiness ceiling for upgrade
+// fork gate for (currently app-v21). It is the readiness ceiling for upgrade
 // auto-voting: a validator must never vote to activate an upgrade it cannot
 // execute — doing so would commit consensus version.app=N while the binary
 // still runs at N-1, halting the chain on the next CometBFT handshake (the
 // maxSupportedAppVersion footgun). Bump this in lockstep with every new
 // appV<N>UpgradeName fork gate added above.
-const maxSupportedAppVersion uint64 = 20
+const maxSupportedAppVersion uint64 = 21
 
 // MaxSupportedAppVersion returns the highest app version this binary has a
 // compiled fork gate for. Operator tooling (cmd/sage-gui `upgrade propose`)
@@ -2962,6 +3059,7 @@ func (app *SageApp) cloneForAppV20Finalize(scopedStore *store.BadgerStore) *Sage
 		appV16AppliedHeight: app.appV16AppliedHeight, appV17AppliedHeight: app.appV17AppliedHeight,
 		appV18AppliedHeight: app.appV18AppliedHeight, appV19AppliedHeight: app.appV19AppliedHeight,
 		appV20AppliedHeight:      app.appV20AppliedHeight,
+		appV21AppliedHeight:      app.appV21AppliedHeight,
 		retainBlocks:             app.retainBlocks,
 		expectedGovernanceDomain: app.expectedGovernanceDelegationDomain(),
 	}
@@ -2997,6 +3095,7 @@ func (app *SageApp) publishAppV20Finalize(clone *SageApp) {
 	app.appV18AppliedHeight = clone.appV18AppliedHeight
 	app.appV19AppliedHeight = clone.appV19AppliedHeight
 	app.appV20AppliedHeight = clone.appV20AppliedHeight
+	app.appV21AppliedHeight = clone.appV21AppliedHeight
 }
 
 // requiresAppV20StrictRulesAt turns on v20 admission/resource/error semantics
@@ -3322,6 +3421,20 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				panic(fmt.Sprintf("sage: governance delegation domain failed at height %d: %v", req.Height, domainErr))
 			}
 		}
+		if plan.Name == appV21UpgradeName {
+			if plan.TargetAppVersion != 21 {
+				return nil, fmt.Errorf(
+					"sage: refuse malformed app-v21 activation at height %d: target_app_version=%d",
+					req.Height, plan.TargetAppVersion,
+				)
+			}
+			if current := app.currentAppVersion(); current != 20 {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v21 activation at height %d: current committed app version is %d, want 20",
+					req.Height, current,
+				)
+			}
+		}
 		// Version-non-regression floor (deterministic on every replica): never
 		// commit a consensus version.app lower than the chain's current app
 		// version. app-v7 (content-validation) is an INDEPENDENT gate that can be
@@ -3406,6 +3519,9 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		}
 		if appV20CeremonyPlan {
 			app.appV20AppliedHeight = req.Height
+		}
+		if plan.Name == appV21UpgradeName {
+			app.appV21AppliedHeight = req.Height
 		}
 		if plan.Name == appV12UpgradeName {
 			app.appV12AppliedHeight = req.Height
@@ -5050,6 +5166,63 @@ func (app *SageApp) checkAndApplyQuorum(memoryID string, height int64, blockTime
 	}
 }
 
+func memoryChallengeEvidenceHash(reason, evidence string) []byte {
+	h := sha256.New()
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(reason)))
+	_, _ = h.Write(length[:])
+	_, _ = h.Write([]byte(reason))
+	binary.BigEndian.PutUint64(length[:], uint64(len(evidence)))
+	_, _ = h.Write(length[:])
+	_, _ = h.Write([]byte(evidence))
+	return h.Sum(nil)
+}
+
+func mergeChallengeElectorateV21(holders, corroborators []string, limit int) ([]string, bool) {
+	set := make(map[string]struct{}, len(holders)+len(corroborators))
+	for _, agentID := range holders {
+		set[agentID] = struct{}{}
+	}
+	if len(set) > limit {
+		return nil, true
+	}
+	truncated := false
+	for _, agentID := range corroborators {
+		if _, exists := set[agentID]; exists {
+			continue
+		}
+		if len(set) == limit {
+			truncated = true
+			break
+		}
+		set[agentID] = struct{}{}
+	}
+	electorate := make([]string, 0, len(set))
+	for agentID := range set {
+		electorate = append(electorate, agentID)
+	}
+	sort.Strings(electorate)
+	return electorate, truncated
+}
+
+func (app *SageApp) eligibleCanonicalCorroboratorsV21(domain string, candidates []string, blockTime time.Time) ([]string, error) {
+	eligible := make([]string, 0, len(candidates))
+	for _, agentID := range candidates {
+		isOwner, err := app.badgerStore.IsDomainOwnerOrAncestor(domain, agentID)
+		if err != nil {
+			return nil, err
+		}
+		hasRead, err := app.badgerStore.HasAccessOrAncestor(domain, agentID, 1, blockTime)
+		if err != nil {
+			return nil, err
+		}
+		if isOwner || hasRead {
+			eligible = append(eligible, agentID)
+		}
+	}
+	return eligible, nil
+}
+
 func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
 	challenge := parsedTx.MemoryChallenge
 	if challenge == nil {
@@ -5060,6 +5233,19 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 	challengerID, err := verifyAgentIdentity(parsedTx)
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 15, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
+	}
+
+	// app-v21 challenge rounds freeze their electorate at opening. Later grant
+	// churn must not add a new voter or remove a snapshotted one, so an already
+	// open v21 record becomes the authorization source for endorsements. Fresh
+	// challenges and legacy app-v17 records still use the live modify check.
+	postV21 := app.postAppV21Fork(height)
+	var weightedRecord *store.ChallengeRecordV21
+	if postV21 {
+		weightedRecord, err = app.badgerStore.GetChallengeRecordV21(challenge.MemoryID)
+		if err != nil {
+			return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: app-v21 challenge record lookup failed: %v", err)}
+		}
 	}
 
 	// app-v15 (verb-ladder): deprecation is the privileged "modify" verb. PRE-FORK
@@ -5103,19 +5289,232 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 			// modify gate (a pre-v8.4 memory with no memdomain: key, or a bogus ID).
 			return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: memory %s has no recorded domain; not authorized to deprecate", challenge.MemoryID)}
 		}
-		isAdmin, adErr := app.badgerStore.IsDomainOwnerOrAncestor(domain, challengerID)
-		if adErr != nil {
-			return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: domain-owner lookup failed: %v", adErr)}
-		}
-		hasModify, hErr := app.badgerStore.HasAccessOrAncestor(domain, challengerID, 3, blockTime)
-		if hErr != nil {
-			return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: access lookup failed: %v", hErr)}
-		}
-		if !isAdmin && !hasModify {
-			return &abcitypes.ExecTxResult{Code: 92, Log: fmt.Sprintf("challenge: agent %s not authorized to deprecate memory %s (need domain ownership or a level-3 modify grant)", challengerID[:16], challenge.MemoryID)}
+		if weightedRecord != nil {
+			i := sort.SearchStrings(weightedRecord.Electorate, challengerID)
+			if i == len(weightedRecord.Electorate) || weightedRecord.Electorate[i] != challengerID {
+				return &abcitypes.ExecTxResult{Code: 92, Log: fmt.Sprintf("challenge: agent %s is not in memory %s's snapshotted app-v21 challenge electorate", challengerID[:16], challenge.MemoryID)}
+			}
+		} else {
+			isAdmin, adErr := app.badgerStore.IsDomainOwnerOrAncestor(domain, challengerID)
+			if adErr != nil {
+				return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: domain-owner lookup failed: %v", adErr)}
+			}
+			hasModify, hErr := app.badgerStore.HasAccessOrAncestor(domain, challengerID, 3, blockTime)
+			if hErr != nil {
+				return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: access lookup failed: %v", hErr)}
+			}
+			if !isAdmin && !hasModify {
+				return &abcitypes.ExecTxResult{Code: 92, Log: fmt.Sprintf("challenge: agent %s not authorized to deprecate memory %s (need domain ownership or a level-3 modify grant)", challengerID[:16], challenge.MemoryID)}
+			}
 		}
 	}
 
+	// app-v21: corroboration-weighted challenge rounds. Existing app-v17 open
+	// records deliberately finish under the legacy two-phase machine below; a
+	// new v21 round is opened only over a live committed memory.
+	weightedFallbackLegacy := false
+	if postV21 {
+		_, priorStatus, priorErr := app.badgerStore.GetMemoryHash(challenge.MemoryID)
+		if priorErr != nil {
+			return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: memory lookup failed: %v", priorErr)}
+		}
+
+		if weightedRecord != nil {
+			var resolvedHash []byte
+			if _, scopedHash, scopedErr := app.scopedLifecycleState(challenge.MemoryID, height); scopedErr != nil {
+				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + scopedErr.Error()}
+			} else if scopedHash != nil {
+				resolvedHash = scopedHash
+			}
+			outcome, endorseErr := app.badgerStore.EndorseChallengeV21(store.EndorseChallengeV21Input{
+				MemoryID:         challenge.MemoryID,
+				ChallengerID:     challengerID,
+				ExecutionHeight:  height,
+				ChallengedStatus: string(memory.StatusChallenged),
+				ResolvedStatus:   string(memory.StatusDeprecated),
+				ResolvedHash:     resolvedHash,
+				EvidenceHash:     memoryChallengeEvidenceHash(challenge.Reason, challenge.Evidence),
+			})
+			if endorseErr != nil {
+				switch {
+				case errors.Is(endorseErr, store.ErrChallengeV21AlreadyVoted):
+					return &abcitypes.ExecTxResult{Code: 93, Log: fmt.Sprintf("challenge: agent %s already challenged memory %s in app-v21 round %d", challengerID[:16], challenge.MemoryID, weightedRecord.Round)}
+				case errors.Is(endorseErr, store.ErrChallengeV21NotEligible):
+					return &abcitypes.ExecTxResult{Code: 92, Log: fmt.Sprintf("challenge: agent %s is not eligible for memory %s's app-v21 round", challengerID[:16], challenge.MemoryID)}
+				default:
+					return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + endorseErr.Error()}
+				}
+			}
+
+			app.pendingWrites = append(app.pendingWrites, pendingWrite{
+				writeType: "challenge",
+				data: &store.ChallengeEntry{
+					MemoryID: challenge.MemoryID, ChallengerID: challengerID,
+					Reason: challenge.Reason, Evidence: challenge.Evidence,
+					BlockHeight: height, CreatedAt: blockTime,
+				},
+			})
+			nextStatus := memory.StatusChallenged
+			if outcome.Resolved {
+				nextStatus = memory.StatusDeprecated
+			}
+			app.pendingWrites = append(app.pendingWrites, pendingWrite{
+				writeType: "status_update",
+				data: &statusUpdate{
+					MemoryID: challenge.MemoryID, Status: nextStatus, At: blockTime,
+					DisputedHeight: weightedRecord.ExecutionHeight,
+					DisputedQuorum: weightedRecord.RequiredChallengers,
+				},
+			})
+			metrics.ChallengesTotal.Inc()
+			if outcome.Resolved {
+				return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf(
+					"memory %s app-v21 challenge reached %d/%d distinct challengers → deprecated by %s",
+					challenge.MemoryID, outcome.Record.ChallengerCount, outcome.Record.RequiredChallengers, challengerID[:16])}
+			}
+			return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf(
+				"memory %s challenged under app-v21 weighted policy (%d/%d distinct challengers)",
+				challenge.MemoryID, outcome.Record.ChallengerCount, outcome.Record.RequiredChallengers)}
+		}
+
+		// A challenged memory with only the legacy app-v17 record must finish
+		// under that record's original rules; never reinterpret its threshold at
+		// the app-v21 boundary.
+		if priorStatus == string(memory.StatusChallenged) {
+			legacyRecord, legacyErr := app.badgerStore.GetChallengeRecord(challenge.MemoryID)
+			if legacyErr != nil {
+				return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: legacy challenge record lookup failed: %v", legacyErr)}
+			}
+			if legacyRecord == nil {
+				return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: memory %s is challenged but has no legacy or app-v21 challenge record", challenge.MemoryID)}
+			}
+			// Continue into the legacy app-v17 confirm path below.
+		} else {
+			if priorStatus != string(memory.StatusCommitted) {
+				return &abcitypes.ExecTxResult{Code: 94, Log: fmt.Sprintf(
+					"challenge: app-v21 weighted policy only opens over committed memories (memory %s is %q)",
+					challenge.MemoryID, priorStatus)}
+			}
+			holders, holdersOverLimit, holdersErr := app.badgerStore.ModifyVerbHoldersUpTo(
+				domain, blockTime, store.MaxChallengeElectorateV21,
+			)
+			if holdersErr != nil {
+				if errors.Is(holdersErr, store.ErrChallengeV21PrefixScanLimit) {
+					return &abcitypes.ExecTxResult{Code: 95, Log: "challenge: modify-holder scan exceeded bounded work before an exact electorate could be determined"}
+				}
+				return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: modify-holder enumeration failed: %v", holdersErr)}
+			}
+			if holdersOverLimit {
+				// A finite consensus record must remain bounded, but overflow must
+				// not make the memory impossible to challenge. Preserve app-v17's
+				// bounded two-party fallback for this exceptional large modifier
+				// roster. The fresh v21 enumerator stops at limit+1, so reaching
+				// this branch never performs an unbounded grant scan.
+				weightedFallbackLegacy = true
+				app.logger.Warn().
+					Str("memory_id", challenge.MemoryID).
+					Str("domain", domain).
+					Int("electorate_limit", store.MaxChallengeElectorateV21).
+					Msg("app-v21 challenge electorate exceeds bounded record; using legacy app-v17 two-party fallback")
+				goto legacyChallengePolicy
+			}
+
+			corroborators, corroboratorScanTruncated, corroboratorsErr := app.badgerStore.ListCanonicalCorroboratorsV21UpTo(
+				challenge.MemoryID, challengerID, store.MaxChallengeCorroboratorScanV21,
+			)
+			if corroboratorsErr != nil {
+				if errors.Is(corroboratorsErr, store.ErrChallengeV21PrefixScanLimit) {
+					return &abcitypes.ExecTxResult{Code: 95, Log: "challenge: canonical corroborator scan exceeded bounded work before an exact electorate could be determined"}
+				}
+				return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: canonical corroborator enumeration failed: %v", corroboratorsErr)}
+			}
+			corroborators, corroboratorsErr = app.eligibleCanonicalCorroboratorsV21(domain, corroborators, blockTime)
+			if corroboratorsErr != nil {
+				return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: canonical corroborator authorization failed: %v", corroboratorsErr)}
+			}
+			electorate, electorateOverLimit := mergeChallengeElectorateV21(
+				holders, corroborators, store.MaxChallengeElectorateV21,
+			)
+			if corroboratorScanTruncated && len(electorate) < store.MaxChallengeElectorateV21 {
+				// Pre-v21 markers were not read-authorized at write time. If they
+				// consume the bounded raw scan before the eligible committee is
+				// full, later canonical supporters may still exist. Fail closed
+				// rather than misclassify an indeterminate suffix as k=0.
+				return &abcitypes.ExecTxResult{Code: 95, Log: fmt.Sprintf(
+					"challenge: canonical corroborator scan reached %d markers before a complete bounded read-authorized electorate could be determined",
+					store.MaxChallengeCorroboratorScanV21,
+				)}
+			}
+			if corroboratorScanTruncated || electorateOverLimit {
+				// The full supporter set is larger than one bounded record. Keep
+				// the deterministic canonical prefix that fits alongside every
+				// modify holder. Every supporter counted below remains in the
+				// frozen electorate, so the resulting threshold stays reachable.
+				app.logger.Warn().
+					Str("memory_id", challenge.MemoryID).
+					Str("domain", domain).
+					Int("electorate_limit", store.MaxChallengeElectorateV21).
+					Msg("app-v21 canonical corroborators exceed bounded electorate; using deterministic supporter committee")
+			}
+
+			var resolvedHash []byte
+			if _, scopedHash, scopedErr := app.scopedLifecycleState(challenge.MemoryID, height); scopedErr != nil {
+				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + scopedErr.Error()}
+			} else if scopedHash != nil {
+				resolvedHash = scopedHash
+			}
+			outcome, openErr := app.badgerStore.OpenChallengeV21(store.OpenChallengeV21Input{
+				MemoryID: challenge.MemoryID, OpenerID: challengerID, Domain: domain,
+				ExecutionHeight: height, ExpectedPriorStatus: string(memory.StatusCommitted),
+				ChallengedStatus: string(memory.StatusChallenged),
+				ResolvedStatus:   string(memory.StatusDeprecated),
+				ResolvedHash:     resolvedHash,
+				Electorate:       electorate,
+				EvidenceHash:     memoryChallengeEvidenceHash(challenge.Reason, challenge.Evidence),
+			})
+			if openErr != nil {
+				switch {
+				case errors.Is(openErr, store.ErrChallengeV21ElectorateLimit):
+					return &abcitypes.ExecTxResult{Code: 95, Log: "challenge: " + openErr.Error()}
+				case errors.Is(openErr, store.ErrChallengeV21NotEligible):
+					return &abcitypes.ExecTxResult{Code: 92, Log: fmt.Sprintf("challenge: agent %s is not in the app-v21 modify-holder electorate", challengerID[:16])}
+				default:
+					return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + openErr.Error()}
+				}
+			}
+
+			app.pendingWrites = append(app.pendingWrites, pendingWrite{
+				writeType: "challenge",
+				data: &store.ChallengeEntry{
+					MemoryID: challenge.MemoryID, ChallengerID: challengerID,
+					Reason: challenge.Reason, Evidence: challenge.Evidence,
+					BlockHeight: height, CreatedAt: blockTime,
+				},
+			})
+			nextStatus := memory.StatusChallenged
+			if outcome.Resolved {
+				nextStatus = memory.StatusDeprecated
+			}
+			app.pendingWrites = append(app.pendingWrites, pendingWrite{
+				writeType: "status_update",
+				data: &statusUpdate{
+					MemoryID: challenge.MemoryID, Status: nextStatus, At: blockTime,
+					DisputedHeight: height, DisputedQuorum: outcome.Record.RequiredChallengers,
+				},
+			})
+			metrics.ChallengesTotal.Inc()
+			if outcome.Resolved {
+				return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf(
+					"memory %s deprecated under app-v21 weighted policy (0 eligible corroborators; 1/1 challenger)",
+					challenge.MemoryID)}
+			}
+			return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf(
+				"memory %s challenged under app-v21 weighted policy (1/%d distinct challengers; %d eligible corroborators)",
+				challenge.MemoryID, outcome.Record.RequiredChallengers, outcome.Record.EligibleCorroborators)}
+		}
+	}
+
+legacyChallengePolicy:
 	// app-v17 (C3): quorum-scaled two-phase challenge. Where more than one agent
 	// can modify a memory's domain, a single challenger no longer deprecates
 	// unilaterally — the memory is parked CHALLENGED pending either a SECOND
@@ -5182,9 +5581,19 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 		// FRESH challenge: count the distinct modify-verb holders on the domain at
 		// THIS execution height (C-D3: persisted in the challenge record, never
 		// re-measured at confirm/reinstate).
-		holders, hsErr := app.badgerStore.ModifyVerbHolders(domain, blockTime)
-		if hsErr != nil {
-			return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: modify-holder enumeration failed: %v", hsErr)}
+		var holders []string
+		if weightedFallbackLegacy {
+			// The bounded v21 scan already proved at least limit+1 effective
+			// electorate members. app-v17 resolution needs only to distinguish
+			// one holder from multiple holders; a bounded sentinel preserves that
+			// behavior without repeating the historical unbounded enumeration.
+			holders = make([]string, store.MaxChallengeElectorateV21+1)
+		} else {
+			var hsErr error
+			holders, hsErr = app.badgerStore.ModifyVerbHolders(domain, blockTime)
+			if hsErr != nil {
+				return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("challenge: modify-holder enumeration failed: %v", hsErr)}
+			}
 		}
 		if len(holders) >= 2 && priorStatus == string(memory.StatusCommitted) {
 			// >= 2 holders AND the target is a live COMMITTED memory: park
@@ -5296,7 +5705,7 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 // 10 ("unknown tx type") and mutates nothing, so a chain that never activates
 // app-v17 replays byte-identically. Every reject returns BEFORE any write.
 func (app *SageApp) processMemoryReinstate(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
-	postFork := app.postAppV17Fork(height)
+	postFork := app.postAppV17Rules(height)
 	if !postFork {
 		return &abcitypes.ExecTxResult{Code: 10, Log: "unknown tx type"}
 	}
@@ -5321,6 +5730,33 @@ func (app *SageApp) processMemoryReinstate(parsedTx *tx.ParsedTx, height int64, 
 	if status != string(memory.StatusChallenged) {
 		return &abcitypes.ExecTxResult{Code: 94, Log: fmt.Sprintf("reinstate: memory %s is not challenged (status=%s)", rein.MemoryID, status)}
 	}
+	var weightedRecord *store.ChallengeRecordV21
+	if app.postAppV21Fork(height) {
+		weightedRecord, mErr = app.badgerStore.GetChallengeRecordV21(rein.MemoryID)
+		if mErr != nil {
+			return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("reinstate: app-v21 challenge record lookup failed: %v", mErr)}
+		}
+	}
+	if weightedRecord != nil {
+		i := sort.SearchStrings(weightedRecord.Electorate, agentID)
+		if i == len(weightedRecord.Electorate) || weightedRecord.Electorate[i] != agentID {
+			return &abcitypes.ExecTxResult{Code: 92, Log: fmt.Sprintf(
+				"reinstate: agent %s is not in memory %s's snapshotted app-v21 electorate",
+				agentID[:16], rein.MemoryID)}
+		}
+		restored, restoreErr := app.badgerStore.ReinstateChallengeV21(rein.MemoryID, string(memory.StatusChallenged))
+		if restoreErr != nil {
+			return &abcitypes.ExecTxResult{Code: 16, Log: "reinstate: " + restoreErr.Error()}
+		}
+		app.pendingWrites = append(app.pendingWrites, pendingWrite{
+			writeType: "status_update",
+			data:      &statusUpdate{MemoryID: rein.MemoryID, Status: memory.StatusCommitted, At: blockTime},
+		})
+		return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf(
+			"memory %s app-v21 challenge round %d reinstated → committed by %s",
+			rein.MemoryID, restored.Round, agentID[:16])}
+	}
+
 	rec, rErr := app.badgerStore.GetChallengeRecord(rein.MemoryID)
 	if rErr != nil {
 		return &abcitypes.ExecTxResult{Code: 91, Log: fmt.Sprintf("reinstate: challenge record lookup failed: %v", rErr)}
@@ -5416,6 +5852,29 @@ func (app *SageApp) processMemoryCorroborate(parsedTx *tx.ParsedTx, height int64
 		}
 		if author != "" && author == agentID {
 			return &abcitypes.ExecTxResult{Code: 17, Log: fmt.Sprintf("corroborate: agent %s cannot corroborate its own memory %s", agentID[:16], corrob.MemoryID)}
+		}
+		if app.postAppV21Fork(height) {
+			domain, domainErr := app.badgerStore.GetMemoryDomain(corrob.MemoryID)
+			if domainErr != nil {
+				return &abcitypes.ExecTxResult{Code: 17, Log: fmt.Sprintf("corroborate: domain lookup failed: %v", domainErr)}
+			}
+			if domain == "" {
+				return &abcitypes.ExecTxResult{Code: 17, Log: fmt.Sprintf("corroborate: memory %s has no recorded domain", corrob.MemoryID)}
+			}
+			isOwner, ownerErr := app.badgerStore.IsDomainOwnerOrAncestor(domain, agentID)
+			if ownerErr != nil {
+				return &abcitypes.ExecTxResult{Code: 17, Log: fmt.Sprintf("corroborate: domain-owner lookup failed: %v", ownerErr)}
+			}
+			hasRead, accessErr := app.badgerStore.HasAccessOrAncestor(domain, agentID, 1, blockTime)
+			if accessErr != nil {
+				return &abcitypes.ExecTxResult{Code: 17, Log: fmt.Sprintf("corroborate: access lookup failed: %v", accessErr)}
+			}
+			if !isOwner && !hasRead {
+				return &abcitypes.ExecTxResult{Code: 17, Log: fmt.Sprintf(
+					"corroborate: agent %s lacks current read access to memory %s's domain",
+					agentID[:16], corrob.MemoryID,
+				)}
+			}
 		}
 		// M2: a co-committed memory records only the LOCAL relay submitter in
 		// memauthor; its true (co-)authors live in cocommit:coauthors. Extend the
@@ -8349,6 +8808,14 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 			return fmt.Errorf("app-v20 upgrade readiness failed: %w", readinessErr)
 		}
 	}
+	if p.Name == appV21UpgradeName {
+		if p.TargetAppVersion != 21 {
+			return fmt.Errorf("app-v21 upgrade has target version %d, want 21", p.TargetAppVersion)
+		}
+		if current := app.currentAppVersion(); current != 20 {
+			return fmt.Errorf("app-v21 upgrade requires current app version 20, got %d", current)
+		}
+	}
 
 	// Execution-height regression re-guard: the chain's committed app version
 	// may have advanced (another upgrade activated) between propose and quorum.
@@ -8453,6 +8920,16 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 		}
 		if !isCanonicalAppV20CeremonyDomain(prop.GovernanceDomain) {
 			return &abcitypes.ExecTxResult{Code: 47, Log: "upgrade propose: app-v20 requires a canonical 32-byte lowercase governance_domain"}
+		}
+	}
+	if prop.Name == appV21UpgradeName {
+		if prop.TargetAppVersion != 21 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v21 requires target_app_version 21 (got %d)", prop.TargetAppVersion)}
+		}
+		if current := app.currentAppVersion(); current != 20 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v21 requires current committed app version 20 (got %d)", current)}
 		}
 	}
 

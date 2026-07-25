@@ -250,13 +250,19 @@ func (s *PostgresStore) ensureProjectionSchema(ctx context.Context) error {
 		if _, err := ps.db.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, projectionSchemaLockKey); err != nil {
 			return fmt.Errorf("acquire projection schema lock: %w", err)
 		}
-		if _, err := ps.db.Exec(ctx, `
-			CREATE TABLE IF NOT EXISTS abci_projection_batches (
+		for _, statement := range []string{
+			`CREATE TABLE IF NOT EXISTS abci_projection_batches (
 				block_height BIGINT PRIMARY KEY,
 				app_hash     BYTEA NOT NULL CHECK (octet_length(app_hash) = 32),
 				created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-			)`); err != nil {
-			return fmt.Errorf("create projection batch table: %w", err)
+			)`,
+			`CREATE TABLE IF NOT EXISTS memory_evidence_projection_incomplete (
+				memory_id UUID PRIMARY KEY REFERENCES memories(memory_id) ON DELETE CASCADE
+			)`,
+		} {
+			if _, err := ps.db.Exec(ctx, statement); err != nil {
+				return fmt.Errorf("create projection metadata table: %w", err)
+			}
 		}
 		return nil
 	})
@@ -853,6 +859,126 @@ func (s *PostgresStore) InsertChallenge(ctx context.Context, challenge *Challeng
 		return fmt.Errorf("insert challenge: %w", err)
 	}
 	return nil
+}
+
+// EnsureCanonicalEvidenceProjection restores count-bearing audit rows from
+// AppHash-covered evidence markers without duplicating richer rows already
+// projected during ordinary block execution. It is used by scoped recovery
+// after state sync or projection loss and is safe to rerun.
+func (s *PostgresStore) EnsureCanonicalEvidenceProjection(
+	ctx context.Context,
+	memoryID string,
+	corroboratorIDs, challengerIDs []string,
+	at time.Time,
+) (bool, error) {
+	repaired := false
+	for _, agentID := range corroboratorIDs {
+		tag, err := s.db.Exec(ctx,
+			`INSERT INTO corroborations (memory_id, agent_id, evidence, created_at)
+			 SELECT $1, $2, $3, $4
+			 WHERE NOT EXISTS (
+				SELECT 1 FROM corroborations WHERE memory_id = $1 AND agent_id = $2
+			 )`,
+			memoryID, agentID, "recovered from canonical corroboration marker", at)
+		if err != nil {
+			return repaired, fmt.Errorf("restore canonical corroboration projection: %w", err)
+		}
+		if tag.RowsAffected() > 0 {
+			repaired = true
+		}
+	}
+	for _, agentID := range challengerIDs {
+		tag, err := s.db.Exec(ctx,
+			`INSERT INTO challenges (memory_id, challenger_id, reason, evidence, block_height, created_at)
+			 SELECT $1, $2, $3, $4, $5, $6
+			 WHERE NOT EXISTS (
+				SELECT 1 FROM challenges WHERE memory_id = $1 AND challenger_id = $2
+			 )`,
+			memoryID, agentID, "recovered from canonical app-v21 challenge marker", "", 0, at)
+		if err != nil {
+			return repaired, fmt.Errorf("restore canonical challenge projection: %w", err)
+		}
+		if tag.RowsAffected() > 0 {
+			repaired = true
+		}
+	}
+	return repaired, nil
+}
+
+// MarkEvidenceProjectionIncomplete records that recovered evidence rows are a
+// canonical lower bound rather than a complete lifetime SQL audit. The marker
+// is intentionally one-way and survives later ordinary evidence writes.
+func (s *PostgresStore) HasMemoryProjection(ctx context.Context, memoryID string) (bool, error) {
+	var exists bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM memories WHERE memory_id = $1)`,
+		memoryID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check memory projection: %w", err)
+	}
+	return exists, nil
+}
+
+func (s *PostgresStore) MarkEvidenceProjectionIncomplete(ctx context.Context, memoryID string) error {
+	if _, err := s.db.Exec(ctx,
+		`INSERT INTO memory_evidence_projection_incomplete (memory_id)
+		 VALUES ($1) ON CONFLICT (memory_id) DO NOTHING`,
+		memoryID); err != nil {
+		return fmt.Errorf("mark evidence projection incomplete: %w", err)
+	}
+	return nil
+}
+
+// GetEvidenceProjectionCompleteness treats an absent marker as complete for
+// backward compatibility with native/existing projections.
+func (s *PostgresStore) GetEvidenceProjectionCompleteness(ctx context.Context, memoryIDs []string) (map[string]bool, error) {
+	complete := make(map[string]bool, len(memoryIDs))
+	for _, memoryID := range memoryIDs {
+		complete[memoryID] = true
+	}
+	if len(memoryIDs) == 0 {
+		return complete, nil
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT memory_id::text FROM memory_evidence_projection_incomplete WHERE memory_id = ANY($1)`,
+		memoryIDs)
+	if err != nil {
+		return nil, fmt.Errorf("get evidence projection completeness: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var memoryID string
+		if scanErr := rows.Scan(&memoryID); scanErr != nil {
+			return nil, fmt.Errorf("scan evidence projection completeness: %w", scanErr)
+		}
+		complete[memoryID] = false
+	}
+	return complete, rows.Err()
+}
+
+// GetChallengeCounts returns the number of distinct challengers recorded for
+// each memory ID. The challenges table is an append-only off-chain audit
+// projection, so this is a lifetime evidence count rather than an open-vote
+// count.
+func (s *PostgresStore) GetChallengeCounts(ctx context.Context, memoryIDs []string) (map[string]int, error) {
+	counts := make(map[string]int, len(memoryIDs))
+	if len(memoryIDs) == 0 {
+		return counts, nil
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT memory_id, COUNT(DISTINCT challenger_id) FROM challenges WHERE memory_id = ANY($1) GROUP BY memory_id`, memoryIDs)
+	if err != nil {
+		return nil, fmt.Errorf("get challenge counts: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, fmt.Errorf("scan challenge count: %w", err)
+		}
+		counts[id] = n
+	}
+	return counts, rows.Err()
 }
 
 func (s *PostgresStore) InsertCorroboration(ctx context.Context, corr *Corroboration) error {
@@ -2133,15 +2259,15 @@ func (s *PostgresStore) GetLinkedMemories(ctx context.Context, memoryID string) 
 	return links, rows.Err()
 }
 
-// GetCorroborationCounts returns the corroboration count for each memory ID in a
-// single batched query (avoids the N+1 of GetCorroborations per memory).
+// GetCorroborationCounts returns the distinct corroborator count for each memory
+// ID in a single batched query (avoids the N+1 of GetCorroborations per memory).
 func (s *PostgresStore) GetCorroborationCounts(ctx context.Context, memoryIDs []string) (map[string]int, error) {
 	counts := make(map[string]int, len(memoryIDs))
 	if len(memoryIDs) == 0 {
 		return counts, nil
 	}
 	rows, err := s.db.Query(ctx,
-		`SELECT memory_id, COUNT(*) FROM corroborations WHERE memory_id = ANY($1) GROUP BY memory_id`, memoryIDs)
+		`SELECT memory_id, COUNT(DISTINCT agent_id) FROM corroborations WHERE memory_id = ANY($1) GROUP BY memory_id`, memoryIDs)
 	if err != nil {
 		return nil, fmt.Errorf("get corroboration counts: %w", err)
 	}

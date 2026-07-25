@@ -241,10 +241,15 @@ type MemoryStore interface {
 	InsertVote(ctx context.Context, vote *ValidationVote) error
 	GetVotes(ctx context.Context, memoryID string) ([]*ValidationVote, error)
 	InsertChallenge(ctx context.Context, challenge *ChallengeEntry) error
+	// GetChallengeCounts returns the number of distinct challengers recorded for
+	// each memory ID in the off-chain audit projection. These are lifetime audit
+	// counts, not an assertion that every row is an open consensus challenge.
+	GetChallengeCounts(ctx context.Context, memoryIDs []string) (map[string]int, error)
 	InsertCorroboration(ctx context.Context, corr *Corroboration) error
 	GetCorroborations(ctx context.Context, memoryID string) ([]*Corroboration, error)
-	// GetCorroborationCounts returns the corroboration count for each of memoryIDs
-	// in a single batched query (avoids the N+1 of GetCorroborations per memory).
+	// GetCorroborationCounts returns the distinct corroborator count for each of
+	// memoryIDs in a single batched query (avoids the N+1 of
+	// GetCorroborations per memory).
 	GetCorroborationCounts(ctx context.Context, memoryIDs []string) (map[string]int, error)
 	GetPendingByDomain(ctx context.Context, domainTag string, limit int) ([]*memory.MemoryRecord, error)
 	// OldestProposedCreatedAt returns the created_at of the oldest memory still
@@ -288,6 +293,44 @@ type MemoryStore interface {
 	// them. Single-node repair — multi-node backends may no-op.
 	RepairSelfDupRejected(ctx context.Context, selfID string, flipChain func(memoryID string) error) (int, error)
 	Close() error
+}
+
+// EvidenceProjectionCompletenessReader is the additive read-side extension
+// used by REST/federation. Keeping it separate from recovery mutation methods
+// lets older/custom stores expose provenance without implementing recovery.
+type EvidenceProjectionCompletenessReader interface {
+	GetEvidenceProjectionCompleteness(ctx context.Context, memoryIDs []string) (map[string]bool, error)
+}
+
+// EvidenceProjectionCompletenessStore is the optional production recovery
+// extension. A missing marker is deliberately interpreted as complete so
+// existing native projections remain backward compatible. Recovery paths write
+// a durable incomplete marker when a previously absent SQL memory row means
+// canonical Badger evidence can only rebuild a lower bound of the historical
+// audit (for example pre-app-v21 challenges). Ordinary corroboration/challenge
+// projection writes must never clear it.
+type EvidenceProjectionCompletenessStore interface {
+	EvidenceProjectionCompletenessReader
+	// HasMemoryProjection reports whether the SQL memory row already exists.
+	// Recovery checks this inside the same transaction as InsertMemory so an
+	// ordinary startup rebuild cannot mislabel a healthy native projection.
+	HasMemoryProjection(ctx context.Context, memoryID string) (bool, error)
+	MarkEvidenceProjectionIncomplete(ctx context.Context, memoryID string) error
+}
+
+// EvidenceProjectionCompleteness returns per-memory completeness, defaulting to
+// true for stores that predate or intentionally do not implement provenance.
+// Production SQLite/Postgres stores implement the optional extension above.
+func EvidenceProjectionCompleteness(ctx context.Context, candidate any, memoryIDs []string) (map[string]bool, error) {
+	complete := make(map[string]bool, len(memoryIDs))
+	for _, memoryID := range memoryIDs {
+		complete[memoryID] = true
+	}
+	provenance, ok := candidate.(EvidenceProjectionCompletenessReader)
+	if !ok {
+		return complete, nil
+	}
+	return provenance.GetEvidenceProjectionCompleteness(ctx, memoryIDs)
 }
 
 // TagCount represents a tag and how many memories use it.

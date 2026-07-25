@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/l33tdawg/sage/api/rest/middleware"
+	"github.com/l33tdawg/sage/internal/memory"
 	"github.com/l33tdawg/sage/internal/metrics"
 	"github.com/l33tdawg/sage/internal/poe"
 	"github.com/l33tdawg/sage/internal/store"
@@ -40,6 +42,7 @@ type ChallengeRequest struct {
 type ChallengeResponse struct {
 	Message string `json:"message"`
 	TxHash  string `json:"tx_hash"`
+	Status  string `json:"status,omitempty"`
 }
 
 // ForgetRequest is the JSON body for POST /v1/memory/{memory_id}/forget.
@@ -53,6 +56,7 @@ type ForgetRequest struct {
 type ForgetResponse struct {
 	Message string `json:"message"`
 	TxHash  string `json:"tx_hash"`
+	Status  string `json:"status,omitempty"`
 }
 
 // ReinstateRequest is the JSON body for
@@ -258,16 +262,19 @@ func (s *Server) handleChallengeMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	metrics.ChallengesTotal.Inc()
+	resultStatus := s.challengeResultStatus(r.Context(), memoryID)
 
 	if s.OnEvent != nil {
 		s.OnEvent("forget", memoryID, "", req.Reason, map[string]any{
 			"tx_hash": txHash,
+			"status":  resultStatus,
 		})
 	}
 
 	writeJSON(w, http.StatusOK, ChallengeResponse{
 		Message: "Challenge submitted successfully.",
 		TxHash:  txHash,
+		Status:  resultStatus,
 	})
 }
 
@@ -335,17 +342,51 @@ func (s *Server) handleForgetMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	metrics.ChallengesTotal.Inc()
+	resultStatus := s.challengeResultStatus(r.Context(), memoryID)
 
 	if s.OnEvent != nil {
 		s.OnEvent("forget", memoryID, "", reason, map[string]any{
 			"tx_hash": txHash,
+			"status":  resultStatus,
 		})
 	}
 
 	writeJSON(w, http.StatusOK, ForgetResponse{
 		Message: "Memory forgotten.",
 		TxHash:  txHash,
+		Status:  resultStatus,
 	})
+}
+
+// challengeResultStatus reads authoritative consensus state after
+// broadcastTxCommit. Tests and legacy embedded callers that do not wire Badger
+// fall back to the SQL projection; a wired production node never lets projection
+// lag redefine the committed result.
+func (s *Server) challengeResultStatus(ctx context.Context, memoryID string) string {
+	if s.badgerStore != nil {
+		_, status, err := s.badgerStore.GetMemoryHash(memoryID)
+		if err != nil {
+			s.logger.Warn().Err(err).Str("memory_id", memoryID).Msg("post-commit challenge status unavailable from canonical state")
+			return ""
+		}
+		switch memory.MemoryStatus(status) {
+		case memory.StatusChallenged, memory.StatusDeprecated:
+			return status
+		default:
+			return ""
+		}
+	}
+
+	rec, err := s.store.GetMemory(ctx, memoryID)
+	if err != nil {
+		return ""
+	}
+	switch rec.Status {
+	case memory.StatusChallenged, memory.StatusDeprecated:
+		return string(rec.Status)
+	default:
+		return ""
+	}
 }
 
 // handleReinstateMemory handles POST /v1/memory/{memory_id}/reinstate.

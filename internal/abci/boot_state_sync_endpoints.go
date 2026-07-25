@@ -192,6 +192,13 @@ func (r *BootStateSyncRuntime) ArmStateSyncServing(controller *StateSyncServingC
 	if r.serving != nil || r.receiving != nil {
 		return errors.New("state sync endpoint controller is already armed")
 	}
+	if r.bundle.expectedAppVersion != controller.authorization.AppVersion() {
+		return fmt.Errorf(
+			"state sync serving application version %d does not match authorized session version %d",
+			r.bundle.expectedAppVersion,
+			controller.authorization.AppVersion(),
+		)
+	}
 	r.serving = controller
 	return nil
 }
@@ -467,7 +474,7 @@ func (r *BootStateSyncRuntime) ApplySnapshotChunk(ctx context.Context, request *
 		return stateSyncApplyResponse(abcitypes.ResponseApplySnapshotChunk_ABORT), nil
 	}
 	if err := r.activatePreparedBundleAuthorized(
-		int64(metadata.Height), metadata.AppHash, statesync.RequiredAppVersion,
+		int64(metadata.Height), metadata.AppHash, controller.authorization.AppVersion(),
 		controller.requireAuthorizedLocked,
 		func(current *ConsensusBundle) (*ConsensusBundle, error) {
 			return prepared.Activate(operationCtx, current, controller.requireAuthorizedLocked)

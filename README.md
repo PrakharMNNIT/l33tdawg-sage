@@ -51,6 +51,41 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.13.4
+
+**Challenges now respect corroborated knowledge, and clients can inspect the
+evidence instead of bypassing the API.** Governed app-v21 snapshots the eligible
+modify holders plus current read-authorized canonical corroborators for each new challenge and
+requires `k+1` distinct challengers when `k` canonical corroborators support the
+memory. Only a modify holder can open the dispute; snapshotted corroborators may
+then reverse their support by endorsing it. Zero-corroborator noise still
+resolves on the first authorized challenge; an eight-corroborator memory now
+requires nine distinct challengers.
+
+- **First-class, replay-safe challenge rounds.** The electorate, threshold,
+  round, and distinct challenge votes are AppHash-covered and committed
+  atomically. Grant churn cannot rewrite an open round, duplicate or stale votes
+  cannot accrue, and legacy app-v17 disputes finish under their original rules.
+- **Evidence is visible everywhere.** REST query/search/detail, federated recall,
+  MCP recall, and the Python SDK now return distinct `corroboration_count` and
+  lifetime `challenge_count` values. `evidence_counts_available` is true only
+  when both queries succeed and no recovery/repair-incomplete marker is present;
+  after pristine recovery the numeric values remain useful canonical lower
+  bounds, but a zero is not proof that no historical evidence existed. Open
+  disputes also expose the current app-v21 round tally and threshold. Challenge
+  and forget responses report authoritative durable post-commit status instead
+  of assuming every challenge deprecated.
+- **Safe state-sync upgrade.** Authorized state sync accepts app-v20 and app-v21
+  images, reconstructs canonical corroborator/challenger counts into a pristine
+  serving projection as explicitly incomplete lifetime lower bounds, and pins
+  each transfer to one exact application version. Older v20 sessions remain
+  compatible; mismatched or unsupported images fail closed.
+
+Caller-asserted memory type, confidence, and challenge strength are deliberately
+not consensus weights: they are not validator-attested facts and would otherwise
+let a caller self-assign immunity. Existing chains retain the exact app-v17
+policy until the governed app-v21 activation. SDK 11.13.4.
+
 ## What's New in v11.13.3
 
 **CEREBRUM now manages federated agent contacts by name and keeps access
@@ -690,7 +725,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.3`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.4`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
