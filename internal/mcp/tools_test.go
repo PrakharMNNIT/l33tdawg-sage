@@ -1188,6 +1188,63 @@ func TestSageTaskCreatesPlannedAssignedThenStartsAsExactOwner(t *testing.T) {
 	require.Equal(t, s.agentID, result.(map[string]any)["assignee"])
 }
 
+func TestSageTaskRejectsContentUpdateBeforeRequest(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	_, err := s.toolTask(context.Background(), map[string]any{
+		"memory_id": "task-existing",
+		"content":   "replace the immutable task description",
+	})
+	require.ErrorContains(t, err, "task content is immutable after creation")
+	require.Zero(t, requests)
+}
+
+func TestSageTaskExistingRequiresExplicitOperation(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer("http://localhost:9999", priv)
+
+	_, err := s.toolTask(context.Background(), map[string]any{
+		"memory_id": "task-existing",
+	})
+	require.ErrorContains(t, err, "provide status or link_to")
+
+	_, err = s.toolTask(context.Background(), map[string]any{
+		"memory_id": "task-existing",
+		"status":    "planned",
+	})
+	require.ErrorContains(t, err, "cannot re-plan")
+}
+
+func TestSageTaskLinksWithoutChangingStatus(t *testing.T) {
+	var linkRequests int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/memory/link", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		linkRequests++
+		w.WriteHeader(http.StatusOK)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	result, err := s.toolTask(context.Background(), map[string]any{
+		"memory_id": "task-existing",
+		"link_to":   []any{"task-note"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, linkRequests)
+	require.Equal(t, "linked", result.(map[string]any)["action"])
+	require.Equal(t, 1, result.(map[string]any)["linked"])
+}
+
 func TestSageInception_ExistingMemories(t *testing.T) {
 	ts := mockSageAPI(t)
 	defer ts.Close()

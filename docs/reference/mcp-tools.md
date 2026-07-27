@@ -510,8 +510,9 @@ verifying memories were committed after storing.
 
 ### sage_task
 
-**Purpose:** Create or update a task in the persistent backlog. Tasks use
-`memory_type: task` and do not decay while open.
+**Purpose:** Create a task, update its workflow status, or link related memories
+in the persistent backlog. Tasks use `memory_type: task` and do not decay while
+open. Their consensus-backed content is immutable after creation.
 
 **Source:** `tools.go:161-178` (definition), `tools.go:1475-1589` (prefix helper and handler)
 
@@ -519,18 +520,20 @@ verifying memories were committed after storing.
 
 | Name        | Type     | Required | Description |
 |-------------|----------|----------|-------------|
-| `content`   | string   | no*      | Task description. Required when creating. Stored with exactly one `[TASK] ` prefix, including when the input is already marked. |
+| `content`   | string   | no*      | Task description. Required when creating and rejected when `memory_id` is present. Stored with exactly one `[TASK] ` prefix, including when the input is already marked. |
 | `domain`    | string   | no       | Domain tag. Default: `general`. |
 | `memory_id` | string   | no*      | Existing task memory ID. Required when updating. |
-| `status`    | string   | no       | `planned`, `in_progress`, `done`, `dropped`. Default: `planned`. |
-| `link_to`   | string[] | no       | Memory IDs to link this task to via `related` link type. |
+| `status`    | string   | no       | `planned`, `in_progress`, `done`, `dropped`. New tasks default to `planned`. Existing tasks require an explicit mutable status; agents cannot re-plan them. |
+| `link_to`   | string[] | no       | Memory IDs to link this task to via `related` link type. May be used with `memory_id` without changing task status. |
 
-*Provide either `content` (create) or `memory_id` (update). Providing neither
-returns an error.
+*Provide either `content` (create) or `memory_id` (update/link), never both.
+An existing task also requires `status`, `link_to`, or both. Providing neither
+returns an error before any API request is sent.
 
 **Returns:**
 - Create: `{memory_id, task_status, domain, assignee, action: "created", linked, message}`.
-- Update: `{memory_id, status, action: "updated", linked, message}`.
+- Status update: `{memory_id, status, action: "updated", linked, message}`.
+- Link-only update: `{memory_id, action: "linked", linked, message}`.
 
 **REST:** `POST /v1/memory/submit` (create), `PUT /v1/dashboard/tasks/{id}/status`
 (update), `POST /v1/memory/link` (linking)
