@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-07):** **v11.13.8 is the current release.** MCP identities are isolated by provider, and federation can share a selected agent together with its owned domains after clear operator confirmation. CEREBRUM reports the live ABCI app version after an upgrade, gives operators an explicit Read/Write/Modify access matrix, and records committed RBAC changes in Chain Activity. The complete CI/security/fault matrix remains a mandatory publication invariant, and the native-shell productization bridge remains targeted at v11.11–v11.14.
+**Status (2026-07):** **v11.13.9 is the current release.** WebTransport and QUIC dependencies are patched against the memory-exhaustion advisory in both Go modules, and `sage_task` now rejects immutable content replacement and implicit re-planning while preserving explicit status and link-only updates. MCP identities remain isolated by provider, federation can share a selected agent together with its owned domains after clear operator confirmation, and CEREBRUM records committed RBAC changes in Chain Activity. The complete CI/security/fault matrix remains a mandatory publication invariant, and the native-shell productization bridge remains targeted at v11.11–v11.14.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 

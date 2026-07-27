@@ -51,6 +51,16 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.13.9
+
+**SAGE now closes the WebTransport memory-exhaustion advisory and makes task
+updates explicit.** Root and Natter modules use patched WebTransport/QUIC
+dependencies. `sage_task` rejects immutable content replacements locally,
+requires an explicit status transition, and supports link-only updates without
+an implicit re-plan.
+
+SDK 11.13.9.
+
 ## What's New in v11.13.8
 
 **CEREBRUM now records committed permission changes in Chain Activity.** Access
@@ -765,7 +775,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.8`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.9`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
