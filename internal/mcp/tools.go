@@ -200,14 +200,15 @@ func (s *Server) registerTools() map[string]Tool {
 				"they persist until explicitly completed or dropped. Use this to track planned work, feature ideas, " +
 				"bug reports, and anything that should survive across sessions. " +
 				"To create: provide content + domain. To update status: provide memory_id + status. " +
-				"To link related memories: provide memory_id + link_to (array of memory IDs).",
+				"To link related memories without changing status: provide memory_id + link_to (array of memory IDs). " +
+				"Task content is immutable after creation.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"content":   map[string]any{"type": "string", "description": "Task description (for creating new tasks)"},
 					"domain":    map[string]any{"type": "string", "description": "Domain tag for the task", "default": "general"},
 					"memory_id": map[string]any{"type": "string", "description": "Existing task memory ID (for updates)"},
-					"status":    map[string]any{"type": "string", "enum": []string{"planned", "in_progress", "done", "dropped"}, "description": "Task status", "default": "planned"},
+					"status":    map[string]any{"type": "string", "enum": []string{"planned", "in_progress", "done", "dropped"}, "description": "Task status. New tasks default to planned; existing tasks require an explicit mutable status."},
 					"link_to":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Memory IDs to link this task to"},
 				},
 			},
@@ -2117,7 +2118,10 @@ func (s *Server) toolTask(ctx context.Context, params map[string]any) (any, erro
 	memoryID := stringParam(params, "memory_id", "")
 	content := stringParam(params, "content", "")
 	domain := stringParam(params, "domain", "general")
-	status := stringParam(params, "status", "planned")
+	status, statusProvided := params["status"].(string)
+	if memoryID == "" && !statusProvided {
+		status = "planned"
+	}
 
 	// Parse link_to array
 	var linkTo []string
@@ -2134,17 +2138,32 @@ func (s *Server) toolTask(ctx context.Context, params map[string]any) (any, erro
 	result := map[string]any{}
 
 	if memoryID != "" {
-		// Update existing task
-		updateReq, _ := json.Marshal(map[string]any{
-			"task_status": status,
-		})
-		path := fmt.Sprintf("/v1/dashboard/tasks/%s/status", url.PathEscape(memoryID))
-		if err := s.doSignedJSON(ctx, "PUT", path, updateReq, nil); err != nil {
-			return nil, fmt.Errorf("update task status: %w", err)
+		if content != "" {
+			return nil, fmt.Errorf("task content is immutable after creation; omit content and provide an explicit status or link_to")
+		}
+		if !statusProvided && len(linkTo) == 0 {
+			return nil, fmt.Errorf("provide status or link_to when updating an existing task")
+		}
+		if statusProvided {
+			if status == "planned" {
+				return nil, fmt.Errorf("agents cannot re-plan an existing task; use the local CEREBRUM task board")
+			}
+			if status != "in_progress" && status != "done" && status != "dropped" {
+				return nil, fmt.Errorf("existing task status must be one of: in_progress, done, dropped")
+			}
+			updateReq, _ := json.Marshal(map[string]any{
+				"task_status": status,
+			})
+			path := fmt.Sprintf("/v1/dashboard/tasks/%s/status", url.PathEscape(memoryID))
+			if err := s.doSignedJSON(ctx, "PUT", path, updateReq, nil); err != nil {
+				return nil, fmt.Errorf("update task status: %w", err)
+			}
+			result["status"] = status
+			result["action"] = "updated"
+		} else {
+			result["action"] = "linked"
 		}
 		result["memory_id"] = memoryID
-		result["status"] = status
-		result["action"] = "updated"
 	} else if content != "" {
 		// Create new task
 		if status != "planned" && status != "in_progress" {
