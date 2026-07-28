@@ -51,6 +51,20 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.14.2
+
+**Emergency CEREBRUM and updater recovery patch.** Local installations with
+vault encryption disabled no longer open to a blank dashboard after upgrading:
+the real loopback CEREBRUM browser can read memories, search, use the task
+board, enable the vault, and apply or restart official verified updates.
+Unsigned background processes, LAN and cross-site browsers, ordinary signed
+agents, and sensitive operator mutations remain denied. The updater now prefers
+GitHub's immutable release-asset SHA-256 digest and uses checksum sidecars only
+as a fallback, removing the transient checksum-discovery failure that blocked
+some v11.14.1 upgrades. Existing memories were never removed by this issue.
+
+SDK 11.14.2.
+
 ## What's New in v11.14.1
 
 **SAGE now gives co-located companion agents a consensus-enforced
@@ -817,7 +831,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.14.1`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.14.2`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

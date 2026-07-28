@@ -1,4 +1,4 @@
-<!-- Core document reconciled through SAGE v11.14.1, including app-v22 agent capabilities, directional cross-chain peer RBAC, and the quorum/state-sync/governance-gateway sections. -->
+<!-- Core document reconciled through SAGE v11.14.2, including app-v22 agent capabilities, directional cross-chain peer RBAC, and the quorum/state-sync/governance-gateway sections. -->
 
 # RBAC, Organizations, and Federation
 

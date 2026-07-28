@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.14.1. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.14.2. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -1533,27 +1533,33 @@ caller actually won; a losing reader never receives the same work item.
 
 `GET /v1/dashboard/tasks?all=true&limit=N` is the local-human CEREBRUM Kanban feed; signed agents receive `403` and use the scoped backlog instead. It returns explicit `memory_type=task` records across `planned`, `in_progress`, `done`, and `dropped` on both SQLite and PostgreSQL; ordinary agent conversations/observations are not inferred as tasks. Historical task rows whose older writer did not persist `task_status` are returned with an empty status so CEREBRUM can ask the operator to classify each one—SAGE does not guess that unknown work is Planned or Done. New PostgreSQL inserts persist `TaskStatus`, matching SQLite. Each task also returns `task_status_updated_at`; CEREBRUM uses that lifecycle timestamp—not the task's original `created_at`—to keep Done/Dropped cards visible for seven days after their terminal transition. Manual Clear remains available before that window expires, while older cards can still be revealed with Show all (`web/handler.go:1919-1962`, `web/static/js/app.js:2328-2340`).
 
-**Dashboard operator authority (v11.14.1+):** Loopback source addresses,
-`Origin`, `Host`, and Fetch Metadata identify routing context, not a person.
-Privileged CEREBRUM mutations require either (a) a valid dashboard cookie from
-an enabled, unlocked encrypted vault, together with the local browser/CSRF
-checks, or (b) a request cryptographically verified as the exact configured
-node-operator identity. Vault encryption is off by default, so an
-encryption-off browser remains useful for non-sensitive read-only dashboard
-status views, but memory, pipeline, task-board, agent-topology, event-stream,
-export, and write controls fail with HTTP 403. Run `sage-gui setup` to establish
-the encrypted vault before using those browser surfaces. The HTTP encryption
-enable is itself privileged and therefore requires an exact
-node-operator-signed request;
-an unsigned co-located process cannot choose the passphrase, receive the
-recovery key, or mint its own browser session. Ordinary signed agents and
-unsigned local processes cannot acquire operator authority by forging browser headers
-(`web/handler.go:isCEREBRUMOperatorRequest`).
-The boot-instructions GET is the narrow sensitive-read exception needed by
-`sage_inception`: it accepts the operator/session boundary above or a freshly
-signature-verified agent that is still active in the local registry. Unsigned
-local callers, arbitrary unregistered keys, and inactive/removed agents are
-denied (`web/handler.go:bootInstructionsReadGate`).
+**Dashboard operator authority and local recovery (v11.14.2+):** Loopback
+source addresses, `Origin`, `Host`, and Fetch Metadata identify routing context,
+not a cryptographic person. Privileged CEREBRUM mutations therefore still
+require either (a) a valid dashboard cookie from an enabled, unlocked encrypted
+vault together with the local browser/CSRF checks, or (b) a request verified as
+the exact configured node-operator identity.
+
+Vault encryption is off by default. To avoid stranding an existing personal
+installation before it can establish that session, the real loopback CEREBRUM
+browser has a deliberately narrower compatibility path: it can read the
+memory/search/graph, pipeline, task-board, agent-topology, event-stream, export,
+tags, related-memory, and boot-instruction views; enable the vault and receive
+the new session in that same response; and apply/restart official
+checksum-verified SAGE updates. Both the socket peer and HTTP Host must be
+loopback, and the request must carry browser-controlled same-origin Fetch
+Metadata or a local Origin fallback. This exception does not authorize ordinary
+memory/task/agent/federation/governance mutations.
+
+An unsigned background process with no browser metadata, a LAN browser, a
+cross-site browser, or an ordinary signed agent cannot enter that compatibility
+path. Signed non-operator agents remain on their scoped API surfaces. The
+boot-instructions GET also accepts a freshly signature-verified agent that is
+still active in the local registry for `sage_inception`; arbitrary
+unregistered keys and inactive/removed agents are denied
+(`web/handler.go:isCEREBRUMOperatorRequest`,
+`web/handler.go:isLoopbackCEREBRUMBrowserRequest`,
+`web/handler.go:bootInstructionsReadGate`).
 
 `POST /v1/dashboard/network/claim` is the deliberately narrow exception to
 dashboard authentication: the one-time claim token is the sole authority for
