@@ -475,7 +475,9 @@ func verifiedDashboardAgentID(ctx context.Context) string {
 //     CSRF and anti-rebinding checks.
 //
 // Encryption-off nodes have no browser session authority: privileged
-// CEREBRUM controls require the exact node-operator signature.
+// CEREBRUM controls require the exact node-operator signature. Read-only
+// CEREBRUM views and the vault-enablement bootstrap have narrower compatibility
+// paths below so an upgrade cannot strand an existing local installation.
 func (h *DashboardHandler) isCEREBRUMOperatorRequest(r *http.Request) bool {
 	operatorID := strings.TrimSpace(h.NodeOperatorAgentID)
 	if verifiedAgentID := verifiedDashboardAgentID(r.Context()); verifiedAgentID != "" {
@@ -499,7 +501,53 @@ func (h *DashboardHandler) isCEREBRUMOperatorRequest(r *http.Request) bool {
 	return err == nil && h.validSession(cookie.Value)
 }
 
-const cerebrumOperatorAuthorityHint = "Enable vault encryption and unlock CEREBRUM for a browser session, or use a request signed by the exact node-operator identity."
+func (h *DashboardHandler) isCEREBRUMReadRequest(r *http.Request) bool {
+	return h.isCEREBRUMOperatorRequest(r) ||
+		(!h.Encrypted.Load() && isLoopbackCEREBRUMBrowserRequest(r))
+}
+
+// isLoopbackCEREBRUMBrowserRequest recognizes the local dashboard SPA without
+// treating every process that can connect to localhost as the human operator.
+// Fetch Metadata is browser-controlled; Origin is the fallback for older
+// browsers on requests that carry one. Host and peer must both be loopback so
+// an unencrypted node opened over the LAN never acquires operator authority.
+func isLoopbackCEREBRUMBrowserRequest(r *http.Request) bool {
+	if verifiedDashboardAgentID(r.Context()) != "" ||
+		strings.TrimSpace(r.Header.Get("X-Agent-ID")) != "" {
+		return false
+	}
+	if !isLoopbackRemote(r.RemoteAddr) || !hostIsLoopback(r.Host) || !isLocalRequest(r) {
+		return false
+	}
+	secFetch := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	switch secFetch {
+	case "same-origin", "none":
+		return origin == "" || originIsLocal(origin)
+	case "":
+		return origin != "" && originIsLocal(origin)
+	default:
+		return false
+	}
+}
+
+func hostIsLoopback(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+const cerebrumOperatorAuthorityHint = "Open CEREBRUM on this machine, unlock its encrypted vault, or use a request signed by the exact node-operator identity."
 
 func writeCEREBRUMOperatorForbidden(w http.ResponseWriter, action string) {
 	writeError(w, http.StatusForbidden, action+" "+cerebrumOperatorAuthorityHint)
@@ -528,6 +576,21 @@ func isAgentOwnedDashboardMutation(r *http.Request) bool {
 	}
 }
 
+func (h *DashboardHandler) isCEREBRUMLocalCompatibilityMutation(r *http.Request) bool {
+	if h.Encrypted.Load() || r.Method != http.MethodPost ||
+		!isLoopbackCEREBRUMBrowserRequest(r) {
+		return false
+	}
+	switch strings.TrimSuffix(r.URL.Path, "/") {
+	case "/v1/dashboard/settings/ledger/enable",
+		"/v1/dashboard/settings/update/apply",
+		"/v1/dashboard/settings/update/restart":
+		return true
+	default:
+		return false
+	}
+}
+
 // dashboardOperatorMutationGate makes operator authority the default for every
 // protected non-read dashboard route. This closes the class of bugs where a
 // newly added handler relied only on authMiddleware and accidentally treated
@@ -543,6 +606,10 @@ func (h *DashboardHandler) dashboardOperatorMutationGate(next http.Handler) http
 			next.ServeHTTP(w, r)
 			return
 		}
+		if h.isCEREBRUMLocalCompatibilityMutation(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !h.isCEREBRUMOperatorRequest(r) {
 			writeCEREBRUMOperatorForbidden(w, "Changing CEREBRUM state requires operator authority.")
 			return
@@ -553,7 +620,7 @@ func (h *DashboardHandler) dashboardOperatorMutationGate(next http.Handler) http
 
 func (h *DashboardHandler) cerebrumOperatorGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !h.isCEREBRUMOperatorRequest(r) {
+		if !h.isCEREBRUMReadRequest(r) {
 			writeCEREBRUMOperatorForbidden(w, "This CEREBRUM resource requires operator authority.")
 			return
 		}
@@ -568,7 +635,7 @@ func (h *DashboardHandler) cerebrumOperatorGate(next http.Handler) http.Handler 
 // with a fresh signature and still be active in the local agent registry.
 func (h *DashboardHandler) bootInstructionsReadGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.isCEREBRUMOperatorRequest(r) {
+		if h.isCEREBRUMReadRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -2136,7 +2203,7 @@ func (h *DashboardHandler) handleGetTasks(w http.ResponseWriter, r *http.Request
 		// Agents use the scoped backlog below, where authorization happens before
 		// work is returned or claimed. Keeping signed callers out also prevents a
 		// global board limit from starving their permitted tasks behind denied rows.
-		if !h.isCEREBRUMOperatorRequest(r) {
+		if !h.isCEREBRUMReadRequest(r) {
 			writeError(w, http.StatusForbidden, "the full task board is available only in local CEREBRUM; agents should use their task backlog")
 			return
 		}
@@ -2152,7 +2219,7 @@ func (h *DashboardHandler) handleGetTasks(w http.ResponseWriter, r *http.Request
 		// X-Agent-ID (set by the MCP server on every request) drives ownership: an
 		// agent's backlog excludes tasks claimed by another agent.
 		agentID := verifiedDashboardAgentID(r.Context())
-		if agentID == "" && !h.isCEREBRUMOperatorRequest(r) {
+		if agentID == "" && !h.isCEREBRUMReadRequest(r) {
 			writeError(w, http.StatusForbidden, "the task backlog is available only to signed agents or an authenticated CEREBRUM session")
 			return
 		}

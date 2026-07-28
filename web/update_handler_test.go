@@ -45,6 +45,21 @@ func TestSemverGreater(t *testing.T) {
 	}
 }
 
+func TestAssetSHA256Digest(t *testing.T) {
+	const sum = "01e4bb2ba530b9269b6391569a7865e3e90bcecc1256ec632dc31c01551b5773"
+	assert.Equal(t, sum, assetSHA256Digest("sha256:"+sum))
+	assert.Equal(t, sum, assetSHA256Digest("SHA256:"+strings.ToUpper(sum)))
+
+	for _, invalid := range []string{
+		"",
+		"sha512:" + sum,
+		"sha256:short",
+		"sha256:" + strings.Repeat("z", 64),
+	} {
+		assert.Empty(t, assetSHA256Digest(invalid), invalid)
+	}
+}
+
 func TestHandleRestartQueuesCoordinatedLifecycle(t *testing.T) {
 	var calls atomic.Int32
 	h := &DashboardHandler{BootID: "boot-a", RequestRestart: func() error {
@@ -52,7 +67,7 @@ func TestHandleRestartQueuesCoordinatedLifecycle(t *testing.T) {
 		return nil
 	}}
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/settings/update/restart", nil)
-	markLocalCEREBRUM(h, req)
+	markUnencryptedLoopbackCEREBRUM(req)
 	w := httptest.NewRecorder()
 	h.handleRestart(w, req)
 	if runtime.GOOS == "windows" {
@@ -88,7 +103,7 @@ func TestHandleApplyUpdateRequiresTrustedChecksum(t *testing.T) {
 	h := &DashboardHandler{}
 	body := strings.NewReader(`{"download_url":"https://github.com/l33tdawg/sage/releases/download/v11.7.0/sage.tar.gz"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/settings/update/apply", body)
-	markLocalCEREBRUM(h, req)
+	markUnencryptedLoopbackCEREBRUM(req)
 	w := httptest.NewRecorder()
 	h.handleApplyUpdate(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
@@ -97,6 +112,31 @@ func TestHandleApplyUpdateRequiresTrustedChecksum(t *testing.T) {
 	} else {
 		assert.Contains(t, w.Body.String(), "checksum")
 	}
+}
+
+func TestUnencryptedLoopbackCEREBRUMReachesUpdaterThroughRouter(t *testing.T) {
+	h, _ := newTestHandler(t)
+	router := testRouter(h)
+	body := strings.NewReader(`{"download_url":"https://github.com/l33tdawg/sage/releases/download/v11.14.2/sage.tar.gz"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/settings/update/apply", body)
+	req.Header.Set("Content-Type", "application/json")
+	markUnencryptedLoopbackCEREBRUM(req)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	if runtime.GOOS == "windows" {
+		assert.Contains(t, w.Body.String(), "signed release installer")
+	} else {
+		assert.Contains(t, w.Body.String(), "checksum")
+	}
+}
+
+func markUnencryptedLoopbackCEREBRUM(req *http.Request) {
+	req.Header.Set("Origin", "http://localhost:8080")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 }
 
 func TestUpdateStatusSurvivesDroppedSSEConnection(t *testing.T) {

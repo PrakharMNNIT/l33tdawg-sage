@@ -40,6 +40,7 @@ type githubAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Size               int64  `json:"size"`
+	Digest             string `json:"digest"`
 }
 
 // handleCheckUpdate checks current version vs latest GitHub release.
@@ -95,12 +96,14 @@ func (h *DashboardHandler) handleCheckUpdate(w http.ResponseWriter, r *http.Requ
 	assetName := findUpdateAssetName(latest, runtime.GOOS, runtime.GOARCH)
 	var downloadURL string
 	var assetSize int64
+	var assetDigest string
 	var checksumsURL string
 	var assetChecksumURL string
 	for _, a := range release.Assets {
 		if a.Name == assetName {
 			downloadURL = a.BrowserDownloadURL
 			assetSize = a.Size
+			assetDigest = a.Digest
 		}
 		if a.Name == "checksums.txt" {
 			checksumsURL = a.BrowserDownloadURL
@@ -110,13 +113,14 @@ func (h *DashboardHandler) handleCheckUpdate(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// GoReleaser archives are listed in checksums.txt. Desktop installers are
-	// built afterward and publish a sibling .sha256 asset instead; prefer that
-	// when present so the signed macOS DMG can use the same verified updater.
-	var expectedChecksum string
-	if assetChecksumURL != "" && assetName != "" {
+	// GitHub computes the immutable release-asset digest itself. Prefer it over
+	// a second network request for checksums.txt/a sidecar: a transient redirect,
+	// CDN, or sidecar fetch failure must not make an otherwise verifiable update
+	// appear untrusted. Older assets without a digest retain the sidecar fallback.
+	expectedChecksum := assetSHA256Digest(assetDigest)
+	if expectedChecksum == "" && assetChecksumURL != "" && assetName != "" {
 		expectedChecksum = fetchChecksumForAsset(r.Context(), client, assetChecksumURL, assetName)
-	} else if checksumsURL != "" && assetName != "" {
+	} else if expectedChecksum == "" && checksumsURL != "" && assetName != "" {
 		expectedChecksum = fetchChecksumForAsset(r.Context(), client, checksumsURL, assetName)
 	}
 
@@ -155,6 +159,22 @@ func (h *DashboardHandler) handleCheckUpdate(w http.ResponseWriter, r *http.Requ
 	}
 
 	writeJSONResp(w, http.StatusOK, result)
+}
+
+func assetSHA256Digest(digest string) string {
+	const prefix = "sha256:"
+	digest = strings.TrimSpace(digest)
+	if !strings.HasPrefix(strings.ToLower(digest), prefix) {
+		return ""
+	}
+	sum := digest[len(prefix):]
+	if len(sum) != sha256.Size*2 {
+		return ""
+	}
+	if _, err := hex.DecodeString(sum); err != nil {
+		return ""
+	}
+	return strings.ToLower(sum)
 }
 
 // runningBinaryDiskVersion returns the version reported by the binary currently
@@ -210,7 +230,7 @@ func restartRequired(running, disk string) bool {
 // handleApplyUpdate kicks off an async download-and-replace of the sage-gui binary.
 // Progress is streamed to the dashboard via SSE events so the user sees each step.
 func (h *DashboardHandler) handleApplyUpdate(w http.ResponseWriter, r *http.Request) {
-	if !h.isCEREBRUMOperatorRequest(r) {
+	if !h.isCEREBRUMReadRequest(r) {
 		writeCEREBRUMOperatorForbidden(w, "Installing updates requires operator authority.")
 		return
 	}
@@ -652,7 +672,7 @@ func RollbackPendingUpdate(execPath string) (bool, error) {
 // never execs from an HTTP goroutine: that skipped defers and could leave
 // consensus, stores, listeners, and sidecars in an indeterminate state.
 func (h *DashboardHandler) handleRestart(w http.ResponseWriter, r *http.Request) {
-	if !h.isCEREBRUMOperatorRequest(r) {
+	if !h.isCEREBRUMReadRequest(r) {
 		writeCEREBRUMOperatorForbidden(w, "Restarting SAGE requires operator authority.")
 		return
 	}

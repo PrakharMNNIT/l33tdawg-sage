@@ -65,7 +65,10 @@ func TestHandleEnableLedger(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"passphrase": "test-pass-123"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/ledger/enable", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	signExactNodeOperatorRequest(t, h, req, body)
+	req.Header.Set("Origin", "http://localhost:8080")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

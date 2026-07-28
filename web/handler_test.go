@@ -134,18 +134,16 @@ func TestSignedAgentCannotMutateDashboardMemoryMetadata(t *testing.T) {
 	assert.Empty(t, tags)
 }
 
-func TestUnsignedLoopbackCannotMutateDashboardMemoryMetadata(t *testing.T) {
+func TestUnencryptedLoopbackCEREBRUMCanReadMemories(t *testing.T) {
 	h, s := newTestHandler(t)
 	router := testRouter(h)
 	insertTestMemory(t, s, "loopback-target", "original.domain")
 
-	body := []byte(`{"domain":"spoofed.domain"}`)
 	req := httptest.NewRequest(
-		http.MethodPatch,
-		"/v1/dashboard/memory/loopback-target",
-		bytes.NewReader(body),
+		http.MethodGet,
+		"/v1/dashboard/memory/list",
+		nil,
 	)
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://localhost:8080")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Host = "localhost:8080"
@@ -153,11 +151,74 @@ func TestUnsignedLoopbackCannotMutateDashboardMemoryMetadata(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
-	require.Equal(t, http.StatusForbidden, rr.Code, rr.Body.String())
-	require.Contains(t, rr.Body.String(), "node-operator")
-	record, err := s.GetMemory(context.Background(), "loopback-target")
-	require.NoError(t, err)
-	assert.Equal(t, "original.domain", record.DomainTag)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "loopback-target")
+}
+
+func TestUnencryptedCEREBRUMOperatorCompatibilityIsLoopbackBrowserOnly(t *testing.T) {
+	tests := []struct {
+		name      string
+		remote    string
+		host      string
+		origin    string
+		secFetch  string
+		wantAllow bool
+	}{
+		{
+			name:   "loopback browser fetch metadata",
+			remote: "127.0.0.1:54321", host: "localhost:8080",
+			secFetch: "same-origin", wantAllow: true,
+		},
+		{
+			name:   "loopback older browser origin fallback",
+			remote: "127.0.0.1:54321", host: "127.0.0.1:8080",
+			origin: "http://127.0.0.1:8080", wantAllow: true,
+		},
+		{
+			name:   "unsigned loopback process",
+			remote: "127.0.0.1:54321", host: "localhost:8080",
+		},
+		{
+			name:   "cross site browser",
+			remote: "127.0.0.1:54321", host: "localhost:8080",
+			origin: "https://attacker.example", secFetch: "cross-site",
+		},
+		{
+			name:   "LAN browser",
+			remote: "192.168.1.42:54321", host: "192.168.1.10:8080",
+			origin: "http://192.168.1.10:8080", secFetch: "same-origin",
+		},
+		{
+			name:   "remote peer spoofing loopback headers",
+			remote: "192.168.1.42:54321", host: "localhost:8080",
+			origin: "http://localhost:8080", secFetch: "same-origin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/list", nil)
+			req.RemoteAddr = tt.remote
+			req.Host = tt.host
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+			if tt.secFetch != "" {
+				req.Header.Set("Sec-Fetch-Site", tt.secFetch)
+			}
+			assert.Equal(t, tt.wantAllow, isLoopbackCEREBRUMBrowserRequest(req))
+		})
+	}
+
+	t.Run("signed non-operator browser", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/list", nil)
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Host = "localhost:8080"
+		req.Header.Set("Origin", "http://localhost:8080")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req = req.WithContext(context.WithValue(req.Context(), verifiedDashboardAgentKey{}, "signed-non-operator"))
+		assert.False(t, isLoopbackCEREBRUMBrowserRequest(req))
+	})
 }
 
 func TestExactSignedNodeOperatorCanMutateDashboardMemoryMetadata(t *testing.T) {
@@ -200,43 +261,41 @@ func TestDashboardOperatorDefaultDeniesUnsignedAgentRemovalAndBundleDownload(t *
 		CreatedAt:      time.Now().UTC(),
 	}))
 
-	localRequest := func(method, path string) *http.Request {
+	unsignedProcessRequest := func(method, path string) *http.Request {
 		req := httptest.NewRequest(method, path, nil)
-		req.Header.Set("Origin", "http://localhost:8080")
-		req.Header.Set("Sec-Fetch-Site", "same-origin")
 		req.Host = "localhost:8080"
 		req.RemoteAddr = "127.0.0.1:54321"
 		return req
 	}
 
 	removeResp := httptest.NewRecorder()
-	router.ServeHTTP(removeResp, localRequest(http.MethodDelete, "/v1/dashboard/network/agents/operator-gate-target"))
+	router.ServeHTTP(removeResp, unsignedProcessRequest(http.MethodDelete, "/v1/dashboard/network/agents/operator-gate-target"))
 	require.Equal(t, http.StatusForbidden, removeResp.Code, removeResp.Body.String())
 	_, err := s.GetAgent(context.Background(), "operator-gate-target")
 	require.NoError(t, err, "denied removal must leave the agent intact")
 
 	bundleResp := httptest.NewRecorder()
-	router.ServeHTTP(bundleResp, localRequest(http.MethodGet, "/v1/dashboard/network/agents/operator-gate-target/bundle"))
+	router.ServeHTTP(bundleResp, unsignedProcessRequest(http.MethodGet, "/v1/dashboard/network/agents/operator-gate-target/bundle"))
 	require.Equal(t, http.StatusForbidden, bundleResp.Code, bundleResp.Body.String())
 
 	exportResp := httptest.NewRecorder()
-	router.ServeHTTP(exportResp, localRequest(http.MethodGet, "/v1/dashboard/export"))
+	router.ServeHTTP(exportResp, unsignedProcessRequest(http.MethodGet, "/v1/dashboard/export"))
 	require.Equal(t, http.StatusForbidden, exportResp.Code, exportResp.Body.String())
 
 	memoryResp := httptest.NewRecorder()
-	router.ServeHTTP(memoryResp, localRequest(http.MethodGet, "/v1/dashboard/memory/list"))
+	router.ServeHTTP(memoryResp, unsignedProcessRequest(http.MethodGet, "/v1/dashboard/memory/list"))
 	require.Equal(t, http.StatusForbidden, memoryResp.Code, memoryResp.Body.String())
 
 	pipelineResp := httptest.NewRecorder()
-	router.ServeHTTP(pipelineResp, localRequest(http.MethodGet, "/v1/dashboard/pipeline"))
+	router.ServeHTTP(pipelineResp, unsignedProcessRequest(http.MethodGet, "/v1/dashboard/pipeline"))
 	require.Equal(t, http.StatusForbidden, pipelineResp.Code, pipelineResp.Body.String())
 
 	listResp := httptest.NewRecorder()
-	router.ServeHTTP(listResp, localRequest(http.MethodGet, "/v1/dashboard/network/agents"))
+	router.ServeHTTP(listResp, unsignedProcessRequest(http.MethodGet, "/v1/dashboard/network/agents"))
 	require.Equal(t, http.StatusForbidden, listResp.Code, listResp.Body.String())
 
 	enableBody := []byte(`{"passphrase":"local-process-chosen"}`)
-	enableReq := localRequest(http.MethodPost, "/v1/dashboard/settings/ledger/enable")
+	enableReq := unsignedProcessRequest(http.MethodPost, "/v1/dashboard/settings/ledger/enable")
 	enableReq.Body = io.NopCloser(bytes.NewReader(enableBody))
 	enableReq.Header.Set("Content-Type", "application/json")
 	enableResp := httptest.NewRecorder()
@@ -327,7 +386,8 @@ func TestBootInstructionsReadRequiresOperatorOrActiveRegisteredAgent(t *testing.
 	unsignedReq.RemoteAddr = "127.0.0.1:54321"
 	unsigned := httptest.NewRecorder()
 	router.ServeHTTP(unsigned, unsignedReq)
-	require.Equal(t, http.StatusForbidden, unsigned.Code, unsigned.Body.String())
+	require.Equal(t, http.StatusOK, unsigned.Code, unsigned.Body.String())
+	assert.Contains(t, unsigned.Body.String(), "operator-selected context")
 
 	_, unregisteredKey, err := ed25519pkg.GenerateKey(nil)
 	require.NoError(t, err)
@@ -746,7 +806,7 @@ func TestTaskBoardAllTrueRequiresLocalHumanCEREBRUM(t *testing.T) {
 		host       string
 		wantStatus int
 	}{
-		{name: "same-origin browser without session", origin: "http://localhost:8080", secFetch: "same-origin", host: "localhost:8080", wantStatus: http.StatusForbidden},
+		{name: "same-origin browser without session", origin: "http://localhost:8080", secFetch: "same-origin", host: "localhost:8080", wantStatus: http.StatusOK},
 		{name: "origin-less caller", host: "localhost:8080", wantStatus: http.StatusForbidden},
 		{name: "cross-origin browser", origin: "https://evil.example", secFetch: "cross-site", host: "localhost:8080", wantStatus: http.StatusForbidden},
 	}

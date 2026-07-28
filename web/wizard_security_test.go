@@ -106,7 +106,7 @@ func TestWizardSecurityGate_DefenseInDepth(t *testing.T) {
 }
 
 // TestWizard_SameOriginBrowserNeedsOperatorSession verifies browser routing
-// headers alone no longer authorize subprocess-driving wizard endpoints.
+// headers alone do not authorize subprocess-driving wizard endpoints.
 func TestWizard_Allows_SameOriginBrowser(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("wizard install path is POSIX-only")
@@ -123,6 +123,7 @@ func TestWizard_Allows_SameOriginBrowser(t *testing.T) {
 		req.Header.Set("Origin", tc.origin)
 		req.Header.Set("Sec-Fetch-Site", "same-origin")
 		req.Host = tc.host // a real same-origin request's Host matches its origin
+		req.RemoteAddr = "127.0.0.1:54321"
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusForbidden, w.Code, "same-origin from %s must still require operator authority", tc.origin)
@@ -240,9 +241,8 @@ func TestAuthMiddleware_DeniesCrossOrigin_WhenEncryptionOff(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// TestAuthMiddleware_AllowsSameOrigin_WhenEncryptionOff confirms the outer
-// routing gate may admit the SPA while the sensitive-resource gate still
-// requires operator authority.
+// TestAuthMiddleware_AllowsSameOrigin_WhenEncryptionOff confirms the local SPA
+// can still read operator-gated CEREBRUM resources without a vault session.
 func TestAuthMiddleware_AllowsSameOrigin_WhenEncryptionOff(t *testing.T) {
 	h, _ := newTestHandler(t)
 	r := testRouter(h)
@@ -250,8 +250,10 @@ func TestAuthMiddleware_AllowsSameOrigin_WhenEncryptionOff(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/list", nil)
 	req.Header.Set("Origin", "http://localhost:8080")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Host = "localhost:8080" // a real same-origin request's Host matches its origin
+	req.RemoteAddr = "127.0.0.1:54321"
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
 }
