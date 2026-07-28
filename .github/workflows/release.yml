@@ -599,6 +599,14 @@ jobs:
             's/# Create DMG\n/echo "==> Reclaiming Go caches before DMG assembly..."\ndf -h \/\ngo clean -cache -modcache\ndf -h \/\n\n# Create DMG\n/' \
             installer/macos/build-dmg.sh
           grep -q 'Reclaiming Go caches before DMG assembly' installer/macos/build-dmg.sh
+          # hdiutil's automatic srcfolder sizing can leave no copy headroom on
+          # cross-compiled Intel bundles (observed on the macos-26 arm64
+          # runner). Give the temporary filesystem an explicit capacity; UDZO
+          # still compresses the published image to the actual payload size.
+          perl -0pi -e \
+            's/hdiutil create -volname/hdiutil create -size 1024m -volname/' \
+            installer/macos/build-dmg.sh
+          grep -q 'hdiutil create -size 1024m -volname' installer/macos/build-dmg.sh
           ./installer/macos/build-dmg.sh
 
           if [ "${SAGE_ARCH}" = amd64 ]; then

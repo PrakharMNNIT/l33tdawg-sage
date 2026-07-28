@@ -181,7 +181,11 @@ License: Apache 2.0
 Author: Dhillon Andrew Kannabhiran
 README
 
-hdiutil create -volname "SAGE ${VERSION}" \
+# hdiutil's inferred srcfolder capacity can be too tight for cross-compiled
+# Intel app bundles, failing during the copy with ENOSPC even when the runner
+# itself has ample free disk. The temporary 1 GiB filesystem is compressed to
+# the actual payload size by UDZO.
+hdiutil create -size 1024m -volname "SAGE ${VERSION}" \
     -srcfolder "$DMG_TEMP" \
     -ov -format UDZO \
     "${BUILD_DIR}/${DMG_NAME}.dmg"

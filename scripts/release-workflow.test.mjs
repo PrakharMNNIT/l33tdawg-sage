@@ -389,6 +389,14 @@ test('macOS release artifacts must be signed, notarized, stapled, and assessed',
       body.indexOf('./installer/macos/build-dmg.sh'),
     'the cache-reclamation injection must be installed before the tagged build script runs',
   );
+  assert.ok(
+    body.includes(
+      String.raw`'s/hdiutil create -volname/hdiutil create -size 1024m -volname/'`,
+    ),
+    'release recovery must add explicit DMG filesystem headroom to the immutable tagged script',
+  );
+  assert.match(body, /grep -q 'hdiutil create -size 1024m -volname'/);
+  assert.match(macosBuild, /hdiutil create -size 1024m -volname/);
   assert.match(body, /codesign --verify --deep --strict/);
   assert.match(body, /stapler validate/);
   assert.match(body, /spctl --assess --type execute/);
