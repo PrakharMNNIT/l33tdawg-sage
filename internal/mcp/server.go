@@ -318,7 +318,8 @@ func (s *Server) handleInitialize(req *jsonRPCRequest) *jsonRPCResponse {
 				"If discussing quantum physics, use 'quantum-physics'. Specific domains = better recall.\n\n" +
 				"FEEDBACK LOOP: After significant tasks, call sage_reflect with dos (what worked) and don'ts (what failed). " +
 				"Both make you better. Paper 4 proved this: rho=0.716 with memory vs rho=0.040 without.\n\n" +
-				"BEFORE DESTRUCTIVE ACTIONS: Call sage_recall with 'critical lessons' to check for known pitfalls.",
+				"BEFORE DESTRUCTIVE ACTIONS: Call sage_recall with 'critical lessons' to check for known pitfalls.\n\n" +
+				inboxSecurityBoundaryInstruction,
 		},
 	}
 }

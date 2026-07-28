@@ -634,6 +634,19 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		writeProblem(w, http.StatusBadRequest, "Invalid agent name", "agent_name must be at most 512 bytes")
 		return
 	}
+	callerMayPipe := s.callerMayUseFederatedPipe(callerID)
+	if agentName != "" && !callerMayPipe {
+		// Named federation discovery feeds sage_find_agent and therefore is a
+		// pipeline capability, not general federation topology discovery. Keep a
+		// denied contact indistinguishable from no matching contact and do not
+		// probe any peer.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"connections": []availableFederationConnection{},
+			"total":       0,
+			"message":     "No visible federated agent matches that name.",
+		})
+		return
+	}
 	agentLimit := 20
 	if raw := r.URL.Query().Get("agent_limit"); raw != "" {
 		parsed, parseErr := strconv.Atoi(raw)
@@ -703,7 +716,10 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 						lookup, lookupErr = contactFinder.FindRemotePipeContacts(ctx, chain, agentName, agentLimit)
 					}
 				}
-				if connection, ok := s.availableFederationConnectionForCaller(ctx, callerID, chain, status, agentName, lookup, lookupErr, hasContactFinder || hasStatusContactFinder); ok {
+				if connection, ok := s.availableFederationConnectionForCaller(
+					ctx, callerID, chain, status, agentName, lookup, lookupErr,
+					hasContactFinder || hasStatusContactFinder, callerMayPipe,
+				); ok {
 					results[index].connection = connection
 				}
 			}
@@ -746,6 +762,7 @@ func (s *Server) availableFederationConnectionForCaller(
 	lookup *federation.PipeContactLookupResponse,
 	lookupErr error,
 	hasTargetedLookup bool,
+	includePipeContacts bool,
 ) (*availableFederationConnection, bool) {
 	if status == nil {
 		return nil, false
@@ -789,15 +806,18 @@ func (s *Server) availableFederationConnectionForCaller(
 		}
 	}
 
-	contacts := status.PipeContacts
-	if agentName != "" {
-		// A named discovery request must never fall back to the full legacy
-		// status roster. Either use the bounded targeted result, or reveal no
-		// recipients for this peer.
-		contacts = nil
-		if hasTargetedLookup && lookupErr == nil && lookup != nil &&
-			federation.ValidateRemotePipeContactGrant(remoteChainID, lookup.Grant) == nil {
-			contacts = lookup.Grant
+	var contacts *federation.PipeContactGrant
+	if includePipeContacts {
+		contacts = status.PipeContacts
+		if agentName != "" {
+			// A named discovery request must never fall back to the full legacy
+			// status roster. Either use the bounded targeted result, or reveal no
+			// recipients for this peer.
+			contacts = nil
+			if hasTargetedLookup && lookupErr == nil && lookup != nil &&
+				federation.ValidateRemotePipeContactGrant(remoteChainID, lookup.Grant) == nil {
+				contacts = lookup.Grant
+			}
 		}
 	}
 	if contacts != nil && !contacts.Paused &&
@@ -848,6 +868,13 @@ func (s *Server) handleFederatedContactAuthorize(w http.ResponseWriter, r *http.
 		writeProblem(w, http.StatusForbidden, "Access denied", "A registered agent identity is required for federation contact authorization.")
 		return
 	}
+	if !s.callerMayUseFederatedPipe(callerID) {
+		// Cache reauthorization is part of recipient discovery. Returning an empty
+		// set immediately prevents a pre-denial sage_find_agent cache entry from
+		// surviving the operator's kill switch.
+		writeJSON(w, http.StatusOK, map[string]any{"allowed_contacts": []map[string]string{}})
+		return
+	}
 	seen := make(map[string]struct{}, len(req.Contacts))
 	allowed := make([]map[string]string, 0, len(req.Contacts))
 	now := time.Now().Unix()
@@ -883,6 +910,26 @@ func (s *Server) handleFederatedContactAuthorize(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, map[string]any{"allowed_contacts": allowed})
 }
 
+// callerMayUseFederatedPipe is the app-v22 gate shared by live recipient
+// discovery, cache reauthorization, and final resolve/send authorization.
+// Before activation it preserves legacy behavior. After activation, missing
+// consensus state or an unknown caller fails closed rather than letting an
+// off-chain projection bypass the operator's deny bit.
+func (s *Server) callerMayUseFederatedPipe(callerID string) bool {
+	if callerID == "" {
+		return false
+	}
+	if !s.isPostV22ForNextTx() {
+		return true
+	}
+	if s.badgerStore == nil {
+		return false
+	}
+	capabilities, registered, err := s.badgerStore.GetRegisteredAgentCapabilities(callerID)
+	return err == nil && registered &&
+		!capabilities.Has(store.AgentCapabilityDenyFederatedPipe)
+}
+
 func normalizeAvailablePermissions(in []availableFederationPermission) []availableFederationPermission {
 	merged := make(map[string]availableFederationPermission)
 	for _, permission := range in {
@@ -908,9 +955,24 @@ func (s *Server) federationVisibleRemoteScopes(ctx context.Context, callerID, re
 		return []string{remoteScope}
 	}
 	var role, domainAccess string
+	var capabilities store.AgentCapabilities
 	if s.badgerStore != nil {
+		if s.isPostV22ForNextTx() {
+			var registered bool
+			var err error
+			capabilities, registered, err = s.badgerStore.GetRegisteredAgentCapabilities(callerID)
+			if err != nil {
+				return nil
+			}
+			if !registered {
+				capabilities = 0
+			}
+		}
 		if agent, err := s.badgerStore.GetRegisteredAgent(callerID); err == nil && agent != nil {
 			role, domainAccess = agent.Role, agent.DomainAccess
+			if !s.isPostV22ForNextTx() {
+				capabilities = agent.Capabilities
+			}
 		}
 	}
 	if role == "" && s.agentStore != nil {
@@ -921,7 +983,9 @@ func (s *Server) federationVisibleRemoteScopes(ctx context.Context, callerID, re
 	if role == "" {
 		return nil
 	}
-	if role == "admin" || domainAccess == "" {
+	if role == "admin" ||
+		(s.isPostV22ForNextTx() && capabilities.Has(store.AgentCapabilityReadAllDomains)) ||
+		domainAccess == "" {
 		return []string{remoteScope}
 	}
 	var access []struct {

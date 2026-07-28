@@ -1,8 +1,12 @@
 package web
 
 import (
+	"fmt"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestRedeemRateLimiter_ConcurrentAllowSweep exercises allow() and sweep()
@@ -43,4 +47,26 @@ func TestRedeemRateLimiter_Caps(t *testing.T) {
 	if !rl.allow("5.6.7.8") {
 		t.Fatal("second IP should be allowed independently")
 	}
+}
+
+func TestRedeemRateLimiter_ReclaimsExpiredBucketsAtBound(t *testing.T) {
+	rl := &redeemRateLimiter{attempts: make(map[string][]time.Time, redeemMaxTrackedIPs)}
+	expired := time.Now().Add(-redeemWindow - time.Second)
+	for i := 0; i < redeemMaxTrackedIPs; i++ {
+		rl.attempts[fmt.Sprintf("198.51.100.%d", i)] = []time.Time{expired}
+	}
+
+	require.True(t, rl.allow("203.0.113.1"))
+	require.Len(t, rl.attempts, 1)
+	require.Contains(t, rl.attempts, "203.0.113.1")
+}
+
+func TestRedeemRateLimiter_CapsLiveDistinctIPBuckets(t *testing.T) {
+	rl := &redeemRateLimiter{}
+	for i := 0; i < redeemMaxTrackedIPs; i++ {
+		require.True(t, rl.allow(fmt.Sprintf("2001:db8::%x", i)))
+	}
+
+	require.False(t, rl.allow("2001:db8::ffff:ffff"))
+	require.Len(t, rl.attempts, redeemMaxTrackedIPs)
 }

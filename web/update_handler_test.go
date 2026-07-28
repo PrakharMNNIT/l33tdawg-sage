@@ -52,7 +52,7 @@ func TestHandleRestartQueuesCoordinatedLifecycle(t *testing.T) {
 		return nil
 	}}
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/settings/update/restart", nil)
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	h.handleRestart(w, req)
 	if runtime.GOOS == "windows" {
@@ -78,7 +78,7 @@ func TestHandleRestartRejectsAgentAndUpdateRace(t *testing.T) {
 
 	h.UpdateInProgress.Store(true)
 	req = httptest.NewRequest(http.MethodPost, "/v1/dashboard/settings/update/restart", nil)
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w = httptest.NewRecorder()
 	h.handleRestart(w, req)
 	require.Equal(t, http.StatusConflict, w.Code)
@@ -88,7 +88,7 @@ func TestHandleApplyUpdateRequiresTrustedChecksum(t *testing.T) {
 	h := &DashboardHandler{}
 	body := strings.NewReader(`{"download_url":"https://github.com/l33tdawg/sage/releases/download/v11.7.0/sage.tar.gz"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/settings/update/apply", body)
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	h.handleApplyUpdate(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)

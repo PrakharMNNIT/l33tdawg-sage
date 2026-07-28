@@ -12,7 +12,7 @@
 # governed upgrade-delay floor is three blocks instead of 200, and the proposer
 # cooldown is one block instead of 50. It also recognizes a test-only dormant
 # pre-publication pause hook used to place the exact crash below. A fresh
-# provider still performs the real signed auto-advance ceremony through app-v21,
+# provider still performs the real signed auto-advance ceremony through app-v22,
 # including app-v20's chain-derived governance domain at a positive activation
 # height.
 # Authorization, quorum, identity, state-sync, P2P, receiver-session,
@@ -762,7 +762,7 @@ write_authorization() {
   "chain_id": "${chain_id}",
   "joining_node_id": "${joining_id}",
   "validator_public_key": "${validator_pubkey}",
-  "app_version": 21,
+  "app_version": 22,
   "expires_at": "${expiry}",
   "snapshot_height_floor": ${floor},
   "validator_node_ids": ["${provider_id}"],
@@ -790,26 +790,26 @@ echo "=== v11.9 integrated authorized state-sync wire gate ==="
 echo "source: ${SOURCE_ID} (both image labels verified before topology start)"
 echo "fixture: one validator provider; observer/receiver/unauthorized peers are distinct non-validator full nodes"
 
-# 1. Drive a fresh real chain through the signed app-v21 ladder. The scoped
+# 1. Drive a fresh real chain through the signed app-v22 ladder. The scoped
 # projection installed below still proves app-v20's governance-domain semantics.
 write_provider_personal_config
-cat >"${PROVIDER_HOME}/post-v21.txt" <<'EOF'
-This committed post-app-v21 fixture record proves the provider snapshot is beyond the positive activation height.
+cat >"${PROVIDER_HOME}/post-v22.txt" <<'EOF'
+This committed post-app-v22 fixture record proves the provider snapshot is beyond the positive activation height.
 EOF
 cat >"${PROVIDER_HOME}/advance.txt" <<'EOF'
 This first state-sync eligibility record advances the provider beyond the exported snapshot height.
 
 This second state-sync eligibility record supplies additional committed blocks for the H plus two light-client window.
 EOF
-chmod 0644 "${PROVIDER_HOME}/post-v21.txt" "${PROVIDER_HOME}/advance.txt"
+chmod 0644 "${PROVIDER_HOME}/post-v22.txt" "${PROVIDER_HOME}/advance.txt"
 
 start_sage "${PROVIDER}" "${PROVIDER_HOME}" provider-rpc
 docker network connect --alias provider-p2p "${P2P_NETWORK}" "${PROVIDER}"
 wait_rpc "${PROVIDER}"
 wait_rest "${PROVIDER}"
-wait_app_version "${PROVIDER}" 21
+wait_app_version "${PROVIDER}" 22
 pre_seed_height=$(rpc_height "${PROVIDER}")
-seed_memories "${PROVIDER}" /sage/post-v21.txt
+seed_memories "${PROVIDER}" /sage/post-v22.txt
 wait_height_at_least "${PROVIDER}" "$((pre_seed_height + 1))"
 scoped_memory_id=$(docker exec "${PROVIDER}" ./sage-gui-v119-fixture \
   v119-state-sync-fixture install-scoped-proof)
@@ -861,7 +861,7 @@ wait_convergence "${PROVIDER}" "${OBSERVER}"
 snapshot_height=$(rpc_height "${PROVIDER}")
 snapshot_app_hash=$(rpc_app_hash "${PROVIDER}")
 if [ "${snapshot_height}" -le 1 ]; then
-  echo "ERROR: provider did not reach a positive post-app-v21 snapshot height" >&2
+  echo "ERROR: provider did not reach a positive post-app-v22 snapshot height" >&2
   exit 1
 fi
 if ! is_canonical_hash "${snapshot_app_hash}"; then
@@ -1102,7 +1102,7 @@ fi
 # `/abci_info` while the runtime write lease is held: it is expected to wait
 # behind the same gate we are proving.
 pre_publish_evidence=$(docker exec "${RECEIVER}" cat "${PRE_PUBLISH_MARKER}")
-python3 - "${snapshot_height}" "${snapshot_app_hash}" 21 "${pre_publish_evidence}" <<'PY'
+python3 - "${snapshot_height}" "${snapshot_app_hash}" 22 "${pre_publish_evidence}" <<'PY'
 import json
 import sys
 
@@ -1201,12 +1201,12 @@ receiver_app_version=$(rpc_app_version "${RECEIVER}" 2>/dev/null || true)
 provider_app_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 receiver_app_hash=$(rpc_app_hash "${RECEIVER}" 2>/dev/null || true)
 provider_app_hash=$(rpc_app_hash "${PROVIDER}" 2>/dev/null || true)
-if [ "${receiver_app_version}" != 21 ] ||
-   [ "${provider_app_version}" != 21 ] ||
+if [ "${receiver_app_version}" != 22 ] ||
+   [ "${provider_app_version}" != 22 ] ||
    ! is_canonical_hash "${receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v21 state" >&2
+  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v22 state" >&2
   exit 1
 fi
 
@@ -1260,12 +1260,12 @@ success_receiver_app_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null
 provider_app_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 success_receiver_app_hash=$(rpc_app_hash "${SUCCESS_RECEIVER}" 2>/dev/null || true)
 provider_app_hash=$(rpc_app_hash "${PROVIDER}" 2>/dev/null || true)
-if [ "${success_receiver_app_version}" != 21 ] ||
-   [ "${provider_app_version}" != 21 ] ||
+if [ "${success_receiver_app_version}" != 22 ] ||
+   [ "${provider_app_version}" != 22 ] ||
    ! is_canonical_hash "${success_receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${success_receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: successful receiver/provider did not publish exact app-v21 state" >&2
+  echo "ERROR: successful receiver/provider did not publish exact app-v22 state" >&2
   exit 1
 fi
 
@@ -1304,8 +1304,8 @@ wait_convergence "${PROVIDER}" "${SUCCESS_RECEIVER}"
 assert_nonvalidator "${SUCCESS_RECEIVER}"
 post_restart_provider_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 post_restart_receiver_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null || true)
-if [ "${post_restart_provider_version}" != 21 ] || [ "${post_restart_receiver_version}" != 21 ]; then
-  echo "ERROR: provider SIGKILL recovery regressed exact app-v21 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
+if [ "${post_restart_provider_version}" != 22 ] || [ "${post_restart_receiver_version}" != 22 ]; then
+  echo "ERROR: provider SIGKILL recovery regressed exact app-v22 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
   exit 1
 fi
 
@@ -1328,5 +1328,5 @@ for image in "${ABCI_IMAGE}" "${NODE_IMAGE}"; do
 done
 
 echo "=== v11.9 AUTHORIZED STATE-SYNC WIRE GATE PASSED ==="
-echo "PASS: frozen source ${SOURCE_ID}; governed app-v21 provider; real signed app-v20 scope+memory; exact app-v21 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
+echo "PASS: frozen source ${SOURCE_ID}; governed app-v22 provider; real signed app-v20 scope+memory; exact app-v22 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
 echo "ROLE: receiver is intentionally a synchronized NON-VALIDATOR full node; validator-set admission remains a separate signed governance action"

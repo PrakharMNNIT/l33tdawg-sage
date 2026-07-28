@@ -42,7 +42,11 @@ type signedAgentRequest struct {
 // signed validator and chain domain cannot be ignored during cross-chain replay.
 // Truly proofless direct governance (including the upgrade auto-voter) retains
 // its historical outer-signature + nonce behavior.
-func (app *SageApp) enforceDelegatedAgentProof(parsedTx *tx.ParsedTx, consensusTime time.Time, claim bool, postAppV20 bool) error {
+func (app *SageApp) enforceDelegatedAgentProof(
+	parsedTx *tx.ParsedTx,
+	consensusTime time.Time,
+	claim, postAppV20, postAppV22 bool,
+) error {
 	usesAgentIdentity := txUsesAgentIdentity(parsedTx.Type)
 	governanceProof := postAppV20 && isProofBearingGovernanceRequest(parsedTx)
 	if (!usesAgentIdentity && !governanceProof) ||
@@ -83,7 +87,7 @@ func (app *SageApp) enforceDelegatedAgentProof(parsedTx *tx.ParsedTx, consensusT
 	if err != nil {
 		return err
 	}
-	if bindErr := app.verifySignedAgentAction(parsedTx, agentID, req, postAppV20); bindErr != nil {
+	if bindErr := app.verifySignedAgentAction(parsedTx, agentID, req, postAppV20, postAppV22); bindErr != nil {
 		return fmt.Errorf("delegated agent action mismatch: %w", bindErr)
 	}
 
@@ -499,7 +503,12 @@ func compareAgentPayload(actual, expected *tx.ParsedTx) error {
 // it has to be a NEW forward-only fork
 // that changes behaviour only ABOVE its own activation height, never a retroactive
 // re-strictification. Guarded by TestReplayGuardDelegatedMemorySubmitAcceptedBelowAppV19.
-func (app *SageApp) verifySignedAgentAction(actual *tx.ParsedTx, agentID string, req signedAgentRequest, bindMemoryTags bool) error { //nolint:gocyclo,maintidx // exhaustive protocol routing is intentionally centralized
+func (app *SageApp) verifySignedAgentAction(
+	actual *tx.ParsedTx,
+	agentID string,
+	req signedAgentRequest,
+	bindMemoryTags, postAppV22 bool,
+) error { //nolint:gocyclo,maintidx // exhaustive protocol routing is intentionally centralized
 	expected := &tx.ParsedTx{Type: actual.Type}
 
 	switch actual.Type {
@@ -773,36 +782,77 @@ func (app *SageApp) verifySignedAgentAction(actual *tx.ParsedTx, agentID string,
 			return err
 		}
 		var body struct {
+			ProposerOrgID    string   `json:"proposer_org_id,omitempty"`
 			TargetOrgID      string   `json:"target_org_id"`
 			AllowedDomains   []string `json:"allowed_domains,omitempty"`
 			AllowedDepts     []string `json:"allowed_depts,omitempty"`
-			MaxClearance     int      `json:"max_clearance,omitempty"`
+			MaxClearance     *int     `json:"max_clearance,omitempty"`
 			ExpiresAt        int64    `json:"expires_at,omitempty"`
 			RequiresApproval bool     `json:"requires_approval,omitempty"`
 		}
 		if err := decodeSignedJSON(req.body, &body, false); err != nil {
 			return err
 		}
-		if body.MaxClearance == 0 {
-			body.MaxClearance = 2
+		maxClearance := 2
+		if body.MaxClearance != nil {
+			if *body.MaxClearance < 0 || *body.MaxClearance > 4 {
+				return fmt.Errorf("signed federation proposal fails the REST contract")
+			}
+			maxClearance = *body.MaxClearance
+			// Historical REST treated an explicit zero exactly like omission
+			// and emitted CONFIDENTIAL. App-v22 preserves explicit PUBLIC.
+			// Accept the representation actually carried by the tx so replay
+			// of an old delegated request stays stable while new requests bind
+			// to zero.
+			if !postAppV22 &&
+				*body.MaxClearance == 0 &&
+				actual.FederationPropose != nil &&
+				actual.FederationPropose.MaxClearance == tx.ClearanceConfidential {
+				maxClearance = int(tx.ClearanceConfidential)
+			}
 		}
-		if body.TargetOrgID == "" || body.MaxClearance < 0 || body.MaxClearance > 4 {
+		if body.TargetOrgID == "" {
 			return fmt.Errorf("signed federation proposal fails the REST contract")
 		}
-		orgID, err := app.badgerStore.GetAgentOrg(agentID)
-		if err != nil {
-			return fmt.Errorf("derive proposing organization: %w", err)
+		orgID := body.ProposerOrgID
+		if orgID != "" {
+			member, memberErr := app.badgerStore.IsAgentInOrg(agentID, orgID)
+			if memberErr != nil {
+				return fmt.Errorf("verify proposing organization membership: %w", memberErr)
+			}
+			if !member {
+				return fmt.Errorf("signed federation proposal selects an organization the agent does not belong to")
+			}
+		} else {
+			derivedOrgID, deriveErr := app.badgerStore.GetAgentOrg(agentID)
+			if deriveErr != nil {
+				return fmt.Errorf("derive proposing organization: %w", deriveErr)
+			}
+			orgID = derivedOrgID
 		}
-		expected.FederationPropose = &tx.FederationPropose{ProposerOrgID: orgID, TargetOrgID: body.TargetOrgID, AllowedDomains: body.AllowedDomains, AllowedDepts: body.AllowedDepts, MaxClearance: tx.ClearanceLevel(body.MaxClearance), ExpiresAt: body.ExpiresAt, RequiresApproval: body.RequiresApproval}
+		expected.FederationPropose = &tx.FederationPropose{ProposerOrgID: orgID, TargetOrgID: body.TargetOrgID, AllowedDomains: body.AllowedDomains, AllowedDepts: body.AllowedDepts, MaxClearance: tx.ClearanceLevel(maxClearance), ExpiresAt: body.ExpiresAt, RequiresApproval: body.RequiresApproval}
 
 	case tx.TxTypeFederationApprove:
 		params, err := requireAgentRoute(req, "POST", "v1", "federation", ":fed_id", "approve")
 		if err != nil {
 			return err
 		}
-		orgID, err := app.badgerStore.GetAgentOrg(agentID)
+		primaryOrgID, err := app.badgerStore.GetAgentOrg(agentID)
 		if err != nil {
 			return fmt.Errorf("derive approving organization: %w", err)
+		}
+		orgID := primaryOrgID
+		// Historical REST embedded the legacy primary org. The app-v22 REST
+		// path embeds the authoritative stored target so multi-org callers do
+		// not broadcast a transaction consensus will reject. Bind either exact
+		// representation according to the actual tx to preserve replay.
+		if actual.FederationApprove != nil {
+			_, targetOrgID, _, _, _, getErr := app.badgerStore.GetFederation(params[0])
+			if getErr == nil && actual.FederationApprove.ApproverOrgID == targetOrgID {
+				if member, _ := app.badgerStore.IsAgentInOrg(agentID, targetOrgID); member {
+					orgID = targetOrgID
+				}
+			}
 		}
 		expected.FederationApprove = &tx.FederationApprove{FederationID: params[0], ApproverOrgID: orgID}
 
@@ -817,9 +867,21 @@ func (app *SageApp) verifySignedAgentAction(actual *tx.ParsedTx, agentID string,
 		if decodeErr := decodeSignedJSON(req.body, &body, true); decodeErr != nil {
 			return decodeErr
 		}
-		orgID, err := app.badgerStore.GetAgentOrg(agentID)
+		primaryOrgID, err := app.badgerStore.GetAgentOrg(agentID)
 		if err != nil {
 			return fmt.Errorf("derive revoking organization: %w", err)
+		}
+		orgID := primaryOrgID
+		// As with approval, accept the app-v22 exact-side representation while
+		// retaining the historical primary-org representation for replay.
+		if actual.FederationRevoke != nil {
+			proposerOrgID, targetOrgID, _, _, _, getErr := app.badgerStore.GetFederation(params[0])
+			actualOrgID := actual.FederationRevoke.RevokerOrgID
+			if getErr == nil && (actualOrgID == proposerOrgID || actualOrgID == targetOrgID) {
+				if member, _ := app.badgerStore.IsAgentInOrg(agentID, actualOrgID); member {
+					orgID = actualOrgID
+				}
+			}
 		}
 		expected.FederationRevoke = &tx.FederationRevoke{FederationID: params[0], RevokerOrgID: orgID, Reason: body.Reason}
 
@@ -920,15 +982,20 @@ func (app *SageApp) verifySignedAgentAction(actual *tx.ParsedTx, agentID string,
 			VisibleAgents *string `json:"visible_agents"`
 			OrgID         *string `json:"org_id"`
 			DeptID        *string `json:"dept_id"`
+			Capabilities  *uint32 `json:"capabilities"`
 		}
 		if err := decodeSignedJSON(req.body, &body, false); err != nil {
 			return err
 		}
+		// The REST handler always reads the current record: omitted fields use
+		// PATCH backfill, while CapabilitiesPresent records whether an explicit
+		// mask differs from consensus state (a non-zero value independently
+		// implies the codec extension). Reconstruct both decisions from the same
+		// record or an unchanged explicit zero will bind a different wire shape
+		// here than the handler actually signed and broadcast.
 		var existing *store.OnChainAgent
-		if body.Clearance == nil || body.DomainAccess == nil || body.VisibleAgents == nil || body.OrgID == nil || body.DeptID == nil {
-			if current, getErr := app.badgerStore.GetRegisteredAgent(params[0]); getErr == nil {
-				existing = current
-			}
+		if current, getErr := app.badgerStore.GetRegisteredAgent(params[0]); getErr == nil {
+			existing = current
 		}
 		clearance := 1
 		if body.Clearance != nil {
@@ -952,13 +1019,21 @@ func (app *SageApp) verifySignedAgentAction(actual *tx.ParsedTx, agentID string,
 			orgID = existing.OrgID
 			deptID = existing.DeptID
 		}
+		var capabilities uint32
+		if body.Capabilities != nil {
+			capabilities = *body.Capabilities
+		}
+		capabilitiesChanged := body.Capabilities != nil &&
+			(existing == nil || store.AgentCapabilities(capabilities) != existing.Capabilities)
 		expected.AgentSetPermission = &tx.AgentSetPermission{
-			AgentID:       params[0],
-			Clearance:     uint8(clearance),
-			DomainAccess:  backfillString(body.DomainAccess, domainAccess),
-			VisibleAgents: backfillString(body.VisibleAgents, visibleAgents),
-			OrgID:         backfillString(body.OrgID, orgID),
-			DeptID:        backfillString(body.DeptID, deptID),
+			AgentID:             params[0],
+			Clearance:           uint8(clearance),
+			DomainAccess:        backfillString(body.DomainAccess, domainAccess),
+			VisibleAgents:       backfillString(body.VisibleAgents, visibleAgents),
+			OrgID:               backfillString(body.OrgID, orgID),
+			DeptID:              backfillString(body.DeptID, deptID),
+			Capabilities:        capabilities,
+			CapabilitiesPresent: capabilitiesChanged,
 		}
 
 	case tx.TxTypeGovPropose:

@@ -302,6 +302,196 @@ func TestSetPermission_PartialUpdate_PreservesClearance(t *testing.T) {
 	assert.Equal(t, "dept-B", parsed.AgentSetPermission.DeptID, "Bug 2: missing dept_id must preserve existing dept membership")
 }
 
+func TestSetPermission_UnchangedExplicitZeroOmitsAppV22Extension(t *testing.T) {
+	var capturedTxHex string
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedTxHex = r.URL.Query().Get("tx")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": map[string]interface{}{
+				"check_tx": map[string]interface{}{"code": 0},
+				"tx_result": map[string]interface{}{
+					"code": 0,
+				},
+				"hash":   "PERMTX_LEGACY_ZERO",
+				"height": "1",
+			},
+		})
+	}))
+	defer cometMock.Close()
+
+	srv, _, _ := newTestServer(t, cometMock.URL)
+	bs, err := store.NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	defer bs.CloseBadger()
+	srv.badgerStore = bs
+
+	pub, priv, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	agentID := auth.PublicKeyToAgentID(pub)
+	require.NoError(t, bs.RegisterAgent(agentID, "legacy-agent", "member", "", "", "", 1))
+
+	body := []byte(`{"visible_agents":"*","capabilities":0}`)
+	req := signedRequestAs(t, priv, agentID, http.MethodPut, "/v1/agent/"+agentID+"/permission", body)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	parsed, err := tx.DecodeTx(decodeHexTxParam(t, capturedTxHex))
+	require.NoError(t, err)
+	require.NotNil(t, parsed.AgentSetPermission)
+	assert.False(t, parsed.AgentSetPermission.CapabilitiesPresent,
+		"unchanged zero must use the legacy wire form until app-v22 activates")
+}
+
+func TestSetPermission_OmittedCapabilityUsesAbsentWireAndPreservesCurrentInABCI(t *testing.T) {
+	var capturedTxHex string
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedTxHex = r.URL.Query().Get("tx")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": map[string]interface{}{
+				"check_tx": map[string]interface{}{"code": 0},
+				"tx_result": map[string]interface{}{
+					"code": 0,
+				},
+				"hash":   "PERMTX_OMITTED_CAPABILITY",
+				"height": "1",
+			},
+		})
+	}))
+	defer cometMock.Close()
+
+	srv, _, _ := newTestServer(t, cometMock.URL)
+	bs, err := store.NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	defer bs.CloseBadger()
+	srv.badgerStore = bs
+	srv.SetPostV22ForNextTxAccessor(func() bool { return true })
+
+	pub, _, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	agentID := auth.PublicKeyToAgentID(pub)
+	require.NoError(t, bs.RegisterAgentWithCapabilities(
+		agentID, "restricted-agent", "member", "", "", "", 1, 15,
+	))
+	adminPub, adminPriv, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	adminID := auth.PublicKeyToAgentID(adminPub)
+	require.NoError(t, bs.RegisterAgent(adminID, "global-admin", "admin", "", "", "", 4))
+
+	// Capabilities are intentionally omitted. REST must leave the extension
+	// absent; consensus preserves the current mask when the decoded transaction
+	// has CapabilitiesPresent=false.
+	body := []byte(`{"visible_agents":"*"}`)
+	req := signedRequestAs(t, adminPriv, adminID, http.MethodPut, "/v1/agent/"+agentID+"/permission", body)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	parsed, err := tx.DecodeTx(decodeHexTxParam(t, capturedTxHex))
+	require.NoError(t, err)
+	require.NotNil(t, parsed.AgentSetPermission)
+	assert.Zero(t, parsed.AgentSetPermission.Capabilities)
+	assert.False(t, parsed.AgentSetPermission.CapabilitiesPresent,
+		"an omitted mask must stay absent even when the current consensus mask is nonzero")
+}
+
+func TestSetPermission_AppV22AnyChangedFieldRequiresGlobalAdmin(t *testing.T) {
+	broadcasts := 0
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		broadcasts++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": map[string]interface{}{
+				"check_tx": map[string]interface{}{"code": 0},
+				"tx_result": map[string]interface{}{
+					"code": 0,
+				},
+				"hash": "PERMTX_APPV22",
+			},
+		})
+	}))
+	defer cometMock.Close()
+
+	srv, _, _ := newTestServer(t, cometMock.URL)
+	bs, err := store.NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	defer bs.CloseBadger()
+	srv.badgerStore = bs
+	srv.SetPostV22ForNextTxAccessor(func() bool { return true })
+
+	orgAdminPub, orgAdminPriv, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	orgAdminID := auth.PublicKeyToAgentID(orgAdminPub)
+	globalPub, globalPriv, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	globalID := auth.PublicKeyToAgentID(globalPub)
+	targetPub, _, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	targetID := auth.PublicKeyToAgentID(targetPub)
+
+	require.NoError(t, bs.RegisterAgent(orgAdminID, "org-admin", "member", "", "", "", 4))
+	require.NoError(t, bs.RegisterAgent(globalID, "global-admin", "admin", "", "", "", 4))
+	require.NoError(t, bs.RegisterAgentWithCapabilities(
+		targetID, "target", "member", "", "", "", 1,
+		store.AgentCapabilityReadAllDomains,
+	))
+	require.NoError(t, bs.RegisterOrg("shared-org", "Shared", "", orgAdminID, 1))
+	require.NoError(t, bs.AddOrgMember("shared-org", orgAdminID, 4, "admin", 1))
+	require.NoError(t, bs.AddOrgMember("shared-org", targetID, 1, "member", 1))
+
+	// An unchanged PATCH remains a no-op that existing self/org authorization
+	// may submit; app-v22 only reserves actual mutations for global admins.
+	noOp := signedRequestAs(
+		t, orgAdminPriv, orgAdminID, http.MethodPut,
+		"/v1/agent/"+targetID+"/permission",
+		[]byte(`{}`),
+	)
+	noOpRecorder := httptest.NewRecorder()
+	srv.Router().ServeHTTP(noOpRecorder, noOp)
+	require.Equal(t, http.StatusOK, noOpRecorder.Code, noOpRecorder.Body.String())
+	require.Equal(t, 1, broadcasts)
+
+	denied := signedRequestAs(
+		t, orgAdminPriv, orgAdminID, http.MethodPut,
+		"/v1/agent/"+targetID+"/permission",
+		[]byte(`{"clearance":2}`),
+	)
+	deniedRecorder := httptest.NewRecorder()
+	srv.Router().ServeHTTP(deniedRecorder, denied)
+	require.Equal(t, http.StatusForbidden, deniedRecorder.Code, deniedRecorder.Body.String())
+	require.Contains(t, deniedRecorder.Body.String(), "global administrator")
+	require.Equal(t, 1, broadcasts, "denied mutation must not broadcast")
+
+	allowed := signedRequestAs(
+		t, globalPriv, globalID, http.MethodPut,
+		"/v1/agent/"+targetID+"/permission",
+		[]byte(`{"clearance":2}`),
+	)
+	allowedRecorder := httptest.NewRecorder()
+	srv.Router().ServeHTTP(allowedRecorder, allowed)
+	require.Equal(t, http.StatusOK, allowedRecorder.Code, allowedRecorder.Body.String())
+	require.Equal(t, 2, broadcasts)
+}
+
+func TestSetPermission_CapabilityChangeWithoutConsensusStateFailsClosed(t *testing.T) {
+	cometMock := permTestCometMock(t, 0, "must not be reached")
+	defer cometMock.Close()
+
+	srv, _, _ := newTestServer(t, cometMock.URL)
+	srv.badgerStore = nil
+	srv.SetPostV22ForNextTxAccessor(func() bool { return true })
+
+	body := []byte(`{"capabilities":15}`)
+	req, _ := signedRequest(t, http.MethodPut, "/v1/agent/target-agent/permission", body)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code, rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "consensus agent state is unavailable")
+}
+
 // TestSetPermission_BootstrapAdminFromSQL_BypassesPreflight is the v6.8.5
 // regression for the dev-side 403. When BadgerDB doesn't have a record
 // for the caller but the SQL agent store says they're an admin (the

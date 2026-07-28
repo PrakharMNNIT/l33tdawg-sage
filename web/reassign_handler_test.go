@@ -320,7 +320,7 @@ func TestReassignDomainOwnershipRejectsAuthenticatedNonOperator(t *testing.T) {
 		"/v1/dashboard/network/reassign-domain-ownership",
 		bytes.NewReader([]byte(`{"source_agent_id":"source","target_agent_id":"target","domain":"quiettype-pages"}`)),
 	)
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	req = req.WithContext(context.WithValue(req.Context(), verifiedDashboardAgentKey{}, "signed-member-agent"))
 	resp := httptest.NewRecorder()
 
@@ -410,7 +410,7 @@ func TestReassignDomainOwnershipPostAppV20UsesChainBoundOperatorProof(t *testing
 		bytes.NewReader(body),
 	)
 	req.Header.Set("Content-Type", "application/json")
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	resp := httptest.NewRecorder()
 
 	h.handleReassignDomainOwnership(agentStore)(resp, req)

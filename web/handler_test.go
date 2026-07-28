@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -81,11 +82,285 @@ func insertTestTask(t *testing.T, s *store.SQLiteStore, id, domain, provider str
 	require.NoError(t, s.UpdateMemoryClassification(context.Background(), id, store.ClearancePublic))
 }
 
+func TestSignedAgentCannotMutateDashboardMemoryMetadata(t *testing.T) {
+	h, s := newTestHandler(t)
+	router := testRouter(h)
+	insertTestMemory(t, s, "metadata-target", "original.domain")
+
+	_, priv, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   []byte
+	}{
+		{
+			name:   "single memory update",
+			method: http.MethodPatch,
+			path:   "/v1/dashboard/memory/metadata-target",
+			body:   []byte(`{"domain":"attacker.domain","tags":["injected"]}`),
+		},
+		{
+			name:   "bulk memory update",
+			method: http.MethodPost,
+			path:   "/v1/dashboard/memory/bulk",
+			body:   []byte(`{"ids":["metadata-target"],"domain":"attacker.domain","add_tags":["injected"]}`),
+		},
+		{
+			name:   "replace memory tags",
+			method: http.MethodPut,
+			path:   "/v1/dashboard/memory/metadata-target/tags",
+			body:   []byte(`{"tags":["injected"]}`),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewReader(tc.body))
+			signAgentRequest(t, req, priv, tc.body)
+			rr := httptest.NewRecorder()
+			router.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusForbidden, rr.Code, rr.Body.String())
+		})
+	}
+
+	rec, err := s.GetMemory(context.Background(), "metadata-target")
+	require.NoError(t, err)
+	assert.Equal(t, "original.domain", rec.DomainTag)
+	tags, err := s.GetTags(context.Background(), "metadata-target")
+	require.NoError(t, err)
+	assert.Empty(t, tags)
+}
+
+func TestUnsignedLoopbackCannotMutateDashboardMemoryMetadata(t *testing.T) {
+	h, s := newTestHandler(t)
+	router := testRouter(h)
+	insertTestMemory(t, s, "loopback-target", "original.domain")
+
+	body := []byte(`{"domain":"spoofed.domain"}`)
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/v1/dashboard/memory/loopback-target",
+		bytes.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://localhost:8080")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusForbidden, rr.Code, rr.Body.String())
+	require.Contains(t, rr.Body.String(), "node-operator")
+	record, err := s.GetMemory(context.Background(), "loopback-target")
+	require.NoError(t, err)
+	assert.Equal(t, "original.domain", record.DomainTag)
+}
+
+func TestExactSignedNodeOperatorCanMutateDashboardMemoryMetadata(t *testing.T) {
+	h, s := newTestHandler(t)
+	router := testRouter(h)
+	insertTestMemory(t, s, "operator-target", "original.domain")
+
+	pub, priv, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	h.NodeOperatorAgentID = auth.PublicKeyToAgentID(pub)
+	body := []byte(`{"domain":"operator.domain"}`)
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/v1/dashboard/memory/operator-target",
+		bytes.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	signAgentRequest(t, req, priv, body)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	record, err := s.GetMemory(context.Background(), "operator-target")
+	require.NoError(t, err)
+	assert.Equal(t, "operator.domain", record.DomainTag)
+}
+
+func TestDashboardOperatorDefaultDeniesUnsignedAgentRemovalAndBundleDownload(t *testing.T) {
+	h, s := newTestHandler(t)
+	router := testRouter(h)
+	expires := time.Now().Add(time.Hour)
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID:        "operator-gate-target",
+		Name:           "Operator Gate Target",
+		Role:           "member",
+		Status:         "active",
+		BundlePath:     filepath.Join(t.TempDir(), "agent-bundle.zip"),
+		ClaimToken:     "SECRET-CLAIM",
+		ClaimExpiresAt: &expires,
+		CreatedAt:      time.Now().UTC(),
+	}))
+
+	localRequest := func(method, path string) *http.Request {
+		req := httptest.NewRequest(method, path, nil)
+		req.Header.Set("Origin", "http://localhost:8080")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.Host = "localhost:8080"
+		req.RemoteAddr = "127.0.0.1:54321"
+		return req
+	}
+
+	removeResp := httptest.NewRecorder()
+	router.ServeHTTP(removeResp, localRequest(http.MethodDelete, "/v1/dashboard/network/agents/operator-gate-target"))
+	require.Equal(t, http.StatusForbidden, removeResp.Code, removeResp.Body.String())
+	_, err := s.GetAgent(context.Background(), "operator-gate-target")
+	require.NoError(t, err, "denied removal must leave the agent intact")
+
+	bundleResp := httptest.NewRecorder()
+	router.ServeHTTP(bundleResp, localRequest(http.MethodGet, "/v1/dashboard/network/agents/operator-gate-target/bundle"))
+	require.Equal(t, http.StatusForbidden, bundleResp.Code, bundleResp.Body.String())
+
+	exportResp := httptest.NewRecorder()
+	router.ServeHTTP(exportResp, localRequest(http.MethodGet, "/v1/dashboard/export"))
+	require.Equal(t, http.StatusForbidden, exportResp.Code, exportResp.Body.String())
+
+	memoryResp := httptest.NewRecorder()
+	router.ServeHTTP(memoryResp, localRequest(http.MethodGet, "/v1/dashboard/memory/list"))
+	require.Equal(t, http.StatusForbidden, memoryResp.Code, memoryResp.Body.String())
+
+	pipelineResp := httptest.NewRecorder()
+	router.ServeHTTP(pipelineResp, localRequest(http.MethodGet, "/v1/dashboard/pipeline"))
+	require.Equal(t, http.StatusForbidden, pipelineResp.Code, pipelineResp.Body.String())
+
+	listResp := httptest.NewRecorder()
+	router.ServeHTTP(listResp, localRequest(http.MethodGet, "/v1/dashboard/network/agents"))
+	require.Equal(t, http.StatusForbidden, listResp.Code, listResp.Body.String())
+
+	enableBody := []byte(`{"passphrase":"local-process-chosen"}`)
+	enableReq := localRequest(http.MethodPost, "/v1/dashboard/settings/ledger/enable")
+	enableReq.Body = io.NopCloser(bytes.NewReader(enableBody))
+	enableReq.Header.Set("Content-Type", "application/json")
+	enableResp := httptest.NewRecorder()
+	router.ServeHTTP(enableResp, enableReq)
+	require.Equal(t, http.StatusForbidden, enableResp.Code, enableResp.Body.String())
+	assert.False(t, h.Encrypted.Load(), "unsigned local software must not choose the vault passphrase")
+}
+
+func TestDashboardOperatorDefaultRejectsOrdinarySignerAndAcceptsExactOperator(t *testing.T) {
+	h, _ := newTestHandler(t)
+	router := testRouter(h)
+	body := []byte(`{"done":true}`)
+
+	_, ordinaryKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	ordinaryReq := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/dashboard/settings/onboarding",
+		bytes.NewReader(body),
+	)
+	ordinaryReq.Header.Set("Content-Type", "application/json")
+	signAgentRequest(t, ordinaryReq, ordinaryKey, body)
+	ordinaryResp := httptest.NewRecorder()
+	router.ServeHTTP(ordinaryResp, ordinaryReq)
+	require.Equal(t, http.StatusForbidden, ordinaryResp.Code, ordinaryResp.Body.String())
+
+	ordinaryReadReq := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/list", nil)
+	signAgentGET(t, ordinaryReadReq, ordinaryKey)
+	ordinaryReadResp := httptest.NewRecorder()
+	router.ServeHTTP(ordinaryReadResp, ordinaryReadReq)
+	require.Equal(t, http.StatusForbidden, ordinaryReadResp.Code, ordinaryReadResp.Body.String())
+
+	operatorPub, operatorKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	h.NodeOperatorAgentID = auth.PublicKeyToAgentID(operatorPub)
+	operatorReq := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/dashboard/settings/onboarding",
+		bytes.NewReader(body),
+	)
+	operatorReq.Header.Set("Content-Type", "application/json")
+	signAgentRequest(t, operatorReq, operatorKey, body)
+	operatorResp := httptest.NewRecorder()
+	router.ServeHTTP(operatorResp, operatorReq)
+	require.Equal(t, http.StatusOK, operatorResp.Code, operatorResp.Body.String())
+}
+
+func TestBootInstructionsReadRequiresOperatorOrActiveRegisteredAgent(t *testing.T) {
+	h, s := newTestHandler(t)
+	require.NoError(t, h.prefStore.SetPreference(context.Background(), "boot_instructions", "operator-selected context"))
+	router := testRouter(h)
+
+	activePub, activeKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	activeID := auth.PublicKeyToAgentID(activePub)
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: activeID, Name: "active", Role: "member", Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+
+	inactivePub, inactiveKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	inactiveID := auth.PublicKeyToAgentID(inactivePub)
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: inactiveID, Name: "inactive", Role: "member", Status: "inactive", CreatedAt: time.Now().UTC(),
+	}))
+
+	removedPub, removedKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	removedID := auth.PublicKeyToAgentID(removedPub)
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: removedID, Name: "removed", Role: "member", Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+	require.NoError(t, s.RemoveAgent(context.Background(), removedID))
+
+	get := func(key ed25519pkg.PrivateKey) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/settings/boot-instructions", nil)
+		signAgentGET(t, req, key)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		return rr
+	}
+
+	unsignedReq := httptest.NewRequest(http.MethodGet, "/v1/dashboard/settings/boot-instructions", nil)
+	unsignedReq.Header.Set("Origin", "http://localhost:8080")
+	unsignedReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	unsignedReq.Host = "localhost:8080"
+	unsignedReq.RemoteAddr = "127.0.0.1:54321"
+	unsigned := httptest.NewRecorder()
+	router.ServeHTTP(unsigned, unsignedReq)
+	require.Equal(t, http.StatusForbidden, unsigned.Code, unsigned.Body.String())
+
+	_, unregisteredKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusForbidden, get(unregisteredKey).Code)
+	require.Equal(t, http.StatusForbidden, get(inactiveKey).Code)
+	require.Equal(t, http.StatusForbidden, get(removedKey).Code)
+
+	active := get(activeKey)
+	require.Equal(t, http.StatusOK, active.Code, active.Body.String())
+	assert.Contains(t, active.Body.String(), "operator-selected context")
+
+	operatorPub, operatorKey, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	h.NodeOperatorAgentID = auth.PublicKeyToAgentID(operatorPub)
+	operator := get(operatorKey)
+	require.Equal(t, http.StatusOK, operator.Code, operator.Body.String())
+
+	sessionReq := httptest.NewRequest(http.MethodGet, "/v1/dashboard/settings/boot-instructions", nil)
+	markLocalCEREBRUM(h, sessionReq)
+	session := httptest.NewRecorder()
+	router.ServeHTTP(session, sessionReq)
+	require.Equal(t, http.StatusOK, session.Code, session.Body.String())
+}
+
 func signAgentGET(t *testing.T, req *http.Request, priv ed25519pkg.PrivateKey) string {
 	return signAgentRequest(t, req, priv, nil)
 }
 
-func markLocalCEREBRUM(req *http.Request) {
+func markLocalCEREBRUM(h *DashboardHandler, req *http.Request) {
+	const token = "test-cerebrum-session"
+	h.Encrypted.Store(true)
+	h.sessions.Store(token, time.Now().Add(time.Hour))
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	req.Header.Set("Origin", "http://localhost:8080")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Host = "localhost:8080"
@@ -142,6 +417,14 @@ func signAgentRequest(t *testing.T, req *http.Request, priv ed25519pkg.PrivateKe
 	return agentID
 }
 
+func signExactNodeOperatorRequest(t *testing.T, h *DashboardHandler, req *http.Request, body []byte) {
+	t.Helper()
+	pub, priv, err := ed25519pkg.GenerateKey(nil)
+	require.NoError(t, err)
+	h.NodeOperatorAgentID = auth.PublicKeyToAgentID(pub)
+	signAgentRequest(t, req, priv, body)
+}
+
 func TestDashboardAgentSignatureRejectsReplay(t *testing.T) {
 	h, _ := newTestHandler(t)
 	router := testRouter(h)
@@ -182,6 +465,7 @@ func TestHandleListMemories(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/v1/dashboard/memory/list?limit=3", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -221,6 +505,7 @@ func TestCerebrumHidesFederationAuditMemories(t *testing.T) {
 
 	t.Run("list", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/list?limit=50", nil)
+		markLocalCEREBRUM(h, req)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -237,6 +522,7 @@ func TestCerebrumHidesFederationAuditMemories(t *testing.T) {
 
 	t.Run("search", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/list?q=content&limit=50", nil)
+		markLocalCEREBRUM(h, req)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -253,6 +539,7 @@ func TestCerebrumHidesFederationAuditMemories(t *testing.T) {
 
 	t.Run("stats", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/stats", nil)
+		markLocalCEREBRUM(h, req)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -267,6 +554,7 @@ func TestCerebrumHidesFederationAuditMemories(t *testing.T) {
 
 	t.Run("graph", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/graph?status=proposed&limit=50", nil)
+		markLocalCEREBRUM(h, req)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -288,6 +576,7 @@ func TestCerebrumHidesFederationAuditMemories(t *testing.T) {
 		to := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 		path := "/v1/dashboard/memory/timeline?bucket=hour&from=" + from + "&to=" + to
 		req := httptest.NewRequest(http.MethodGet, path, nil)
+		markLocalCEREBRUM(h, req)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -305,6 +594,7 @@ func TestCerebrumHidesFederationAuditMemories(t *testing.T) {
 
 	t.Run("portable export", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/export", nil)
+		markLocalCEREBRUM(h, req)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -321,7 +611,7 @@ func TestCerebrumCannotMutateFederationAuditMemory(t *testing.T) {
 	insertTestMemory(t, s, "user-memory", "general")
 
 	deleteReq := httptest.NewRequest(http.MethodDelete, "/v1/dashboard/memory/sync-anchor", nil)
-	markLocalCEREBRUM(deleteReq)
+	markLocalCEREBRUM(h, deleteReq)
 	deleteW := httptest.NewRecorder()
 	r.ServeHTTP(deleteW, deleteReq)
 	require.Equal(t, http.StatusNotFound, deleteW.Code, deleteW.Body.String())
@@ -329,6 +619,7 @@ func TestCerebrumCannotMutateFederationAuditMemory(t *testing.T) {
 	body := bytes.NewBufferString(`{"domain":"general"}`)
 	updateReq := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/memory/sync-anchor", body)
 	updateReq.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, updateReq)
 	updateW := httptest.NewRecorder()
 	r.ServeHTTP(updateW, updateReq)
 	require.Equal(t, http.StatusNotFound, updateW.Code, updateW.Body.String())
@@ -336,6 +627,7 @@ func TestCerebrumCannotMutateFederationAuditMemory(t *testing.T) {
 	reservedBody := bytes.NewBufferString(`{"domain":"SAGE-SYNCAUDIT-GRP-FAKE"}`)
 	reservedReq := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/memory/user-memory", reservedBody)
 	reservedReq.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, reservedReq)
 	reservedW := httptest.NewRecorder()
 	r.ServeHTTP(reservedW, reservedReq)
 	require.Equal(t, http.StatusBadRequest, reservedW.Code, reservedW.Body.String())
@@ -365,7 +657,7 @@ func TestTaskAssignmentCrossProviderAppearsInBacklogAndInbox(t *testing.T) {
 	body := bytes.NewBufferString(fmt.Sprintf(`{"assignee":%q}`, agentID))
 	req := httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/assigned-task/assign", body)
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -378,7 +670,7 @@ func TestTaskAssignmentCrossProviderAppearsInBacklogAndInbox(t *testing.T) {
 	body = bytes.NewBufferString(fmt.Sprintf(`{"assignee":%q}`, agentID))
 	req = httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/assigned-task/assign", body)
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -454,7 +746,7 @@ func TestTaskBoardAllTrueRequiresLocalHumanCEREBRUM(t *testing.T) {
 		host       string
 		wantStatus int
 	}{
-		{name: "same-origin browser", origin: "http://localhost:8080", secFetch: "same-origin", host: "localhost:8080", wantStatus: http.StatusOK},
+		{name: "same-origin browser without session", origin: "http://localhost:8080", secFetch: "same-origin", host: "localhost:8080", wantStatus: http.StatusForbidden},
 		{name: "origin-less caller", host: "localhost:8080", wantStatus: http.StatusForbidden},
 		{name: "cross-origin browser", origin: "https://evil.example", secFetch: "cross-site", host: "localhost:8080", wantStatus: http.StatusForbidden},
 	}
@@ -462,7 +754,7 @@ func TestTaskBoardAllTrueRequiresLocalHumanCEREBRUM(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/tasks?all=true", nil)
 			req.Host = tc.host
-			if tc.name == "same-origin browser" {
+			if tc.name == "same-origin browser without session" {
 				req.RemoteAddr = "127.0.0.1:54321"
 			}
 			if tc.origin != "" {
@@ -484,7 +776,7 @@ func TestTaskBoardReturnsStatusTransitionClock(t *testing.T) {
 	require.NoError(t, s.UpdateTaskStatus(context.Background(), "completed-board-task", memory.TaskStatusDone))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/tasks?all=true", nil)
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	h.handleGetTasks(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -508,7 +800,7 @@ func TestTaskBoardReorderPersistsForLocalOperator(t *testing.T) {
 
 	body := bytes.NewBufferString(`{"task_status":"planned","task_ids":["order-a","order-b"]}`)
 	req := httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/order", body)
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	h.handleReorderTasksDashboard(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -604,7 +896,7 @@ func TestCreateTaskConsensusFailureDoesNotInsertPhantom(t *testing.T) {
 	body := []byte(`{"content":"must commit","domain":"work"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/tasks", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
@@ -620,7 +912,7 @@ func TestCreateTaskStandaloneStoresProposedAuthoredTask(t *testing.T) {
 	body := []byte(`{"content":"standalone work","domain":"work"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/tasks", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
@@ -649,7 +941,7 @@ func TestTaskAssignmentRejectsInactiveOrUnknownAgent(t *testing.T) {
 		body := bytes.NewBufferString(fmt.Sprintf(`{"assignee":%q}`, assignee))
 		req := httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/guarded-task/assign", body)
 		req.Header.Set("Content-Type", "application/json")
-		markLocalCEREBRUM(req)
+		markLocalCEREBRUM(h, req)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
@@ -691,7 +983,7 @@ func TestTaskAssignmentDoesNotBypassAgentDomainAllowlist(t *testing.T) {
 	body := bytes.NewBufferString(`{"assignee":"restricted-agent"}`)
 	req := httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/forbidden-domain-task/assign", body)
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
@@ -711,7 +1003,7 @@ func TestTaskNotificationRechecksRBACAfterAssignment(t *testing.T) {
 	body := bytes.NewBufferString(fmt.Sprintf(`{"assignee":%q}`, agentID))
 	req := httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/reclassified-task/assign", body)
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -743,7 +1035,7 @@ func TestTaskNotificationRejectsAgentDeactivatedAfterAssignment(t *testing.T) {
 	body := bytes.NewBufferString(fmt.Sprintf(`{"assignee":%q}`, agentID))
 	req := httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/deactivated-task/assign", body)
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -772,7 +1064,7 @@ func TestTaskNotificationTransientAuthorizationFailureDoesNotConsumeNotice(t *te
 	body := bytes.NewBufferString(fmt.Sprintf(`{"assignee":%q}`, agentID))
 	req := httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/retry-auth-task/assign", body)
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -811,7 +1103,7 @@ func TestAgentTaskStatusRequiresActiveCurrentOwnerAndCannotReopen(t *testing.T) 
 	assignBody := bytes.NewBufferString(fmt.Sprintf(`{"assignee":%q}`, agentA))
 	req := httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/owned-task/assign", assignBody)
 	req.Header.Set("Content-Type", "application/json")
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -854,7 +1146,7 @@ func TestHandleDeleteMemory(t *testing.T) {
 	insertTestMemory(t, s, "m1", "general")
 
 	req := httptest.NewRequest("DELETE", "/v1/dashboard/memory/m1", nil)
-	markLocalCEREBRUM(req)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -879,6 +1171,7 @@ func TestHandleUpdateMemory(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"domain": "security"})
 	req := httptest.NewRequest("PATCH", "/v1/dashboard/memory/m1", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -896,6 +1189,7 @@ func TestHandleUpdateMemory_MissingDomain(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{})
 	req := httptest.NewRequest("PATCH", "/v1/dashboard/memory/m1", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -911,6 +1205,7 @@ func TestHandleGraph(t *testing.T) {
 	insertTestMemory(t, s, "m3", "security")
 
 	req := httptest.NewRequest("GET", "/v1/dashboard/memory/graph?status=proposed", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -978,6 +1273,7 @@ func TestHandleExport_AllMemories(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/v1/dashboard/export", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1010,6 +1306,7 @@ func TestHandleExport_ExcludesDeprecatedMemories(t *testing.T) {
 	require.NoError(t, s.UpdateStatus(context.Background(), "forgotten", memory.StatusDeprecated, time.Now().UTC()))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/export", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1033,6 +1330,7 @@ func TestHandleExport_PaginatesAcrossPages(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/v1/dashboard/export", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1057,6 +1355,7 @@ func TestHandleExport_EmptyDB(t *testing.T) {
 	r := testRouter(h)
 
 	req := httptest.NewRequest("GET", "/v1/dashboard/export", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1078,6 +1377,7 @@ func TestMemoryBackup_FreshHandlerRoundTrip(t *testing.T) {
 	require.NoError(t, sourceStore.UpdateStatus(context.Background(), "forgotten", memory.StatusDeprecated, time.Now().UTC()))
 
 	exportReq := httptest.NewRequest(http.MethodGet, "/v1/dashboard/export", nil)
+	markLocalCEREBRUM(sourceHandler, exportReq)
 	exportW := httptest.NewRecorder()
 	testRouter(sourceHandler).ServeHTTP(exportW, exportReq)
 	require.Equal(t, http.StatusOK, exportW.Code)
@@ -1097,6 +1397,7 @@ func TestMemoryBackup_FreshHandlerRoundTrip(t *testing.T) {
 
 	previewReq := httptest.NewRequest(http.MethodPost, "/v1/dashboard/import/preview", &upload)
 	previewReq.Header.Set("Content-Type", writer.FormDataContentType())
+	markLocalCEREBRUM(freshHandler, previewReq)
 	previewW := httptest.NewRecorder()
 	freshRouter.ServeHTTP(previewW, previewReq)
 	require.Equal(t, http.StatusOK, previewW.Code, previewW.Body.String())
@@ -1112,6 +1413,7 @@ func TestMemoryBackup_FreshHandlerRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	confirmReq := httptest.NewRequest(http.MethodPost, "/v1/dashboard/import/confirm", bytes.NewReader(confirmBody))
 	confirmReq.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(freshHandler, confirmReq)
 	confirmW := httptest.NewRecorder()
 	freshRouter.ServeHTTP(confirmW, confirmReq)
 	require.Equal(t, http.StatusOK, confirmW.Code, confirmW.Body.String())
@@ -1141,6 +1443,7 @@ func TestMemoryBackup_DeprecatedOnlyPreviewExplainsNothingWillRestore(t *testing
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/import/preview", &upload)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1187,6 +1490,7 @@ func TestHandleLock_InvalidatesSession(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"passphrase": "test-pass"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/ledger/enable", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	signExactNodeOperatorRequest(t, h, req, body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
@@ -1239,6 +1543,7 @@ func TestHandleTimeline(t *testing.T) {
 	url := fmt.Sprintf("/v1/dashboard/memory/timeline?from=%s&to=%s&bucket=hour", from, to)
 
 	req := httptest.NewRequest("GET", url, nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1357,6 +1662,7 @@ func TestHandleUnregisteredAgents(t *testing.T) {
 	insertTestMemoryWithAgent(t, s, "m3", "security", "orphan-agent-id")
 
 	req := httptest.NewRequest("GET", "/v1/dashboard/network/unregistered", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1392,6 +1698,7 @@ func TestHandleUnregisteredAgents_NoneOrphan(t *testing.T) {
 	insertTestMemoryWithAgent(t, s, "m1", "general", "only-agent")
 
 	req := httptest.NewRequest("GET", "/v1/dashboard/network/unregistered", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1437,6 +1744,7 @@ func TestHandleUpdateAgent_SyncBroadcast_Success(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"name": "New Display Name"})
 	req := httptest.NewRequest("PATCH", "/v1/dashboard/network/agents/agent-rename-1", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1481,6 +1789,7 @@ func TestHandleUpdateAgent_SyncBroadcast_Failure_ReturnsWarning(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"name": "Renamed Agent"})
 	req := httptest.NewRequest("PATCH", "/v1/dashboard/network/agents/agent-rename-2", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1515,6 +1824,7 @@ func TestHandleUpdateAgent_NoCometBFT_NoWarning(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"name": "Renamed Without Consensus"})
 	req := httptest.NewRequest("PATCH", "/v1/dashboard/network/agents/agent-rename-3", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1558,7 +1868,7 @@ func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 	require.NoError(t, err)
 	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-permission-1", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1567,6 +1877,175 @@ func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 	require.NotNil(t, captured.AgentSetPermission)
 	assert.Equal(t, []byte(adminPub), captured.AgentPubKey, "permission tx must carry genesis admin proof")
 	assert.NotEqual(t, validatorKey.Public(), captured.AgentPubKey, "validator key is not the RBAC admin")
+}
+
+func TestHandleUpdateAgent_AppV22CapabilitiesCommitBeforeSuccess(t *testing.T) {
+	var captured *tx.ParsedTx
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
+		encoded, decErr := hex.DecodeString(raw)
+		require.NoError(t, decErr)
+		captured, decErr = tx.DecodeTx(encoded)
+		require.NoError(t, decErr)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"CAP123","height":"88"}}`)
+	}))
+	defer cometMock.Close()
+
+	h, s := newTestHandler(t)
+	h.CometBFTRPC = cometMock.URL
+	_, h.SigningKey, _ = ed25519pkg.GenerateKey(nil)
+	_, h.AdminSigningKey, _ = ed25519pkg.GenerateKey(nil)
+	h.AppV22ActiveFn = func() bool { return true }
+	h.BadgerStore = newGrantTestBadger(t)
+	require.NoError(t, h.BadgerStore.RegisterAgent("agent-capability-1", "Mynah", "member", "", "voice-bridge", "", 1))
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: "agent-capability-1", Name: "Mynah", Role: "member", Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+
+	body := []byte(`{"name":"Mynah Updated","capabilities":15}`)
+	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-capability-1", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(h, req)
+	w := httptest.NewRecorder()
+	testRouter(h).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, captured)
+	require.NotNil(t, captured.AgentSetPermission)
+	assert.Equal(t, uint32(15), captured.AgentSetPermission.Capabilities)
+	assert.True(t, captured.AgentSetPermission.CapabilitiesPresent)
+	updated, err := s.GetAgent(context.Background(), "agent-capability-1")
+	require.NoError(t, err)
+	assert.Equal(t, "Mynah Updated", updated.Name, "ordinary metadata remains independently persisted")
+	assert.Zero(t, updated.Capabilities, "capabilities remain chain-authoritative instead of creating a second SQLite source of truth")
+}
+
+func TestHandleUpdateAgent_AppV22CapabilityFailureRestoresProjection(t *testing.T) {
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer cometMock.Close()
+
+	h, s := newTestHandler(t)
+	h.CometBFTRPC = cometMock.URL
+	_, h.SigningKey, _ = ed25519pkg.GenerateKey(nil)
+	_, h.AdminSigningKey, _ = ed25519pkg.GenerateKey(nil)
+	h.AppV22ActiveFn = func() bool { return true }
+	h.BadgerStore = newGrantTestBadger(t)
+	require.NoError(t, h.BadgerStore.RegisterAgent("agent-capability-2", "Mynah", "member", "", "voice-bridge", "", 1))
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: "agent-capability-2", Name: "Mynah", Role: "member", Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+
+	body := []byte(`{"name":"Mynah Metadata Survives","capabilities":15}`)
+	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-capability-2", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(h, req)
+	w := httptest.NewRecorder()
+	testRouter(h).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+	updated, err := s.GetAgent(context.Background(), "agent-capability-2")
+	require.NoError(t, err)
+	assert.Equal(t, "Mynah Metadata Survives", updated.Name, "permission rollback must preserve unrelated metadata edits")
+	assert.Zero(t, updated.Capabilities, "CEREBRUM must not display an uncommitted restriction mask")
+}
+
+func TestHandleUpdateAgent_ZeroCapabilityIsLegacyCompatibleBeforeAppV22(t *testing.T) {
+	var captured *tx.ParsedTx
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
+		encoded, decErr := hex.DecodeString(raw)
+		require.NoError(t, decErr)
+		captured, decErr = tx.DecodeTx(encoded)
+		require.NoError(t, decErr)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"LEGACY0","height":"87"}}`)
+	}))
+	defer cometMock.Close()
+
+	h, s := newTestHandler(t)
+	h.CometBFTRPC = cometMock.URL
+	_, h.SigningKey, _ = ed25519pkg.GenerateKey(nil)
+	_, h.AdminSigningKey, _ = ed25519pkg.GenerateKey(nil)
+	h.AppV22ActiveFn = func() bool { return false }
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: "agent-capability-legacy", Name: "Legacy", Role: "member", Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+
+	body := []byte(`{"visible_agents":"*","capabilities":0}`)
+	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-capability-legacy", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(h, req)
+	w := httptest.NewRecorder()
+	testRouter(h).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	updated, err := s.GetAgent(context.Background(), "agent-capability-legacy")
+	require.NoError(t, err)
+	assert.Equal(t, "*", updated.VisibleAgents)
+	assert.Zero(t, updated.Capabilities)
+	require.NotNil(t, captured)
+	require.NotNil(t, captured.AgentSetPermission)
+	assert.False(t, captured.AgentSetPermission.CapabilitiesPresent,
+		"an unchanged explicit zero must stay on the legacy wire before app-v22")
+}
+
+func TestHandleUpdateAgent_PermissionFailureRestoresAllPolicyFields(t *testing.T) {
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer cometMock.Close()
+
+	h, s := newTestHandler(t)
+	h.CometBFTRPC = cometMock.URL
+	_, h.SigningKey, _ = ed25519pkg.GenerateKey(nil)
+	_, h.AdminSigningKey, _ = ed25519pkg.GenerateKey(nil)
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: "agent-policy-rollback", Name: "Rollback", Role: "member",
+		Clearance: 1, DomainAccess: `[{"domain":"old","read":true}]`,
+		VisibleAgents: "old-agent", OrgID: "old-org", DeptID: "old-dept",
+		Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+
+	body := []byte(`{"clearance":4,"domain_access":"[{\"domain\":\"new\",\"read\":true,\"write\":true}]","visible_agents":"*","org_id":"new-org","dept_id":"new-dept"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-policy-rollback", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	markLocalDashboardRequest(h, req)
+	w := httptest.NewRecorder()
+	testRouter(h).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+	updated, err := s.GetAgent(context.Background(), "agent-policy-rollback")
+	require.NoError(t, err)
+	assert.Equal(t, 1, updated.Clearance)
+	assert.Equal(t, `[{"domain":"old","read":true}]`, updated.DomainAccess)
+	assert.Equal(t, "old-agent", updated.VisibleAgents)
+	assert.Equal(t, "old-org", updated.OrgID)
+	assert.Equal(t, "old-dept", updated.DeptID)
+}
+
+func TestOverlayOnChainAgentPolicyReplacesStaleSQLiteRBAC(t *testing.T) {
+	projected := &store.AgentEntry{
+		Role: "member", Clearance: 1, OrgID: "stale-org", DeptID: "stale-dept",
+		DomainAccess:  `[{"domain":"stale","read":true,"write":true}]`,
+		VisibleAgents: "*", Capabilities: 0,
+	}
+	authoritative := &store.OnChainAgent{
+		Role: "member", Clearance: 2, OrgID: "live-org", DeptID: "live-dept",
+		DomainAccess:  `[{"domain":"live","read":true}]`,
+		VisibleAgents: "agent-live", Capabilities: store.AgentCapabilityReadAllDomains,
+	}
+
+	overlayOnChainAgentPolicy(projected, authoritative)
+
+	assert.Equal(t, 2, projected.Clearance)
+	assert.Equal(t, "live-org", projected.OrgID)
+	assert.Equal(t, "live-dept", projected.DeptID)
+	assert.Equal(t, `[{"domain":"live","read":true}]`, projected.DomainAccess)
+	assert.Equal(t, "agent-live", projected.VisibleAgents)
+	assert.Equal(t, store.AgentCapabilityReadAllDomains, projected.Capabilities)
 }
 
 func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
@@ -1595,7 +2074,7 @@ func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
 	body := []byte(`{"clearance":2}`)
 	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-activity-1", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	resp := httptest.NewRecorder()
 	r.ServeHTTP(resp, req)
 	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
@@ -1681,7 +2160,7 @@ func TestDomainAccessRejectsModifyForDynamicallySharedDomain(t *testing.T) {
 	body := []byte(`{"domain_access":"[{\"domain\":\"community-updates\",\"read\":true,\"write\":true,\"modify\":true}]"}`)
 	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/dynamic-shared-target", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1692,7 +2171,7 @@ func TestDomainAccessRejectsModifyForDynamicallySharedDomain(t *testing.T) {
 
 	createReq := httptest.NewRequest(http.MethodPost, "/v1/dashboard/network/agents", bytes.NewReader(body))
 	createReq.Header.Set("Content-Type", "application/json")
-	markLocalDashboardRequest(createReq)
+	markLocalDashboardRequest(h, createReq)
 	createW := httptest.NewRecorder()
 	r.ServeHTTP(createW, createReq)
 	assert.Equal(t, http.StatusBadRequest, createW.Code, createW.Body.String())

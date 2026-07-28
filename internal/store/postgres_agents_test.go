@@ -224,6 +224,36 @@ func TestPostgresListAgentsExcludesRemoved(t *testing.T) {
 	assert.False(t, ids[gone.AgentID], "removed agent must be excluded")
 }
 
+func TestPostgresAgentCapabilitiesRoundTripCreateGetListAndUpdate(t *testing.T) {
+	s := agentTestStore(t)
+	ctx := context.Background()
+	mask := AgentCapabilityReadAllDomains | AgentCapabilityDenyForeignDomainWrite
+	agent := seedAgent(t, s, func(agent *AgentEntry) {
+		agent.Capabilities = mask
+	})
+
+	got, err := s.GetAgent(ctx, agent.AgentID)
+	require.NoError(t, err)
+	assert.Equal(t, mask, got.Capabilities)
+
+	agents, err := s.ListAgents(ctx)
+	require.NoError(t, err)
+	found := false
+	for _, candidate := range agents {
+		if candidate.AgentID == agent.AgentID {
+			found = true
+			assert.Equal(t, mask, candidate.Capabilities)
+		}
+	}
+	require.True(t, found)
+
+	got.Capabilities = AgentCapabilityDenyFederatedPipe
+	require.NoError(t, s.UpdateAgent(ctx, got))
+	updated, err := s.GetAgent(ctx, agent.AgentID)
+	require.NoError(t, err)
+	assert.Equal(t, AgentCapabilityDenyFederatedPipe, updated.Capabilities)
+}
+
 func TestPostgresAgentStatusAndLastSeen(t *testing.T) {
 	s := agentTestStore(t)
 	ctx := context.Background()
@@ -403,7 +433,7 @@ func TestPostgresEnsureAgentSchemaLegacyMigration(t *testing.T) {
 		"name", "registered_name", "role", "avatar", "boot_bio", "validator_pubkey",
 		"node_id", "p2p_address", "status", "clearance", "org_id", "dept_id",
 		"domain_access", "bundle_path", "on_chain_height", "visible_agents",
-		"provider", "claim_token", "claim_expires_at", "first_seen", "last_seen",
+		"capabilities", "provider", "claim_token", "claim_expires_at", "first_seen", "last_seen",
 		"created_at", "removed_at",
 	}
 	rows, err := pool.Query(ctx, `SELECT column_name FROM information_schema.columns WHERE table_name = 'agents'`)

@@ -42,10 +42,11 @@ type OrgSetClearanceReq struct {
 
 // FederationProposeReq is the JSON body for POST /v1/federation/propose.
 type FederationProposeReq struct {
+	ProposerOrgID    string   `json:"proposer_org_id,omitempty"`
 	TargetOrgID      string   `json:"target_org_id"`
 	AllowedDomains   []string `json:"allowed_domains,omitempty"`
 	AllowedDepts     []string `json:"allowed_depts,omitempty"`
-	MaxClearance     int      `json:"max_clearance,omitempty"`
+	MaxClearance     *int     `json:"max_clearance,omitempty"`
 	ExpiresAt        int64    `json:"expires_at,omitempty"`
 	RequiresApproval bool     `json:"requires_approval,omitempty"`
 }
@@ -56,6 +57,15 @@ type FederationRevokeReq struct {
 }
 
 // --- Organization Handlers ---------------------------------------------------
+
+func (s *Server) callerIsGlobalAdmin(r *http.Request) bool {
+	if s.badgerStore == nil {
+		return false
+	}
+	agentID := middleware.ContextAgentID(r.Context())
+	agent, err := s.badgerStore.GetRegisteredAgent(agentID)
+	return err == nil && agent != nil && agent.Role == "admin"
+}
 
 // handleOrgRegister handles POST /v1/org/register.
 func (s *Server) handleOrgRegister(w http.ResponseWriter, r *http.Request) {
@@ -71,6 +81,10 @@ func (s *Server) handleOrgRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agentID := middleware.ContextAgentID(r.Context())
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 organization registration requires a global admin.")
+		return
+	}
 
 	// Deterministic org ID from agent pubkey + name.
 	orgIDHash := sha256.Sum256([]byte(agentID + req.Name))
@@ -278,6 +292,10 @@ func (s *Server) handleOrgAddMember(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing agent ID", "agent_id is required")
 		return
 	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 organization membership changes require a global admin.")
+		return
+	}
 	// Only a missing clearance falls back to the safe INTERNAL default; an
 	// explicit 0 (ClearancePublic) is honored verbatim.
 	clearance := 1
@@ -334,6 +352,10 @@ func (s *Server) handleOrgRemoveMember(w http.ResponseWriter, r *http.Request) {
 	agentToRemove := chi.URLParam(r, "agent_id")
 	if orgID == "" || agentToRemove == "" {
 		writeProblem(w, http.StatusBadRequest, "Missing parameters", "org_id and agent_id path parameters are required")
+		return
+	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 organization membership changes require a global admin.")
 		return
 	}
 
@@ -393,6 +415,10 @@ func (s *Server) handleOrgSetClearance(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing agent ID", "agent_id is required")
 		return
 	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 organization clearance changes require a global admin.")
+		return
+	}
 
 	clearanceTx := &tx.ParsedTx{
 		Type:      tx.TxTypeOrgSetClearance,
@@ -447,23 +473,48 @@ func (s *Server) handleFederationPropose(w http.ResponseWriter, r *http.Request)
 		writeProblem(w, http.StatusBadRequest, "Missing target org ID", "target_org_id is required")
 		return
 	}
-	if req.MaxClearance == 0 {
-		req.MaxClearance = 2 // Default to CONFIDENTIAL
+	maxClearance := 2 // Omitted defaults to CONFIDENTIAL; explicit PUBLIC (0) is preserved.
+	if req.MaxClearance != nil {
+		if *req.MaxClearance < 0 || *req.MaxClearance > int(tx.ClearanceTopSecret) {
+			writeProblem(w, http.StatusBadRequest, "Invalid max clearance", "max_clearance must be between 0 and 4.")
+			return
+		}
+		maxClearance = *req.MaxClearance
+	}
+	if req.ExpiresAt < 0 || (req.ExpiresAt > 0 && req.ExpiresAt <= time.Now().Unix()) {
+		writeProblem(w, http.StatusBadRequest, "Invalid expiry", "expires_at must be zero or in the future.")
+		return
+	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 federation changes require a global admin.")
+		return
 	}
 
 	agentID := middleware.ContextAgentID(r.Context())
 
-	// Look up proposer's org from on-chain state.
+	// Resolve the proposer's org from on-chain state. Multi-org callers may
+	// select an exact membership; omission preserves the legacy primary-org
+	// default for API compatibility.
 	if s.badgerStore == nil {
 		writeProblem(w, http.StatusServiceUnavailable, "State store unavailable",
 			"On-chain state store is not configured.")
 		return
 	}
-	proposerOrg, err := s.badgerStore.GetAgentOrg(agentID)
-	if err != nil {
-		writeProblem(w, http.StatusForbidden, "Not in an organization",
-			"You must belong to an organization to propose federations")
-		return
+	proposerOrg := req.ProposerOrgID
+	if proposerOrg != "" {
+		member, memberErr := s.badgerStore.IsAgentInOrg(agentID, proposerOrg)
+		if memberErr != nil || !member {
+			writeProblem(w, http.StatusForbidden, "Not in proposer organization",
+				"You must belong to proposer_org_id to propose its federation.")
+			return
+		}
+	} else {
+		proposerOrg, err = s.badgerStore.GetAgentOrg(agentID)
+		if err != nil {
+			writeProblem(w, http.StatusForbidden, "Not in an organization",
+				"You must belong to an organization to propose federations")
+			return
+		}
 	}
 
 	proposeTx := &tx.ParsedTx{
@@ -475,7 +526,7 @@ func (s *Server) handleFederationPropose(w http.ResponseWriter, r *http.Request)
 			TargetOrgID:      req.TargetOrgID,
 			AllowedDomains:   req.AllowedDomains,
 			AllowedDepts:     req.AllowedDepts,
-			MaxClearance:     tx.ClearanceLevel(req.MaxClearance), // #nosec G115 -- validated small int
+			MaxClearance:     tx.ClearanceLevel(maxClearance), // #nosec G115 -- validated 0..4
 			ExpiresAt:        req.ExpiresAt,
 			RequiresApproval: req.RequiresApproval,
 		},
@@ -516,19 +567,30 @@ func (s *Server) handleFederationApprove(w http.ResponseWriter, r *http.Request)
 		writeProblem(w, http.StatusBadRequest, "Missing federation ID", "fed_id path parameter is required")
 		return
 	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 federation changes require a global admin.")
+		return
+	}
 
 	agentID := middleware.ContextAgentID(r.Context())
 
-	// Look up approver's org from on-chain state.
+	// Resolve the authoritative target from the stored agreement. A legacy
+	// primary-org lookup is insufficient for multi-org agents and can produce a
+	// transaction that REST reports as accepted but consensus rejects.
 	if s.badgerStore == nil {
 		writeProblem(w, http.StatusServiceUnavailable, "State store unavailable",
 			"On-chain state store is not configured.")
 		return
 	}
-	approverOrg, err := s.badgerStore.GetAgentOrg(agentID)
+	_, approverOrg, _, _, _, err := s.badgerStore.GetFederation(fedID)
 	if err != nil {
-		writeProblem(w, http.StatusForbidden, "Not in an organization",
-			"You must belong to an organization to approve federations")
+		writeProblem(w, http.StatusNotFound, "Federation not found", "The federation agreement does not exist.")
+		return
+	}
+	member, memberErr := s.badgerStore.IsAgentInOrg(agentID, approverOrg)
+	if memberErr != nil || !member {
+		writeProblem(w, http.StatusForbidden, "Not in target organization",
+			"You must belong to the federation's target organization to approve it.")
 		return
 	}
 
@@ -577,19 +639,35 @@ func (s *Server) handleFederationRevoke(w http.ResponseWriter, r *http.Request) 
 		writeProblem(w, http.StatusBadRequest, "Missing federation ID", "fed_id path parameter is required")
 		return
 	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 federation changes require a global admin.")
+		return
+	}
 
 	agentID := middleware.ContextAgentID(r.Context())
 
-	// Look up revoker's org from on-chain state.
+	// Resolve both authoritative sides from the stored agreement and choose a
+	// deterministic exact membership (proposer first). This matches consensus
+	// for multi-org callers and rejects unrelated global admins before broadcast.
 	if s.badgerStore == nil {
 		writeProblem(w, http.StatusServiceUnavailable, "State store unavailable",
 			"On-chain state store is not configured.")
 		return
 	}
-	revokerOrg, err := s.badgerStore.GetAgentOrg(agentID)
+	proposerOrg, targetOrg, _, _, _, err := s.badgerStore.GetFederation(fedID)
 	if err != nil {
-		writeProblem(w, http.StatusForbidden, "Not in an organization",
-			"You must belong to an organization to revoke federations")
+		writeProblem(w, http.StatusNotFound, "Federation not found", "The federation agreement does not exist.")
+		return
+	}
+	revokerOrg := ""
+	if inProposer, _ := s.badgerStore.IsAgentInOrg(agentID, proposerOrg); inProposer {
+		revokerOrg = proposerOrg
+	} else if inTarget, _ := s.badgerStore.IsAgentInOrg(agentID, targetOrg); inTarget {
+		revokerOrg = targetOrg
+	}
+	if revokerOrg == "" {
+		writeProblem(w, http.StatusForbidden, "Not in federation organization",
+			"You must belong to either side of the federation to revoke it.")
 		return
 	}
 

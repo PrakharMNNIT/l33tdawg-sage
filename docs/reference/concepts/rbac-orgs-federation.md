@@ -1,4 +1,4 @@
-<!-- Core document reconciled through SAGE v11.13.9, including directional cross-chain peer RBAC and the quorum/state-sync/governance-gateway sections. -->
+<!-- Core document reconciled through SAGE v11.14.1, including app-v22 agent capabilities, directional cross-chain peer RBAC, and the quorum/state-sync/governance-gateway sections. -->
 
 # RBAC, Organizations, and Federation
 
@@ -121,6 +121,67 @@ The REST handler uses `broadcast_tx_commit`, so a `FinalizeBlock` rejection is s
 
 `POST /v1/access/revoke` → `TxTypeAccessRevoke` → `badgerStore.RevokeGrant`. Sets `RevokedAt` in PostgreSQL.
 
+### App-v22 Agent Capabilities
+
+App-v22 adds a consensus-stored `uint32` capability/restriction mask to each
+registered agent. Zero is the byte-compatible legacy behavior. Only a global
+`role=admin` may change any persisted permission field (`clearance`,
+`domain_access`, `visible_agents`, `org_id`, `dept_id`, or `capabilities`).
+Existing self/org-admin authorization may submit an exactly equal no-op, but
+cannot use another field to bypass capability review. A restricted process
+therefore cannot clear its own restrictions through REST, CEREBRUM, or a
+directly submitted transaction (`internal/store/agent_capabilities.go`;
+`internal/tx/codec.go`; `internal/abci/app.go`).
+
+| Bit | Meaning |
+|---:|---|
+| `1` | Read across domain and submitting-agent filters, but never above the agent's stored numeric clearance. |
+| `2` | Deny writes to shared domains such as `general`, `self`, `meta`, `sage-*`, and dynamic shared domains. |
+| `4` | Deny explicit domain registration and every implicit first-writer claim path. |
+| `8` | Deny writes to domains owned by another agent, even if a level-2 grant exists. |
+| `16` | Deny federated pipeline discovery/delivery; local inbox messaging remains unchanged. |
+
+The co-located voice/companion preset is mask `15` (`1|2|4|8`), not `31`.
+It can recall globally only within its clearance and can ask visible agents on
+compatible federated SAGEs to act through their inboxes. Any requested memory
+mutation is then a normal local action by the receiving agent under that
+agent's own grants. This does not enable federation Write, which remains a
+separate reserved, fail-closed transport surface.
+
+The companion's own writable memory domain must be an assigned, non-shared
+domain (for example `voice-interface`). Names under the static `sage-*` family,
+including `sage-voice-bridge`, are ownerless shared domains; mask `15`
+deliberately blocks writes there even if an old SQLite access projection still
+contains a write toggle. The consensus capability—not that projection—is the
+authoritative write boundary.
+
+At app-v22 activation, existing registered agents keep mask `0` for replay and
+upgrade compatibility. A key that self-registers after activation starts with
+mask `30` (`2|4|8|16`): no shared/foreign writes, no domain claims, and no
+federated recipient routing. This prevents a restricted process from minting a
+fresh key to bypass its operator-assigned mask. A global administrator must
+then assign the intended profile; the companion preset `15` is the explicit
+step that adds clearance-bounded read-all and enables federated inbox routing.
+Badger remains authoritative for the mask and every other policy field. The
+ABCI projection persists the same mask to SQLite/Postgres for ordinary clients,
+while the REST and dashboard detail/list reads overlay current Badger policy
+onto legacy or crash-window SQL rows before serialization. A stale SQL zero
+therefore cannot make a restricted agent appear unrestricted
+(`internal/abci/app.go`; `internal/store/sqlite.go`;
+`internal/store/postgres.go`; `api/rest/agent_handler.go`).
+
+The same write and claim restrictions run in both ordinary memory submission
+and co-commit consensus paths. App-v22 also requires global-admin authority for
+every organization, department, and organization-federation mutation:
+registration, add/remove member, clearance change, department
+registration/add/remove, and federation propose/approve/revoke. Federation
+mutations additionally require the global admin to be a member of the relevant
+proposer, target, or revoking-side organization so bilateral attribution is
+explicit. A restricted companion therefore cannot manufacture TOP SECRET
+clearance or a sharing agreement through the org API
+(`internal/abci/app.go`; `api/rest/memory_handler.go`;
+`api/rest/org_handler.go`; `api/rest/pipe_handler.go`).
+
 ### CEREBRUM Dashboard: Real Grants + Agent-to-Agent Ownership Transfer (v11.3)
 
 Two dashboard surfaces now write to the on-chain RBAC state above instead of merely displaying it. They reuse the existing transaction types; app-v18 fork-extends their optional wire payload and consensus authorization for administrator overrides.
@@ -129,7 +190,7 @@ Two dashboard surfaces now write to the on-chain RBAC state above instead of mer
 
 - **app-v18 explicit genesis-admin override (v11.7 candidate).** CEREBRUM may offer **Admin override & assign** only when the target agent's private key is held on this node (local, not merely visible through federation). The confirmation identifies the effective original owner and desired read/write level. The transaction carries that expected owner and owning ancestor as a consensus-checked binding, so a concurrent ownership change rejects rather than applying a stale confirmation. Once app-v18 is activated, a registered global admin may sign `AccessGrant` / `AccessRevoke` even when it is not the domain owner; the grant remains an ordinary auditable `grant:<domain>:<agentID>` record and does **not** change domain ownership or memory authorship. Ordinary agents remain owner/ancestor-owner gated. Level 1 is read-only; memory submit and co-commit require the effective owner or an explicit level-2 direct/ancestor grant—org membership and federation clearance do not imply write authority. Pre-app-v18 blocks and the activation block retain the old rule byte-for-byte (`internal/abci/app.go`, `web/reassign_handler.go`).
 
-- **Domain ownership transfers agent-to-agent via governance.** `POST /v1/dashboard/network/reassign-domain-ownership` orchestrates, commit-confirmed: `gov_propose(domain_reassign)` -> the sole validator's accept vote drives it to `Executed` -> `TxTypeDomainReassign` flips the owner and purges the domain's grants -> `TxTypeAccessGrant` gives the new owner level 3 (deferred to the owner's own node if their key is not local). This transfers OWNERSHIP and read/write ACCESS only; it does NOT rewrite memory authorship - every memory stays authored by its original `submitting_agent`. Single-validator node only; a multi-validator chain is rejected because the other validators must vote on the proposal (`web/reassign_handler.go:285-318`).
+- **Domain ownership transfers agent-to-agent via governance.** `POST /v1/dashboard/network/reassign-domain-ownership` orchestrates, commit-confirmed: `gov_propose(domain_reassign)` -> the sole validator's accept vote drives it to `Executed` -> `TxTypeDomainReassign` flips the owner and purges the domain's grants -> `TxTypeAccessGrant` gives the new owner level 3 (deferred to the owner's own node if their key is not local). Post-app-v22, the approved new owner must also be a canonical, registered on-chain agent before any ownership mutation; malformed or unknown target IDs fail closed. This transfers OWNERSHIP and read/write ACCESS only; it does NOT rewrite memory authorship - every memory stays authored by its original `submitting_agent`. Single-validator node only; a multi-validator chain is rejected because the other validators must vote on the proposal (`internal/abci/app.go`; `web/reassign_handler.go:285-318`).
 
 ---
 
@@ -143,6 +204,8 @@ A `POST /v1/memory/query` request passes through these gates in order (`memory_h
 
 - `role == "admin"` → bypass all checks, full access
 - `role == "observer"` → write operations blocked
+- app-v22 `ReadAllDomains` → read allowlist bypass only; writes still follow
+  the ordinary allowlist and all per-record classification checks still run
 - `DomainAccess == ""` or empty list → no per-domain restrictions, allow all
 - Otherwise: explicit allowlist model — domain must appear with `read: true` (for queries) or `write: true` (for submissions)
 
@@ -205,15 +268,24 @@ HasAccessMultiOrg(domain, agentID, memoryClassification, blockTime, postFork):
 
 6. Federation check: for each (agentOrg, domainOrg) cross-product where agentOrg != domainOrg:
    FindFederation(agentOrg, domainOrg) → fedID
-   GetFederation(fedID) → status, maxClearance, expiresAt, allowedDepts
+   GetFederation(fedID) → status, maxClearance, expiresAt
    if status == "active" AND !expired AND memoryClassification <= maxClearance:
-     (check dept scope if AllowedDepts != ["*"] and not empty)
+     require AllowedDomains to contain "*", the exact domain, or a dotted ancestor
+     if AllowedDepts is restrictive, require an exact forward membership in
+       (agentOrg, allowedDept, agentID)
      return true
 
 return false
 ```
 
-**Current semantics:** On live v11 chains, access checks use ancestor-walk behavior for grants and domain ownership. Exact-match behavior remains only for replaying pre-fork history.
+**Current semantics:** On live app-v22 chains, access checks use ancestor-walk
+behavior for grants and domain ownership. `AllowedDomains` is authoritative:
+empty denies, `"*"` allows all, and an exact or dotted ancestor covers a
+descendant. Empty or `"*"` `AllowedDepts` is unrestricted; any other list
+fails closed unless an exact forward department membership matches. The
+legacy single `agent_dept` reverse slot is never authoritative for this check.
+Pre-app-v22 replay retains the historical evaluator that ignored both scope
+lists.
 
 ---
 
@@ -223,7 +295,10 @@ A federation is a bilateral agreement between two organizations.
 
 ### Proposal and Approval
 
-`POST /v1/federation/propose` → `TxTypeFederationPropose` → persists `FederationEntry{status:"proposed"}` in BadgerDB and PostgreSQL.
+`POST /v1/federation/propose` → `TxTypeFederationPropose` → persists
+`FederationEntry{status:"proposed"}` in BadgerDB and PostgreSQL. A multi-org
+caller may provide `proposer_org_id`; it must name one of the caller's exact
+memberships. Omission preserves the legacy primary-org default.
 
 `POST /v1/federation/{fed_id}/approve` → `TxTypeFederationApprove` → sets status to `"active"`.
 
@@ -235,16 +310,21 @@ The `FederationID` is deterministic: computed from the two org IDs + height to a
 |------------------|----------|------------------------------------------------------------|
 | `ProposerOrgID`  | string   | Org that proposed the agreement                            |
 | `TargetOrgID`    | string   | Invited org                                                |
-| `AllowedDomains` | []string | Which domains are shared; `["*"]` = all                    |
+| `AllowedDomains` | []string | Which domains are shared; `["*"]` = all; empty denies       |
 | `AllowedDepts`   | []string | Dept scope; `["*"]` or empty = all depts                   |
 | `MaxClearance`   | 0-4      | Ceiling clearance for cross-org reads                      |
 | `ExpiresAt`      | *time    | Nil = permanent                                            |
-| `RequiresApproval` | bool   | Stored but not currently enforced at query time            |
+| `RequiresApproval` | bool   | Legacy/informational; activation always requires target approval |
 | `Status`         | string   | `"proposed"`, `"active"`, `"revoked"`                      |
 
 ### MaxClearance Cap
 
 `checkFederationAccess` (`badger.go:2156-2175`) enforces: `if memoryClassification > maxClearance → deny`. This means a federation with `max_clearance=1` (INTERNAL) cannot expose CONFIDENTIAL (2) or higher memories to the federated org, regardless of the individual agent's clearance within their own org.
+
+Every proposal remains `"proposed"` until an explicit target-organization
+approval changes it to `"active"`, regardless of the stored
+`RequiresApproval` value. That flag is retained for wire/storage compatibility;
+it does not bypass bilateral activation.
 
 ### Revocation
 
@@ -427,6 +507,19 @@ path and never activate the domain-bound rules. Every validator must therefore
 restart on the identical v11.9 binary before the tagged ceremony; upgrading
 only a greater-than-two-thirds subset is not a supported rollout boundary.
 
+App-v22 has an additional persisted-ladder invariant at every transition
+boundary: proposal admission, approved-proposal execution, activation, and
+startup/restart recovery. Consensus storage must contain the canonical app-v6
+applied record, which is the historical protocol's cumulative proof for
+app-v2 through app-v5, followed by a distinct canonical record for every
+independent app-v7 through app-v21 activation. Every record must have its exact
+canonical name and target, a positive height, and a height strictly greater
+than its predecessor. Cached fork gates and synthesized/subsumed evidence do
+not satisfy the v7+ requirement. This check is confined to the app-v22
+transition and recovery boundary, so historical pre-v22 replay retains its
+original behavior (`internal/abci/appv22_agent_capabilities.go`,
+`internal/abci/app.go`).
+
 Operational prerequisite: before app-v20 activation, every operator intended
 to expose a *proposal* gateway must be registered as a global admin. A topology
 where only a validator key is admin can use a direct validator-key proposal or
@@ -482,15 +575,16 @@ and remains off when neither is set (`cmd/sage-gui/state_sync_config.go`). Both
 roles require a strict locally installed JSON trust root. Its schema binds
 chain ID, joining Comet node ID, the joining node's prospective validator
 Ed25519 public key, app
-application version 20 or 21, expiry, snapshot floor, existing validator node
+application version 20, 21, or 22, expiry, snapshot floor, existing validator node
 IDs, and approved
 providers. Provider IDs must exactly equal validator IDs; v1 does not permit a
 preferred subset. The loader rejects files over 64 KiB, symlinks, non-regular or
 group/world-writable modes, open-time replacement, unknown fields, trailing
 JSON, and non-canonical values (`internal/statesync/authorization.go`).
 Every authorization and transfer session is pinned to one exact supported app
-version: a v20 receiver accepts only a v20 image and a v21 receiver accepts only
-a v21 image. This preserves existing v20 sessions while preventing a transfer
+version: a v20 receiver accepts only a v20 image, a v21 receiver only a v21
+image, and a v22 receiver only a v22 image. This preserves existing sessions
+while preventing a transfer
 from crossing an application-state-machine boundary.
 
 Authorization and a successful transfer do not grant voting power: the sealed

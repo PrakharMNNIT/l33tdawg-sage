@@ -6,6 +6,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/l33tdawg/sage/internal/idfmt"
 	"github.com/l33tdawg/sage/internal/store"
 )
 
@@ -30,7 +31,7 @@ func MigrateAgentsOnChain(ctx context.Context, agentStore store.AgentStore, badg
 	for _, agent := range agents {
 		if agent.FirstSeen == nil && !agent.CreatedAt.IsZero() {
 			if updateErr := agentStore.BackfillFirstSeen(ctx, agent.AgentID, agent.CreatedAt); updateErr != nil {
-				logger.Warn().Err(updateErr).Str("agent", agent.AgentID[:16]).Msg("migrate: failed to backfill first_seen")
+				logger.Warn().Err(updateErr).Str("agent", idfmt.Prefix(agent.AgentID)).Msg("migrate: failed to backfill first_seen")
 			}
 		}
 	}
@@ -52,9 +53,9 @@ func MigrateAgentsOnChain(ctx context.Context, agentStore store.AgentStore, badg
 					}
 					agent.OnChainHeight = height
 					if updateErr := agentStore.UpdateAgent(ctx, agent); updateErr != nil {
-						logger.Warn().Err(updateErr).Str("agent", agent.AgentID[:16]).Msg("migrate: failed to backfill on_chain_height")
+						logger.Warn().Err(updateErr).Str("agent", idfmt.Prefix(agent.AgentID)).Msg("migrate: failed to backfill on_chain_height")
 					} else {
-						logger.Info().Str("agent", agent.AgentID[:16]).Int64("height", height).Msg("migrate: backfilled on_chain_height from BadgerDB")
+						logger.Info().Str("agent", idfmt.Prefix(agent.AgentID)).Int64("height", height).Msg("migrate: backfilled on_chain_height from BadgerDB")
 					}
 				}
 			}
@@ -83,18 +84,18 @@ func MigrateAgentsOnChain(ctx context.Context, agentStore store.AgentStore, badg
 			role = "member"
 		}
 		if regErr := badgerStore.RegisterAgent(agent.AgentID, agent.Name, role, agent.BootBio, agent.Provider, agent.P2PAddress, 1); regErr != nil {
-			logger.Warn().Err(regErr).Str("agent", agent.AgentID[:16]).Msg("migrate: failed to register in BadgerDB")
+			logger.Warn().Err(regErr).Str("agent", idfmt.Prefix(agent.AgentID)).Msg("migrate: failed to register in BadgerDB")
 			continue
 		}
 
 		// Update SQLite with on_chain_height = 1
 		agent.OnChainHeight = 1
 		if updateErr := agentStore.UpdateAgent(ctx, agent); updateErr != nil {
-			logger.Warn().Err(updateErr).Str("agent", agent.AgentID[:16]).Msg("migrate: failed to update SQLite on_chain_height")
+			logger.Warn().Err(updateErr).Str("agent", idfmt.Prefix(agent.AgentID)).Msg("migrate: failed to update SQLite on_chain_height")
 		}
 
 		migrated++
-		logger.Info().Str("agent", agent.AgentID[:16]).Str("name", agent.Name).Msg("migrate: agent registered on-chain")
+		logger.Info().Str("agent", idfmt.Prefix(agent.AgentID)).Str("name", agent.Name).Msg("migrate: agent registered on-chain")
 	}
 
 	if migrated > 0 || skipped > 0 {

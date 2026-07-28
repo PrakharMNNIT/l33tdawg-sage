@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.13.9 code (2026-07-27). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
+<!-- Verified against SAGE v11.14.1 code (2026-07-28). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
 
 # SAGE Federation and Brain HTTP API Reference (v11)
 
@@ -146,7 +146,7 @@ Authenticated reachability / identity and permission preflight (`handleStatus`,
 | `time` | int64 | serving node's unix time |
 | `capabilities` | []string | optional features. A SQLite-backed v11.13.5 node advertises `sync`, `federated-pipeline-v1`, and `federated-pipeline-contact-lookup-v1`; it never advertises reserved `write-v1`. |
 | `peer_rbac_grant` | object, optional | the serving node's current `{policy_version, paused, domains:[{domain,read,write,copy}]}` snapshot, disclosed only to the exact bound peer; present with zero rows means deny-all. While paused, current peers see `paused:true` and an empty domain list; the empty list also keeps older peers fail-closed. The versioned `write` member is always false in v11.9 (`internal/federation/peer_rbac.go:313-330`). |
-| `pipe_contacts` | object, optional | Compatible v1 peer-scoped projection of domain owners and **active local agents with current level-1 Read access** for shared Read/Copy domains. Without the advisory `X-Sage-Capabilities: federated-pipeline-contact-lookup-v1` request header it is a deterministic valid subset: all effective owners plus a stable first 128 active-agent candidates, bounded again to 1,024 contacts and 1 MiB. This keeps old consumers safe without a roster-wide RBAC scan. A lookup-capable requester receives the policy/capability preflight without this roster (and locally caps that compact response at 1 MiB), then uses the bounded live lookup route below. A v11.13.0 peer ignores that advisory header; if its historic full status exceeds the compact cap, the requester retries its normal legacy status once through a single-worker compatibility lane and filters it immediately. |
+| `pipe_contacts` | object, optional | Compatible v1 peer-scoped projection of domain owners and **active local agents with current level-1 Read access** for shared Read/Copy domains. After app-v22, `ReadAllDomains` also qualifies an active reviewed target, while `DenyFederatedPipe` excludes a target even when it owns the domain. Without the advisory `X-Sage-Capabilities: federated-pipeline-contact-lookup-v1` request header it is a deterministic valid subset: eligible effective owners plus a stable first 128 active-agent candidates, bounded again to 1,024 contacts and 1 MiB. This keeps old consumers safe without a roster-wide RBAC scan. A lookup-capable requester receives the policy/capability preflight without this roster (and locally caps that compact response at 1 MiB), then uses the bounded live lookup route below. A v11.13.0 peer ignores that advisory header; if its historic full status exceeds the compact cap, the requester retries its normal legacy status once through a single-worker compatibility lane and filters it immediately. |
 | `sharing_grant` | object, optional | legacy compatibility envelope (`allowed_domains`, `max_clearance`) |
 
 ### `POST /fed/v1/pipe/event`
@@ -165,24 +165,50 @@ reroute a friendly alias, relabel another source chain's proof, extend its TTL,
 or substitute the agent (`api/rest/pipe_handler.go:132-321`,
 `internal/federation/pipe_transport.go:72-169`, `:371-463`).
 
+After app-v22, an operator may grant a co-located companion
+`ReadAllDomains`. That capability satisfies the sender's local
+caller/domain intersection for authenticated contact discovery without
+bypassing numeric memory clearance. Federated inbox messaging remains enabled
+for the standard companion mask (`15`); the independent
+`DenyFederatedPipe` bit (`16`) makes targeted recipient discovery, cached
+contact reauthorization, resolve, and send fail closed for that caller. The
+general federation view still returns authorized peer/domain topology but
+suppresses its remote-agent contact roster. Return results follow the same
+durable pipeline to the originating SAGE. The outbox re-checks the source
+agent's live consensus mask before every network delivery and holds that
+authorization lease through the side effect, so enabling the deny bit also
+parks queued payloads and cannot return while an older payload remains in
+flight. Results travel back to the originating SAGE
+and appear through `sage_turn`/`sage_inbox`
+(`internal/store/agent_capabilities.go`; `api/rest/pipe_handler.go`;
+`api/rest/federation_handler.go`).
+
 ### `POST /fed/v1/pipe/contacts/lookup`
 
-Authenticated, peer-scoped bounded recipient discovery and exact route
-resolution. The body supplies exactly one of `name` (ASCII case-insensitive
-exact match across display, registered, and provider names; non-ASCII names use
-their registered casing) or `target`
+Authenticated, peer-scoped, deadline-limited recipient discovery and exact
+route resolution. The body supplies exactly one of `name` (at least two
+Unicode code points; ASCII
+case-insensitive substring match across display, registered, and provider
+names; exact matches rank first and non-ASCII names use SQLite's registered
+casing behavior) or `target`
 (canonical address, handle, exact agent ID, or exact display name), plus an
-optional `limit` (default 20, maximum 20). A v11.13.5 requester advertises the
+optional `limit` (default 20, maximum 20). Human-name candidate SQL has a
+two-second deadline. A v11.13.5 requester advertises the
 lookup capability on the preceding status preflight, receives no status roster,
-and obtains this live, bounded result instead. The response carries at most 20
-contacts plus `total` and `truncated`; targeted results are live-only and never
+and obtains this live result instead. Candidate metadata is capped at 64 before
+live RBAC evaluation, and the response carries at most 20 contacts plus `total`
+and `truncated`; targeted results are live-only and never
 replace a legacy status routing hint. The handler narrows to a fixed 64-agent
 local name candidate budget before re-deriving live policy, access, and
-agent-contact state; it does not expose an enumerable remote agent directory or
-turn a broad name into a roster-wide authorization scan. Substring discovery is
-deliberately unavailable on this leased protocol path; callers must provide a
-known agent name, registered name, or provider name.
+agent-contact state; it does not expose an enumerable remote agent directory.
+The leading-wildcard substring query may still scan the local registration
+table, but it runs before revocation-sensitive leases and is deadline-limited.
+Callers must provide at least two characters from a known agent name,
+registered name, or provider name.
 
+Target capabilities are cached only for that bounded live projection:
+`ReadAllDomains` substitutes for the ordinary level-1 domain grant, while
+`DenyFederatedPipe` wins over ReadAll and domain ownership.
 Admission then re-derives the recipient's current shared-domain RBAC access and
 exact agreement/policy/contact revision under the policy, ownership/direct-grant,
 organization membership/clearance, federation-state, department-membership, and
@@ -193,6 +219,10 @@ wire. Delivery is at-least-once with durable idempotence and equivocation
 rejection. Replay tombstones survive revoke/re-pair cleanup
 (`internal/store/pipeline_transport.go:191-326`,
 `internal/store/sync_tables.go:496-531`).
+Inbound admission, inbox claim, and imported-result completion rebuild the same
+exact-target projection under the consensus authorization lease, so a
+published target deny cannot leave older work authorized or race an already
+authorized local action.
 
 The whole inner proof plus intent/payload/result use the local vault-backed
 storage path. Foreign completion creates no memory journal, and the result is
@@ -278,6 +308,12 @@ consensus-bound ingress capability tied to the active ceremony generation,
 frozen peer, domain, and exact submission; until then all federation Write paths
 fail closed (`internal/federation/remote_write.go:10-19`;
 `internal/store/peer_rbac_policy.go:26-41`, `106-110`, `128-130`).
+
+Agent-to-agent messaging is the supported alternative, not a hidden Write
+escape hatch: a sender asks the remote agent to perform work, and that receiving
+agent may write only through its own SAGE's normal consensus path and local
+authorization. The returned pipeline result is transient untrusted input and is
+not automatically committed as memory.
 
 Preview builds could leave an ordinary level-2 grant recorded in the managed
 ledger. Migration clears every stored peer-policy Write bit before it can be
@@ -425,7 +461,7 @@ caller-filtered.
 | `GET /v1/federation/cross` | `handleCrossFedList` (`federation_handler.go:266-297`) | Exact node operator | List on-chain agreements (reads chain state directly; works without the transport wired). |
 | `POST /v1/federation/cross/{chain_id}/revoke` | `handleCrossFedRevoke` (`federation_handler.go:229-318`) | Exact node operator + on-chain authz | Best-effort notify the exact active peer, then broadcast local tx-34 and purge the connection generation. |
 | `GET /v1/federation/cross/{chain_id}/status` | `handleCrossFedPeerStatus` (`federation_handler.go:299-333`) | Exact node operator | Live reachability preflight against the peer's `/fed/v1/status`. |
-| `GET /v1/federation/available` | `handleFederationAvailable` | Registered Ed25519 caller | Probe at most 64 active peers with at most eight concurrent workers and return only the remote read/copy subtrees, contacts, and saved-copy summary intersecting this caller's local ACL. Optional `agent_name` and `agent_limit` (default 20, 1–20) use compact status preflight plus a bounded remote contact lookup; that named form returns only the peer label and matching contacts, not general policy, capabilities, subtree, or sync metadata. Never returns endpoints, CA pins, agreement generations, secrets, or mutation controls. |
+| `GET /v1/federation/available` | `handleFederationAvailable` | Registered Ed25519 caller | Probe at most 64 active peers with at most eight concurrent workers and return only the remote read/copy subtrees, contacts, and saved-copy summary intersecting this caller's local ACL. Optional `agent_name` and `agent_limit` (default 20, 1–20) use compact status preflight plus a bounded remote substring contact lookup; that named form returns only the peer label and matching contacts, not general policy, capabilities, subtree, or sync metadata. App-v22 `DenyFederatedPipe` suppresses contacts from the general form and makes the named form return empty before probing peers. Never returns endpoints, CA pins, agreement generations, secrets, or mutation controls. |
 | `POST /v1/federation/contacts/authorize` | `handleFederatedContactAuthorize` | Registered Ed25519 caller | Local-only reauthorization of supplied chain/domain contact pairs. Returns only input pairs whose agreement remains active/unexpired and whose domain is still readable by this caller; it neither probes a peer nor discloses contacts. |
 | `POST /v1/federation/cross/{chain_id}/write` | `handleCrossFedWrite` (`api/rest/federation_write_handler.go:11-25`) | Ed25519 + exact node operator | Reserved compatibility surface. After operator and chain-id validation it returns `501` before parsing an inner credential or dialing a peer. |
 | `GET/PUT /v1/federation/cross/{chain_id}/sync` | `handleSyncDomainsGet/Set` (`api/rest/federation_handler.go:342-576`, `656-746`) | Ed25519 + exact node operator | Read or replace local v3 Publish/Subscribe lanes; true legacy links retain their `domains` contract. |
@@ -611,6 +647,12 @@ fake MRI nodes, because the graph still represents this node's stored brain
 `BrainDomainInventory`).
 
 The same expanded detail contains **Agent work requests**, not a chat composer.
+Every surfaced message is untrusted request content, never system/user
+authority. MCP marks inbox payloads `authority:"request_only"` with an explicit
+prompt-injection warning; results are `authority:"data_only"`. This applies to
+local and federated agents alike, while federated content additionally carries
+`trust:"external_untrusted"`. Receiving agents must independently authorize
+consequential actions against their current user/task and policy.
 For local surfaced recipients, the operator independently enables inbound work
 from that peer; a recipient must be active and currently hold ordinary local
 level-1 Read access to a shared domain (the owner is eligible by definition). Every

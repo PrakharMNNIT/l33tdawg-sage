@@ -182,6 +182,10 @@ type Config struct {
 	// It must remain absent before activation because older validators reproduce
 	// the historical payload without that extension when checking signatures.
 	PostV20ForNextTx func() bool
+	// PostV22ForNextTx gates consensus-backed per-agent pipeline restrictions.
+	// The outbox re-checks this immediately before each network delivery so a
+	// queued payload cannot escape after an operator enables the deny bit.
+	PostV22ForNextTx func() bool
 	// PostV8ForAccess reports whether the live chain uses the ancestor-aware
 	// access semantics. Federated inbox contacts must mirror the access check
 	// that governs a local agent's current domain read capability.
@@ -200,6 +204,7 @@ type Manager struct {
 	badger           *store.BadgerStore
 	memStore         store.MemoryStore
 	postV20ForNextTx func() bool
+	postV22ForNextTx func() bool
 	postV8ForAccess  func() bool
 	logger           zerolog.Logger
 
@@ -555,6 +560,7 @@ func NewManager(cfg Config) *Manager {
 		badger:                      cfg.Badger,
 		memStore:                    cfg.MemStore,
 		postV20ForNextTx:            cfg.PostV20ForNextTx,
+		postV22ForNextTx:            cfg.PostV22ForNextTx,
 		postV8ForAccess:             cfg.PostV8ForAccess,
 		logger:                      cfg.Logger.With().Str("component", "federation").Logger(),
 		seenSigs:                    make(map[string]map[string]int64),
@@ -637,6 +643,9 @@ func (m *Manager) ActiveAgreement(remoteChainID string) (*store.CrossFedRecord, 
 	if rec.Status != "active" {
 		return nil, fmt.Errorf("agreement %s: status %q", remoteChainID, rec.Status)
 	}
+	if rec.MaxClearance > uint8(store.ClearanceTopSecret) {
+		return nil, fmt.Errorf("agreement %s: invalid max clearance %d", remoteChainID, rec.MaxClearance)
+	}
 	if rec.ExpiresAt != 0 && time.Now().Unix() >= rec.ExpiresAt {
 		return nil, fmt.Errorf("agreement %s: expired", remoteChainID)
 	}
@@ -662,6 +671,9 @@ func (m *Manager) ActiveAgreements() []store.CrossFedRecord {
 			continue
 		}
 		if rec.Status != "active" {
+			continue
+		}
+		if rec.MaxClearance > uint8(store.ClearanceTopSecret) {
 			continue
 		}
 		if rec.ExpiresAt != 0 && time.Now().Unix() >= rec.ExpiresAt {

@@ -976,13 +976,38 @@ func TestListAgents(t *testing.T) {
 	assert.NotNil(t, removed.RemovedAt)
 }
 
-func TestFindPipeContactLookupCandidatesRequiresExactCaseInsensitiveName(t *testing.T) {
+func TestSQLiteAgentCapabilitiesRoundTripCreateGetListAndUpdate(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	agent := testAgent("capability-agent", "Capability Agent", "member")
+	agent.Capabilities = AgentCapabilityReadAllDomains | AgentCapabilityDenyForeignDomainWrite
+	require.NoError(t, s.CreateAgent(ctx, agent))
+
+	got, err := s.GetAgent(ctx, agent.AgentID)
+	require.NoError(t, err)
+	assert.Equal(t, agent.Capabilities, got.Capabilities)
+
+	agents, err := s.ListAgents(ctx)
+	require.NoError(t, err)
+	require.Len(t, agents, 1)
+	assert.Equal(t, agent.Capabilities, agents[0].Capabilities)
+
+	got.Capabilities = AgentCapabilityDenyFederatedPipe
+	require.NoError(t, s.UpdateAgent(ctx, got))
+	updated, err := s.GetAgent(ctx, agent.AgentID)
+	require.NoError(t, err)
+	assert.Equal(t, AgentCapabilityDenyFederatedPipe, updated.Capabilities)
+}
+
+func TestFindPipeContactLookupCandidatesSupportsBoundedCaseInsensitiveSubstring(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	exact := testAgent("agent-exact", "Innovium", "member")
+	exact.Status = "active"
 	exact.RegisteredName = "innovium-agent"
 	exact.Provider = "claude-code"
 	partial := testAgent("agent-partial", "Innovium Research", "member")
+	partial.Status = "active"
 	partial.RegisteredName = "research-worker"
 	partial.Provider = "other"
 	require.NoError(t, s.CreateAgent(ctx, exact))
@@ -990,8 +1015,9 @@ func TestFindPipeContactLookupCandidatesRequiresExactCaseInsensitiveName(t *test
 
 	byName, err := s.FindPipeContactLookupCandidates(ctx, "iNnOvIuM", 64)
 	require.NoError(t, err)
-	require.Len(t, byName, 1)
+	require.Len(t, byName, 2)
 	assert.Equal(t, exact.AgentID, byName[0].AgentID)
+	assert.Equal(t, partial.AgentID, byName[1].AgentID)
 
 	byRegistered, err := s.FindPipeContactLookupCandidates(ctx, "INNOVIUM-AGENT", 64)
 	require.NoError(t, err)
@@ -1000,7 +1026,75 @@ func TestFindPipeContactLookupCandidatesRequiresExactCaseInsensitiveName(t *test
 
 	partialOnly, err := s.FindPipeContactLookupCandidates(ctx, "nov", 64)
 	require.NoError(t, err)
-	assert.Empty(t, partialOnly, "leased federated discovery must not fall back to a roster substring scan")
+	require.Len(t, partialOnly, 2)
+	assert.Equal(t, exact.AgentID, partialOnly[0].AgentID)
+	assert.Equal(t, partial.AgentID, partialOnly[1].AgentID)
+
+	literalWildcard, err := s.FindPipeContactLookupCandidates(ctx, "%", 64)
+	require.NoError(t, err)
+	assert.Empty(t, literalWildcard, "LIKE metacharacters must not widen federated discovery")
+
+	limited, err := s.FindPipeContactLookupCandidates(ctx, "nov", 1)
+	require.NoError(t, err)
+	require.Len(t, limited, 1)
+	assert.Equal(t, exact.AgentID, limited[0].AgentID)
+}
+
+func TestFindAgentsByNameSupportsBoundedLocalSubstringLookup(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	voice := testAgent("agent-voice", "MYNAH (SAGE Voice Bridge Agent)", "member")
+	voice.Status = "active"
+	voice.RegisteredName = "SAGE Voice Bridge"
+	voice.Provider = "mynah-appliance"
+	mac := testAgent("agent-mac", "MYNAH (Mac App)", "member")
+	mac.Status = "active"
+	mac.RegisteredName = "MYNAH Mac"
+	mac.Provider = "mynah-app"
+	inactive := testAgent("agent-inactive", "MYNAH (retired preview)", "member")
+	inactive.Status = "inactive"
+	removed := testAgent("agent-removed", "MYNAH (removed)", "member")
+	removed.Status = "active"
+	unicode := testAgent("agent-unicode", "MÜNAH (Unicode Agent)", "member")
+	unicode.Status = "active"
+	require.NoError(t, s.CreateAgent(ctx, voice))
+	require.NoError(t, s.CreateAgent(ctx, mac))
+	require.NoError(t, s.CreateAgent(ctx, inactive))
+	require.NoError(t, s.CreateAgent(ctx, removed))
+	require.NoError(t, s.CreateAgent(ctx, unicode))
+	require.NoError(t, s.RemoveAgent(ctx, removed.AgentID))
+
+	brand, err := s.FindAgentsByName(ctx, "mynah", 20)
+	require.NoError(t, err)
+	require.Len(t, brand, 2)
+	assert.Equal(t, []string{mac.AgentID, voice.AgentID}, []string{brand[0].AgentID, brand[1].AgentID})
+
+	bridge, err := s.FindAgentsByName(ctx, "voice bridge", 20)
+	require.NoError(t, err)
+	require.Len(t, bridge, 1)
+	assert.Equal(t, voice.AgentID, bridge[0].AgentID)
+
+	provider, err := s.FindAgentsByName(ctx, "appliance", 20)
+	require.NoError(t, err)
+	require.Len(t, provider, 1)
+	assert.Equal(t, voice.AgentID, provider[0].AgentID)
+
+	literalWildcard, err := s.FindAgentsByName(ctx, "%", 20)
+	require.NoError(t, err)
+	assert.Empty(t, literalWildcard, "LIKE metacharacters in a human query must not widen the roster scan")
+
+	limited, err := s.FindAgentsByName(ctx, "mynah", 1)
+	require.NoError(t, err)
+	assert.Len(t, limited, 1)
+
+	unicodeExactCase, err := s.FindAgentsByName(ctx, "mÜnah", 20)
+	require.NoError(t, err)
+	require.Len(t, unicodeExactCase, 1)
+	assert.Equal(t, unicode.AgentID, unicodeExactCase[0].AgentID)
+
+	unicodeDifferentCase, err := s.FindAgentsByName(ctx, "münah", 20)
+	require.NoError(t, err)
+	assert.Empty(t, unicodeDifferentCase, "non-ASCII code points require registered casing")
 }
 
 func TestUpdateAgent(t *testing.T) {

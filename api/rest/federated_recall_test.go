@@ -593,6 +593,81 @@ func TestFederationAvailableRunsTargetedLookupsInParallel(t *testing.T) {
 	assert.Equal(t, 2, fed.statusAwareCalls, "named discovery must reuse its authenticated status instead of probing each peer twice")
 }
 
+func TestFederationAvailableDiscoveryHonorsFederatedPipeDeny(t *testing.T) {
+	srv, _, _ := newTestServer(t, "")
+	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = badger.CloseBadger() })
+	srv.badgerStore = badger
+	srv.SetPostV22ForNextTxAccessor(func() bool { return true })
+	require.NoError(t, badger.SetCrossFed(
+		"chain-peer", "https://redacted.invalid", []byte("peer-pin"),
+		2, 0, []string{"research"}, nil, "active",
+	))
+	fed := &parallelStatusFederation{
+		fakeFederation: &fakeFederation{},
+		statuses: map[string]*federation.StatusResponse{
+			"chain-peer": {
+				ChainID: "chain-peer", NetworkName: "Peer SAGE",
+				PeerRBACGrant: &federation.PeerRBACGrant{Domains: []federation.PeerRBACDomainGrant{{
+					Domain: "research", Read: true,
+				}}},
+				PipeContacts: &federation.PipeContactGrant{
+					Version: federation.PipeContactVersion, AgreementID: strings.Repeat("a", 64),
+					Revision: strings.Repeat("b", 64), Contacts: []federation.PipeContact{{
+						AgentID: strings.Repeat("c", 64), ContactID: strings.Repeat("d", 64),
+						Address: strings.Repeat("c", 64) + "@chain-peer", Handle: "#peer/cccccccc",
+						DisplayName: "MYNAH (Remote)", Available: true, Accepting: true,
+						Domains: []federation.PipeContactDomain{{Domain: "research"}},
+					}},
+				},
+			},
+		},
+	}
+	srv.SetFederation(fed)
+
+	req, callerID := signedRequest(t, http.MethodGet, "/v1/federation/available?agent_name=mynah", nil)
+	require.NoError(t, badger.RegisterAgent(callerID, "restricted", "member", "", "test", "", 1))
+	require.NoError(t, badger.SetAgentPermissionWithCapabilities(
+		callerID, 1, `[{"domain":"research","read":true}]`, "*", "", "",
+		store.AgentCapabilityDenyFederatedPipe,
+	))
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var response struct {
+		Connections []availableFederationConnection `json:"connections"`
+		Total       int                             `json:"total"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+	assert.Empty(t, response.Connections)
+	assert.Zero(t, response.Total)
+	fed.mu.Lock()
+	statusCalls := fed.calls
+	fed.mu.Unlock()
+	assert.Zero(t, statusCalls, "the deny bit must stop recipient discovery before any peer probe")
+
+	// The general federation view remains useful for domain/topology discovery,
+	// but the same denied caller must not receive its embedded contact roster.
+	generalReq := httptest.NewRequest(http.MethodGet, "/v1/federation/available", nil)
+	generalReq = generalReq.WithContext(middleware.WithAgentID(generalReq.Context(), callerID))
+	generalRR := httptest.NewRecorder()
+	srv.handleFederationAvailable(generalRR, generalReq)
+	require.Equal(t, http.StatusOK, generalRR.Code, generalRR.Body.String())
+	require.NoError(t, json.Unmarshal(generalRR.Body.Bytes(), &response))
+	require.Len(t, response.Connections, 1)
+	connection := response.Connections[0]
+	assert.Equal(t, "chain-peer", connection.RemoteChainID)
+	assert.Equal(t, "Peer SAGE", connection.NetworkName)
+	assert.True(t, connection.Reachable)
+	assert.Equal(t, []string{"research"}, connection.SharedReadDomains)
+	assert.NotEmpty(t, connection.RemotePermissions)
+	assert.Empty(t, connection.RemoteAgents,
+		"the no-name topology view must not expose recipients while federated pipe is denied")
+	assert.False(t, connection.RemoteAgentsTruncated)
+}
+
 func TestFederationCallerACLMatchesLocalDomainPolicy(t *testing.T) {
 	srv, _, _ := newTestServer(t, "")
 	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
@@ -623,6 +698,7 @@ func TestFederationCallerACLMatchesLocalDomainPolicy(t *testing.T) {
 
 func TestFederatedContactAuthorizationRechecksCurrentLocalACL(t *testing.T) {
 	srv, _, _ := newTestServer(t, "")
+	srv.SetPostV22ForNextTxAccessor(func() bool { return true })
 	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = badger.CloseBadger() })
@@ -654,6 +730,16 @@ func TestFederatedContactAuthorizationRechecksCurrentLocalACL(t *testing.T) {
 		RemoteChainID string `json:"remote_chain_id"`
 		Domain        string `json:"domain"`
 	}{{RemoteChainID: "chain-innovium", Domain: "research"}}, response.AllowedContacts)
+
+	require.NoError(t, badger.SetAgentPermissionWithCapabilities(
+		callerID, 2, `[{"domain":"research","read":true}]`, "*", "", "",
+		store.AgentCapabilityDenyFederatedPipe,
+	))
+	denied := request()
+	require.Equal(t, http.StatusOK, denied.Code, denied.Body.String())
+	require.NoError(t, json.Unmarshal(denied.Body.Bytes(), &response))
+	assert.Empty(t, response.AllowedContacts,
+		"the federated pipe kill switch must invalidate already-cached contacts")
 
 	require.NoError(t, badger.SetAgentPermission(callerID, 2,
 		`[{"domain":"engineering","read":true}]`, "*", "", ""))

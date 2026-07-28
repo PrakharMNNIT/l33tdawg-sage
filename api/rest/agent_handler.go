@@ -330,6 +330,7 @@ func (s *Server) handleAgentSetPermission(w http.ResponseWriter, r *http.Request
 		VisibleAgents *string `json:"visible_agents"`
 		OrgID         *string `json:"org_id"`
 		DeptID        *string `json:"dept_id"`
+		Capabilities  *uint32 `json:"capabilities"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
@@ -366,12 +367,14 @@ func (s *Server) handleAgentSetPermission(w http.ResponseWriter, r *http.Request
 	// 2 in the v6.8.4 hotfix bundle (see also processAgentRegister idempotent
 	// path in internal/abci/app.go).
 	var existing *store.OnChainAgent
-	needBackfill := req.Clearance == nil || req.DomainAccess == nil || req.VisibleAgents == nil ||
-		req.OrgID == nil || req.DeptID == nil
-	if needBackfill && s.badgerStore != nil {
+	if s.badgerStore != nil {
 		if e, err := s.badgerStore.GetRegisteredAgent(targetID); err == nil {
 			existing = e
 		}
+	}
+	if s.isPostV22ForNextTx() && existing == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Agent permissions unavailable", "current consensus agent state is unavailable.")
+		return
 	}
 
 	clearance := uint8(1)
@@ -404,18 +407,58 @@ func (s *Server) handleAgentSetPermission(w http.ResponseWriter, r *http.Request
 	} else if existing != nil {
 		deptID = existing.DeptID
 	}
+	capabilities := store.AgentCapabilities(0)
+	if req.Capabilities != nil {
+		capabilities = store.AgentCapabilities(*req.Capabilities)
+	} else if existing != nil {
+		capabilities = existing.Capabilities
+	}
+	if !capabilities.Valid() {
+		writeProblem(w, http.StatusBadRequest, "Invalid capabilities", fmt.Sprintf("unknown capability bits: 0x%x", uint32(capabilities&^store.KnownAgentCapabilities)))
+		return
+	}
+	capabilitiesChanged := req.Capabilities != nil && (existing == nil || capabilities != existing.Capabilities)
+	if capabilitiesChanged && !s.isPostV22ForNextTx() {
+		writeProblem(w, http.StatusConflict, "Agent capabilities unavailable", "app-v22 must activate before agent capabilities can be assigned.")
+		return
+	}
+	permissionsChanged := existing == nil ||
+		clearance != existing.Clearance ||
+		domainAccess != existing.DomainAccess ||
+		visibleAgents != existing.VisibleAgents ||
+		(orgID != "" && orgID != existing.OrgID) ||
+		(deptID != "" && deptID != existing.DeptID) ||
+		capabilities != existing.Capabilities
+	if s.isPostV22ForNextTx() && permissionsChanged {
+		if s.badgerStore == nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Agent permissions unavailable", "consensus agent state is unavailable.")
+			return
+		}
+		callerID := middleware.ContextAgentID(r.Context())
+		caller, callerErr := s.badgerStore.GetRegisteredAgent(callerID)
+		if callerErr != nil || caller == nil || caller.Role != "admin" {
+			writeProblem(w, http.StatusForbidden, "Access denied", "only a global administrator can change agent permissions after app-v22.")
+			return
+		}
+	}
+	var wireCapabilities uint32
+	if req.Capabilities != nil {
+		wireCapabilities = *req.Capabilities
+	}
 
 	permTx := &tx.ParsedTx{
 		Type:      tx.TxTypeAgentSetPermission,
 		Nonce:     tx.MonotonicNonce(s.signingKey),
 		Timestamp: time.Now(),
 		AgentSetPermission: &tx.AgentSetPermission{
-			AgentID:       targetID,
-			Clearance:     clearance,
-			DomainAccess:  domainAccess,
-			VisibleAgents: visibleAgents,
-			OrgID:         orgID,
-			DeptID:        deptID,
+			AgentID:             targetID,
+			Clearance:           clearance,
+			DomainAccess:        domainAccess,
+			VisibleAgents:       visibleAgents,
+			OrgID:               orgID,
+			DeptID:              deptID,
+			Capabilities:        wireCapabilities,
+			CapabilitiesPresent: capabilitiesChanged,
 		},
 	}
 
@@ -548,6 +591,28 @@ func sanitizeAgentForRead(a *store.AgentEntry, privileged bool) *store.AgentEntr
 	return &out
 }
 
+// overlayOnChainAgentPolicyForRead prevents the SQL projection from becoming a
+// second authority for app-v22 policy fields. Projection persistence keeps the
+// normal path current, while this bounded Badger overlay also makes reads
+// correct across upgrades and crash-recovery windows where an older SQL row
+// still carries the pre-v22 zero mask.
+func (s *Server) overlayOnChainAgentPolicyForRead(agent *store.AgentEntry) {
+	if agent == nil || s.badgerStore == nil {
+		return
+	}
+	onChain, err := s.badgerStore.GetRegisteredAgent(agent.AgentID)
+	if err != nil || onChain == nil {
+		return
+	}
+	agent.Role = onChain.Role
+	agent.Clearance = int(onChain.Clearance)
+	agent.OrgID = onChain.OrgID
+	agent.DeptID = onChain.DeptID
+	agent.DomainAccess = onChain.DomainAccess
+	agent.VisibleAgents = onChain.VisibleAgents
+	agent.Capabilities = onChain.Capabilities
+}
+
 // handleGetRegisteredAgent handles GET /v1/agent/{id}.
 // Reads from offchain store (no tx broadcast needed).
 func (s *Server) handleGetRegisteredAgent(w http.ResponseWriter, r *http.Request) {
@@ -567,6 +632,7 @@ func (s *Server) handleGetRegisteredAgent(w http.ResponseWriter, r *http.Request
 		writeProblem(w, http.StatusNotFound, "Agent not found", fmt.Sprintf("No agent found with ID %s.", id))
 		return
 	}
+	s.overlayOnChainAgentPolicyForRead(agent)
 
 	callerID := middleware.ContextAgentID(r.Context())
 	privileged := callerID == id || s.callerIsOperatorOrAdmin(r.Context(), callerID)
@@ -594,6 +660,7 @@ func (s *Server) handleListRegisteredAgents(w http.ResponseWriter, r *http.Reque
 	// credential exchangeable for the agent key seed) or per-agent ACL topology.
 	sanitized := make([]*store.AgentEntry, 0, len(agents))
 	for _, a := range agents {
+		s.overlayOnChainAgentPolicyForRead(a)
 		sanitized = append(sanitized, sanitizeAgentForRead(a, false))
 	}
 
@@ -603,20 +670,20 @@ func (s *Server) handleListRegisteredAgents(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-type exactAgentNameFinder interface {
-	FindAgentsByExactName(ctx context.Context, name string, limit int) ([]*store.AgentEntry, error)
+type agentNameFinder interface {
+	FindAgentsByName(ctx context.Context, name string, limit int) ([]*store.AgentEntry, error)
 }
 
 // handleFindRegisteredAgents is the signed, bounded companion to the public
 // roster endpoint. MCP recipient discovery must not fetch ListAgents merely to
 // return at most 20 matches: that full endpoint computes every agent's derived
-// memory count. Exact matching shares the index-backed contact lookup path.
+// memory count. Local substring matching uses a capped metadata-only query.
 func (s *Server) handleFindRegisteredAgents(w http.ResponseWriter, r *http.Request) {
 	if s.agentStore == nil {
 		writeProblem(w, http.StatusServiceUnavailable, "Agent store unavailable", "Agent store not configured.")
 		return
 	}
-	finder, ok := s.agentStore.(exactAgentNameFinder)
+	finder, ok := s.agentStore.(agentNameFinder)
 	if !ok {
 		writeProblem(w, http.StatusNotImplemented, "Agent lookup unavailable", "The configured agent store does not support bounded name lookup.")
 		return
@@ -635,7 +702,7 @@ func (s *Server) handleFindRegisteredAgents(w http.ResponseWriter, r *http.Reque
 		}
 		limit = parsed
 	}
-	agents, err := finder.FindAgentsByExactName(r.Context(), name, limit)
+	agents, err := finder.FindAgentsByName(r.Context(), name, limit)
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "Lookup error", err.Error())
 		return

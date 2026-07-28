@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,10 +16,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/l33tdawg/sage/internal/auth"
+	"github.com/l33tdawg/sage/internal/idfmt"
 	"github.com/l33tdawg/sage/internal/memory"
 	"github.com/l33tdawg/sage/internal/store"
 )
@@ -32,6 +35,8 @@ const (
 	// its authenticated-but-untrusted body well below the general memory route
 	// budget so a paired peer cannot turn directory discovery into a read DoS.
 	maxPipeContactLookupRequestBytes = 2 << 10
+	minPipeContactHumanSelectorRunes = 2
+	pipeContactLookupQueryTimeout    = 2 * time.Second
 	maxFedTopK                       = 50
 	defaultFedTopK                   = 10
 	maxTimestampSkew                 = 5 * time.Minute
@@ -239,7 +244,7 @@ func (m *Manager) peerAuth(next http.Handler) http.Handler {
 				return
 			}
 			if !auth.VerifyRequestV2(pub, peerChain, m.localChainID, r.Method, reqPath, body, ts, nonce, sig) {
-				m.logger.Warn().Str("peer", peerChain).Str("agent", agentID[:16]).Msg("federation request denied: bad signature")
+				m.logger.Warn().Str("peer", peerChain).Str("agent", idfmt.Prefix(agentID)).Msg("federation request denied: bad signature")
 				httpError(w, http.StatusUnauthorized, "signature verification failed")
 				return
 			}
@@ -586,6 +591,10 @@ func (m *Manager) handlePipeContactLookup(w http.ResponseWriter, r *http.Request
 		httpError(w, http.StatusBadRequest, "provide exactly one valid contact selector")
 		return
 	}
+	if req.Name != "" && utf8.RuneCountInString(req.Name) < minPipeContactHumanSelectorRunes {
+		httpError(w, http.StatusBadRequest, "contact name selector is too short")
+		return
+	}
 	if req.Limit <= 0 {
 		req.Limit = maxPipeContactLookupResults
 	}
@@ -598,6 +607,46 @@ func (m *Manager) handlePipeContactLookup(w http.ResponseWriter, r *http.Request
 	if ss == nil || m.badger == nil {
 		httpError(w, http.StatusServiceUnavailable, "pipe contact lookup is unavailable")
 		return
+	}
+	// Human substring matching may require a bounded-output SQLite scan. Do
+	// that work before taking the revocation-sensitive policy/ownership/contact
+	// leases, then reload only the resulting (max 64) IDs under the leases
+	// below. A concurrent removal therefore either disappears on reload or
+	// waits for the live RBAC projection; a peer cannot hold revoke behind a
+	// leading-wildcard roster scan.
+	var prefetchedNameCandidateIDs []string
+	humanTarget := req.Target != "" &&
+		!strings.HasPrefix(req.Target, "#") &&
+		!isCanonicalAgentID(req.Target)
+	if _, chainID := splitPipeAddress(req.Target); chainID != "" {
+		humanTarget = false
+	}
+	if req.Name != "" || humanTarget {
+		query := req.Name
+		if query == "" {
+			query = req.Target
+		}
+		if utf8.RuneCountInString(query) < minPipeContactHumanSelectorRunes {
+			httpError(w, http.StatusBadRequest, "contact name selector is too short")
+			return
+		}
+		lookupCtx, cancelLookup := context.WithTimeout(r.Context(), pipeContactLookupQueryTimeout)
+		candidates, candidateErr := ss.FindPipeContactLookupCandidates(lookupCtx, query, maxPipeContactLookupCandidates)
+		cancelLookup()
+		if candidateErr != nil {
+			if errors.Is(candidateErr, context.DeadlineExceeded) || errors.Is(candidateErr, context.Canceled) {
+				httpError(w, http.StatusServiceUnavailable, "pipe contact candidate lookup timed out")
+				return
+			}
+			httpError(w, http.StatusInternalServerError, "pipe contact candidate lookup failed")
+			return
+		}
+		prefetchedNameCandidateIDs = make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			if candidate != nil {
+				prefetchedNameCandidateIDs = append(prefetchedNameCandidateIDs, candidate.AgentID)
+			}
+		}
 	}
 	policyUnlock := ss.LockSyncPolicyRead()
 	ownerUnlock := m.badger.LockDomainOwnershipRead()
@@ -631,7 +680,7 @@ func (m *Manager) handlePipeContactLookup(w http.ResponseWriter, r *http.Request
 		httpError(w, http.StatusForbidden, "requesting operator is not bound to this peer RBAC policy")
 		return
 	}
-	grant, total, err := m.buildPipeContactLookupGrant(r.Context(), peer, policy, req)
+	grant, total, err := m.buildPipeContactLookupGrant(r.Context(), peer, policy, req, prefetchedNameCandidateIDs)
 	if err != nil {
 		m.logger.Error().Err(err).Str("peer", peer.ChainID).Msg("federation pipe contact lookup projection failed")
 		releaseSnapshot()
@@ -738,6 +787,11 @@ func pipeContactMatchesTarget(contact PipeContact, target string) bool {
 }
 
 func pipeContactMatchesName(query string, contact PipeContact) (exact bool, partial bool) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return false, false
+	}
+	foldedQuery := strings.ToLower(query)
 	for _, candidate := range []string{contact.DisplayName, contact.RegisteredName, contact.Provider} {
 		candidate = strings.TrimSpace(candidate)
 		if candidate == "" {
@@ -746,8 +800,11 @@ func pipeContactMatchesName(query string, contact PipeContact) (exact bool, part
 		if strings.EqualFold(candidate, query) {
 			return true, false
 		}
+		if strings.Contains(strings.ToLower(candidate), foldedQuery) {
+			partial = true
+		}
 	}
-	return false, false
+	return false, partial
 }
 
 // handleQuery serves a scoped read-only recall to an authenticated peer.

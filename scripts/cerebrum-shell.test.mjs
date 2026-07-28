@@ -25,6 +25,15 @@ test('Access Controls is a first-class sidebar route', () => {
     assert.match(appSource, /accessMode \? 'access' : 'overview'/);
 });
 
+test('Access Controls exposes the exact signer identity behind every grant', () => {
+    const networkPage = appSource.slice(appSource.indexOf('function NetworkPage('), appSource.indexOf('function AddAgentWizard('));
+    assert.match(networkPage, /class="agent-id-short"[^>]*>ID \$\{String\(agent\.agent_id/);
+    assert.match(networkPage, /These permissions apply only to signer/);
+    assert.match(networkPage, /client must report this same Agent ID/);
+    assert.match(networkPage, /sage_status/);
+    assert.match(networkPage, /sage_inception/);
+});
+
 test('first-run onboarding offers a real create-or-join decision', () => {
     const onboarding = appSource.slice(appSource.indexOf('function OnboardingWizard('), appSource.indexOf('// PipelineView'));
     const guestJoin = appSource.slice(appSource.indexOf('function NetworkJoinGuestPanel('), appSource.indexOf('function RemoveConfirmModal('));
@@ -282,9 +291,9 @@ test('chain activity exposes committed RBAC changes and remains usable while emp
     assert.match(activity, /aria-label="Resize Chain Activity"/);
 });
 
-test('chain health recognizes app-v21 as the current consensus protocol', () => {
-    assert.match(appSource, /const appVerTone = appVer === '21'/);
-    assert.match(appSource, /Green when current \(21\)\./);
+test('chain health recognizes app-v22 as the current consensus protocol', () => {
+    assert.match(appSource, /const appVerTone = appVer === '22'/);
+    assert.match(appSource, /Green when current \(22\)\./);
     assert.doesNotMatch(appSource, /appVer === '15'/);
 });
 
@@ -671,6 +680,10 @@ test('access-control bulk actions stay scoped and saves expose consensus progres
         'bulk Modify must skip reserved shared domains that cannot carry level-3 grants');
     assert.match(matrix, /sharedModifyUnavailable[\s\S]*Shared domains support read\/write but cannot carry a level-3 Modify grant/,
         'reserved shared-domain rows must explain why Modify is unavailable');
+    assert.match(matrix, /denySharedWrite && isReservedSharedDomain\(domain\)/,
+        'the consensus shared-write deny bit must disable stale per-domain write projections');
+    assert.match(network, /sharedWriteDenied = \(editCapabilities & 2\) !== 0 && isReservedSharedDomain\(domain\)/,
+        'saving the companion preset must clear stale shared-domain write and modify selections');
     assert.match(network, /if \(accessSavingRef\.current\) return;/,
         'repeated clicks must not start duplicate on-chain save requests');
     assert.match(network, /accessSavingRef\.current = true;[\s\S]*finally \{[\s\S]*accessSavingRef\.current = false;/,
@@ -678,7 +691,17 @@ test('access-control bulk actions stay scoped and saves expose consensus progres
     assert.match(network, /Applying access on-chain…/);
     assert.match(network, /disabled=\$\{!accessDirty \|\| accessSaving\}/);
     assert.match(network, /\$\{accessSaving \? 'Saving…' : 'Save'\}/);
-    assert.match(matrix, /function DomainAccessMatrix\(\{ domains, domainAccess, onChange, onAddDomain, disabled, busy = false, allowModify = true \}\)/);
+    assert.match(matrix, /function DomainAccessMatrix\(\{ domains, domainAccess, onChange, disabled, busy = false, allowModify = true, denySharedWrite = false \}\)/);
+    assert.doesNotMatch(matrix, /Add new domain tag|handleAddDomain|setNewDomain|onAddDomain/,
+        'operators attribute access to agent-created domains instead of creating domain tags');
+    assert.match(matrix, /No domains yet\. Domains appear here as agents submit memories\./,
+        'the empty state must explain that domain creation belongs to agents');
+    assert.match(matrix, /placeholder="Filter domains\.\.\."/,
+        'operators must retain the existing-domain finder');
+    assert.match(matrix, /const allDomains = \[\.\.\.new Set\(\[\.\.\.domains, \.\.\.Object\.keys\(domainAccess\)\]\)\]\.sort\(\)/,
+        'persisted grants must remain visible for attribution even while inventory refreshes');
+    assert.match(matrix, />assigned<\/span>/,
+        'a grant absent from the current inventory must be attributed without calling it a new domain');
     assert.match(matrix, /disabled=\$\{busy\}/,
         'access controls must be frozen while their on-chain snapshot is being saved');
     assert.match(network, /if \(accessSavingRef\.current\) \{[\s\S]*Wait for Save to finish before switching agents/,

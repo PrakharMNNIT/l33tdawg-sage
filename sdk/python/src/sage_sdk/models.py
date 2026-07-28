@@ -323,6 +323,14 @@ class PipeMessage(BaseModel):
     federation_agreement_id: str | None = None
     federation_contact_id: str | None = None
     federation_contact_revision: str | None = None
+    # Response-only trust metadata derived by SAGE. These fields are optional
+    # so the SDK remains compatible with older nodes that predate the explicit
+    # pipeline authority boundary.
+    authority: str | None = None
+    trust: str | None = None
+    security_notice: str | None = None
+    payload_authority: str | None = None
+    result_authority: str | None = None
 
 
 class PipeInboxResponse(BaseModel):
@@ -346,6 +354,9 @@ class PipeDeliveryUpdate(BaseModel):
     attempts: int = 0
     last_error: str | None = None
     created_at: str | None = None
+    authority: str | None = None
+    trust: str | None = None
+    security_notice: str | None = None
 
 
 class PipeDeliveryUpdatesResponse(BaseModel):

@@ -629,7 +629,7 @@ func (s *Server) handleGetPending(w http.ResponseWriter, r *http.Request) {
 	// for shape-parity (a no-op once checkDomainAccess approves a concrete domain).
 	domainAccessApproved := false
 	if domainTag != "" {
-		if accessErr := checkDomainAccess(r.Context(), s.agentStore, s.badgerStore, agentID, domainTag, "read"); accessErr != nil {
+		if accessErr := s.checkDomainAccess(r.Context(), agentID, domainTag, "read"); accessErr != nil {
 			writeProblem(w, http.StatusForbidden, "Access denied", accessErr.Error())
 			return
 		}
@@ -638,7 +638,7 @@ func (s *Server) handleGetPending(w http.ResponseWriter, r *http.Request) {
 	if domainTag != "" && !domainAccessApproved && s.badgerStore != nil {
 		domainOwner, domErr := s.badgerStore.GetDomainOwner(domainTag)
 		if domErr == nil && domainOwner != "" {
-			hasAccess, accessErr := s.badgerStore.HasAccessMultiOrg(domainTag, agentID, 0, time.Now(), s.isPostV8Fork())
+			hasAccess, accessErr := s.hasMemoryReadAccess(domainTag, agentID, 0, time.Now())
 			if accessErr != nil || !hasAccess {
 				writeProblem(w, http.StatusForbidden, "Access denied",
 					fmt.Sprintf("No read access to domain %s", domainTag))
@@ -668,7 +668,7 @@ func (s *Server) handleGetPending(w http.ResponseWriter, r *http.Request) {
 			if rec.SubmittingAgent != agentID {
 				// Domain-read filter — only needed when no single domain was pre-gated.
 				if !domainAccessApproved && rec.DomainTag != "" {
-					if accessErr := checkDomainAccess(r.Context(), s.agentStore, s.badgerStore, agentID, rec.DomainTag, "read"); accessErr != nil {
+					if accessErr := s.checkDomainAccess(r.Context(), agentID, rec.DomainTag, "read"); accessErr != nil {
 						continue
 					}
 				}
@@ -678,7 +678,7 @@ func (s *Server) handleGetPending(w http.ResponseWriter, r *http.Request) {
 					if memClass > 0 {
 						domainOwner, domErr := s.badgerStore.GetDomainOwner(rec.DomainTag)
 						if domErr == nil && domainOwner != "" {
-							hasAccess, _ := s.badgerStore.HasAccessMultiOrg(rec.DomainTag, agentID, memClass, now, s.isPostV8Fork())
+							hasAccess, _ := s.hasMemoryReadAccess(rec.DomainTag, agentID, memClass, now)
 							if !hasAccess {
 								continue
 							}

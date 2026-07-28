@@ -33,6 +33,93 @@ func TestWriteChatGPTDesktopConfig_AppWideAndPreservesOtherServers(t *testing.T)
 	assert.Contains(t, config, `command = "/Applications/SAGE/sage-gui"`)
 	assert.Contains(t, config, `SAGE_HOME = "/tmp/sage-home"`)
 	assert.Contains(t, config, `SAGE_PROVIDER = "codex"`)
+	assert.NotContains(t, config, "SAGE_IDENTITY_PATH",
+		"the user-level Codex config must let the MCP process derive identity from each workspace")
+	assert.Contains(t, config, `SAGE_IDENTITY_MODE = "workspace"`,
+		"workspace mode must neutralize inherited shell identity variables")
+}
+
+func TestGlobalCodexConfigDerivesDistinctIdentityPerProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	sageHome := filepath.Join(home, ".sage")
+	globalConfig := filepath.Join(home, ".codex", "config.toml")
+	projectA := filepath.Join(home, "work", "project-a")
+	projectB := filepath.Join(home, "work", "project-b")
+
+	block := codexSageConfigBlock(globalConfig, "/bin/sage-gui", sageHome, "codex")
+	assert.NotContains(t, block, "SAGE_IDENTITY_PATH")
+	assert.Contains(t, block, `SAGE_IDENTITY_MODE = "workspace"`)
+	assert.Contains(t, block, `SAGE_PROJECT = ""`)
+
+	identityA := implicitMCPIdentityPath(sageHome, projectA, "codex", "")
+	identityB := implicitMCPIdentityPath(sageHome, projectB, "codex", "")
+	require.NotEqual(t, identityA, identityB)
+	assert.Contains(t, identityA, "project-a-agent-")
+	assert.Contains(t, identityB, "project-b-agent-")
+	assert.Equal(t,
+		filepath.Join(providerProjectAgentDir(sageHome, projectA, ""), "agent.key"),
+		identityA,
+		"global Codex MCP and its provider-neutral workspace hook must resolve the same key",
+	)
+}
+
+func TestWorkspaceIdentityModeIgnoresInheritedShellPins(t *testing.T) {
+	t.Setenv("SAGE_IDENTITY_MODE", "workspace")
+	t.Setenv("SAGE_IDENTITY_PATH", "/tmp/foreign-project.key")
+	t.Setenv("SAGE_AGENT_KEY", "/tmp/operator.key")
+
+	path, workspace := configuredMCPIdentityEnv()
+
+	assert.True(t, workspace)
+	assert.Empty(t, path)
+}
+
+func TestGlobalCodexConfigMigratesGeneratedSharedIdentityButPreservesCustomKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	sageHome := filepath.Join(home, ".sage")
+	globalConfig := filepath.Join(home, ".codex", "config.toml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(globalConfig), 0755))
+	generated := filepath.Join(sageHome, "agents", "global-codex", "agent.key")
+	require.NoError(t, os.WriteFile(globalConfig, []byte(codexSageConfigBlockWithIdentity(
+		globalConfig, "/old/sage-gui", sageHome, "codex", generated,
+	)), 0600))
+
+	_, err := mergeCodexConfigForProvider(globalConfig, "/new/sage-gui", sageHome, "codex")
+	require.NoError(t, err)
+	updated, err := os.ReadFile(globalConfig)
+	require.NoError(t, err)
+	assert.NotContains(t, string(updated), "SAGE_IDENTITY_PATH")
+
+	custom := filepath.Join(home, "keys", "pinned-agent.key")
+	require.NoError(t, os.WriteFile(globalConfig, []byte(codexSageConfigBlockWithIdentity(
+		globalConfig, "/old/sage-gui", sageHome, "codex", custom,
+	)), 0600))
+	_, err = mergeCodexConfigForProvider(globalConfig, "/new/sage-gui", sageHome, "codex")
+	require.NoError(t, err)
+	updated, err = os.ReadFile(globalConfig)
+	require.NoError(t, err)
+	assert.Contains(t, string(updated), `SAGE_IDENTITY_PATH = "`+custom+`"`)
+	assert.Contains(t, string(updated), `SAGE_IDENTITY_MODE = "pinned"`)
+
+	legacy := filepath.Join(home, "keys", "legacy-agent.key")
+	legacyConfig := strings.Replace(
+		codexSageConfigBlockWithIdentity(globalConfig, "/old/sage-gui", sageHome, "codex", ""),
+		`SAGE_IDENTITY_MODE = "workspace"`,
+		`SAGE_IDENTITY_MODE = "pinned"`+"\n"+`SAGE_AGENT_KEY = "`+legacy+`"`,
+		1,
+	)
+	require.NoError(t, os.WriteFile(globalConfig, []byte(legacyConfig), 0600))
+	_, err = mergeCodexConfigForProvider(globalConfig, "/new/sage-gui", sageHome, "codex")
+	require.NoError(t, err)
+	updated, err = os.ReadFile(globalConfig)
+	require.NoError(t, err)
+	assert.Contains(t, string(updated), `SAGE_IDENTITY_PATH = "`+legacy+`"`)
+	assert.Contains(t, string(updated), `SAGE_IDENTITY_MODE = "pinned"`)
+	assert.NotContains(t, string(updated), "SAGE_AGENT_KEY")
 }
 
 func TestMergeCodexConfig_PreservesComplexTOMLAndReplacesQuotedSage(t *testing.T) {

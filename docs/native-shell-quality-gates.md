@@ -4,11 +4,14 @@ These gates are release criteria, not aspirational telemetry. A native package
 is not promoted on any platform without immutable CI evidence for that platform.
 Browser CEREBRUM and the existing Go release matrix remain mandatory.
 
-Each gate names the release it blocks from. Most block from v11.11; the
-performance budgets beyond incremental shell RSS, and the accessibility gates,
-block from v11.14 — the roadmap's designated hardening pass. A gate that blocks
-later is still a gate: v11.11 must set it, establish the architecture behind it,
-record what is measurable, and ship nothing that forecloses it.
+Each gate names the release milestone that must establish it. Most begin in
+v11.11; the performance budgets beyond incremental shell RSS and the
+accessibility gates are v11.14 hardening work. Because the shell remains a
+private, undistributed alpha throughout v11 and first distribution is targeted
+at v12, those rows block native-shell distribution rather than unrelated v11
+release channels. A later distribution gate is still a gate: the bridge
+releases must establish the architecture, record what is measurable, and ship
+nothing that forecloses it.
 
 ## Current enforcement status
 
@@ -39,7 +42,7 @@ artifacts and their records are not release evidence.
 ## The native shell is alpha and does not gate releases
 
 **Browser CEREBRUM is the product. The native shell is a background track.**
-Through the v11.11–v11.13 bridge the shell is **alpha**: built, linted, and
+Through the v11.11–v11.14 bridge the shell is **alpha**: built, linted, and
 runtime-tested in CI, never staged as a public release asset, and not intended
 for end-user use. Users stay on the web version, and normal releases continue to
 ship bug fixes and capabilities on their usual cadence — federation, agent
@@ -129,12 +132,12 @@ bridge releases land; they become release-blocking at first distribution.
 Windows named-pipe reads and writes now use overlapped cancellable deadlines
 with native stalled/partial-frame tests in the code gate.
 
-The remaining performance budgets and the accessibility gates become
-release-blocking from **v11.14**, which the roadmap designates as the
-accessibility/performance/offline hardening pass. v11.11 sets those budgets,
-establishes the architecture, and records what is measurable; it does not
-enforce them. See the notes on each section below — that phasing is the
-roadmap's, and it is not licence to ship something that forecloses them.
+The remaining performance budgets and the accessibility gates are the
+**v11.14** accessibility/performance/offline hardening milestone. The current
+private alpha records the evidence it can measure, including idle CPU, but
+these rows become release-blocking when the native shell is first distributed
+at v12. See the notes on each section below — private-alpha status is not
+licence to ship a native package that lacks the required evidence.
 
 All three platforms now run an installed-package lifecycle smoke on a hosted
 runner. Each one installs from the constructed package, launches the installed
@@ -218,7 +221,8 @@ platform pass.
 
 ## Performance budgets
 
-These budgets are set in v11.11 and enforced in v11.14. That split is the
+These budgets are set in v11.11, instrumented/hardened through v11.14, and
+become release-blocking for the first distributed native shell in v12. That split is the
 roadmap's, not a relaxation: v11.11 "set budgets ... and establish [the]
 architecture now even though v11.14 performs the full hardening pass", and
 v11.14 "hold[s] the v11.11 performance budgets for the embedded experience on
@@ -231,14 +235,14 @@ from daemon boot, model boot, consensus, and queries.
 | Measure | Budget | Blocking from | Measurable today? |
 |---|---:|---|---|
 | Incremental shell RSS, daemon excluded | <= 200 MiB p95 | **v11.11** | yes — process RSS |
-| Settled shell idle CPU | <= 1% p95 | v11.14 | yes — sampled over the settle window |
-| Warm re-open to focused existing window | <= 500 ms p95 | v11.14 | partly — handoff is timable, "focused" needs a frontmost-window check |
-| Cold launch to bundled recovery paint | <= 1,000 ms p95 | v11.14 | no — needs a paint signal |
-| Ready daemon to interactive CEREBRUM | <= 2,000 ms p95 | v11.14 | no — needs an interactive signal |
-| Daemon loss to visible recovery action | <= 2,000 ms | v11.14 | no — needs a recovery-shown signal |
-| Shell/navigation input response | <= 100 ms p95 | v11.14 | no — needs UI automation and marks |
-| Native overhead over same browser action | <= 25 ms p95 | v11.14 | no — needs both paths instrumented |
-| MRI frame pacing | >= 55 FPS median; no recurring >100 ms stalls | v11.14 | no — needs frame timing and a real GPU |
+| Settled shell idle CPU | <= 1% p95 | first distribution (v12) | yes — sampled over the settle window |
+| Warm re-open to focused existing window | <= 500 ms p95 | first distribution (v12) | partly — handoff is timable, "focused" needs a frontmost-window check |
+| Cold launch to bundled recovery paint | <= 1,000 ms p95 | first distribution (v12) | no — needs a paint signal |
+| Ready daemon to interactive CEREBRUM | <= 2,000 ms p95 | first distribution (v12) | no — needs an interactive signal |
+| Daemon loss to visible recovery action | <= 2,000 ms | first distribution (v12) | no — needs a recovery-shown signal |
+| Shell/navigation input response | <= 100 ms p95 | first distribution (v12) | no — needs UI automation and marks |
+| Native overhead over same browser action | <= 25 ms p95 | first distribution (v12) | no — needs both paths instrumented |
+| MRI frame pacing | >= 55 FPS median; no recurring >100 ms stalls | first distribution (v12) | no — needs frame timing and a real GPU |
 
 **RSS blocks from v11.11 because it is the premise of the framework decision,
 not because it is convenient.** `desktop-shell-decision.md` rejected Electron at
@@ -274,7 +278,7 @@ recovery-shown or frame-timing signal, so they cannot be observed from outside
 the process at all. Until that exists those rows are set budgets, not measured
 ones, and nothing here should be read as evidence that they have been met.
 
-From v11.14, three consecutive benchmark runs must pass. A regression of more
+For the first distributed native shell in v12, three consecutive benchmark runs must pass. A regression of more
 than 10% against the last published release fails even when the absolute ceiling
 passes, unless the release record accepts the tradeoff with evidence. Hosted CI
 runners are acceptable for the RSS row; the latency and frame-pacing rows
@@ -288,7 +292,7 @@ roadmap reason: v11.11 "establish[es] keyboard navigation, focus visibility,
 screen-reader naming, and reduced-motion architecture now even though v11.14
 performs the full hardening pass", and v11.14 "meet[s] the accessibility bar v12
 treats as a release criterion". **The requirements below become release-blocking
-from v11.14.** v11.11 must establish the architecture that makes them
+for the first distributed native shell in v12.** v11.11 must establish the architecture that makes them
 achievable, and must not ship anything that forecloses them.
 
 The screen-reader matrix cannot be automated on hosted runners and needs a

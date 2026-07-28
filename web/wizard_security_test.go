@@ -105,8 +105,8 @@ func TestWizardSecurityGate_DefenseInDepth(t *testing.T) {
 	_ = r // touched so the broader test setup compiles cleanly
 }
 
-// TestWizard_Allows_SameOriginBrowser verifies the dashboard SPA's same-origin
-// fetches continue to reach the wizard endpoints (the path most users hit).
+// TestWizard_SameOriginBrowserNeedsOperatorSession verifies browser routing
+// headers alone no longer authorize subprocess-driving wizard endpoints.
 func TestWizard_Allows_SameOriginBrowser(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("wizard install path is POSIX-only")
@@ -125,7 +125,7 @@ func TestWizard_Allows_SameOriginBrowser(t *testing.T) {
 		req.Host = tc.host // a real same-origin request's Host matches its origin
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		assert.Equal(t, http.StatusOK, w.Code, "same-origin from %s should pass", tc.origin)
+		assert.Equal(t, http.StatusForbidden, w.Code, "same-origin from %s must still require operator authority", tc.origin)
 	}
 }
 
@@ -152,8 +152,8 @@ func TestWizard_Rejects_DNSRebinding(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code, "rebinding domain Host must be refused")
 }
 
-// TestWizard_Allows_NoOrigin_CLI confirms non-browser callers (curl, native
-// CLIs) which don't emit Origin headers continue to work.
+// TestWizard_Allows_NoOrigin_CLI confirms an unsigned CLI does not become the
+// operator merely by omitting browser headers.
 func TestWizard_Allows_NoOrigin_CLI(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("wizard install path is POSIX-only")
@@ -165,7 +165,7 @@ func TestWizard_Allows_NoOrigin_CLI(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/check-cloudflared", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
 // TestValidateCloudflareLoginURL exercises the login-URL allowlist used to
@@ -240,8 +240,9 @@ func TestAuthMiddleware_DeniesCrossOrigin_WhenEncryptionOff(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// TestAuthMiddleware_AllowsSameOrigin_WhenEncryptionOff confirms the SPA's
-// own fetches continue to work after the auth tightening.
+// TestAuthMiddleware_AllowsSameOrigin_WhenEncryptionOff confirms the outer
+// routing gate may admit the SPA while the sensitive-resource gate still
+// requires operator authority.
 func TestAuthMiddleware_AllowsSameOrigin_WhenEncryptionOff(t *testing.T) {
 	h, _ := newTestHandler(t)
 	r := testRouter(h)
@@ -252,5 +253,5 @@ func TestAuthMiddleware_AllowsSameOrigin_WhenEncryptionOff(t *testing.T) {
 	req.Host = "localhost:8080" // a real same-origin request's Host matches its origin
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, http.StatusForbidden, w.Code)
 }

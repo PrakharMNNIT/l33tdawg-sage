@@ -524,19 +524,20 @@ func agentOnChainKey(agentID string) []byte {
 
 // OnChainAgent represents an agent's on-chain state in BadgerDB.
 type OnChainAgent struct {
-	AgentID        string `json:"agent_id"`
-	Name           string `json:"name"`                      // Mutable display name (GUI-editable)
-	RegisteredName string `json:"registered_name,omitempty"` // Immutable name assigned at registration
-	Role           string `json:"role"`
-	BootBio        string `json:"boot_bio,omitempty"`
-	Provider       string `json:"provider,omitempty"`
-	P2PAddress     string `json:"p2p_address,omitempty"`
-	Clearance      uint8  `json:"clearance"`
-	DomainAccess   string `json:"domain_access,omitempty"`
-	VisibleAgents  string `json:"visible_agents,omitempty"`
-	OrgID          string `json:"org_id,omitempty"`
-	DeptID         string `json:"dept_id,omitempty"`
-	RegisteredAt   int64  `json:"registered_at"` // Block height
+	AgentID        string            `json:"agent_id"`
+	Name           string            `json:"name"`                      // Mutable display name (GUI-editable)
+	RegisteredName string            `json:"registered_name,omitempty"` // Immutable name assigned at registration
+	Role           string            `json:"role"`
+	BootBio        string            `json:"boot_bio,omitempty"`
+	Provider       string            `json:"provider,omitempty"`
+	P2PAddress     string            `json:"p2p_address,omitempty"`
+	Clearance      uint8             `json:"clearance"`
+	DomainAccess   string            `json:"domain_access,omitempty"`
+	VisibleAgents  string            `json:"visible_agents,omitempty"`
+	OrgID          string            `json:"org_id,omitempty"`
+	DeptID         string            `json:"dept_id,omitempty"`
+	Capabilities   AgentCapabilities `json:"capabilities,omitempty"`
+	RegisteredAt   int64             `json:"registered_at"` // Block height
 }
 
 // MemoryHashEntry represents the on-chain state for a memory.
@@ -4986,8 +4987,46 @@ func (s *BadgerStore) AddDeptMember(orgID, deptID, agentID string, clearance uin
 func (s *BadgerStore) RemoveDeptMember(orgID, deptID, agentID string) error {
 	return s.withDomainOwnershipMutation(func() error {
 		return s.update(func(txn *badger.Txn) error {
-			if err := s.txnDelete(txn, deptMemberKey(orgID, deptID, agentID)); err != nil {
+			targetKey := deptMemberKey(orgID, deptID, agentID)
+			if _, err := txn.Get(targetKey); err != nil {
+				if errors.Is(err, badger.ErrKeyNotFound) {
+					return fmt.Errorf("dept member not found: %s/%s/%s", orgID, deptID, agentID)
+				}
 				return err
+			}
+			if err := s.txnDelete(txn, targetKey); err != nil {
+				return err
+			}
+
+			// The historical reverse index stores one deterministic department
+			// even though forward membership is multi-valued. Recompute it from
+			// the remaining forward edges instead of deleting it blindly: a
+			// removal for one department must not erase a different membership,
+			// and a wrong/nonexistent target must not widen federation access.
+			prefix := []byte("dept_member:")
+			suffix := []byte(":" + agentID)
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = false
+			opts.Prefix = prefix
+			it := txn.NewIterator(opts)
+			defer it.Close()
+
+			nextReverse := ""
+			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+				key := it.Item().KeyCopy(nil)
+				if bytes.Equal(key, targetKey) || !bytes.HasSuffix(key, suffix) {
+					continue
+				}
+				scope := strings.TrimSuffix(strings.TrimPrefix(string(key), "dept_member:"), ":"+agentID)
+				parts := strings.SplitN(scope, ":", 2)
+				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+					return fmt.Errorf("invalid dept member key: %s", string(key))
+				}
+				nextReverse = parts[0] + ":" + parts[1]
+				break
+			}
+			if nextReverse != "" {
+				return s.txnSet(txn, agentDeptKey(agentID), []byte(nextReverse))
 			}
 			return s.txnDelete(txn, agentDeptKey(agentID))
 		})
@@ -5080,6 +5119,60 @@ func (s *BadgerStore) GetAgentDept(agentID string) (orgID, deptID string, err er
 	return
 }
 
+// GetFederationAllowedDomains retrieves the domain scopes for an organization
+// federation. Empty is deliberately restrictive; callers must require an
+// explicit "*" for an unscoped agreement.
+func (s *BadgerStore) GetFederationAllowedDomains(fedID string) ([]string, error) {
+	var allowedDomains []string
+	err := s.view(func(txn *badger.Txn) error {
+		item, getErr := txn.Get(federationKey(fedID))
+		if getErr != nil {
+			return getErr
+		}
+		return item.Value(func(val []byte) error {
+			var offset int
+			var decErr error
+			_, offset, decErr = decodeString(val, 0)
+			if decErr != nil {
+				return decErr
+			}
+			_, offset, decErr = decodeString(val, offset)
+			if decErr != nil {
+				return decErr
+			}
+			if offset+10 > len(val) {
+				return fmt.Errorf("invalid federation entry: missing access fields")
+			}
+			offset += 10 // maxClearance + expiresAt + requiresApproval
+			_, offset, decErr = decodeString(val, offset)
+			if decErr != nil {
+				return decErr
+			}
+			if offset+4 > len(val) {
+				return nil
+			}
+			count := int(binary.BigEndian.Uint32(val[offset : offset+4])) // #nosec G115 -- persisted slice length fits in int
+			offset += 4
+			for i := 0; i < count; i++ {
+				var domain string
+				domain, offset, decErr = decodeString(val, offset)
+				if decErr != nil {
+					return decErr
+				}
+				allowedDomains = append(allowedDomains, domain)
+			}
+			return nil
+		})
+	})
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return nil, fmt.Errorf("federation not found: %s", fedID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return allowedDomains, nil
+}
+
 // GetFederationAllowedDepts retrieves the allowed departments for a federation.
 func (s *BadgerStore) GetFederationAllowedDepts(fedID string) ([]string, error) {
 	var allowedDepts []string
@@ -5163,7 +5256,24 @@ func (s *BadgerStore) GetFederationAllowedDepts(fedID string) ([]string, error) 
 // on the consensus path and app.IsPostV8Fork() (advisory chain-height read)
 // on REST handlers.
 func (s *BadgerStore) HasAccessMultiOrg(domain, agentID string, memoryClassification uint8, blockTime time.Time, postFork bool) (bool, error) {
-	return s.hasAccessMultiOrg(domain, agentID, 1, memoryClassification, blockTime, postFork)
+	return s.HasAccessMultiOrgWithFederationPolicy(domain, agentID, memoryClassification, blockTime, postFork, false)
+}
+
+// HasAccessMultiOrgWithFederationPolicy is the fork-aware form used by
+// consensus and live app-v22 callers. enforceAppV22Federation gates the
+// app-v22 organization-federation scope rules so historical blocks retain the
+// legacy behavior that ignored AllowedDomains, AllowedDepts, and malformed
+// MaxClearance values.
+func (s *BadgerStore) HasAccessMultiOrgWithFederationPolicy(
+	domain, agentID string,
+	memoryClassification uint8,
+	blockTime time.Time,
+	postFork, enforceAppV22Federation bool,
+) (bool, error) {
+	return s.hasAccessMultiOrg(
+		domain, agentID, 1, memoryClassification, blockTime,
+		postFork, enforceAppV22Federation,
+	)
 }
 
 // HasWriteAccessMultiOrg is the write-verb sibling of HasAccessMultiOrg.
@@ -5178,7 +5288,12 @@ func (s *BadgerStore) HasWriteAccessMultiOrg(domain, agentID string, blockTime t
 	return s.HasAccess(domain, agentID, 2, blockTime)
 }
 
-func (s *BadgerStore) hasAccessMultiOrg(domain, agentID string, directGrantLevel, requiredClearance uint8, blockTime time.Time, postFork bool) (bool, error) {
+func (s *BadgerStore) hasAccessMultiOrg(
+	domain, agentID string,
+	directGrantLevel, requiredClearance uint8,
+	blockTime time.Time,
+	postFork, enforceAppV22Federation bool,
+) (bool, error) {
 	// Step 1: Check direct grant. Post-fork walks the dotted path so a grant
 	// on a parent domain covers descendant writes; pre-fork preserves exact
 	// match (v7.1.1-equivalent replay).
@@ -5258,7 +5373,11 @@ func (s *BadgerStore) hasAccessMultiOrg(domain, agentID string, directGrantLevel
 			if agentOrg == domainOrg {
 				continue
 			}
-			ok, fedErr := s.checkFederationAccess(agentOrg, domainOrg, agentID, clearance, requiredClearance, blockTime)
+			ok, fedErr := s.checkFederationAccess(
+				agentOrg, domainOrg, agentID, domain,
+				clearance, requiredClearance, blockTime,
+				enforceAppV22Federation,
+			)
 			if fedErr == nil && ok {
 				return true, nil
 			}
@@ -5271,7 +5390,12 @@ func (s *BadgerStore) hasAccessMultiOrg(domain, agentID string, directGrantLevel
 // checkFederationAccess evaluates a single (agentOrg, domainOrg) pair against
 // any active federation between them. Extracted so HasAccessMultiOrg can fan
 // out across multi-org members without nested loops blowing up the function.
-func (s *BadgerStore) checkFederationAccess(agentOrg, domainOrg, agentID string, agentClearance, memoryClassification uint8, blockTime time.Time) (bool, error) {
+func (s *BadgerStore) checkFederationAccess(
+	agentOrg, domainOrg, agentID, domain string,
+	agentClearance, memoryClassification uint8,
+	blockTime time.Time,
+	enforceAppV22Federation bool,
+) (bool, error) {
 	fedID, err := s.FindFederation(agentOrg, domainOrg)
 	if err != nil {
 		return false, nil
@@ -5280,6 +5404,9 @@ func (s *BadgerStore) checkFederationAccess(agentOrg, domainOrg, agentID string,
 	// Step 6: Get federation details and check constraints
 	_, _, maxClearance, expiresAtUnix, status, err := s.GetFederation(fedID)
 	if err != nil || status != "active" {
+		return false, nil
+	}
+	if enforceAppV22Federation && maxClearance > uint8(ClearanceTopSecret) {
 		return false, nil
 	}
 
@@ -5296,13 +5423,23 @@ func (s *BadgerStore) checkFederationAccess(agentOrg, domainOrg, agentID string,
 		return false, nil // Agent's clearance insufficient for this memory
 	}
 
-	// Step 7: Department-aware filtering for cross-org federation
-	_, agentDept, deptErr := s.GetAgentDept(agentID)
-	if deptErr == nil && agentDept != "" {
-		// Agent is in a department — check if federation restricts by dept
+	if enforceAppV22Federation {
+		allowedDomains, scopeErr := s.GetFederationAllowedDomains(fedID)
+		if scopeErr != nil {
+			return false, scopeErr
+		}
+		if !organizationFederationDomainAllowed(allowedDomains, domain) {
+			return false, nil
+		}
+
+		// Step 7: Department-aware filtering for cross-org federation. Exact
+		// forward membership is authoritative; the legacy one-slot reverse
+		// index cannot represent membership in multiple departments or orgs.
 		allowedDepts, fedDeptErr := s.GetFederationAllowedDepts(fedID)
-		if fedDeptErr == nil && len(allowedDepts) > 0 {
-			// Check for wildcard
+		if fedDeptErr != nil {
+			return false, fedDeptErr
+		}
+		if len(allowedDepts) > 0 {
 			hasWildcard := false
 			for _, d := range allowedDepts {
 				if d == "*" {
@@ -5311,10 +5448,12 @@ func (s *BadgerStore) checkFederationAccess(agentOrg, domainOrg, agentID string,
 				}
 			}
 			if !hasWildcard {
-				// Verify agent's dept is in the allowed list
 				deptAllowed := false
 				for _, d := range allowedDepts {
-					if d == agentDept {
+					if d == "" {
+						continue
+					}
+					if _, _, membershipErr := s.GetDeptMemberClearance(agentOrg, d, agentID); membershipErr == nil {
 						deptAllowed = true
 						break
 					}
@@ -5327,6 +5466,24 @@ func (s *BadgerStore) checkFederationAccess(agentOrg, domainOrg, agentID string,
 	}
 
 	return true, nil
+}
+
+// organizationFederationDomainAllowed mirrors federation.DomainAllowed without
+// importing internal/federation (which already depends on store): "*", exact,
+// or dotted-ancestor coverage. Empty scopes and empty requested domains deny.
+func organizationFederationDomainAllowed(allowed []string, domain string) bool {
+	for _, candidate := range allowed {
+		if candidate == "*" {
+			return true
+		}
+		if candidate == "" || domain == "" {
+			continue
+		}
+		if candidate == domain || strings.HasPrefix(domain, candidate+".") {
+			return true
+		}
+	}
+	return false
 }
 
 // AppendAccessLog appends an audit log entry to BadgerDB.
@@ -5357,6 +5514,16 @@ func (s *BadgerStore) AppendAccessLog(height int64, agentID, domain, action stri
 
 // RegisterAgent stores a new agent's on-chain identity.
 func (s *BadgerStore) RegisterAgent(agentID, name, role, bio, provider, p2pAddress string, height int64) error {
+	return s.RegisterAgentWithCapabilities(agentID, name, role, bio, provider, p2pAddress, height, 0)
+}
+
+// RegisterAgentWithCapabilities atomically creates an agent with its initial
+// app-v22 capability mask. Legacy callers use RegisterAgent and therefore keep
+// the exact zero-mask record they have always produced.
+func (s *BadgerStore) RegisterAgentWithCapabilities(agentID, name, role, bio, provider, p2pAddress string, height int64, capabilities AgentCapabilities) error {
+	if !capabilities.Valid() {
+		return fmt.Errorf("unknown agent capability bits: 0x%x", uint32(capabilities&^KnownAgentCapabilities))
+	}
 	agent := &OnChainAgent{
 		AgentID:        agentID,
 		Name:           name,
@@ -5366,6 +5533,7 @@ func (s *BadgerStore) RegisterAgent(agentID, name, role, bio, provider, p2pAddre
 		Provider:       provider,
 		P2PAddress:     p2pAddress,
 		Clearance:      1, // Default: INTERNAL
+		Capabilities:   capabilities,
 		RegisteredAt:   height,
 	}
 	data, err := json.Marshal(agent)
@@ -5397,6 +5565,29 @@ func (s *BadgerStore) GetRegisteredAgent(agentID string) (*OnChainAgent, error) 
 		agent.RegisteredName = agent.Name
 	}
 	return &agent, nil
+}
+
+// GetRegisteredAgentCapabilities returns the small app-v22 authorization
+// projection needed by bounded transport gates without making callers import
+// Badger's missing-key sentinel or retain the full agent record.
+func (s *BadgerStore) GetRegisteredAgentCapabilities(agentID string) (AgentCapabilities, bool, error) {
+	agent, err := s.GetRegisteredAgent(agentID)
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if agent == nil {
+		return 0, false, nil
+	}
+	if !agent.Capabilities.Valid() {
+		return 0, true, fmt.Errorf(
+			"unknown agent capability bits: 0x%x",
+			uint32(agent.Capabilities&^KnownAgentCapabilities),
+		)
+	}
+	return agent.Capabilities, true, nil
 }
 
 // IsAgentRegistered checks if an agent exists on-chain.
@@ -5796,31 +5987,56 @@ func (s *BadgerStore) SetRawForTest(key, value []byte) error {
 
 // SetAgentPermission updates an agent's permissions on-chain.
 func (s *BadgerStore) SetAgentPermission(agentID string, clearance uint8, domainAccess, visibleAgents, orgID, deptID string) error {
-	return s.update(func(txn *badger.Txn) error {
-		item, err := txn.Get(agentOnChainKey(agentID))
-		if err != nil {
-			return fmt.Errorf("agent not found: %w", err)
-		}
-		var agent OnChainAgent
-		if valErr := item.Value(func(val []byte) error {
-			return json.Unmarshal(val, &agent)
-		}); valErr != nil {
-			return valErr
-		}
-		agent.Clearance = clearance
-		agent.DomainAccess = domainAccess
-		agent.VisibleAgents = visibleAgents
-		if orgID != "" {
-			agent.OrgID = orgID
-		}
-		if deptID != "" {
-			agent.DeptID = deptID
-		}
-		data, err := json.Marshal(&agent)
-		if err != nil {
-			return err
-		}
-		return s.txnSet(txn, agentOnChainKey(agentID), data)
+	return s.setAgentPermission(agentID, clearance, domainAccess, visibleAgents, orgID, deptID, nil)
+}
+
+// SetAgentPermissionWithCapabilities applies the app-v22 full permission
+// replacement, including the consensus-enforced capability mask.
+func (s *BadgerStore) SetAgentPermissionWithCapabilities(agentID string, clearance uint8, domainAccess, visibleAgents, orgID, deptID string, capabilities AgentCapabilities) error {
+	if !capabilities.Valid() {
+		return fmt.Errorf(
+			"unknown agent capability bits: 0x%x",
+			uint32(capabilities&^KnownAgentCapabilities),
+		)
+	}
+	return s.setAgentPermission(agentID, clearance, domainAccess, visibleAgents, orgID, deptID, &capabilities)
+}
+
+func (s *BadgerStore) setAgentPermission(agentID string, clearance uint8, domainAccess, visibleAgents, orgID, deptID string, capabilities *AgentCapabilities) error {
+	// Permission publication shares the same lease as federated actions that
+	// consume ownership/grant/capability state. Once this update returns, no
+	// payload authorized under the older record can still be crossing the
+	// network; transaction-scoped stores acquire the write side only at commit.
+	return s.withDomainOwnershipMutation(func() error {
+		return s.update(func(txn *badger.Txn) error {
+			item, err := txn.Get(agentOnChainKey(agentID))
+			if err != nil {
+				return fmt.Errorf("agent not found: %w", err)
+			}
+			var agent OnChainAgent
+			if valErr := item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &agent)
+			}); valErr != nil {
+				return valErr
+			}
+			agent.Clearance = clearance
+			agent.DomainAccess = domainAccess
+			agent.VisibleAgents = visibleAgents
+			if orgID != "" {
+				agent.OrgID = orgID
+			}
+			if deptID != "" {
+				agent.DeptID = deptID
+			}
+			if capabilities != nil {
+				agent.Capabilities = *capabilities
+			}
+			data, err := json.Marshal(&agent)
+			if err != nil {
+				return err
+			}
+			return s.txnSet(txn, agentOnChainKey(agentID), data)
+		})
 	})
 }
 

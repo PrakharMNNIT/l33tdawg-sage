@@ -53,6 +53,10 @@ func (s *Server) handleDeptRegister(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing department name", "name is required")
 		return
 	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 department registration requires a global admin.")
+		return
+	}
 
 	// Deterministic dept ID from org ID + name.
 	deptIDHash := sha256.Sum256([]byte(orgID + req.Name))
@@ -168,6 +172,10 @@ func (s *Server) handleDeptAddMember(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing agent ID", "agent_id is required")
 		return
 	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 department membership changes require a global admin.")
+		return
+	}
 	// Only a missing clearance falls back to the safe INTERNAL default; an
 	// explicit 0 (ClearancePublic) is honored verbatim.
 	clearance := 1
@@ -226,6 +234,10 @@ func (s *Server) handleDeptRemoveMember(w http.ResponseWriter, r *http.Request) 
 	agentToRemove := chi.URLParam(r, "agent_id")
 	if orgID == "" || deptID == "" || agentToRemove == "" {
 		writeProblem(w, http.StatusBadRequest, "Missing parameters", "org_id, dept_id, and agent_id path parameters are required")
+		return
+	}
+	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
+		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 department membership changes require a global admin.")
 		return
 	}
 

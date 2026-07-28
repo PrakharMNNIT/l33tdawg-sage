@@ -145,7 +145,7 @@ The dashboard's **Connect an AI tool** flow (in the onboarding wizard, and on th
 
 ### 1. Same machine, one click
 
-For ChatGPT desktop **Codex mode**, Claude Code, Codex CLI, Cursor, Windsurf, or Claude Desktop running on the same computer as SAGE. Pick the tool, give a project folder if it is a per-project client (Claude Code, Codex CLI, Cursor), and click Connect. SAGE **writes the config file itself** and the agent registers its own on-chain identity on first connect. ChatGPT desktop Codex mode uses the app-wide `~/.codex/config.toml`; Work does not use this local stdio configuration. Restart the tool and it picks up its SAGE connection. You manage its identity and permissions afterward on the Agents page.
+For ChatGPT desktop **Codex mode**, Claude Code, Codex CLI, Cursor, Windsurf, or Claude Desktop running on the same computer as SAGE. Pick the tool, give a project folder if it is a per-project client (Claude Code, Codex CLI, Cursor), and click Connect. SAGE **writes the config file itself** and the agent registers its own on-chain identity on first connect. ChatGPT desktop Codex mode uses the app-wide `~/.codex/config.toml`, but the MCP process derives a separate stable Codex signing identity from each active workspace folder; an explicitly pinned custom `SAGE_IDENTITY_PATH` still wins. Work does not use this local stdio configuration. Restart the tool and it picks up its SAGE connection. You manage its identity and permissions afterward on the Agents page, which shows the exact signer ID each grant applies to.
 
 ### 2. ChatGPT Work or remote MCP on another computer
 
@@ -270,7 +270,7 @@ This is safe to run on existing installs — it won't overwrite your `.mcp.json`
 
 The new ChatGPT desktop app contains Chat, Work, and Codex, but the connection differs by mode:
 
-- **Codex mode on the same computer:** open **Connect an AI tool > On this computer > ChatGPT desktop — Codex**. SAGE merges its local MCP server into `~/.codex/config.toml`. Restart ChatGPT, select Codex, and start a new task.
+- **Codex mode on the same computer:** open **Connect an AI tool > On this computer > ChatGPT desktop — Codex**. SAGE merges its local MCP server into `~/.codex/config.toml`; that shared registration derives a distinct identity from each workspace rather than pinning every project to one `global-codex` key. Restart ChatGPT, select Codex, and start a new task.
 - **ChatGPT Work (web or desktop):** open **Connect an AI tool > ChatGPT Work**. SAGE manages OpenAI's `tunnel-client` in the background, then Work uses SAGE through the installed plugin. The advanced command block is only a fallback for operators who want to run the daemon by hand.
 - **Regular Chat:** remains supported in ChatGPT and starts from the **Quick chat** button, but it is not the local Codex MCP runtime.
 

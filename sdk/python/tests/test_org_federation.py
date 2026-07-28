@@ -167,6 +167,7 @@ def test_propose_federation(client, mock_api):
         max_clearance=3,
         expires_at=0,
         requires_approval=True,
+        proposer_org_id=ORG_ID,
     )
     assert result["status"] == "proposed"
 
@@ -319,6 +320,7 @@ async def test_async_propose_federation(async_client, mock_api):
     result = await async_client.propose_federation(
         target_org_id=TARGET_ORG_ID,
         allowed_domains=["crypto"],
+        proposer_org_id=ORG_ID,
     )
     assert result["status"] == "proposed"
 

@@ -864,6 +864,7 @@ func runServe(startupProof string) (rerr error) {
 	restServer.SetPostV8ForkAccessor(app.IsPostV8Fork)
 	restServer.SetPostV17ForNextTxAccessor(app.IsAppV17ActiveForNextTx)
 	restServer.SetPostV20ForNextTxAccessor(app.IsAppV20ActiveForNextTx)
+	restServer.SetPostV22ForNextTxAccessor(app.IsAppV22ActiveForNextTx)
 	restServer.SetGovernanceDomainAccessor(app.GovernanceDelegationDomain)
 
 	// v7.1: tell the REST layer which ed25519 public key identifies the local
@@ -919,6 +920,7 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.TunnelClient = tunnelClientMgr  // managed OpenAI tunnel-client for ChatGPT/Codex
 	dashboard.BadgerStore = badgerStore       // Wire on-chain RBAC for agent isolation
 	dashboard.PostV8ForkFn = app.IsPostV8Fork // v8.0: ancestor-walk grants on post-fork dashboards
+	dashboard.PostV22ForNextTxFn = app.IsAppV22ActiveForNextTx
 	dashboard.ScopedProjectionRebuildFn = func(rebuildCtx context.Context) (int, error) {
 		rebuilt, rebuildErr := rebuildScopedProjection(rebuildCtx)
 		if rebuildErr != nil {
@@ -1008,6 +1010,7 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.AppV18ActiveFn = app.IsAppV18ActiveForNextTx
 	dashboard.AppV19ActiveFn = app.IsAppV19ActiveForNextTx // app-v19: local-agents-default-READ flip (off-consensus)
 	dashboard.AppV20ActiveFn = app.IsAppV20ActiveForNextTx
+	dashboard.AppV22ActiveFn = app.IsAppV22ActiveForNextTx
 	dashboard.GovernanceDomainFn = app.GovernanceDelegationDomain
 	dashboard.StrictRBAC = cfg.RBAC.Strict // opt-out of the app-v19 default-read flip
 	// Embeddings setup: flip the config to the bundled Ollama + nomic-embed-text
@@ -1258,6 +1261,7 @@ func runServe(startupProof string) (rerr error) {
 			Badger:           badgerStore,
 			MemStore:         sqliteStore,
 			PostV20ForNextTx: app.IsAppV20ActiveForNextTx,
+			PostV22ForNextTx: app.IsAppV22ActiveForNextTx,
 			PostV8ForAccess:  app.IsPostV8Fork,
 			Logger:           logger,
 		})

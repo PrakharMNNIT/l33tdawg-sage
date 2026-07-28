@@ -115,6 +115,7 @@ type redeemRateLimiter struct {
 
 const redeemMaxAttempts = 10
 const redeemWindow = 1 * time.Minute
+const redeemMaxTrackedIPs = 4096
 
 // allow returns true if the IP is within the rate limit.
 func (rl *redeemRateLimiter) allow(ip string) bool {
@@ -127,22 +128,53 @@ func (rl *redeemRateLimiter) allow(ip string) bool {
 		rl.attempts = make(map[string][]time.Time)
 	}
 
-	// Prune old entries
+	// Prune this caller before applying its rate limit.
 	fresh := rl.attempts[ip][:0:0]
 	for _, t := range rl.attempts[ip] {
 		if t.After(cutoff) {
 			fresh = append(fresh, t)
 		}
 	}
+	if len(fresh) == 0 {
+		delete(rl.attempts, ip)
+	} else {
+		rl.attempts[ip] = fresh
+	}
 
 	if len(fresh) >= redeemMaxAttempts {
-		rl.attempts[ip] = fresh
 		return false
+	}
+
+	// Claim and pairing redemption are unauthenticated, so source churn must
+	// not create one permanent map entry per address. Sweep expired buckets at
+	// the bound, then fail closed for a new address if every live slot remains
+	// occupied. Existing tracked addresses retain their ordinary per-IP limit.
+	if _, tracked := rl.attempts[ip]; !tracked && len(rl.attempts) >= redeemMaxTrackedIPs {
+		rl.sweepLocked(cutoff)
+		if len(rl.attempts) >= redeemMaxTrackedIPs {
+			return false
+		}
 	}
 
 	fresh = append(fresh, now)
 	rl.attempts[ip] = fresh
 	return true
+}
+
+func (rl *redeemRateLimiter) sweepLocked(cutoff time.Time) {
+	for ip, times := range rl.attempts {
+		fresh := times[:0:0]
+		for _, t := range times {
+			if t.After(cutoff) {
+				fresh = append(fresh, t)
+			}
+		}
+		if len(fresh) == 0 {
+			delete(rl.attempts, ip)
+		} else {
+			rl.attempts[ip] = fresh
+		}
+	}
 }
 
 // sweep drops entries whose timestamps have all aged out, bounding map growth
@@ -152,18 +184,7 @@ func (rl *redeemRateLimiter) sweep() {
 	cutoff := time.Now().Add(-redeemWindow)
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	for ip, times := range rl.attempts {
-		keep := false
-		for _, t := range times {
-			if t.After(cutoff) {
-				keep = true
-				break
-			}
-		}
-		if !keep {
-			delete(rl.attempts, ip)
-		}
-	}
+	rl.sweepLocked(cutoff)
 }
 
 // generatePairingCode creates a code like "SAG-X7KP4M2N" using crypto/rand.
@@ -217,13 +238,15 @@ func handleCreatePairingCode(agentStore store.AgentStore, ps *PairingStore) http
 // UNAUTHENTICATED — the code IS the authentication.
 func handleRedeemPairingCode(agentStore store.AgentStore, ps *PairingStore, rl *redeemRateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Rate limit by IP to prevent brute-force attacks
-		ip := r.RemoteAddr
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			ip = strings.Split(fwd, ",")[0]
-		}
-		ip = strings.TrimSpace(ip)
-		if !rl.allow(ip) {
+		// A successful response contains the Ed25519 agent key. Never let a
+		// browser or intermediary retain either success or error responses.
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+
+		// The public pairing route is not behind a configured trusted-proxy
+		// boundary, so caller-controlled forwarding headers are not identity.
+		// Use only the socket peer, matching the agent-claim route.
+		if !rl.allow(clientIP(r)) {
 			writeError(w, http.StatusTooManyRequests, "too many redemption attempts, try again later")
 			return
 		}

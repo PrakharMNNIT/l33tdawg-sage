@@ -190,6 +190,9 @@ type DashboardHandler struct {
 	// instead of doing exact-match (HasAccess). nil keeps pre-fork
 	// (v7.1.1-equivalent) semantics.
 	PostV8ForkFn func() bool
+	// PostV22ForNextTxFn is the off-consensus advisory accessor for app-v22
+	// federation-scope enforcement. nil preserves the historical evaluator.
+	PostV22ForNextTxFn func() bool
 
 	// ConnectFunc performs a same-machine one-click connect for a provider
 	// (claude-code, codex, cursor, windsurf, claude-desktop): it writes the
@@ -247,6 +250,9 @@ type DashboardHandler struct {
 	// AppV20ActiveFn reports whether a newly broadcast scope_action can execute
 	// under app-v20. nil/false keeps the dashboard construction path disabled.
 	AppV20ActiveFn func() bool
+	// AppV22ActiveFn reports whether capability-bearing agent permission
+	// transactions can execute in the next block.
+	AppV22ActiveFn func() bool
 	// GovernanceDomainFn returns the committed app-v20 chain authorization
 	// domain. Post-v20 dashboard governance fails closed when it is unavailable.
 	GovernanceDomainFn func() string
@@ -459,35 +465,126 @@ func verifiedDashboardAgentID(ctx context.Context) string {
 	return agentID
 }
 
-// isCEREBRUMOperatorRequest distinguishes the local dashboard operator from a
-// signed agent or an unauthenticated LAN process. Browser headers provide CSRF
-// protection, not identity: non-loopback browsers must also carry a real
-// encrypted-dashboard session. Older WebViews can omit Fetch Metadata and
-// Origin on same-origin requests; those requests are admitted only when they
-// come from loopback, target a safe local/IP Host, and carry a valid encrypted
-// dashboard session. On encryption-off nodes operator mutations and full-board
-// reads are therefore loopback-only.
+// isCEREBRUMOperatorRequest distinguishes the dashboard operator from an
+// ordinary signed agent or an unauthenticated local process. Routing headers,
+// loopback source addresses, Origin, and Fetch Metadata are not identity.
+// Authority is either:
+//   - the exact configured node-operator identity on a cryptographically
+//     verified request (usable from any route), or
+//   - a real encrypted-dashboard session that also passes the local/browser
+//     CSRF and anti-rebinding checks.
+//
+// Encryption-off nodes have no browser session authority: privileged
+// CEREBRUM controls require the exact node-operator signature.
 func (h *DashboardHandler) isCEREBRUMOperatorRequest(r *http.Request) bool {
-	if verifiedDashboardAgentID(r.Context()) != "" || !isLocalRequest(r) {
+	operatorID := strings.TrimSpace(h.NodeOperatorAgentID)
+	if verifiedAgentID := verifiedDashboardAgentID(r.Context()); verifiedAgentID != "" {
+		return operatorID != "" && verifiedAgentID == operatorID
+	}
+	if headerAgentID := strings.TrimSpace(r.Header.Get("X-Agent-ID")); headerAgentID != "" {
+		return operatorID != "" && headerAgentID == operatorID && h.validAgentSignature(r)
+	}
+
+	if !h.Encrypted.Load() || !isLocalRequest(r) {
 		return false
 	}
 	secFetch := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if secFetch == "" && origin == "" {
-		if !isLoopbackRemote(r.RemoteAddr) || !hostIsLoopbackOrIP(r.Host) || !h.Encrypted.Load() {
+		if !isLoopbackRemote(r.RemoteAddr) || !hostIsLoopbackOrIP(r.Host) {
 			return false
 		}
-		cookie, err := r.Cookie(sessionCookieName)
-		return err == nil && h.validSession(cookie.Value)
-	}
-	if isLoopbackRemote(r.RemoteAddr) {
-		return true
-	}
-	if !h.Encrypted.Load() {
-		return false
 	}
 	cookie, err := r.Cookie(sessionCookieName)
 	return err == nil && h.validSession(cookie.Value)
+}
+
+const cerebrumOperatorAuthorityHint = "Enable vault encryption and unlock CEREBRUM for a browser session, or use a request signed by the exact node-operator identity."
+
+func writeCEREBRUMOperatorForbidden(w http.ResponseWriter, action string) {
+	writeError(w, http.StatusForbidden, action+" "+cerebrumOperatorAuthorityHint)
+}
+
+// isAgentOwnedDashboardMutation is the deliberately small exception list to
+// CEREBRUM's operator-by-default mutation policy. Each target has its own
+// non-operator authorization:
+//   - task status: exact active assignee + current task read permission,
+//   - pre-validate: dry-run only, no state change.
+func isAgentOwnedDashboardMutation(r *http.Request) bool {
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	switch {
+	case r.Method == http.MethodPost && path == "/v1/memory/pre-validate":
+		return true
+	case r.Method == http.MethodPut:
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		return len(parts) == 5 &&
+			parts[0] == "v1" &&
+			parts[1] == "dashboard" &&
+			parts[2] == "tasks" &&
+			parts[3] != "" &&
+			parts[4] == "status"
+	default:
+		return false
+	}
+}
+
+// dashboardOperatorMutationGate makes operator authority the default for every
+// protected non-read dashboard route. This closes the class of bugs where a
+// newly added handler relied only on authMiddleware and accidentally treated
+// unsigned loopback software or any signed agent as the human node operator.
+func (h *DashboardHandler) dashboardOperatorMutationGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r)
+			return
+		}
+		if isAgentOwnedDashboardMutation(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !h.isCEREBRUMOperatorRequest(r) {
+			writeCEREBRUMOperatorForbidden(w, "Changing CEREBRUM state requires operator authority.")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *DashboardHandler) cerebrumOperatorGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !h.isCEREBRUMOperatorRequest(r) {
+			writeCEREBRUMOperatorForbidden(w, "This CEREBRUM resource requires operator authority.")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// bootInstructionsReadGate preserves sage_inception for real agents without
+// exposing the operator's custom boot context to any process that can merely
+// reach localhost or mint an unrelated Ed25519 key. CEREBRUM operator authority
+// is sufficient; every other caller must already have crossed authMiddleware
+// with a fresh signature and still be active in the local agent registry.
+func (h *DashboardHandler) bootInstructionsReadGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.isCEREBRUMOperatorRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		agentID := verifiedDashboardAgentID(r.Context())
+		agentStore, ok := h.store.(store.AgentStore)
+		if agentID == "" || !ok {
+			writeError(w, http.StatusForbidden, "boot instructions require an active registered agent or CEREBRUM operator")
+			return
+		}
+		agent, err := agentStore.GetAgent(r.Context(), agentID)
+		if err != nil || agent == nil || agent.Status != "active" || agent.RemovedAt != nil {
+			writeError(w, http.StatusForbidden, "boot instructions require an active registered agent or CEREBRUM operator")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // securityHeaders adds standard security headers to all responses.
@@ -522,6 +619,9 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 
 		// Pairing redemption — unauthenticated (the code IS the auth).
 		h.RegisterPairingRoutes(r)
+		// Agent-install claim redemption is also deliberately outside dashboard
+		// auth: its one-time token is the sole authority for this exact route.
+		h.RegisterAgentClaimRoute(r)
 
 		// Recovery — unauthenticated (the recovery key IS the auth).
 		r.Post("/v1/dashboard/settings/ledger/recover", h.handleRecoverLedger)
@@ -529,13 +629,14 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 		// Protected routes — auth middleware checks dynamically whether encryption is active.
 		r.Group(func(r chi.Router) {
 			r.Use(h.authMiddleware)
+			r.Use(h.dashboardOperatorMutationGate)
 			// Redeploy guard — returns 503 for write endpoints during active redeployment.
 			r.Use(redeployGuard(h.Redeployer))
 
-			r.Get("/v1/dashboard/memory/list", h.handleListMemories)
-			r.Get("/v1/dashboard/export", h.handleExport)
-			r.Get("/v1/dashboard/memory/timeline", h.handleTimeline)
-			r.Get("/v1/dashboard/memory/graph", h.handleGraph)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/list", h.handleListMemories)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/export", h.handleExport)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/timeline", h.handleTimeline)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/graph", h.handleGraph)
 			r.Get("/v1/dashboard/stats", h.handleStats)
 
 			// Embeddings setup — turn on the bundled semantic embedder + re-embed.
@@ -554,7 +655,7 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			r.Delete("/v1/dashboard/memory/{id}", h.handleDeleteMemory)
 			r.Patch("/v1/dashboard/memory/{id}", h.handleUpdateMemory)
 			r.Post("/v1/dashboard/memory/bulk", h.handleBulkUpdateMemories)
-			r.Get("/v1/dashboard/events", h.SSE.ServeHTTP)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/events", h.SSE.ServeHTTP)
 			r.Post("/v1/dashboard/import", h.handleImportUpload)
 			r.Post("/v1/dashboard/import/preview", h.handleImportPreview)
 			r.Post("/v1/dashboard/import/confirm", h.handleImportConfirm)
@@ -573,7 +674,7 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			r.Get("/v1/dashboard/settings/cleanup", h.handleGetCleanupSettings)
 			r.Post("/v1/dashboard/settings/cleanup", h.handleSaveCleanupSettings)
 			r.Post("/v1/dashboard/cleanup/run", h.handleRunCleanup)
-			r.Get("/v1/dashboard/settings/boot-instructions", h.handleGetBootInstructions)
+			r.With(h.bootInstructionsReadGate).Get("/v1/dashboard/settings/boot-instructions", h.handleGetBootInstructions)
 			r.Post("/v1/dashboard/settings/boot-instructions", h.handleSaveBootInstructions)
 			r.Get("/v1/dashboard/settings/memory-mode", h.handleGetMemoryMode)
 			r.Post("/v1/dashboard/settings/memory-mode", h.handleSaveMemoryMode)
@@ -607,11 +708,11 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			r.Get("/v1/dashboard/task-notifications", h.handleTaskNotifications)
 
 			// Tags
-			r.Get("/v1/dashboard/tags", h.handleListTags)
-			r.Get("/v1/dashboard/memory/{id}/tags", h.handleGetMemoryTags)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/tags", h.handleListTags)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/{id}/tags", h.handleGetMemoryTags)
 			r.Put("/v1/dashboard/memory/{id}/tags", h.handleSetMemoryTags)
 			// Memory "train of thought" - powers the MRI click-to-explore.
-			r.Get("/v1/dashboard/memory/{id}/related", h.handleMemoryRelated)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/{id}/related", h.handleMemoryRelated)
 
 			// Auto-start (open at login)
 			r.Get("/v1/dashboard/settings/autostart", h.handleGetAutostart)
@@ -635,8 +736,8 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			r.Post("/v1/memory/pre-validate", h.handlePreValidate)
 
 			// Pipeline — agent-to-agent message bus
-			r.Get("/v1/dashboard/pipeline", h.handlePipelineList)
-			r.Get("/v1/dashboard/pipeline/stats", h.handlePipelineStats)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/pipeline", h.handlePipelineList)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/pipeline/stats", h.handlePipelineStats)
 			r.Post("/v1/dashboard/pipeline/send", h.handlePipelineSend)
 
 			// Network agent management routes
@@ -803,14 +904,11 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 // Encryption ON — require either a valid session cookie or a fresh Ed25519
 // signature.
 //
-// Encryption OFF — fail-open is unsafe because the dashboard CORS allowlist
-// includes localhost-bound origins for the SPA, and any non-browser client
-// can still trigger state-changing endpoints. Instead we require either:
-//   - a same-origin / no-Origin request (the SPA itself, or a CLI), OR
-//   - a valid Ed25519 signature.
-//
-// This keeps the SPA and CLI workflows exactly as before while denying any
-// browser tab whose Origin is not localhost / 127.0.0.1.
+// Encryption OFF — admit the same-origin/no-Origin SPA and CLI to ordinary
+// routes, or a fresh Ed25519 signature. Privileged mutation handlers add the
+// stricter isCEREBRUMOperatorRequest gate: an unsigned local request can read
+// the dashboard but cannot become the operator merely by forging routing or
+// browser headers.
 func (h *DashboardHandler) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// An agent identity is usable only when this exact request verifies. Check
@@ -1811,7 +1909,7 @@ func (h *DashboardHandler) handleStats(w http.ResponseWriter, r *http.Request) {
 // handleDeleteMemory deprecates a memory.
 func (h *DashboardHandler) handleDeleteMemory(w http.ResponseWriter, r *http.Request) {
 	if !h.isCEREBRUMOperatorRequest(r) {
-		writeError(w, http.StatusForbidden, "memories can only be removed from an authenticated CEREBRUM session")
+		writeCEREBRUMOperatorForbidden(w, "Removing memories requires operator authority.")
 		return
 	}
 	id := chi.URLParam(r, "id")
@@ -1832,6 +1930,10 @@ func (h *DashboardHandler) handleDeleteMemory(w http.ResponseWriter, r *http.Req
 
 // handleUpdateMemory updates a memory's domain tag and/or tags.
 func (h *DashboardHandler) handleUpdateMemory(w http.ResponseWriter, r *http.Request) {
+	if !h.isCEREBRUMOperatorRequest(r) {
+		writeCEREBRUMOperatorForbidden(w, "Changing memory metadata requires operator authority.")
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "missing memory id")
@@ -1875,6 +1977,10 @@ func (h *DashboardHandler) handleUpdateMemory(w http.ResponseWriter, r *http.Req
 
 // handleBulkUpdateMemories applies domain and/or tag changes to multiple memories at once.
 func (h *DashboardHandler) handleBulkUpdateMemories(w http.ResponseWriter, r *http.Request) {
+	if !h.isCEREBRUMOperatorRequest(r) {
+		writeCEREBRUMOperatorForbidden(w, "Bulk-changing memory metadata requires operator authority.")
+		return
+	}
 	var body struct {
 		IDs     []string `json:"ids"`
 		Domain  string   `json:"domain,omitempty"`
@@ -1995,6 +2101,10 @@ func (h *DashboardHandler) handleGetMemoryTags(w http.ResponseWriter, r *http.Re
 
 // handleSetMemoryTags replaces all tags on a memory.
 func (h *DashboardHandler) handleSetMemoryTags(w http.ResponseWriter, r *http.Request) {
+	if !h.isCEREBRUMOperatorRequest(r) {
+		writeCEREBRUMOperatorForbidden(w, "Changing memory tags requires operator authority.")
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if h.rejectInternalCerebrumMemory(w, r.Context(), id) {
 		return
@@ -2111,7 +2221,7 @@ func (h *DashboardHandler) handleGetTasks(w http.ResponseWriter, r *http.Request
 // ordering. Agent identities cannot use this local CEREBRUM preference surface.
 func (h *DashboardHandler) handleReorderTasksDashboard(w http.ResponseWriter, r *http.Request) {
 	if !h.isCEREBRUMOperatorRequest(r) {
-		writeError(w, http.StatusForbidden, "task order can only be changed from an authenticated CEREBRUM session")
+		writeCEREBRUMOperatorForbidden(w, "Changing task order requires operator authority.")
 		return
 	}
 	var body struct {
@@ -2222,7 +2332,7 @@ func (h *DashboardHandler) handleUpdateTaskStatusDashboard(w http.ResponseWriter
 		return
 	}
 	if !h.isCEREBRUMOperatorRequest(r) {
-		writeError(w, http.StatusForbidden, "task status can only be changed by the assigned agent or from an authenticated CEREBRUM session")
+		writeCEREBRUMOperatorForbidden(w, "Changing another agent's task status requires operator authority.")
 		return
 	}
 	if err := h.store.UpdateTaskStatus(r.Context(), id, ts); err != nil {
@@ -2242,12 +2352,12 @@ func (h *DashboardHandler) handleUpdateTaskStatusDashboard(w http.ResponseWriter
 // that agent now, so the card moves to In Progress immediately.
 func (h *DashboardHandler) handleAssignTask(w http.ResponseWriter, r *http.Request) {
 	// Assignment is a dashboard operator action. A caller presenting an agent
-	// identity cannot assign, reassign, or unassign work. On an unencrypted
-	// personal node, every local process is already inside the documented trusted
-	// operator boundary; Origin/Sec-Fetch only defend against cross-site browser
-	// requests and are not claimed as authentication against local software.
+	// identity cannot assign, reassign, or unassign work unless it is the exact
+	// cryptographically verified node operator. Browser callers need a valid
+	// encrypted local CEREBRUM session; locality and browser headers alone are
+	// never operator authority.
 	if !h.isCEREBRUMOperatorRequest(r) {
-		writeError(w, http.StatusForbidden, "task assignments can only be changed from the local CEREBRUM task board")
+		writeCEREBRUMOperatorForbidden(w, "Changing task assignments requires operator authority.")
 		return
 	}
 	id := chi.URLParam(r, "id")
@@ -2339,7 +2449,11 @@ func (h *DashboardHandler) agentTaskReadDecision(ctx context.Context, agentID, m
 		return false, false
 	}
 	postFork := h.PostV8ForkFn != nil && h.PostV8ForkFn()
-	allowed, err = h.BadgerStore.HasAccessMultiOrg(domain, agentID, uint8(classification), time.Now(), postFork)
+	postV22 := h.PostV22ForNextTxFn != nil && h.PostV22ForNextTxFn()
+	allowed, err = h.BadgerStore.HasAccessMultiOrgWithFederationPolicy(
+		domain, agentID, uint8(classification), time.Now(),
+		postFork, postV22,
+	)
 	if err != nil {
 		return false, false
 	}
@@ -2472,7 +2586,7 @@ func (h *DashboardHandler) handleTaskNotifications(w http.ResponseWriter, r *htt
 // handleCreateTaskDashboard creates a new task from the CEREBRUM dashboard.
 func (h *DashboardHandler) handleCreateTaskDashboard(w http.ResponseWriter, r *http.Request) {
 	if !h.isCEREBRUMOperatorRequest(r) {
-		writeError(w, http.StatusForbidden, "tasks can only be added from an authenticated CEREBRUM session; agents should use sage_task")
+		writeCEREBRUMOperatorForbidden(w, "Creating tasks from CEREBRUM requires operator authority; agents should use sage_task.")
 		return
 	}
 	var body struct {

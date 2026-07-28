@@ -392,6 +392,30 @@ func TestExpiredAgreementDenied(t *testing.T) {
 	}
 }
 
+func TestMalformedClearanceAgreementDenied(t *testing.T) {
+	a := newTestChain(t, "chain-a")
+	if err := a.badger.SetCrossFed(
+		"chain-b",
+		"https://127.0.0.1:1",
+		make([]byte, 32),
+		255,
+		0,
+		[]string{"*"},
+		nil,
+		"active",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.mgr.ActiveAgreement("chain-b"); err == nil {
+		t.Fatal("agreement with out-of-range clearance accepted")
+	}
+	for _, agreement := range a.mgr.ActiveAgreements() {
+		if agreement.RemoteChainID == "chain-b" {
+			t.Fatal("malformed agreement leaked into active agreement enumeration")
+		}
+	}
+}
+
 // --- e2e: mTLS listener + query client ----------------------------------------
 
 func TestFederatedQueryEndToEnd(t *testing.T) {

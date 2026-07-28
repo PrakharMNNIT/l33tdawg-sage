@@ -209,7 +209,7 @@ func TestFederationPermissionSavePreflightsAndReportsCopyAlignment(t *testing.T)
 		body := bytes.NewBufferString(`{"permissions":[{"domain":"tii.work","copy":true}]}`)
 		req := withFederationChain(httptest.NewRequest(http.MethodPut,
 			"http://localhost/v1/dashboard/federation/connections/chain-peer/permissions", body), "chain-peer")
-		markLocalCEREBRUM(req)
+		markLocalCEREBRUM(h, req)
 		rr := httptest.NewRecorder()
 		h.handleFedPermissionsPut(rr, req)
 		return rr
@@ -247,7 +247,7 @@ func TestFederationPermissionSavePreflightsAndReportsCopyAlignment(t *testing.T)
 		body := bytes.NewBufferString(`{"permissions":[]}`)
 		req := withFederationChain(httptest.NewRequest(http.MethodPut,
 			"http://localhost/v1/dashboard/federation/connections/chain-peer/permissions", body), "chain-peer")
-		markLocalCEREBRUM(req)
+		markLocalCEREBRUM(h, req)
 		rr := httptest.NewRecorder()
 		h.handleFedPermissionsPut(rr, req)
 		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
@@ -269,7 +269,7 @@ func TestFederationPermissionSavePreflightsAndReportsCopyAlignment(t *testing.T)
 
 		getReq := withFederationChain(httptest.NewRequest(http.MethodGet,
 			"http://localhost/v1/dashboard/federation/connections/chain-peer/permissions", nil), "chain-peer")
-		markLocalCEREBRUM(getReq)
+		markLocalCEREBRUM(h, getReq)
 		getRR := httptest.NewRecorder()
 		h.handleFedPermissionsGet(getRR, getReq)
 		require.Equal(t, http.StatusOK, getRR.Code, getRR.Body.String())
@@ -313,8 +313,7 @@ func TestFederationPauseEndpointPreservesPolicyAndReportsBothDirections(t *testi
 	pauseReq := withFederationChain(httptest.NewRequest(http.MethodPut,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/pause",
 		bytes.NewBufferString(`{"paused":true}`)), "chain-peer")
-	pauseReq.RemoteAddr = "127.0.0.1:4242"
-	pauseReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, pauseReq)
 	pauseRR := httptest.NewRecorder()
 	h.handleFedPause(pauseRR, pauseReq)
 	require.Equal(t, http.StatusOK, pauseRR.Code, pauseRR.Body.String())
@@ -331,8 +330,7 @@ func TestFederationPauseEndpointPreservesPolicyAndReportsBothDirections(t *testi
 
 	permissionsReq := withFederationChain(httptest.NewRequest(http.MethodGet,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/permissions", nil), "chain-peer")
-	permissionsReq.RemoteAddr = "127.0.0.1:4242"
-	permissionsReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, permissionsReq)
 	permissionsRR := httptest.NewRecorder()
 	h.handleFedPermissionsGet(permissionsRR, permissionsReq)
 	require.Equal(t, http.StatusOK, permissionsRR.Code, permissionsRR.Body.String())
@@ -347,8 +345,7 @@ func TestFederationPauseEndpointPreservesPolicyAndReportsBothDirections(t *testi
 
 	localOnlyReq := withFederationChain(httptest.NewRequest(http.MethodGet,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/permissions?live=0", nil), "chain-peer")
-	localOnlyReq.RemoteAddr = "127.0.0.1:4242"
-	localOnlyReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, localOnlyReq)
 	localOnlyRR := httptest.NewRecorder()
 	h.handleFedPermissionsGet(localOnlyRR, localOnlyReq)
 	require.Equal(t, http.StatusOK, localOnlyRR.Code, localOnlyRR.Body.String())
@@ -364,8 +361,7 @@ func TestFederationPauseEndpointPreservesPolicyAndReportsBothDirections(t *testi
 	resumeReq := withFederationChain(httptest.NewRequest(http.MethodPut,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/pause",
 		bytes.NewBufferString(`{"paused":false}`)), "chain-peer")
-	resumeReq.RemoteAddr = "127.0.0.1:4242"
-	resumeReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, resumeReq)
 	resumeRR := httptest.NewRecorder()
 	h.handleFedPause(resumeRR, resumeReq)
 	require.Equal(t, http.StatusOK, resumeRR.Code, resumeRR.Body.String())

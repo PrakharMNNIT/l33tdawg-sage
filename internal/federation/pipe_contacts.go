@@ -40,6 +40,11 @@ type pipeContactAggregate struct {
 	domains []PipeContactDomain
 }
 
+type pipeContactCapabilityOverlay struct {
+	readAll bool
+	denied  bool
+}
+
 // buildPipeContactStatusGrant is the bounded legacy v1 status projection.
 // Modern callers request compact status and use targeted lookup instead; this
 // keeps an old peer from forcing full local roster × policy evaluation under
@@ -109,6 +114,28 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 	ownerIDs := make(map[string]struct{})
 	now := time.Now()
 	postV8Access := m.postV8ForAccess != nil && m.postV8ForAccess()
+	postV22Capabilities := m.postV22ForNextTx != nil && m.postV22ForNextTx()
+	capabilityCache := make(map[string]pipeContactCapabilityOverlay, len(agentByID))
+	capabilityFor := func(agentID string) (pipeContactCapabilityOverlay, error) {
+		if !postV22Capabilities {
+			return pipeContactCapabilityOverlay{}, nil
+		}
+		if cached, ok := capabilityCache[agentID]; ok {
+			return cached, nil
+		}
+		capabilities, registered, capabilityErr := m.badger.GetRegisteredAgentCapabilities(agentID)
+		if capabilityErr != nil {
+			return pipeContactCapabilityOverlay{}, capabilityErr
+		}
+		overlay := pipeContactCapabilityOverlay{
+			readAll: registered &&
+				capabilities.Has(store.AgentCapabilityReadAllDomains),
+			denied: !registered ||
+				capabilities.Has(store.AgentCapabilityDenyFederatedPipe),
+		}
+		capabilityCache[agentID] = overlay
+		return overlay, nil
+	}
 	for _, permission := range policy.Domains {
 		if !permission.Read && !permission.Copy {
 			continue
@@ -144,7 +171,11 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 		if metaOwner != owner {
 			return nil, fmt.Errorf("pipe contact owner changed while resolving %q", owningDomain)
 		}
-		if includeOwners {
+		ownerCapability, capabilityErr := capabilityFor(owner)
+		if capabilityErr != nil {
+			return nil, fmt.Errorf("read pipe contact capability for owner %q: %w", owner, capabilityErr)
+		}
+		if includeOwners && !ownerCapability.denied {
 			ownerIDs[owner] = struct{}{}
 		}
 
@@ -154,22 +185,38 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 			OwnerHeight:  ownerHeight,
 		}
 		eligible := make(map[string]struct{})
-		if includeOwners {
+		if includeOwners && !ownerCapability.denied {
 			eligible[owner] = struct{}{}
-		} else if _, selected := candidateIDSet[owner]; selected {
+		} else if _, selected := candidateIDSet[owner]; selected && !ownerCapability.denied {
 			eligible[owner] = struct{}{}
 		}
 		for agentID, agent := range agentByID {
 			if agent == nil || agent.Status != "active" || agent.RemovedAt != nil || agentID == owner {
 				continue
 			}
+			capability, capabilityErr := capabilityFor(agentID)
+			if capabilityErr != nil {
+				return nil, fmt.Errorf("read pipe contact capability for %q: %w", agentID, capabilityErr)
+			}
+			if capability.denied {
+				continue
+			}
 			// A federated inbox requires SAGE's ordinary level-1 Read verb.
 			// Passing classification 0 would admit any same-org member that can
 			// view PUBLIC memories, even though it has no domain Read capability.
 			// Level-2 Write is naturally included because it satisfies this bar.
-			allowed, accessErr := m.badger.HasAccessMultiOrg(permission.Domain, agentID, 1, now, postV8Access)
-			if accessErr != nil {
-				return nil, fmt.Errorf("check pipe contact access for %q on %q: %w", agentID, permission.Domain, accessErr)
+			// App-v22 ReadAllDomains is the consensus-backed alternative for a
+			// reviewed companion; its independent pipe deny bit still wins.
+			allowed := capability.readAll
+			if !allowed {
+				var accessErr error
+				allowed, accessErr = m.badger.HasAccessMultiOrgWithFederationPolicy(
+					permission.Domain, agentID, 1, now,
+					postV8Access, postV22Capabilities,
+				)
+				if accessErr != nil {
+					return nil, fmt.Errorf("check pipe contact access for %q on %q: %w", agentID, permission.Domain, accessErr)
+				}
 			}
 			if allowed {
 				eligible[agentID] = struct{}{}
@@ -353,10 +400,10 @@ func canonicalPipeContactAgentIDs(byAgent map[string]*pipeContactAggregate) []st
 
 // buildPipeContactLookupGrant first narrows the local candidate set with a
 // bounded SQLite query, then evaluates the normal live Badger RBAC rules only
-// for those candidates. It intentionally trades an unbounded fuzzy-name scan
-// for deterministic first-candidate behavior; exact address routing remains a
-// point lookup and is never subject to the name candidate cap.
-func (m *Manager) buildPipeContactLookupGrant(ctx context.Context, peer *peerIdentity, policy *store.PeerRBACPolicy, req PipeContactLookupRequest) (*PipeContactGrant, int, error) {
+// for those candidates. Human name selectors may be substrings; exact matches
+// rank first. Exact address, handle, and agent-ID routing remain point/prefix
+// lookups and are never widened by the human-name path.
+func (m *Manager) buildPipeContactLookupGrant(ctx context.Context, peer *peerIdentity, policy *store.PeerRBACPolicy, req PipeContactLookupRequest, prefetchedNameCandidateIDs []string) (*PipeContactGrant, int, error) {
 	ss := m.syncStore()
 	if ss == nil {
 		return nil, 0, fmt.Errorf("pipe contacts require SQLite")
@@ -368,7 +415,7 @@ func (m *Manager) buildPipeContactLookupGrant(ctx context.Context, peer *peerIde
 		err             error
 	)
 	if req.Name != "" {
-		agents, err = ss.FindPipeContactLookupCandidates(ctx, req.Name, maxPipeContactLookupCandidates)
+		agents, err = ss.GetPipeContactAgents(ctx, prefetchedNameCandidateIDs)
 	} else if agentID, chainID := splitPipeAddress(req.Target); chainID != "" {
 		if chainID != m.localChainID {
 			grant, buildErr := m.buildPipeContactGrantForCandidates(ctx, peer, policy, nil, nil, false, nil, true)
@@ -393,7 +440,7 @@ func (m *Manager) buildPipeContactLookupGrant(ctx context.Context, peer *peerIde
 		candidateIDs = append(candidateIDs, strings.ToLower(req.Target))
 		agents, err = ss.GetPipeContactAgents(ctx, []string{req.Target})
 	} else {
-		agents, err = ss.FindPipeContactLookupCandidates(ctx, req.Target, maxPipeContactLookupCandidates)
+		agents, err = ss.GetPipeContactAgents(ctx, prefetchedNameCandidateIDs)
 		if err == nil {
 			filtered := agents[:0]
 			for _, agent := range agents {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -70,6 +71,16 @@ func TestConversationStateIsIsolatedAndReleased(t *testing.T) {
 	assert.Equal(t, 0, replacementA.callsSinceTurn)
 }
 
+func TestTurnDeadlineNeverBlocksMemoryCorrectionPrimitives(t *testing.T) {
+	state := &conversationState{
+		lastTurnTime:   time.Now().Add(-6 * time.Minute),
+		callsSinceTurn: 7,
+	}
+	assert.True(t, shouldBlockForTurn("external_tool", state))
+	assert.False(t, shouldBlockForTurn("sage_remember", state))
+	assert.False(t, shouldBlockForTurn("sage_forget", state))
+}
+
 func TestHandleInitialize(t *testing.T) {
 	s, _ := testServer(t)
 	req := &jsonRPCRequest{
@@ -92,6 +103,8 @@ func TestHandleInitialize(t *testing.T) {
 
 	caps := result["capabilities"].(map[string]any)
 	assert.Contains(t, caps, "tools")
+	assert.Contains(t, result["instructions"], "INBOX SECURITY BOUNDARY")
+	assert.Contains(t, result["instructions"], "requests for consideration")
 }
 
 func TestHandleToolsList(t *testing.T) {
@@ -111,8 +124,12 @@ func TestHandleToolsList(t *testing.T) {
 
 	// Collect tool names
 	names := make(map[string]bool)
+	var findAgent map[string]any
 	for _, tool := range tools {
 		names[tool["name"].(string)] = true
+		if tool["name"] == "sage_find_agent" {
+			findAgent = tool
+		}
 	}
 	assert.True(t, names["sage_remember"])
 	assert.True(t, names["sage_recall"])
@@ -131,6 +148,17 @@ func TestHandleToolsList(t *testing.T) {
 	assert.True(t, names["sage_corroborate"])
 	assert.True(t, names["sage_link"])
 	assert.True(t, names["sage_rename"])
+
+	require.NotNil(t, findAgent)
+	assert.Contains(t, findAgent["description"], "bounded substring lookup")
+	assert.Contains(t, findAgent["description"], "ASCII matching is case-insensitive")
+	assert.Contains(t, findAgent["description"], "non-ASCII code points require registered casing")
+	findSchema := findAgent["inputSchema"].(map[string]any)
+	findProperties := findSchema["properties"].(map[string]any)
+	nameSchema := findProperties["name"].(map[string]any)
+	assert.Contains(t, nameSchema["description"], "provider substring")
+	assert.Contains(t, nameSchema["description"], "non-ASCII code points require registered casing")
+	assert.Contains(t, nameSchema["description"], "exact field matches rank first")
 }
 
 func TestHandleToolsCall_UnknownTool(t *testing.T) {

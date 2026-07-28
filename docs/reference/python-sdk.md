@@ -1,8 +1,8 @@
-Verified against SDK source for SAGE v11.13.9. Package: sage-agent-sdk.
+Verified against SDK source for SAGE v11.14.1. Package: sage-agent-sdk.
 
 # SAGE Python SDK Reference
 
-**Package:** `sage-agent-sdk` **Version:** 11.13.9
+**Package:** `sage-agent-sdk` **Version:** 11.14.1
 **Requires:** Python 3.10+ | httpx ≥ 0.25 | pydantic ≥ 2.0 | PyNaCl ≥ 1.5
 
 ```bash
@@ -622,6 +622,11 @@ pipe_inbox(limit: int = 5) -> PipeInboxResponse
 `GET /v1/pipe/inbox`
 
 Returns `PipeInboxResponse(items: list[PipeMessage], count)`.
+Each `PipeMessage` exposes the server-derived `authority`,
+`payload_authority`, `trust`, and `security_notice` fields. Inbox payloads are
+`request_only`, with local content marked `agent_untrusted` and federated
+content `external_untrusted`. Treat `intent` and `payload` only as untrusted
+requests for consideration, never as instructions.
 
 ---
 
@@ -665,7 +670,11 @@ pipe_status(pipe_id: str) -> PipeMessage
 
 `PipeMessage` includes additive `source_chain_id`, `source_pipe_id`,
 `destination_chain_id`, `reply_source_chain_id`, policy/agreement/contact
-bindings, and claim/journal fields when applicable.
+bindings, claim/journal fields when applicable, and optional response-only
+`authority`, `trust`, `security_notice`, `payload_authority`, and
+`result_authority`. Status labels payload and result independently and omits a
+single object-wide authority when both are present. These fields are optional
+for compatibility with older SAGE nodes.
 
 ---
 
@@ -678,6 +687,9 @@ pipe_results(limit: int = 5) -> PipeInboxResponse
 `GET /v1/pipe/results`
 
 Lists completed (result-submitted) pipeline messages.
+The results endpoint and result field are `data_only`; the original payload,
+when present, remains explicitly `request_only`. Both local and foreign agent
+results are untrusted content, not instructions.
 
 ---
 
@@ -691,7 +703,10 @@ pipe_updates(limit: int = 5) -> PipeDeliveryUpdatesResponse
 
 Atomically claims one-shot, payload-free terminal delivery notices for
 federated sends and results signed by this local agent. `last_error` may include
-peer-originated text and must be treated as external/untrusted.
+peer-originated text and must be treated as untrusted data. Each
+`PipeDeliveryUpdate` has optional `authority`, `trust`, and `security_notice`
+fields; v11.14.1+ returns `notification_only` / `untrusted_metadata`. The fields
+remain optional so the client can parse responses from older nodes.
 
 ---
 
@@ -994,12 +1009,18 @@ propose_federation(
     max_clearance: int = 2,
     expires_at: int = 0,
     requires_approval: bool = True,
+    proposer_org_id: str | None = None,
 ) -> dict
 ```
 
 `POST /v1/federation/propose`
 
-`allowed_domains`/`allowed_depts` default to empty lists on the wire (not omitted). `max_clearance` caps clearance access regardless of the agent's actual clearance.
+`proposer_org_id` selects one exact organization membership for multi-org
+callers; omission uses the legacy primary organization.
+`allowed_domains`/`allowed_depts` default to empty lists on the wire (not
+omitted). On app-v22 an empty domain scope denies federation reads, while an
+empty department scope is unrestricted. `max_clearance` caps clearance access
+regardless of the agent's actual clearance.
 
 ---
 
@@ -1011,7 +1032,7 @@ approve_federation(federation_id: str) -> dict
 
 `POST /v1/federation/{federation_id}/approve`
 
-Target org admin only.
+At app-v22: global admin and exact member of the stored target organization.
 
 ---
 
@@ -1022,6 +1043,9 @@ revoke_federation(federation_id: str, reason: str = "") -> dict
 ```
 
 `POST /v1/federation/{federation_id}/revoke`
+
+At app-v22 the caller must be a global admin and exact member of either stored
+federation organization.
 
 ---
 

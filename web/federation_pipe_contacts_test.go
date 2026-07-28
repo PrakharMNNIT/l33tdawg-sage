@@ -86,8 +86,7 @@ func TestFederatedPipeContactDashboardReadAndMutation(t *testing.T) {
 
 	getReq := withFederationChain(httptest.NewRequest(http.MethodGet,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/pipe-contacts", nil), "chain-peer")
-	getReq.RemoteAddr = "127.0.0.1:4242"
-	getReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, getReq)
 	getRR := httptest.NewRecorder()
 	h.handleFedPipeContactsGet(getRR, getReq)
 	require.Equal(t, http.StatusOK, getRR.Code, getRR.Body.String())
@@ -104,8 +103,7 @@ func TestFederatedPipeContactDashboardReadAndMutation(t *testing.T) {
 
 	localOnlyReq := withFederationChain(httptest.NewRequest(http.MethodGet,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/pipe-contacts?live=0", nil), "chain-peer")
-	localOnlyReq.RemoteAddr = "127.0.0.1:4242"
-	localOnlyReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, localOnlyReq)
 	localOnlyRR := httptest.NewRecorder()
 	h.handleFedPipeContactsGet(localOnlyRR, localOnlyReq)
 	require.Equal(t, http.StatusOK, localOnlyRR.Code, localOnlyRR.Body.String())
@@ -113,8 +111,7 @@ func TestFederatedPipeContactDashboardReadAndMutation(t *testing.T) {
 
 	targetReq := withFederationChain(httptest.NewRequest(http.MethodGet,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/pipe-contacts?live=0&agent_id="+agentID, nil), "chain-peer")
-	targetReq.RemoteAddr = "127.0.0.1:4242"
-	targetReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, targetReq)
 	targetRR := httptest.NewRecorder()
 	h.handleFedPipeContactsGet(targetRR, targetReq)
 	require.Equal(t, http.StatusOK, targetRR.Code, targetRR.Body.String())
@@ -135,8 +132,7 @@ func TestFederatedPipeContactDashboardReadAndMutation(t *testing.T) {
 	putReq := withFederationChain(httptest.NewRequest(http.MethodPut,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/pipe-contacts",
 		bytes.NewBufferString(`{"agent_id":"`+agentID+`","contact_id":"`+contactID+`","accepting":true}`)), "chain-peer")
-	putReq.RemoteAddr = "127.0.0.1:4242"
-	putReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, putReq)
 	putRR := httptest.NewRecorder()
 	h.handleFedPipeContactsPut(putRR, putReq)
 	require.Equal(t, http.StatusOK, putRR.Code, putRR.Body.String())
@@ -164,8 +160,7 @@ func TestFederatedPipeContactDashboardRejectsStaleMutation(t *testing.T) {
 	req := withFederationChain(httptest.NewRequest(http.MethodPut,
 		"http://localhost/v1/dashboard/federation/connections/chain-peer/pipe-contacts",
 		bytes.NewBufferString(`{"agent_id":"agent","contact_id":"contact","accepting":true}`)), "chain-peer")
-	req.RemoteAddr = "127.0.0.1:4242"
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, req)
 	rr := httptest.NewRecorder()
 	h.handleFedPipeContactsPut(rr, req)
 	require.Equal(t, http.StatusConflict, rr.Code, rr.Body.String())

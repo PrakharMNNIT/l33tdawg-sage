@@ -75,6 +75,7 @@ func TestFederationSyncV3ContractAndOmittedLanePreservation(t *testing.T) {
 
 	getReq := withFederationChain(httptest.NewRequest(http.MethodGet,
 		"http://localhost/v1/dashboard/federation/connections/chain-b/sync", nil), "chain-b")
+	markLocalCEREBRUM(h, getReq)
 	getRR := httptest.NewRecorder()
 	h.handleFedSyncGet(getRR, getReq)
 	require.Equal(t, http.StatusOK, getRR.Code)
@@ -95,8 +96,7 @@ func TestFederationSyncV3ContractAndOmittedLanePreservation(t *testing.T) {
 	putReq := withFederationChain(httptest.NewRequest(http.MethodPut,
 		"http://localhost/v1/dashboard/federation/connections/chain-b/sync",
 		bytes.NewBufferString(`{"subscribe_domains":["new.subscription"]}`)), "chain-b")
-	putReq.RemoteAddr = "127.0.0.1:4242"
-	putReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, putReq)
 	putRR := httptest.NewRecorder()
 	h.handleFedSyncSet(putRR, putReq)
 	require.Equal(t, http.StatusOK, putRR.Code, putRR.Body.String())
@@ -109,8 +109,7 @@ func TestFederationSyncV3ContractAndOmittedLanePreservation(t *testing.T) {
 	legacyReq := withFederationChain(httptest.NewRequest(http.MethodPut,
 		"http://localhost/v1/dashboard/federation/connections/chain-b/sync",
 		bytes.NewBufferString(`{"domains":["legacy"]}`)), "chain-b")
-	legacyReq.RemoteAddr = "127.0.0.1:4242"
-	legacyReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, legacyReq)
 	legacyRR := httptest.NewRecorder()
 	h.handleFedSyncSet(legacyRR, legacyReq)
 	assert.Equal(t, http.StatusConflict, legacyRR.Code, legacyRR.Body.String())
@@ -142,8 +141,7 @@ func TestFederationSyncSubscribeOnlyMigrationDoesNotPromoteLegacyCopy(t *testing
 	putReq := withFederationChain(httptest.NewRequest(http.MethodPut,
 		"http://localhost/v1/dashboard/federation/connections/chain-b/sync",
 		bytes.NewBufferString(`{"subscribe_domains":["wanted"]}`)), "chain-b")
-	putReq.RemoteAddr = "127.0.0.1:4242"
-	putReq.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, putReq)
 	putRR := httptest.NewRecorder()
 	h.handleFedSyncSet(putRR, putReq)
 	require.Equal(t, http.StatusOK, putRR.Code, putRR.Body.String())

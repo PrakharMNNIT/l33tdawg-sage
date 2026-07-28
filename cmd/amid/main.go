@@ -198,6 +198,31 @@ type governanceDomainBinder interface {
 	SetExpectedGovernanceDelegationDomain(chainID string) error
 }
 
+type restForkAccessorSetter interface {
+	SetPostV8ForkAccessor(func() bool)
+	SetPostV17ForNextTxAccessor(func() bool)
+	SetPostV20ForNextTxAccessor(func() bool)
+	SetPostV22ForNextTxAccessor(func() bool)
+}
+
+type appForkAccessorSource interface {
+	IsPostV8Fork() bool
+	IsAppV17ActiveForNextTx() bool
+	IsAppV20ActiveForNextTx() bool
+	IsAppV22ActiveForNextTx() bool
+}
+
+// wireRESTForkAccessors keeps amid's REST authorization behavior in lockstep
+// with the consensus app. A missing accessor silently leaves that release's
+// REST gates dormant, so keep all fork predicates together and regression-test
+// the complete set.
+func wireRESTForkAccessors(server restForkAccessorSetter, app appForkAccessorSource) {
+	server.SetPostV8ForkAccessor(app.IsPostV8Fork)
+	server.SetPostV17ForNextTxAccessor(app.IsAppV17ActiveForNextTx)
+	server.SetPostV20ForNextTxAccessor(app.IsAppV20ActiveForNextTx)
+	server.SetPostV22ForNextTxAccessor(app.IsAppV22ActiveForNextTx)
+}
+
 const (
 	governanceDomainRequestTimeout = 3 * time.Second
 	governanceDomainResponseLimit  = 1 << 20
@@ -491,9 +516,7 @@ func startServices(ctx context.Context, app *sageabci.SageApp, restAddr, metrics
 	// v8.0: wire the off-consensus fork-gate accessor so REST handlers
 	// flip to ancestor-walk access checks once the chain reports a post-fork
 	// height. Advisory only — the consensus path uses app.postV8Fork(height).
-	restServer.SetPostV8ForkAccessor(app.IsPostV8Fork)
-	restServer.SetPostV17ForNextTxAccessor(app.IsAppV17ActiveForNextTx)
-	restServer.SetPostV20ForNextTxAccessor(app.IsAppV20ActiveForNextTx)
+	wireRESTForkAccessors(restServer, app)
 	restServer.SetGovernanceDomainAccessor(app.GovernanceDelegationDomain)
 
 	if tlsCert != "" && tlsKey != "" {

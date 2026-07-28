@@ -34,7 +34,7 @@ r = json.load(open(sys.argv[1]))
 assert r["shell_rss_kib"]["p95"] == 142544, r["shell_rss_kib"]
 assert r["daemon_rss_kib_excluded_from_budget"]["p95"] >= 70000, r
 assert r["budgets"]["shell_rss_blocking_from"] == "v11.11", r["budgets"]
-assert r["budgets"]["idle_cpu_blocking_from"] == "v11.14", r["budgets"]
+assert r["budgets"]["idle_cpu_blocking_from"] == "first-native-distribution-v12", r["budgets"]
 assert r["shell_process_count_max"] == 1, r
 PY
 

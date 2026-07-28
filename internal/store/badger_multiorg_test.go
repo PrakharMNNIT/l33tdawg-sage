@@ -193,6 +193,116 @@ func TestMultiOrg_RemoveOrgMember_KeepsOtherMemberships(t *testing.T) {
 	}
 }
 
+func TestRemoveDeptMemberPreservesExactForwardMembershipInvariant(t *testing.T) {
+	bs := newTestBadger(t)
+
+	const (
+		orgA  = "org-a-000000000000000000000000000"
+		orgB  = "org-b-000000000000000000000000000"
+		agent = "agent-0000000000000000000000000000000000000000000000000000000000"
+	)
+	require.NoError(t, bs.RegisterDept(orgA, "alpha", "Alpha", "", "", 1))
+	require.NoError(t, bs.RegisterDept(orgB, "beta", "Beta", "", "", 1))
+	require.NoError(t, bs.AddDeptMember(orgA, "alpha", agent, 2, "member", 2))
+	require.NoError(t, bs.AddDeptMember(orgB, "beta", agent, 2, "member", 3))
+
+	// A wrong removal must fail without deleting the reverse entry or either
+	// authoritative forward edge.
+	require.Error(t, bs.RemoveDeptMember(orgA, "missing", agent))
+	reverseOrg, reverseDept, err := bs.GetAgentDept(agent)
+	require.NoError(t, err)
+	assert.Equal(t, orgB, reverseOrg)
+	assert.Equal(t, "beta", reverseDept)
+	_, _, err = bs.GetDeptMemberClearance(orgA, "alpha", agent)
+	require.NoError(t, err)
+	_, _, err = bs.GetDeptMemberClearance(orgB, "beta", agent)
+	require.NoError(t, err)
+
+	// Removing the reverse-selected membership deterministically falls back
+	// to the surviving exact forward membership.
+	require.NoError(t, bs.RemoveDeptMember(orgB, "beta", agent))
+	reverseOrg, reverseDept, err = bs.GetAgentDept(agent)
+	require.NoError(t, err)
+	assert.Equal(t, orgA, reverseOrg)
+	assert.Equal(t, "alpha", reverseDept)
+
+	require.NoError(t, bs.RemoveDeptMember(orgA, "alpha", agent))
+	_, _, err = bs.GetAgentDept(agent)
+	require.Error(t, err)
+}
+
+func TestAppV22FederationScopesAreForkAwareAndUseExactDeptMembership(t *testing.T) {
+	bs := newTestBadger(t)
+
+	const (
+		orgA   = "org-a-000000000000000000000000000"
+		orgB   = "org-b-000000000000000000000000000"
+		adminA = "admin-a-00000000000000000000000000000000000000000000000000000000"
+		adminB = "admin-b-00000000000000000000000000000000000000000000000000000000"
+		agent  = "agent-0000000000000000000000000000000000000000000000000000000000"
+	)
+	now := time.Unix(10_000, 0)
+	require.NoError(t, bs.RegisterOrg(orgA, "Org A", "", adminA, 1))
+	require.NoError(t, bs.RegisterOrg(orgB, "Org B", "", adminB, 1))
+	require.NoError(t, bs.AddOrgMember(orgA, adminA, 4, "admin", 1))
+	require.NoError(t, bs.AddOrgMember(orgB, adminB, 4, "admin", 1))
+	require.NoError(t, bs.AddOrgMember(orgA, agent, 4, "member", 1))
+	require.NoError(t, bs.RegisterDomain("research", adminB, "", 1))
+
+	// Legacy federation evaluation ignored an empty AllowedDomains list.
+	require.NoError(t, bs.SetFederation("fed-empty", orgA, orgB, nil, 4, 0, false, "active"))
+	legacyAllowed, err := bs.HasAccessMultiOrgWithFederationPolicy(
+		"research.child", agent, 0, now, true, false,
+	)
+	require.NoError(t, err)
+	assert.True(t, legacyAllowed)
+	v22Allowed, err := bs.HasAccessMultiOrgWithFederationPolicy(
+		"research.child", agent, 0, now, true, true,
+	)
+	require.NoError(t, err)
+	assert.False(t, v22Allowed, "app-v22 empty domain scopes fail closed")
+
+	require.NoError(t, bs.SetFederation(
+		"fed-empty", orgA, orgB, []string{"research"}, 4, 0, false, "active",
+		[]string{"voice"},
+	))
+	v22Allowed, err = bs.HasAccessMultiOrgWithFederationPolicy(
+		"research.child", agent, 0, now, true, true,
+	)
+	require.NoError(t, err)
+	assert.False(t, v22Allowed, "restrictive department scope requires exact forward membership")
+
+	// A same-named department in the wrong org cannot satisfy org A's scope.
+	require.NoError(t, bs.AddDeptMember(orgB, "voice", agent, 4, "member", 2))
+	v22Allowed, err = bs.HasAccessMultiOrgWithFederationPolicy(
+		"research.child", agent, 0, now, true, true,
+	)
+	require.NoError(t, err)
+	assert.False(t, v22Allowed)
+
+	require.NoError(t, bs.AddDeptMember(orgA, "voice", agent, 4, "member", 3))
+	v22Allowed, err = bs.HasAccessMultiOrgWithFederationPolicy(
+		"research.child", agent, 0, now, true, true,
+	)
+	require.NoError(t, err)
+	assert.True(t, v22Allowed)
+	unrelated, err := bs.HasAccessMultiOrgWithFederationPolicy(
+		"unrelated", agent, 0, now, true, true,
+	)
+	require.NoError(t, err)
+	assert.False(t, unrelated, "domain scopes only cover exact names and dotted descendants")
+
+	require.NoError(t, bs.SetFederation(
+		"fed-empty", orgA, orgB, []string{"*"}, 255, 0, false, "active",
+		[]string{"*"},
+	))
+	malformed, err := bs.HasAccessMultiOrgWithFederationPolicy(
+		"research.child", agent, 0, now, true, true,
+	)
+	require.NoError(t, err)
+	assert.False(t, malformed, "app-v22 rejects malformed stored clearance ceilings")
+}
+
 func TestMultiOrg_EnsureAgentOrgsIndex_BackfillsLegacyData(t *testing.T) {
 	bs := newTestBadger(t)
 

@@ -102,6 +102,7 @@ func TestWizard_CheckCloudflared_NotInstalled(t *testing.T) {
 	h, _ := newTestHandler(t)
 	r := testRouter(h)
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/check-cloudflared", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -118,6 +119,7 @@ func TestWizard_CheckCloudflared_Installed(t *testing.T) {
 	h, _ := newTestHandler(t)
 	r := testRouter(h)
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/check-cloudflared", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -135,6 +137,7 @@ func TestWizard_Login_CapturesURL(t *testing.T) {
 	h, _ := newTestHandler(t)
 	r := testRouter(h)
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/login", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -213,6 +216,7 @@ func TestWizard_CreateTunnel_FullFlow(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/create-tunnel", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -249,6 +253,7 @@ func TestWizard_CreateTunnel_RejectsBadSubdomain(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/create-tunnel", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -267,6 +272,7 @@ func TestWizard_CreateTunnel_RejectsBadZone(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/create-tunnel", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -296,6 +302,7 @@ func TestWizard_CreateTunnel_DoesNotClobberExistingConfig(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"subdomain": "sage", "zone": "example.com"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/create-tunnel", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -410,7 +417,9 @@ func TestWizard_HappyPath_E2E(t *testing.T) {
 
 	// 1. check-cloudflared → installed
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/check-cloudflared", nil))
+	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/check-cloudflared", nil)
+	markLocalCEREBRUM(h, req)
+	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	var checkResp map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &checkResp))
@@ -418,7 +427,9 @@ func TestWizard_HappyPath_E2E(t *testing.T) {
 
 	// 2. login → URL captured
 	w = httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/login", nil))
+	req = httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/login", nil)
+	markLocalCEREBRUM(h, req)
+	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	var loginResp map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &loginResp))
@@ -430,7 +441,9 @@ func TestWizard_HappyPath_E2E(t *testing.T) {
 
 	// 4. login-status → authenticated
 	w = httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/wizard/chatgpt/login-status", nil))
+	req = httptest.NewRequest(http.MethodGet, "/v1/wizard/chatgpt/login-status", nil)
+	markLocalCEREBRUM(h, req)
+	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	var statusResp map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &statusResp))
@@ -442,8 +455,9 @@ func TestWizard_HappyPath_E2E(t *testing.T) {
 
 	body, _ := json.Marshal(map[string]string{"subdomain": "sage", "zone": "example.com"})
 	w = httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/create-tunnel", bytes.NewReader(body))
+	req = httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/create-tunnel", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 
@@ -499,6 +513,7 @@ func TestWizard_InstallCloudflared_StreamsOutput(t *testing.T) {
 	h, _ := newTestHandler(t)
 	r := testRouter(h)
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/install-cloudflared", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

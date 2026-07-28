@@ -143,6 +143,7 @@ func (s *PostgresStore) ensureAgentSchema(ctx context.Context) error {
 				bundle_path      TEXT        NOT NULL DEFAULT '',
 				on_chain_height  BIGINT      NOT NULL DEFAULT 0,
 				visible_agents   TEXT        NOT NULL DEFAULT '',
+				capabilities     BIGINT      NOT NULL DEFAULT 0,
 				provider         TEXT        NOT NULL DEFAULT '',
 				claim_token      TEXT        NOT NULL DEFAULT '',
 				claim_expires_at TIMESTAMPTZ,
@@ -175,6 +176,7 @@ func (s *PostgresStore) ensureAgentSchema(ctx context.Context) error {
 			`ALTER TABLE agents ADD COLUMN IF NOT EXISTS bundle_path      TEXT        NOT NULL DEFAULT ''`,
 			`ALTER TABLE agents ADD COLUMN IF NOT EXISTS on_chain_height  BIGINT      NOT NULL DEFAULT 0`,
 			`ALTER TABLE agents ADD COLUMN IF NOT EXISTS visible_agents   TEXT        NOT NULL DEFAULT ''`,
+			`ALTER TABLE agents ADD COLUMN IF NOT EXISTS capabilities     BIGINT      NOT NULL DEFAULT 0`,
 			`ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider         TEXT        NOT NULL DEFAULT ''`,
 			`ALTER TABLE agents ADD COLUMN IF NOT EXISTS claim_token      TEXT        NOT NULL DEFAULT ''`,
 			`ALTER TABLE agents ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMPTZ`,
@@ -184,6 +186,7 @@ func (s *PostgresStore) ensureAgentSchema(ctx context.Context) error {
 			`ALTER TABLE agents ADD COLUMN IF NOT EXISTS removed_at       TIMESTAMPTZ`,
 			`CREATE INDEX IF NOT EXISTS idx_agents_name ON agents (name) WHERE status != 'removed'`,
 			`CREATE INDEX IF NOT EXISTS idx_agents_org ON agents (org_id) WHERE org_id != ''`,
+			`CREATE INDEX IF NOT EXISTS idx_agents_claim_token ON agents (claim_token) WHERE claim_token != ''`,
 		}
 		for _, stmt := range stmts {
 			if _, err := ps.db.Exec(ctx, stmt); err != nil {
@@ -2682,24 +2685,47 @@ const agentColumns = `
 	a.validator_pubkey, a.node_id, a.p2p_address, a.status, a.clearance,
 	a.org_id, a.dept_id, a.domain_access, a.bundle_path,
 	a.first_seen, a.last_seen, a.created_at, a.removed_at,
-	a.on_chain_height, a.visible_agents, a.provider,
+	a.on_chain_height, a.visible_agents, a.capabilities, a.provider,
 	COALESCE((SELECT COUNT(*) FROM memories WHERE submitting_agent = a.agent_id), 0)::int,
 	a.claim_token, a.claim_expires_at`
+
+const postgresFindAgentsByNameSQL = `
+	SELECT a.agent_id, a.name, COALESCE(a.registered_name, ''),
+		COALESCE(a.provider, ''), a.status, a.removed_at
+	FROM agents a
+	WHERE a.status = 'active' AND a.removed_at IS NULL
+	  AND (
+	    a.name COLLATE "C" ILIKE $1 ESCAPE '\'
+	    OR COALESCE(a.registered_name, '') COLLATE "C" ILIKE $1 ESCAPE '\'
+	    OR COALESCE(a.provider, '') COLLATE "C" ILIKE $1 ESCAPE '\'
+	  )
+	ORDER BY CASE
+	  WHEN a.name COLLATE "C" ILIKE $2 ESCAPE '\'
+	    OR COALESCE(a.registered_name, '') COLLATE "C" ILIKE $2 ESCAPE '\'
+	    OR COALESCE(a.provider, '') COLLATE "C" ILIKE $2 ESCAPE '\' THEN 0
+	  ELSE 1
+	END, LOWER(a.name COLLATE "C") COLLATE "C", a.agent_id
+	LIMIT $3`
 
 // scanAgent reads one agents row in agentColumns order. Satisfied by both
 // pgx.Row (QueryRow) and pgx.Rows (after Next).
 func scanAgent(row interface{ Scan(...any) error }) (*AgentEntry, error) {
 	a := &AgentEntry{}
+	var capabilities int64
 	if err := row.Scan(
 		&a.AgentID, &a.Name, &a.RegisteredName, &a.Role, &a.Avatar, &a.BootBio,
 		&a.ValidatorPubkey, &a.NodeID, &a.P2PAddress, &a.Status, &a.Clearance,
 		&a.OrgID, &a.DeptID, &a.DomainAccess, &a.BundlePath,
 		&a.FirstSeen, &a.LastSeen, &a.CreatedAt, &a.RemovedAt,
-		&a.OnChainHeight, &a.VisibleAgents, &a.Provider, &a.MemoryCount,
+		&a.OnChainHeight, &a.VisibleAgents, &capabilities, &a.Provider, &a.MemoryCount,
 		&a.ClaimToken, &a.ClaimExpiresAt,
 	); err != nil {
 		return nil, err
 	}
+	if capabilities < 0 || capabilities > int64(^uint32(0)) {
+		return nil, fmt.Errorf("agent capability mask %d is outside uint32 range", capabilities)
+	}
+	a.Capabilities = AgentCapabilities(capabilities)
 	if a.RegisteredName == "" {
 		a.RegisteredName = a.Name // backfill for pre-existing agents
 	}
@@ -2746,6 +2772,48 @@ func (s *PostgresStore) GetAgentByName(ctx context.Context, name string) (*Agent
 	return a, nil
 }
 
+// FindAgentsByName is the Postgres parity path for the signed
+// /v1/agents/lookup endpoint used by amid. It deliberately projects only the
+// bounded recipient metadata needed by MCP instead of invoking ListAgents'
+// roster-wide derived memory-count query. ILIKE under the explicit C collation
+// provides SQLite-compatible ASCII case folding while preserving registered
+// non-ASCII casing; escaped metacharacters remain literal, and exact field
+// matches sort before partials just as they do in SQLite.
+func (s *PostgresStore) FindAgentsByName(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	exact, pattern, limit, ok := normalizeAgentNameLookup(query, limit, maxAgentNameLookupResults)
+	if !ok {
+		return nil, nil
+	}
+	rows, err := s.db.Query(ctx, postgresFindAgentsByNameSQL, pattern, exact, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find agents by name: %w", err)
+	}
+	defer rows.Close()
+
+	agents := make([]*AgentEntry, 0, limit)
+	for rows.Next() {
+		agent := &AgentEntry{}
+		if scanErr := rows.Scan(
+			&agent.AgentID,
+			&agent.Name,
+			&agent.RegisteredName,
+			&agent.Provider,
+			&agent.Status,
+			&agent.RemovedAt,
+		); scanErr != nil {
+			return nil, fmt.Errorf("scan agent name lookup: %w", scanErr)
+		}
+		if agent.RegisteredName == "" {
+			agent.RegisteredName = agent.Name
+		}
+		agents = append(agents, agent)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate agent name lookup: %w", err)
+	}
+	return agents, nil
+}
+
 func (s *PostgresStore) CreateAgent(ctx context.Context, agent *AgentEntry) error {
 	now := time.Now().UTC()
 	firstSeen := now
@@ -2767,13 +2835,13 @@ func (s *PostgresStore) CreateAgent(ctx context.Context, agent *AgentEntry) erro
 	tag, err := s.db.Exec(ctx, `
 		INSERT INTO agents (agent_id, name, registered_name, role, avatar, boot_bio, validator_pubkey,
 			node_id, p2p_address, status, clearance, org_id, dept_id, domain_access, bundle_path,
-			on_chain_height, visible_agents, provider, claim_token, claim_expires_at,
+			on_chain_height, visible_agents, capabilities, provider, claim_token, claim_expires_at,
 			first_seen, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		ON CONFLICT (agent_id) DO NOTHING`,
 		agent.AgentID, agent.Name, agent.RegisteredName, agent.Role, agent.Avatar, agent.BootBio, agent.ValidatorPubkey,
 		agent.NodeID, agent.P2PAddress, agent.Status, agent.Clearance, agent.OrgID, agent.DeptID,
-		agent.DomainAccess, agent.BundlePath, agent.OnChainHeight, agent.VisibleAgents, agent.Provider,
+		agent.DomainAccess, agent.BundlePath, agent.OnChainHeight, agent.VisibleAgents, int64(agent.Capabilities), agent.Provider,
 		agent.ClaimToken, agent.ClaimExpiresAt, firstSeen, createdAt)
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
@@ -2790,12 +2858,12 @@ func (s *PostgresStore) UpdateAgent(ctx context.Context, agent *AgentEntry) erro
 	_, err := s.db.Exec(ctx, `
 		UPDATE agents SET name=$1, role=$2, avatar=$3, boot_bio=$4, clearance=$5,
 			org_id=$6, dept_id=$7, domain_access=$8, p2p_address=$9,
-			on_chain_height=$10, visible_agents=$11, provider=$12,
-			claim_token=$13, claim_expires_at=$14
-		WHERE agent_id=$15`,
+			on_chain_height=$10, visible_agents=$11, capabilities=$12, provider=$13,
+			claim_token=$14, claim_expires_at=$15
+		WHERE agent_id=$16`,
 		agent.Name, agent.Role, agent.Avatar, agent.BootBio, agent.Clearance,
 		agent.OrgID, agent.DeptID, agent.DomainAccess, agent.P2PAddress,
-		agent.OnChainHeight, agent.VisibleAgents, agent.Provider,
+		agent.OnChainHeight, agent.VisibleAgents, int64(agent.Capabilities), agent.Provider,
 		agent.ClaimToken, agent.ClaimExpiresAt, agent.AgentID)
 	if err != nil {
 		return fmt.Errorf("update agent: %w", err)

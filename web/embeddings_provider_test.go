@@ -21,6 +21,7 @@ func TestEmbeddingProviderEndpointPersistsHashAndRequestsRestart(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/embeddings/provider",
 		bytes.NewBufferString(`{"provider":"hash"}`))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	rr := httptest.NewRecorder()
 	testRouter(h).ServeHTTP(rr, req)
 
@@ -79,7 +80,9 @@ func TestEmbeddingReembedUsesActiveCustomSpace(t *testing.T) {
 	h.RunBackground = func(fn func(context.Context)) { fn(context.Background()) }
 
 	rr := httptest.NewRecorder()
-	testRouter(h).ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/dashboard/embeddings/reembed", nil))
+	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/embeddings/reembed", nil)
+	markLocalCEREBRUM(h, req)
+	testRouter(h).ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 	counts, err := s.CountMemoriesByProvider(context.Background())
 	require.NoError(t, err)
@@ -127,6 +130,8 @@ func TestEmbeddingReembedRejectsPreCutoverHashProvider(t *testing.T) {
 	h, _ := newTestHandler(t)
 	h.SetEmbedder(hashOnlyEmbedder{})
 	rr := httptest.NewRecorder()
-	testRouter(h).ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/dashboard/embeddings/reembed", nil))
+	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/embeddings/reembed", nil)
+	markLocalCEREBRUM(h, req)
+	testRouter(h).ServeHTTP(rr, req)
 	require.Equal(t, http.StatusPreconditionFailed, rr.Code, rr.Body.String())
 }

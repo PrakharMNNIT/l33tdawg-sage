@@ -171,8 +171,8 @@ test('native shell evidence is version-locked, private, and cannot promote an un
   assert.match(evidence, /SAGE_DAEMON_VERSION/);
   assert.match(
     daemonStager,
-    /SEMVER_PATTERN='\^11\\\.\(10\|11\|12\|13\)\\\./,
-    'the tagged daemon stager must accept the current v11.13 release series',
+    /SEMVER_PATTERN='\^11\\\.\(10\|11\|12\|13\|14\)\\\./,
+    'the tagged daemon stager must accept the current v11.14 release series',
   );
   assert.match(evidence, /Repair v11\.12\.0 native staging helper for immutable-tag recovery/);
   assert.match(evidence, /github\.event_name == 'workflow_dispatch'.*RELEASE_TAG == 'v11\.12\.0'/);
@@ -220,7 +220,7 @@ test('native shell evidence is version-locked, private, and cannot promote an un
   ]);
   assert.match(promotion, /always\(\)/);
   assert.match(promotion, /Native standalone promotion does not apply before v11\.11\.0/);
-  // The native shell is alpha through the v11.11-v11.13 bridge: built in CI,
+  // The native shell is alpha through the v11.11-v11.14 bridge: built in CI,
   // never staged as a public asset. The gate must NOT block the release, or
   // every other channel is held hostage to an artifact no user receives.
   assert.doesNotMatch(promotion, /whole-release hold/);
@@ -340,26 +340,26 @@ test('the Linux cold gate proves the closed placeholder through the real Comet d
   assert.doesNotMatch(v119StateSync, /busybox nslookup provider-p2p/);
 });
 
-test('the mandatory cold gate transfers one exact app-v21 session', () => {
+test('the mandatory cold gate transfers one exact app-v22 session', () => {
   assert.match(
     faultWorkflow,
-    /name: App-v21 real Comet\/ABCI crash, partition, and state-sync gate/,
+    /name: App-v22 real Comet\/ABCI crash, partition, and state-sync gate/,
   );
-  assert.match(v119StateSync, /"app_version": 21/);
-  assert.doesNotMatch(v119StateSync, /"app_version": 20/);
-  assert.match(v119StateSync, /wait_app_version "\$\{PROVIDER\}" 21/);
+  assert.match(v119StateSync, /"app_version": 22/);
+  assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21)/);
+  assert.match(v119StateSync, /wait_app_version "\$\{PROVIDER\}" 22/);
   assert.match(
     v119StateSync,
-    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" 21 "\$\{pre_publish_evidence\}"/,
+    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" 22 "\$\{pre_publish_evidence\}"/,
   );
-  assert.match(v119StateSync, /\[ "\$\{receiver_app_version\}" != 21 \]/);
-  assert.match(v119StateSync, /\[ "\$\{success_receiver_app_version\}" != 21 \]/);
+  assert.match(v119StateSync, /\[ "\$\{receiver_app_version\}" != 22 \]/);
+  assert.match(v119StateSync, /\[ "\$\{success_receiver_app_version\}" != 22 \]/);
   assert.equal(
-    (v119StateSync.match(/\[ "\$\{provider_app_version\}" != 21 \]/g) || []).length,
+    (v119StateSync.match(/\[ "\$\{provider_app_version\}" != 22 \]/g) || []).length,
     2,
   );
-  assert.match(v119StateSync, /\[ "\$\{post_restart_provider_version\}" != 21 \]/);
-  assert.match(v119StateSync, /\[ "\$\{post_restart_receiver_version\}" != 21 \]/);
+  assert.match(v119StateSync, /\[ "\$\{post_restart_provider_version\}" != 22 \]/);
+  assert.match(v119StateSync, /\[ "\$\{post_restart_receiver_version\}" != 22 \]/);
   assert.match(
     stateSyncRuntime,
     /Uint64\("app_version", expectedAppVersion\)[\s\S]*?Msg\("authorized state-sync session assembled and exact-version candidate verified"\)/,
@@ -436,13 +436,13 @@ test('the fresh real-Comet fixture cannot skip historical app forks', () => {
 
   assert.match(
     v119Chaos,
-    /for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do/,
+    /for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do/,
   );
-  assert.doesNotMatch(v119Chaos, /for target in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do/);
-  assert.match(v119Chaos, /\[ "\$\{version\}" -ne 21 \]/);
+  assert.doesNotMatch(v119Chaos, /for target in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do/);
+  assert.match(v119Chaos, /\[ "\$\{version\}" -ne 22 \]/);
   assert.match(
     v119Chaos,
-    /restart_pair_and_converge\(\)[\s\S]*?assert_matched_apphash "\$\{label\}" 180[\s\S]*?wait_all_app_version 21 180/,
+    /restart_pair_and_converge\(\)[\s\S]*?assert_matched_apphash "\$\{label\}" 180[\s\S]*?wait_all_app_version 22 180/,
   );
   assert.match(
     heartbeatSubmission,
@@ -459,9 +459,9 @@ test('the fresh real-Comet fixture cannot skip historical app forks', () => {
     /submit_governance_heartbeat_for_progress "\$\{label\} heartbeat 1"[\s\S]*?submit_governance_heartbeat_for_progress "\$\{label\} heartbeat 2"[\s\S]*?wait_progress "\$\{RPC_PORTS\[\$progress_port_index\]\}" "\$\{before\}" 2 120/,
   );
   assert.equal(
-    (v119Chaos.match(/wait_all_app_version 21 180/g) || []).length,
+    (v119Chaos.match(/wait_all_app_version 22 180/g) || []).length,
     3,
-    'restart recovery plus both healed partition phases must reassert app-v21',
+    'restart recovery plus both healed partition phases must reassert app-v22',
   );
 });
 
@@ -473,7 +473,7 @@ test('the real-Comet fixture proves governance-domain binding before the long fo
   );
   const bindingGate = v119Chaos.lastIndexOf('wait_all_governance_domain_bindings 30');
   const forkLadder = v119Chaos.indexOf(
-    'for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do',
+    'for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do',
   );
   assert.ok(bindingGate >= 0 && bindingGate < forkLadder);
 });

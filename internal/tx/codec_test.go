@@ -499,6 +499,48 @@ func TestAgentSetPermissionRoundTrip(t *testing.T) {
 	assert.Equal(t, original.AgentSetPermission.DeptID, decoded.AgentSetPermission.DeptID)
 }
 
+func TestAgentSetPermissionCapabilitiesTrailingExtension(t *testing.T) {
+	legacy := &AgentSetPermission{
+		AgentID:       "agent-capability-test",
+		Clearance:     2,
+		DomainAccess:  `[{"domain":"research","read":true}]`,
+		VisibleAgents: "*",
+		OrgID:         "org-a",
+		DeptID:        "dept-b",
+	}
+	legacyBytes := encodeAgentSetPermission(legacy)
+	decodedLegacy, err := decodeAgentSetPermission(legacyBytes)
+	require.NoError(t, err)
+	assert.Zero(t, decodedLegacy.Capabilities)
+	assert.False(t, decodedLegacy.CapabilitiesPresent)
+	assert.Equal(t, legacy, decodedLegacy, "zero mask must preserve the exact legacy payload")
+
+	extended := *legacy
+	extended.Capabilities = 15
+	extendedBytes := encodeAgentSetPermission(&extended)
+	require.Len(t, extendedBytes, len(legacyBytes)+4)
+	assert.Equal(t, legacyBytes, extendedBytes[:len(legacyBytes)], "app-v22 must only append to the legacy body")
+	assert.Equal(t, []byte{0, 0, 0, 15}, extendedBytes[len(legacyBytes):])
+
+	decodedExtended, err := decodeAgentSetPermission(extendedBytes)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(15), decodedExtended.Capabilities)
+	assert.True(t, decodedExtended.CapabilitiesPresent)
+
+	explicitZero := *legacy
+	explicitZero.CapabilitiesPresent = true
+	explicitZeroBytes := encodeAgentSetPermission(&explicitZero)
+	require.Len(t, explicitZeroBytes, len(legacyBytes)+4)
+	assert.Equal(t, []byte{0, 0, 0, 0}, explicitZeroBytes[len(legacyBytes):])
+	decodedExplicitZero, err := decodeAgentSetPermission(explicitZeroBytes)
+	require.NoError(t, err)
+	assert.Zero(t, decodedExplicitZero.Capabilities)
+	assert.True(t, decodedExplicitZero.CapabilitiesPresent, "explicit zero must remain distinguishable from a legacy omission")
+
+	_, err = decodeAgentSetPermission(append(append([]byte(nil), legacyBytes...), 0x01))
+	require.ErrorIs(t, err, ErrInvalidTxData, "partial/unknown trailing extensions must fail closed")
+}
+
 func TestAgentRegisterEmptyFields(t *testing.T) {
 	// Test with minimal fields (only AgentID and Name required in practice)
 	original := &ParsedTx{

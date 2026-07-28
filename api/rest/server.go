@@ -95,6 +95,9 @@ type Server struct {
 	// postV20ForNextTxFn prevents operator surfaces from constructing a scope
 	// proposal before app-v20 consensus can apply it. nil is fail-closed.
 	postV20ForNextTxFn func() bool
+	// postV22ForNextTxFn gates construction of consensus-enforced agent
+	// capability masks. nil is fail-closed.
+	postV22ForNextTxFn func() bool
 
 	// federation is the v11 OFF-consensus transport (recall proxy, co-commit
 	// receipt exchange, cross-fed agreement setup). nil disables every
@@ -241,6 +244,16 @@ func (s *Server) SetPostV20ForNextTxAccessor(fn func() bool) {
 
 func (s *Server) isPostV20ForNextTx() bool {
 	return s.postV20ForNextTxFn != nil && s.postV20ForNextTxFn()
+}
+
+// SetPostV22ForNextTxAccessor wires the dynamic app-v22 agent-capability gate.
+// Callers should pass app.IsAppV22ActiveForNextTx.
+func (s *Server) SetPostV22ForNextTxAccessor(fn func() bool) {
+	s.postV22ForNextTxFn = fn
+}
+
+func (s *Server) isPostV22ForNextTx() bool {
+	return s.postV22ForNextTxFn != nil && s.postV22ForNextTxFn()
 }
 
 // loadValidatorSigningKey loads the CometBFT validator private key so that

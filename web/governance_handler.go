@@ -437,7 +437,7 @@ func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http
 
 func (h *DashboardHandler) requireDashboardGovernanceOperator(w http.ResponseWriter, r *http.Request) bool {
 	if !h.isCEREBRUMOperatorRequest(r) {
-		writeError(w, http.StatusForbidden, "only the authenticated local node operator may mutate governance")
+		writeCEREBRUMOperatorForbidden(w, "Changing governance requires operator authority.")
 		return false
 	}
 	return true

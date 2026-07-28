@@ -129,10 +129,7 @@ func TestFederationGroupRouteAcceptsOnlyOperatorEd25519Signature(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/v1/dashboard/federation/groups", nil)
-	req.RemoteAddr = "127.0.0.1:43210"
-	req.Host = "localhost:8080"
-	req.Header.Set("Origin", "http://localhost:8080")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	markLocalCEREBRUM(h, req)
 	rr = httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotImplemented {
@@ -193,8 +190,8 @@ func TestFederationGroupSurfaceRequiresVerifiedNodeOperator(t *testing.T) {
 				t.Fatalf("nonoperator status=%d", got)
 			}
 
-			// A raw local process without CEREBRUM browser provenance is not an
-			// operator credential. An exact same-origin local CEREBRUM request is.
+			// Neither a raw local process nor forged same-origin browser headers
+			// are operator credentials without a valid encrypted session.
 			for _, browser := range []bool{false, true} {
 				req = httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 				req.RemoteAddr = "127.0.0.1:43210"
@@ -204,9 +201,6 @@ func TestFederationGroupSurfaceRequiresVerifiedNodeOperator(t *testing.T) {
 					req.Header.Set("Sec-Fetch-Site", "same-origin")
 				}
 				want := http.StatusForbidden
-				if browser {
-					want = http.StatusNotImplemented
-				}
 				if got := call(req); got != want {
 					t.Fatalf("unsigned loopback browser=%v status=%d want=%d", browser, got, want)
 				}

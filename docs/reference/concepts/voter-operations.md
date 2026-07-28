@@ -130,4 +130,8 @@ It does **not** mean content is vetted: the voter's `Decide` is mechanical
 (dedup / length / noise / confidence thresholds). Any well-formed submission above the
 confidence floor becomes committed institutional memory with no human or semantic
 review. Classification still gates *reads*, so this is a pollution risk, not a
-disclosure one; the correction path is `sage_forget` / challenge.
+disclosure one. If no replacement is needed, the removal path is
+`sage_forget` / challenge. If the content is being corrected, use
+`sage_remember(replaces_memory_id=...)`: it verifies the replacement is
+committed before challenging the old memory, so an interrupted correction may
+leave both records but never neither.

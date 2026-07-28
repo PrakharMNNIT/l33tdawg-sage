@@ -555,6 +555,10 @@ type AgentSetPermission struct {
 	VisibleAgents string // JSON array of agent IDs or "*" for all
 	OrgID         string
 	DeptID        string
+	// Capabilities is an app-v22 trailing extension. Zero preserves the legacy
+	// permission record and transaction behavior.
+	Capabilities        uint32
+	CapabilitiesPresent bool
 }
 
 // ParsedTx is the top-level transaction envelope.

@@ -142,10 +142,7 @@ func runMCP() error {
 	// 2. SAGE_AGENT_KEY (kept for backward compatibility)
 	// 3. Per-project key (~/.sage/agents/<name>-<hash>/agent.key)
 	// 4. Default ~/.sage/agent.key
-	keyPath := os.Getenv("SAGE_IDENTITY_PATH")
-	if keyPath == "" {
-		keyPath = os.Getenv("SAGE_AGENT_KEY")
-	}
+	keyPath, _ := configuredMCPIdentityEnv()
 
 	projectName := strings.TrimSpace(os.Getenv("SAGE_PROJECT"))
 
@@ -155,14 +152,15 @@ func runMCP() error {
 	} else {
 		projectDir, err := os.Getwd()
 		if err != nil {
-			// Fallback to legacy shared key
-			keyPath = existingIdentityOrDefault("", home, "", os.Getenv("SAGE_PROVIDER"))
-			fmt.Fprintf(os.Stderr, "INFO: Identity resolved via default ~/.sage/agent.key\n")
-		} else {
-			projectName = filepath.Base(projectDir)
-			keyPath = existingIdentityOrDefault("", home, projectDir, os.Getenv("SAGE_PROVIDER"))
-			fmt.Fprintf(os.Stderr, "INFO: Identity resolved via per-project agents/: %s\n", keyPath)
+			// A shared user-level MCP registration intentionally has no pinned
+			// signer: its working directory is the project/identity boundary.
+			// Falling back to ~/.sage/agent.key here would silently turn a
+			// failed workspace lookup into node-operator authority.
+			return fmt.Errorf("resolve project directory for unpinned MCP identity: %w", err)
 		}
+		projectName = filepath.Base(projectDir)
+		keyPath = implicitMCPIdentityPath(home, projectDir, os.Getenv("SAGE_PROVIDER"), os.Getenv("SAGE_PROJECT"))
+		fmt.Fprintf(os.Stderr, "INFO: Identity resolved via per-project agents/: %s\n", keyPath)
 	}
 
 	// Ensure parent directory exists (critical for SAGE_IDENTITY_PATH auto-generation).
@@ -194,6 +192,39 @@ func runMCP() error {
 		selfHealProject(projectDir, home, os.Getenv("SAGE_PROVIDER"), keyPath)
 	}
 	return server.Run(context.Background())
+}
+
+// configuredMCPIdentityEnv separates an explicitly pinned MCP registration
+// from the shared Codex workspace mode. The latter must ignore ambient shell
+// exports; otherwise launching Codex from a configured terminal collapses
+// every project back onto that inherited signer.
+func configuredMCPIdentityEnv() (string, bool) {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("SAGE_IDENTITY_MODE")), "workspace") {
+		return "", true
+	}
+	if keyPath := os.Getenv("SAGE_IDENTITY_PATH"); keyPath != "" {
+		return keyPath, false
+	}
+	return os.Getenv("SAGE_AGENT_KEY"), false
+}
+
+// implicitMCPIdentityPath resolves the no-explicit-key path used by a shared
+// user-level MCP registration. Codex's global config is inherited by every
+// workspace, while its global lifecycle hooks also have no provider env. Both
+// sides must therefore derive the historical provider-neutral project key or
+// hooks and MCP calls authenticate as different agents in the same folder.
+// Project-local Codex installs still pin their provider-specific key explicitly.
+func implicitMCPIdentityPath(sageHome, projectDir, provider, configuredProject string) string {
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") && strings.TrimSpace(configuredProject) == "" {
+		userHome, _ := os.UserHomeDir()
+		cleanProject := filepath.Clean(projectDir)
+		if cleanProject == "." || cleanProject == string(filepath.Separator) ||
+			(userHome != "" && sameFilesystemPath(cleanProject, userHome)) {
+			return filepath.Join(sageHome, "agents", "global-codex", "agent.key")
+		}
+		return filepath.Join(providerProjectAgentDir(sageHome, projectDir, ""), "agent.key")
+	}
+	return existingIdentityOrDefault("", sageHome, projectDir, provider)
 }
 
 // providerProjectAgentDir gives each MCP client provider an independent

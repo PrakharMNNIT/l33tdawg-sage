@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/governance"
@@ -76,7 +77,11 @@ func requireDashboardGovernanceProofBody(t *testing.T, parsed *tx.ParsedTx, meth
 	return body
 }
 
-func markLocalDashboardRequest(req *http.Request) {
+func markLocalDashboardRequest(h *DashboardHandler, req *http.Request) {
+	const token = "test-dashboard-session"
+	h.Encrypted.Store(true)
+	h.sessions.Store(token, time.Now().Add(time.Hour))
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	req.RemoteAddr = "127.0.0.1:41000"
 	req.Host = "localhost:8080"
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
@@ -89,7 +94,7 @@ func TestDashboardGovernanceRejectsAuthenticatedNonOperator(t *testing.T) {
 
 	body := []byte(`{"operation":"remove_validator","target_id":"validator-a","reason":"test"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/governance/propose", bytes.NewReader(body))
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	req = req.WithContext(context.WithValue(req.Context(), verifiedDashboardAgentKey{}, "authenticated-agent"))
 	resp := httptest.NewRecorder()
 	h.handleDashboardGovPropose(resp, req)
@@ -105,7 +110,7 @@ func TestDashboardScopeGovernanceUsesValidatorOuterAndOperatorProof(t *testing.T
 
 	body := []byte(`{"operation":"scope_action","target_id":"scope-a","reason":"form scope","payload":"AQ=="}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/governance/propose", bytes.NewReader(body))
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	resp := httptest.NewRecorder()
 	h.handleDashboardGovPropose(resp, req)
 
@@ -133,7 +138,7 @@ func TestDashboardNonScopeProposalUsesValidatorOuterAndOperatorProofPostV20(t *t
 
 	body := []byte(`{"operation":"remove_validator","target_id":"validator-a","reason":"test"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/governance/propose", bytes.NewReader(body))
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	resp := httptest.NewRecorder()
 	h.handleDashboardGovPropose(resp, req)
 
@@ -167,7 +172,7 @@ func TestDashboardNonScopeProposalKeepsLegacyAdminOuterBeforeAppV20(t *testing.T
 
 	body := []byte(`{"operation":"remove_validator","target_id":"validator-a","reason":"test"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/governance/propose", bytes.NewReader(body))
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	resp := httptest.NewRecorder()
 	h.handleDashboardGovPropose(resp, req)
 
@@ -185,7 +190,7 @@ func TestDashboardVoteUsesValidatorOuterAndOperatorProofPostV20(t *testing.T) {
 
 	body := []byte(`{"proposal_id":"proposal-a","decision":"accept"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/governance/vote", bytes.NewReader(body))
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	resp := httptest.NewRecorder()
 	h.handleDashboardGovVote(resp, req)
 
@@ -212,7 +217,7 @@ func TestDashboardGovernanceMissingDomainFailsClosedBeforeBroadcast(t *testing.T
 
 	body := []byte(`{"operation":"remove_validator","target_id":"validator-a","reason":"test"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/governance/propose", bytes.NewReader(body))
-	markLocalDashboardRequest(req)
+	markLocalDashboardRequest(h, req)
 	resp := httptest.NewRecorder()
 	h.handleDashboardGovPropose(resp, req)
 
@@ -257,7 +262,7 @@ func TestDashboardGovernanceCommitFailuresReturnBadGatewayWithoutGhostEvent(t *t
 			defer h.SSE.Unsubscribe(events)
 
 			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
-			markLocalDashboardRequest(req)
+			markLocalDashboardRequest(h, req)
 			resp := httptest.NewRecorder()
 			tc.invoke(h, resp, req)
 

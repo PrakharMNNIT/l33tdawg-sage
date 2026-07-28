@@ -35,6 +35,7 @@ func TestHandleSaveMemoryMode_Full(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"mode": "full"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -53,6 +54,7 @@ func TestHandleSaveMemoryMode_Bookend(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"mode": "bookend"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -71,6 +73,7 @@ func TestHandleSaveMemoryMode_OnDemand(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"mode": "on-demand"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -83,6 +86,7 @@ func TestHandleSaveMemoryMode_OnDemand(t *testing.T) {
 
 	// Read back
 	req = httptest.NewRequest("GET", "/v1/dashboard/settings/memory-mode", nil)
+	markLocalCEREBRUM(h, req)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -97,6 +101,7 @@ func TestHandleSaveMemoryMode_InvalidMode(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"mode": "turbo"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -111,12 +116,14 @@ func TestHandleSaveMemoryMode_Persistence(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"mode": "bookend"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 
 	// Read back
 	req = httptest.NewRequest("GET", "/v1/dashboard/settings/memory-mode", nil)
+	markLocalCEREBRUM(h, req)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -136,6 +143,7 @@ func TestHandleSaveMemoryMode_FlagFile(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"mode": "bookend"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -162,6 +170,7 @@ func TestHandleSaveMemoryMode_FlagFileUpdatesOnModeChange(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"mode": "bookend"})
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -173,6 +182,7 @@ func TestHandleSaveMemoryMode_FlagFileUpdatesOnModeChange(t *testing.T) {
 	body, _ = json.Marshal(map[string]string{"mode": "full"})
 	req = httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -187,6 +197,7 @@ func TestHandleSaveMemoryMode_InvalidJSON(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/dashboard/settings/memory-mode", bytes.NewReader([]byte("not json")))
 	req.Header.Set("Content-Type", "application/json")
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

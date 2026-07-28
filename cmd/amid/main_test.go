@@ -35,6 +35,59 @@ type recordingGovernanceDomainBinder struct {
 	calls   int
 }
 
+type recordingRESTForkAccessors struct {
+	postV8  func() bool
+	postV17 func() bool
+	postV20 func() bool
+	postV22 func() bool
+}
+
+func (r *recordingRESTForkAccessors) SetPostV8ForkAccessor(fn func() bool) {
+	r.postV8 = fn
+}
+
+func (r *recordingRESTForkAccessors) SetPostV17ForNextTxAccessor(fn func() bool) {
+	r.postV17 = fn
+}
+
+func (r *recordingRESTForkAccessors) SetPostV20ForNextTxAccessor(fn func() bool) {
+	r.postV20 = fn
+}
+
+func (r *recordingRESTForkAccessors) SetPostV22ForNextTxAccessor(fn func() bool) {
+	r.postV22 = fn
+}
+
+type mutableAppForkAccessors struct {
+	postV8  bool
+	postV17 bool
+	postV20 bool
+	postV22 bool
+}
+
+func (a *mutableAppForkAccessors) IsPostV8Fork() bool            { return a.postV8 }
+func (a *mutableAppForkAccessors) IsAppV17ActiveForNextTx() bool { return a.postV17 }
+func (a *mutableAppForkAccessors) IsAppV20ActiveForNextTx() bool { return a.postV20 }
+func (a *mutableAppForkAccessors) IsAppV22ActiveForNextTx() bool { return a.postV22 }
+
+func TestWireRESTForkAccessorsIncludesAppV22AndStaysDynamic(t *testing.T) {
+	server := &recordingRESTForkAccessors{}
+	app := &mutableAppForkAccessors{}
+
+	wireRESTForkAccessors(server, app)
+
+	if server.postV8 == nil || server.postV17 == nil || server.postV20 == nil || server.postV22 == nil {
+		t.Fatal("amid did not wire every REST fork accessor")
+	}
+	if server.postV22() {
+		t.Fatal("app-v22 accessor unexpectedly active before the app reports activation")
+	}
+	app.postV22 = true
+	if !server.postV22() {
+		t.Fatal("app-v22 REST accessor did not track the live app predicate")
+	}
+}
+
 func (b *recordingGovernanceDomainBinder) SetExpectedGovernanceDelegationDomain(chainID string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

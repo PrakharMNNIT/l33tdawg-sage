@@ -724,6 +724,7 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	agentMigrations := []string{
 		"ALTER TABLE network_agents ADD COLUMN on_chain_height INTEGER DEFAULT 0",
 		"ALTER TABLE network_agents ADD COLUMN visible_agents TEXT DEFAULT ''",
+		"ALTER TABLE network_agents ADD COLUMN capabilities INTEGER DEFAULT 0",
 		"ALTER TABLE network_agents ADD COLUMN provider TEXT DEFAULT ''",
 		"ALTER TABLE network_agents ADD COLUMN claim_token TEXT DEFAULT ''",
 		"ALTER TABLE network_agents ADD COLUMN claim_expires_at TEXT",
@@ -740,6 +741,7 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 		"CREATE INDEX IF NOT EXISTS idx_network_agents_contact_name ON network_agents(name COLLATE NOCASE, agent_id) WHERE status != 'removed'",
 		"CREATE INDEX IF NOT EXISTS idx_network_agents_contact_registered_name ON network_agents(registered_name COLLATE NOCASE, agent_id) WHERE status != 'removed'",
 		"CREATE INDEX IF NOT EXISTS idx_network_agents_contact_provider ON network_agents(provider COLLATE NOCASE, agent_id) WHERE status != 'removed'",
+		"CREATE INDEX IF NOT EXISTS idx_network_agents_claim_token ON network_agents(claim_token) WHERE claim_token != ''",
 	} {
 		if _, err := s.writeExecContext(ctx, index); err != nil {
 			return fmt.Errorf("create federated contact lookup index: %w", err)
@@ -3303,7 +3305,7 @@ func (s *SQLiteStore) ListAgents(ctx context.Context) ([]*AgentEntry, error) {
 			a.status, a.clearance, COALESCE(a.org_id,''), COALESCE(a.dept_id,''),
 			COALESCE(a.domain_access,''), COALESCE(a.bundle_path,''),
 			a.first_seen, a.last_seen, a.created_at, a.removed_at,
-			COALESCE(a.on_chain_height, 0), COALESCE(a.visible_agents, ''), COALESCE(a.provider, ''),
+			COALESCE(a.on_chain_height, 0), COALESCE(a.visible_agents, ''), COALESCE(a.capabilities, 0), COALESCE(a.provider, ''),
 			COALESCE((SELECT COUNT(*) FROM memories WHERE submitting_agent = a.agent_id), 0),
 			COALESCE(a.claim_token, ''), a.claim_expires_at
 		FROM network_agents a
@@ -3322,7 +3324,7 @@ func (s *SQLiteStore) ListAgents(ctx context.Context) ([]*AgentEntry, error) {
 			&a.ValidatorPubkey, &a.NodeID, &a.P2PAddress, &a.Status, &a.Clearance,
 			&a.OrgID, &a.DeptID, &a.DomainAccess, &a.BundlePath,
 			&firstSeen, &lastSeen, &createdAt, &removedAt,
-			&a.OnChainHeight, &a.VisibleAgents, &a.Provider, &a.MemoryCount,
+			&a.OnChainHeight, &a.VisibleAgents, &a.Capabilities, &a.Provider, &a.MemoryCount,
 			&a.ClaimToken, &claimExpiry); scanErr != nil {
 			return nil, fmt.Errorf("scan agent: %w", scanErr)
 		}
@@ -3342,78 +3344,53 @@ func (s *SQLiteStore) ListAgents(ctx context.Context) ([]*AgentEntry, error) {
 }
 
 // FindPipeContactLookupCandidates returns a deliberately small agent metadata
-// projection for federated exact-name discovery. It intentionally does not
-// offer substring matching: this runs while federation authorization leases
-// are held, so a leading-wildcard roster scan would let a peer delay revocation.
-// Each exact field query is backed by a dedicated NOCASE index and capped before
-// live Badger RBAC checks are performed. SQLite NOCASE folds ASCII only, so
-// non-ASCII names must be supplied with their registered code-point casing.
+// projection for federated human-name discovery. The SQL result is capped
+// before live Badger RBAC checks and exact field matches sort ahead of substring
+// matches, so a short name such as "mynah" can find the voice bridge without
+// weakening exact target/address resolution. LIKE metacharacters are escaped;
+// SQLite's LOWER/NOCASE behavior folds ASCII only.
 func (s *SQLiteStore) FindPipeContactLookupCandidates(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
-	if limit <= 0 {
+	exact, pattern, limit, ok := normalizeAgentNameLookup(query, limit, 0)
+	if !ok {
 		return nil, nil
 	}
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return nil, nil
+	rows, err := s.conn.QueryContext(ctx, `
+		SELECT agent_id, name, COALESCE(registered_name,''), COALESCE(provider,''), status, removed_at
+		FROM network_agents
+		WHERE status = 'active' AND removed_at IS NULL
+		  AND (
+		    LOWER(name) LIKE ? ESCAPE '\'
+		    OR LOWER(COALESCE(registered_name,'')) LIKE ? ESCAPE '\'
+		    OR LOWER(COALESCE(provider,'')) LIKE ? ESCAPE '\'
+		  )
+		ORDER BY CASE
+		  WHEN LOWER(name) LIKE ? ESCAPE '\'
+		    OR LOWER(COALESCE(registered_name,'')) LIKE ? ESCAPE '\'
+		    OR LOWER(COALESCE(provider,'')) LIKE ? ESCAPE '\' THEN 0
+		  ELSE 1
+		END, LOWER(name), agent_id
+		LIMIT ?`,
+		pattern, pattern, pattern,
+		exact, exact, exact,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find pipe contact lookup candidates: %w", err)
 	}
-	byID := make(map[string]*AgentEntry, limit)
-	for _, field := range []string{"name", "registered_name", "provider"} {
-		rows, err := s.conn.QueryContext(ctx, `
-			SELECT agent_id, name, COALESCE(registered_name,''), COALESCE(provider,''), status, removed_at
-			FROM network_agents
-			WHERE status != 'removed' AND `+field+` = ? COLLATE NOCASE
-			ORDER BY agent_id
-			LIMIT ?`, query, limit)
-		if err != nil {
-			return nil, fmt.Errorf("find pipe contact lookup candidates: %w", err)
-		}
-		agents, scanErr := scanPipeContactLookupAgents(rows)
-		closeErr := rows.Close()
-		if scanErr != nil {
-			return nil, scanErr
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close pipe contact lookup candidates: %w", closeErr)
-		}
-		for _, agent := range agents {
-			if agent != nil {
-				byID[agent.AgentID] = agent
-			}
-		}
-	}
-	out := make([]*AgentEntry, 0, min(limit, len(byID)))
-	for _, agent := range byID {
-		out = append(out, agent)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		left, right := pipeContactLookupName(out[i]), pipeContactLookupName(out[j])
-		if left == right {
-			return out[i].AgentID < out[j].AgentID
-		}
-		return left < right
-	})
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
+	defer func() { _ = rows.Close() }()
+	return scanPipeContactLookupAgents(rows)
 }
 
-// FindAgentsByExactName is the REST/MCP-facing spelling of the same bounded,
-// index-backed projection used by federated contact discovery. Keeping one
-// implementation prevents a local agent lookup from quietly regressing to
-// ListAgents' roster-wide derived memory-count query.
-func (s *SQLiteStore) FindAgentsByExactName(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+// FindAgentsByName is the bounded local recipient lookup used by MCP. Unlike
+// peer-facing contact discovery, a local operator may use a human substring
+// such as "mynah" for "MYNAH (SAGE Voice Bridge Agent)". This projection stays
+// metadata-only and capped; it never invokes ListAgents' roster-wide derived
+// memory-count query.
+func (s *SQLiteStore) FindAgentsByName(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	if limit > maxAgentNameLookupResults {
+		limit = maxAgentNameLookupResults
+	}
 	return s.FindPipeContactLookupCandidates(ctx, query, limit)
-}
-
-func pipeContactLookupName(agent *AgentEntry) string {
-	if agent == nil {
-		return ""
-	}
-	if agent.Name != "" {
-		return strings.ToLower(agent.Name)
-	}
-	return strings.ToLower(agent.RegisteredName)
 }
 
 // FindPipeContactAgentsByIDPrefix resolves a friendly handle suffix without
@@ -3541,7 +3518,7 @@ func (s *SQLiteStore) GetAgent(ctx context.Context, agentID string) (*AgentEntry
 			a.status, a.clearance, COALESCE(a.org_id,''), COALESCE(a.dept_id,''),
 			COALESCE(a.domain_access,''), COALESCE(a.bundle_path,''),
 			a.first_seen, a.last_seen, a.created_at, a.removed_at,
-			COALESCE(a.on_chain_height, 0), COALESCE(a.visible_agents, ''), COALESCE(a.provider, ''),
+			COALESCE(a.on_chain_height, 0), COALESCE(a.visible_agents, ''), COALESCE(a.capabilities, 0), COALESCE(a.provider, ''),
 			COALESCE((SELECT COUNT(*) FROM memories WHERE submitting_agent = a.agent_id), 0),
 			COALESCE(a.claim_token, ''), a.claim_expires_at
 		FROM network_agents a WHERE a.agent_id = ?`, agentID).Scan(
@@ -3549,7 +3526,7 @@ func (s *SQLiteStore) GetAgent(ctx context.Context, agentID string) (*AgentEntry
 		&a.ValidatorPubkey, &a.NodeID, &a.P2PAddress, &a.Status, &a.Clearance,
 		&a.OrgID, &a.DeptID, &a.DomainAccess, &a.BundlePath,
 		&firstSeen, &lastSeen, &createdAt, &removedAt,
-		&a.OnChainHeight, &a.VisibleAgents, &a.Provider, &a.MemoryCount,
+		&a.OnChainHeight, &a.VisibleAgents, &a.Capabilities, &a.Provider, &a.MemoryCount,
 		&a.ClaimToken, &claimExpiry)
 	if err != nil {
 		return nil, fmt.Errorf("get agent: %w", err)
@@ -3576,7 +3553,7 @@ func (s *SQLiteStore) GetAgentByName(ctx context.Context, name string) (*AgentEn
 			a.status, a.clearance, COALESCE(a.org_id,''), COALESCE(a.dept_id,''),
 			COALESCE(a.domain_access,''), COALESCE(a.bundle_path,''),
 			a.first_seen, a.last_seen, a.created_at, a.removed_at,
-			COALESCE(a.on_chain_height, 0), COALESCE(a.visible_agents, ''), COALESCE(a.provider, ''),
+			COALESCE(a.on_chain_height, 0), COALESCE(a.visible_agents, ''), COALESCE(a.capabilities, 0), COALESCE(a.provider, ''),
 			COALESCE((SELECT COUNT(*) FROM memories WHERE submitting_agent = a.agent_id), 0),
 			COALESCE(a.claim_token, ''), a.claim_expires_at
 		FROM network_agents a WHERE a.name = ? AND a.status != 'removed'`, name).Scan(
@@ -3584,7 +3561,7 @@ func (s *SQLiteStore) GetAgentByName(ctx context.Context, name string) (*AgentEn
 		&a.ValidatorPubkey, &a.NodeID, &a.P2PAddress, &a.Status, &a.Clearance,
 		&a.OrgID, &a.DeptID, &a.DomainAccess, &a.BundlePath,
 		&firstSeen, &lastSeen, &createdAt, &removedAt,
-		&a.OnChainHeight, &a.VisibleAgents, &a.Provider, &a.MemoryCount,
+		&a.OnChainHeight, &a.VisibleAgents, &a.Capabilities, &a.Provider, &a.MemoryCount,
 		&a.ClaimToken, &claimExpiry)
 	if err != nil {
 		return nil, nil // not found — return nil, nil per interface contract
@@ -3626,12 +3603,12 @@ func (s *SQLiteStore) createAgent(ctx context.Context, agent *AgentEntry) error 
 	_, err := s.writeExecContext(ctx, `
 		INSERT INTO network_agents (agent_id, name, registered_name, role, avatar, boot_bio, validator_pubkey,
 			node_id, p2p_address, status, clearance, org_id, dept_id, domain_access, bundle_path,
-			on_chain_height, visible_agents, provider, claim_token, claim_expires_at,
+			on_chain_height, visible_agents, capabilities, provider, claim_token, claim_expires_at,
 			first_seen, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		agent.AgentID, agent.Name, agent.RegisteredName, agent.Role, agent.Avatar, agent.BootBio, agent.ValidatorPubkey,
 		agent.NodeID, agent.P2PAddress, agent.Status, agent.Clearance, agent.OrgID, agent.DeptID,
-		agent.DomainAccess, agent.BundlePath, agent.OnChainHeight, agent.VisibleAgents, agent.Provider,
+		agent.DomainAccess, agent.BundlePath, agent.OnChainHeight, agent.VisibleAgents, agent.Capabilities, agent.Provider,
 		agent.ClaimToken, claimExpiry, firstSeen, createdAt)
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
@@ -3654,12 +3631,12 @@ func (s *SQLiteStore) updateAgent(ctx context.Context, agent *AgentEntry) error 
 	_, err := s.writeExecContext(ctx, `
 		UPDATE network_agents SET name=?, role=?, avatar=?, boot_bio=?, clearance=?,
 			org_id=?, dept_id=?, domain_access=?, p2p_address=?,
-			on_chain_height=?, visible_agents=?, provider=?,
+			on_chain_height=?, visible_agents=?, capabilities=?, provider=?,
 			claim_token=?, claim_expires_at=?
 		WHERE agent_id=?`,
 		agent.Name, agent.Role, agent.Avatar, agent.BootBio, agent.Clearance,
 		agent.OrgID, agent.DeptID, agent.DomainAccess, agent.P2PAddress,
-		agent.OnChainHeight, agent.VisibleAgents, agent.Provider,
+		agent.OnChainHeight, agent.VisibleAgents, agent.Capabilities, agent.Provider,
 		agent.ClaimToken, claimExpiry, agent.AgentID)
 	if err != nil {
 		return fmt.Errorf("update agent: %w", err)

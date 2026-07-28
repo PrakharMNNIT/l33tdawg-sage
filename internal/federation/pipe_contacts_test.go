@@ -181,6 +181,126 @@ func TestPipeContactsIncludeActiveAgentsWithSharedDomainAccess(t *testing.T) {
 	require.ErrorIs(t, err, ErrFederatedPipeInvalid)
 }
 
+func TestPipeContactCapabilitiesIncludeReadAllAndLinearizeTargetDeny(t *testing.T) {
+	ctx := context.Background()
+	m, ss, bs := newDrainTestManager(t)
+	m.postV22ForNextTx = func() bool { return true }
+	peerID := newPeerOperatorID(t)
+	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
+
+	owner := newPeerOperatorID(t)
+	readAllTarget := newPeerOperatorID(t)
+	deniedOwner := newPeerOperatorID(t)
+	for _, agent := range []struct {
+		id   string
+		name string
+		caps store.AgentCapabilities
+	}{
+		{owner, "research-owner", 0},
+		{readAllTarget, "MYNAH companion", store.AgentCapabilityReadAllDomains},
+		{deniedOwner, "denied-owner", store.AgentCapabilityDenyFederatedPipe},
+	} {
+		require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{
+			AgentID: agent.id, Name: agent.name, RegisteredName: agent.name, Status: "active",
+		}))
+		require.NoError(t, bs.RegisterAgentWithCapabilities(
+			agent.id, agent.name, "member", "", "test", "", 1, agent.caps,
+		))
+	}
+	require.NoError(t, bs.RegisterDomain("research", owner, "", 10))
+	require.NoError(t, bs.RegisterDomain("operations", deniedOwner, "", 11))
+	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{
+		{Domain: "research", Read: true},
+		{Domain: "operations", Read: true},
+	})
+	require.NoError(t, err)
+
+	grant := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
+	require.NotNil(t, grant)
+	contacts := make(map[string]PipeContact, len(grant.Contacts))
+	for _, contact := range grant.Contacts {
+		contacts[contact.AgentID] = contact
+	}
+	require.Contains(t, contacts, owner)
+	require.NotContains(t, contacts, deniedOwner,
+		"DenyFederatedPipe must exclude a target even when it owns a shared domain")
+	targetContact, ok := contacts[readAllTarget]
+	require.True(t, ok, "ReadAllDomains must qualify an active reviewed target without a legacy access grant")
+	require.Equal(t, []PipeContactDomain{
+		{Domain: "operations", OwningDomain: "operations", OwnerHeight: 11},
+		{Domain: "research", OwningDomain: "research", OwnerHeight: 10},
+	}, targetContact.Domains)
+
+	updated, err := m.SetPipeContactAcceptance(
+		ctx, "chain-peer", readAllTarget, targetContact.ContactID, true,
+	)
+	require.NoError(t, err)
+	for _, contact := range updated.Contacts {
+		if contact.AgentID == readAllTarget {
+			targetContact = contact
+			break
+		}
+	}
+	require.True(t, targetContact.Accepting)
+	policy, err := m.GetPeerRBACPolicy(ctx, "chain-peer")
+	require.NoError(t, err)
+	require.NotNil(t, policy)
+	event := &PipeEvent{
+		PolicyEpoch: policy.PolicyEpoch, AgreementID: updated.AgreementID,
+		ContactID:       targetContact.ContactID,
+		ContactRevision: pipeContactAuthorizationRevision(updated, &targetContact),
+		TargetAgentID:   readAllTarget,
+	}
+	peer := &peerIdentity{ChainID: "chain-peer", AgentID: peerID, Agreement: agreement}
+	resolved, err := m.authorizeInboundPipeContact(ctx, peer, event)
+	require.NoError(t, err)
+	require.Equal(t, readAllTarget, resolved.AgentID)
+
+	msg := &store.PipelineMessage{
+		PipeID: "pipe-read-all-target", FromAgent: newPeerOperatorID(t), ToAgent: readAllTarget,
+		SourceChainID: "chain-peer", SourcePipeID: "remote-event-id",
+		FederationPolicyEpoch: policy.PolicyEpoch, FederationAgreementID: updated.AgreementID,
+		FederationContactID:       targetContact.ContactID,
+		FederationContactRevision: pipeContactAuthorizationRevision(updated, &targetContact),
+	}
+	actionStarted := make(chan struct{})
+	releaseAction := make(chan struct{})
+	authorized := make(chan error, 1)
+	go func() {
+		authorized <- m.WithAuthorizedImportedPipe(ctx, msg, func() error {
+			close(actionStarted)
+			<-releaseAction
+			return nil
+		})
+	}()
+	<-actionStarted
+	denyPublished := make(chan error, 1)
+	go func() {
+		denyPublished <- bs.SetAgentPermissionWithCapabilities(
+			readAllTarget, 1, "", "", "", "",
+			store.AgentCapabilityReadAllDomains|store.AgentCapabilityDenyFederatedPipe,
+		)
+	}()
+	select {
+	case err := <-denyPublished:
+		t.Fatalf("target deny published while an older imported authorization action was active: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseAction)
+	require.NoError(t, <-authorized)
+	require.NoError(t, <-denyPublished)
+
+	require.ErrorIs(t, m.AuthorizeImportedPipe(ctx, msg), ErrFederatedPipeInvalid,
+		"after target deny publishes, imported work must fail closed")
+	deniedGrant := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
+	require.NotNil(t, deniedGrant)
+	for _, contact := range deniedGrant.Contacts {
+		require.NotEqual(t, readAllTarget, contact.AgentID,
+			"target deny must remove an already accepted ReadAll contact from discovery")
+		require.NotEqual(t, deniedOwner, contact.AgentID)
+	}
+}
+
 func TestLargeSharedRecipientProjectionUsesTargetedLookup(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
@@ -244,7 +364,7 @@ func TestLargeSharedRecipientProjectionUsesTargetedLookup(t *testing.T) {
 	require.NoError(t, json.NewDecoder(compactRec.Body).Decode(&compact))
 	require.Nil(t, compact.PipeContacts, "lookup-capable clients must not force the legacy roster projection")
 
-	body, err := json.Marshal(PipeContactLookupRequest{Name: "innovium", Limit: 20})
+	body, err := json.Marshal(PipeContactLookupRequest{Name: "nov", Limit: 20})
 	require.NoError(t, err)
 	req := httptest.NewRequest(http.MethodPost, "/fed/v1/pipe/contacts/lookup", bytes.NewReader(body))
 	req = req.WithContext(context.WithValue(req.Context(), peerCtxKey{}, &peerIdentity{
@@ -260,6 +380,32 @@ func TestLargeSharedRecipientProjectionUsesTargetedLookup(t *testing.T) {
 	require.Len(t, response.Grant.Contacts, 1)
 	require.Equal(t, target, response.Grant.Contacts[0].AgentID)
 	require.True(t, response.Grant.Contacts[0].Accepting)
+
+	tooShortBody, err := json.Marshal(PipeContactLookupRequest{Name: "i", Limit: 20})
+	require.NoError(t, err)
+	tooShortReq := httptest.NewRequest(http.MethodPost, "/fed/v1/pipe/contacts/lookup", bytes.NewReader(tooShortBody))
+	tooShortReq = tooShortReq.WithContext(context.WithValue(tooShortReq.Context(), peerCtxKey{}, &peerIdentity{
+		ChainID: "chain-peer", AgentID: peerID, Agreement: agreement,
+	}))
+	tooShortRec := httptest.NewRecorder()
+	m.handlePipeContactLookup(tooShortRec, tooShortReq)
+	require.Equal(t, http.StatusBadRequest, tooShortRec.Code, tooShortRec.Body.String())
+
+	// Human-name discovery accepts substrings, but a friendly Target remains an
+	// exact display-name selector so /pipe/resolve cannot silently widen routing.
+	exactTargetBody, err := json.Marshal(PipeContactLookupRequest{Target: "nov", Limit: 20})
+	require.NoError(t, err)
+	exactTargetReq := httptest.NewRequest(http.MethodPost, "/fed/v1/pipe/contacts/lookup", bytes.NewReader(exactTargetBody))
+	exactTargetReq = exactTargetReq.WithContext(context.WithValue(exactTargetReq.Context(), peerCtxKey{}, &peerIdentity{
+		ChainID: "chain-peer", AgentID: peerID, Agreement: agreement,
+	}))
+	exactTargetRec := httptest.NewRecorder()
+	m.handlePipeContactLookup(exactTargetRec, exactTargetReq)
+	require.Equal(t, http.StatusOK, exactTargetRec.Code, exactTargetRec.Body.String())
+	var exactTargetResponse PipeContactLookupResponse
+	require.NoError(t, json.NewDecoder(exactTargetRec.Body).Decode(&exactTargetResponse))
+	require.Zero(t, exactTargetResponse.Total)
+	require.Empty(t, exactTargetResponse.Grant.Contacts)
 
 	oversizedBody, err := json.Marshal(PipeContactLookupRequest{Name: "innovium", Limit: maxPipeContactLookupResults + 1})
 	require.NoError(t, err)

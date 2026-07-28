@@ -182,6 +182,7 @@ CREATE TABLE agents (
     bundle_path      TEXT        NOT NULL DEFAULT '',
     on_chain_height  BIGINT      NOT NULL DEFAULT 0,
     visible_agents   TEXT        NOT NULL DEFAULT '',
+    capabilities     BIGINT      NOT NULL DEFAULT 0,
     provider         TEXT        NOT NULL DEFAULT '',
     claim_token      TEXT        NOT NULL DEFAULT '',
     claim_expires_at TIMESTAMPTZ,
@@ -192,6 +193,7 @@ CREATE TABLE agents (
 );
 CREATE INDEX IF NOT EXISTS idx_agents_name ON agents (name) WHERE status != 'removed';
 CREATE INDEX IF NOT EXISTS idx_agents_org ON agents (org_id) WHERE org_id != '';
+CREATE INDEX IF NOT EXISTS idx_agents_claim_token ON agents (claim_token) WHERE claim_token != '';
 
 -- Durable one-way task assignment notices. These are separate from pipeline
 -- messages: reading a notice does not claim work or require a result.

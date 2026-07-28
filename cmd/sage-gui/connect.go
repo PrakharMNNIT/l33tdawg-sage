@@ -205,6 +205,14 @@ func mcpIdentityPath(configPath, sageHome, provider string) string {
 	if projectDir != "" {
 		return filepath.Join(providerProjectAgentDir(sageHome, projectDir, provider), "agent.key")
 	}
+	// Codex's user-level config is shared by every workspace. Leaving the key
+	// unset lets `sage-gui mcp` derive the provider-neutral workspace identity
+	// from the MCP process working directory. The global hooks use that same
+	// path; pinning global-codex here made every Codex project authenticate as
+	// one agent even though folder hooks correctly derived separate keys.
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return ""
+	}
 	return filepath.Join(sageHome, "agents", "global-"+sanitizeDirName(provider), "agent.key")
 }
 

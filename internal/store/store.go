@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/l33tdawg/sage/internal/memory"
@@ -477,31 +478,62 @@ type DeptMemberEntry struct {
 
 // AgentEntry represents a network agent (validator/peer node).
 type AgentEntry struct {
-	AgentID         string     `json:"agent_id"`
-	Name            string     `json:"name"`
-	RegisteredName  string     `json:"registered_name,omitempty"` // Immutable name from initial registration
-	Role            string     `json:"role"`
-	Avatar          string     `json:"avatar,omitempty"`
-	BootBio         string     `json:"boot_bio,omitempty"`
-	ValidatorPubkey string     `json:"validator_pubkey,omitempty"`
-	NodeID          string     `json:"node_id,omitempty"`
-	P2PAddress      string     `json:"p2p_address,omitempty"`
-	Status          string     `json:"status"`
-	Clearance       int        `json:"clearance"`
-	OrgID           string     `json:"org_id,omitempty"`
-	DeptID          string     `json:"dept_id,omitempty"`
-	DomainAccess    string     `json:"domain_access,omitempty"`
-	BundlePath      string     `json:"bundle_path,omitempty"`
-	FirstSeen       *time.Time `json:"first_seen,omitempty"`
-	LastSeen        *time.Time `json:"last_seen,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	RemovedAt       *time.Time `json:"removed_at,omitempty"`
-	OnChainHeight   int64      `json:"on_chain_height,omitempty"` // Block height where registered (0 = legacy)
-	VisibleAgents   string     `json:"visible_agents,omitempty"`  // JSON array of agent IDs ("*" = all)
-	Provider        string     `json:"provider,omitempty"`        // "claude-code", "chatgpt", etc.
-	MemoryCount     int        `json:"memory_count,omitempty"`
-	ClaimToken      string     `json:"claim_token,omitempty"`      // One-time token for CLI agent install
-	ClaimExpiresAt  *time.Time `json:"claim_expires_at,omitempty"` // When the claim token expires
+	AgentID         string            `json:"agent_id"`
+	Name            string            `json:"name"`
+	RegisteredName  string            `json:"registered_name,omitempty"` // Immutable name from initial registration
+	Role            string            `json:"role"`
+	Avatar          string            `json:"avatar,omitempty"`
+	BootBio         string            `json:"boot_bio,omitempty"`
+	ValidatorPubkey string            `json:"validator_pubkey,omitempty"`
+	NodeID          string            `json:"node_id,omitempty"`
+	P2PAddress      string            `json:"p2p_address,omitempty"`
+	Status          string            `json:"status"`
+	Clearance       int               `json:"clearance"`
+	OrgID           string            `json:"org_id,omitempty"`
+	DeptID          string            `json:"dept_id,omitempty"`
+	DomainAccess    string            `json:"domain_access,omitempty"`
+	BundlePath      string            `json:"bundle_path,omitempty"`
+	FirstSeen       *time.Time        `json:"first_seen,omitempty"`
+	LastSeen        *time.Time        `json:"last_seen,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	RemovedAt       *time.Time        `json:"removed_at,omitempty"`
+	OnChainHeight   int64             `json:"on_chain_height,omitempty"` // Block height where registered (0 = legacy)
+	VisibleAgents   string            `json:"visible_agents,omitempty"`  // JSON array of agent IDs ("*" = all)
+	Capabilities    AgentCapabilities `json:"capabilities,omitempty"`    // On-chain app-v22 capability mask
+	Provider        string            `json:"provider,omitempty"`        // "claude-code", "chatgpt", etc.
+	MemoryCount     int               `json:"memory_count,omitempty"`
+	ClaimToken      string            `json:"claim_token,omitempty"`      // One-time token for CLI agent install
+	ClaimExpiresAt  *time.Time        `json:"claim_expires_at,omitempty"` // When the claim token expires
+}
+
+const maxAgentNameLookupResults = 20
+
+// normalizeAgentNameLookup keeps the SQLite and Postgres recipient finders on
+// one bounded literal-substring contract. The escaped exact value is also safe
+// to use as a LIKE/ILIKE operand when ranking exact field matches.
+func normalizeAgentNameLookup(query string, limit, maxLimit int) (exact, pattern string, boundedLimit int, ok bool) {
+	if limit <= 0 {
+		return "", "", 0, false
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return "", "", 0, false
+	}
+	if maxLimit > 0 && limit > maxLimit {
+		limit = maxLimit
+	}
+	exact = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(foldASCIILower(query))
+	return exact, "%" + exact + "%", limit, true
+}
+
+func foldASCIILower(value string) string {
+	folded := []byte(value)
+	for i, char := range folded {
+		if char >= 'A' && char <= 'Z' {
+			folded[i] = char + ('a' - 'A')
+		}
+	}
+	return string(folded)
 }
 
 // RedeploymentLogEntry represents a redeployment operation log entry.

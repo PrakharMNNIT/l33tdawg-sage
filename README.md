@@ -51,6 +51,48 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.14.1
+
+**SAGE now gives co-located companion agents a consensus-enforced
+least-privilege profile.** App-v22 adds operator-controlled capabilities for
+clearance-bounded cross-domain reads while denying shared-domain writes,
+foreign-domain writes, and domain claims. The companion preset keeps local and
+federated agent inbox messaging enabled, so a voice bridge can delegate work to
+a visible agent on another compatible SAGE and relay its eventual result.
+Short-name agent lookup now searches bounded local metadata, so names such as
+`mynah` resolve without requiring the full registered display name. Direct
+remote memory Write remains unavailable: agents send a pipeline request to the
+remote agent, which performs any separately authorized local action.
+Codex's user-level MCP registration now derives a separate stable signing
+identity from each workspace folder instead of silently reusing `global-codex`;
+explicit custom key pins remain supported. CEREBRUM shows the exact signer ID
+beside every access grant so a display-name match cannot hide an identity
+mismatch, and its access matrix only filters and assigns domains already
+created by agents rather than asking an administrator to create domain tags.
+Fresh self-registrations after app-v22 start quarantined (mask `30`):
+they cannot write or claim domains or use federated inbox routing until a
+global administrator assigns an intentional profile; existing agents retain
+their pre-upgrade mask.
+
+App-v22 also refuses to be proposed, approved into a pending plan, activated,
+or restored unless consensus storage proves the complete predecessor ladder.
+The canonical persisted app-v6 record is the one compatibility proof for the
+historical cumulative app-v2 through app-v5 activation; app-v7 through app-v21
+must each have their own canonical applied-upgrade record, with the exact
+target and strictly increasing positive activation heights. Missing,
+synthesized, or out-of-order v7+ evidence fails closed. Historical pre-v22
+block replay is unchanged.
+
+**Agent inboxes now enforce an explicit prompt-injection trust boundary.**
+Every local or federated payload is surfaced as an untrusted
+`request_only` request, never as system, developer, or user instructions;
+pipeline results are untrusted `data_only` content, and task notices are
+notifications that must be confirmed against the exact current backlog
+assignment. Tool descriptions, inception guidance, response metadata, docs,
+and regression tests all carry the same rule.
+
+SDK 11.14.1.
+
 ## What's New in v11.13.9
 
 **SAGE now closes the WebTransport memory-exhaustion advisory and makes task
@@ -775,7 +817,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.13.9`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.14.1`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

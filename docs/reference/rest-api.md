@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.13.9. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.14.1. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -496,12 +496,16 @@ List all registered agents. **No auth required.**
 
 ### `GET /v1/agents/lookup`
 
-Signed, bounded exact-name lookup for MCP recipient discovery. `name` is required
-(1–512 bytes) and matches display name, registered name, or provider with
-ASCII case-insensitivity (non-ASCII names use registered casing); `limit`
-defaults to 20 and is 1–20. It returns the same
-sanitized agent fields as the public roster, but uses an index-backed metadata
-projection rather than enumerating the roster or deriving memory counts.
+Signed, bounded human-name lookup for MCP recipient discovery. `name` is
+required (1–512 bytes) and performs a literal substring match over active,
+non-removed agents' display name, immutable registered name, and provider.
+ASCII matching is case-insensitive; non-ASCII code points require their
+registered casing. Exact field matches rank before partial matches, so `mynah`
+can resolve `MYNAH (SAGE Voice Bridge Agent)` without making `%` or `_` act as
+wildcards. `limit` defaults to 20 and is 1–20. It returns the same sanitized
+agent fields as the public roster, but uses a capped metadata projection rather
+than enumerating the roster or deriving memory counts. SQLite and PostgreSQL
+implement the same lookup contract.
 
 **Response** (HTTP 200): `{"agents": [...AgentEntry], "total": N}`
 
@@ -607,7 +611,9 @@ Get a registered agent by ID. Auth required.
 
 ### `PUT /v1/agent/{id}/permission`
 
-Set clearance, domain access, and visibility on an agent. PATCH semantics: omitted fields preserve their on-chain value (`agent_handler.go:284-323`).
+Set clearance, domain access, visibility, and—after governed app-v22
+activation—the consensus-enforced capability mask on an agent. PATCH semantics:
+omitted fields preserve their on-chain value (`api/rest/agent_handler.go`).
 
 **Auth rules** (`agent_handler.go:213-240`): Self-set OR global `role=admin` OR org admin in any org the target belongs to. ABCI re-checks independently.
 
@@ -620,8 +626,26 @@ Set clearance, domain access, and visibility on an agent. PATCH semantics: omitt
 | `visible_agents` | *string | no | JSON array of agent IDs, or `"*"` for all; preserved if omitted |
 | `org_id` | *string | no | |
 | `dept_id` | *string | no | |
+| `capabilities` | *uint32 | no | App-v22 bit mask. Only a global `role=admin` may change it; non-zero values are rejected before app-v22 and unknown bits are always rejected. |
 
 All fields are nullable pointers — sending `null` explicitly resets to empty string / default.
+
+App-v22 capability bits are `1` read every domain (still bounded by the
+agent's numeric clearance), `2` deny shared-domain writes, `4` deny domain
+claims, `8` deny writes to domains owned by another agent, and `16` deny
+federated pipeline recipient discovery/delivery. The CEREBRUM co-located
+companion preset is `15`: it deliberately leaves local and federated inbox
+messaging enabled. A capability change cannot be self-cleared because ABCI
+independently requires a global administrator whenever the stored mask changes
+(`internal/store/agent_capabilities.go`;
+`internal/abci/app.go`; `internal/tx/codec.go`).
+
+Existing agents retain mask `0` across app-v22 activation. New
+self-registrations after activation receive the quarantine mask `30`
+(`2|4|8|16`) and cannot write/claim domains or discover/send to federated
+recipients until a global administrator assigns a deliberate profile. This is
+consensus-enforced, so generating a replacement local key cannot bypass an
+operator restriction.
 
 **Response** (HTTP 200): `{"agent_id": "...", "status": "permissions_updated", "tx_hash": "..."}`
 
@@ -750,6 +774,10 @@ Execute a domain ownership transfer that was authorized by an accepted governanc
 ### `POST /v1/org/register`
 
 Register an organization. Calling agent becomes admin. `org_id` is deterministic: `hex(SHA256(agentID + name)[:16])`.
+After app-v22, both REST preflight and consensus require the caller to be a
+global `role=admin`; an ordinary agent cannot create an organization to
+self-award TOP SECRET membership (`api/rest/org_handler.go`;
+`internal/abci/app.go`).
 
 **Request body:**
 
@@ -782,7 +810,9 @@ List org members from chain; enriches `created_at` from mirror. Mirror-only rows
 
 ### `POST /v1/org/{org_id}/member`
 
-Add agent to org. Admin only on-chain.
+Add agent to org. Admin only on-chain. After app-v22 the signer must also be a
+global `role=admin`, closing the organization-membership clearance-escalation
+path for restricted companions.
 
 **Request body:**
 
@@ -879,18 +909,20 @@ List department members.
 
 ### `POST /v1/federation/propose`
 
-Propose a bilateral federation agreement. Caller must be in an org on-chain. Proposer's org is resolved from chain state automatically.
+Propose a bilateral federation agreement. At app-v22 the caller must be a
+global admin and a member of the selected proposer organization.
 
 **Request body:**
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
+| `proposer_org_id` | string | no | Exact caller membership to represent; omitted uses the legacy primary org |
 | `target_org_id` | string | yes | |
-| `allowed_domains` | []string | no | `["*"]` means all |
-| `allowed_depts` | []string | no | |
-| `max_clearance` | int | no | Ceiling clearance; defaults to 2 (CONFIDENTIAL) |
+| `allowed_domains` | []string | no | `["*"]` means all; empty denies after app-v22 |
+| `allowed_depts` | []string | no | Empty/`["*"]` means unrestricted; otherwise exact forward membership is required |
+| `max_clearance` | int | no | 0-4 ceiling; omitted defaults to 2, explicit 0 remains PUBLIC |
 | `expires_at` | int64 | no | Unix timestamp; 0=permanent |
-| `requires_approval` | bool | no | |
+| `requires_approval` | bool | no | Legacy/informational; target approval is always required for activation |
 
 **Response** (HTTP 201): `{"status": "proposed", "tx_hash": "..."}`
 
@@ -898,7 +930,8 @@ Propose a bilateral federation agreement. Caller must be in an org on-chain. Pro
 
 ### `POST /v1/federation/{fed_id}/approve`
 
-Approve a pending federation. Caller must be in an org; approver org resolved from chain.
+Approve a pending federation. At app-v22 the caller must be a global admin and
+an exact member of the stored target organization.
 
 **Response** (HTTP 200): `{"status": "approved", "tx_hash": "..."}`
 
@@ -906,7 +939,8 @@ Approve a pending federation. Caller must be in an org; approver org resolved fr
 
 ### `POST /v1/federation/{fed_id}/revoke`
 
-Revoke an active federation.
+Revoke an active federation. At app-v22 the caller must be a global admin and
+an exact member of either stored federation organization.
 
 **Request body:** `{"reason": "..."}` (optional)
 
@@ -1474,6 +1508,13 @@ An empty inbox is always encoded as `{"items":[],"count":0}`, never
 `items:null`; the Python SDK also normalizes `null` from an older node to an
 empty list (`api/rest/pipe_handler.go`; `internal/store/sqlite.go`;
 `sdk/python/src/sage_sdk/models.py:315-323`).
+Each item carries response-only
+`authority:"request_only"`, `payload_authority:"request_only"`,
+`trust:"agent_untrusted"`, and an explicit `security_notice`. Imported items
+instead use `trust:"external_untrusted"`. These labels are derived by the REST
+serializer and are not fields in the stored pipeline row, so a sender cannot
+persist or supply its own authority. `intent` and `payload` remain requests for
+consideration, never system, developer, or user instructions.
 Foreign items carry additive immutable provenance including
 `source_chain_id`, stable `source_pipe_id`, exact sender/recipient identities,
 and agreement/policy/contact bindings. REST clients must treat foreign payloads
@@ -1492,17 +1533,56 @@ caller actually won; a losing reader never receives the same work item.
 
 `GET /v1/dashboard/tasks?all=true&limit=N` is the local-human CEREBRUM Kanban feed; signed agents receive `403` and use the scoped backlog instead. It returns explicit `memory_type=task` records across `planned`, `in_progress`, `done`, and `dropped` on both SQLite and PostgreSQL; ordinary agent conversations/observations are not inferred as tasks. Historical task rows whose older writer did not persist `task_status` are returned with an empty status so CEREBRUM can ask the operator to classify each one—SAGE does not guess that unknown work is Planned or Done. New PostgreSQL inserts persist `TaskStatus`, matching SQLite. Each task also returns `task_status_updated_at`; CEREBRUM uses that lifecycle timestamp—not the task's original `created_at`—to keep Done/Dropped cards visible for seven days after their terminal transition. Manual Clear remains available before that window expires, while older cards can still be revealed with Show all (`web/handler.go:1919-1962`, `web/static/js/app.js:2328-2340`).
 
+**Dashboard operator authority (v11.14.1+):** Loopback source addresses,
+`Origin`, `Host`, and Fetch Metadata identify routing context, not a person.
+Privileged CEREBRUM mutations require either (a) a valid dashboard cookie from
+an enabled, unlocked encrypted vault, together with the local browser/CSRF
+checks, or (b) a request cryptographically verified as the exact configured
+node-operator identity. Vault encryption is off by default, so an
+encryption-off browser remains useful for non-sensitive read-only dashboard
+status views, but memory, pipeline, task-board, agent-topology, event-stream,
+export, and write controls fail with HTTP 403. Run `sage-gui setup` to establish
+the encrypted vault before using those browser surfaces. The HTTP encryption
+enable is itself privileged and therefore requires an exact
+node-operator-signed request;
+an unsigned co-located process cannot choose the passphrase, receive the
+recovery key, or mint its own browser session. Ordinary signed agents and
+unsigned local processes cannot acquire operator authority by forging browser headers
+(`web/handler.go:isCEREBRUMOperatorRequest`).
+The boot-instructions GET is the narrow sensitive-read exception needed by
+`sage_inception`: it accepts the operator/session boundary above or a freshly
+signature-verified agent that is still active in the local registry. Unsigned
+local callers, arbitrary unregistered keys, and inactive/removed agents are
+denied (`web/handler.go:bootInstructionsReadGate`).
+
+`POST /v1/dashboard/network/claim` is the deliberately narrow exception to
+dashboard authentication: the one-time claim token is the sole authority for
+that exact redemption route, including when the node is encrypted and the CLI
+connects remotely. New claims use 32 random bytes encoded as canonical unpadded
+base64url (256 bits); the public route rejects the earlier six-character token
+format, so an outstanding legacy claim must be regenerated by the operator.
+Requests are capped at 4 KiB and rate-limited per socket source IP (not a
+caller-controlled forwarding header). The limiter self-sweeps expired address
+buckets and caps live tracked sources so unauthenticated source churn cannot
+grow server memory without bound. SQLite and PostgreSQL consume a valid
+unexpired token with one conditional `UPDATE ... RETURNING`, so concurrent
+redemptions yield exactly one success. Consumption precedes bundle I/O:
+missing/corrupt key material fails closed without making the token reusable.
+The response is an explicit allowlist of install metadata plus the hex key
+seed; it never serializes `claim_token`, `claim_expires_at`, or `bundle_path`
+and is marked `Cache-Control: no-store`/`Pragma: no-cache`
+(`web/network_handler.go`; `internal/store/agent_claim.go`).
+
 `PUT /v1/dashboard/tasks/order` accepts `{"task_status":"planned","task_ids":["id-a","id-b"]}` from a local/authenticated CEREBRUM operator. It persists the supplied top-to-bottom order within that status column; omitted cards retain their relative order after the supplied cards. Moving a card to another status resets its board position so it arrives at the top of the destination column. CEREBRUM reads the backend maximum of 500 board cards and exposes accessible up/down controls on each card (`web/handler.go`, `internal/store/sqlite.go`, `internal/store/postgres.go`, `web/static/js/app.js`).
 
 Terminal task transitions retain `assignee` as the last responsible agent for board attribution while setting the handoff gate that prevents terminal pickup. Done/Dropped cards render that identity as read-only “Completed by”/“Dropped by” metadata instead of an editable assignment selector. Reopening to Planned clears the historical assignee and requires a fresh operator handoff; direct terminal-to-In-Progress transitions are rejected. Upgrade repair backfills terminal attribution from authenticated `task_picked_up_by` evidence where older versions already cleared `assignee`. For older agent-authored cards with neither field, it uses `submitting_agent` only when that exact ID exists in the agent registry; it never guesses from the provider label (`internal/store/sqlite.go`, `internal/store/postgres.go`, `web/static/js/app.js`).
 
 `PUT /v1/dashboard/tasks/{id}/assign` accepts `{"assignee":"<agent-id>"}`
 (empty unassigns). This is a local CEREBRUM operator action; callers presenting
-an agent identity cannot assign or reassign work. On an unencrypted personal
-node, local processes are part of the documented trusted operator boundary, so
-same-origin headers prevent browser CSRF but are not authentication against
-untrusted local software. Encrypted nodes additionally require the dashboard
-session. The target must be an active registered agent and must be
+an ordinary agent identity cannot assign or reassign work. A browser caller
+requires the enabled/unlocked encrypted-vault session described above; an exact
+node-operator-signed request is the non-browser alternative. The target must be
+an active registered agent and must be
 allowed to read a non-public task. SQLite commits the assignee, monotonic
 assignment generation, in-progress transition, pickup reset, retirement of the
 prior notice, and new one-way notice atomically. Repeating the same assignment
@@ -1583,7 +1663,14 @@ receipt; terminal delivery feedback is claimed through `/v1/pipe/updates`.
 
 Get current status of a pipeline message.
 
-**Response** (HTTP 200): Full `PipelineMessage` object.
+**Response** (HTTP 200): Full `PipelineMessage` object plus response-only trust
+metadata. `payload_authority:"request_only"` labels request content and
+`result_authority:"data_only"` labels a present result. Status deliberately has
+no object-wide `authority`: a completed message can contain both its original
+request and its result, and one label would ambiguously bless the other field.
+`security_notice` states the combined boundary. `trust` is
+`agent_untrusted` locally and `external_untrusted` when either federation chain
+provenance field is present.
 
 ---
 
@@ -1594,7 +1681,12 @@ Completed pipeline messages sent by the authenticated agent.
 **Query parameters:** `limit` (1–20, default 5)
 
 **Response** (HTTP 200): `{"items": [...], "count": N}`. Empty results use
-`items:[]`, never `items:null`.
+`items:[]`, never `items:null`. Each result is labeled
+`authority:"data_only"` and `result_authority:"data_only"` for the singular
+results endpoint. Because a row also contains its original request, that
+content remains explicitly `payload_authority:"request_only"` and the combined
+security notice explains both fields. Local and foreign rows use
+`agent_untrusted` and `external_untrusted`, respectively.
 
 ---
 
@@ -1612,8 +1704,11 @@ marked reported and do not repeat on every turn.
 `{"items":[{"event_id","pipe_id","event_kind":"send|result","remote_chain_id","target_agent_id","state":"failed","attempts","last_error","created_at"}],"count":N}`.
 An empty update set uses `items:[]`, never `items:null`; current Python clients
 also tolerate the older null encoding.
-No intent, payload, result, or proof bytes are exposed. `last_error` may contain
-peer-originated diagnostic text and must be presented as external/untrusted.
+No intent, payload, result, or proof bytes are exposed. Every update carries
+response-only `authority:"notification_only"`,
+`trust:"untrusted_metadata"`, and a `security_notice`. `last_error` may contain
+peer-originated diagnostic text and is data, never an instruction or
+authorization to take a recovery action.
 `sage_turn` polls this route and returns actionable `pipe_delivery_updates`.
 
 ---

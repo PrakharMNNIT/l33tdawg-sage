@@ -142,6 +142,12 @@ func codexSageConfigBlock(configPath, binPath, sageHome, provider string) string
 }
 
 func codexSageConfigBlockWithIdentity(configPath, binPath, sageHome, provider, identityPath string) string {
+	identityLine := ""
+	identityMode := "workspace"
+	if strings.TrimSpace(identityPath) != "" {
+		identityLine = "SAGE_IDENTITY_PATH = " + tomlString(identityPath) + "\n"
+		identityMode = "pinned"
+	}
 	return fmt.Sprintf(`[mcp_servers.sage]
 command = %s
 args = ["mcp"]
@@ -150,9 +156,10 @@ args = ["mcp"]
 SAGE_HOME = %s
 SAGE_PROVIDER = %s
 SAGE_API_URL = %s
-SAGE_IDENTITY_PATH = %s
+SAGE_IDENTITY_MODE = %s
+%s
 SAGE_PROJECT = %s
-`, tomlString(binPath), tomlString(sageHome), tomlString(provider), tomlString(mcpConfigAPIURL), tomlString(identityPath), tomlString(mcpProjectName(configPath, sageHome, provider)))
+`, tomlString(binPath), tomlString(sageHome), tomlString(provider), tomlString(mcpConfigAPIURL), tomlString(identityMode), identityLine, tomlString(mcpProjectName(configPath, sageHome, provider)))
 }
 
 func tomlString(value string) string {
@@ -221,26 +228,44 @@ func mergeCodexConfigForProvider(path, binPath, sageHome, provider string) (stri
 }
 
 func configuredTOMLMCPIdentityPath(parsed any, configPath, sageHome, provider string) string {
+	projectDir := mcpProjectDir(configPath, sageHome, provider)
+	defaultIdentity := func() string {
+		if projectDir == "" && strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			return ""
+		}
+		return existingIdentityOrDefault("", sageHome, projectDir, provider)
+	}
 	config, ok := parsed.(map[string]any)
 	if !ok {
-		return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+		return defaultIdentity()
 	}
 	servers, ok := config["mcp_servers"].(map[string]any)
 	if !ok {
-		return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+		return defaultIdentity()
 	}
 	sage, ok := servers["sage"].(map[string]any)
 	if !ok {
-		return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+		return defaultIdentity()
 	}
 	env, ok := sage["env"].(map[string]any)
 	if !ok {
-		return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+		return defaultIdentity()
 	}
 	if path, ok := env["SAGE_IDENTITY_PATH"].(string); ok {
-		return existingIdentityOrDefault(path, sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+		generatedGlobal := filepath.Join(sageHome, "agents", "global-codex", "agent.key")
+		if projectDir == "" &&
+			strings.EqualFold(strings.TrimSpace(provider), "codex") &&
+			sameFilesystemPath(path, generatedGlobal) {
+			return ""
+		}
+		return existingIdentityOrDefault(path, sageHome, projectDir, provider)
 	}
-	return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+	// Preserve the legacy explicit pin during self-heal by normalizing it into
+	// the current SAGE_IDENTITY_PATH spelling in the regenerated block.
+	if path, ok := env["SAGE_AGENT_KEY"].(string); ok && strings.TrimSpace(path) != "" {
+		return existingIdentityOrDefault(path, sageHome, projectDir, provider)
+	}
+	return defaultIdentity()
 }
 
 func codexConfigIdentityPath(configPath, sageHome, provider string) string {

@@ -6,12 +6,12 @@ on:
   workflow_call:
     inputs:
       require_scoped_reconfiguration:
-        description: Require signed app-v20 scope reconfiguration plus the app-v21 real-Comet partition gate
+        description: Require signed app-v20 scope reconfiguration plus the app-v22 real-Comet partition gate
         required: false
         default: false
         type: boolean
       require_authorized_state_sync:
-        description: Require the integrated exact app-v21 provider-to-pristine-full-node state-sync transfer
+        description: Require the integrated exact app-v22 provider-to-pristine-full-node state-sync transfer
         required: false
         default: false
         type: boolean
@@ -23,12 +23,12 @@ on:
   workflow_dispatch:
     inputs:
       require_scoped_reconfiguration:
-        description: Require signed app-v20 scope reconfiguration plus the app-v21 real-Comet partition gate
+        description: Require signed app-v20 scope reconfiguration plus the app-v22 real-Comet partition gate
         required: false
         default: false
         type: boolean
       require_authorized_state_sync:
-        description: Require the integrated exact app-v21 provider-to-pristine-full-node state-sync phase
+        description: Require the integrated exact app-v22 provider-to-pristine-full-node state-sync phase
         required: false
         default: false
         type: boolean
@@ -62,7 +62,7 @@ jobs:
         run: make test-cometbft-patch
 
   real-comet-chaos:
-    name: App-v21 real Comet/ABCI crash, partition, and state-sync gate
+    name: App-v22 real Comet/ABCI crash, partition, and state-sync gate
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Independent of app-multiprocess: no needs.app-multiprocess.* reference
@@ -113,7 +113,7 @@ jobs:
             V119_STATE_SYNC_SOURCE_ID=${{ steps.source-id.outputs.value }}
           cache-from: type=gha,scope=v119-chaos-node
           cache-to: type=gha,mode=max,scope=v119-chaos-node
-      - name: Run bounded app-v21 real process fault gate
+      - name: Run bounded app-v22 real process fault gate
         env:
           V119_CHAOS_REBUILD: '0'
           V119_REQUIRE_AUTHORIZED_STATE_SYNC: ${{ inputs.require_authorized_state_sync && '1' || '0' }}

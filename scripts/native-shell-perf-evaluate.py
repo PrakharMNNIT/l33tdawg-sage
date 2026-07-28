@@ -10,9 +10,10 @@ framework decision -- desktop-shell-decision.md rejected Electron at 358,720 KiB
 against it and selected Tauri at 142,544 KiB -- so it is the one performance
 number with a live decision riding on it.
 
-Recorded only: settled idle CPU. It becomes blocking in v11.14 and needs a named
-baseline machine, because hosted-runner variance is wider than the 1% budget.
-See docs/native-shell-quality-gates.md.
+Recorded only: settled idle CPU. v11.14 is the instrumentation/hardening
+milestone; this becomes blocking for the first distributed native shell in v12
+and needs a named baseline machine because hosted-runner variance is wider than
+the 1% budget. See docs/native-shell-quality-gates.md.
 
 usage: native-shell-perf-evaluate.py <samples> <ceiling-kib> <out-json>
                                      <os-version> <os-build> <arch> <version>
@@ -75,15 +76,16 @@ record = {
         "shell_rss_kib_ceiling": ceiling_kib,
         "shell_rss_blocking_from": "v11.11",
         "idle_cpu_percent_ceiling": 1.0,
-        "idle_cpu_blocking_from": "v11.14",
+        "idle_cpu_blocking_from": "first-native-distribution-v12",
     },
     "measurement_limits": [
         "RSS covers processes running the exact shell executable path. macOS WebKit "
         "content/GPU/network processes are XPC services rather than children and are "
         "not attributed here; the ADR baseline of 142,544 KiB was likewise a single "
         "process, so this is comparable to it but is not whole-system cost.",
-        "Idle CPU is recorded only. It becomes blocking in v11.14 and needs a named "
-        "baseline machine, because hosted runner variance is wider than the 1% budget.",
+        "Idle CPU is recorded only. v11.14 is the hardening milestone; it becomes "
+        "blocking for the first distributed native shell in v12 and needs a named "
+        "baseline machine because hosted runner variance is wider than the 1% budget.",
     ],
 }
 with open(out_path, "w") as handle:

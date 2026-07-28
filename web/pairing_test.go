@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,6 +139,7 @@ func TestHandleCreatePairingCode(t *testing.T) {
 
 	// Generate pairing code
 	req := httptest.NewRequest("POST", "/v1/dashboard/network/agents/abc123/pair", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -162,6 +164,7 @@ func TestHandleCreatePairingCodeAgentNotFound(t *testing.T) {
 	h.RegisterRoutes(r)
 
 	req := httptest.NewRequest("POST", "/v1/dashboard/network/agents/nonexistent/pair", nil)
+	markLocalCEREBRUM(h, req)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -210,6 +213,8 @@ func TestHandleRedeemPairingCode(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+	assert.Equal(t, "no-cache", w.Header().Get("Pragma"))
 
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
@@ -291,7 +296,7 @@ func TestRedeemRateLimiter(t *testing.T) {
 	assert.True(t, rl.allow("192.168.1.2"), "different IP should be allowed")
 }
 
-func TestRedeemRateLimiterHTTP(t *testing.T) {
+func TestPairingRateLimitUsesRemoteAddrNotForwardedHeader(t *testing.T) {
 	h, _ := newTestHandler(t)
 	ps := NewPairingStore()
 	h.Pairing = ps
@@ -303,17 +308,30 @@ func TestRedeemRateLimiterHTTP(t *testing.T) {
 	for i := 0; i < redeemMaxAttempts; i++ {
 		req := httptest.NewRequest("GET", "/v1/dashboard/network/pair/SAG-INVALID0", nil)
 		req.RemoteAddr = "10.0.0.1:12345"
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.%d", i+1))
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		assert.Equal(t, http.StatusNotFound, w.Code, "attempt %d should be 404", i+1)
+		assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+		assert.Equal(t, "no-cache", w.Header().Get("Pragma"))
 	}
 
-	// Next attempt should be rate limited
+	// Rotating an untrusted forwarding header cannot escape one socket source's
+	// bucket.
 	req := httptest.NewRequest("GET", "/v1/dashboard/network/pair/SAG-INVALID0", nil)
 	req.RemoteAddr = "10.0.0.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.250")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusTooManyRequests, w.Code)
+
+	// A genuinely distinct socket source retains an independent allowance.
+	distinct := httptest.NewRequest("GET", "/v1/dashboard/network/pair/SAG-INVALID0", nil)
+	distinct.RemoteAddr = "10.0.0.2:54321"
+	distinct.Header.Set("X-Forwarded-For", "203.0.113.250")
+	distinctResponse := httptest.NewRecorder()
+	r.ServeHTTP(distinctResponse, distinct)
+	assert.Equal(t, http.StatusNotFound, distinctResponse.Code)
 }
 
 func TestHandleRedeemCaseInsensitive(t *testing.T) {

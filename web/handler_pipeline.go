@@ -17,7 +17,8 @@ import (
 // agent through the pipe bus. The agent-side POST /v1/pipe/send stamps the sender
 // from a bearer token, so there was no human path at all. Session-authed; the note
 // is stamped from a friendly "operator" origin so it renders cleanly in the
-// agent's inbox (sage_inbox / sage_turn) and never trips the FromAgent[:16] slice.
+// agent's inbox (sage_inbox / sage_turn); legacy short origins are formatted
+// through the same bounded agent-ID path as ordinary pipeline senders.
 func (h *DashboardHandler) handlePipelineSend(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ToAgent string `json:"to_agent"`

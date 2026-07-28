@@ -75,8 +75,8 @@ func TestStateSyncAuthorizationRejectsIncompleteJoinBindings(t *testing.T) {
 		{name: "chain", mutate: func(c *JoinAuthorizationConfig) { c.ChainID = "../escape" }, want: "chain ID"},
 		{name: "joiner", mutate: func(c *JoinAuthorizationConfig) { c.JoiningNodeID = "short" }, want: "joining node ID"},
 		{name: "validator key", mutate: func(c *JoinAuthorizationConfig) { c.ValidatorPublicKey = []byte("short") }, want: "Ed25519"},
-		{name: "version below supported set", mutate: func(c *JoinAuthorizationConfig) { c.AppVersion = 19 }, want: "version (20 or 21)"},
-		{name: "version above supported set", mutate: func(c *JoinAuthorizationConfig) { c.AppVersion = 22 }, want: "version (20 or 21)"},
+		{name: "version below supported set", mutate: func(c *JoinAuthorizationConfig) { c.AppVersion = 19 }, want: "version (20, 21, or 22)"},
+		{name: "version above supported set", mutate: func(c *JoinAuthorizationConfig) { c.AppVersion = 23 }, want: "version (20, 21, or 22)"},
 		{name: "expiry", mutate: func(c *JoinAuthorizationConfig) { c.ExpiresAt = now }, want: "expired"},
 		{name: "floor", mutate: func(c *JoinAuthorizationConfig) { c.SnapshotHeightFloor = 0 }, want: "height floor"},
 		{name: "provider not validator", mutate: func(c *JoinAuthorizationConfig) {
@@ -105,9 +105,9 @@ func TestStateSyncAuthorizationRejectsIncompleteJoinBindings(t *testing.T) {
 	}
 }
 
-func TestStateSyncAuthorizationSupportsV20AndV21Exactly(t *testing.T) {
+func TestStateSyncAuthorizationSupportsV20ThroughV22Exactly(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	for _, version := range []uint64{20, 21} {
+	for _, version := range []uint64{20, 21, 22} {
 		t.Run(fmt.Sprintf("app-v%d", version), func(t *testing.T) {
 			join, servingProfile, receivingProfile := authorizationTestConfig(now)
 			join.AppVersion = version
@@ -123,7 +123,8 @@ func TestStateSyncAuthorizationSupportsV20AndV21Exactly(t *testing.T) {
 	assert.False(t, SupportsAppVersion(19))
 	assert.True(t, SupportsAppVersion(20))
 	assert.True(t, SupportsAppVersion(21))
-	assert.False(t, SupportsAppVersion(22))
+	assert.True(t, SupportsAppVersion(22))
+	assert.False(t, SupportsAppVersion(23))
 }
 
 func TestStateSyncAuthorizationRejectsUnsafeP2PProfiles(t *testing.T) {

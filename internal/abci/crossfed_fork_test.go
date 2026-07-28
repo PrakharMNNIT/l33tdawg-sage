@@ -3,6 +3,7 @@ package abci
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -99,6 +100,65 @@ func TestCrossFed_SetAndRevoke(t *testing.T) {
 	// The transport coords survive the status update (guards the truncation landmine).
 	ep2, _, _, _, _, _, _, _ := app.badgerStore.GetCrossFed("sage-b")
 	assert.Equal(t, "https://peer.example:8443", ep2)
+}
+
+func TestCrossFed_AppV22TermsValidationPreservesLegacyReplay(t *testing.T) {
+	app := setupTestApp(t)
+	app.appV15AppliedHeight = 5
+	app.appV22AppliedHeight = 15
+	admin := newAgentKey(t)
+	registerAgent(t, app, admin, "admin", "admin")
+
+	cases := []struct {
+		name   string
+		mutate func(*tx.CrossFedTerms)
+		log    string
+	}{
+		{
+			name: "clearance ceiling",
+			mutate: func(terms *tx.CrossFedTerms) {
+				terms.MaxClearance = tx.ClearanceLevel(255)
+			},
+			log: "max_clearance",
+		},
+		{
+			name: "past expiry",
+			mutate: func(terms *tx.CrossFedTerms) {
+				terms.ExpiresAt = -1
+			},
+			log: "expires_at",
+		},
+		{
+			name: "restrictive department",
+			mutate: func(terms *tx.CrossFedTerms) {
+				terms.AllowedDepts = []string{"voice"}
+			},
+			log: "allowed_depts",
+		},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			legacy := termsFor(fmt.Sprintf("legacy-%d", i), []string{"*"})
+			tc.mutate(legacy)
+			legacyResult := app.processCrossFedSet(
+				crossFedSetTx(t, admin, legacy),
+				10,
+				time.Unix(100, 0),
+			)
+			require.Equal(t, uint32(0), legacyResult.Code, legacyResult.Log)
+
+			postV22 := termsFor(fmt.Sprintf("post-v22-%d", i), []string{"*"})
+			tc.mutate(postV22)
+			postResult := app.processCrossFedSet(
+				crossFedSetTx(t, admin, postV22),
+				16,
+				time.Unix(100, 0),
+			)
+			require.Equal(t, uint32(105), postResult.Code, postResult.Log)
+			require.Contains(t, postResult.Log, tc.log)
+		})
+	}
 }
 
 // TestCrossFed_Authz: chain-admin (wildcard) OK; domain-owner (scoped) OK;

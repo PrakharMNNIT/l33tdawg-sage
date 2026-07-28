@@ -2215,6 +2215,11 @@ func encodeAgentSetPermission(a *AgentSetPermission) []byte {
 	buf = appendBytes(buf, []byte(a.VisibleAgents))
 	buf = appendBytes(buf, []byte(a.OrgID))
 	buf = appendBytes(buf, []byte(a.DeptID))
+	if a.CapabilitiesPresent || a.Capabilities != 0 {
+		var extension [4]byte
+		binary.BigEndian.PutUint32(extension[:], a.Capabilities)
+		buf = append(buf, extension[:]...)
+	}
 	return buf
 }
 
@@ -2254,11 +2259,20 @@ func decodeAgentSetPermission(data []byte) (*AgentSetPermission, error) {
 	}
 	a.OrgID = string(b)
 
-	b, _, err = readBytes(data, off)
+	b, off, err = readBytes(data, off)
 	if err != nil {
 		return nil, err
 	}
 	a.DeptID = string(b)
+
+	switch remaining := len(data) - off; remaining {
+	case 0:
+	case 4:
+		a.Capabilities = binary.BigEndian.Uint32(data[off : off+4])
+		a.CapabilitiesPresent = true
+	default:
+		return nil, ErrInvalidTxData
+	}
 
 	return a, nil
 }

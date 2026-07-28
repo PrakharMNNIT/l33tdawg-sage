@@ -32,7 +32,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.13.9';
+const SAGE_VERSION = 'v11.14.1';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -7661,14 +7661,14 @@ const isReservedSharedDomain = domain => {
         || value.startsWith('sage-');
 };
 
-function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disabled, busy = false, allowModify = true }) {
+function DomainAccessMatrix({ domains, domainAccess, onChange, disabled, busy = false, allowModify = true, denySharedWrite = false }) {
     const [filter, setFilter] = useState('');
-    const [newDomain, setNewDomain] = useState('');
-    // Merge externally-passed domains with any custom-added domains in domainAccess
+    // Preserve assigned grants that are not present in the current domain inventory.
     const allDomains = [...new Set([...domains, ...Object.keys(domainAccess)])].sort();
     const filtered = allDomains.filter(d => !filter || d.toLowerCase().includes(filter.toLowerCase()));
 
     const toggle = (domain, field) => {
+        if (denySharedWrite && isReservedSharedDomain(domain) && (field === 'write' || field === 'modify')) return;
         const cur = domainAccess[domain] || { read: false, write: false, modify: false };
         const upd = { ...cur, [field]: !cur[field] };
         if (field === 'modify' && upd.modify) {
@@ -7689,6 +7689,10 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
         // to every domain while the operator is reviewing six search results
         // can otherwise launch hundreds of unintended on-chain transactions.
         filtered.forEach(d => {
+            if (denySharedWrite && isReservedSharedDomain(d) && (field === 'write' || field === 'modify')) {
+                upd[d] = { ...(upd[d] || { read: false, write: false, modify: false }), write: false, modify: false };
+                return;
+            }
             if (field === 'modify' && isReservedSharedDomain(d)) return;
             upd[d] = { ...(upd[d] || { read: false, write: false, modify: false }), [field]: val };
             if (field === 'modify' && val) {
@@ -7704,15 +7708,6 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
         });
         onChange(upd);
     };
-    const handleAddDomain = () => {
-        const cleaned = newDomain.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '-');
-        if (!cleaned) return;
-        // Add with read+write enabled
-        onChange({ ...domainAccess, [cleaned]: { read: true, write: true, modify: false } });
-        if (onAddDomain) onAddDomain(cleaned);
-        setNewDomain('');
-    };
-
     if (disabled) return html`<div class="domain-matrix"><div class="domain-matrix-empty" style="color:var(--accent);">This role's broad read/write policy is applied at registration. Assign explicit level-3 Modify grants later from Access Controls.</div></div>`;
 
     return html`
@@ -7727,34 +7722,29 @@ function DomainAccessMatrix({ domains, domainAccess, onChange, onAddDomain, disa
                     <button disabled=${busy} onClick=${e => { e.stopPropagation(); bulkSet('read', false); }}>Revoke visible</button>
                 </div>
             </div>
-            <div class="domain-matrix-add" onClick=${e => e.stopPropagation()}>
-                <input class="domain-matrix-search" type="text" placeholder="Add new domain tag..."
-                    value=${newDomain} onInput=${e => setNewDomain(e.target.value)}
-                    onKeyDown=${e => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }} disabled=${busy} />
-                <button class="domain-add-btn" onClick=${handleAddDomain} disabled=${busy || !newDomain.trim()}>+ Add</button>
-            </div>
             <div class="domain-matrix-columns"><span>Domain</span><span style="text-align:center;">Read</span><span style="text-align:center;">Write</span><span style="text-align:center;">Modify</span></div>
             <div class="domain-matrix-body">
                 ${filtered.length === 0 && allDomains.length > 0 ? html`<div class="domain-matrix-no-results">No domains matching "${filter}"</div>` : ''}
-                ${allDomains.length === 0 ? html`<div class="domain-matrix-empty">No domains yet. Add one above or they'll appear as memories are submitted.</div>` : ''}
+                ${allDomains.length === 0 ? html`<div class="domain-matrix-empty">No domains yet. Domains appear here as agents submit memories.</div>` : ''}
                 ${filtered.map(domain => {
                     const a = domainAccess[domain] || { read: false, write: false, modify: false };
-                    const isCustom = !domains.includes(domain);
+                    const isGrantOnly = !domains.includes(domain);
                     const sharedModifyUnavailable = isReservedSharedDomain(domain);
-                    return html`<div class="domain-matrix-row ${isCustom ? 'custom' : ''}" key=${domain}>
+                    const sharedWriteDenied = denySharedWrite && sharedModifyUnavailable;
+                    return html`<div class="domain-matrix-row ${isGrantOnly ? 'grant-only' : ''}" key=${domain}>
                         <div class="domain-matrix-domain">
                             <span class="domain-matrix-dot" style="background:${getDomainColor(domain)};"></span>
                             ${domain}
-                            ${isCustom ? html`<span style="font-size:10px;color:var(--text-muted);margin-left:6px;">new</span>` : ''}
+                            ${isGrantOnly ? html`<span style="font-size:10px;color:var(--text-muted);margin-left:6px;">assigned</span>` : ''}
                         </div>
                         <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()}>
                             <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow read access to ${domain}`} checked=${a.read} disabled=${busy} onChange=${() => toggle(domain, 'read')} /><span class="toggle-slider"></span></label>
                         </div>
-                        <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()}>
-                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow write access to ${domain}`} checked=${a.write} disabled=${busy} onChange=${() => toggle(domain, 'write')} /><span class="toggle-slider"></span></label>
+                        <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()} title=${sharedWriteDenied ? 'This agent’s consensus capability blocks writes to shared domains.' : ''}>
+                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow write access to ${domain}`} checked=${a.write && !sharedWriteDenied} disabled=${busy || sharedWriteDenied} onChange=${() => toggle(domain, 'write')} /><span class="toggle-slider"></span></label>
                         </div>
-                        <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()} title=${sharedModifyUnavailable ? 'Shared domains support read/write but cannot carry a level-3 Modify grant.' : ''}>
-                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow modify access to ${domain}`} checked=${a.modify} disabled=${busy || !allowModify || (sharedModifyUnavailable && !a.modify)} onChange=${() => toggle(domain, 'modify')} /><span class="toggle-slider"></span></label>
+                        <div class="domain-matrix-toggle" onClick=${e => e.stopPropagation()} title=${sharedWriteDenied ? 'This agent’s consensus capability blocks writes to shared domains.' : sharedModifyUnavailable ? 'Shared domains support read/write but cannot carry a level-3 Modify grant.' : ''}>
+                            <label class="toggle-switch"><input type="checkbox" aria-label=${`Allow modify access to ${domain}`} checked=${a.modify && !sharedWriteDenied} disabled=${busy || sharedWriteDenied || !allowModify || (sharedModifyUnavailable && !a.modify)} onChange=${() => toggle(domain, 'modify')} /><span class="toggle-slider"></span></label>
                         </div>
                     </div>`;
                 })}
@@ -7908,6 +7898,7 @@ function NetworkPage({ sse, accessMode = false }) {
     const accessSavingRef = useRef(false);
     const [accessFailures, setAccessFailures] = useState([]);
     const [editVisibleAgents, setEditVisibleAgents] = useState('');
+    const [editCapabilities, setEditCapabilities] = useState(0);
     // Edit mode state
     const [editing, setEditing] = useState(false);
     const [editName, setEditName] = useState('');
@@ -8116,6 +8107,7 @@ function NetworkPage({ sse, accessMode = false }) {
             setAccessSaved(false);
             setAccessFailures([]);
             setEditVisibleAgents(agent.visible_agents || '');
+            setEditCapabilities(Number(agent.capabilities || 0));
             // Parse domain_access
             let parsed = {};
             try {
@@ -8130,7 +8122,15 @@ function NetworkPage({ sse, accessMode = false }) {
         if (accessSavingRef.current) return;
         const arr = Object.entries(editDomainAccess)
             .filter(([_, v]) => v.read || v.write || v.modify)
-            .map(([domain, p]) => ({ domain, read: p.read, write: p.write, modify: p.modify }));
+            .map(([domain, p]) => {
+                const sharedWriteDenied = (editCapabilities & 2) !== 0 && isReservedSharedDomain(domain);
+                return {
+                    domain,
+                    read: p.read,
+                    write: sharedWriteDenied ? false : p.write,
+                    modify: sharedWriteDenied ? false : p.modify,
+                };
+            });
         accessSavingRef.current = true;
         setAccessSaving(true);
         setAccessSaved(false);
@@ -8147,6 +8147,7 @@ function NetworkPage({ sse, accessMode = false }) {
                 clearance: editClearance,
                 domain_access: JSON.stringify(arr),
                 visible_agents: editVisibleAgents,
+                capabilities: editCapabilities,
                 admin_override: overrideConfirmations,
             });
             if (res.error) { showToast(res.error, 'error'); return; }
@@ -8209,7 +8210,7 @@ function NetworkPage({ sse, accessMode = false }) {
             accessSavingRef.current = false;
             setAccessSaving(false);
         }
-    }, [editRole, editClearance, editDomainAccess, editVisibleAgents, accessFailures, loadAgents]);
+    }, [editRole, editClearance, editDomainAccess, editVisibleAgents, editCapabilities, accessFailures, loadAgents]);
 
     const handleAdminAccessOverride = useCallback(async (agent) => {
         const eligible = accessFailures.filter(f => f.override_ready);
@@ -8713,6 +8714,7 @@ function NetworkPage({ sse, accessMode = false }) {
                                     <div class="agent-avatar">${agent.avatar || '\u{1F916}'}</div>
                                     <div>
                                         <div class="agent-name">${agent.name}</div>
+                                        <div class="agent-id-short" title=${agent.agent_id}>ID ${String(agent.agent_id || '').slice(0, 8)}</div>
                                         <span class="agent-role-badge ${agent.role}">${agent.role}</span>
                                     </div>
                                 </div>
@@ -8796,6 +8798,10 @@ function NetworkPage({ sse, accessMode = false }) {
 
                                     ${expandedTab === 'access' && html`
                                         <div>
+                                            <div class="access-identity-note">
+                                                These permissions apply only to signer <span class="mono">${agent.agent_id}</span>.
+                                                The client must report this same Agent ID in <span class="mono">sage_status</span> or <span class="mono">sage_inception</span>; names are labels, not identity.
+                                            </div>
                                             <div class="access-section-title">Role <${HelpTip} text="Admins have full access to all domains and can manage the network. Members read and write only in the domains they hold an on-chain access grant for. Observers are read-only. Role is fixed when the agent is registered on-chain and cannot be changed here." /></div>
                                             <div class="role-selector" onClick=${e => e.stopPropagation()}>
                                                 <div class="role-card selected ${agent.role}">
@@ -8807,12 +8813,53 @@ function NetworkPage({ sse, accessMode = false }) {
                                                 Role is set at registration and cannot be changed here.
                                             </div>
 
+                                            <div class="access-section-title">Agent Capabilities <${HelpTip} text="Consensus-enforced app-v22 policy. Read-all remains bounded by the clearance slider. Restriction bits cannot be removed by the agent itself. Federated inbox messaging remains enabled unless its separate kill switch is selected." /></div>
+                                            <div style="display:grid;gap:8px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;" onClick=${e => e.stopPropagation()}>
+                                                <label style="display:flex;gap:9px;align-items:flex-start;">
+                                                    <input type="checkbox" checked=${(editCapabilities & 15) === 15 && (editCapabilities & 16) === 0}
+                                                        disabled=${accessSaving}
+                                                        onChange=${e => { setEditCapabilities(e.target.checked ? 15 : 0); setAccessDirty(true); }} />
+                                                    <span><strong>Co-located companion / voice bridge</strong><br/><span style="color:var(--text-muted);font-size:12px;">Read every domain up to its clearance; never claim domains or write shared/foreign domains; keep local and federated agent inbox messaging enabled.</span></span>
+                                                </label>
+                                                <label style="display:flex;gap:9px;align-items:center;">
+                                                    <input type="checkbox" checked=${(editCapabilities & 1) !== 0}
+                                                        disabled=${accessSaving}
+                                                        onChange=${e => { setEditCapabilities(e.target.checked ? (editCapabilities | 1) : (editCapabilities & ~1)); setAccessDirty(true); }} />
+                                                    <span>Read all domains (classification still limited by clearance)</span>
+                                                </label>
+                                                <label style="display:flex;gap:9px;align-items:center;">
+                                                    <input type="checkbox" checked=${(editCapabilities & 2) !== 0}
+                                                        disabled=${accessSaving}
+                                                        onChange=${e => { setEditCapabilities(e.target.checked ? (editCapabilities | 2) : (editCapabilities & ~2)); setAccessDirty(true); }} />
+                                                    <span>Block writes to shared domains</span>
+                                                </label>
+                                                <label style="display:flex;gap:9px;align-items:center;">
+                                                    <input type="checkbox" checked=${(editCapabilities & 4) !== 0}
+                                                        disabled=${accessSaving}
+                                                        onChange=${e => { setEditCapabilities(e.target.checked ? (editCapabilities | 4) : (editCapabilities & ~4)); setAccessDirty(true); }} />
+                                                    <span>Block domain claims</span>
+                                                </label>
+                                                <label style="display:flex;gap:9px;align-items:center;">
+                                                    <input type="checkbox" checked=${(editCapabilities & 8) !== 0}
+                                                        disabled=${accessSaving}
+                                                        onChange=${e => { setEditCapabilities(e.target.checked ? (editCapabilities | 8) : (editCapabilities & ~8)); setAccessDirty(true); }} />
+                                                    <span>Block writes to domains owned by another agent</span>
+                                                </label>
+                                                <label style="display:flex;gap:9px;align-items:center;">
+                                                    <input type="checkbox" checked=${(editCapabilities & 16) !== 0}
+                                                        disabled=${accessSaving}
+                                                        onChange=${e => { setEditCapabilities(e.target.checked ? (editCapabilities | 16) : (editCapabilities & ~16)); setAccessDirty(true); }} />
+                                                    <span>Block federated agent inbox messages (local notes remain available)</span>
+                                                </label>
+                                            </div>
+
                                             <div class="access-section-title">Domain Access <${HelpTip} text="Control which knowledge domains this agent can read, write, or modify. Modify is level 3 and includes permission to challenge/deprecate or reinstate memories. The domain owner normally authorizes the change. For an agent installed on this computer, the genesis admin can explicitly override access without changing the original owner or memory authorship." /></div>
                                             <${DomainAccessMatrix}
                                                 domains=${allDomains}
                                                 domainAccess=${editDomainAccess}
                                                 onChange=${(v) => { setEditDomainAccess(v); setAccessDirty(true); }}
                                                 busy=${accessSaving}
+                                                denySharedWrite=${(editCapabilities & 2) !== 0}
                                             />
                                             ${accessFailures.length > 0 && html`
                                                 <div style="margin-top:12px;padding:12px 14px;border:1px solid rgba(245,158,11,.35);border-radius:10px;background:rgba(245,158,11,.08);" onClick=${e => e.stopPropagation()}>
@@ -11440,8 +11487,8 @@ function OverviewPage({ sse }) {
     // report a consensus app version yet, so do not cry "behind" (amber) on it.
     // Only a real version below the v11 baseline is genuinely behind. During a
     // rolling activation the intermediate fork rungs remain neutral; the
-    // current protocol turns green only once the app-v21 gate is active.
-    const appVerTone = appVer === '21' ? 'healthy' : (appVerNum > 0 && appVerNum < 15 ? 'degraded' : 'neutral');
+    // current protocol turns green only once the app-v22 gate is active.
+    const appVerTone = appVer === '22' ? 'healthy' : (appVerNum > 0 && appVerNum < 15 ? 'degraded' : 'neutral');
     const appVerShown = (appVer && appVer !== '0') ? ('v' + appVer) : '--';
     const mempoolTxs = (chain && chain.mempool_txs != null) ? Number(chain.mempool_txs) : null;
     const mempoolHot = mempoolTxs != null && !isNaN(mempoolTxs) && mempoolTxs > 50;
@@ -11466,7 +11513,7 @@ function OverviewPage({ sse }) {
         tile(chain ? Number(chain.block_height || 0).toLocaleString() : '--', 'Block height', { color: '#10b981', title: 'Total blocks committed to the chain.' }),
         tile(fmtAge(blockElapsed), 'Last block age', { title: 'Time since the last committed block.', sub: chainIdle ? 'idle - not a stall' : '' }),
         tile(chain ? (chain.catching_up ? 'Catching up' : 'In sync') : '--', 'Sync state', { small: true, color: chain ? (chain.catching_up ? '#f59e0b' : '#10b981') : undefined }),
-        tile(appVerShown, 'App version', { small: true, color: appVerTone === 'healthy' ? '#10b981' : (appVerTone === 'degraded' ? '#f59e0b' : undefined), title: 'CometBFT app protocol version. Green when current (21).' }),
+        tile(appVerShown, 'App version', { small: true, color: appVerTone === 'healthy' ? '#10b981' : (appVerTone === 'degraded' ? '#f59e0b' : undefined), title: 'CometBFT app protocol version. Green when current (22).' }),
         tile(chainIdle ? 'Idle' : (blockRate ? blockRate.toFixed(1) + 's' : '--'), 'Block rate', { small: chainIdle, title: 'Seconds per block, derived client-side from height deltas.' }),
         tile(uptimeDisplay, 'Node uptime', { small: true, title: 'Time since this node process started.' }),
         tile(chain && chain.mempool_txs != null ? chain.mempool_txs : '--', 'Pending transactions', { color: mempoolHot ? '#f59e0b' : undefined, title: 'Unconfirmed transactions waiting in the mempool. Amber above 50 signals a backlog.' }),
@@ -14618,7 +14665,7 @@ function FederationPage() {
                 </div>
             </div>`}
             ${fedOn === false && html`<div class="fed-off-note muted">Federation is off, so joining or hosting a connection is unavailable. Turn it on above to connect.</div>`}
-            ${fedOn && html`<${FederationWarmup} onState=${(ready) => setWarming(!ready)} />`}
+            ${html`<${FederationWarmup} onState=${(ready) => setWarming(!ready)} />`}
             ${fedOn && !warming && html`<div class="fed-roles">
                 <button class="fed-role-card" onClick=${() => setMode('guest')}>
                     <div class="fed-role-glyph">${icons.federation}</div>

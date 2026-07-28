@@ -211,7 +211,7 @@ func restartRequired(running, disk string) bool {
 // Progress is streamed to the dashboard via SSE events so the user sees each step.
 func (h *DashboardHandler) handleApplyUpdate(w http.ResponseWriter, r *http.Request) {
 	if !h.isCEREBRUMOperatorRequest(r) {
-		writeError(w, http.StatusForbidden, "updates can only be installed from an authenticated CEREBRUM session")
+		writeCEREBRUMOperatorForbidden(w, "Installing updates requires operator authority.")
 		return
 	}
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
@@ -653,7 +653,7 @@ func RollbackPendingUpdate(execPath string) (bool, error) {
 // consensus, stores, listeners, and sidecars in an indeterminate state.
 func (h *DashboardHandler) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if !h.isCEREBRUMOperatorRequest(r) {
-		writeError(w, http.StatusForbidden, "restart can only be requested from an authenticated CEREBRUM session")
+		writeCEREBRUMOperatorForbidden(w, "Restarting SAGE requires operator authority.")
 		return
 	}
 	if h.UpdateInProgress.Load() {

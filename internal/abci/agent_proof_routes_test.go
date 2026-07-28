@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tlsca"
 	"github.com/l33tdawg/sage/internal/tx"
 )
@@ -28,8 +29,14 @@ func canonicalAgentRequest(t *testing.T, method, path string, body any) []byte {
 func TestAppV17DelegatedRESTRouteMatrix(t *testing.T) { //nolint:maintidx // protocol matrix intentionally exhaustive
 	app := setupTestApp(t)
 	agent := newAgentKey(t)
+	require.NoError(t, app.badgerStore.RegisterOrg("org-alt", "Alternate", "", agent.id, 1))
+	require.NoError(t, app.badgerStore.AddOrgMember("org-alt", agent.id, 4, "admin", 1))
 	require.NoError(t, app.badgerStore.RegisterOrg("org-home", "Home", "", agent.id, 1))
 	require.NoError(t, app.badgerStore.AddOrgMember("org-home", agent.id, 4, "admin", 1))
+	require.NoError(t, app.badgerStore.SetFederation(
+		"fed-exact", "org-alt", "org-alt",
+		[]string{"*"}, 4, 0, false, "proposed",
+	))
 
 	contentHash := sha256.Sum256([]byte("hello"))
 	// The node owns the active embedding space and may regenerate a vector that
@@ -141,14 +148,39 @@ func TestAppV17DelegatedRESTRouteMatrix(t *testing.T) { //nolint:maintidx // pro
 			parsed:  &tx.ParsedTx{Type: tx.TxTypeFederationPropose, FederationPropose: &tx.FederationPropose{ProposerOrgID: "org-home", TargetOrgID: "org-away", AllowedDomains: []string{"*"}, MaxClearance: tx.ClearanceConfidential}},
 		},
 		{
+			name:    "federation propose exact multi-org membership",
+			request: canonicalAgentRequest(t, "POST", "/v1/federation/propose", map[string]any{"proposer_org_id": "org-alt", "target_org_id": "org-away", "allowed_domains": []string{"*"}, "max_clearance": 0}),
+			parsed:  &tx.ParsedTx{Type: tx.TxTypeFederationPropose, FederationPropose: &tx.FederationPropose{ProposerOrgID: "org-alt", TargetOrgID: "org-away", AllowedDomains: []string{"*"}, MaxClearance: tx.ClearancePublic}},
+		},
+		{
+			name:    "historical federation explicit zero mapped to default",
+			request: canonicalAgentRequest(t, "POST", "/v1/federation/propose", map[string]any{"target_org_id": "org-away", "max_clearance": 0}),
+			parsed:  &tx.ParsedTx{Type: tx.TxTypeFederationPropose, FederationPropose: &tx.FederationPropose{ProposerOrgID: "org-home", TargetOrgID: "org-away", MaxClearance: tx.ClearanceConfidential}},
+		},
+		{
+			name:    "historical federation negative expiry remains bindable",
+			request: canonicalAgentRequest(t, "POST", "/v1/federation/propose", map[string]any{"target_org_id": "org-away", "expires_at": -1}),
+			parsed:  &tx.ParsedTx{Type: tx.TxTypeFederationPropose, FederationPropose: &tx.FederationPropose{ProposerOrgID: "org-home", TargetOrgID: "org-away", MaxClearance: tx.ClearanceConfidential, ExpiresAt: -1}},
+		},
+		{
 			name:    "federation approve",
 			request: canonicalAgentRequest(t, "POST", "/v1/federation/fed-1/approve", nil),
 			parsed:  &tx.ParsedTx{Type: tx.TxTypeFederationApprove, FederationApprove: &tx.FederationApprove{FederationID: "fed-1", ApproverOrgID: "org-home"}},
 		},
 		{
+			name:    "federation approve exact stored target membership",
+			request: canonicalAgentRequest(t, "POST", "/v1/federation/fed-exact/approve", nil),
+			parsed:  &tx.ParsedTx{Type: tx.TxTypeFederationApprove, FederationApprove: &tx.FederationApprove{FederationID: "fed-exact", ApproverOrgID: "org-alt"}},
+		},
+		{
 			name:    "federation revoke",
 			request: canonicalAgentRequest(t, "POST", "/v1/federation/fed-1/revoke", map[string]any{"reason": "done"}),
 			parsed:  &tx.ParsedTx{Type: tx.TxTypeFederationRevoke, FederationRevoke: &tx.FederationRevoke{FederationID: "fed-1", RevokerOrgID: "org-home", Reason: "done"}},
+		},
+		{
+			name:    "federation revoke exact stored side membership",
+			request: canonicalAgentRequest(t, "POST", "/v1/federation/fed-exact/revoke", map[string]any{"reason": "done"}),
+			parsed:  &tx.ParsedTx{Type: tx.TxTypeFederationRevoke, FederationRevoke: &tx.FederationRevoke{FederationID: "fed-exact", RevokerOrgID: "org-alt", Reason: "done"}},
 		},
 		{
 			name:    "department register",
@@ -215,9 +247,53 @@ func TestAppV17DelegatedRESTRouteMatrix(t *testing.T) { //nolint:maintidx // pro
 		t.Run(tc.name, func(t *testing.T) {
 			req, err := parseSignedAgentRequest(tc.request)
 			require.NoError(t, err)
-			require.NoError(t, app.verifySignedAgentAction(tc.parsed, agent.id, req, false))
+			require.NoError(t, app.verifySignedAgentAction(tc.parsed, agent.id, req, false, false))
 		})
 	}
+}
+
+func TestFederationExplicitPublicDelegatedBindingForkBoundary(t *testing.T) {
+	app := setupTestApp(t)
+	agent := newAgentKey(t)
+	require.NoError(t, app.badgerStore.RegisterOrg("org-home", "Home", "", agent.id, 1))
+	require.NoError(t, app.badgerStore.AddOrgMember("org-home", agent.id, 4, "admin", 1))
+
+	raw := canonicalAgentRequest(t, "POST", "/v1/federation/propose", map[string]any{
+		"target_org_id": "org-away",
+		"max_clearance": 0,
+	})
+	req, err := parseSignedAgentRequest(raw)
+	require.NoError(t, err)
+
+	historical := &tx.ParsedTx{
+		Type: tx.TxTypeFederationPropose,
+		FederationPropose: &tx.FederationPropose{
+			ProposerOrgID: "org-home",
+			TargetOrgID:   "org-away",
+			MaxClearance:  tx.ClearanceConfidential,
+		},
+	}
+	require.NoError(t, app.verifySignedAgentAction(
+		historical, agent.id, req,
+		false, false,
+	), "pre-app-v22 must replay the historical explicit-zero default")
+	require.ErrorContains(t, app.verifySignedAgentAction(
+		historical, agent.id, req,
+		false, true,
+	), "differs", "post-app-v22 must not broaden signed PUBLIC to CONFIDENTIAL")
+
+	postV22 := &tx.ParsedTx{
+		Type: tx.TxTypeFederationPropose,
+		FederationPropose: &tx.FederationPropose{
+			ProposerOrgID: "org-home",
+			TargetOrgID:   "org-away",
+			MaxClearance:  tx.ClearancePublic,
+		},
+	}
+	require.NoError(t, app.verifySignedAgentAction(
+		postV22, agent.id, req,
+		false, true,
+	))
 }
 
 func TestAppV17DelegatedMemorySubmitAllowsNodeRegeneratedEmbedding(t *testing.T) {
@@ -238,10 +314,93 @@ func TestAppV17DelegatedMemorySubmitAllowsNodeRegeneratedEmbedding(t *testing.T)
 		DomainTag: "sage-mcp-reliability", ConfidenceScore: 0.8,
 		Content: "a longer turn observation",
 	}}
-	require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false))
+	require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false))
 
 	actual.MemorySubmit.EmbeddingHash = []byte("not-a-sha256")
-	require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false), "invalid node-generated embedding hash")
+	require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false), "invalid node-generated embedding hash")
+}
+
+func TestAgentPermissionProofCapabilityPresenceMatchesRESTChangeDetection(t *testing.T) {
+	const targetID = "permission-target"
+
+	tests := []struct {
+		name              string
+		current           store.AgentCapabilities
+		requested         uint32
+		capabilityPresent bool
+	}{
+		{
+			name:              "explicit unchanged zero keeps legacy wire",
+			current:           0,
+			requested:         0,
+			capabilityPresent: false,
+		},
+		{
+			name:              "explicit unchanged nonzero preserves handler presence",
+			current:           15,
+			requested:         15,
+			capabilityPresent: false,
+		},
+		{
+			name:              "changed mask emits extension",
+			current:           0,
+			requested:         15,
+			capabilityPresent: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			app := setupTestApp(t)
+			require.NoError(t, app.badgerStore.RegisterAgentWithCapabilities(
+				targetID, "Target", "member", "", "codex", "", 1, tc.current,
+			))
+			request := canonicalAgentRequest(t, "PUT", "/v1/agent/"+targetID+"/permission", map[string]any{
+				"capabilities": tc.requested,
+			})
+			req, err := parseSignedAgentRequest(request)
+			require.NoError(t, err)
+
+			actual := &tx.ParsedTx{
+				Type: tx.TxTypeAgentSetPermission,
+				AgentSetPermission: &tx.AgentSetPermission{
+					AgentID:             targetID,
+					Clearance:           1,
+					Capabilities:        tc.requested,
+					CapabilitiesPresent: tc.capabilityPresent,
+				},
+			}
+			require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false))
+
+			if tc.requested == 0 {
+				// Zero is the only mask whose extension presence is not also
+				// implied by its value, so flipping the presence bit changes
+				// the canonical wire payload.
+				actual.AgentSetPermission.CapabilitiesPresent = !tc.capabilityPresent
+			} else {
+				actual.AgentSetPermission.Capabilities = tc.requested ^ 1
+			}
+			require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false), "differs")
+		})
+	}
+
+	t.Run("omitted mask preserves current nonzero capability", func(t *testing.T) {
+		app := setupTestApp(t)
+		require.NoError(t, app.badgerStore.RegisterAgentWithCapabilities(
+			targetID, "Target", "member", "", "codex", "", 1, 15,
+		))
+		req, err := parseSignedAgentRequest(canonicalAgentRequest(
+			t, "PUT", "/v1/agent/"+targetID+"/permission", map[string]any{"clearance": 2},
+		))
+		require.NoError(t, err)
+		actual := &tx.ParsedTx{
+			Type: tx.TxTypeAgentSetPermission,
+			AgentSetPermission: &tx.AgentSetPermission{
+				AgentID: targetID, Clearance: 2,
+			},
+		}
+		require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false))
+	})
 }
 
 func TestAppV20DelegatedMemorySubmitBindsCanonicalTags(t *testing.T) {
@@ -259,10 +418,10 @@ func TestAppV20DelegatedMemorySubmitBindsCanonicalTags(t *testing.T) {
 		MemoryType: tx.MemoryTypeFact, DomainTag: "research", ConfidenceScore: 0.9,
 		Content: content, Tags: []string{"alpha", "zeta"},
 	}}
-	require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, true))
+	require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, true, false))
 
 	actual.MemorySubmit.Tags = []string{"alpha", "other"}
-	require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, true), "differs")
+	require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, true, false), "differs")
 }
 
 func TestAppV17DelegatedNonRESTRoutesFailClosed(t *testing.T) {
@@ -277,7 +436,7 @@ func TestAppV17DelegatedNonRESTRoutesFailClosed(t *testing.T) {
 		{Type: tx.TxTypeUpgradeRevert, UpgradeRevert: &tx.UpgradeRevert{Name: "app-v17", TargetAppVersion: 16}},
 	} {
 		t.Run(fmt.Sprintf("type-%d", parsed.Type), func(t *testing.T) {
-			require.ErrorContains(t, app.verifySignedAgentAction(parsed, "agent", req, false), "no delegated REST action")
+			require.ErrorContains(t, app.verifySignedAgentAction(parsed, "agent", req, false, false), "no delegated REST action")
 		})
 	}
 }

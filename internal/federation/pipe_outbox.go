@@ -19,6 +19,8 @@ const (
 	pipeDrainConcurrency = 4
 )
 
+var errFederatedPipeSourceDenied = errors.New("federated pipeline delivery is disabled for the source agent")
+
 // NudgePipelineTransport wakes the existing federation outbox worker. Domain
 // sync and pipeline transport share only the lifecycle/ticker, never their
 // authorization state or storage state machines.
@@ -78,12 +80,17 @@ func (m *Manager) deliverPipelineEvent(parent context.Context, ss *store.SQLiteS
 	// delivery outcome are one read-leased operation: once revoke returns, no
 	// payload from its retired generation can still be in flight.
 	policyUnlock := func() {}
+	ownerUnlock := func() {}
 	contactUnlock := func() {}
 	if outbox != nil && outbox.EventKind == "send" {
 		policyUnlock = ss.LockSyncPolicyRead()
+		if m.badger != nil {
+			ownerUnlock = m.badger.LockDomainOwnershipRead()
+		}
 		contactUnlock = ss.LockAgentContactRead()
 	}
 	defer policyUnlock()
+	defer ownerUnlock()
 	defer contactUnlock()
 	event, terminal, err := m.buildPipelineEvent(ctx, ss, outbox)
 	if err != nil {
@@ -113,6 +120,9 @@ func (m *Manager) deliverPipelineEvent(parent context.Context, ss *store.SQLiteS
 			err = getErr
 		} else {
 			err = m.WithAuthorizedImportedPipe(ctx, msg, func() error {
+				if !m.sourceMayUseFederatedPipe(outbox.SourceAgentID) {
+					return errFederatedPipeSourceDenied
+				}
 				preflight := m.pipeResultPreflightFn
 				if preflight == nil {
 					preflight = m.preflightPipelineResultPeer
@@ -233,6 +243,13 @@ func (m *Manager) buildPipelineEvent(ctx context.Context, ss *store.SQLiteStore,
 	if err != nil || sourceAgent == nil || sourceAgent.Status != "active" || sourceAgent.RemovedAt != nil {
 		return nil, true, fmt.Errorf("pipeline source agent is not active on this SAGE")
 	}
+	if !m.sourceMayUseFederatedPipe(outbox.SourceAgentID) {
+		// Keep the event pending: the capability is an operator-controlled kill
+		// switch and may be deliberately re-enabled before the event expires.
+		// Most importantly, reject before intent/payload/result bytes are copied
+		// into the outbound envelope or any peer resolution/network call occurs.
+		return nil, false, errFederatedPipeSourceDenied
+	}
 	event := &PipeEvent{
 		Version: PipeEventVersion, EventID: outbox.EventID, Kind: outbox.EventKind,
 		SourceChainID: m.localChainID, DestinationChainID: outbox.RemoteChainID,
@@ -285,4 +302,16 @@ func (m *Manager) buildPipelineEvent(ctx context.Context, ss *store.SQLiteStore,
 		return nil, true, fmt.Errorf("unsupported pipeline outbox kind %q", outbox.EventKind)
 	}
 	return event, false, nil
+}
+
+func (m *Manager) sourceMayUseFederatedPipe(agentID string) bool {
+	if m.postV22ForNextTx == nil || !m.postV22ForNextTx() {
+		return true
+	}
+	if m.badger == nil || agentID == "" {
+		return false
+	}
+	capabilities, registered, err := m.badger.GetRegisteredAgentCapabilities(agentID)
+	return err == nil && registered &&
+		!capabilities.Has(store.AgentCapabilityDenyFederatedPipe)
 }

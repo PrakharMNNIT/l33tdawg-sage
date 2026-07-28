@@ -11,7 +11,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -55,27 +57,26 @@ func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 		return // Store doesn't support agent management
 	}
 
-	r.Get("/v1/dashboard/network/agents", handleListAgents(agentStore))
-	r.Get("/v1/dashboard/network/agents/{id}", handleGetAgent(agentStore))
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents", h.handleListAgents(agentStore))
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}", h.handleGetAgent(agentStore))
 	r.Post("/v1/dashboard/network/agents", h.handleCreateAgent(agentStore))
 	r.Patch("/v1/dashboard/network/agents/{id}", h.handleUpdateAgent(agentStore))
 	r.Delete("/v1/dashboard/network/agents/{id}", handleRemoveAgent(agentStore, h.store))
-	r.Get("/v1/dashboard/network/agents/{id}/bundle", handleDownloadBundle(agentStore))
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}/bundle", handleDownloadBundle(agentStore))
 	r.Post("/v1/dashboard/network/agents/{id}/rotate-key", handleRotateAgentKey(agentStore))
 	r.Get("/v1/dashboard/network/templates", handleTemplates())
-	r.Post("/v1/dashboard/network/claim", handleClaimAgent(agentStore))
 	r.Get("/v1/dashboard/network/redeploy/status", h.handleRedeployStatusLive)
 	r.Post("/v1/dashboard/network/redeploy", h.handleTriggerRedeploy)
 	r.Post("/v1/dashboard/network/redeploy/clear", h.handleClearRedeploy)
 
-	r.Get("/v1/dashboard/network/unregistered", h.handleUnregisteredAgents(agentStore))
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/unregistered", h.handleUnregisteredAgents(agentStore))
 	r.Post("/v1/dashboard/network/merge", h.handleMergeAgent(agentStore))
-	r.Get("/v1/dashboard/network/agents/{id}/tags", h.handleAgentTags(agentStore))
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}/tags", h.handleAgentTags(agentStore))
 	// v11.3: RBAC domain-ownership transfer (honest replacement for the retired
 	// authorship-rewrite transfer-tag/transfer-domain paths). handleAgentDomains
 	// lists an agent's RBAC domains; handleReassignDomainOwnership moves a
 	// domain's ownership + access on-chain without rewriting authorship.
-	r.Get("/v1/dashboard/network/agents/{id}/domains", h.handleAgentDomains(agentStore))
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}/domains", h.handleAgentDomains(agentStore))
 	r.Post("/v1/dashboard/network/reassign-domain-ownership", h.handleReassignDomainOwnership(agentStore))
 
 	// Pairing code generation (authenticated — admin creates code for an agent)
@@ -84,7 +85,7 @@ func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 	}
 }
 
-func handleListAgents(agentStore store.AgentStore) http.HandlerFunc {
+func (h *DashboardHandler) handleListAgents(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		agents, err := agentStore.ListAgents(r.Context())
 		if err != nil {
@@ -94,11 +95,18 @@ func handleListAgents(agentStore store.AgentStore) http.HandlerFunc {
 		if agents == nil {
 			agents = []*store.AgentEntry{}
 		}
+		if h.BadgerStore != nil {
+			for _, agent := range agents {
+				if onChain, getErr := h.BadgerStore.GetRegisteredAgent(agent.AgentID); getErr == nil && onChain != nil {
+					overlayOnChainAgentPolicy(agent, onChain)
+				}
+			}
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"agents": agents})
 	}
 }
 
-func handleGetAgent(agentStore store.AgentStore) http.HandlerFunc {
+func (h *DashboardHandler) handleGetAgent(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
 		agent, err := agentStore.GetAgent(r.Context(), id)
@@ -106,14 +114,35 @@ func handleGetAgent(agentStore store.AgentStore) http.HandlerFunc {
 			writeError(w, http.StatusNotFound, "agent not found")
 			return
 		}
+		if h.BadgerStore != nil {
+			if onChain, getErr := h.BadgerStore.GetRegisteredAgent(agent.AgentID); getErr == nil && onChain != nil {
+				overlayOnChainAgentPolicy(agent, onChain)
+			}
+		}
 		writeJSONResp(w, http.StatusOK, agent)
 	}
+}
+
+// overlayOnChainAgentPolicy keeps CEREBRUM's access controls honest when an
+// old SQLite projection is stale. Badger is the consensus authority for every
+// policy-bearing field; SQLite remains the source for display metadata.
+func overlayOnChainAgentPolicy(agent *store.AgentEntry, onChain *store.OnChainAgent) {
+	if agent == nil || onChain == nil {
+		return
+	}
+	agent.Role = onChain.Role
+	agent.Clearance = int(onChain.Clearance)
+	agent.OrgID = onChain.OrgID
+	agent.DeptID = onChain.DeptID
+	agent.DomainAccess = onChain.DomainAccess
+	agent.VisibleAgents = onChain.VisibleAgents
+	agent.Capabilities = onChain.Capabilities
 }
 
 func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !h.isCEREBRUMOperatorRequest(r) {
-			writeError(w, http.StatusForbidden, "only the authenticated local node operator may create agents")
+			writeCEREBRUMOperatorForbidden(w, "Creating agents requires operator authority.")
 			return
 		}
 		var req struct {
@@ -303,8 +332,15 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 			writeError(w, http.StatusNotFound, "agent not found")
 			return
 		}
-		// Snapshot the prior access matrix so a domain_access change can be
-		// reconciled into real on-chain AccessGrant/AccessRevoke txs below.
+		// Policy is consensus-authoritative. Start edits from Badger rather
+		// than a potentially stale SQLite projection, and retain a complete
+		// snapshot so any rejected transaction can be rolled back atomically.
+		if h.BadgerStore != nil {
+			if onChain, getErr := h.BadgerStore.GetRegisteredAgent(id); getErr == nil && onChain != nil {
+				overlayOnChainAgentPolicy(existing, onChain)
+			}
+		}
+		policyBeforeUpdate := *existing
 		oldDomainAccess := existing.DomainAccess
 
 		var req struct {
@@ -318,6 +354,7 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 			DomainAccess  *string                    `json:"domain_access"`
 			P2PAddress    *string                    `json:"p2p_address"`
 			VisibleAgents *string                    `json:"visible_agents"`
+			Capabilities  *uint32                    `json:"capabilities"`
 			AdminOverride []adminOverrideExpectation `json:"admin_override"`
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -336,23 +373,19 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 			req.DeptID != nil ||
 			req.DomainAccess != nil ||
 			req.VisibleAgents != nil ||
+			req.Capabilities != nil ||
 			len(req.AdminOverride) > 0
 		if sensitivePolicyChange && !h.isCEREBRUMOperatorRequest(r) {
-			writeError(w, http.StatusForbidden, "agent permissions may only be changed by the authenticated local node operator")
+			writeCEREBRUMOperatorForbidden(w, "Changing agent permissions requires operator authority.")
 			return
 		}
 		overrides := make(map[string]adminOverrideExpectation, len(req.AdminOverride))
 		if len(req.AdminOverride) > 0 {
 			// The genesis key is a human/operator capability. A cryptographically
 			// valid agent request must never be able to turn a JSON flag into an
-			// admin-signed grant. Only the local CEREBRUM/operator boundary may
-			// invoke this explicit override.
-			if verifiedDashboardAgentID(r.Context()) != "" ||
-				(r.Header.Get("Sec-Fetch-Site") == "" && strings.TrimSpace(r.Header.Get("Origin")) == "") ||
-				!isLocalRequest(r) {
-				writeError(w, http.StatusForbidden, "administrator access override must be confirmed in local CEREBRUM")
-				return
-			}
+			// admin-signed grant. The sensitive-policy gate above admits only a
+			// valid encrypted local CEREBRUM session or the exact cryptographically
+			// verified node-operator identity.
 			for _, expected := range req.AdminOverride {
 				expected.Domain = strings.TrimSpace(expected.Domain)
 				expected.OwnerID = strings.TrimSpace(expected.OwnerID)
@@ -421,6 +454,31 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 		if req.VisibleAgents != nil {
 			existing.VisibleAgents = *req.VisibleAgents
 		}
+		capabilitiesBeforeUpdate := existing.Capabilities
+		capabilitiesChanged := false
+		if req.Capabilities != nil {
+			capabilities := store.AgentCapabilities(*req.Capabilities)
+			if !capabilities.Valid() {
+				writeError(w, http.StatusBadRequest, "invalid agent capabilities")
+				return
+			}
+			capabilitiesChanged = capabilities != capabilitiesBeforeUpdate
+			if capabilitiesChanged && (h.AppV22ActiveFn == nil || !h.AppV22ActiveFn()) {
+				writeError(w, http.StatusConflict, "agent capabilities require app-v22 activation")
+				return
+			}
+			if capabilitiesChanged &&
+				(h.CometBFTRPC == "" || h.SigningKey == nil || len(h.AdminSigningKey) != ed25519.PrivateKeySize) {
+				writeError(w, http.StatusServiceUnavailable, "agent capabilities require an available consensus signer")
+				return
+			}
+			// Capabilities are consensus-authoritative. Do not put the requested
+			// mask into the SQL metadata projection before Comet commit; ABCI's
+			// committed projection (and the Badger read overlay) publishes it.
+			// Keeping existing.Capabilities unchanged also means a successful
+			// broadcast response cannot make an uncommitted mask visible during
+			// the Commit/projection window.
+		}
 		if len(overrides) > 0 {
 			desired := parseDomainAccessLevels(existing.DomainAccess)
 			if desired == nil {
@@ -433,6 +491,15 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 					return
 				}
 			}
+		}
+
+		policyUpdateRequested := req.Clearance != nil || req.DomainAccess != nil ||
+			req.VisibleAgents != nil || req.OrgID != nil || req.DeptID != nil ||
+			capabilitiesChanged
+		if policyUpdateRequested && h.BadgerStore != nil &&
+			(h.CometBFTRPC == "" || h.SigningKey == nil || len(h.AdminSigningKey) != ed25519.PrivateKeySize) {
+			writeError(w, http.StatusServiceUnavailable, "agent permission update requires an available consensus signer")
+			return
 		}
 
 		if err := agentStore.UpdateAgent(r.Context(), existing); err != nil {
@@ -463,23 +530,42 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 			// regardless of the metadata result above. org_id/dept_id are part of
 			// the on-chain RBAC record (the tx carries them), so an org/dept-only
 			// edit must broadcast too, else SQLite diverges from BadgerDB silently.
-			if req.Clearance != nil || req.DomainAccess != nil || req.VisibleAgents != nil || req.OrgID != nil || req.DeptID != nil {
+			if policyUpdateRequested {
 				clearance := uint8(existing.Clearance) // #nosec G115 -- clamped to 0-4 above
+				var wireCapabilities uint32
+				if req.Capabilities != nil {
+					wireCapabilities = *req.Capabilities
+				}
 				permTx := &tx.ParsedTx{
 					Type: tx.TxTypeAgentSetPermission,
 					AgentSetPermission: &tx.AgentSetPermission{
-						AgentID:       id,
-						Clearance:     clearance,
-						DomainAccess:  existing.DomainAccess,
-						VisibleAgents: existing.VisibleAgents,
-						OrgID:         existing.OrgID,
-						DeptID:        existing.DeptID,
+						AgentID:             id,
+						Clearance:           clearance,
+						DomainAccess:        existing.DomainAccess,
+						VisibleAgents:       existing.VisibleAgents,
+						OrgID:               existing.OrgID,
+						DeptID:              existing.DeptID,
+						Capabilities:        wireCapabilities,
+						CapabilitiesPresent: capabilitiesChanged,
 					},
 				}
-				if len(h.AdminSigningKey) != ed25519.PrivateKeySize {
-					warnings = append(warnings, "on-chain permission sync failed: genesis admin key unavailable")
-				} else if txHash, height, _, bErr := h.signAndBroadcastCommit(permTx, h.AdminSigningKey); bErr != nil {
-					warnings = append(warnings, "on-chain permission sync failed: "+bErr.Error())
+				if txHash, height, _, bErr := h.signAndBroadcastCommit(permTx, h.AdminSigningKey); bErr != nil {
+					// Preserve unrelated metadata edits, but restore every
+					// consensus-owned policy field. Returning 2xx with a warning
+					// here made the dashboard claim grants that Badger denied.
+					existing.Role = policyBeforeUpdate.Role
+					existing.Clearance = policyBeforeUpdate.Clearance
+					existing.OrgID = policyBeforeUpdate.OrgID
+					existing.DeptID = policyBeforeUpdate.DeptID
+					existing.DomainAccess = policyBeforeUpdate.DomainAccess
+					existing.VisibleAgents = policyBeforeUpdate.VisibleAgents
+					existing.Capabilities = policyBeforeUpdate.Capabilities
+					if restoreErr := agentStore.UpdateAgent(r.Context(), existing); restoreErr != nil {
+						writeError(w, http.StatusInternalServerError, "permission transaction failed and the local projection could not be restored")
+						return
+					}
+					writeError(w, http.StatusBadGateway, "agent permission transaction was rejected: "+bErr.Error())
+					return
 				} else {
 					h.emitAccessActivity("permissions_updated", fmt.Sprintf("Permissions updated for %s", existing.Name), "", map[string]any{
 						"agent_id": id, "agent_name": existing.Name, "clearance": clearance, "tx_hash": txHash, "height": height,
@@ -670,82 +756,121 @@ func handleTemplates() http.HandlerFunc {
 	}
 }
 
-// claimCharset is the set of unambiguous uppercase alphanumeric characters for claim tokens.
-const claimCharset = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+const agentClaimTokenBytes = 32
 
-// generateClaimToken generates a 6-character uppercase alphanumeric claim token using crypto/rand.
+// generateClaimToken generates a 256-bit unguessable bearer credential. Claim
+// redemption is intentionally reachable without dashboard authentication, so a
+// short human-entered code is not an acceptable authority for this route.
 func generateClaimToken() (string, error) {
-	b := make([]byte, 6)
+	b := make([]byte, agentClaimTokenBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	for i := range b {
-		b[i] = claimCharset[int(b[i])%len(claimCharset)]
-	}
-	return string(b), nil
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// handleClaimAgent exchanges a one-time claim token for the agent's key seed and info.
-func handleClaimAgent(agentStore store.AgentStore) http.HandlerFunc {
+func validAgentClaimToken(token string) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	return err == nil &&
+		len(raw) == agentClaimTokenBytes &&
+		base64.RawURLEncoding.EncodeToString(raw) == token
+}
+
+const agentClaimRequestMaxBytes = 4 << 10
+
+// RegisterAgentClaimRoute wires the one route for which the one-time claim
+// token is the complete authority. It must remain outside authMiddleware so an
+// encrypted node can be claimed by the remote CLI it was created for.
+func (h *DashboardHandler) RegisterAgentClaimRoute(r chi.Router) {
+	agentStore, agentsOK := h.store.(AgentStoreProvider)
+	claimStore, claimsOK := h.store.(store.AgentClaimStore)
+	if !agentsOK || !claimsOK {
+		return
+	}
+	r.Post("/v1/dashboard/network/claim", handleClaimAgent(agentStore, claimStore, &redeemRateLimiter{}))
+}
+
+// handleClaimAgent exchanges a one-time claim token for the agent's key seed
+// and a deliberately credential-free subset of its metadata.
+func handleClaimAgent(agentStore store.AgentStore, claimStore store.AgentClaimStore, rl *redeemRateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// A successful response contains an Ed25519 seed. Explicitly forbid
+		// storage by browsers and intermediaries on every claim outcome.
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+
+		if !rl.allow(clientIP(r)) {
+			w.Header().Set("Retry-After", "60")
+			writeError(w, http.StatusTooManyRequests, "too many redemption attempts, try again later")
+			return
+		}
+
 		var req struct {
 			Token string `json:"token"`
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, agentClaimRequestMaxBytes)
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		req.Token = strings.TrimSpace(req.Token)
 		if req.Token == "" {
 			writeError(w, http.StatusBadRequest, "token is required")
 			return
 		}
-
-		// Find the agent with this claim token
-		agents, err := agentStore.ListAgents(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to list agents")
-			return
-		}
-
-		var matched *store.AgentEntry
-		for _, a := range agents {
-			if a.ClaimToken == req.Token {
-				matched = a
-				break
-			}
-		}
-		if matched == nil {
+		if !validAgentClaimToken(req.Token) {
 			writeError(w, http.StatusNotFound, "invalid or expired claim token")
 			return
 		}
 
-		// Check expiry
-		if matched.ClaimExpiresAt != nil && time.Now().After(*matched.ClaimExpiresAt) {
-			// Clear expired token
-			matched.ClaimToken = ""
-			matched.ClaimExpiresAt = nil
-			_ = agentStore.UpdateAgent(r.Context(), matched)
+		// The store performs an indexed compare-and-clear. Consumption happens
+		// before any bundle I/O, so a clear downstream failure cannot leave the
+		// credential reusable.
+		agentID, err := claimStore.RedeemAgentClaim(r.Context(), req.Token, time.Now())
+		if errors.Is(err, store.ErrAgentClaimInvalid) {
+			writeError(w, http.StatusNotFound, "invalid or expired claim token")
+			return
+		}
+		if errors.Is(err, store.ErrAgentClaimExpired) {
 			writeError(w, http.StatusGone, "claim token has expired")
 			return
 		}
-
-		// Read the agent key seed from the bundle directory
-		keyPath := filepath.Join(sageHome(), "bundles", matched.AgentID, "agent.key")
-		seed, err := os.ReadFile(keyPath)
 		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to redeem claim token")
+			return
+		}
+
+		matched, err := agentStore.GetAgent(r.Context(), agentID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "agent not found after claim")
+			return
+		}
+		keyPath := filepath.Join(sageHome(), "bundles", agentID, "agent.key")
+		seed, err := os.ReadFile(keyPath)
+		if err != nil || len(seed) != ed25519.SeedSize {
 			writeError(w, http.StatusInternalServerError, "agent key not found on server")
 			return
 		}
 
-		// Clear the claim token (one-time use)
-		matched.ClaimToken = ""
-		matched.ClaimExpiresAt = nil
-		_ = agentStore.UpdateAgent(r.Context(), matched)
-
 		writeJSONResp(w, http.StatusOK, map[string]any{
-			"agent":    matched,
 			"agent_id": matched.AgentID,
+			"agent": map[string]any{
+				"agent_id":         matched.AgentID,
+				"name":             matched.Name,
+				"role":             matched.Role,
+				"clearance":        matched.Clearance,
+				"avatar":           matched.Avatar,
+				"boot_bio":         matched.BootBio,
+				"domain_access":    matched.DomainAccess,
+				"validator_pubkey": matched.ValidatorPubkey,
+			},
 			"key_seed": hex.EncodeToString(seed),
 		})
 	}

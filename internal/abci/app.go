@@ -124,6 +124,23 @@ type agentPermissionData struct {
 	VisibleAgents string
 	OrgID         string
 	DeptID        string
+	Capabilities  store.AgentCapabilities
+}
+
+// shortConsensusID keeps transaction logs safe for legacy human-readable org
+// and department IDs as well as canonical 64-hex agent IDs. Valid historical
+// IDs keep the exact same first-16 display; malformed or legacy short payload
+// fields can no longer panic FinalizeBlock after a state mutation.
+func shortConsensusID(id string) string {
+	if len(id) > 16 {
+		return id[:16]
+	}
+	return id
+}
+
+func isCanonicalAgentID(agentID string) bool {
+	pub, err := auth.AgentIDToPublicKey(agentID)
+	return err == nil && auth.PublicKeyToAgentID(pub) == agentID
 }
 
 // memClassificationData carries the fields needed to update a memory's classification in PostgreSQL.
@@ -582,6 +599,10 @@ type SageApp struct {
 	// block on the legacy rule and historical replay byte-identical.
 	appV21AppliedHeight int64 // 0 => fork dormant
 
+	// appV22AppliedHeight gates operator-controlled, consensus-enforced agent
+	// capabilities. The activation block remains under app-v21 rules.
+	appV22AppliedHeight int64 // 0 => fork dormant
+
 	// retainBlocks, when > 0, is the number of most-recent blocks Commit asks
 	// CometBFT to keep: ResponseCommit.RetainHeight = height - retainBlocks
 	// (clamped at 0 = keep everything). Pruning is LOCAL and advisory — it never
@@ -752,6 +773,8 @@ const appV20UpgradeName = "app-v20"
 // appV21UpgradeName is the canonical governed activation for
 // corroboration-weighted challenge rounds.
 const appV21UpgradeName = "app-v21"
+
+const appV22UpgradeName = "app-v22"
 
 // governanceDelegationDomainStateKey holds the stable, consensus-derived
 // domain that post-app-v20 governance authorizations must sign. It is approved
@@ -1195,7 +1218,7 @@ func (app *SageApp) postAppV21Fork(height int64) bool {
 //
 //nolint:unused // C1 mints the empty gate; the first callsites land with C2/C3
 func (app *SageApp) postAppV17Rules(height int64) bool {
-	return app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
+	return app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height) || app.postAppV22Fork(height)
 }
 
 func (app *SageApp) postAppV18Rules(height int64) bool {
@@ -1212,7 +1235,7 @@ func (app *SageApp) postAppV18Rules(height int64) bool {
 //
 //nolint:unused // behavior-empty gate; no consensus callsite reads it (D adds zero processTx branch)
 func (app *SageApp) postAppV19Rules(height int64) bool {
-	return app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
+	return app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height) || app.postAppV22Fork(height)
 }
 
 // IsAppV17ActiveForNextTx is the REST-side transaction-construction accessor.
@@ -1261,7 +1284,7 @@ func (app *SageApp) IsAppV20ActiveForNextTx() bool {
 // Collapses to exactly postAppV16Fork on every existing chain
 // (appV17AppliedHeight==0), so historical blocks replay byte-identically.
 func (app *SageApp) postAppV16Rules(height int64) bool {
-	return app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
+	return app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height) || app.postAppV22Fork(height)
 }
 
 // shouldRecordMemoryDomain reports whether a successful submit must persist its
@@ -1290,7 +1313,7 @@ func (app *SageApp) shouldRecordMemoryDomain(height int64) bool {
 // higher gates are 0, so this collapses to exactly postAppV8Fork and historical
 // blocks replay byte-identically.
 func (app *SageApp) postAppV8Rules(height int64) bool {
-	return app.postAppV8Fork(height) || app.postAppV9Fork(height) || app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
+	return app.postAppV8Fork(height) || app.postAppV9Fork(height) || app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height) || app.postAppV22Fork(height)
 }
 
 // postAppV9Rules reports whether app-v9's consensus rules (consensus-path
@@ -1301,7 +1324,7 @@ func (app *SageApp) postAppV8Rules(height int64) bool {
 // postAppV9Fork on every existing chain (appV10/appV11AppliedHeight==0), so replay
 // is byte-identical.
 func (app *SageApp) postAppV9Rules(height int64) bool {
-	return app.postAppV9Fork(height) || app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
+	return app.postAppV9Fork(height) || app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height) || app.postAppV22Fork(height)
 }
 
 // postAppV10Rules reports whether app-v10's consensus rules (corroboration
@@ -1313,7 +1336,7 @@ func (app *SageApp) postAppV9Rules(height int64) bool {
 // when app-v11 landed — app-v10 was the highest fork until then and needed no
 // subsumption helper.
 func (app *SageApp) postAppV10Rules(height int64) bool {
-	return app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
+	return app.postAppV10Fork(height) || app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height) || app.postAppV22Fork(height)
 }
 
 // postAppV11Rules reports whether app-v11's consensus rules (the per-node
@@ -1324,7 +1347,7 @@ func (app *SageApp) postAppV10Rules(height int64) bool {
 // postAppV11Fork on every existing chain (appV12AppliedHeight==0), so
 // historical blocks replay byte-identically.
 func (app *SageApp) postAppV11Rules(height int64) bool {
-	return app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
+	return app.postAppV11Fork(height) || app.postAppV12Fork(height) || app.postAppV13Fork(height) || app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height) || app.postAppV22Fork(height)
 }
 
 // postAppV12Rules reports whether app-v12's consensus rule (the FLAWED
@@ -1362,7 +1385,7 @@ func (app *SageApp) postAppV13Rules(height int64) bool {
 // postAppV12Rules/postAppV13Rules — those are mutually-exclusive
 // AppHash-REPLACEMENT rules, deliberately non-subsumed.
 func (app *SageApp) postAppV15Rules(height int64) bool {
-	return app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height)
+	return app.postAppV15Fork(height) || app.postAppV16Fork(height) || app.postAppV17Fork(height) || app.postAppV18Fork(height) || app.postAppV19Fork(height) || app.postAppV20Fork(height) || app.postAppV21Fork(height) || app.postAppV22Fork(height)
 }
 
 // refreshAppV9Fork populates appV9AppliedHeight from the persisted upgrade
@@ -2203,6 +2226,16 @@ func NewSageApp(badgerPath string, postgresURL string, logger zerolog.Logger) (*
 		_ = bs.CloseBadger()
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV22Fork(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV22Prerequisite(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	// Reload persisted validators from BadgerDB (survives restart)
@@ -2273,6 +2306,12 @@ func NewSageAppWithStores(bs *store.BadgerStore, offchain store.OffchainStore, l
 		return nil, invariantErr
 	}
 	if invariantErr := app.validateAppV21Prerequisite(); invariantErr != nil {
+		return nil, invariantErr
+	}
+	if invariantErr := app.refreshAppV22Fork(); invariantErr != nil {
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV22Prerequisite(); invariantErr != nil {
 		return nil, invariantErr
 	}
 	app.reconcilePoEForkMonotonicity()
@@ -2353,12 +2392,14 @@ func restoredValidatorInfo(id string, power int64) *validator.ValidatorInfo {
 // 6 <= 7, so the watchdog stops without re-proposing.
 func (app *SageApp) currentAppVersion() uint64 {
 	switch {
+	case app.appV22AppliedHeight > 0:
+		return 22 // app-v22 (operator-controlled agent capabilities) — highest gate
 	case app.appV21AppliedHeight > 0:
-		return 21 // app-v21 (corroboration-weighted challenge rounds) — highest gate
+		return 21 // app-v21 (corroboration-weighted challenge rounds)
 	case app.appV20AppliedHeight > 0:
-		return 20 // app-v20 (v11.9 domain-scoped quorum foundation) — highest gate
+		return 20 // app-v20 (v11.9 domain-scoped quorum foundation)
 	case app.appV19AppliedHeight > 0:
-		return 19 // app-v19 (empty scaffolding gate, v11.8 — off-consensus default-read flip only) — highest gate
+		return 19 // app-v19 (empty scaffolding gate, v11.8 — off-consensus default-read flip only)
 	case app.appV18AppliedHeight > 0:
 		return 18 // app-v18 (explicit global-admin RBAC override) — independent gate, ranks below app-v19 (19 > 18)
 	case app.appV17AppliedHeight > 0:
@@ -2399,13 +2440,13 @@ func (app *SageApp) currentAppVersion() uint64 {
 }
 
 // maxSupportedAppVersion is the highest app version this binary has a compiled
-// fork gate for (currently app-v21). It is the readiness ceiling for upgrade
+// fork gate for (currently app-v22). It is the readiness ceiling for upgrade
 // auto-voting: a validator must never vote to activate an upgrade it cannot
 // execute — doing so would commit consensus version.app=N while the binary
 // still runs at N-1, halting the chain on the next CometBFT handshake (the
 // maxSupportedAppVersion footgun). Bump this in lockstep with every new
 // appV<N>UpgradeName fork gate added above.
-const maxSupportedAppVersion uint64 = 21
+const maxSupportedAppVersion uint64 = 22
 
 // MaxSupportedAppVersion returns the highest app version this binary has a
 // compiled fork gate for. Operator tooling (cmd/sage-gui `upgrade propose`)
@@ -2607,6 +2648,19 @@ func (app *SageApp) ActiveUpgradeVote() (proposalID string, targetVersion uint64
 		if readinessErr := app.appV20ConsensusReadiness(); readinessErr != nil {
 			app.logger.Warn().Err(readinessErr).Str("proposal_id", prop.ProposalID).
 				Msg("local consensus state is not app-v20-ready; skipping auto-vote")
+			supported = false
+		}
+	}
+	if payload.Name == appV22UpgradeName && payload.TargetAppVersion == 22 {
+		if app.currentAppVersion() != 21 {
+			app.logger.Warn().
+				Str("proposal_id", prop.ProposalID).
+				Uint64("current_app_version", app.currentAppVersion()).
+				Msg("app-v22 upgrade requires app-v21 as its immediate predecessor; skipping auto-vote")
+			supported = false
+		} else if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+			app.logger.Warn().Err(ladderErr).Str("proposal_id", prop.ProposalID).
+				Msg("app-v22 predecessor ladder is invalid; skipping auto-vote")
 			supported = false
 		}
 	}
@@ -2999,7 +3053,10 @@ func (app *SageApp) CheckTx(_ context.Context, req *abcitypes.RequestCheckTx) (*
 	// time is acceptable in CheckTx (which is not consensus); FinalizeBlock
 	// repeats the check against req.Time and atomically consumes the proof.
 	if app.IsAppV17ActiveForNextTx() {
-		if proofErr := app.enforceDelegatedAgentProof(parsedTx, time.Now(), false, postAppV20); proofErr != nil {
+		if proofErr := app.enforceDelegatedAgentProof(
+			parsedTx, time.Now(), false,
+			postAppV20, app.IsAppV22ActiveForNextTx(),
+		); proofErr != nil {
 			metrics.TxRejectedTotal.WithLabelValues("agent_proof_binding").Inc()
 			return &abcitypes.ResponseCheckTx{Code: 109, Log: fmt.Sprintf("agent proof rejected: %v", proofErr)}, nil
 		}
@@ -3060,6 +3117,7 @@ func (app *SageApp) cloneForAppV20Finalize(scopedStore *store.BadgerStore) *Sage
 		appV18AppliedHeight: app.appV18AppliedHeight, appV19AppliedHeight: app.appV19AppliedHeight,
 		appV20AppliedHeight:      app.appV20AppliedHeight,
 		appV21AppliedHeight:      app.appV21AppliedHeight,
+		appV22AppliedHeight:      app.appV22AppliedHeight,
 		retainBlocks:             app.retainBlocks,
 		expectedGovernanceDomain: app.expectedGovernanceDelegationDomain(),
 	}
@@ -3096,6 +3154,7 @@ func (app *SageApp) publishAppV20Finalize(clone *SageApp) {
 	app.appV19AppliedHeight = clone.appV19AppliedHeight
 	app.appV20AppliedHeight = clone.appV20AppliedHeight
 	app.appV21AppliedHeight = clone.appV21AppliedHeight
+	app.appV22AppliedHeight = clone.appV22AppliedHeight
 }
 
 // requiresAppV20StrictRulesAt turns on v20 admission/resource/error semantics
@@ -3435,6 +3494,26 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				)
 			}
 		}
+		if plan.Name == appV22UpgradeName {
+			if plan.TargetAppVersion != 22 {
+				return nil, fmt.Errorf(
+					"sage: refuse malformed app-v22 activation at height %d: target_app_version=%d",
+					req.Height, plan.TargetAppVersion,
+				)
+			}
+			if current := app.currentAppVersion(); current != 21 {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v22 activation at height %d: current committed app version is %d, want 21",
+					req.Height, current,
+				)
+			}
+			if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v22 activation at height %d: invalid predecessor ladder: %w",
+					req.Height, ladderErr,
+				)
+			}
+		}
 		// Version-non-regression floor (deterministic on every replica): never
 		// commit a consensus version.app lower than the chain's current app
 		// version. app-v7 (content-validation) is an INDEPENDENT gate that can be
@@ -3522,6 +3601,9 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		}
 		if plan.Name == appV21UpgradeName {
 			app.appV21AppliedHeight = req.Height
+		}
+		if plan.Name == appV22UpgradeName {
+			app.appV22AppliedHeight = req.Height
 		}
 		if plan.Name == appV12UpgradeName {
 			app.appV12AppliedHeight = req.Height
@@ -3723,7 +3805,10 @@ func (app *SageApp) processTx(parsedTx *tx.ParsedTx, height int64, blockTime tim
 	// state. Same-key node-originated transactions are already action-bound by
 	// the outer signature and app-v9 nonce and bypass this delegated-only gate.
 	if app.postAppV17Rules(height) {
-		if proofErr := app.enforceDelegatedAgentProof(parsedTx, blockTime, true, app.postAppV20Fork(height)); proofErr != nil {
+		if proofErr := app.enforceDelegatedAgentProof(
+			parsedTx, blockTime, true,
+			app.postAppV20Fork(height), app.postAppV22Rules(height),
+		); proofErr != nil {
 			metrics.TxRejectedTotal.WithLabelValues("agent_proof_binding_consensus").Inc()
 			return &abcitypes.ExecTxResult{Code: 109, Log: fmt.Sprintf("agent proof rejected: %v", proofErr)}
 		}
@@ -3957,6 +4042,10 @@ func (app *SageApp) processMemorySubmit(parsedTx *tx.ParsedTx, height int64, blo
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 11, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
+	agentCapabilities, capabilityErr := app.agentCapabilitiesAt(agentID, height)
+	if capabilityErr != nil {
+		return &abcitypes.ExecTxResult{Code: 11, Log: "access denied: " + capabilityErr.Error()}
+	}
 
 	// app-v16: a memory MUST carry a domain. Pre-app-v16 an empty domain_tag created
 	// a domainless memory (no memdomain: key) that could never be deprecated — the
@@ -3972,35 +4061,49 @@ func (app *SageApp) processMemorySubmit(parsedTx *tx.ParsedTx, height int64, blo
 	// If the domain doesn't exist, auto-register it with the submitting agent as owner.
 	// Reserved shared domains (e.g. "general", "self") are writable by any authenticated agent
 	// and are never auto-registered — they are conventional catch-alls without single-owner semantics.
+	if submit.DomainTag != "" && app.isSharedDomain(submit.DomainTag, height) &&
+		agentCapabilities.Has(store.AgentCapabilityDenySharedDomainWrite) {
+		return &abcitypes.ExecTxResult{Code: 11, Log: fmt.Sprintf("access denied: agent %s cannot write shared domain %s", agentID[:16], submit.DomainTag)}
+	}
 	if submit.DomainTag != "" && !app.isSharedDomain(submit.DomainTag, height) {
 		var domainOwner string
 		var domainErr error
-		if app.postAppV18Rules(height) {
+		explicitWriteRules := app.postAppV18Rules(height) || app.postAppV22Rules(height)
+		if explicitWriteRules {
 			domainOwner, _, domainErr = app.badgerStore.ResolveOwningAncestor(submit.DomainTag)
 		} else {
 			domainOwner, domainErr = app.badgerStore.GetDomainOwner(submit.DomainTag)
 		}
-		if app.postAppV18Rules(height) && domainErr != nil {
+		if explicitWriteRules && domainErr != nil {
 			return &abcitypes.ExecTxResult{Code: 11, Log: fmt.Sprintf("access denied: invalid domain ownership path: %v", domainErr)}
 		}
 		if domainErr == nil && domainOwner != "" {
+			if domainOwner != agentID && agentCapabilities.Has(store.AgentCapabilityDenyForeignDomainWrite) {
+				return &abcitypes.ExecTxResult{Code: 11, Log: fmt.Sprintf("access denied: agent %s cannot write domain %s it does not own", agentID[:16], submit.DomainTag)}
+			}
 			// Domain is owned — check write access (level 2).
 			postFork := app.postV8Fork(height)
 			recordV8Branch(postFork)
-			hasAccess := app.postAppV18Rules(height) && domainOwner == agentID
+			hasAccess := explicitWriteRules && domainOwner == agentID
 			var accessErr error
 			if hasAccess {
 				// app-v18: the effective owner inherently controls writes; an
 				// explicit self-grant is an optimization, not an authority source.
-			} else if app.postAppV18Rules(height) {
+			} else if explicitWriteRules {
 				hasAccess, accessErr = app.badgerStore.HasWriteAccessMultiOrg(submit.DomainTag, agentID, blockTime, true)
 			} else {
-				hasAccess, accessErr = app.badgerStore.HasAccessMultiOrg(submit.DomainTag, agentID, 0, blockTime, postFork)
+				hasAccess, accessErr = app.badgerStore.HasAccessMultiOrgWithFederationPolicy(
+					submit.DomainTag, agentID, 0, blockTime,
+					postFork, app.postAppV22Rules(height),
+				)
 			}
 			if accessErr != nil || !hasAccess {
 				return &abcitypes.ExecTxResult{Code: 11, Log: fmt.Sprintf("access denied: agent %s has no write access to domain %s", agentID[:16], submit.DomainTag)}
 			}
 		} else {
+			if agentCapabilities.Has(store.AgentCapabilityDenyDomainClaim) {
+				return &abcitypes.ExecTxResult{Code: 11, Log: fmt.Sprintf("access denied: agent %s cannot claim unowned domain %s", agentID[:16], submit.DomainTag)}
+			}
 			// Domain not registered — auto-register with submitting agent as owner.
 			// RegisterDomain is check-and-set: it returns ErrDomainAlreadyRegistered on race,
 			// in which case we fall through to the access check on the next tx.
@@ -4328,6 +4431,10 @@ func (app *SageApp) processCoCommitSubmit(parsedTx *tx.ParsedTx, height int64, b
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 94, Log: fmt.Sprintf("co-commit: agent identity verification failed: %v", err)}
 	}
+	localCapabilities, capabilityErr := app.agentCapabilitiesAt(localID, height)
+	if capabilityErr != nil {
+		return &abcitypes.ExecTxResult{Code: 97, Log: "co-commit: access denied: " + capabilityErr.Error()}
+	}
 
 	if len(env.Coauthors) == 0 {
 		return &abcitypes.ExecTxResult{Code: 95, Log: "co-commit: envelope has no coauthors"}
@@ -4428,31 +4535,45 @@ func (app *SageApp) processCoCommitSubmit(parsedTx *tx.ParsedTx, height int64, b
 	// LOCAL authz for the LOCAL submitter only, on the envelope's domain (foreign
 	// coauthors are NOT run through this). Mirror processMemorySubmit's owned-domain
 	// write gate; auto-register an unowned, non-shared domain to the local submitter.
+	if env.Domain != "" && app.isSharedDomain(env.Domain, height) &&
+		localCapabilities.Has(store.AgentCapabilityDenySharedDomainWrite) {
+		return &abcitypes.ExecTxResult{Code: 97, Log: fmt.Sprintf("co-commit: agent %s cannot write shared domain %s", localID[:16], env.Domain)}
+	}
 	if env.Domain != "" && !app.isSharedDomain(env.Domain, height) {
 		var domainOwner string
 		var domainErr error
-		if app.postAppV18Rules(height) {
+		explicitWriteRules := app.postAppV18Rules(height) || app.postAppV22Rules(height)
+		if explicitWriteRules {
 			domainOwner, _, domainErr = app.badgerStore.ResolveOwningAncestor(env.Domain)
 		} else {
 			domainOwner, domainErr = app.badgerStore.GetDomainOwner(env.Domain)
 		}
-		if app.postAppV18Rules(height) && domainErr != nil {
+		if explicitWriteRules && domainErr != nil {
 			return &abcitypes.ExecTxResult{Code: 97, Log: fmt.Sprintf("co-commit: invalid domain ownership path: %v", domainErr)}
 		}
 		if domainErr == nil && domainOwner != "" {
-			hasAccess := app.postAppV18Rules(height) && domainOwner == localID
+			if domainOwner != localID && localCapabilities.Has(store.AgentCapabilityDenyForeignDomainWrite) {
+				return &abcitypes.ExecTxResult{Code: 97, Log: fmt.Sprintf("co-commit: agent %s cannot write domain %s it does not own", localID[:16], env.Domain)}
+			}
+			hasAccess := explicitWriteRules && domainOwner == localID
 			var accessErr error
 			if hasAccess {
 				// See processMemorySubmit: ownership itself is sufficient authority.
-			} else if app.postAppV18Rules(height) {
+			} else if explicitWriteRules {
 				hasAccess, accessErr = app.badgerStore.HasWriteAccessMultiOrg(env.Domain, localID, blockTime, true)
 			} else {
-				hasAccess, accessErr = app.badgerStore.HasAccessMultiOrg(env.Domain, localID, 0, blockTime, app.postAppV8Rules(height))
+				hasAccess, accessErr = app.badgerStore.HasAccessMultiOrgWithFederationPolicy(
+					env.Domain, localID, 0, blockTime,
+					app.postAppV8Rules(height), app.postAppV22Rules(height),
+				)
 			}
 			if accessErr != nil || !hasAccess {
 				return &abcitypes.ExecTxResult{Code: 97, Log: fmt.Sprintf("co-commit: agent %s has no write access to domain %s", localID[:16], env.Domain)}
 			}
 		} else {
+			if localCapabilities.Has(store.AgentCapabilityDenyDomainClaim) {
+				return &abcitypes.ExecTxResult{Code: 97, Log: fmt.Sprintf("co-commit: agent %s cannot claim unowned domain %s", localID[:16], env.Domain)}
+			}
 			// Domain not registered — auto-register with the local submitter as owner.
 			// M1: mirror processMemorySubmit — ALSO create the owner's level-2
 			// self-grant and mirror both writes off-chain, or an org-less owner is
@@ -4784,6 +4905,22 @@ func (app *SageApp) processCrossFedSet(parsedTx *tx.ParsedTx, height int64, bloc
 	}
 	if t.Status != "active" {
 		return &abcitypes.ExecTxResult{Code: 104, Log: "cross_fed: status must be active for a set tx"}
+	}
+	// These stricter terms validations were introduced with app-v22. Keep the
+	// legacy branch byte-for-byte permissive so historical app-v15+ blocks
+	// replay to the same AppHash after a binary upgrade.
+	if app.postAppV22Rules(height) {
+		if uint8(t.MaxClearance) > uint8(tx.ClearanceTopSecret) {
+			return &abcitypes.ExecTxResult{Code: 105, Log: "cross_fed: max_clearance must be 0..4"}
+		}
+		if t.ExpiresAt < 0 || (t.ExpiresAt > 0 && t.ExpiresAt <= blockTime.Unix()) {
+			return &abcitypes.ExecTxResult{Code: 105, Log: "cross_fed: expires_at must be zero or in the future"}
+		}
+		for _, dept := range t.AllowedDepts {
+			if dept != "*" {
+				return &abcitypes.ExecTxResult{Code: 105, Log: "cross_fed: restrictive allowed_depts is unsupported; omit it or use [\"*\"]"}
+			}
+		}
 	}
 	// NOTE: the self-federation guard (remote_chain_id == our own chain_id) is
 	// enforced OFF-consensus — at the tx-builder (REST/CLI) and the transport-phase
@@ -6042,6 +6179,13 @@ func (app *SageApp) processAccessGrant(parsedTx *tx.ParsedTx, height int64, bloc
 				if app.isSharedDomain(grant.Domain, height) {
 					return &abcitypes.ExecTxResult{Code: 50, Log: fmt.Sprintf("shared domain not ownable: %s", grant.Domain)}
 				}
+				granterCapabilities, capabilityErr := app.agentCapabilitiesAt(granterID, height)
+				if capabilityErr != nil {
+					return &abcitypes.ExecTxResult{Code: 34, Log: "access denied: " + capabilityErr.Error()}
+				}
+				if granterCapabilities.Has(store.AgentCapabilityDenyDomainClaim) {
+					return &abcitypes.ExecTxResult{Code: 34, Log: fmt.Sprintf("access denied: agent %s cannot claim unowned domain %s", granterID[:16], grant.Domain)}
+				}
 				// Auto-register the granter as owner of this unowned,
 				// non-shared domain. Mirrors processMemorySubmit's
 				// auto-register branch exactly — same pendingWrites shape,
@@ -6160,9 +6304,9 @@ func (app *SageApp) processAccessGrant(parsedTx *tx.ParsedTx, height int64, bloc
 		},
 	})
 
-	app.logger.Info().Str("granter", granterID[:16]).Str("grantee", grant.GranteeID[:16]).Str("domain", grant.Domain).Uint8("level", grant.Level).Msg("access granted")
+	app.logger.Info().Str("granter", shortConsensusID(granterID)).Str("grantee", shortConsensusID(grant.GranteeID)).Str("domain", grant.Domain).Uint8("level", grant.Level).Msg("access granted")
 
-	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("access granted to %s for domain %s", grant.GranteeID[:16], grant.Domain)}
+	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("access granted to %s for domain %s", shortConsensusID(grant.GranteeID), grant.Domain)}
 }
 
 func (app *SageApp) processAccessRevoke(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -6219,9 +6363,9 @@ func (app *SageApp) processAccessRevoke(parsedTx *tx.ParsedTx, height int64, blo
 		},
 	})
 
-	app.logger.Info().Str("revoker", revokerID[:16]).Str("grantee", revoke.GranteeID[:16]).Str("domain", revoke.Domain).Msg("access revoked")
+	app.logger.Info().Str("revoker", shortConsensusID(revokerID)).Str("grantee", shortConsensusID(revoke.GranteeID)).Str("domain", revoke.Domain).Msg("access revoked")
 
-	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("access revoked for %s on domain %s", revoke.GranteeID[:16], revoke.Domain)}
+	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("access revoked for %s on domain %s", shortConsensusID(revoke.GranteeID), revoke.Domain)}
 }
 
 func (app *SageApp) processAccessQuery(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -6254,7 +6398,10 @@ func (app *SageApp) processAccessQuery(parsedTx *tx.ParsedTx, height int64, bloc
 	}
 
 	// Multi-org access gate: checks direct grants, org membership, clearance, federation
-	hasAccess, err := app.badgerStore.HasAccessMultiOrg(query.Domain, agentID, 0, blockTime, app.postV8Fork(height))
+	hasAccess, err := app.badgerStore.HasAccessMultiOrgWithFederationPolicy(
+		query.Domain, agentID, 0, blockTime,
+		app.postV8Fork(height), app.postAppV22Rules(height),
+	)
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 41, Log: fmt.Sprintf("access check error: %v", err)}
 	}
@@ -6320,6 +6467,13 @@ func (app *SageApp) processDomainRegister(parsedTx *tx.ParsedTx, height int64, b
 	ownerID, err := verifyAgentIdentity(parsedTx)
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 40, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
+	}
+	ownerCapabilities, capabilityErr := app.agentCapabilitiesAt(ownerID, height)
+	if capabilityErr != nil {
+		return &abcitypes.ExecTxResult{Code: 45, Log: "access denied: " + capabilityErr.Error()}
+	}
+	if ownerCapabilities.Has(store.AgentCapabilityDenyDomainClaim) {
+		return &abcitypes.ExecTxResult{Code: 45, Log: fmt.Sprintf("access denied: agent %s cannot register domains", ownerID[:16])}
 	}
 
 	// Check domain doesn't already exist
@@ -6387,6 +6541,9 @@ func (app *SageApp) processOrgRegister(parsedTx *tx.ParsedTx, height int64, bloc
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 50, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
+	if app.postAppV22Rules(height) && !app.isGlobalAdminAgent(adminID) {
+		return &abcitypes.ExecTxResult{Code: 50, Log: "access denied: app-v22 organization registration requires a global administrator"}
+	}
 
 	// Generate deterministic org ID if not provided
 	orgID := reg.OrgID
@@ -6443,8 +6600,21 @@ func (app *SageApp) processOrgAddMember(parsedTx *tx.ParsedTx, height int64, blo
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 54, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
-	if !app.isOrgAdmin(add.OrgID, senderID) {
-		return &abcitypes.ExecTxResult{Code: 54, Log: fmt.Sprintf("access denied: %s is not admin of org %s", senderID[:16], add.OrgID)}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 54, Log: "access denied: app-v22 organization membership changes require a global administrator"}
+	}
+	if postAppV22 {
+		if _, _, orgErr := app.badgerStore.GetOrg(add.OrgID); orgErr != nil {
+			return &abcitypes.ExecTxResult{Code: 54, Log: fmt.Sprintf("org %s not found", add.OrgID)}
+		}
+		if !isCanonicalAgentID(add.AgentID) || !app.badgerStore.IsAgentRegistered(add.AgentID) {
+			return &abcitypes.ExecTxResult{Code: 54, Log: "invalid or unregistered target agent ID"}
+		}
+	}
+	if !globalAdmin && !app.isOrgAdmin(add.OrgID, senderID) {
+		return &abcitypes.ExecTxResult{Code: 54, Log: fmt.Sprintf("access denied: %s is not admin of org %s", shortConsensusID(senderID), add.OrgID)}
 	}
 
 	// Validate clearance level (0-4)
@@ -6466,9 +6636,9 @@ func (app *SageApp) processOrgAddMember(parsedTx *tx.ParsedTx, height int64, blo
 		},
 	})
 
-	app.logger.Info().Str("org_id", add.OrgID).Str("agent", add.AgentID[:16]).Str("role", add.Role).Msg("member added to org")
+	app.logger.Info().Str("org_id", add.OrgID).Str("agent", shortConsensusID(add.AgentID)).Str("role", add.Role).Msg("member added to org")
 
-	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("member %s added to org %s", add.AgentID[:16], add.OrgID)}
+	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("member %s added to org %s", shortConsensusID(add.AgentID), add.OrgID)}
 }
 
 func (app *SageApp) processOrgRemoveMember(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -6482,8 +6652,18 @@ func (app *SageApp) processOrgRemoveMember(parsedTx *tx.ParsedTx, height int64, 
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 57, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
-	if !app.isOrgAdmin(rem.OrgID, senderID) {
-		return &abcitypes.ExecTxResult{Code: 57, Log: fmt.Sprintf("access denied: %s is not admin of org %s", senderID[:16], rem.OrgID)}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 57, Log: "access denied: app-v22 organization membership changes require a global administrator"}
+	}
+	if postAppV22 {
+		if _, _, orgErr := app.badgerStore.GetOrg(rem.OrgID); orgErr != nil {
+			return &abcitypes.ExecTxResult{Code: 57, Log: fmt.Sprintf("org %s not found", rem.OrgID)}
+		}
+	}
+	if !globalAdmin && !app.isOrgAdmin(rem.OrgID, senderID) {
+		return &abcitypes.ExecTxResult{Code: 57, Log: fmt.Sprintf("access denied: %s is not admin of org %s", shortConsensusID(senderID), rem.OrgID)}
 	}
 
 	// Remove member on-chain
@@ -6499,9 +6679,9 @@ func (app *SageApp) processOrgRemoveMember(parsedTx *tx.ParsedTx, height int64, 
 		},
 	})
 
-	app.logger.Info().Str("org_id", rem.OrgID).Str("agent", rem.AgentID[:16]).Msg("member removed from org")
+	app.logger.Info().Str("org_id", rem.OrgID).Str("agent", shortConsensusID(rem.AgentID)).Msg("member removed from org")
 
-	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("member %s removed from org %s", rem.AgentID[:16], rem.OrgID)}
+	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("member %s removed from org %s", shortConsensusID(rem.AgentID), rem.OrgID)}
 }
 
 func (app *SageApp) processOrgSetClearance(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -6515,8 +6695,21 @@ func (app *SageApp) processOrgSetClearance(parsedTx *tx.ParsedTx, height int64, 
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 59, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
-	if !app.isOrgAdmin(sc.OrgID, senderID) {
-		return &abcitypes.ExecTxResult{Code: 59, Log: fmt.Sprintf("access denied: %s is not admin of org %s", senderID[:16], sc.OrgID)}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 59, Log: "access denied: app-v22 organization clearance changes require a global administrator"}
+	}
+	if postAppV22 {
+		if _, _, orgErr := app.badgerStore.GetOrg(sc.OrgID); orgErr != nil {
+			return &abcitypes.ExecTxResult{Code: 59, Log: fmt.Sprintf("org %s not found", sc.OrgID)}
+		}
+		if !isCanonicalAgentID(sc.AgentID) || !app.badgerStore.IsAgentRegistered(sc.AgentID) {
+			return &abcitypes.ExecTxResult{Code: 59, Log: "invalid or unregistered target agent ID"}
+		}
+	}
+	if !globalAdmin && !app.isOrgAdmin(sc.OrgID, senderID) {
+		return &abcitypes.ExecTxResult{Code: 59, Log: fmt.Sprintf("access denied: %s is not admin of org %s", shortConsensusID(senderID), sc.OrgID)}
 	}
 
 	// Validate clearance level (0-4)
@@ -6537,9 +6730,9 @@ func (app *SageApp) processOrgSetClearance(parsedTx *tx.ParsedTx, height int64, 
 		},
 	})
 
-	app.logger.Info().Str("org_id", sc.OrgID).Str("agent", sc.AgentID[:16]).Uint8("clearance", uint8(sc.Clearance)).Msg("member clearance updated")
+	app.logger.Info().Str("org_id", sc.OrgID).Str("agent", shortConsensusID(sc.AgentID)).Uint8("clearance", uint8(sc.Clearance)).Msg("member clearance updated")
 
-	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("clearance set for %s in org %s", sc.AgentID[:16], sc.OrgID)}
+	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("clearance set for %s in org %s", shortConsensusID(sc.AgentID), sc.OrgID)}
 }
 
 func (app *SageApp) processFederationPropose(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -6553,6 +6746,21 @@ func (app *SageApp) processFederationPropose(parsedTx *tx.ParsedTx, height int64
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 61, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 61, Log: "access denied: app-v22 federation changes require a global administrator"}
+	}
+	// App-v22 tightened federation terms. Do not retroactively apply these
+	// rejects to historical proposals during replay.
+	if postAppV22 {
+		if uint8(prop.MaxClearance) > uint8(tx.ClearanceTopSecret) {
+			return &abcitypes.ExecTxResult{Code: 61, Log: "invalid max clearance: must be 0-4"}
+		}
+		if prop.ExpiresAt < 0 || (prop.ExpiresAt > 0 && prop.ExpiresAt <= blockTime.Unix()) {
+			return &abcitypes.ExecTxResult{Code: 61, Log: "invalid federation expiry: must be zero or in the future"}
+		}
+	}
 
 	// Verify the sender is a member of the proposer org and is its admin.
 	// Multi-org members can act as admin in any org they belong to.
@@ -6560,7 +6768,7 @@ func (app *SageApp) processFederationPropose(parsedTx *tx.ParsedTx, height int64
 	if memberErr != nil || !memberOf {
 		return &abcitypes.ExecTxResult{Code: 61, Log: fmt.Sprintf("agent %s is not a member of proposer org %s", senderID[:16], prop.ProposerOrgID)}
 	}
-	if !app.isOrgAdmin(prop.ProposerOrgID, senderID) {
+	if !globalAdmin && !app.isOrgAdmin(prop.ProposerOrgID, senderID) {
 		return &abcitypes.ExecTxResult{Code: 61, Log: fmt.Sprintf("access denied: %s is not admin of org %s", senderID[:16], prop.ProposerOrgID)}
 	}
 
@@ -6591,7 +6799,7 @@ func (app *SageApp) processFederationPropose(parsedTx *tx.ParsedTx, height int64
 		},
 	})
 
-	app.logger.Info().Str("federation_id", fedID).Str("proposer", prop.ProposerOrgID[:16]).Str("target", prop.TargetOrgID[:16]).Msg("federation proposed")
+	app.logger.Info().Str("federation_id", fedID).Str("proposer", shortConsensusID(prop.ProposerOrgID)).Str("target", shortConsensusID(prop.TargetOrgID)).Msg("federation proposed")
 
 	return &abcitypes.ExecTxResult{Code: 0, Data: []byte(fedID), Log: fmt.Sprintf("federation %s proposed", fedID)}
 }
@@ -6606,6 +6814,11 @@ func (app *SageApp) processFederationApprove(parsedTx *tx.ParsedTx, height int64
 	senderID, err := verifyAgentIdentity(parsedTx)
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 64, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
+	}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 64, Log: "access denied: app-v22 federation changes require a global administrator"}
 	}
 
 	// Get federation details
@@ -6626,7 +6839,7 @@ func (app *SageApp) processFederationApprove(parsedTx *tx.ParsedTx, height int64
 	if memberErr != nil || !memberOf {
 		return &abcitypes.ExecTxResult{Code: 64, Log: fmt.Sprintf("agent %s is not a member of target org %s", senderID[:16], targetOrg)}
 	}
-	if !app.isOrgAdmin(targetOrg, senderID) {
+	if !globalAdmin && !app.isOrgAdmin(targetOrg, senderID) {
 		return &abcitypes.ExecTxResult{Code: 64, Log: fmt.Sprintf("access denied: %s is not admin of target org %s", senderID[:16], targetOrg)}
 	}
 
@@ -6643,7 +6856,7 @@ func (app *SageApp) processFederationApprove(parsedTx *tx.ParsedTx, height int64
 		},
 	})
 
-	app.logger.Info().Str("federation_id", approve.FederationID).Str("approver_org", approve.ApproverOrgID[:16]).Msg("federation approved")
+	app.logger.Info().Str("federation_id", approve.FederationID).Str("approver_org", shortConsensusID(targetOrg)).Msg("federation approved")
 
 	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("federation %s approved", approve.FederationID)}
 }
@@ -6658,6 +6871,11 @@ func (app *SageApp) processFederationRevoke(parsedTx *tx.ParsedTx, height int64,
 	senderID, err := verifyAgentIdentity(parsedTx)
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 66, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
+	}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 66, Log: "access denied: app-v22 federation changes require a global administrator"}
 	}
 
 	// Get federation details
@@ -6674,16 +6892,16 @@ func (app *SageApp) processFederationRevoke(parsedTx *tx.ParsedTx, height int64,
 	// Verify the sender is a member of either federated org and is its admin.
 	// Multi-org members can revoke from whichever side of the federation they
 	// hold an admin role on.
+	var revokerOrg string
 	inProposer, _ := app.badgerStore.IsAgentInOrg(senderID, proposerOrg)
 	inTarget, _ := app.badgerStore.IsAgentInOrg(senderID, targetOrg)
-	var revokerOrg string
 	switch {
-	case inProposer && app.isOrgAdmin(proposerOrg, senderID):
+	case inProposer && (globalAdmin || app.isOrgAdmin(proposerOrg, senderID)):
 		revokerOrg = proposerOrg
-	case inTarget && app.isOrgAdmin(targetOrg, senderID):
+	case inTarget && (globalAdmin || app.isOrgAdmin(targetOrg, senderID)):
 		revokerOrg = targetOrg
 	default:
-		return &abcitypes.ExecTxResult{Code: 66, Log: "only admins of either federated org can revoke federations"}
+		return &abcitypes.ExecTxResult{Code: 66, Log: "only an authorized member of either federated org can revoke federations"}
 	}
 
 	// Update federation status to "revoked"
@@ -6699,7 +6917,7 @@ func (app *SageApp) processFederationRevoke(parsedTx *tx.ParsedTx, height int64,
 		},
 	})
 
-	app.logger.Info().Str("federation_id", revoke.FederationID).Str("revoker_org", revokerOrg[:16]).Msg("federation revoked")
+	app.logger.Info().Str("federation_id", revoke.FederationID).Str("revoker_org", shortConsensusID(revokerOrg)).Msg("federation revoked")
 
 	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("federation %s revoked", revoke.FederationID)}
 }
@@ -6715,6 +6933,11 @@ func (app *SageApp) processDeptRegister(parsedTx *tx.ParsedTx, height int64, blo
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 71, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 71, Log: "access denied: app-v22 department registration requires a global administrator"}
+	}
 
 	// Verify org exists
 	_, _, getErr := app.badgerStore.GetOrg(reg.OrgID)
@@ -6723,7 +6946,7 @@ func (app *SageApp) processDeptRegister(parsedTx *tx.ParsedTx, height int64, blo
 	}
 
 	// Verify sender is org admin
-	if !app.isOrgAdmin(reg.OrgID, senderID) {
+	if !globalAdmin && !app.isOrgAdmin(reg.OrgID, senderID) {
 		return &abcitypes.ExecTxResult{Code: 71, Log: fmt.Sprintf("access denied: %s is not admin of org %s", senderID[:16], reg.OrgID)}
 	}
 
@@ -6771,8 +6994,16 @@ func (app *SageApp) processDeptAddMember(parsedTx *tx.ParsedTx, height int64, bl
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 75, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
-	if !app.isOrgAdmin(add.OrgID, senderID) {
-		return &abcitypes.ExecTxResult{Code: 75, Log: fmt.Sprintf("access denied: %s is not admin of org %s", senderID[:16], add.OrgID)}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 75, Log: "access denied: app-v22 department membership changes require a global administrator"}
+	}
+	if postAppV22 && (!isCanonicalAgentID(add.AgentID) || !app.badgerStore.IsAgentRegistered(add.AgentID)) {
+		return &abcitypes.ExecTxResult{Code: 75, Log: "invalid or unregistered target agent ID"}
+	}
+	if !globalAdmin && !app.isOrgAdmin(add.OrgID, senderID) {
+		return &abcitypes.ExecTxResult{Code: 75, Log: fmt.Sprintf("access denied: %s is not admin of org %s", shortConsensusID(senderID), add.OrgID)}
 	}
 
 	// Verify dept exists
@@ -6801,9 +7032,9 @@ func (app *SageApp) processDeptAddMember(parsedTx *tx.ParsedTx, height int64, bl
 		},
 	})
 
-	app.logger.Info().Str("org_id", add.OrgID).Str("dept_id", add.DeptID).Str("agent", add.AgentID[:16]).Msg("member added to dept")
+	app.logger.Info().Str("org_id", add.OrgID).Str("dept_id", add.DeptID).Str("agent", shortConsensusID(add.AgentID)).Msg("member added to dept")
 
-	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("member %s added to dept %s", add.AgentID[:16], add.DeptID)}
+	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("member %s added to dept %s", shortConsensusID(add.AgentID), add.DeptID)}
 }
 
 func (app *SageApp) processDeptRemoveMember(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -6817,8 +7048,13 @@ func (app *SageApp) processDeptRemoveMember(parsedTx *tx.ParsedTx, height int64,
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 79, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
-	if !app.isOrgAdmin(rem.OrgID, senderID) {
-		return &abcitypes.ExecTxResult{Code: 79, Log: fmt.Sprintf("access denied: %s is not admin of org %s", senderID[:16], rem.OrgID)}
+	postAppV22 := app.postAppV22Rules(height)
+	globalAdmin := postAppV22 && app.isGlobalAdminAgent(senderID)
+	if postAppV22 && !globalAdmin {
+		return &abcitypes.ExecTxResult{Code: 79, Log: "access denied: app-v22 department membership changes require a global administrator"}
+	}
+	if !globalAdmin && !app.isOrgAdmin(rem.OrgID, senderID) {
+		return &abcitypes.ExecTxResult{Code: 79, Log: fmt.Sprintf("access denied: %s is not admin of org %s", shortConsensusID(senderID), rem.OrgID)}
 	}
 
 	// Remove member from department on-chain
@@ -6834,9 +7070,9 @@ func (app *SageApp) processDeptRemoveMember(parsedTx *tx.ParsedTx, height int64,
 		},
 	})
 
-	app.logger.Info().Str("org_id", rem.OrgID).Str("dept_id", rem.DeptID).Str("agent", rem.AgentID[:16]).Msg("member removed from dept")
+	app.logger.Info().Str("org_id", rem.OrgID).Str("dept_id", rem.DeptID).Str("agent", shortConsensusID(rem.AgentID)).Msg("member removed from dept")
 
-	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("member %s removed from dept %s", rem.AgentID[:16], rem.DeptID)}
+	return &abcitypes.ExecTxResult{Code: 0, Log: fmt.Sprintf("member %s removed from dept %s", shortConsensusID(rem.AgentID), rem.DeptID)}
 }
 
 func (app *SageApp) processAgentRegister(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -6856,13 +7092,21 @@ func (app *SageApp) processAgentRegister(parsedTx *tx.ParsedTx, height int64, bl
 	if regAgentID == "" {
 		regAgentID = agentID
 	}
+	if app.postAppV22Rules(height) {
+		if regAgentID != agentID {
+			return &abcitypes.ExecTxResult{Code: 60, Log: "access denied: app-v22 agent registration must bind the payload agent ID to the authenticated signer"}
+		}
+		if !isCanonicalAgentID(regAgentID) {
+			return &abcitypes.ExecTxResult{Code: 60, Log: "invalid agent ID: expected canonical lowercase Ed25519 public key"}
+		}
+	}
 
 	// Idempotent: if already registered, still buffer offchain write to backfill on_chain_height.
 	// IMPORTANT (v6.8.4): copy ALL on-chain fields from the existing record — including OrgID,
-	// DeptID, DomainAccess, and VisibleAgents — into the AgentEntry. The flush handler at
+	// DeptID, DomainAccess, VisibleAgents, and Capabilities — into the AgentEntry. The flush handler at
 	// case "agent_register" falls back to UpdateAgent on UNIQUE-constraint failure, and
 	// UpdateAgent writes the whole row. Omitting permission fields here silently zeros out
-	// network_agents.{org_id, dept_id, domain_access, visible_agents} in the SQL mirror on
+	// network_agents.{org_id, dept_id, domain_access, visible_agents, capabilities} in the SQL mirror on
 	// every re-register, breaking cross-agent visibility for any agent whose bridge calls
 	// register_agent() at startup after permissions were granted.
 	if app.badgerStore.IsAgentRegistered(regAgentID) {
@@ -6884,11 +7128,12 @@ func (app *SageApp) processAgentRegister(parsedTx *tx.ParsedTx, height int64, bl
 					DeptID:         existing.DeptID,
 					DomainAccess:   existing.DomainAccess,
 					VisibleAgents:  existing.VisibleAgents,
+					Capabilities:   existing.Capabilities,
 					OnChainHeight:  existing.RegisteredAt,
 					CreatedAt:      blockTime,
 				},
 			})
-			return &abcitypes.ExecTxResult{Code: 0, Data: []byte(regAgentID), Log: fmt.Sprintf("agent %s already registered", regAgentID[:16])}
+			return &abcitypes.ExecTxResult{Code: 0, Data: []byte(regAgentID), Log: fmt.Sprintf("agent %s already registered", shortConsensusID(regAgentID))}
 		}
 	}
 
@@ -6918,11 +7163,24 @@ func (app *SageApp) processAgentRegister(parsedTx *tx.ParsedTx, height int64, bl
 		postV9 := app.postAppV9Rules(height)
 		recordAppV9Branch(postV9) // both branches counted so the dashboard sees the pre/post split
 		if postV9 {
-			app.logger.Warn().Str("agent_id", regAgentID[:16]).Msg("app-v9: wire-supplied role=admin on self-registration downgraded to member")
+			app.logger.Warn().Str("agent_id", shortConsensusID(regAgentID)).Msg("app-v9: wire-supplied role=admin on self-registration downgraded to member")
 			role = "member"
 		}
 	}
-	if regErr := app.badgerStore.RegisterAgent(regAgentID, reg.Name, role, reg.BootBio, reg.Provider, reg.P2PAddress, height); regErr != nil {
+	initialCapabilities := store.AgentCapabilities(0)
+	if app.postAppV22Rules(height) {
+		initialCapabilities = store.DefaultSelfRegisteredAgentCapabilities
+	}
+	if regErr := app.badgerStore.RegisterAgentWithCapabilities(
+		regAgentID,
+		reg.Name,
+		role,
+		reg.BootBio,
+		reg.Provider,
+		reg.P2PAddress,
+		height,
+		initialCapabilities,
+	); regErr != nil {
 		return &abcitypes.ExecTxResult{Code: 61, Log: fmt.Sprintf("badger write error: %v", regErr)}
 	}
 
@@ -6939,14 +7197,15 @@ func (app *SageApp) processAgentRegister(parsedTx *tx.ParsedTx, height int64, bl
 			P2PAddress:     reg.P2PAddress,
 			Status:         "active",
 			Clearance:      1, // Default: INTERNAL
+			Capabilities:   initialCapabilities,
 			OnChainHeight:  height,
 			CreatedAt:      blockTime,
 		},
 	})
 
-	app.logger.Info().Str("agent_id", regAgentID[:16]).Str("name", reg.Name).Str("provider", reg.Provider).Msg("agent registered on-chain")
+	app.logger.Info().Str("agent_id", shortConsensusID(regAgentID)).Str("name", reg.Name).Str("provider", reg.Provider).Msg("agent registered on-chain")
 
-	return &abcitypes.ExecTxResult{Code: 0, Data: []byte(regAgentID), Log: fmt.Sprintf("agent %s registered", regAgentID[:16])}
+	return &abcitypes.ExecTxResult{Code: 0, Data: []byte(regAgentID), Log: fmt.Sprintf("agent %s registered", shortConsensusID(regAgentID))}
 }
 
 func (app *SageApp) processAgentUpdate(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -6968,12 +7227,12 @@ func (app *SageApp) processAgentUpdate(parsedTx *tx.ParsedTx, height int64, bloc
 
 	// Self-update only
 	if senderID != targetID {
-		return &abcitypes.ExecTxResult{Code: 63, Log: fmt.Sprintf("access denied: %s cannot update agent %s", senderID[:16], targetID[:16])}
+		return &abcitypes.ExecTxResult{Code: 63, Log: fmt.Sprintf("access denied: %s cannot update agent %s", shortConsensusID(senderID), shortConsensusID(targetID))}
 	}
 
 	// Agent must be registered
 	if !app.badgerStore.IsAgentRegistered(targetID) {
-		return &abcitypes.ExecTxResult{Code: 64, Log: fmt.Sprintf("agent %s not registered", targetID[:16])}
+		return &abcitypes.ExecTxResult{Code: 64, Log: fmt.Sprintf("agent %s not registered", shortConsensusID(targetID))}
 	}
 	if app.appV20StrictFinalize {
 		current, getErr := app.badgerStore.GetRegisteredAgent(targetID)
@@ -7004,9 +7263,9 @@ func (app *SageApp) processAgentUpdate(parsedTx *tx.ParsedTx, height int64, bloc
 		},
 	})
 
-	app.logger.Info().Str("agent_id", targetID[:16]).Str("name", upd.Name).Msg("agent metadata updated")
+	app.logger.Info().Str("agent_id", shortConsensusID(targetID)).Str("name", upd.Name).Msg("agent metadata updated")
 
-	return &abcitypes.ExecTxResult{Code: 0, Data: []byte(targetID), Log: fmt.Sprintf("agent %s updated", targetID[:16])}
+	return &abcitypes.ExecTxResult{Code: 0, Data: []byte(targetID), Log: fmt.Sprintf("agent %s updated", shortConsensusID(targetID))}
 }
 
 // bootstrapAdminFromSQL handles the v6.8.5 admin-bootstrap escape hatch.
@@ -7117,6 +7376,7 @@ func (app *SageApp) bootstrapAdminFromSQL(senderID string, height int64, blockTi
 			DeptID:         sqlAgent.DeptID,
 			DomainAccess:   sqlAgent.DomainAccess,
 			VisibleAgents:  sqlAgent.VisibleAgents,
+			Capabilities:   sqlAgent.Capabilities,
 			OnChainHeight:  height,
 			CreatedAt:      blockTime,
 		},
@@ -7157,8 +7417,11 @@ func (app *SageApp) processAgentSetPermission(parsedTx *tx.ParsedTx, height int6
 	}
 
 	// Target agent must be registered (read first so we can compute auth against its org).
+	if app.postAppV22Rules(height) && !isCanonicalAgentID(perm.AgentID) {
+		return &abcitypes.ExecTxResult{Code: 68, Log: "invalid target agent ID: expected canonical lowercase Ed25519 public key"}
+	}
 	if !app.badgerStore.IsAgentRegistered(perm.AgentID) {
-		return &abcitypes.ExecTxResult{Code: 68, Log: fmt.Sprintf("target agent %s not registered", perm.AgentID[:16])}
+		return &abcitypes.ExecTxResult{Code: 68, Log: fmt.Sprintf("target agent %s not registered", shortConsensusID(perm.AgentID))}
 	}
 
 	// Read the target's current on-chain permissions so we can detect
@@ -7166,7 +7429,35 @@ func (app *SageApp) processAgentSetPermission(parsedTx *tx.ParsedTx, height int6
 	// require additional authority beyond bare "can write to this row".
 	targetAgent, targetErr := app.badgerStore.GetRegisteredAgent(perm.AgentID)
 	if targetErr != nil {
-		return &abcitypes.ExecTxResult{Code: 68, Log: fmt.Sprintf("target agent %s lookup failed", perm.AgentID[:16])}
+		return &abcitypes.ExecTxResult{Code: 68, Log: fmt.Sprintf("target agent %s lookup failed", shortConsensusID(perm.AgentID))}
+	}
+	capabilitiesPresent := perm.CapabilitiesPresent || perm.Capabilities != 0
+	requestedCapabilities := targetAgent.Capabilities
+	if capabilitiesPresent {
+		requestedCapabilities = store.AgentCapabilities(perm.Capabilities)
+	}
+	if !app.postAppV22Rules(height) && capabilitiesPresent {
+		return &abcitypes.ExecTxResult{Code: 67, Log: "agent capabilities require app-v22"}
+	}
+	if app.postAppV22Rules(height) && !requestedCapabilities.Valid() {
+		return &abcitypes.ExecTxResult{Code: 67, Log: fmt.Sprintf("unknown agent capability bits: 0x%x", uint32(requestedCapabilities&^store.KnownAgentCapabilities))}
+	}
+	requestedOrgID := targetAgent.OrgID
+	if perm.OrgID != "" {
+		requestedOrgID = perm.OrgID
+	}
+	requestedDeptID := targetAgent.DeptID
+	if perm.DeptID != "" {
+		requestedDeptID = perm.DeptID
+	}
+	permissionsChanged := perm.Clearance != targetAgent.Clearance ||
+		perm.DomainAccess != targetAgent.DomainAccess ||
+		perm.VisibleAgents != targetAgent.VisibleAgents ||
+		requestedOrgID != targetAgent.OrgID ||
+		requestedDeptID != targetAgent.DeptID ||
+		requestedCapabilities != targetAgent.Capabilities
+	if app.postAppV22Rules(height) && permissionsChanged && senderAgent.Role != "admin" {
+		return &abcitypes.ExecTxResult{Code: 67, Log: "access denied: only a global administrator can change agent permissions after app-v22"}
 	}
 
 	// Auth model: a caller may write `agent_set_permission` on a target if
@@ -7206,7 +7497,6 @@ func (app *SageApp) processAgentSetPermission(parsedTx *tx.ParsedTx, height int6
 	if authMode == "" {
 		return &abcitypes.ExecTxResult{Code: 67, Log: "access denied"}
 	}
-
 	// Clamp: new clearance must not exceed the caller's effective ceiling.
 	// Self-set callers can lower but not raise; org admins are bounded by
 	// their own clearance in the shared org; global admins go to TopSecret.
@@ -7244,6 +7534,7 @@ func (app *SageApp) processAgentSetPermission(parsedTx *tx.ParsedTx, height int6
 		candidate.Clearance = perm.Clearance
 		candidate.DomainAccess = perm.DomainAccess
 		candidate.VisibleAgents = perm.VisibleAgents
+		candidate.Capabilities = requestedCapabilities
 		if perm.OrgID != "" {
 			candidate.OrgID = perm.OrgID
 		}
@@ -7256,7 +7547,15 @@ func (app *SageApp) processAgentSetPermission(parsedTx *tx.ParsedTx, height int6
 	}
 
 	// Update permissions on-chain
-	if permErr := app.badgerStore.SetAgentPermission(perm.AgentID, perm.Clearance, perm.DomainAccess, perm.VisibleAgents, perm.OrgID, perm.DeptID); permErr != nil {
+	if permErr := app.badgerStore.SetAgentPermissionWithCapabilities(
+		perm.AgentID,
+		perm.Clearance,
+		perm.DomainAccess,
+		perm.VisibleAgents,
+		perm.OrgID,
+		perm.DeptID,
+		requestedCapabilities,
+	); permErr != nil {
 		return &abcitypes.ExecTxResult{Code: 69, Log: fmt.Sprintf("badger write error: %v", permErr)}
 	}
 
@@ -7270,12 +7569,13 @@ func (app *SageApp) processAgentSetPermission(parsedTx *tx.ParsedTx, height int6
 			VisibleAgents: perm.VisibleAgents,
 			OrgID:         perm.OrgID,
 			DeptID:        perm.DeptID,
+			Capabilities:  requestedCapabilities,
 		},
 	})
 
-	app.logger.Info().Str("agent_id", perm.AgentID[:16]).Uint8("clearance", perm.Clearance).Str("set_by", senderID[:16]).Msg("agent permissions updated")
+	app.logger.Info().Str("agent_id", shortConsensusID(perm.AgentID)).Uint8("clearance", perm.Clearance).Str("set_by", shortConsensusID(senderID)).Msg("agent permissions updated")
 
-	return &abcitypes.ExecTxResult{Code: 0, Data: []byte(perm.AgentID), Log: fmt.Sprintf("agent %s permissions updated", perm.AgentID[:16])}
+	return &abcitypes.ExecTxResult{Code: 0, Data: []byte(perm.AgentID), Log: fmt.Sprintf("agent %s permissions updated", shortConsensusID(perm.AgentID))}
 }
 
 func (app *SageApp) processMemoryReassign(parsedTx *tx.ParsedTx, height int64, blockTime time.Time) *abcitypes.ExecTxResult {
@@ -7305,7 +7605,7 @@ func (app *SageApp) processMemoryReassign(parsedTx *tx.ParsedTx, height int64, b
 
 	// Target agent must be registered on-chain
 	if !app.badgerStore.IsAgentRegistered(reassign.TargetAgentID) {
-		return &abcitypes.ExecTxResult{Code: 68, Log: fmt.Sprintf("target agent %s not registered", reassign.TargetAgentID[:16])}
+		return &abcitypes.ExecTxResult{Code: 68, Log: fmt.Sprintf("target agent %s not registered", shortConsensusID(reassign.TargetAgentID))}
 	}
 
 	// Source agent does NOT need to be registered — that's the whole point:
@@ -7321,15 +7621,15 @@ func (app *SageApp) processMemoryReassign(parsedTx *tx.ParsedTx, height int64, b
 	})
 
 	app.logger.Info().
-		Str("source", reassign.SourceAgentID[:16]).
-		Str("target", reassign.TargetAgentID[:16]).
-		Str("admin", senderID[:16]).
+		Str("source", shortConsensusID(reassign.SourceAgentID)).
+		Str("target", shortConsensusID(reassign.TargetAgentID)).
+		Str("admin", shortConsensusID(senderID)).
 		Msg("memory reassignment approved on-chain")
 
 	return &abcitypes.ExecTxResult{
 		Code: 0,
 		Data: []byte(reassign.TargetAgentID),
-		Log:  fmt.Sprintf("memories reassigned from %s to %s", reassign.SourceAgentID[:16], reassign.TargetAgentID[:16]),
+		Log:  fmt.Sprintf("memories reassigned from %s to %s", shortConsensusID(reassign.SourceAgentID), shortConsensusID(reassign.TargetAgentID)),
 	}
 }
 
@@ -8089,6 +8389,7 @@ func (app *SageApp) flushPendingWrites(ctx context.Context, s store.OffchainStor
 					existing.Clearance = d.Clearance
 					existing.DomainAccess = d.DomainAccess
 					existing.VisibleAgents = d.VisibleAgents
+					existing.Capabilities = d.Capabilities
 					if d.OrgID != "" {
 						existing.OrgID = d.OrgID
 					}
@@ -8104,6 +8405,7 @@ func (app *SageApp) flushPendingWrites(ctx context.Context, s store.OffchainStor
 						Clearance:     d.Clearance,
 						DomainAccess:  d.DomainAccess,
 						VisibleAgents: d.VisibleAgents,
+						Capabilities:  d.Capabilities,
 						OrgID:         d.OrgID,
 						DeptID:        d.DeptID,
 						Status:        "active",
@@ -8114,9 +8416,9 @@ func (app *SageApp) flushPendingWrites(ctx context.Context, s store.OffchainStor
 						if getErr != nil {
 							createErr = errors.Join(getErr, createErr)
 						}
-						err = fmt.Errorf("agent %s not in offchain store and create failed: %w", d.AgentID[:16], createErr)
+						err = fmt.Errorf("agent %s not in offchain store and create failed: %w", shortConsensusID(d.AgentID), createErr)
 					} else {
-						app.logger.Info().Str("agent_id", d.AgentID[:16]).Msg("created offchain agent record for permission sync")
+						app.logger.Info().Str("agent_id", shortConsensusID(d.AgentID)).Msg("created offchain agent record for permission sync")
 					}
 				}
 			}
@@ -8127,8 +8429,8 @@ func (app *SageApp) flushPendingWrites(ctx context.Context, s store.OffchainStor
 					err = reassignErr
 				} else {
 					app.logger.Info().
-						Str("source", d.SourceAgentID[:16]).
-						Str("target", d.TargetAgentID[:16]).
+						Str("source", shortConsensusID(d.SourceAgentID)).
+						Str("target", shortConsensusID(d.TargetAgentID)).
 						Int64("count", count).
 						Msg("memories reassigned in offchain store")
 				}
@@ -8210,7 +8512,10 @@ func (app *SageApp) isAuthenticatedAppV20BootstrapProposal(rawTx []byte, height 
 		return false
 	}
 	if app.postAppV17Rules(height) {
-		if proofErr := app.enforceDelegatedAgentProof(parsed, blockTime, false, false); proofErr != nil {
+		if proofErr := app.enforceDelegatedAgentProof(
+			parsed, blockTime, false,
+			false, app.postAppV22Rules(height),
+		); proofErr != nil {
 			return false
 		}
 	}
@@ -8816,6 +9121,17 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 			return fmt.Errorf("app-v21 upgrade requires current app version 20, got %d", current)
 		}
 	}
+	if p.Name == appV22UpgradeName {
+		if p.TargetAppVersion != 22 {
+			return fmt.Errorf("app-v22 upgrade has target version %d, want 22", p.TargetAppVersion)
+		}
+		if current := app.currentAppVersion(); current != 21 {
+			return fmt.Errorf("app-v22 upgrade requires current app version 21, got %d", current)
+		}
+		if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+			return fmt.Errorf("app-v22 upgrade has invalid predecessor ladder: %w", ladderErr)
+		}
+	}
 
 	// Execution-height regression re-guard: the chain's committed app version
 	// may have advanced (another upgrade activated) between propose and quorum.
@@ -8930,6 +9246,20 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 		if current := app.currentAppVersion(); current != 20 {
 			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
 				"upgrade propose: app-v21 requires current committed app version 20 (got %d)", current)}
+		}
+	}
+	if prop.Name == appV22UpgradeName {
+		if prop.TargetAppVersion != 22 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v22 requires target_app_version 22 (got %d)", prop.TargetAppVersion)}
+		}
+		if current := app.currentAppVersion(); current != 21 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v22 requires current committed app version 21 (got %d)", current)}
+		}
+		if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v22 predecessor ladder is invalid: %v", ladderErr)}
 		}
 	}
 
@@ -9371,6 +9701,21 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 	if payload.Domain != req.Domain || payload.NewOwnerID != req.NewOwnerID || payload.OpenToShared != req.OpenToShared {
 		return &abcitypes.ExecTxResult{Code: 83, Log: "proposal body mismatch (domain/new_owner/open_to_shared)"}
 	}
+	if app.postAppV22Rules(height) {
+		if !isCanonicalAgentID(req.NewOwnerID) {
+			return &abcitypes.ExecTxResult{Code: 80, Log: fmt.Sprintf(
+				"domain reassign: new owner %q is not a canonical agent identity",
+				shortConsensusID(req.NewOwnerID),
+			)}
+		}
+		newOwner, ownerErr := app.badgerStore.GetRegisteredAgent(req.NewOwnerID)
+		if ownerErr != nil || newOwner == nil || newOwner.AgentID != req.NewOwnerID {
+			return &abcitypes.ExecTxResult{Code: 80, Log: fmt.Sprintf(
+				"domain reassign: new owner %s is not a registered on-chain agent",
+				shortConsensusID(req.NewOwnerID),
+			)}
+		}
+	}
 
 	// Consumed-once check: a proposal authorizes exactly one execution.
 	consumedKey := "gov:proposal:" + req.ProposalID + ":consumed"
@@ -9464,7 +9809,7 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 	app.logger.Info().
 		Str("domain", req.Domain).
 		Str("previous_owner", existingOwner).
-		Str("new_owner", req.NewOwnerID[:16]).
+		Str("new_owner", shortConsensusID(req.NewOwnerID)).
 		Str("proposal_id", req.ProposalID).
 		Bool("open_to_shared", req.OpenToShared).
 		Int("purged_grants", purged).
