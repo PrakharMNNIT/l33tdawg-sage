@@ -600,6 +600,24 @@ func (s *Server) signedRequest(ctx context.Context, method, path string, body []
 		}
 	}
 
+	// A trailing "?" with nothing after it is not part of the request the server
+	// sees, so signing it produces a signature over a string the verifier can
+	// never reconstruct.
+	//
+	// This shipped as a silent 401. Callers build paths as
+	// `"/v1/dashboard/tasks?" + q.Encode()`, and `url.Values{}.Encode()` returns
+	// "" when every parameter is optional and none was set — so the client
+	// signed "/v1/dashboard/tasks?" while `validAgentSignature` rebuilt
+	// "/v1/dashboard/tasks" from `r.URL.Path` and an empty `r.URL.RawQuery`
+	// (web/handler.go:979). Only `sage_backlog` with no domain filter hit it,
+	// which is the default call, so the owner's backlog was unreadable while
+	// every other tool worked — and the model reported it as "your backlog is
+	// empty" rather than as an error.
+	//
+	// Normalised here rather than at each call site because there are five of
+	// them and the next one will not remember either.
+	path = strings.TrimSuffix(path, "?")
+
 	timestamp := time.Now().Unix()
 
 	nonce := make([]byte, 8)
