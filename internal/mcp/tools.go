@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Tool defines an MCP tool with its schema and handler.
@@ -1220,6 +1221,9 @@ func (s *Server) cacheFederatedAgentConnections(ctx context.Context, query strin
 }
 
 func matchesAgentName(query string, candidates ...string) (exact bool, partial bool) {
+	queryTokens := agentNameTokens(query)
+	normalizedQuery := strings.Join(queryTokens, " ")
+
 	for _, candidate := range candidates {
 		candidate = strings.TrimSpace(candidate)
 		if candidate == "" {
@@ -1228,8 +1232,126 @@ func matchesAgentName(query string, candidates ...string) (exact bool, partial b
 		if strings.EqualFold(candidate, query) {
 			return true, false
 		}
+		candidateTokens := agentNameTokens(candidate)
+		if len(candidateTokens) == 0 || len(queryTokens) == 0 {
+			continue
+		}
+		normalizedCandidate := strings.Join(candidateTokens, " ")
+		// "MYNAH (SAGE Voice Bridge Agent)" and "mynah sage voice bridge agent"
+		// are the same name written two ways. Punctuation is display, not
+		// identity.
+		if normalizedCandidate == normalizedQuery {
+			return true, false
+		}
+		if agentNameOverlaps(queryTokens, candidateTokens) {
+			partial = true
+		}
 	}
-	return false, false
+	return false, partial
+}
+
+// agentNameOverlaps reports whether a human's phrasing plausibly names this
+// agent: either one name contains the other's words in order, or the query's
+// significant words are mostly present.
+//
+// Deliberately conservative, because the caller is `sage_find_agent` and its
+// answer feeds `sage_pipe` — a wrong match sends the owner's work to the wrong
+// agent. Two things keep that safe: an exact match always wins outright
+// (`toolFindAgent` only falls back to partials when `localExact` is empty), and
+// every match is returned with its agent_id for the model to choose from rather
+// than resolved silently to one.
+func agentNameOverlaps(queryTokens, candidateTokens []string) bool {
+	// Before any matching. "agent" is a contiguous run of every agent's name, so
+	// a subsequence test alone would match all of them — this has to gate the
+	// cheap path too, not just the overlap score.
+	hasDistinctive := false
+	for _, q := range queryTokens {
+		if !agentNameGenericWords[q] {
+			hasDistinctive = true
+			break
+		}
+	}
+	if !hasDistinctive {
+		return false
+	}
+	if containsSubsequence(candidateTokens, queryTokens) || containsSubsequence(queryTokens, candidateTokens) {
+		return true
+	}
+	// At least one word that actually names something. "agent" describes every
+	// row on the node, so a query made only of role words identifies nobody —
+	// and sending the owner's work to an arbitrary agent is the failure mode
+	// worth being strict about.
+	distinctivePresent := 0
+	present := 0
+	for _, q := range queryTokens {
+		for _, c := range candidateTokens {
+			if q == c {
+				present++
+				if !agentNameGenericWords[q] {
+					distinctivePresent++
+				}
+				break
+			}
+		}
+	}
+	if distinctivePresent == 0 {
+		return false
+	}
+	// Majority of what the human actually said.
+	if present == 1 && len(queryTokens) > 1 {
+		return false
+	}
+	return present*2 >= len(queryTokens)
+}
+
+func containsSubsequence(haystack, needle []string) bool {
+	if len(needle) == 0 || len(needle) > len(haystack) {
+		return false
+	}
+	for start := 0; start+len(needle) <= len(haystack); start++ {
+		matched := true
+		for i, word := range needle {
+			if haystack[start+i] != word {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+// agentNameGenericWords describe what a thing is rather than which thing it is.
+// Every agent on the node is an "agent"; a query made only of these names
+// nobody, so it must not match everybody.
+var agentNameGenericWords = map[string]bool{
+	"agent": true, "agents": true, "bot": true, "assistant": true,
+	"node": true, "service": true, "ai": true, "llm": true,
+}
+
+// agentNameFillerWords carry no identity, so they neither help a match nor
+// count against one. "the voice notes agent" is three words about the agent and
+// one about grammar.
+var agentNameFillerWords = map[string]bool{
+	"the": true, "a": true, "an": true, "to": true, "for": true, "on": true,
+	"my": true, "our": true, "this": true, "that": true, "please": true,
+}
+
+// agentNameTokens lowercases and splits a name into identity-bearing words.
+func agentNameTokens(name string) []string {
+	fields := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+	tokens := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if agentNameFillerWords[field] {
+			continue
+		}
+		tokens = append(tokens, field)
+	}
+	return tokens
 }
 
 // toolFindAgent provides an explicit, safe recipient-discovery path for
