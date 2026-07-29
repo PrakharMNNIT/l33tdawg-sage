@@ -135,10 +135,17 @@ func (h *DashboardHandler) handleGetProposal(govStore store.GovernanceStore) htt
 
 // handleDashboardGovPropose handles POST /v1/dashboard/governance/propose.
 func (h *DashboardHandler) handleDashboardGovPropose(w http.ResponseWriter, r *http.Request) {
-	if !h.requireDashboardGovernanceOperator(w, r) {
+	var appV23Actor *appV23ControlActor
+	if h.appV23IsActive() {
+		var ok bool
+		appV23Actor, ok = h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+	} else if !h.requireDashboardGovernanceOperator(w, r) {
 		return
 	}
-	if h.CometBFTRPC == "" || h.SigningKey == nil {
+	if h.CometBFTRPC == "" || len(h.SigningKey) != ed25519.PrivateKeySize {
 		writeError(w, http.StatusServiceUnavailable, "CometBFT consensus not configured")
 		return
 	}
@@ -204,7 +211,11 @@ func (h *DashboardHandler) handleDashboardGovPropose(w http.ResponseWriter, r *h
 	proofBody := rawBody
 	if postAppV20 {
 		outerKey = h.SigningKey
-		if len(h.AdminSigningKey) != ed25519.PrivateKeySize {
+		operatorKey := h.AdminSigningKey
+		if appV23Actor != nil {
+			operatorKey = appV23Actor.Key
+		}
+		if len(operatorKey) != ed25519.PrivateKeySize {
 			writeError(w, http.StatusServiceUnavailable, "governance operator key not configured")
 			return
 		}
@@ -239,12 +250,23 @@ func (h *DashboardHandler) handleDashboardGovPropose(w http.ResponseWriter, r *h
 	}
 
 	if postAppV20 {
-		if err = embedDashboardGovernanceProof(proposeTx, h.AdminSigningKey, r.Method, r.URL.RequestURI(), proofBody); err != nil {
+		operatorKey := h.AdminSigningKey
+		if appV23Actor != nil {
+			operatorKey = appV23Actor.Key
+		}
+		if err = embedDashboardGovernanceProof(proposeTx, operatorKey, r.Method, r.URL.RequestURI(), proofBody); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to authorize transaction")
 			return
 		}
 	} else {
 		embedDashboardAgentProof(proposeTx, outerKey)
+	}
+	if appV23Actor != nil {
+		if err = h.appV23AttachElevation(proposeTx, appV23Actor); err != nil {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "local_elevation_failed",
+				"Could not bind the governance action to the current local authority.")
+			return
+		}
 	}
 	if err = tx.SignTx(proposeTx, outerKey); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to sign transaction")
@@ -330,10 +352,17 @@ func resolveDashboardGovProposalPayload(op tx.GovProposalOp, targetID, rawPayloa
 
 // handleDashboardGovVote handles POST /v1/dashboard/governance/vote.
 func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http.Request) {
-	if !h.requireDashboardGovernanceOperator(w, r) {
+	var appV23Actor *appV23ControlActor
+	if h.appV23IsActive() {
+		var ok bool
+		appV23Actor, ok = h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+	} else if !h.requireDashboardGovernanceOperator(w, r) {
 		return
 	}
-	if h.CometBFTRPC == "" || h.SigningKey == nil {
+	if h.CometBFTRPC == "" || len(h.SigningKey) != ed25519.PrivateKeySize {
 		writeError(w, http.StatusServiceUnavailable, "CometBFT consensus not configured")
 		return
 	}
@@ -376,7 +405,11 @@ func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http
 	}
 
 	if h.AppV20ActiveFn != nil && h.AppV20ActiveFn() {
-		if len(h.AdminSigningKey) != ed25519.PrivateKeySize {
+		operatorKey := h.AdminSigningKey
+		if appV23Actor != nil {
+			operatorKey = appV23Actor.Key
+		}
+		if len(operatorKey) != ed25519.PrivateKeySize {
 			writeError(w, http.StatusServiceUnavailable, "governance operator key not configured")
 			return
 		}
@@ -390,12 +423,19 @@ func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http
 			writeError(w, http.StatusInternalServerError, "failed to encode governance authorization")
 			return
 		}
-		if err = embedDashboardGovernanceProof(voteTx, h.AdminSigningKey, r.Method, r.URL.RequestURI(), proofBody); err != nil {
+		if err = embedDashboardGovernanceProof(voteTx, operatorKey, r.Method, r.URL.RequestURI(), proofBody); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to authorize transaction")
 			return
 		}
 	} else {
 		embedDashboardAgentProof(voteTx, h.SigningKey)
+	}
+	if appV23Actor != nil {
+		if err = h.appV23AttachElevation(voteTx, appV23Actor); err != nil {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "local_elevation_failed",
+				"Could not bind the governance vote to the current local authority.")
+			return
+		}
 	}
 	if err = tx.SignTx(voteTx, h.SigningKey); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to sign transaction")

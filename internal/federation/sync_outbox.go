@@ -816,6 +816,19 @@ func (m *Manager) syncDrain(ctx context.Context, ss *store.SQLiteStore, agreemen
 			}
 			continue
 		}
+		// The SQL row is only a serving projection. A process can die after
+		// SQLite commits but before the matching Badger snapshot is published,
+		// and a damaged/tampered projection must never be signed and copied to a
+		// peer. Keep the outbox row retryable so consensus replay can publish the
+		// canonical snapshot without losing the pending copy.
+		var canonical *store.MemoryDisclosureState
+		if m.postV23ForNextTx != nil && m.postV23ForNextTx() {
+			canonical, err = m.badger.ValidateMemoryProjection(rec)
+			if err != nil {
+				retry(row, false, false, syncVaultRetryDelay, "canonical memory publication pending")
+				continue
+			}
+		}
 		if rec.Status != memory.StatusCommitted {
 			// Deprecated (or otherwise no longer committed) since enqueue:
 			// lifecycle is sovereign and does NOT propagate — terminal skip.
@@ -856,12 +869,20 @@ func (m *Manager) syncDrain(ctx context.Context, ss *store.SQLiteStore, agreemen
 			_ = ss.MarkSyncOutboxRejected(writeCtx, chain, row.MemoryID, "domain out of scope at send time")
 			continue
 		}
-		cls, err := ss.GetMemoryClassificationLocal(ctx, row.MemoryID)
+		projectedClass, err := ss.GetMemoryClassificationLocal(ctx, row.MemoryID)
 		if err != nil {
 			// Fail CLOSED on the egress boundary: an unreadable classification
 			// is never treated as "low".
 			retry(row, true, false, syncBackoff(row.Attempts+1), "classification read failed")
 			continue
+		}
+		cls := projectedClass
+		if canonical != nil {
+			cls = int(canonical.Classification)
+			if projectedClass != cls {
+				retry(row, false, false, syncVaultRetryDelay, "canonical classification publication pending")
+				continue
+			}
 		}
 		if cls > int(agreement.MaxClearance) {
 			_ = ss.MarkSyncOutboxRejected(writeCtx, chain, row.MemoryID, "classification above agreement ceiling")
@@ -931,11 +952,19 @@ func (m *Manager) syncDrain(ctx context.Context, ss *store.SQLiteStore, agreemen
 	// take the write side of this lease, so once their API returns no push can
 	// begin from the old snapshot. Never hold a SQLite transaction here.
 	policyUnlock := ss.LockSyncPolicyRead()
-	policyLocked := true
-	defer func() {
-		if policyLocked {
-			policyUnlock()
+	ownerUnlock := m.badger.LockDomainOwnershipRead()
+	locksHeld := true
+	releaseLocks := func() {
+		if !locksHeld {
+			return
 		}
+		// Reverse acquisition order: sync-policy -> Badger authorization.
+		ownerUnlock()
+		policyUnlock()
+		locksHeld = false
+	}
+	defer func() {
+		releaseLocks()
 	}()
 	currentAgreement, gateErr := m.ActiveAgreement(chain)
 	currentConsent, consentErr := m.effectiveConsent(ctx, ss, chain)
@@ -946,16 +975,14 @@ func (m *Manager) syncDrain(ctx context.Context, ss *store.SQLiteStore, agreemen
 	policyPending := control != nil && control.Revision > control.DeliveredRevision &&
 		(control.Role == "host" || control.PolicyVersion >= SyncPolicyVersionPeerRBAC)
 	if gateErr != nil || consentErr != nil || controlErr != nil || directPolicyErr != nil || currentGroupErr != nil || pauseErr != nil {
-		policyUnlock()
-		policyLocked = false
+		releaseLocks()
 		for _, row := range itemRows {
 			retry(row, false, false, syncBackoffBase, "sync policy changed before delivery")
 		}
 		return
 	}
 	if currentPaused {
-		policyUnlock()
-		policyLocked = false
+		releaseLocks()
 		for _, row := range itemRows {
 			// Pause is reversible configuration, not a terminal scope removal.
 			// Return claimed rows to pending unchanged so Resume can deliver them.
@@ -966,6 +993,30 @@ func (m *Manager) syncDrain(ctx context.Context, ss *store.SQLiteStore, agreemen
 	filteredItems := items[:0]
 	filteredRows := itemRows[:0]
 	for i, item := range items {
+		// Revalidate the canonical serving projection under the same Badger
+		// authorization lease held through the external push. This closes both
+		// activation and reassignment races between the earlier batch build and
+		// the network side effect.
+		if m.postV23ForNextTx != nil && m.postV23ForNextTx() {
+			currentRecord, projectionErr := ss.GetMemory(ctx, itemRows[i].MemoryID)
+			if projectionErr != nil {
+				retry(itemRows[i], true, false, syncBackoff(itemRows[i].Attempts+1), "canonical projection reread failed")
+				continue
+			}
+			canonical, projectionErr := m.badger.ValidateMemoryProjection(currentRecord)
+			if projectionErr != nil {
+				retry(itemRows[i], false, false, syncVaultRetryDelay, "canonical memory publication pending")
+				continue
+			}
+			projectedClass, classErr := ss.GetMemoryClassificationLocal(ctx, itemRows[i].MemoryID)
+			if classErr != nil || projectedClass != int(canonical.Classification) ||
+				currentRecord.Content != item.Content ||
+				currentRecord.DomainTag != item.Domain ||
+				int(canonical.Classification) != item.Classification {
+				retry(itemRows[i], false, false, syncVaultRetryDelay, "canonical projection changed before delivery")
+				continue
+			}
+		}
 		relayed := item.OriginChainID != "" && item.OriginChainID != m.localChainID
 		groupAuthorized := DomainAllowed(currentGroupOwned, item.Domain)
 		groupID := ""
@@ -1019,8 +1070,7 @@ func (m *Manager) syncDrain(ctx context.Context, ss *store.SQLiteStore, agreemen
 	}
 	items, itemRows = filteredItems, filteredRows
 	if len(items) == 0 {
-		policyUnlock()
-		policyLocked = false
+		releaseLocks()
 		return
 	}
 
@@ -1034,8 +1084,7 @@ func (m *Manager) syncDrain(ctx context.Context, ss *store.SQLiteStore, agreemen
 		push = m.SyncPush
 	}
 	resp, err := push(pctx, chain, &SyncPushRequest{Items: items})
-	policyUnlock()
-	policyLocked = false
+	releaseLocks()
 	if err != nil {
 		reason := err.Error()
 		for _, row := range itemRows {

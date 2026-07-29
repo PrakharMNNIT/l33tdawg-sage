@@ -565,17 +565,22 @@ func (m *Manager) hostConfirm(sessionID string, certSPKI, guestSig, guestAckSig 
 		}
 		routePrepared = true
 	}
-	// Broadcast the host's own tx-33 CrossFedSet(remote=guest) with the operator
-	// key. crossFedAuthorized re-checks authority on-chain.
-	txHash, err := m.broadcastCrossFedSetAgreementLocked(&tx.CrossFedTerms{
-		RemoteChainID:  ctx.GuestChain,
-		Endpoint:       ctx.GuestEndpoint,
-		PeerPubKey:     ctx.GuestPin,
-		MaxClearance:   tx.ClearanceLevel(ctx.HostGrant.Clearance),
-		AllowedDomains: ctx.HostGrant.Domains,
-		ExpiresAt:      ctx.HostGrant.Expiry,
-		Status:         "active",
-	})
+	// Broadcast the host's own tx-33 CrossFedSet(remote=guest). App-v23
+	// preserves the frozen local Root/Admin actor and adds current-Root
+	// elevation for Admin; older chains retain the historical operator signer.
+	// crossFedAuthorized re-checks authority on-chain.
+	txHash, err := m.broadcastCrossFedSetAgreementLockedAs(
+		ctx.HostGrant.ControlActorID,
+		&tx.CrossFedTerms{
+			RemoteChainID:  ctx.GuestChain,
+			Endpoint:       ctx.GuestEndpoint,
+			PeerPubKey:     ctx.GuestPin,
+			MaxClearance:   tx.ClearanceLevel(ctx.HostGrant.Clearance),
+			AllowedDomains: ctx.HostGrant.Domains,
+			ExpiresAt:      ctx.HostGrant.Expiry,
+			Status:         "active",
+		},
+	)
 	if err != nil {
 		if routePrepared && hooks.Remove != nil {
 			_ = hooks.Remove(ctx.GuestChain)
@@ -649,7 +654,9 @@ func (m *Manager) rememberPeerName(remoteChainID, name string) {
 // agreementMutationMu, so the tx-34 + purge use the non-reentrant locked helper
 // and remain in the same generation critical section.
 func (m *Manager) undoPartialHostConfirmLocked(sessionID string, ctx *ConfirmContext, what string, cause error) (string, string, error) {
-	if _, rErr := m.revokeAgreementLocked(ctx.GuestChain); rErr != nil {
+	if _, rErr := m.revokeAgreementLockedAs(
+		ctx.HostGrant.ControlActorID, ctx.GuestChain,
+	); rErr != nil {
 		m.logger.Error().Err(rErr).Str("guest", ctx.GuestChain).Msg("revoke after partial host confirm failed - manual cleanup may be needed")
 	}
 	ctx.RollbackGuestCA()
@@ -834,6 +841,13 @@ func (m *Manager) HostSessionStatus(sessionID string) (*HostSessionView, error) 
 // to HOST_APPROVED. JOIN carries the fixed trust-only compatibility scope;
 // mutable per-domain Read/Write/Copy permissions are configured after pairing.
 func (m *Manager) HostApprove(sessionID, typedCode string, grant ScopeWire) error {
+	return m.HostApproveAs("", sessionID, typedCode, grant)
+}
+
+func (m *Manager) HostApproveAs(
+	controlActorID, sessionID, typedCode string,
+	grant ScopeWire,
+) error {
 	now := time.Now()
 	js, ok := m.joins.Get(sessionID, now)
 	if !ok {
@@ -845,16 +859,22 @@ func (m *Manager) HostApprove(sessionID, typedCode string, grant ScopeWire) erro
 	if err := validateTrustOnlyJoinScope(grant); err != nil {
 		return err
 	}
+	_, _, effectiveActorID, _, _, err :=
+		m.localConsensusControlSigner(controlActorID)
+	if err != nil {
+		return fmt.Errorf("resolve host JOIN authority: %w", err)
+	}
 	// The code compare AND the E freeze happen atomically inside ApproveWithCode
 	// (one locked critical section over the session), so a concurrent re-request
 	// can never shift the fields between "compared" and "frozen".
 	locked, err := m.joins.ApproveWithCode(sessionID, typedCode, HostGrant{
-		Clearance: clampClearance(grant.MaxClearance),
-		Domains:   grant.AllowedDomains,
-		Expiry:    0,
-		Mode:      grant.Mode,
-		Direction: grant.Direction,
-		Scope:     grant.digest(),
+		Clearance:      clampClearance(grant.MaxClearance),
+		Domains:        grant.AllowedDomains,
+		Expiry:         0,
+		Mode:           grant.Mode,
+		Direction:      grant.Direction,
+		Scope:          grant.digest(),
+		ControlActorID: effectiveActorID,
 	})
 	if locked {
 		return fmt.Errorf("code does not match - session locked")
@@ -1352,6 +1372,14 @@ func (m *Manager) GuestAbort(ctx context.Context, sessionID string) error {
 // first (guest-first activation, RT-7), then POSTs /fed/v1/join/confirm so the
 // host activates its side. hostScope is what the guest polled from /join/status.
 func (m *Manager) GuestConfirm(ctx context.Context, sessionID, guestEndpoint string, hostScope ScopeWire) (string, error) {
+	return m.GuestConfirmAs(ctx, "", sessionID, guestEndpoint, hostScope)
+}
+
+func (m *Manager) GuestConfirmAs(
+	ctx context.Context,
+	controlActorID, sessionID, guestEndpoint string,
+	hostScope ScopeWire,
+) (string, error) {
 	if err := validateTrustOnlyJoinScope(hostScope); err != nil {
 		return "", err
 	}
@@ -1483,14 +1511,17 @@ func (m *Manager) GuestConfirm(ctx context.Context, sessionID, guestEndpoint str
 			}
 			// Guest-first: broadcast our own tx-33 (remote=host), then commit
 			// every local artifact before another set/revoke generation may run.
-			activatedHash, activateErr := m.broadcastCrossFedSetAgreementLocked(&tx.CrossFedTerms{
-				RemoteChainID:  d.hostChain,
-				Endpoint:       d.hostEndpoint,
-				PeerPubKey:     d.hostPin,
-				MaxClearance:   tx.ClearanceLevel(clampClearance(d.scope.MaxClearance)),
-				AllowedDomains: d.scope.AllowedDomains,
-				Status:         "active",
-			})
+			activatedHash, activateErr := m.broadcastCrossFedSetAgreementLockedAs(
+				controlActorID,
+				&tx.CrossFedTerms{
+					RemoteChainID:  d.hostChain,
+					Endpoint:       d.hostEndpoint,
+					PeerPubKey:     d.hostPin,
+					MaxClearance:   tx.ClearanceLevel(clampClearance(d.scope.MaxClearance)),
+					AllowedDomains: d.scope.AllowedDomains,
+					Status:         "active",
+				},
+			)
 			if activateErr != nil {
 				if routePrepared && hooks.Remove != nil {
 					_ = hooks.Remove(d.hostChain)
@@ -1508,22 +1539,22 @@ func (m *Manager) GuestConfirm(ctx context.Context, sessionID, guestEndpoint str
 			m.guestMu.Unlock()
 			if _, cErr := m.StoreRemoteCA(d.hostChain, d.hostCAPEM); cErr != nil {
 				m.logger.Error().Err(cErr).Str("host", d.hostChain).Msg("host CA commit failed post-broadcast")
-				_, _ = m.revokeAgreementLocked(d.hostChain)
+				_, _ = m.revokeAgreementLockedAs(controlActorID, d.hostChain)
 				return "", fmt.Errorf("host CA persistence failed; agreement rolled back: %w", cErr)
 			}
 			if sErr := m.commitPairSeed(d.hostChain, d.hostPin, d.seed); sErr != nil {
 				m.logger.Error().Err(sErr).Str("host", d.hostChain).Msg("guest seed commit failed post-broadcast")
-				_, _ = m.revokeAgreementLocked(d.hostChain)
+				_, _ = m.revokeAgreementLockedAs(controlActorID, d.hostChain)
 				return "", fmt.Errorf("federation seed persistence failed; agreement rolled back: %w", sErr)
 			}
 			if ss := m.syncStore(); ss != nil {
 				if activateErr := ss.ActivateSyncControl(context.Background(), d.hostChain, epoch); activateErr != nil {
-					_, _ = m.revokeAgreementLocked(d.hostChain)
+					_, _ = m.revokeAgreementLockedAs(controlActorID, d.hostChain)
 					return "", fmt.Errorf("sync controller activation failed; agreement rolled back: %w", activateErr)
 				}
 			}
 			if initErr := m.initializePeerRBACPolicy(context.Background(), d.hostChain); initErr != nil {
-				_, _ = m.revokeAgreementLocked(d.hostChain)
+				_, _ = m.revokeAgreementLockedAs(controlActorID, d.hostChain)
 				return "", fmt.Errorf("peer RBAC initialization failed; agreement rolled back: %w", initErr)
 			}
 			generation.Activate()
@@ -1630,14 +1661,22 @@ func (m *Manager) requireGuestDraftAgreementCurrent(d *guestDraft, epoch string)
 	return nil
 }
 
-// broadcastCrossFedSet builds, agent-proofs (with the node operator key), and
-// broadcasts a tx-33 CrossFedSet. Mirrors the REST tx-builder but node-
-// originated - used for both operators' ceremony activations. Determinism/authz
-// are re-checked on-chain (crossFedAuthorized).
+// broadcastCrossFedSet builds, agent-proofs, and broadcasts a tx-33
+// CrossFedSet. Before app-v23 it retains the historical node-operator signer;
+// after app-v23 it preserves the exact Root/Admin control actor and
+// countersigns Admin actions with current Root. The JOIN-frozen transport
+// credential remains unchanged.
 func (m *Manager) broadcastCrossFedSet(terms *tx.CrossFedTerms) (string, error) {
+	return m.broadcastCrossFedSetAs("", terms)
+}
+
+func (m *Manager) broadcastCrossFedSetAs(
+	controlActorID string,
+	terms *tx.CrossFedTerms,
+) (string, error) {
 	agreementUnlock := m.LockAgreementMutation()
 	defer agreementUnlock()
-	return m.broadcastCrossFedSetAgreementLocked(terms)
+	return m.broadcastCrossFedSetAgreementLockedAs(controlActorID, terms)
 }
 
 // broadcastCrossFedSetAgreementLocked commits tx-33 while the caller already
@@ -1645,7 +1684,10 @@ func (m *Manager) broadcastCrossFedSet(terms *tx.CrossFedTerms) (string, error) 
 // change; JOIN callers retain the outer agreement lease while they subsequently
 // commit CA/seed/control artifacts whose authoritative SQLite mutations take
 // policy W internally. Lock order is always agreement mutation -> policy.
-func (m *Manager) broadcastCrossFedSetAgreementLocked(terms *tx.CrossFedTerms) (string, error) {
+func (m *Manager) broadcastCrossFedSetAgreementLockedAs(
+	controlActorID string,
+	terms *tx.CrossFedTerms,
+) (string, error) {
 	// A tx-33 upsert can replace a live legacy agreement, including narrowing
 	// its domains or clearance. Serialize that committed mutation with peer
 	// handlers' read leases so no caller can observe the mutation returning
@@ -1654,33 +1696,46 @@ func (m *Manager) broadcastCrossFedSetAgreementLocked(terms *tx.CrossFedTerms) (
 		policyUnlock := ss.LockSyncPolicyWrite()
 		defer policyUnlock()
 	}
-	return m.broadcastCrossFedSetLocked(terms)
+	return m.broadcastCrossFedSetLockedAs(controlActorID, terms)
 }
 
 // broadcastCrossFedSetLocked is the tx-33 encoder/broadcaster. The caller must
 // hold agreementMutationMu and, when SQLite sync policy is available, its
 // write lease. This lower-level form prevents UpdateAgreementSharing from
 // recursively taking the non-reentrant policy gate after reading current terms.
-func (m *Manager) broadcastCrossFedSetLocked(terms *tx.CrossFedTerms) (string, error) {
+func (m *Manager) broadcastCrossFedSetLockedAs(
+	controlActorID string,
+	terms *tx.CrossFedTerms,
+) (string, error) {
+	signingKey, signingPub, effectiveActorID, root, rootKey, err :=
+		m.localConsensusControlSigner(controlActorID)
+	if err != nil {
+		return "", fmt.Errorf("resolve cross_fed set authority: %w", err)
+	}
 	body := []byte("cross_fed:" + terms.RemoteChainID)
 	bodyHash := sha256.Sum256(body)
 	ts := time.Now().Unix()
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts)) // #nosec G115 -- ts non-negative
-	agentSig := ed25519.Sign(m.agentKey, append(append([]byte{}, bodyHash[:]...), tsBytes...))
+	agentSig := ed25519.Sign(signingKey, append(append([]byte{}, bodyHash[:]...), tsBytes...))
 
 	ptx := &tx.ParsedTx{
 		Type:           tx.TxTypeCrossFedSet,
-		Nonce:          tx.MonotonicNonce(m.agentKey),
+		Nonce:          tx.MonotonicNonce(signingKey),
 		Timestamp:      time.Unix(ts, 0),
 		CrossFedTerms:  terms,
-		AgentPubKey:    m.agentPub,
+		AgentPubKey:    signingPub,
 		AgentSig:       agentSig,
 		AgentBodyHash:  bodyHash[:],
 		AgentTimestamp: ts,
 	}
-	if err := tx.SignTx(ptx, m.agentKey); err != nil {
-		return "", fmt.Errorf("sign cross_fed set tx: %w", err)
+	if elevationErr := m.attachConsensusControlElevation(
+		ptx, effectiveActorID, root, rootKey,
+	); elevationErr != nil {
+		return "", fmt.Errorf("attach cross_fed set elevation: %w", elevationErr)
+	}
+	if signErr := tx.SignTx(ptx, signingKey); signErr != nil {
+		return "", fmt.Errorf("sign cross_fed set tx: %w", signErr)
 	}
 	encoded, err := tx.EncodeTx(ptx)
 	if err != nil {
@@ -1696,7 +1751,11 @@ func (m *Manager) broadcastCrossFedSetLocked(terms *tx.CrossFedTerms) (string, e
 // nothing on disk (consensus cannot touch node-local files); the purge is the
 // off-consensus half.
 func (m *Manager) RevokeAgreement(remoteChainID string) (string, error) {
-	result, err := m.RevokeAgreementNotifying(remoteChainID)
+	return m.RevokeAgreementAs("", remoteChainID)
+}
+
+func (m *Manager) RevokeAgreementAs(controlActorID, remoteChainID string) (string, error) {
+	result, err := m.RevokeAgreementNotifyingAs(controlActorID, remoteChainID)
 	if result == nil {
 		return "", err
 	}
@@ -1706,12 +1765,18 @@ func (m *Manager) RevokeAgreement(remoteChainID string) (string, error) {
 // revokeAgreementLocked commits tx-34 and purges all matching node-local
 // capabilities while the caller owns agreementMutationMu. JOIN rollback uses
 // this form to avoid recursively acquiring the non-reentrant agreement lease.
-func (m *Manager) revokeAgreementLocked(remoteChainID string) (string, error) {
-	return m.revokeAgreementLockedReason(remoteChainID, "operator disconnect")
+func (m *Manager) revokeAgreementLockedAs(controlActorID, remoteChainID string) (string, error) {
+	return m.revokeAgreementLockedReasonAs(controlActorID, remoteChainID, "operator disconnect")
 }
 
 func (m *Manager) revokeAgreementLockedReason(remoteChainID, reason string) (string, error) {
-	hash, err := m.broadcastRevokeAgreementLockedReason(remoteChainID, reason)
+	return m.revokeAgreementLockedReasonAs("", remoteChainID, reason)
+}
+
+func (m *Manager) revokeAgreementLockedReasonAs(
+	controlActorID, remoteChainID, reason string,
+) (string, error) {
+	hash, err := m.broadcastRevokeAgreementLockedReasonAs(controlActorID, remoteChainID, reason)
 	if err != nil {
 		return "", err
 	}
@@ -1726,31 +1791,47 @@ func (m *Manager) revokeAgreementLockedReason(remoteChainID, reason string) (str
 // has succeeded, then purges in a defer. ActiveAgreement already denies the
 // revoked edge during the window, so retained files cannot authorize requests.
 func (m *Manager) broadcastRevokeAgreementLockedReason(remoteChainID, reason string) (string, error) {
+	return m.broadcastRevokeAgreementLockedReasonAs("", remoteChainID, reason)
+}
+
+func (m *Manager) broadcastRevokeAgreementLockedReasonAs(
+	controlActorID, remoteChainID, reason string,
+) (string, error) {
 	if err := ValidateChainID(remoteChainID); err != nil {
 		return "", err
+	}
+	signingKey, signingPub, effectiveActorID, root, rootKey, err :=
+		m.localConsensusControlSigner(controlActorID)
+	if err != nil {
+		return "", fmt.Errorf("resolve cross_fed revoke authority: %w", err)
 	}
 	body := []byte("cross_fed_revoke:" + remoteChainID)
 	bodyHash := sha256.Sum256(body)
 	ts := time.Now().Unix()
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts)) // #nosec G115 -- ts non-negative
-	agentSig := ed25519.Sign(m.agentKey, append(append([]byte{}, bodyHash[:]...), tsBytes...))
+	agentSig := ed25519.Sign(signingKey, append(append([]byte{}, bodyHash[:]...), tsBytes...))
 
 	ptx := &tx.ParsedTx{
 		Type:      tx.TxTypeCrossFedRevoke,
-		Nonce:     tx.MonotonicNonce(m.agentKey),
+		Nonce:     tx.MonotonicNonce(signingKey),
 		Timestamp: time.Unix(ts, 0),
 		CrossFedRevoke: &tx.CrossFedRevoke{
 			RemoteChainID: remoteChainID,
 			Reason:        reason,
 		},
-		AgentPubKey:    m.agentPub,
+		AgentPubKey:    signingPub,
 		AgentSig:       agentSig,
 		AgentBodyHash:  bodyHash[:],
 		AgentTimestamp: ts,
 	}
-	if err := tx.SignTx(ptx, m.agentKey); err != nil {
-		return "", fmt.Errorf("sign cross_fed revoke tx: %w", err)
+	if elevationErr := m.attachConsensusControlElevation(
+		ptx, effectiveActorID, root, rootKey,
+	); elevationErr != nil {
+		return "", fmt.Errorf("attach cross_fed revoke elevation: %w", elevationErr)
+	}
+	if signErr := tx.SignTx(ptx, signingKey); signErr != nil {
+		return "", fmt.Errorf("sign cross_fed revoke tx: %w", signErr)
 	}
 	encoded, err := tx.EncodeTx(ptx)
 	if err != nil {

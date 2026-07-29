@@ -8,15 +8,18 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/l33tdawg/sage/internal/auth"
@@ -66,9 +69,102 @@ func runV119StateSyncFixtureCommand(args []string) (bool, error) {
 		}
 		fmt.Println(cfg.Quorum.StateSync.Receiving)
 		return true, nil
+	case "appv23-root-state":
+		state, localAgentID, err := readV119StateSyncAppV23RootState(context.Background())
+		if err != nil {
+			return true, err
+		}
+		fmt.Printf("%s|%s|%d|%s|%s\n",
+			state.PrincipalID,
+			state.CredentialID,
+			state.Generation,
+			state.HistoryDigest,
+			localAgentID,
+		)
+		return true, nil
 	default:
 		return true, fmt.Errorf("unknown fixture subcommand %q", args[1])
 	}
+}
+
+func readV119StateSyncAppV23RootState(parent context.Context) (*store.AppV23RootState, string, error) {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return nil, "", fmt.Errorf("load fixture config: %w", err)
+	}
+	key, err := loadProposeSigningKey(cfg.AgentKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("load fixture local agent key: %w", err)
+	}
+	publicKey, ok := key.Public().(ed25519.PublicKey)
+	if !ok {
+		return nil, "", errors.New("fixture local key does not expose an Ed25519 public key")
+	}
+	localAgentID := auth.PublicKeyToAgentID(publicKey)
+
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+	queryURL := strings.TrimRight(cmtRPCClientURL(), "/") + "/abci_query?path=" +
+		url.QueryEscape(`"/appv23/root"`)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, queryURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("create app-v23 Root query: %w", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, "", fmt.Errorf("query app-v23 Root state: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("query app-v23 Root state: HTTP %d", response.StatusCode)
+	}
+	var envelope struct {
+		Result struct {
+			Response struct {
+				Code  uint32 `json:"code"`
+				Log   string `json:"log"`
+				Value string `json:"value"`
+			} `json:"response"`
+		} `json:"result"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&envelope); err != nil {
+		return nil, "", fmt.Errorf("decode app-v23 Root query response: %w", err)
+	}
+	if envelope.Error != nil {
+		return nil, "", fmt.Errorf("app-v23 Root query error %d: %s",
+			envelope.Error.Code, envelope.Error.Message)
+	}
+	if envelope.Result.Response.Code != 0 {
+		return nil, "", fmt.Errorf("app-v23 Root query rejected: %s",
+			strings.TrimSpace(envelope.Result.Response.Log))
+	}
+	raw, err := base64.StdEncoding.DecodeString(envelope.Result.Response.Value)
+	if err != nil {
+		return nil, "", fmt.Errorf("decode app-v23 Root query value: %w", err)
+	}
+	var state store.AppV23RootState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return nil, "", fmt.Errorf("decode app-v23 Root semantic state: %w", err)
+	}
+	if !v119CanonicalHash(state.PrincipalID) ||
+		!v119CanonicalHash(state.CredentialID) ||
+		state.Generation == 0 ||
+		!v119CanonicalHash(state.HistoryDigest) {
+		return nil, "", errors.New("app-v23 Root query returned non-canonical semantic state")
+	}
+	return &state, localAgentID, nil
+}
+
+func v119CanonicalHash(value string) bool {
+	if value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }
 
 func installV119StateSyncScopedProof(parent context.Context) (string, error) {

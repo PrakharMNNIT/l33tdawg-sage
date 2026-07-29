@@ -52,6 +52,16 @@ func canonicalSharingDomains(raw []string) ([]string, error) {
 // term are copied from the current active agreement; the peer does not need to
 // update its own independent outbound grant or re-pair.
 func (m *Manager) UpdateAgreementSharing(remoteChainID string, domains []string) (*SharingUpdateResult, error) {
+	return m.UpdateAgreementSharingAs("", remoteChainID, domains)
+}
+
+// UpdateAgreementSharingAs preserves the exact local Root/Admin actor for the
+// tx-33 policy replacement. An empty actor retains the current-Root path used
+// by internal callers and pre-v23 compatibility.
+func (m *Manager) UpdateAgreementSharingAs(
+	controlActorID, remoteChainID string,
+	domains []string,
+) (*SharingUpdateResult, error) {
 	canonical, err := canonicalSharingDomains(domains)
 	if err != nil {
 		return nil, err
@@ -85,7 +95,7 @@ func (m *Manager) UpdateAgreementSharing(remoteChainID string, domains []string)
 		ExpiresAt:      agreement.ExpiresAt,
 		Status:         "active",
 	}
-	txHash, err := m.broadcastCrossFedSetLocked(terms)
+	txHash, err := m.broadcastCrossFedSetLockedAs(controlActorID, terms)
 	if err != nil {
 		return nil, fmt.Errorf("update federation sharing: %w", err)
 	}

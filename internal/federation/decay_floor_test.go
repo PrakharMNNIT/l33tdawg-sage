@@ -14,7 +14,7 @@ import (
 func insertRec(t *testing.T, c *testChain, id, domain, content string, conf float64, created time.Time) {
 	t.Helper()
 	h := sha256.Sum256([]byte(content))
-	if err := c.mem.InsertMemory(context.Background(), &memory.MemoryRecord{
+	record := &memory.MemoryRecord{
 		MemoryID:        id,
 		SubmittingAgent: hex.EncodeToString(c.agentPub),
 		Content:         content,
@@ -24,9 +24,11 @@ func insertRec(t *testing.T, c *testChain, id, domain, content string, conf floa
 		ConfidenceScore: conf,
 		Status:          memory.StatusCommitted,
 		CreatedAt:       created,
-	}); err != nil {
+	}
+	if err := c.mem.InsertMemory(context.Background(), record); err != nil {
 		t.Fatalf("insert %s: %v", id, err)
 	}
+	publishFederationTestRecord(t, c.badger, record, 0)
 }
 
 // TestFederatedQuery_DecayFloor pins the serving-side DecayFloor wiring in
@@ -54,16 +56,18 @@ func TestFederatedQuery_DecayFloor(t *testing.T) {
 	listener := startListener(t, b)
 	federate(t, b, a, "https://unused.invalid", []string{"shared"}, 2, 0)
 	federate(t, a, b, listener.URL, []string{"shared"}, 2, 0)
+	enableV23Pair(t, a, b, []string{"shared"})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := a.mgr.QueryPeer(ctx, b.chainID, &QueryRequest{
+	query := planAndSignV23Query(t, a, b, &QueryRequest{
 		Mode:          ModeText,
 		Query:         "bridge",
 		DomainTag:     "shared.notes",
 		TopK:          10,
 		MinConfidence: 0.70,
 	})
+	resp, err := a.mgr.QueryPeer(ctx, b.chainID, query)
 	if err != nil {
 		t.Fatalf("QueryPeer: %v", err)
 	}

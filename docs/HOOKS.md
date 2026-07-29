@@ -45,7 +45,7 @@ Direct-write hooks sign with the **node operator's** Ed25519 key — that's what
 
 As of v7.1 the SAGE REST layer recognises requests signed with the node operator's key and lets them bypass the cross-agent visibility filter on read paths. Concretely: `Server.SetNodeOperatorID` is wired at startup from `~/.sage/agent.key`, and `resolveVisibleAgents` short-circuits to `seeAll=true` when the caller matches. Per-domain access and per-record classification gates still apply, so the bypass doesn't lift hard access controls — it only lifts the agent-isolation filter that was making the SessionStart prefetch empty on multi-agent nodes.
 
-If `~/.sage/agent.key` is missing or unreadable, the bypass stays off and the legacy RBAC behaviour applies. The fallback nudge in `sage-session-start.sh` continues to cover environments where direct read isn't available.
+On a truly uninitialized node, `sage-gui serve` creates `~/.sage/agent.key` once. On an initialized node, a missing or unreadable key is a recovery error: startup refuses to mint a replacement because federation peers may have pinned that exact transport/operator identity. Restore the original key from backup. If it is unrecoverable, create a new node identity and explicitly re-pair every federation peer. A CEREBRUM Root handover does not rotate this transport key. The direct-write hook itself still soft-fails if the key or local REST service is unavailable.
 
 ## Installing in your own project
 

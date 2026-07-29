@@ -1,4 +1,4 @@
-<!-- Core document reconciled through SAGE v11.14.2, including app-v22 agent capabilities, directional cross-chain peer RBAC, and the quorum/state-sync/governance-gateway sections. -->
+<!-- Core document reconciled through SAGE v11.15.0, including app-v23 roles, Access Groups, Root continuity, linked federated readers, and the quorum/state-sync/governance-gateway sections. -->
 
 # RBAC, Organizations, and Federation
 
@@ -15,7 +15,13 @@ SAGE's access control is a layered system. From outermost to innermost, a query 
 4. **Multi-org domain gate** — `HasAccessMultiOrg`: org membership, same-org clearance, or federation agreement
 5. **Per-record classification gate** — `if memClass > 0`: each result is individually checked against the querier's org-level clearance
 
-All RBAC state is on-chain. Organizations, departments, clearance levels, access grants, and federation agreements are committed through BFT consensus and stored in BadgerDB, with PostgreSQL as the off-chain mirror. BadgerDB is the authoritative source for access control decisions; SQLite is used only as a fallback for data not yet broadcast on-chain.
+Consensus RBAC state includes organizations, departments, clearance levels,
+access grants, app-v23 roles, local enrollment, and local Access Groups.
+Federated linked-reader relations are deliberately node-local, but are bound to
+the exact consensus group and active federation generation. BadgerDB is the
+authoritative source for consensus access-control decisions; SQLite/PostgreSQL
+are rebuildable serving projections and also hold the explicitly node-local
+federation relation state.
 
 ---
 
@@ -121,9 +127,9 @@ The REST handler uses `broadcast_tx_commit`, so a `FinalizeBlock` rejection is s
 
 `POST /v1/access/revoke` → `TxTypeAccessRevoke` → `badgerStore.RevokeGrant`. Sets `RevokedAt` in PostgreSQL.
 
-### App-v22 Agent Capabilities
+### App-v22 Agent Capabilities (historical predecessor and migration input)
 
-App-v22 adds a consensus-stored `uint32` capability/restriction mask to each
+App-v22 added a consensus-stored `uint32` capability/restriction mask to each
 registered agent. Zero is the byte-compatible legacy behavior. Only a global
 `role=admin` may change any persisted permission field (`clearance`,
 `domain_access`, `visible_agents`, `org_id`, `dept_id`, or `capabilities`).
@@ -182,6 +188,100 @@ clearance or a sharing agreement through the org API
 (`internal/abci/app.go`; `api/rest/memory_handler.go`;
 `api/rest/org_handler.go`; `api/rest/pipe_handler.go`).
 
+### App-v23 Roles, Access Groups, and CEREBRUM Root
+
+App-v23 makes the current policy model explicit:
+
+| Element | Meaning |
+|---|---|
+| `member` | Reads domains owned by other active local members of any shared Access Group; writes only owned domains or compatible explicit grants. |
+| `manager` | Member rights plus Write and Modify over domains owned by active local members of a shared Access Group. |
+| `admin` | Sudo-equivalent authority over normal local data, policy, governance, federation, and CEREBRUM operations. Root identity and recovery remain non-delegable. |
+| Access Group | Scope over active local members and their current owned domain trees. It never changes domain ownership or memory authorship. |
+| Clearance | Maximum record classification the principal may read. |
+| Security profile | Hard restrictions that intersect and override role, group scope, and grants. |
+
+Role transitions and onboarding are consensus operations, not independent
+edits to legacy permission fields. Approval atomically binds local enrollment,
+role, profile, clearance, and an owned non-shared home domain. A generic
+self-registration remains a restricted pending Member and cannot manufacture
+Manager/Admin authority or claim a domain. The first-party vendored Mynah
+bootstrap is separately Root-bound and must commit its reviewed Companion
+profile and home domain before `/ready` succeeds
+(`internal/abci/appv23_genesis.go`; `internal/abci/appv23_local_rbac.go`;
+`internal/store/appv23_local_rbac.go`).
+
+CEREBRUM Root is one immutable authority principal with a rotatable current
+credential. It is not an agent role and is excluded from ordinary agent lookup,
+groups, messaging, lifecycle, organization/department, task, pipeline,
+reassignment, pairing, claim, OAuth, and MCP-token surfaces. Handover preserves
+Root-owned domains, groups, grants, and readable history without rewriting
+earlier blocks. Historical memories retain their exact credential author;
+memories written after handover record the replacement credential. Every
+credential generation that has represented Root remains permanently ineligible
+for ordinary registration or later reuse as Root
+(`internal/store/appv23_local_rbac.go`; `internal/abci/app.go`;
+[`app-v23-access-control-design.md`](../app-v23-access-control-design.md)).
+
+An Access Group's local-member compartment is disjoint from its federated
+linked-reader compartment. Local rights are derived dynamically from current
+ownership rather than expanded into pairwise grants. Multiple groups form a
+union, while removal or ownership transfer changes derived scope immediately
+in consensus order. A remote `agent@chain` relation supplies only exact live
+Read bounded by group, domain ownership, agreement generation, host-selected
+classification ceiling, and the original remote agent's nested signature.
+It never supplies Copy, Write, Modify, claim, ownership, grants, roles,
+governance, or transitive access (`internal/federation/query_v23.go`;
+`internal/federation/v23_guest.go`; `internal/store/federated_group_guests.go`).
+
+That read relation does not open messaging. Linked-reader pipeline transport
+uses a separate `linked-v23` authorization mode and receiver-local,
+default-off consent for one exact
+`remote_chain_id + remote_agent_id -> local_agent_id` tuple. The local target
+must be an active ordinary member of a currently linked group; the reverse
+direction requires separate consent on the remote receiver's node. Consent is
+CAS-revisioned and bound to the live JOIN/operator/CA/policy generation.
+Directory/contact discovery grants nothing, and group change, pause, revoke,
+re-pair, Root identity, or hard federated-pipe restriction fails closed
+(`internal/federation/v23_linked_messaging.go`;
+`internal/store/federated_linked_message_consent.go`).
+
+Capability bit names remain visible only as read-only compatibility diagnostics
+behind named profiles. For current policy evaluation, hard restrictions are
+checked first, then principal kind and enrollment, role verbs, group/resource
+scope, clearance, explicit grants, and the active federation generation. See
+[`../app-v23-access-control-design.md`](../app-v23-access-control-design.md).
+
+App-v23 migration preserves exact app-v22 masks instead of forcing every old
+agent into a fresh preset. Legacy Member masks `0`/`16` become Standard and
+`15`/`31` become Companion; all other known masks use the migration-only
+`legacy_restricted` review profile. It cannot be selected for a new or edited
+agent. The earliest historical Admin becomes Root; every other historical
+Admin becomes an active `legacy_restricted` Member with exact mask and
+`legacy_admin_review` audit disposition until a localhost Root-attested
+promotion. This avoids treating possession of an old exportable Admin key as
+proof that the key is still on the node.
+
+Migration never works around a hard deny. Existing non-shared ownership and
+explicit grants remain intact. A domainless agent with `DenyDomainClaim`
+remains domainless, while one without the bit receives a deterministic home it
+could already have claimed. Bare mask `30` with neither ownership nor an
+explicit level-1-or-higher grant is inactive pending review; the same exact mask
+with an explicit grant stays active and domainless so its reviewed read remains
+usable. ReadAll remains classification-bounded, DenyForeignDomainWrite still
+overrides level-2 grants, and DenyFederatedPipe still removes recipient/contact
+eligibility.
+
+There is one narrow liveness grandfather: an unchanged active migrated Member
+whose canonical disposition is `member`, `legacy_restricted`, or
+`legacy_admin_review` may continue ordinary shared-domain memory submission
+when bit `2` is absent. It is strictly `Write`, never level-3 `Modify`; it
+requires the initial role and enrollment revisions and an exact match to the
+immutable migration baseline. Any explicit policy review ends it. Fresh
+app-v23 and direct-genesis agents always use normal explicit shared grants
+(`internal/store/appv23_local_rbac.go`;
+`internal/abci/appv23_local_rbac.go`; `api/rest/memory_handler.go`).
+
 ### CEREBRUM Dashboard: Real Grants + Agent-to-Agent Ownership Transfer (v11.3)
 
 Two dashboard surfaces now write to the on-chain RBAC state above instead of merely displaying it. They reuse the existing transaction types; app-v18 fork-extends their optional wire payload and consensus authorization for administrator overrides.
@@ -195,6 +295,15 @@ Two dashboard surfaces now write to the on-chain RBAC state above instead of mer
 ---
 
 ## Query Scoping — Full Access-Check Pipeline
+
+On app-v23, the versioned policy evaluator first resolves the current
+credential/principal kind and applies hard profile restrictions, active local
+enrollment or exact linked-reader binding, role verbs, Access Group/resource
+scope, clearance, explicit grants, and active federation generation. The
+legacy gates below remain the storage/query mechanics and pre-v23 replay model;
+an app-v23 Admin bypass is authority over normal local data, never permission
+to treat Root or a federated linked reader as an ordinary agent
+(`internal/store/appv23_local_rbac.go`; `api/rest/effective_write_denial.go`).
 
 A `POST /v1/memory/query` request passes through these gates in order (`memory_handler.go:517+`):
 
@@ -278,7 +387,7 @@ HasAccessMultiOrg(domain, agentID, memoryClassification, blockTime, postFork):
 return false
 ```
 
-**Current semantics:** On live app-v22 chains, access checks use ancestor-walk
+**Current semantics:** On app-v22 and later chains, access checks use ancestor-walk
 behavior for grants and domain ownership. `AllowedDomains` is authoritative:
 empty denies, `"*"` allows all, and an exact or dotted ancestor covers a
 descendant. Empty or `"*"` `AllowedDepts` is unrestricted; any other list
@@ -398,6 +507,18 @@ tx-33 narrowing additionally takes the policy write side, so once the mutation
 returns no in-flight response can still use the superseded broader agreement
 (`internal/federation/server.go`; `internal/federation/join_routes.go`;
 `api/rest/federation_handler.go`).
+
+App-v23 also separates that control authority from the peer identity frozen by
+JOIN. The stable transport key continues to sign peer requests, attestations,
+origin proofs, and receipts, while Manager-originated tx-33/tx-34 and accepted
+Copy `MemorySubmit` transactions resolve current CEREBRUM Root. Consensus no
+longer permits a Member/Manager to set or replace a peer agreement merely by
+owning every domain named in the old compatibility scope; current Root signs
+directly and a current-generation Admin requires the ordinary one-action Root
+elevation. Missing current Root key fails before broadcast and never falls back
+to a retired transport credential (`internal/abci/app.go`;
+`internal/federation/v23_guest_control.go`;
+`internal/federation/join_routes.go`; `internal/federation/sync_server.go`).
 
 Sync-group sharing is a separate RBAC lane, but it is not a second trust system.
 Every inbound group route first requires the live signer to match the exact
@@ -519,6 +640,21 @@ not satisfy the v7+ requirement. This check is confined to the app-v22
 transition and recovery boundary, so historical pre-v22 replay retains its
 original behavior (`internal/abci/appv22_agent_capabilities.go`,
 `internal/abci/app.go`).
+
+App-v23 keeps that canonical app-v22 record as its immediate predecessor.
+Activation block H still executes with v22 semantics; H+1 is the first v23
+block. Canonical state-sync export/import includes the immutable Root principal,
+current and retired Root credential markers, enrollment and role/profile
+records, Access Groups and indexes, revisions, memory-author principal
+projections, and every new AppHash-covered policy key. Import validates their
+cross-index and bound invariants before the restored node may serve. Existing
+browser-local visual groups are never promoted into ACLs, SQL is never treated
+as consensus input, and pre-v23 replay retains historical AppHashes. Once a v23
+state or transaction exists, recovery is a forward repair or a trusted
+pre-activation snapshot—not an in-band downgrade to v22
+(`internal/abci/scoped_state_sync.go`; `internal/abci/boot_state_sync_runtime.go`;
+`internal/store/appv23_local_rbac.go`;
+[`app-v23-access-control-design.md`](../app-v23-access-control-design.md)).
 
 Operational prerequisite: before app-v20 activation, every operator intended
 to expose a *proposal* gateway must be registered as a global admin. A topology

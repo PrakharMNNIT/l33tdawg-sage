@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/l33tdawg/sage/internal/memory"
+	"github.com/l33tdawg/sage/internal/vault"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -116,21 +118,25 @@ func TestSearchHybrid_VaultActiveDegradesToVectorOnly(t *testing.T) {
 	s := newTestStore(t)
 	seedHybridCorpus(t, s)
 
-	// Simulate vault-active by attaching a non-nil vault marker. We don't need
-	// a working vault — the SearchHybrid guard only checks `s.vault != nil`.
-	// Using a sentinel struct via SetVault would require a real Vault; instead
-	// we test via the public surface: when vault is active, BM25 is skipped
-	// and only the vector branch runs.
-	s.vaultExpected = true // documentation-only flag; doesn't gate behaviour
-	// Force vault to non-nil through the exported API: we can't construct a
-	// vault here without keys, so we test the equivalent behavior by passing
-	// an empty query (which exercises the same "skip BM25" branch).
+	keyFile := filepath.Join(t.TempDir(), "vault.key")
+	require.NoError(t, vault.Init(keyFile, "test-passphrase"))
+	activeVault, err := vault.Open(keyFile, "test-passphrase")
+	require.NoError(t, err)
+	s.SetVault(activeVault)
+
 	results, err := s.SearchHybrid(context.Background(),
-		"", []float32{1.0, 0.0, 0.0}, QueryOptions{TopK: 2})
+		"jwt", []float32{1.0, 0.0, 0.0}, QueryOptions{TopK: 2})
 	require.NoError(t, err)
 	require.NotEmpty(t, results)
 	assert.Equal(t, "auth-cosine-near", results[0].MemoryID,
 		"vector-only branch must return the cosine winner")
+
+	results, err = s.SearchHybrid(context.Background(),
+		"jwt", nil, QueryOptions{TopK: 2})
+	require.Nil(t, results)
+	require.Error(t, err,
+		"vault-active query-only hybrid has no usable leaf and must not claim empty success")
+	require.ErrorContains(t, err, ErrTextSearchVaultEncryptedMsg)
 }
 
 func TestSearchHybrid_RespectsTopK(t *testing.T) {
@@ -141,6 +147,23 @@ func TestSearchHybrid_RespectsTopK(t *testing.T) {
 		"auth", []float32{0.5, 0.5, 0.5}, QueryOptions{TopK: 2})
 	require.NoError(t, err)
 	assert.LessOrEqual(t, len(results), 2, "TopK must cap the merged result count")
+}
+
+func TestSearchHybrid_HugeTopKAndOversampleCannotOverflow(t *testing.T) {
+	s := newTestStore(t)
+	seedHybridCorpus(t, s)
+	maxInt := int(^uint(0) >> 1)
+	t.Setenv("SAGE_HYBRID_OVERSAMPLE", fmt.Sprintf("%d", maxInt))
+
+	results, err := s.SearchHybrid(
+		context.Background(),
+		"auth",
+		[]float32{0.5, 0.5, 0.5},
+		QueryOptions{TopK: maxInt},
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 5,
+		"overflow-safe saturation must retain the bounded corpus instead of wrapping to a tiny leaf limit")
 }
 
 func TestSearchHybrid_DomainFilterAppliesToBothStreams(t *testing.T) {

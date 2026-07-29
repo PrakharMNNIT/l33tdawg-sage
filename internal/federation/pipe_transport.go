@@ -53,6 +53,8 @@ type PipeEvent struct {
 	AgreementID        string                   `json:"agreement_id"`
 	ContactID          string                   `json:"contact_id"`
 	ContactRevision    string                   `json:"contact_revision"`
+	AuthorizationMode  string                   `json:"authorization_mode,omitempty"`
+	LinkedRelation     *LinkedMessageRelation   `json:"linked_relation,omitempty"`
 	Proof              store.PipelineAgentProof `json:"proof"`
 }
 
@@ -170,12 +172,6 @@ func normalizedPipeTTL(minutes int) time.Duration {
 	return time.Duration(minutes) * time.Minute
 }
 
-func signedTargetMatchesContact(req signedPipeSendRequest, event *PipeEvent, contact PipeContact) bool {
-	return req.ToProvider == "" && req.ToAgent == event.TargetAgentID &&
-		req.SourceChainID == event.SourceChainID &&
-		req.DestinationChainID == event.DestinationChainID && contact.AgentID == event.TargetAgentID
-}
-
 func (m *Manager) authorizeInboundPipeContact(ctx context.Context, peer *peerIdentity, event *PipeEvent) (*PipeContact, error) {
 	agreement, err := m.currentRequestAgreementBound(ctx, peer)
 	if err != nil {
@@ -247,15 +243,6 @@ func (m *Manager) WithAuthorizedImportedPipe(ctx context.Context, msg *store.Pip
 	if ss == nil {
 		return ErrFederatedPipeInvalid
 	}
-	unlock := ss.LockSyncPolicyRead()
-	defer unlock()
-	if m.badger == nil {
-		return ErrFederatedPipeInvalid
-	}
-	ownerUnlock := m.badger.LockDomainOwnershipRead()
-	defer ownerUnlock()
-	contactUnlock := ss.LockAgentContactRead()
-	defer contactUnlock()
 	agreement, err := m.ActiveAgreement(msg.SourceChainID)
 	if err != nil {
 		return ErrFederatedPipeInvalid
@@ -267,8 +254,47 @@ func (m *Manager) WithAuthorizedImportedPipe(ctx context.Context, msg *store.Pip
 	peer := &peerIdentity{ChainID: msg.SourceChainID, AgentID: policy.PeerAgentID, Agreement: agreement}
 	event := &PipeEvent{PolicyEpoch: msg.FederationPolicyEpoch, AgreementID: msg.FederationAgreementID,
 		ContactID: msg.FederationContactID, ContactRevision: msg.FederationContactRevision,
-		TargetAgentID: msg.ToAgent}
-	if _, err = m.authorizeInboundPipeContact(ctx, peer, event); err != nil {
+		SourceAgentID: msg.FromAgent, TargetAgentID: msg.ToAgent,
+		AuthorizationMode: msg.FederationAuthorizationMode}
+	if event.AuthorizationMode == LinkedMessageAuthorizationMode {
+		event.LinkedRelation, err = decodeLinkedMessageRelation(msg.FederationLinkedRelation)
+		if err != nil {
+			return ErrFederatedPipeInvalid
+		}
+		// The host freshness callback is deliberately outside all local leases.
+		// Revoke/pause must never wait on a remote node.
+		if err = m.preflightRemoteHostedLinkedRelation(
+			ctx, peer, event, false,
+		); err != nil {
+			return err
+		}
+	}
+	unlock := ss.LockSyncPolicyRead()
+	defer unlock()
+	if m.badger == nil {
+		return ErrFederatedPipeInvalid
+	}
+	ownerUnlock := m.badger.LockDomainOwnershipRead()
+	defer ownerUnlock()
+	contactUnlock := ss.LockAgentContactRead()
+	defer contactUnlock()
+	currentAgreement, err := m.ActiveAgreement(msg.SourceChainID)
+	if err != nil || !sameAgreementGeneration(agreement, currentAgreement) {
+		return ErrFederatedPipeInvalid
+	}
+	currentPolicy, err := m.getPeerRBACPolicyForAgreement(ctx, currentAgreement)
+	if err != nil || currentPolicy == nil ||
+		currentPolicy.PeerAgentID != policy.PeerAgentID ||
+		currentPolicy.PolicyEpoch != policy.PolicyEpoch ||
+		currentPolicy.Revision != policy.Revision {
+		return ErrFederatedPipeInvalid
+	}
+	peer.Agreement = currentAgreement
+	if event.AuthorizationMode == LinkedMessageAuthorizationMode {
+		if err = m.authorizeInboundLinkedPipe(ctx, peer, event); err != nil {
+			return err
+		}
+	} else if _, err = m.authorizeInboundPipeContact(ctx, peer, event); err != nil {
 		return err
 	}
 	if action != nil {
@@ -278,7 +304,11 @@ func (m *Manager) WithAuthorizedImportedPipe(ctx context.Context, msg *store.Pip
 		// Re-derive while both leases are still held. This catches non-owner
 		// contact inputs (agent availability, agreement and acceptance) changing
 		// through any path that participates in the policy gate.
-		_, err = m.authorizeInboundPipeContact(ctx, peer, event)
+		if event.AuthorizationMode == LinkedMessageAuthorizationMode {
+			err = m.authorizeInboundLinkedPipe(ctx, peer, event)
+		} else {
+			_, err = m.authorizeInboundPipeContact(ctx, peer, event)
+		}
 		return err
 	}
 	return nil
@@ -295,6 +325,82 @@ func newImportedPipeID() (string, error) {
 func pipeEventContentHash(event *PipeEvent) [32]byte {
 	encoded, _ := json.Marshal(event)
 	return sha256.Sum256(encoded)
+}
+
+// prevalidatePipeEventAgentProof rejects unauthenticated or shape-mismatched
+// work before any remote linked-relation callback. The durable admission path
+// repeats these checks after authorization; this early pass exists to prevent
+// an authenticated peer operator from using invalid agent proofs as a callback
+// amplifier against the relation host.
+func prevalidatePipeEventAgentProof(event *PipeEvent) error {
+	if event == nil {
+		return errors.New("pipeline event is nil")
+	}
+	switch event.Kind {
+	case "send":
+		if event.OriginEventID != "" || event.SourcePipeID != "" ||
+			event.Payload == "" || event.Result != "" ||
+			event.TargetAgentID == "" {
+			return errors.New("send event shape is invalid")
+		}
+		method, path, body, err := verifyPipelineAgentProof(event.Proof)
+		if err != nil || method != http.MethodPost || path != "/v1/pipe/send" {
+			return fmt.Errorf(
+				"send proof does not authorize the pipe endpoint: %w", err,
+			)
+		}
+		var signed signedPipeSendRequest
+		if err := decodeStrictPipeJSON(body, &signed); err != nil {
+			return fmt.Errorf("decode signed pipe send: %w", err)
+		}
+		if signed.ToProvider != "" ||
+			signed.ToAgent != event.TargetAgentID ||
+			signed.SourceChainID != event.SourceChainID ||
+			signed.DestinationChainID != event.DestinationChainID ||
+			signed.Payload != event.Payload || signed.Intent != event.Intent {
+			return errors.New("signed send request does not match the pipeline event")
+		}
+		created := time.Unix(event.Proof.Timestamp, 0).UTC()
+		expires := created.Add(normalizedPipeTTL(signed.TTLMinutes))
+		now := time.Now().UTC()
+		if !event.CreatedAt.Equal(created) || !event.ExpiresAt.Equal(expires) ||
+			now.After(expires) || created.After(now.Add(maxTimestampSkew)) {
+			return errors.New("signed pipeline lifetime is invalid or expired")
+		}
+	case "result":
+		if event.OriginEventID == "" || event.SourcePipeID == "" ||
+			event.Result == "" || event.Payload != "" || event.Intent != "" ||
+			len(event.SourcePipeID) > 200 ||
+			strings.ContainsAny(event.SourcePipeID, "/?#") {
+			return errors.New("result event shape is invalid")
+		}
+		method, path, body, err := verifyPipelineAgentProof(event.Proof)
+		if err != nil || method != http.MethodPut ||
+			path != "/v1/pipe/"+event.SourcePipeID+"/result" {
+			return fmt.Errorf(
+				"result proof does not authorize the pipe endpoint: %w", err,
+			)
+		}
+		var signed signedPipeResultRequest
+		if err := decodeStrictPipeJSON(body, &signed); err != nil {
+			return fmt.Errorf("decode signed pipe result: %w", err)
+		}
+		if signed.Result != event.Result ||
+			signed.SourcePipeID != event.OriginEventID ||
+			signed.SourceChainID != event.SourceChainID {
+			return errors.New("signed result request does not match the pipeline event")
+		}
+		created := time.Unix(event.Proof.Timestamp, 0).UTC()
+		expires := created.Add(pipeEventResultLifetime)
+		now := time.Now().UTC()
+		if !event.CreatedAt.Equal(created) || !event.ExpiresAt.Equal(expires) ||
+			now.After(expires) || created.After(now.Add(maxTimestampSkew)) {
+			return errors.New("signed pipeline result lifetime is invalid or expired")
+		}
+	default:
+		return fmt.Errorf("unsupported pipeline event kind %q", event.Kind)
+	}
+	return nil
 }
 
 func (m *Manager) handlePipeEvent(w http.ResponseWriter, r *http.Request) {
@@ -323,6 +429,22 @@ func (m *Manager) handlePipeEvent(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "pipeline event binding is incomplete")
 		return
 	}
+	switch event.AuthorizationMode {
+	case "":
+		if event.LinkedRelation != nil {
+			httpError(w, http.StatusBadRequest, "pipeline authorization binding is invalid")
+			return
+		}
+	case LinkedMessageAuthorizationMode:
+		if event.LinkedRelation == nil ||
+			linkedMessageRelationDigest(event.LinkedRelation) == "" {
+			httpError(w, http.StatusBadRequest, "pipeline authorization binding is invalid")
+			return
+		}
+	default:
+		httpError(w, http.StatusBadRequest, "pipeline authorization binding is invalid")
+		return
+	}
 	if event.EventID != PipelineProofEventID(event.SourceChainID, event.Kind, event.Proof) {
 		httpError(w, http.StatusConflict, "pipeline event id does not match the agent proof")
 		return
@@ -331,6 +453,33 @@ func (m *Manager) handlePipeEvent(w http.ResponseWriter, r *http.Request) {
 		len(event.Result) > store.MaxPipeContentBytes {
 		httpError(w, http.StatusRequestEntityTooLarge, "pipeline content is too large")
 		return
+	}
+	if err := prevalidatePipeEventAgentProof(&event); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid pipeline agent proof")
+		return
+	}
+	if event.AuthorizationMode == LinkedMessageAuthorizationMode {
+		switch event.Kind {
+		case "send", "result":
+			releaseRevalidation, acquired :=
+				m.acquireLinkedRevalidation(peer.ChainID)
+			if !acquired {
+				httpError(w, http.StatusTooManyRequests,
+					"linked relation revalidation is busy")
+				return
+			}
+			err := m.preflightRemoteHostedLinkedRelation(
+				r.Context(), peer, &event, event.Kind == "result",
+			)
+			releaseRevalidation()
+			if err != nil {
+				httpError(w, http.StatusConflict, "federated pipeline authorization changed")
+				return
+			}
+		default:
+			httpError(w, http.StatusBadRequest, "invalid federated pipeline event")
+			return
+		}
 	}
 
 	unlock := ss.LockSyncPolicyRead()
@@ -396,7 +545,13 @@ func (m *Manager) admitPipeSend(ctx context.Context, ss *store.SQLiteStore, peer
 		event.TargetAgentID == "" {
 		return "", false, fmt.Errorf("send event shape is invalid")
 	}
-	contact, err := m.authorizeInboundPipeContact(ctx, peer, event)
+	var contact *PipeContact
+	var err error
+	if event.AuthorizationMode == LinkedMessageAuthorizationMode {
+		err = m.authorizeInboundLinkedPipe(ctx, peer, event)
+	} else {
+		contact, err = m.authorizeInboundPipeContact(ctx, peer, event)
+	}
 	if err != nil {
 		return "", false, err
 	}
@@ -408,7 +563,14 @@ func (m *Manager) admitPipeSend(ctx context.Context, ss *store.SQLiteStore, peer
 	if decodeErr := decodeStrictPipeJSON(body, &signed); decodeErr != nil {
 		return "", false, fmt.Errorf("decode signed pipe send: %w", decodeErr)
 	}
-	if signed.Payload != event.Payload || signed.Intent != event.Intent || !signedTargetMatchesContact(signed, event, *contact) {
+	targetMatches := signed.ToProvider == "" &&
+		signed.ToAgent == event.TargetAgentID &&
+		signed.SourceChainID == event.SourceChainID &&
+		signed.DestinationChainID == event.DestinationChainID
+	if contact != nil {
+		targetMatches = targetMatches && contact.AgentID == event.TargetAgentID
+	}
+	if signed.Payload != event.Payload || signed.Intent != event.Intent || !targetMatches {
 		return "", false, fmt.Errorf("signed send request does not match the pipeline event")
 	}
 	created := time.Unix(event.Proof.Timestamp, 0).UTC()
@@ -427,13 +589,22 @@ func (m *Manager) admitPipeSend(ctx context.Context, ss *store.SQLiteStore, peer
 		SourceChainID: event.SourceChainID, SourcePipeID: event.EventID,
 		FederationPolicyEpoch: event.PolicyEpoch, FederationAgreementID: event.AgreementID,
 		FederationContactID: event.ContactID, FederationContactRevision: event.ContactRevision,
+		FederationAuthorizationMode: event.AuthorizationMode,
+	}
+	if event.LinkedRelation != nil {
+		msg.FederationLinkedRelation, err = json.Marshal(event.LinkedRelation)
+		if err != nil {
+			return "", false, ErrFederatedPipeInvalid
+		}
 	}
 	proofHash := PipelineProofHash(event.SourceChainID, event.Kind, event.Proof)
 	contentHash := pipeEventContentHash(event)
 	dedup := &store.PipelineTransportDedup{
 		RemoteChainID: event.SourceChainID, PolicyEpoch: event.PolicyEpoch, AgreementID: event.AgreementID,
 		ContactID: event.ContactID, ContactRevision: event.ContactRevision,
-		SourceAgentID: event.SourceAgentID, TargetAgentID: event.TargetAgentID,
+		AuthorizationMode:    event.AuthorizationMode,
+		LinkedRelationDigest: linkedMessageRelationDigest(event.LinkedRelation),
+		SourceAgentID:        event.SourceAgentID, TargetAgentID: event.TargetAgentID,
 		EventKind: event.Kind, RemotePipeID: event.EventID, ContentHash: contentHash[:], ProofHash: proofHash[:],
 		LocalPipeID: localID, Outcome: "accepted", ExpiresAt: expires.Add(maxTimestampSkew),
 	}
@@ -446,6 +617,11 @@ func (m *Manager) applyPipeResult(ctx context.Context, ss *store.SQLiteStore, pe
 	}
 	if len(event.SourcePipeID) > 200 || strings.ContainsAny(event.SourcePipeID, "/?#") {
 		return "", false, fmt.Errorf("result source pipe id is invalid")
+	}
+	if event.AuthorizationMode == LinkedMessageAuthorizationMode {
+		if err := m.authorizeInboundLinkedResult(ctx, peer, event); err != nil {
+			return "", false, err
+		}
 	}
 	method, path, body, err := verifyPipelineAgentProof(event.Proof)
 	if err != nil || method != http.MethodPut || path != "/v1/pipe/"+event.SourcePipeID+"/result" {
@@ -472,7 +648,9 @@ func (m *Manager) applyPipeResult(ctx context.Context, ss *store.SQLiteStore, pe
 	if sendEvent.EventKind != "send" || sendEvent.RemoteChainID != peer.ChainID ||
 		sendEvent.TargetAgentID != event.SourceAgentID || sendEvent.SourceAgentID != event.TargetAgentID ||
 		sendEvent.PolicyEpoch != event.PolicyEpoch || sendEvent.AgreementID != event.AgreementID ||
-		sendEvent.ContactID != event.ContactID || sendEvent.ContactRevision != event.ContactRevision {
+		sendEvent.ContactID != event.ContactID || sendEvent.ContactRevision != event.ContactRevision ||
+		sendEvent.AuthorizationMode != event.AuthorizationMode ||
+		!bytes.Equal(sendEvent.LinkedRelation, mustMarshalLinkedMessageRelation(event.LinkedRelation)) {
 		return "", false, ErrFederatedPipeInvalid
 	}
 	msg, err := ss.GetPipeline(ctx, sendEvent.PipeID)
@@ -484,7 +662,9 @@ func (m *Manager) applyPipeResult(ctx context.Context, ss *store.SQLiteStore, pe
 	dedup := &store.PipelineTransportDedup{
 		RemoteChainID: event.SourceChainID, PolicyEpoch: event.PolicyEpoch, AgreementID: event.AgreementID,
 		ContactID: event.ContactID, ContactRevision: event.ContactRevision,
-		SourceAgentID: event.SourceAgentID, TargetAgentID: event.TargetAgentID,
+		AuthorizationMode:    event.AuthorizationMode,
+		LinkedRelationDigest: linkedMessageRelationDigest(event.LinkedRelation),
+		SourceAgentID:        event.SourceAgentID, TargetAgentID: event.TargetAgentID,
 		EventKind: event.Kind, RemotePipeID: event.EventID, ContentHash: contentHash[:], ProofHash: proofHash[:],
 		LocalPipeID: sendEvent.PipeID, Outcome: "completed", ExpiresAt: expires.Add(maxTimestampSkew),
 	}

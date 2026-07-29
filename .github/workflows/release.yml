@@ -422,7 +422,7 @@ jobs:
           (needs.release-metadata.outputs.native_shell_required != 'true' ||
            needs.native-shell-release-evidence.result == 'success') }}
     steps:
-      # The native shell is ALPHA through the v11.11-v11.14 bridge. It is built
+      # The native shell is ALPHA through the v11.11-v11.15 bridge. It is built
       # and tested in CI, and is deliberately never staged as a public release
       # asset: stage-github-release downloads only `release-assets-*`, and
       # release-workflow.test.mjs asserts native evidence is excluded from it.

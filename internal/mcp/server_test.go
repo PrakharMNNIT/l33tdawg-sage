@@ -125,10 +125,14 @@ func TestHandleToolsList(t *testing.T) {
 	// Collect tool names
 	names := make(map[string]bool)
 	var findAgent map[string]any
+	var sageTask map[string]any
 	for _, tool := range tools {
 		names[tool["name"].(string)] = true
 		if tool["name"] == "sage_find_agent" {
 			findAgent = tool
+		}
+		if tool["name"] == "sage_task" {
+			sageTask = tool
 		}
 	}
 	assert.True(t, names["sage_remember"])
@@ -159,6 +163,16 @@ func TestHandleToolsList(t *testing.T) {
 	assert.Contains(t, nameSchema["description"], "provider substring")
 	assert.Contains(t, nameSchema["description"], "non-ASCII code points require registered casing")
 	assert.Contains(t, nameSchema["description"], "exact field matches rank first")
+
+	require.NotNil(t, sageTask)
+	assert.Contains(t, sageTask["description"], "permanently idempotent")
+	assert.Contains(t, sageTask["description"], "including done or dropped")
+	assert.Contains(t, sageTask["description"], "new explicit idempotency_key")
+	taskSchema := sageTask["inputSchema"].(map[string]any)
+	taskProperties := taskSchema["properties"].(map[string]any)
+	idempotencySchema := taskProperties["idempotency_key"].(map[string]any)
+	assert.Contains(t, idempotencySchema["description"], "permanent creation identity")
+	assert.Contains(t, idempotencySchema["description"], "every later identical call returns that existing task")
 }
 
 func TestHandleToolsCall_UnknownTool(t *testing.T) {

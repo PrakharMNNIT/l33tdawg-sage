@@ -56,7 +56,7 @@ embedding:
   base_url: http://localhost:11434
   model: nomic-embed-text
   dimension: 768
-rest_addr: ":8080"
+rest_addr: "127.0.0.1:8080"
 ```
 
 Or for zero-setup (no Ollama needed):
@@ -66,7 +66,7 @@ Or for zero-setup (no Ollama needed):
 embedding:
   provider: hash
   dimension: 768
-rest_addr: ":8080"
+rest_addr: "127.0.0.1:8080"
 ```
 
 ---
@@ -406,12 +406,17 @@ All data lives in `~/.sage/`:
 ```
 ~/.sage/
 ├── config.yaml          # Your configuration
-├── agent.key            # Ed25519 identity key (auto-generated)
+├── agent.key            # Stable node federation transport key
 └── data/
     ├── sage.db           # SQLite database (all memories)
     ├── badger/           # On-chain state (hashes, consensus)
     └── cometbft/         # CometBFT node data
 ```
+
+`agent.key` is generated once on a genuinely fresh node. Federation peers pin
+its public identity during JOIN, so app-v23 Root handover does not replace it.
+Back it up with the data directory: an initialized node refuses to silently
+generate a different key if this file is missing or corrupt.
 
 ### Backup
 
@@ -479,7 +484,7 @@ See the main [README](../README.md) for the full multi-node deployment guide.
 **sage-gui serve fails with "address already in use"**
 Another process is using port 8080. Either stop it or change the port in `~/.sage/config.yaml`:
 ```yaml
-rest_addr: ":8081"
+rest_addr: "127.0.0.1:8081"
 ```
 
 **Claude Desktop doesn't show SAGE tools**

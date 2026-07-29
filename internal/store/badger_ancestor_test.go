@@ -176,7 +176,11 @@ func TestHasAccessOrAncestor_SharedDomainBarrier(t *testing.T) {
 	bs := newTestBadger(t)
 	require.NoError(t, bs.SetAccessGrant("general", ancAgent, 2, 0, ancGranter))
 
-	ok, err := bs.HasAccessOrAncestor("pipeline.general", ancAgent, 1, ancNow(t))
+	ok, err := bs.HasAccessOrAncestor("general", ancAgent, 1, ancNow(t))
+	require.NoError(t, err)
+	assert.False(t, ok, "legacy shared-domain barrier also excludes the exact domain")
+
+	ok, err = bs.HasAccessOrAncestor("pipeline.general", ancAgent, 1, ancNow(t))
 	require.NoError(t, err)
 	assert.False(t, ok, "shared domain 'general' must not cascade as an ancestor")
 

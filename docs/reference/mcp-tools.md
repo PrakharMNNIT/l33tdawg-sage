@@ -1,10 +1,16 @@
-Reconciled against internal/mcp for SAGE v11.14.2.
+Reconciled against internal/mcp for SAGE v11.15.0.
 
 # SAGE MCP Tools Reference
 
 SAGE exposes 27 MCP tools over JSON-RPC 2.0. Stdio tools sign REST calls with
 the local Ed25519 identity; SSE and Streamable-HTTP use the MCP bearer-token/OAuth
-flow. Only consensus-committed memories are returned to callers.
+flow. Under app-v23 each HTTP bearer unlocks and signs with its own distinct
+restricted Member identity pending CEREBRUM review; it never inherits the
+approving Root/Admin key. New app-v23 identities use a transition-stable
+bearer-derived AEAD envelope whose SQLite digest alone cannot decrypt the
+signer, regardless of optional ledger state. Older vault-sealed keyed rows
+rewrap on their next successful unlocked authentication. Only
+consensus-committed memories are returned to callers.
 
 ---
 
@@ -63,9 +69,9 @@ before any other action in every new conversation.
 
 **Returns:**
 - First call (fresh brain): `status: "inception_complete"`, seeds 5 foundational
-  memories in the `self` and `meta` domains, auto-registers the agent on-chain,
-  returns `message` with full boot instructions and boot safeguard commands to
-  execute immediately.
+  memories. App-v23 agents store them in their approved owned home domain;
+  legacy nodes retain the historical `self`/`meta` domains. It auto-registers
+  the agent on-chain and returns full boot instructions.
 - Subsequent calls (brain has memories): `status: "awakened"`, returns
   `instructions` (adapts to configured memory mode), `stats`, `agent_id`,
   `agent_name`, `registration` status. If vault is locked, returns
@@ -116,7 +122,7 @@ most important operational tool.
 |---------------|--------|----------|-------------|
 | `topic`       | string | yes      | What the current conversation is about. Used for contextual recall inside the exact `domain`. |
 | `observation` | string | no       | What happened this turn — user request and key points of your response. Kept concise. Low-value observations (< 30 chars, noise patterns) are silently skipped. |
-| `domain`      | string | no       | Exact knowledge boundary for both recall and storage. Create dynamically (e.g. `go-debugging`, `user-project-x`). Default: `general`. |
+| `domain`      | string | no       | Exact knowledge boundary for both recall and storage. Omit to use the approved app-v23 owned home domain (legacy nodes use `general`). An explicit value is never remapped. |
 
 **Returns:**
 - `recalled`: array of relevant committed memories from the exact requested
@@ -149,12 +155,38 @@ most important operational tool.
   keyword-only (embedder down or a non-semantic hash node) — same meaning as on
   `sage_recall`.
 - Returns `vault_locked` error if the Synaptic Ledger is locked.
-- On SAGE v11.8.4+, a permanent domain ACL rejection returns `Domain write access denied` with the level-2/CEREBRUM remedy immediately; the MCP client does not re-register, retry the write, or suggest `/mcp`. Generic denials from older servers retain the bounded compatibility recovery path.
+- A typed effective write denial returns its exact stable `reason_code`,
+  `retryable=false`, and operator `remedy` in `store_error`. MCP does not
+  re-register, retry the write, or suggest `/mcp`. The seven codes are
+  `missing_write_grant`, `foreign_write_restricted`,
+  `shared_write_restricted`, `domain_claim_restricted`,
+  `principal_pending_review`, `no_owned_home_domain`, and
+  `manager_scope_denied`; the exact remedy matrix is documented under
+  `POST /v1/memory/submit` in `rest-api.md`. Generic denials from older servers
+  retain the bounded compatibility recovery path. The client accepts only the
+  complete canonical problem type + known code + explicit `retryable:false`
+  contract and derives remedy text locally; unknown codes and server-provided
+  remedy text are not trusted.
 
 **Recall path:** Uses hybrid BM25+vector (RRF) by default; falls back to FTS5
 full-text search if `/v1/memory/hybrid` is unavailable; falls back to semantic
 vector search if the vault-encrypted marker is detected. Controlled by
 `SAGE_RECALL_HYBRID` env var (`tools.go:565-571`).
+
+The MCP tools do not expose the REST `expansions` array. For any direct hybrid
+request that does include expansions, the server accepts at most eight entries
+and shares one 8,192-candidate live-authorization budget across the primary
+query, every variant, and every text/vector store leaf. A governed leaf or
+budget failure cannot become a `200` partial hybrid fusion. If MCP subsequently
+uses its compatibility FTS5 fallback, that separate result is explicitly
+reported as `recall_mode: "keyword_only"` with `semantic_degraded: true` and a
+`degraded_reason`; it is not reported as successful hybrid recall.
+
+Every app-v23 raw-candidate authorization walk is capped at 8,192 records per
+node request. When recall, backlog, list, timeline, or another filtered browse
+cannot produce its answer within that budget, the REST boundary returns `422`
+with advice to narrow domain/provider/tag/status/time filters; MCP surfaces that
+failure rather than returning a misleading partial answer.
 
 **REST:** `POST /v1/memory/query` (semantic), `POST /v1/memory/hybrid` (hybrid),
 `POST /v1/memory/search` (FTS5), `POST /v1/embed`, `POST /v1/memory/submit`,
@@ -180,7 +212,7 @@ went wrong (don'ts) to improve future performance.
 | `task_summary` | string | yes      | Brief description of the task. Stored as `observation` at confidence 0.85. |
 | `dos`          | string | no       | What went right — approaches that worked. Stored as `fact` at confidence 0.90. |
 | `donts`        | string | no       | What went wrong — mistakes, failed approaches, things to avoid. Stored as `observation` at confidence 0.90. |
-| `domain`       | string | no       | Knowledge domain. Default: `general`. |
+| `domain`       | string | no       | Exact knowledge domain. Omit to use the approved app-v23 owned home domain (legacy nodes use `general`). An explicit value is never remapped. |
 
 **Returns:**
 - `status: "reflected"`
@@ -211,7 +243,7 @@ replacement first, old-memory challenge second.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `content` | string | yes | Memory content to store. |
-| `domain` | string | no | Domain tag. Default: `general`; a correction inherits the original domain when omitted. |
+| `domain` | string | no | Exact domain tag. A correction inherits its source domain when omitted; a new write uses the approved app-v23 owned home domain (legacy nodes use `general`). An explicit value is never remapped. |
 | `type` | string | no | `fact`, `observation`, `inference`, or `task`. Default: `observation`; a correction inherits the original type when omitted. |
 | `confidence` | number | no | Score 0–1. Default: 0.80. |
 | `tags` | string[] | no | User-defined labels (e.g. `important`, `project-x`). Git branch is auto-appended. |
@@ -224,7 +256,12 @@ replacement first, old-memory challenge second.
   word overlap with an existing committed memory).
 - `status: "rejected"` with `votes` array if pre-validators reject the content.
 - Returns `vault_locked` error if the Synaptic Ledger is locked.
-- Uses the same v11.8.4 typed domain-write denial as `sage_turn`: permanent ACL denials return the level-2/CEREBRUM remedy immediately, without re-registration, retries, or `/mcp` advice.
+- Uses the same typed effective-denial taxonomy as `sage_turn`: the MCP error
+  preserves the exact `reason_code`, `retryable=false`, and `remedy`, without
+  re-registration, retries, or `/mcp` advice. A non-zero capability mask is not
+  generically rejected; only an effective deny restriction is surfaced. If a
+  stale-session retry returns a canonical denial, MCP returns that denial
+  directly without an ambiguous-delivery warning.
 - With `replaces_memory_id`, preserves the source domain, classification, and
   content-hash lineage. `correction_status` is:
   - `completed` when the replacement committed and the old memory was challenged;
@@ -232,7 +269,17 @@ replacement first, old-memory challenge second.
     old memory explicitly left unchanged; or
   - `replacement_committed_old_retained` when replacement succeeded but the
     challenge failed. This ordering is intentionally fail-safe: interruption
-    can leave both memories live, but cannot leave neither.
+  can leave both memories live, but cannot leave neither.
+
+On an upgraded app-v23 node, MCP may observe a migration-only
+`legacy_restricted` policy through effective denials or CEREBRUM diagnostics,
+but no MCP tool can select that profile. Exact legacy hard-deny bits remain
+authoritative. A bare mask-30 self-registration without ownership or an
+explicit level-1-or-higher grant returns `principal_pending_review`; granting
+level 2 is not a remedy for a hard-denied or pending principal. An unchanged
+active migrated agent without bit `2` retains shared-domain memory submission
+until its first explicit policy review; this does not authorize MCP challenge,
+deprecate, reinstate, or any other level-3 Modify operation.
 
 **REST:** `POST /v1/memory/pre-validate` (optional), `POST /v1/embed`,
 `POST /v1/memory/submit`, and for a correction
@@ -305,6 +352,12 @@ also remains recallable with `disputed: true`, a `[DISPUTED]` content prefix,
 and the shared query-time confidence haircut. The
 `recall_mode`/`semantic_degraded` fields surface silent keyword-only fallback so
 a caller isn't misled into trusting a degraded recall.
+
+The underlying REST hybrid contract caps caller-supplied expansions at eight
+and uses one aggregate 8,192-candidate authorization budget across all variants
+and text/vector leaves. Governed hybrid failures fail closed rather than
+returning partial fused results; any MCP compatibility fallback is labeled as a
+different, degraded recall mode.
 
 **REST:** `POST /v1/memory/hybrid`, `POST /v1/memory/query`, `POST /v1/memory/search`
 
@@ -472,7 +525,7 @@ specific status, or tagged with a label.
 | `tag`    | string | no       | Filter by user-defined tag. |
 | `status` | string | no       | Filter by status: `proposed`, `committed`, `deprecated`. |
 | `limit`  | int    | no       | Max results. Default: 20. |
-| `offset` | int    | no       | Pagination offset. Default: 0. |
+| `offset` | int    | no       | Pagination offset. Default: 0. App-v23 max: 7,900. |
 | `sort`   | string | no       | `newest`, `oldest`, or `confidence`. Default: `newest`. |
 
 **Returns:**
@@ -480,6 +533,11 @@ specific status, or tagged with a label.
 - `total_count`: total matching memories.
 
 **REST:** `GET /v1/memory/list`
+
+App-v23 examines at most 8,192 raw authorization candidates per request. An
+offset above 7,900 or a page that cannot be authorized within that raw budget
+returns `422 Query too broad`; narrow domain/tag/status filters or page
+sequentially.
 
 **When to call:** Auditing memory contents in a domain; checking what was stored
 recently; paginating through all memories for review.
@@ -490,19 +548,26 @@ recently; paginating through all memories for review.
 
 **Purpose:** View memory activity over time, grouped into time buckets.
 
-**Source:** `tools.go:84-96` (definition), `tools.go:735-775` (handler)
+**Source:** `tools.go:139-151` (definition), `tools.go:1926-1966` (handler)
 
 **Parameters:**
 
 | Name     | Type   | Required | Description |
 |----------|--------|----------|-------------|
-| `from`   | string | no       | Start date (ISO 8601, e.g. `2024-01-01`). |
-| `to`     | string | no       | End date (ISO 8601, e.g. `2024-12-31`). |
+| `from`   | string | no       | Start date/time (RFC3339). |
+| `to`     | string | no       | End date/time (RFC3339). |
 | `domain` | string | no       | Filter by domain tag. |
 
 **Returns:**
 - `buckets`: array of `{period, count}` — memory creation counts per time period.
 - `total`: total memory count in range.
+
+Before app-v23 the historical no-domain aggregate is global. App-v23 treats
+aggregate existence/timing as governed metadata and counts only records that
+pass the caller's current live disclosure decision; unavailable authorization
+state fails closed instead of returning global counts. App-v23 accepts at most
+31 days and 8,192 raw candidates per call; narrow the range/domain after a
+`422` response.
 
 **REST:** `GET /v1/memory/timeline`
 
@@ -536,28 +601,39 @@ verifying memories were committed after storing.
 in the persistent backlog. Tasks use `memory_type: task` and do not decay while
 open. Their consensus-backed content is immutable after creation.
 
-**Source:** `tools.go:161-178` (definition), `tools.go:1475-1589` (prefix helper and handler)
+**Source:** `tools.go:206-228` (definition), `tools.go:2517-2805` (prefix helper and handler)
 
 **Parameters:**
 
 | Name        | Type     | Required | Description |
 |-------------|----------|----------|-------------|
 | `content`   | string   | no*      | Task description. Required when creating and rejected when `memory_id` is present. Stored with exactly one `[TASK] ` prefix, including when the input is already marked. |
-| `domain`    | string   | no       | Domain tag. Default: `general`. |
+| `domain`    | string   | no       | Exact domain tag. Omit to use the approved app-v23 owned home domain (legacy nodes use `general`). An explicit value is never remapped. |
 | `memory_id` | string   | no*      | Existing task memory ID. Required when updating. |
 | `status`    | string   | no       | `planned`, `in_progress`, `done`, `dropped`. New tasks default to `planned`. Existing tasks require an explicit mutable status; agents cannot re-plan them. |
 | `link_to`   | string[] | no       | Memory IDs to link this task to via `related` link type. May be used with `memory_id` without changing task status. |
+| `idempotency_key` | string | no | Permanent creation identity. When omitted, SAGE derives a deterministic key from the signed caller, resolved domain, and canonical `[TASK] ` content. Repeating that semantic task returns the original task at its current status, including `done` or `dropped`. Supply a new explicit key only when intentionally creating another task with identical content and domain. |
 
 *Provide either `content` (create) or `memory_id` (update/link), never both.
 An existing task also requires `status`, `link_to`, or both. Providing neither
 returns an error before any API request is sent.
 
 **Returns:**
-- Create: `{memory_id, task_status, domain, assignee, action: "created", linked, message}`.
+- Confirmed create/replay: `{memory_id, task_status, domain, assignee, action, committed, committed_height, tx_hash, idempotency_key, idempotency_key_source, idempotency_contract, idempotent_replay?, deduplicated?, linked, message}`. A fresh task has `action: "created"`. Every replay has `action: "existing"`, `idempotent_replay: true`, and `deduplicated: true`; its message says that no new task was created. A replay still in `planned` may perform a requested `planned`→`in_progress` transition and exact-assignee readback without pretending the task was newly created. `idempotency_key_source` is `derived` or `explicit`, and the corresponding contract is `permanent_semantic` or `permanent_explicit_key`. Fresh success is returned only after the submit commit and an immediate exact-assignee backlog readback.
+- Committed but unconfirmed: `{memory_id, action: "reconcile", status: "committed_unconfirmed", committed: true, committed_height, tx_hash, projection_confirmed: false, retryable: false, idempotency_key, idempotency_key_source, idempotency_contract, message}`. This is a normal tool result because the transaction is already on-chain, but no start transition or link request is attempted. Reconcile that exact `memory_id`; never resubmit it. An unconfirmed replay also preserves the same receipt rather than creating another task.
 - Status update: `{memory_id, status, action: "updated", linked, message}`.
 - Link-only update: `{memory_id, action: "linked", linked, message}`.
+- Pre-app-v23 compatibility create: if and only if the caller omitted
+  `idempotency_key` and the older node returns the typed, non-broadcast
+  `https://sage.dev/errors/app-v23-required` response, MCP retries once without
+  its implicitly derived key. Success reports
+  `idempotency_contract:"legacy_non_idempotent"` and omits
+  `idempotency_key`/`idempotency_key_source`. An explicit caller key remains a
+  hard error and is never stripped or silently downgraded.
 
-**REST:** `POST /v1/memory/submit` (create), `PUT /v1/dashboard/tasks/{id}/status`
+**REST:** `POST /v1/memory/submit` (create), `GET /v1/agent/me` for an
+omitted app-v23 domain, `GET /v1/memory/tasks` for durable readback, and
+`PUT /v1/memory/{id}/task-status`
 (update), `POST /v1/memory/link` (linking)
 
 **When to call:** Tracking planned work, feature ideas, or bug reports that must
@@ -570,6 +646,14 @@ that creating agent ID in the same local off-chain insert as the task record. If
 exact-owner start transition. Human-created/unassigned tasks remain `planned`
 until CEREBRUM assigns them, so every `in_progress` task has an owner.
 
+The derived key is deliberately a permanent semantic identity, not a short
+retry window. For example, after `sage_task({content: "Check HDMI", domain:
+"hardware"})` reaches `done`, the same call returns that completed task rather
+than manufacturing another occurrence. A genuinely recurring occurrence must
+carry a fresh caller-chosen key, such as
+`idempotency_key: "check-hdmi-2026-08-01"`. This preserves lost-response
+recovery while making recurrence an explicit decision.
+
 ---
 
 ### sage_backlog
@@ -578,7 +662,8 @@ until CEREBRUM assigns them, so every `in_progress` task has an owner.
 the signed agent ID. The task author's provider does not confer ownership.
 Unassigned tasks remain visible only to the local CEREBRUM operator for triage.
 
-**Source:** `tools.go:180-190` (definition), `tools.go:1508-1558` (handler)
+**Source:** `tools.go:229-239` (definition), `tools.go:2543-2564`,
+`tools.go:2807-2849` (assigned feed and handler)
 
 **Parameters:**
 
@@ -591,7 +676,15 @@ Unassigned tasks remain visible only to the local CEREBRUM operator for triage.
 - `total_open`: total open task count.
 - `message`: human-readable summary.
 
-**REST:** `GET /v1/dashboard/tasks`
+Assignment does not bypass live authorization. Every returned task must also
+pass the caller's current domain/group/grant scope and classification
+clearance. Current-generation Admins may use this ordinary-agent surface only
+through localhost; Root and historical Root are never assignees. A Manager's
+group Modify authority never permits it to mutate a teammate's task.
+
+**REST:** `GET /v1/memory/tasks`. The local-human
+`GET /v1/dashboard/tasks` CEREBRUM board is intentionally not used by MCP
+agents after app-v23.
 
 **When to call:** Session start to resume work the operator assigned to this
 agent; reviewing that agent's priorities across projects.
@@ -710,6 +803,11 @@ bytes can leave the node
 - If the remote node is offline, use its exact `agent@chain` address. A friendly
   handle deliberately cannot resolve from cached display metadata.
 
+Sender-queryable successful-delivery and receiver claim/read receipts are
+explicitly deferred to v11.16. In v11.15, a local queue status, a clean inbox,
+or the absence of a terminal failure must never be described as proof that the
+recipient received or read the work.
+
 **Note:** A purely local exchange keeps the existing completion summary journal.
 A federated payload/result is vault-backed transient input and is never
 auto-journaled as memory.
@@ -723,14 +821,15 @@ and terminal rows purge after 24h.
 
 **When to call:** Delegating subtasks to specialized agents (e.g. send a research
 question to Perplexity, send a code review to another Claude instance). The
-result arrives via `pipe_results` in the next `sage_turn` response or via
-`sage_inbox`.
+result arrives via `pipe_results` in a later `sage_turn` response. `sage_inbox`
+only claims work addressed to the current agent; a clean inbox therefore says
+nothing about whether a pipe this agent sent has received a result.
 
 ---
 
 ### sage_find_agent
 
-**Purpose:** Find a contactable recipient by a human name before calling
+**Purpose:** Discover an active recipient by a human name before calling
 `sage_pipe`. It searches active local registrations first using a bounded,
 literal substring match over display name, immutable registered name, and
 provider. ASCII matching is case-insensitive; non-ASCII code points require
@@ -738,6 +837,13 @@ their registered casing. Thus `mynah` can resolve
 `MYNAH (SAGE Voice Bridge Agent)`. Only when no local match exists does it
 inspect caller-authorized federated contacts; it is not a global agent
 directory.
+
+This is discovery metadata, not presence or a reachability probe. Zero matches
+does not mean that a previously known recipient is offline or undeliverable.
+In particular, a saved exact local `agent_id` can still be passed directly to
+`sage_pipe`; the send path performs its own current target validation. Do not
+turn an absent directory match into a statement that the agent cannot be
+contacted.
 
 **Source:** `tools.go:77-89` (definition), `tools.go:975-1156`
 (caller-scoped bounded cache and reauthorization), `tools.go:1174-1320`
@@ -756,8 +862,9 @@ is active and has opted in to accept work. New peers perform the name lookup on
 the authenticated remote SAGE instead of copying an unbounded agent roster; a
 v11.13.0 peer safely falls back to its compatible bounded status subset. A
 contact is the effective owner of a shared domain or another active agent that
-currently holds local RBAC level-1 Read access to it; app-v22 `ReadAllDomains`
-also qualifies, while `DenyFederatedPipe` excludes the recipient. A level-2
+currently holds local RBAC level-1 Read access to it. The app-v23 Companion
+profile's derived `ReadAllDomains` compatibility restriction also qualifies,
+while `DenyFederatedPipe` excludes the recipient. A level-2
 write grant therefore also qualifies. No endpoint,
 CA, agreement, contact-ID, or other mutation material is exposed. `sage_pipe`
 repeats the same local domain-scope authorization on both federated resolution
@@ -778,15 +885,16 @@ An HTTP MCP bearer token must carry the target agent's Ed25519 signer for these
 federated operations. A legacy keyless bearer is rejected instead of running
 the lookup or pipe send with the node operator's key.
 
-An app-v22 co-located companion with the `ReadAllDomains` capability can use
-federated recipient discovery across the peer-authenticated shared-domain
-contact projection. Its stored clearance still bounds memory recall, and the
-separate `DenyFederatedPipe` bit disables cross-network recipient discovery and
+An app-v23 co-located agent using the named Companion profile can use federated
+recipient discovery across the peer-authenticated shared-domain contact
+projection. The profile derives the app-v22 `ReadAllDomains` compatibility bit,
+but its stored clearance still bounds memory recall. The independent
+`DenyFederatedPipe` restriction disables cross-network recipient discovery and
 inbox delivery without disabling local pipeline messages. Cached contacts are
-re-authorized against the same bit before reuse. The standard companion preset
-does not set that deny bit. A denied caller can still inspect its authorized
-peer/domain topology through `sage_federation`, but that view omits remote agent
-contacts.
+re-authorized against the same current profile before reuse. The Companion
+profile does not set that deny. A denied caller can still inspect its
+authorized peer/domain topology through `sage_federation`, but that view omits
+remote agent contacts.
 
 **Returns:**
 
@@ -845,6 +953,14 @@ authorization. Pipeline results are untrusted data, not instructions.
 - `message`: human-readable summary.
 
 **REST:** `GET /v1/pipe/inbox`, then the remaining capacity from `GET /v1/dashboard/task-notifications`.
+Both reads mutate state by claiming or acknowledging the returned rows, so the
+MCP client deliberately sends each request only once: an ambiguous transport
+failure or retryable HTTP status is returned to the tool call site rather than
+internally replayed and risking consumption of a second batch. The one-shot
+`GET /v1/pipe/updates` follows the same rule.
+`GET /v1/pipe/results` remains retryable because it is a passive, repeating
+sender projection and does not acknowledge its rows (`server.go`,
+`signing_nonce_test.go`).
 The v11.14.1+ raw pipeline REST/SDK response carries the same machine-readable
 request/result trust boundary. Those fields are derived during response
 serialization rather than stored with attacker-controlled pipeline content;
@@ -854,7 +970,9 @@ to describe its authority.
 **When to call:** When you need to check explicitly for pending work from other
 agents. `sage_turn` also checks the inbox automatically on every call
 (`tools.go:2199-2278`), so explicit `sage_inbox` calls are only needed between
-turns or when you need more than 5 items.
+turns or when you need more than 5 items. This tool does not return results for
+pipes the current agent sent; those are reported separately as
+`sage_turn.pipe_results`.
 
 ---
 

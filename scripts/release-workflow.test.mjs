@@ -41,6 +41,10 @@ const stateSyncRuntime = readFileSync(
   new URL('../cmd/sage-gui/state_sync_runtime.go', import.meta.url),
   'utf8',
 );
+const v119StateSyncFixture = readFileSync(
+  new URL('../cmd/sage-gui/v119_state_sync_fixture_command_v119testfixture.go', import.meta.url),
+  'utf8',
+);
 
 function job(id) {
   const marker = `  ${id}:\n`;
@@ -171,8 +175,8 @@ test('native shell evidence is version-locked, private, and cannot promote an un
   assert.match(evidence, /SAGE_DAEMON_VERSION/);
   assert.match(
     daemonStager,
-    /SEMVER_PATTERN='\^11\\\.\(10\|11\|12\|13\|14\)\\\./,
-    'the tagged daemon stager must accept the current v11.14 release series',
+    /SEMVER_PATTERN='\^11\\\.\(10\|11\|12\|13\|14\|15\)\\\./,
+    'the tagged daemon stager must accept the current v11.15 release series',
   );
   assert.match(evidence, /Repair v11\.12\.0 native staging helper for immutable-tag recovery/);
   assert.match(evidence, /github\.event_name == 'workflow_dispatch'.*RELEASE_TAG == 'v11\.12\.0'/);
@@ -220,7 +224,7 @@ test('native shell evidence is version-locked, private, and cannot promote an un
   ]);
   assert.match(promotion, /always\(\)/);
   assert.match(promotion, /Native standalone promotion does not apply before v11\.11\.0/);
-  // The native shell is alpha through the v11.11-v11.14 bridge: built in CI,
+  // The native shell is alpha through the v11.11-v11.15 bridge: built in CI,
   // never staged as a public asset. The gate must NOT block the release, or
   // every other channel is held hostage to an artifact no user receives.
   assert.doesNotMatch(promotion, /whole-release hold/);
@@ -340,30 +344,75 @@ test('the Linux cold gate proves the closed placeholder through the real Comet d
   assert.doesNotMatch(v119StateSync, /busybox nslookup provider-p2p/);
 });
 
-test('the mandatory cold gate transfers one exact app-v22 session', () => {
+test('the mandatory cold gate transfers one exact app-v23 session', () => {
   assert.match(
     faultWorkflow,
-    /name: App-v22 real Comet\/ABCI crash, partition, and state-sync gate/,
+    /name: App-v23 real Comet\/ABCI crash, partition, and state-sync gate/,
   );
-  assert.match(v119StateSync, /"app_version": 22/);
-  assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21)/);
-  assert.match(v119StateSync, /wait_app_version "\$\{PROVIDER\}" 22/);
+  assert.match(v119StateSync, /"app_version": 23/);
+  assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21|22)/);
+  assert.match(v119StateSync, /wait_app_version "\$\{PROVIDER\}" 23/);
   assert.match(
     v119StateSync,
-    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" 22 "\$\{pre_publish_evidence\}"/,
+    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" 23 "\$\{pre_publish_evidence\}"/,
   );
-  assert.match(v119StateSync, /\[ "\$\{receiver_app_version\}" != 22 \]/);
-  assert.match(v119StateSync, /\[ "\$\{success_receiver_app_version\}" != 22 \]/);
+  assert.match(v119StateSync, /\[ "\$\{receiver_app_version\}" != 23 \]/);
+  assert.match(v119StateSync, /\[ "\$\{success_receiver_app_version\}" != 23 \]/);
   assert.equal(
-    (v119StateSync.match(/\[ "\$\{provider_app_version\}" != 22 \]/g) || []).length,
+    (v119StateSync.match(/\[ "\$\{provider_app_version\}" != 23 \]/g) || []).length,
     2,
   );
-  assert.match(v119StateSync, /\[ "\$\{post_restart_provider_version\}" != 22 \]/);
-  assert.match(v119StateSync, /\[ "\$\{post_restart_receiver_version\}" != 22 \]/);
+  assert.match(v119StateSync, /\[ "\$\{post_restart_provider_version\}" != 23 \]/);
+  assert.match(v119StateSync, /\[ "\$\{post_restart_receiver_version\}" != 23 \]/);
   assert.match(
     stateSyncRuntime,
     /Uint64\("app_version", expectedAppVersion\)[\s\S]*?Msg\("authorized state-sync session assembled and exact-version candidate verified"\)/,
   );
+});
+
+test('the mandatory cold gate fails closed unless every seed reports its exact successful count', () => {
+  const seedMemories = shellFunction(v119StateSync, 'seed_memories');
+  assert.match(seedMemories, /local expected_count=\$3/);
+  assert.match(seedMemories, /output=\$\(docker exec "\$\{container\}"/);
+  assert.match(seedMemories, /lines\[-1\] != summary/);
+  assert.match(seedMemories, /matches\[0\] != summary/);
+  assert.doesNotMatch(seedMemories, />\/dev\/null/);
+  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v23\.txt 1/);
+  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/advance\.txt 2/);
+  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/restart\.txt 1/);
+  assert.match(
+    v119StateSync,
+    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v23\.txt 1\nwait_height_at_least/,
+  );
+  assert.match(
+    v119StateSync,
+    /seed_memories "\$\{PROVIDER\}" \/sage\/advance\.txt 2\nwait_height_at_least/,
+  );
+  assert.match(
+    v119StateSync,
+    /seed_memories "\$\{PROVIDER\}" \/sage\/restart\.txt 1\nwait_height_at_least/,
+  );
+});
+
+test('the real-process state-sync gate preserves Root semantics without promoting receiver keys', () => {
+  const rootAssertion = shellFunction(v119StateSync, 'assert_appv23_root_semantics');
+  assert.match(rootAssertion, /provider\[:4\] != receiver\[:4\]/);
+  assert.match(rootAssertion, /receiver\[4\] in receiver\[:2\]/);
+  assert.match(
+    v119StateSync,
+    /assert_appv23_root_semantics "\$\{PROVIDER\}" "\$\{RECEIVER\}"/,
+  );
+  assert.match(
+    v119StateSync,
+    /assert_appv23_root_semantics "\$\{PROVIDER\}" "\$\{SUCCESS_RECEIVER\}"/,
+  );
+  assert.match(v119StateSyncFixture, /case "appv23-root-state":/);
+  assert.match(v119StateSyncFixture, /state\.PrincipalID/);
+  assert.match(v119StateSyncFixture, /state\.CredentialID/);
+  assert.match(v119StateSyncFixture, /state\.Generation/);
+  assert.match(v119StateSyncFixture, /state\.HistoryDigest/);
+  assert.match(v119StateSyncFixture, /localAgentID/);
+  assert.match(v119StateSyncFixture, /url\.QueryEscape\(`"\/appv23\/root"`\)/);
 });
 
 test('Dependabot ignores only incompatible post-v0 go-libp2p versions', () => {
@@ -436,6 +485,7 @@ test('Docker guidance keeps stdio MCP in the running SAGE container', () => {
 });
 
 test('the fresh real-Comet fixture cannot skip historical app forks', () => {
+  const heartbeat = shellFunction(v119Chaos, 'governance_heartbeat');
   const heartbeatSubmission = shellFunction(
     v119Chaos,
     'submit_governance_heartbeat_for_progress',
@@ -444,13 +494,38 @@ test('the fresh real-Comet fixture cannot skip historical app forks', () => {
 
   assert.match(
     v119Chaos,
-    /for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do/,
+    /for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do/,
   );
-  assert.doesNotMatch(v119Chaos, /for target in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do/);
-  assert.match(v119Chaos, /\[ "\$\{version\}" -ne 22 \]/);
+  assert.doesNotMatch(v119Chaos, /for target in 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do/);
+  assert.match(v119Chaos, /\[ "\$\{version\}" -ne 23 \]/);
+  assert.match(
+    heartbeat,
+    /fixture_request_with_key "\$\{V119_GOVERNANCE_HEARTBEAT_KEY\}" 0 PUT \/v1\/agent\/update/,
+  );
+  assert.doesNotMatch(heartbeat, /fixture_request 0 PUT \/v1\/agent\/update/);
   assert.match(
     v119Chaos,
-    /restart_pair_and_converge\(\)[\s\S]*?assert_matched_apphash "\$\{label\}" 180[\s\S]*?wait_all_app_version 22 180/,
+    /"name":"v11\.9-chaos-heartbeat","role":"member"[\s\S]*?heartbeat registration did not commit the exact per-run member identity/,
+  );
+  assert.match(
+    v119Chaos,
+    /governance Root, agent heartbeat, and validator probe identities must be distinct/,
+  );
+  assert.match(
+    v119Chaos,
+    /for identity in[\s\S]*?"\$\{V119_GOVERNANCE_OPERATOR_ID\}"[\s\S]*?"\$\{V119_GOVERNANCE_HEARTBEAT_ID\}"[\s\S]*?"\$\{V119_VALIDATOR_PROBE_ID\}"; do/,
+  );
+  assert.match(
+    v119Chaos,
+    /for node_pubkey in "\$\{NODE_PUBKEYS\[@\]\}"; do[\s\S]*?\[ "\$\{V119_VALIDATOR_PROBE_ID\}" = "\$\{node_pubkey\}" \][\s\S]*?validator probe collides with a generated CometBFT validator/,
+  );
+  assert.match(
+    v119Chaos,
+    /heartbeat_probe=\$\(governance_heartbeat\)[\s\S]*?post-app-v23 heartbeat did not execute as the enrolled Member[\s\S]*?validated app-v23 progress signer as the distinct enrolled Member identity/,
+  );
+  assert.match(
+    v119Chaos,
+    /restart_pair_and_converge\(\)[\s\S]*?assert_matched_apphash "\$\{label\}" 180[\s\S]*?wait_all_app_version 23 180/,
   );
   assert.match(
     heartbeatSubmission,
@@ -466,10 +541,68 @@ test('the fresh real-Comet fixture cannot skip historical app forks', () => {
     restartPair,
     /submit_governance_heartbeat_for_progress "\$\{label\} heartbeat 1"[\s\S]*?submit_governance_heartbeat_for_progress "\$\{label\} heartbeat 2"[\s\S]*?wait_progress "\$\{RPC_PORTS\[\$progress_port_index\]\}" "\$\{before\}" 2 120/,
   );
+  const removedVoteProbeStart = v119Chaos.indexOf(
+    'removed_vote_probe=$(governance_propose 0 add_validator',
+  );
+  const removedVoteProbeEnd = v119Chaos.indexOf(
+    'removed_vote_probe_id=',
+    removedVoteProbeStart,
+  );
+  assert.ok(removedVoteProbeStart >= 0 && removedVoteProbeEnd > removedVoteProbeStart);
+  const removedVoteProbe = v119Chaos.slice(removedVoteProbeStart, removedVoteProbeEnd);
+  assert.match(
+    removedVoteProbe,
+    /"\$\{V119_VALIDATOR_PROBE_ID\}" "\$\{V119_VALIDATOR_PROBE_ID\}"/,
+  );
+  assert.doesNotMatch(
+    removedVoteProbe,
+    /V119_GOVERNANCE_OPERATOR_ID/,
+    'CEREBRUM Root must never be reused as a disposable validator target',
+  );
   assert.equal(
-    (v119Chaos.match(/wait_all_app_version 22 180/g) || []).length,
+    (v119Chaos.match(/wait_all_app_version 23 180/g) || []).length,
     3,
-    'restart recovery plus both healed partition phases must reassert app-v22',
+    'restart recovery plus both healed partition phases must reassert app-v23',
+  );
+});
+
+test('the app-v23 chaos gate keeps every Root operation on true node loopback', () => {
+  const localRootRequest = shellFunction(v119Chaos, 'fixture_local_root_request');
+  assert.match(localRootRequest, /exec -T "abci\$\{index\}"/);
+  assert.match(localRootRequest, /--key \/dev\/stdin/);
+  assert.match(localRootRequest, /--local/);
+  assert.match(localRootRequest, /< "\$\{V119_GOVERNANCE_OPERATOR_KEY\}"/);
+
+  for (const [name, nextName] of [
+    ['governance_context', 'governance_propose'],
+    ['governance_propose', 'governance_vote'],
+    ['governance_vote', 'governance_cancel'],
+    ['governance_cancel', 'assert_abci_validator_state'],
+  ]) {
+    const start = v119Chaos.indexOf(`${name}() {\n`);
+    const end = v119Chaos.indexOf(`\n${nextName}() {\n`, start);
+    assert.ok(start >= 0 && end > start, `cannot isolate shell function ${name}`);
+    const body = v119Chaos.slice(start, end);
+    assert.match(
+      body,
+      /fixture_local_root_request "\$\{index\}"/,
+      `${name} must execute Root authority inside the target ABCI loopback namespace`,
+    );
+    assert.doesNotMatch(
+      body,
+      /^\s*fixture_request "\$\{index\}"/m,
+      `${name} must not send Root authority through the Docker bridge`,
+    );
+  }
+
+  assert.match(
+    v119Chaos,
+    /stdin_operator_id=\$\(docker run --rm --pull never -i --network none[\s\S]*?--key \/dev\/stdin identity[\s\S]*?governance fixture stdin key transport changed the Root identity/,
+  );
+  assert.match(
+    v119Chaos,
+    /remote_root_probe=\$\(fixture_request 0 GET \/v1\/governance\/context 2>&1\)[\s\S]*?HTTP 403[\s\S]*?Local Root required/,
+    'the intentional bridge probe must prove non-loopback Root denial',
   );
 });
 
@@ -481,7 +614,7 @@ test('the real-Comet fixture proves governance-domain binding before the long fo
   );
   const bindingGate = v119Chaos.lastIndexOf('wait_all_governance_domain_bindings 30');
   const forkLadder = v119Chaos.indexOf(
-    'for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do',
+    'for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do',
   );
   assert.ok(bindingGate >= 0 && bindingGate < forkLadder);
 });

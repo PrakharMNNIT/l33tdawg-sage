@@ -106,7 +106,16 @@ func (h *DashboardHandler) federationShareableDomains(ctx context.Context) ([]fe
 
 	operatorID := h.NodeOperatorAgentID
 	isAdmin := false
-	if operatorID != "" {
+	if h.appV23IsActive() {
+		// Root handover leaves NodeOperatorAgentID attached to the stable
+		// federation transport identity. Sharing authority follows the live
+		// consensus Root instead; CEREBRUM/Admin locality is enforced by the
+		// route gate before this read model is built.
+		if root, rootErr := h.BadgerStore.GetAppV23Root(); rootErr == nil && root != nil {
+			operatorID = root.CredentialID
+			isAdmin = true
+		}
+	} else if operatorID != "" {
 		if agent, getErr := h.BadgerStore.GetRegisteredAgent(operatorID); getErr == nil && agent != nil {
 			isAdmin = agent.Role == "admin"
 		}
@@ -124,7 +133,7 @@ func (h *DashboardHandler) federationShareableDomains(ctx context.Context) ([]fe
 		case h.isSharedDomain(domain):
 			authority, canShare = "shared", true
 		case operatorID != "":
-			owner, ownedDomain, resolveErr := h.BadgerStore.ResolveOwningAncestor(domain)
+			owner, ownedDomain, resolveErr := h.resolveEffectiveOwningAncestor(domain)
 			if resolveErr == nil && owner == operatorID {
 				canShare = true
 				if ownedDomain == domain {

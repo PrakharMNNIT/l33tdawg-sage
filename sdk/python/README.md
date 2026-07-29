@@ -2,7 +2,7 @@
 
 Python client for the SAGE (Sovereign Agent Governed Experience) protocol -- a governed, verifiable institutional memory layer for multi-agent systems.
 
-**Requires Python 3.10+** | **SAGE v11.14.2 SDK** | **TLS, RBAC, federation, domain recovery, scoped governance, and per-record `classification` supported**
+**Requires Python 3.10+** | **SAGE v11.15.0 SDK** | **TLS, app-v23 roles and Access Groups, read-only federation, domain recovery, scoped governance, and per-record `classification` supported**
 
 ## Installation
 
@@ -143,7 +143,7 @@ client.set_agent_permission(
 ### Memory Operations
 
 ```python
-# Submit a memory proposal
+# Submit a memory transaction and wait for its chain commit
 result = client.propose(
     content="The observation text",
     memory_type="fact",           # "fact", "observation", "inference", or "task"
@@ -156,7 +156,9 @@ result = client.propose(
     parent_hash="abc123",         # Optional: link to parent memory
     classification=3,             # Optional: per-record clearance 0-4 (3=Secret); omitted = PUBLIC(0)
 )
-# Returns: MemorySubmitResponse(memory_id, tx_hash, status)
+# Returns MemorySubmitResponse with the chain receipt. For app-v23 tasks it
+# also carries task_status, projection_confirmed, idempotency_key, replay state,
+# retryable, and a reconciliation message when needed.
 
 # Query by vector similarity
 results = client.query(
@@ -168,6 +170,22 @@ results = client.query(
     cursor="abc123",             # Optional: pagination cursor
 )
 # Returns: MemoryQueryResponse(results, next_cursor, total_count)
+# App-v23 examines at most 8,192 raw authorization candidates per node request;
+# HTTP 422 means narrow domain/provider/tag/status filters.
+
+# Hybrid BM25/vector recall with optional query expansions
+hybrid = client.hybrid(
+    query="credential rotation",
+    embedding=[0.1] * 768,
+    domain_tag="security",
+    expansions=[
+        {"query": "rotate access keys", "embedding": [0.2] * 768},
+    ],                              # At most 8 submitted entries
+)
+# Under app-v23 the primary query, all expansions, and every text/vector store
+# leaf share one 8,192-candidate live-authorization budget. HTTP 422 means reduce
+# expansions or narrow filters. Governed leaf/budget failures fail the whole
+# call; the server never returns HTTP 200 with partial hybrid fusion.
 
 # Get a single memory
 memory = client.get_memory("550e8400-e29b-41d4-a716-446655440000")
@@ -181,7 +199,11 @@ memories = client.list_memories(
     sort="newest",               # "newest", "oldest", or "confidence"
     agent="a1b2c3...",           # Optional: filter by agent
 )
-# Returns: MemoryListResponse(memories, total, limit, offset)
+# Returns: MemoryListResponse(memories, total, limit, offset, has_more,
+# total_exact, filtered). Under app-v23 total is a visible lower bound while
+# has_more is true; denied/raw counts are never exposed. Visible offset is
+# capped at 7,900 and one request examines at most 8,192 raw authorization
+# candidates; HTTP 422 means narrow filters or page sequentially.
 
 # Get memory timeline (time-bucketed counts)
 timeline = client.timeline(
@@ -190,7 +212,10 @@ timeline = client.timeline(
     from_time="2026-03-01T00:00:00Z",
     to_time="2026-03-16T00:00:00Z",
 )
-# Returns: TimelineResponse(buckets=[{period, count, domain}])
+# Returns: TimelineResponse(buckets=[{period, count, domain}], total=N)
+# App-v23 counts only records that pass current live disclosure; aggregate
+# existence/timing never bypasses RBAC or classification. Range is capped at
+# 31 days and 8,192 raw candidates per request.
 
 # Link related memories
 client.link_memories(
@@ -218,8 +243,27 @@ Task memories are a special memory type for tracking actionable work items.
 result = client.propose(
     content="Investigate CVE-2026-1234",
     memory_type="task",
+    domain_tag=None,               # App-v23: use this agent's owned home domain
+    confidence=0.9,
+)
+
+if result.projection_confirmed is False:
+    # The transaction is already committed. Reconcile this exact ID; retrying
+    # creation would be wrong even though the serving projection is unavailable.
+    print(f"Reconcile {result.memory_id}; do not resubmit")
+elif result.idempotent_replay:
+    print(f"Existing task at {result.task_status}; no new task was created")
+else:
+    print(f"Created {result.memory_id}")
+
+# Omission derives a permanent semantic key. To intentionally create another
+# occurrence with identical content/domain, supply a fresh explicit key:
+recurring = client.propose(
+    content="Investigate CVE-2026-1234",
+    memory_type="task",
     domain_tag="security",
     confidence=0.9,
+    idempotency_key="investigate-cve-2026-1234-occurrence-2",
 )
 
 # List open tasks
@@ -230,8 +274,12 @@ tasks = client.list_tasks(
 # Returns: TaskListResponse(tasks=[{memory_id, content, domain_tag, task_status, ...}], total)
 
 # Update task status
-client.update_task_status(result.memory_id, "in_progress")  # planned/in_progress/done/dropped
+client.update_task_status(result.memory_id, "in_progress")  # in_progress/done/dropped
 ```
+
+The task feed is exact-assignee and live-authorized: assignment never bypasses
+current domain/group/grant or classification access. Unassigned pickup,
+re-planning, and terminal reopen are local CEREBRUM operator actions.
 
 ### Voting & Validation
 
@@ -291,7 +339,8 @@ client.pipe_claim(msg.pipe_id)
 result = client.pipe_result(msg.pipe_id, result="Analysis complete: CVE is critical")
 # Returns: PipeResultResponse(status, journal_id) — auto-journaled to memory
 
-# Check message status
+# Inspect this node's local workflow row (not a delivery/read receipt;
+# sender-queryable successful delivery/read receipts are deferred to v11.16)
 status = client.pipe_status(msg.pipe_id)
 
 # List completed results
@@ -673,8 +722,8 @@ PipelineStatus.failed     # Processing failed
 ```python
 from sage_sdk.exceptions import (
     SageError,            # Base exception
-    SageAPIError,         # Any API error (has status_code, detail)
-    SageAuthError,        # 401/403 authentication failure
+    SageAPIError,         # Any API error; includes structured RFC 7807 fields
+    SageAuthError,        # 401/403; subclass of SageAPIError
     SageNotFoundError,    # 404 resource not found
     SageValidationError,  # 422 validation error
 )
@@ -684,10 +733,19 @@ try:
 except SageNotFoundError as e:
     print(f"Not found: {e.detail}")
 except SageAuthError as e:
-    print(f"Auth failed: {e}")
+    # App-v23 canonical write denials preserve exact machine-readable guidance.
+    print(e.reason_code, e.remedy, e.retryable)
 except SageAPIError as e:
     print(f"API error {e.status_code}: {e.detail}")
 ```
+
+`SageAPIError` exposes `status_code`, `detail`, `error_type`, `reason_code`,
+`remedy`, and `retryable`. For
+`https://sage.dev/errors/domain-write-denied`, branch on the structured
+`reason_code` and `retryable=False`, never by matching `detail`. In v11.15.0 a
+`missing_write_grant` remedy uses the owned-domain or Root/Admin-approved
+Manager Access Group flow; it does not imply that CEREBRUM ships a direct
+level-2 grant editor.
 
 ## Configuration
 
@@ -799,7 +857,7 @@ def hash_embed(text: str, dim: int = 768) -> list[float]:
 | `GET` | `/v1/memory/timeline` | `timeline()` |
 | `POST` | `/v1/memory/link` | `link_memories()` |
 | `POST` | `/v1/memory/pre-validate` | `pre_validate()` |
-| `POST` | `/v1/memory/{id}/vote` | `vote()` |
+| `POST` | `/v1/memory/{id}/vote` | `vote()` (local validator-operator override) |
 | `POST` | `/v1/memory/{id}/challenge` | `challenge()` |
 | `POST` | `/v1/memory/{id}/corroborate` | `corroborate()` |
 | `PUT` | `/v1/memory/{id}/task-status` | `update_task_status()` |

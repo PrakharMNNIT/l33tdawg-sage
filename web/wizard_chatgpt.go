@@ -1098,11 +1098,9 @@ func wizardVerifyTunnel(ctx context.Context, healthURL string, log func(step, ms
 // canonical api/rest handler — we just call our local SAGE node over HTTP
 // (using the same admin-auth that gates the wizard).
 //
-// The wizard is already authenticated via the dashboard cookie; on the
-// backend we proxy the token mint through the in-process /v1/mcp/tokens
-// handler by calling it via the local HTTP listener with X-Agent-ID +
-// X-Signature headers. Since that's invasive, we instead read the result
-// from a thin in-package helper if MCP token store is present.
+// The wizard is already authenticated as local CEREBRUM. The shared token
+// store performs the same app-v23 identity-registration path as /v1/mcp/tokens:
+// the authorizing Root/Admin never becomes the bearer's acting identity.
 func (h *DashboardHandler) handleWizardMintToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AgentID   string `json:"agent_id"`
@@ -1116,24 +1114,26 @@ func (h *DashboardHandler) handleWizardMintToken(w http.ResponseWriter, r *http.
 	if req.TokenName == "" {
 		req.TokenName = "chatgpt"
 	}
-	operatorID := strings.TrimSpace(h.NodeOperatorAgentID)
-	if len(operatorID) != 64 {
-		writeError(w, http.StatusServiceUnavailable, "node operator identity unavailable — MCP tokens cannot be issued")
-		return
-	}
-	// Token issuance is stronger than the wizard's general local-process gate.
-	// Require either the exact verified operator signing principal installed by
-	// authMiddleware, or a genuine encrypted-dashboard session. Unsigned
-	// loopback/no-Origin callers and arbitrary signed agents must never cause an
-	// operator-owned bearer to be minted.
-	verifiedOperator := verifiedDashboardAgentID(r.Context()) == operatorID
-	operatorSession := h.Encrypted.Load() && h.HasValidSessionCookie(r)
-	if !verifiedOperator && !operatorSession {
+	issuerID := strings.TrimSpace(h.NodeOperatorAgentID)
+	if h.appV23IsActive() {
+		// Resolve live consensus authority on every request. Root handover
+		// deliberately leaves NodeOperatorAgentID as the stable federation
+		// transport identity, so it must never remain the MCP issuer.
+		actor, ok := h.requireAppV23ControlActor(w, r, false)
+		if !ok {
+			return
+		}
+		issuerID = actor.ID
+	} else if !h.isCEREBRUMOperatorRequest(r) {
 		writeError(w, http.StatusForbidden, "node operator authorization required to mint MCP tokens")
 		return
 	}
-	if req.AgentID != "" && req.AgentID != operatorID {
-		writeError(w, http.StatusBadRequest, "remote MCP connections run as the local node operator; choose the operator identity")
+	if len(issuerID) != 64 {
+		writeError(w, http.StatusServiceUnavailable, "current CEREBRUM authority unavailable — MCP tokens cannot be issued")
+		return
+	}
+	if req.AgentID != "" && req.AgentID != issuerID {
+		writeError(w, http.StatusBadRequest, "agent_id must match the current authorizing Root or Admin")
 		return
 	}
 
@@ -1144,7 +1144,7 @@ func (h *DashboardHandler) handleWizardMintToken(w http.ResponseWriter, r *http.
 	}
 
 	// Mint the token using the same primitives as the api/rest handler.
-	token, id, actingAgentID, createdAt, err := mintMCPTokenForWizard(r.Context(), ts, operatorID, req.TokenName)
+	token, id, actingAgentID, createdAt, err := mintMCPTokenForWizard(r.Context(), ts, issuerID, req.TokenName)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "mint token: "+err.Error())
 		return

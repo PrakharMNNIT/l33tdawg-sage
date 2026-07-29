@@ -3,8 +3,10 @@ package rest
 import (
 	"crypto/ed25519"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/l33tdawg/sage/api/rest/middleware"
 	"github.com/l33tdawg/sage/internal/federation"
+	"github.com/l33tdawg/sage/internal/store"
 )
 
 type notifyingRevokeFederation struct {
@@ -72,6 +75,102 @@ func TestLegacyFederationControlRequiresExactNodeOperator(t *testing.T) {
 		if rr.Code == http.StatusForbidden {
 			t.Fatalf("operator did not cross federation-control gate for %s %s", route.method, route.path)
 		}
+	}
+}
+
+func TestAppV23FederationControlFollowsCurrentRootNotTransportKey(t *testing.T) {
+	transportPub, _, transportKeyErr := ed25519.GenerateKey(nil)
+	if transportKeyErr != nil {
+		t.Fatal(transportKeyErr)
+	}
+	currentRootPub, _, currentRootKeyErr := ed25519.GenerateKey(nil)
+	if currentRootKeyErr != nil {
+		t.Fatal(currentRootKeyErr)
+	}
+	companionPub, _, companionKeyErr := ed25519.GenerateKey(nil)
+	if companionKeyErr != nil {
+		t.Fatal(companionKeyErr)
+	}
+	transportID := fmt.Sprintf("%x", transportPub)
+	currentRootID := fmt.Sprintf("%x", currentRootPub)
+	companionID := fmt.Sprintf("%x", companionPub)
+	badgerStore, storeErr := store.NewBadgerStore(t.TempDir())
+	if storeErr != nil {
+		t.Fatal(storeErr)
+	}
+	t.Cleanup(func() { _ = badgerStore.CloseBadger() })
+	if bootstrapErr := badgerStore.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: transportID, Scope: "rest-federation-control",
+		AgentID: companionID, Profile: store.AppV23ProfileStandard,
+		HomeDomain: "companion.home", Clearance: 2, Height: 1,
+		BootstrapDigest: strings.Repeat("c9", 32),
+	}); bootstrapErr != nil {
+		t.Fatal(bootstrapErr)
+	}
+	if rotateErr := badgerStore.RotateAppV23RootCredential(1, currentRootID, 2); rotateErr != nil {
+		t.Fatal(rotateErr)
+	}
+	s := &Server{
+		logger: zerolog.Nop(), nodeOperatorID: transportID,
+		signingKey: nil, badgerStore: badgerStore,
+	}
+	s.SetPostV23ForNextTxAccessor(func() bool { return true })
+
+	retired := httptest.NewRecorder()
+	legacyFederationControlRouter(s, transportID).ServeHTTP(
+		retired, httptest.NewRequest(http.MethodGet, "/v1/federation/cross", nil),
+	)
+	if retired.Code != http.StatusForbidden {
+		t.Fatalf("retired Root/transport status=%d body=%s", retired.Code, retired.Body.String())
+	}
+
+	current := httptest.NewRecorder()
+	legacyFederationControlRouter(s, currentRootID).ServeHTTP(
+		current, httptest.NewRequest(http.MethodGet, "/v1/federation/cross", nil),
+	)
+	if current.Code != http.StatusOK {
+		t.Fatalf("current Root status=%d body=%s", current.Code, current.Body.String())
+	}
+
+	enrollment, enrollmentErr := badgerStore.GetAppV23Enrollment(companionID)
+	if enrollmentErr != nil {
+		t.Fatal(enrollmentErr)
+	}
+	role, roleErr := badgerStore.GetAppV23Role(companionID)
+	if roleErr != nil {
+		t.Fatal(roleErr)
+	}
+	if policyErr := badgerStore.SetAppV23Policy(
+		currentRootID, companionID, store.AppV23RoleAdmin,
+		enrollment.Profile, store.AppV23ProfileStandard, 4,
+		store.AgentCapabilityReadAllDomains,
+		role.Revision, enrollment.Revision, 3,
+	); policyErr != nil {
+		t.Fatal(policyErr)
+	}
+	admin := httptest.NewRecorder()
+	legacyFederationControlRouter(s, companionID).ServeHTTP(
+		admin, httptest.NewRequest(http.MethodGet, "/v1/federation/cross", nil),
+	)
+	if admin.Code != http.StatusOK {
+		t.Fatalf("current-generation Admin status=%d body=%s", admin.Code, admin.Body.String())
+	}
+
+	nextRootPub, _, nextRootKeyErr := ed25519.GenerateKey(nil)
+	if nextRootKeyErr != nil {
+		t.Fatal(nextRootKeyErr)
+	}
+	if rotateErr := badgerStore.RotateAppV23RootCredential(
+		2, fmt.Sprintf("%x", nextRootPub), 4,
+	); rotateErr != nil {
+		t.Fatal(rotateErr)
+	}
+	staleAdmin := httptest.NewRecorder()
+	legacyFederationControlRouter(s, companionID).ServeHTTP(
+		staleAdmin, httptest.NewRequest(http.MethodGet, "/v1/federation/cross", nil),
+	)
+	if staleAdmin.Code != http.StatusForbidden {
+		t.Fatalf("stale-generation Admin status=%d body=%s", staleAdmin.Code, staleAdmin.Body.String())
 	}
 }
 

@@ -33,15 +33,29 @@ type OAuthClient struct {
 // ErrOAuthClientNotFound — distinct from sql.ErrNoRows so callers can branch.
 var ErrOAuthClientNotFound = errors.New("oauth client not registered")
 
-// migrateOAuthClients creates the oauth_clients table on first boot. Idempotent.
-func (s *SQLiteStore) migrateOAuthClients(ctx context.Context) {
-	_, _ = s.writeExecContext(ctx, `
+// migrateOAuthClients creates and validates the oauth_clients table on first
+// boot. This table is the redirect-URI trust root for OAuth DCR, so startup
+// must fail rather than serve OAuth against a partial or malformed schema.
+func (s *SQLiteStore) migrateOAuthClients(ctx context.Context) error {
+	if _, err := s.writeExecContext(ctx, `
 	CREATE TABLE IF NOT EXISTS oauth_clients (
 		client_id     TEXT PRIMARY KEY,
 		redirect_uris TEXT NOT NULL DEFAULT '[]',
 		client_name   TEXT NOT NULL DEFAULT '',
 		created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-	)`)
+	)`); err != nil {
+		return fmt.Errorf("create oauth client table: %w", err)
+	}
+	if _, err := s.writeExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_oauth_clients_created ON oauth_clients(created_at)`); err != nil {
+		return fmt.Errorf("create oauth client retention index: %w", err)
+	}
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT client_id, redirect_uris, client_name, created_at FROM oauth_clients LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf("validate oauth client schema: %w", err)
+	}
+	return rows.Close()
 }
 
 // InsertOAuthClient persists a freshly-registered client. redirect_uris is

@@ -11,6 +11,7 @@ import (
 
 	"github.com/l33tdawg/sage/internal/federation"
 	sagep2p "github.com/l33tdawg/sage/internal/p2p"
+	"github.com/l33tdawg/sage/internal/store"
 	"gopkg.in/yaml.v3"
 )
 
@@ -33,6 +34,13 @@ type Config struct {
 	Encryption EncryptionConfig `yaml:"encryption"`
 	Quorum     QuorumConfig     `yaml:"quorum"`
 	RBAC       RBACConfig       `yaml:"rbac,omitempty"`
+	// VendoredAgentBootstrap is an explicit, genesis-only first-party
+	// enrollment contract. When configured before a personal chain is created,
+	// SAGE binds the companion key to the genesis root key and atomically seeds
+	// its local enrollment, Companion profile, clearance, and owned home
+	// domain. It is deliberately absent by default: generic self-registration
+	// must retain the restricted review posture.
+	VendoredAgentBootstrap *VendoredAgentBootstrapConfig `yaml:"vendored_agent_bootstrap,omitempty"`
 	// NOT omitempty: the default is enabled=true, so a zero FederationConfig
 	// (enabled=false, the operator's explicit "off") must be written as
 	// `federation: {enabled: false}`. With omitempty the off-state would be
@@ -42,8 +50,11 @@ type Config struct {
 	Voter      VoterConfig      `yaml:"voter"`
 	DataDir    string           `yaml:"data_dir"`
 	RESTAddr   string           `yaml:"rest_addr"`
-	AgentKey   string           `yaml:"agent_key_file"`
-	BlockTime  string           `yaml:"block_time"` // e.g. "1s", "3s"
+	// AgentKey is the stable node federation transport credential path.
+	// A fresh node may create it once. Root handover never rewrites it because
+	// federation peers pin its public identity during JOIN.
+	AgentKey  string `yaml:"agent_key_file"`
+	BlockTime string `yaml:"block_time"` // e.g. "1s", "3s"
 
 	// ChainID is a read-only mirror of the network's globally-unique chain_id,
 	// reconciled from the authoritative CometBFT genesis on every serve (see
@@ -82,7 +93,19 @@ type Config struct {
 	// auto-vote → activate, one fork at a time), so updating the binary also
 	// brings the CHAIN up to date. Quorum clusters never auto-advance
 	// regardless of this knob — fork scheduling there is an operator decision.
+	// DisableAutoUpgrade stops optional personal-node ladder movement above the
+	// binary's mandatory security floor. It cannot keep v11.15.0 below app-v23.
 	DisableAutoUpgrade bool `yaml:"disable_auto_upgrade,omitempty"`
+}
+
+// VendoredAgentBootstrapConfig describes the local key and initial data scope
+// of a first-party application bundled with a newly-created personal node.
+// The private key never enters genesis; only its canonical public identity and
+// a dual root+agent signature are persisted.
+type VendoredAgentBootstrapConfig struct {
+	AgentKeyFile string `yaml:"agent_key_file"`
+	HomeDomain   string `yaml:"home_domain"`
+	Clearance    uint8  `yaml:"clearance"`
 }
 
 // FederationConfig controls all v11 cross-network federation networking.
@@ -269,6 +292,7 @@ func LoadConfig() (*Config, error) {
 			if vErr := cfg.validate(); vErr != nil {
 				return nil, vErr
 			}
+			normalizeConfigPaths(cfg, home)
 			return cfg, nil
 		}
 		return nil, fmt.Errorf("read config: %w", err)
@@ -283,17 +307,29 @@ func LoadConfig() (*Config, error) {
 		return nil, vErr
 	}
 
-	// Expand ~ and ensure absolute paths
+	normalizeConfigPaths(cfg, home)
+
+	return cfg, nil
+}
+
+// normalizeConfigPaths applies the same path contract whether configuration
+// came from config.yaml, environment-only first launch, or defaults.
+func normalizeConfigPaths(cfg *Config, home string) {
+	// Expand ~ and ensure absolute paths.
 	cfg.DataDir = expandHome(cfg.DataDir)
 	cfg.AgentKey = expandHome(cfg.AgentKey)
+	if cfg.VendoredAgentBootstrap != nil {
+		cfg.VendoredAgentBootstrap.AgentKeyFile = expandHome(cfg.VendoredAgentBootstrap.AgentKeyFile)
+	}
 	if !filepath.IsAbs(cfg.DataDir) {
 		cfg.DataDir = filepath.Join(home, cfg.DataDir)
 	}
 	if !filepath.IsAbs(cfg.AgentKey) {
 		cfg.AgentKey = filepath.Join(home, cfg.AgentKey)
 	}
-
-	return cfg, nil
+	if cfg.VendoredAgentBootstrap != nil && !filepath.IsAbs(cfg.VendoredAgentBootstrap.AgentKeyFile) {
+		cfg.VendoredAgentBootstrap.AgentKeyFile = filepath.Join(home, cfg.VendoredAgentBootstrap.AgentKeyFile)
+	}
 }
 
 // validate rejects contradictory configuration after the file + env merge.
@@ -301,6 +337,22 @@ func LoadConfig() (*Config, error) {
 func (cfg *Config) validate() error {
 	if cfg.Voter.Required && !cfg.Voter.Enabled {
 		return fmt.Errorf("invalid config: voter.required=true but voter.enabled=false — a required voter cannot be disabled (fix the voter block in config.yaml or SAGE_VOTER_ENABLED/SAGE_VOTER_REQUIRED)")
+	}
+	if bootstrap := cfg.VendoredAgentBootstrap; bootstrap != nil {
+		bootstrap.AgentKeyFile = strings.TrimSpace(bootstrap.AgentKeyFile)
+		bootstrap.HomeDomain = strings.TrimSpace(bootstrap.HomeDomain)
+		if bootstrap.AgentKeyFile == "" {
+			return errors.New("invalid config: vendored_agent_bootstrap.agent_key_file is required")
+		}
+		if bootstrap.HomeDomain == "" {
+			return errors.New("invalid config: vendored_agent_bootstrap.home_domain is required")
+		}
+		if store.IsSharedDomainName(bootstrap.HomeDomain) {
+			return errors.New("invalid config: vendored_agent_bootstrap.home_domain must be a non-shared domain")
+		}
+		if bootstrap.Clearance > 4 {
+			return errors.New("invalid config: vendored_agent_bootstrap.clearance must be 0..4")
+		}
 	}
 	if err := cfg.Quorum.StateSync.validate(cfg.Quorum.Enabled); err != nil {
 		return err
@@ -359,6 +411,30 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("SAGE_VOTER_REQUIRED"); v != "" {
 		if b, ok := envBool("SAGE_VOTER_REQUIRED", v); ok {
 			cfg.Voter.Required = b
+		}
+	}
+	bootstrapKey := strings.TrimSpace(os.Getenv("SAGE_VENDORED_AGENT_KEY_FILE"))
+	bootstrapDomain := strings.TrimSpace(os.Getenv("SAGE_VENDORED_AGENT_HOME_DOMAIN"))
+	bootstrapClearance := strings.TrimSpace(os.Getenv("SAGE_VENDORED_AGENT_CLEARANCE"))
+	if bootstrapKey != "" || bootstrapDomain != "" || bootstrapClearance != "" {
+		if cfg.VendoredAgentBootstrap == nil {
+			cfg.VendoredAgentBootstrap = &VendoredAgentBootstrapConfig{Clearance: 1}
+		}
+		if bootstrapKey != "" {
+			cfg.VendoredAgentBootstrap.AgentKeyFile = bootstrapKey
+		}
+		if bootstrapDomain != "" {
+			cfg.VendoredAgentBootstrap.HomeDomain = bootstrapDomain
+		}
+		if bootstrapClearance != "" {
+			n, err := strconv.ParseUint(bootstrapClearance, 10, 8)
+			if err != nil || n > 4 {
+				// Leave an invalid sentinel for Config.validate so startup fails
+				// loudly instead of silently choosing a privilege level.
+				cfg.VendoredAgentBootstrap.Clearance = 255
+			} else {
+				cfg.VendoredAgentBootstrap.Clearance = uint8(n)
+			}
 		}
 	}
 }

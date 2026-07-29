@@ -10,6 +10,18 @@ import (
 	"github.com/l33tdawg/sage/internal/vault"
 )
 
+// CandidateFilterScanBudget bounds authorization work for one ranked recall.
+// A caller can legitimately own only a sparse tail of a large result stream;
+// without a ceiling, repeatedly asking for that tail turns live Badger policy
+// checks into an authenticated CPU/DB denial of service. The REST layer maps
+// ErrCandidateFilterScanBudgetExceeded to an actionable "narrow the query"
+// response instead of returning a misleading partial recall.
+const CandidateFilterScanBudget = 8192
+
+var ErrCandidateFilterScanBudgetExceeded = errors.New(
+	"authorization candidate scan budget exceeded",
+)
+
 // ValidationVote represents a validator's vote on a memory.
 type ValidationVote struct {
 	ID           int64     `json:"id"`
@@ -103,12 +115,19 @@ type QueryOptions struct {
 	// execution (which never sets it) invokes no wall-clock read and stays
 	// deterministic. DecayNow pins the evaluation instant so a caller can keep the
 	// serialized confidence exactly consistent with the filter decision.
-	DecayFloor       float64   `json:"-"`
-	DecayNow         time.Time `json:"-"`
-	SubmittingAgents []string  `json:"submitting_agents,omitempty"` // RBAC: restrict to these agent IDs
-	Tags             []string  `json:"tags,omitempty"`              // any-match filter on user-defined tags
-	CreatedFrom      string    `json:"created_from,omitempty"`      // ISO-8601 lower bound on created_at (inclusive)
-	CreatedTo        string    `json:"created_to,omitempty"`        // ISO-8601 upper bound on created_at (inclusive)
+	DecayFloor float64   `json:"-"`
+	DecayNow   time.Time `json:"-"`
+	// CandidateFilter is a trusted, read-only admission hook used by app-v23
+	// recall to apply live authorization before TopK is consumed. Stores must
+	// preserve rank order, continue scanning until TopK admitted records are
+	// found or the ranked stream is exhausted, and propagate filter errors.
+	// REST re-checks disclosure before serialization to close authorization
+	// races. It is never accepted from JSON and is never used by consensus.
+	CandidateFilter  func(*memory.MemoryRecord) (bool, error) `json:"-"`
+	SubmittingAgents []string                                 `json:"submitting_agents,omitempty"` // RBAC: restrict to these agent IDs
+	Tags             []string                                 `json:"tags,omitempty"`              // any-match filter on user-defined tags
+	CreatedFrom      string                                   `json:"created_from,omitempty"`      // ISO-8601 lower bound on created_at (inclusive)
+	CreatedTo        string                                   `json:"created_to,omitempty"`        // ISO-8601 upper bound on created_at (inclusive)
 }
 
 // decayFilterScanCap bounds how many rank/distance-ordered candidates a
@@ -119,6 +138,28 @@ type QueryOptions struct {
 // a pathological query can't scan the whole corpus. (SQLite QuerySimilar already
 // scans every candidate, so it needs no cap.)
 const decayFilterScanCap = 1000
+
+// applyCandidateFilter applies a trusted recall admission hook without changing
+// rank order. A nil hook preserves historical store behavior exactly.
+func applyCandidateFilter(
+	recs []*memory.MemoryRecord,
+	filter func(*memory.MemoryRecord) (bool, error),
+) ([]*memory.MemoryRecord, error) {
+	if filter == nil {
+		return recs, nil
+	}
+	out := recs[:0]
+	for _, rec := range recs {
+		allowed, err := filter(rec)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
 
 // recordIDs extracts the memory IDs from a record slice, order-preserving.
 func recordIDs(recs []*memory.MemoryRecord) []string {
@@ -185,6 +226,10 @@ type ListOptions struct {
 	Limit                 int
 	Offset                int
 	Sort                  string // "newest", "oldest", "confidence"
+	// StablePaging adds memory_id as the deterministic secondary sort key.
+	// App-v23 authorization walks multiple raw pages and enables this flag;
+	// historical one-page callers retain their exact ordering.
+	StablePaging bool
 }
 
 // StoreStats holds aggregate statistics.
@@ -202,6 +247,13 @@ type TimelineBucket struct {
 	Period string `json:"period"` // ISO date string
 	Count  int    `json:"count"`
 	Domain string `json:"domain,omitempty"`
+}
+
+// TimelinePeriodFormatter preserves each backend's historical public bucket
+// representation when app-v23 performs disclosure-filtered aggregation in Go.
+// SQLite and PostgreSQL intentionally have different legacy shapes.
+type TimelinePeriodFormatter interface {
+	FormatTimelinePeriod(at time.Time, bucket string) string
 }
 
 // MemoryStore defines the interface for memory storage operations.
@@ -294,6 +346,26 @@ type MemoryStore interface {
 	// them. Single-node repair — multi-node backends may no-op.
 	RepairSelfDupRejected(ctx context.Context, selfID string, flipChain func(memoryID string) error) (int, error)
 	Close() error
+}
+
+// PendingMemoryPageStore and OpenTaskPageStore are additive paging extensions.
+// REST app-v23 uses them to apply live disclosure before consuming a visible
+// page limit. Keeping them separate from MemoryStore preserves compatibility
+// with third-party and test stores built against the historical interface.
+type PendingMemoryPageStore interface {
+	GetPendingByDomainPage(
+		ctx context.Context,
+		domainTag string,
+		limit, offset int,
+	) ([]*memory.MemoryRecord, error)
+}
+
+type OpenTaskPageStore interface {
+	GetOpenTasksPage(
+		ctx context.Context,
+		domain, provider, assignee string,
+		limit, offset int,
+	) ([]*memory.MemoryRecord, error)
 }
 
 // EvidenceProjectionCompletenessReader is the additive read-side extension
@@ -663,13 +735,15 @@ type PipelineMessage struct {
 	// local pipe. Imported work always receives a fresh local PipeID and keeps
 	// the peer's ID in SourcePipeID; outbound work names DestinationChainID so
 	// it can never become locally claimable even if agent IDs collide.
-	SourceChainID             string `json:"source_chain_id,omitempty"`
-	SourcePipeID              string `json:"source_pipe_id,omitempty"`
-	DestinationChainID        string `json:"destination_chain_id,omitempty"`
-	FederationPolicyEpoch     string `json:"federation_policy_epoch,omitempty"`
-	FederationAgreementID     string `json:"federation_agreement_id,omitempty"`
-	FederationContactID       string `json:"federation_contact_id,omitempty"`
-	FederationContactRevision string `json:"federation_contact_revision,omitempty"`
+	SourceChainID               string `json:"source_chain_id,omitempty"`
+	SourcePipeID                string `json:"source_pipe_id,omitempty"`
+	DestinationChainID          string `json:"destination_chain_id,omitempty"`
+	FederationPolicyEpoch       string `json:"federation_policy_epoch,omitempty"`
+	FederationAgreementID       string `json:"federation_agreement_id,omitempty"`
+	FederationContactID         string `json:"federation_contact_id,omitempty"`
+	FederationContactRevision   string `json:"federation_contact_revision,omitempty"`
+	FederationAuthorizationMode string `json:"federation_authorization_mode,omitempty"`
+	FederationLinkedRelation    []byte `json:"-"`
 }
 
 // PipelineStore defines the interface for agent-to-agent pipeline storage.
@@ -705,41 +779,45 @@ type PipelineAgentProof struct {
 // PipelineTransportOutbox is transport metadata attached to one authoritative
 // pipeline row. It is not a second inbox or public state machine.
 type PipelineTransportOutbox struct {
-	EventID         string
-	PipeID          string
-	RemoteChainID   string
-	EventKind       string
-	PolicyEpoch     string
-	AgreementID     string
-	ContactID       string
-	ContactRevision string
-	SourceAgentID   string
-	TargetAgentID   string
-	Proof           PipelineAgentProof
-	State           string
-	Attempts        int
-	NextAttemptAt   time.Time
-	CreatedAt       time.Time
-	ExpiresAt       time.Time
-	DeliveredAt     *time.Time
-	LastError       string
+	EventID           string
+	PipeID            string
+	RemoteChainID     string
+	EventKind         string
+	PolicyEpoch       string
+	AgreementID       string
+	ContactID         string
+	ContactRevision   string
+	AuthorizationMode string
+	LinkedRelation    []byte
+	SourceAgentID     string
+	TargetAgentID     string
+	Proof             PipelineAgentProof
+	State             string
+	Attempts          int
+	NextAttemptAt     time.Time
+	CreatedAt         time.Time
+	ExpiresAt         time.Time
+	DeliveredAt       *time.Time
+	LastError         string
 }
 
 type PipelineTransportDedup struct {
-	RemoteChainID   string
-	PolicyEpoch     string
-	AgreementID     string
-	ContactID       string
-	ContactRevision string
-	SourceAgentID   string
-	TargetAgentID   string
-	EventKind       string
-	RemotePipeID    string
-	ContentHash     []byte
-	ProofHash       []byte
-	LocalPipeID     string
-	Outcome         string
-	ExpiresAt       time.Time
+	RemoteChainID        string
+	PolicyEpoch          string
+	AgreementID          string
+	ContactID            string
+	ContactRevision      string
+	AuthorizationMode    string
+	LinkedRelationDigest string
+	SourceAgentID        string
+	TargetAgentID        string
+	EventKind            string
+	RemotePipeID         string
+	ContentHash          []byte
+	ProofHash            []byte
+	LocalPipeID          string
+	Outcome              string
+	ExpiresAt            time.Time
 }
 
 // PipelineDeliveryUpdate is a payload-free terminal transport notice for the

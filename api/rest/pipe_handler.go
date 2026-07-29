@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,6 +26,14 @@ type federatedPipeTargetResolver interface {
 	ResolveRemotePipeTarget(context.Context, string) (*federation.RemotePipeTarget, error)
 }
 
+type federatedLinkedPipeTargetResolver interface {
+	ResolveRemoteLinkedPipeTarget(
+		context.Context,
+		string,
+		string,
+	) (*federation.RemotePipeTarget, error)
+}
+
 type federatedPipeTransportNudger interface {
 	NudgePipelineTransport()
 }
@@ -43,6 +52,30 @@ func (s *Server) callerCanReachFederatedPipeTarget(ctx context.Context, callerID
 		return false
 	}
 	if !s.callerMayUseFederatedPipe(callerID) {
+		return false
+	}
+	if target.AuthorizationMode == federation.LinkedMessageAuthorizationMode {
+		relation := target.LinkedRelation
+		if relation == nil ||
+			relation.SourceAgentID != callerID ||
+			relation.TargetAgentID != target.AgentID {
+			return false
+		}
+		localChainID := s.federation.LocalChainID()
+		switch relation.Direction {
+		case federation.LinkedMessageMemberToGuest:
+			return relation.HostChainID == localChainID &&
+				relation.PeerChainID == target.ChainID &&
+				relation.Guest.RemoteAgentID == target.AgentID
+		case federation.LinkedMessageGuestToMember:
+			return relation.HostChainID == target.ChainID &&
+				relation.PeerChainID == localChainID &&
+				relation.Guest.RemoteAgentID == callerID
+		default:
+			return false
+		}
+	}
+	if target.AuthorizationMode != "" || target.LinkedRelation != nil {
 		return false
 	}
 	for _, domain := range target.Domains {
@@ -171,6 +204,16 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil, false
 		}
+		if isQualifiedFederatedPipeTarget(target) {
+			if linkedResolver, linkedOK := s.federation.(federatedLinkedPipeTargetResolver); linkedOK {
+				resolved, linkedErr := linkedResolver.ResolveRemoteLinkedPipeTarget(
+					r.Context(), middleware.ContextAgentID(r.Context()), target,
+				)
+				if linkedErr == nil && resolved != nil {
+					return resolved, true
+				}
+			}
+		}
 		resolved, err := resolver.ResolveRemotePipeTarget(r.Context(), target)
 		if err != nil {
 			if !errors.Is(err, federation.ErrRemotePipeTargetNotFound) || isQualifiedFederatedPipeTarget(target) {
@@ -204,9 +247,24 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.agentStore != nil {
 		if pub, err := auth.AgentIDToPublicKey(target); err == nil && auth.PublicKeyToAgentID(pub) == target {
-			if _, err := s.agentStore.GetAgent(r.Context(), target); err == nil {
-				writeJSON(w, http.StatusOK, map[string]any{"to_agent": target, "to_provider": "", "destination_chain_id": ""})
+			isRoot, rootErr := s.appV23IsRootIdentity(target)
+			if rootErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed", "Current CEREBRUM Root state is unavailable.")
 				return
+			}
+			if !isRoot {
+				if _, err := s.agentStore.GetAgent(r.Context(), target); err == nil {
+					active, activeErr := s.appV23ActiveOrdinaryAgent(target)
+					if activeErr != nil {
+						writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed",
+							"Current local enrollment state is unavailable.")
+						return
+					}
+					if active {
+						writeJSON(w, http.StatusOK, map[string]any{"to_agent": target, "to_provider": "", "destination_chain_id": ""})
+						return
+					}
+				}
 			}
 		} else {
 			agents, err := s.agentStore.ListAgents(r.Context())
@@ -215,14 +273,45 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			for _, agent := range agents {
-				if agent != nil && agent.Provider == target {
-					writeJSON(w, http.StatusOK, map[string]any{"to_agent": "", "to_provider": target, "destination_chain_id": ""})
+				if agent == nil {
+					continue
+				}
+				isRoot, rootErr := s.appV23IsRootIdentity(agent.AgentID)
+				if rootErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed", "Current CEREBRUM Root state is unavailable.")
 					return
+				}
+				if !isRoot && agent.Provider == target {
+					active, activeErr := s.appV23ActiveOrdinaryAgent(agent.AgentID)
+					if activeErr != nil {
+						writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed",
+							"Current local enrollment state is unavailable.")
+						return
+					}
+					if active {
+						writeJSON(w, http.StatusOK, map[string]any{"to_agent": "", "to_provider": target, "destination_chain_id": ""})
+						return
+					}
 				}
 			}
 			if agent, err := s.agentStore.GetAgentByName(r.Context(), target); err == nil && agent != nil {
-				writeJSON(w, http.StatusOK, map[string]any{"to_agent": agent.AgentID, "to_provider": "", "destination_chain_id": ""})
-				return
+				isRoot, rootErr := s.appV23IsRootIdentity(agent.AgentID)
+				if rootErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed", "Current CEREBRUM Root state is unavailable.")
+					return
+				}
+				if !isRoot {
+					active, activeErr := s.appV23ActiveOrdinaryAgent(agent.AgentID)
+					if activeErr != nil {
+						writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed",
+							"Current local enrollment state is unavailable.")
+						return
+					}
+					if active {
+						writeJSON(w, http.StatusOK, map[string]any{"to_agent": agent.AgentID, "to_provider": "", "destination_chain_id": ""})
+						return
+					}
+				}
 			}
 		}
 	}
@@ -270,6 +359,7 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			"Intent too large", fmt.Sprintf("intent exceeds the %d byte limit.", store.MaxPipeIntentBytes))
 		return
 	}
+	agentID := middleware.ContextAgentID(r.Context())
 
 	var remoteTarget *federation.RemotePipeTarget
 	qualifiedTarget := ""
@@ -294,9 +384,32 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var err error
-		remoteTarget, err = resolver.ResolveRemotePipeTarget(r.Context(), qualifiedTarget)
-		if err != nil {
-			s.writeRemotePipeTargetError(w, err)
+		if linkedResolver, linkedOK := s.federation.(federatedLinkedPipeTargetResolver); linkedOK {
+			remoteTarget, err = linkedResolver.ResolveRemoteLinkedPipeTarget(
+				r.Context(), agentID, qualifiedTarget,
+			)
+		}
+		if remoteTarget == nil || err != nil {
+			// An exact linked relation is caller-specific. If none exists,
+			// preserve the ordinary contact resolver and its historical error
+			// contract; never accept relation bytes supplied by the client.
+			remoteTarget, err = resolver.ResolveRemotePipeTarget(
+				r.Context(), qualifiedTarget,
+			)
+			if err != nil {
+				s.writeRemotePipeTargetError(w, err)
+				return
+			}
+		}
+		if remoteTarget.AuthorizationMode == federation.LinkedMessageAuthorizationMode {
+			if remoteTarget.LinkedRelation == nil {
+				writeProblem(w, http.StatusNotFound, "Unknown target",
+					fmt.Sprintf("no visible federated agent matches %q", qualifiedTarget))
+				return
+			}
+		} else if remoteTarget.AuthorizationMode != "" || remoteTarget.LinkedRelation != nil {
+			writeProblem(w, http.StatusNotFound, "Unknown target",
+				fmt.Sprintf("no visible federated agent matches %q", qualifiedTarget))
 			return
 		}
 		if !s.callerCanReachFederatedPipeTarget(r.Context(), middleware.ContextAgentID(r.Context()), remoteTarget) {
@@ -320,9 +433,30 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			// peer contact and its default-off acceptance state.
 		} else if req.ToAgent != "" {
 			// Direct agent_id — must exist
+			isRoot, rootErr := s.appV23IsRootIdentity(req.ToAgent)
+			if rootErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed", "Current CEREBRUM Root state is unavailable.")
+				return
+			}
+			if isRoot {
+				writeProblem(w, http.StatusNotFound, "Unknown target agent",
+					"That local agent is not registered.")
+				return
+			}
 			if _, err := s.agentStore.GetAgent(r.Context(), req.ToAgent); err != nil {
 				writeProblem(w, http.StatusNotFound, "Unknown target agent",
 					fmt.Sprintf("agent_id %s is not registered locally; federated sends require destination_chain_id", req.ToAgent))
+				return
+			}
+			active, activeErr := s.appV23ActiveOrdinaryAgent(req.ToAgent)
+			if activeErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed",
+					"Current local enrollment state is unavailable.")
+				return
+			}
+			if !active {
+				writeProblem(w, http.StatusNotFound, "Unknown target agent",
+					"That local agent is not registered.")
 				return
 			}
 		} else if req.ToProvider != "" {
@@ -331,15 +465,52 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				found := false
 				for _, a := range agents {
-					if a.Provider == req.ToProvider {
-						found = true
-						break
+					if a == nil {
+						continue
+					}
+					isRoot, rootErr := s.appV23IsRootIdentity(a.AgentID)
+					if rootErr != nil {
+						writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed", "Current CEREBRUM Root state is unavailable.")
+						return
+					}
+					if !isRoot && a.Provider == req.ToProvider {
+						active, activeErr := s.appV23ActiveOrdinaryAgent(a.AgentID)
+						if activeErr != nil {
+							writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed",
+								"Current local enrollment state is unavailable.")
+							return
+						}
+						if active {
+							found = true
+							break
+						}
 					}
 				}
 				if !found {
 					// Also try as agent name
 					if agent, _ := s.agentStore.GetAgentByName(r.Context(), req.ToProvider); agent != nil {
-						// Resolve name → agent_id for direct delivery
+						isRoot, rootErr := s.appV23IsRootIdentity(agent.AgentID)
+						if rootErr != nil {
+							writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed", "Current CEREBRUM Root state is unavailable.")
+							return
+						}
+						if isRoot {
+							writeProblem(w, http.StatusNotFound, "Unknown target",
+								fmt.Sprintf("no registered local agent named %q; resolve federated targets before sending", req.ToProvider))
+							return
+						}
+						active, activeErr := s.appV23ActiveOrdinaryAgent(agent.AgentID)
+						if activeErr != nil {
+							writeProblem(w, http.StatusServiceUnavailable, "Target resolution failed",
+								"Current local enrollment state is unavailable.")
+							return
+						}
+						if !active {
+							writeProblem(w, http.StatusNotFound, "Unknown target",
+								fmt.Sprintf("no registered local agent named %q; resolve federated targets before sending", req.ToProvider))
+							return
+						}
+						// Resolve name → agent_id for direct delivery.
 						req.ToAgent = agent.AgentID
 						req.ToProvider = ""
 					} else {
@@ -359,8 +530,6 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 	if ttl > 1440 {
 		ttl = 1440
 	}
-
-	agentID := middleware.ContextAgentID(r.Context())
 
 	// Look up sender's provider from agent registry
 	fromProvider := ""
@@ -413,6 +582,16 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 		msg.FederationAgreementID = remoteTarget.AgreementID
 		msg.FederationContactID = remoteTarget.ContactID
 		msg.FederationContactRevision = remoteTarget.ContactRevision
+		msg.FederationAuthorizationMode = remoteTarget.AuthorizationMode
+		if remoteTarget.AuthorizationMode == federation.LinkedMessageAuthorizationMode {
+			var err error
+			msg.FederationLinkedRelation, err = json.Marshal(remoteTarget.LinkedRelation)
+			if err != nil {
+				writeProblem(w, http.StatusBadGateway, "Federated agent lookup failed",
+					"The exact linked-agent authorization could not be encoded.")
+				return
+			}
+		}
 	}
 
 	var insertErr error
@@ -427,7 +606,9 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			RemoteChainID: msg.DestinationChainID, EventKind: "send",
 			PolicyEpoch: msg.FederationPolicyEpoch, AgreementID: msg.FederationAgreementID,
 			ContactID: msg.FederationContactID, ContactRevision: msg.FederationContactRevision,
-			SourceAgentID: msg.FromAgent, TargetAgentID: msg.ToAgent,
+			AuthorizationMode: msg.FederationAuthorizationMode,
+			LinkedRelation:    append([]byte(nil), msg.FederationLinkedRelation...),
+			SourceAgentID:     msg.FromAgent, TargetAgentID: msg.ToAgent,
 			Proof:     transportProof,
 			CreatedAt: msg.CreatedAt, ExpiresAt: msg.ExpiresAt,
 		}
@@ -731,7 +912,9 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 			RemoteChainID: msg.SourceChainID, EventKind: "result", PolicyEpoch: msg.FederationPolicyEpoch,
 			AgreementID: msg.FederationAgreementID, ContactID: msg.FederationContactID,
 			ContactRevision: msg.FederationContactRevision, SourceAgentID: agentID,
-			TargetAgentID: msg.FromAgent, Proof: transportProof, CreatedAt: created,
+			AuthorizationMode: msg.FederationAuthorizationMode,
+			LinkedRelation:    append([]byte(nil), msg.FederationLinkedRelation...),
+			TargetAgentID:     msg.FromAgent, Proof: transportProof, CreatedAt: created,
 			ExpiresAt: created.Add(24 * time.Hour),
 		}
 		authorizer := s.federation.(federatedPipeAdmissionAuthorizer)

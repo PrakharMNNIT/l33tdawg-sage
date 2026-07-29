@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/store"
 )
 
@@ -220,7 +222,7 @@ func TestPeerRBACUpgradeFreezesVerifiedLegacyHostWithoutRepair(t *testing.T) {
 	}
 }
 
-func peerRBACQuery(t *testing.T, m *Manager, agreement *store.CrossFedRecord, chainID, agentID, domain, text string) *httptest.ResponseRecorder {
+func rawPeerRBACQuery(t *testing.T, m *Manager, agreement *store.CrossFedRecord, chainID, agentID, domain, text string) *httptest.ResponseRecorder {
 	t.Helper()
 	body, err := json.Marshal(QueryRequest{Mode: ModeText, Query: text, DomainTag: domain, TopK: 10})
 	if err != nil {
@@ -235,21 +237,179 @@ func peerRBACQuery(t *testing.T, m *Manager, agreement *store.CrossFedRecord, ch
 	return rec
 }
 
+// peerRBACV23Request constructs the complete app-v23 disclosure envelope used
+// by the policy-race tests. The original local-agent proof, durable challenge,
+// exact agreement generation, local linked-reader row, and peer policy are all
+// real; only the HTTP peer-auth middleware is replaced by peerIdentity context.
+func peerRBACV23Request(
+	t *testing.T,
+	m *Manager,
+	ss *store.SQLiteStore,
+	agreement *store.CrossFedRecord,
+	chainID, bindingPeerID, requestPeerID, domain, text string,
+) *http.Request {
+	t.Helper()
+	ctx := context.Background()
+	root, rootErr := m.badger.GetAppV23Root()
+	if rootErr != nil {
+		t.Fatal(rootErr)
+	}
+	if root == nil {
+		companionPub, _, keyErr := ed25519.GenerateKey(rand.Reader)
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		if err := m.badger.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+			RootID: hex.EncodeToString(m.agentPub), Scope: "peer-rbac-test-" + m.localChainID,
+			AgentID: hex.EncodeToString(companionPub), Profile: store.AppV23ProfileStandard,
+			HomeDomain: "peer-rbac-test-local", Clearance: 1, Capabilities: 0,
+			Height: 1, BootstrapDigest: hex.EncodeToString(bytes.Repeat([]byte{0x23}, 32)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.federatedGuestStore = ss
+	m.queryChallengeStore = ss
+	m.postV23ForNextTx = func() bool { return true }
+	resolver, ok := m.localGroupResolver.(v23GroupResolverFake)
+	if !ok {
+		resolver = v23GroupResolverFake{"peer-rbac-v23-readers": {}}
+		m.localGroupResolver = resolver
+	}
+	if resolver["peer-rbac-v23-readers"] == nil {
+		resolver["peer-rbac-v23-readers"] = map[string]bool{}
+	}
+	resolver["peer-rbac-v23-readers"][domain] = true
+	if !m.seedEstablished(chainID) || len(m.seedCandidates(chainID)) == 0 {
+		seed := bytes.Repeat([]byte{0x42}, 32)
+		commit, rollback, stageErr := m.stageSeed(chainID, seed, seed, time.Now().Unix())
+		if stageErr != nil {
+			t.Fatal(stageErr)
+		}
+		t.Cleanup(rollback)
+		if err := commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	digest, digestErr := m.agreementBindingDigestV23(ctx, agreement, bindingPeerID)
+	if digestErr != nil {
+		t.Fatal(digestErr)
+	}
+	callerID := hex.EncodeToString(m.agentPub)
+	existing, guestErr := ss.GetFederatedGroupGuest(
+		ctx, "peer-rbac-v23-readers", chainID, callerID,
+	)
+	if guestErr != nil {
+		t.Fatal(guestErr)
+	}
+	revision := int64(1)
+	if existing != nil {
+		revision = existing.Revision + 1
+	}
+	guest := store.FederatedGroupGuest{
+		GroupID: "peer-rbac-v23-readers", RemoteChainID: chainID,
+		RemoteAgentID: callerID, AgreementBindingDigest: digest,
+		MaxClassification: 4, Revision: revision,
+		State: store.FederatedGuestStateActive,
+	}
+	if err := store.SignFederatedGroupGuest(&guest, m.agentKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.PutFederatedGroupGuest(ctx, guest); err != nil {
+		t.Fatal(err)
+	}
+	challengeBytes := make([]byte, 32)
+	if _, err := rand.Read(challengeBytes); err != nil {
+		t.Fatal(err)
+	}
+	challenge := hex.EncodeToString(challengeBytes)
+	if err := ss.IssueFederatedQueryChallenge(ctx, store.FederatedQueryChallenge{
+		ChallengeID: challenge, RemoteChainID: chainID, PeerAgentID: bindingPeerID,
+		RequestedAgentID: callerID, DomainTag: domain,
+		AgreementBindingDigest: digest, ExpiresAt: time.Now().Add(time.Minute).Unix(),
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	signedBody, signedBodyErr := json.Marshal(map[string]any{
+		"query": text, "domain_tag": domain, "top_k": 10,
+		"federated": true, "federate_chains": []string{m.localChainID},
+		"federation_context": map[string]any{
+			"source_chain_id":    chainID,
+			"agreement_bindings": map[string]string{m.localChainID: digest},
+			"query_challenges":   map[string]string{m.localChainID: challenge},
+		},
+	})
+	if signedBodyErr != nil {
+		t.Fatal(signedBodyErr)
+	}
+	now := time.Now().Unix()
+	nonce := []byte("12345678")
+	query := QueryRequest{
+		ProtocolVersion: FederationProtocolV23, SourceChainID: chainID,
+		DestinationChainID: m.localChainID, AgreementBindingDigest: digest,
+		QueryChallenge: challenge, Mode: ModeText, Query: text,
+		DomainTag: domain, TopK: 10,
+		AgentProof: &QueryAgentProof{
+			AgentID: callerID,
+			Signature: auth.SignRequestWithNonce(
+				m.agentKey, http.MethodPost, "/v1/memory/search", signedBody, now, nonce,
+			),
+			Timestamp: now, Nonce: nonce,
+			CanonicalRequest: append([]byte("POST /v1/memory/search\n"), signedBody...),
+		},
+	}
+	body, bodyErr := json.Marshal(query)
+	if bodyErr != nil {
+		t.Fatal(bodyErr)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/fed/v1/query", bytes.NewReader(body))
+	return req.WithContext(context.WithValue(req.Context(), peerCtxKey{}, &peerIdentity{
+		ChainID: chainID, AgentID: requestPeerID, Agreement: agreement,
+	}))
+}
+
+func peerRBACQueryForPeer(
+	t *testing.T,
+	m *Manager,
+	ss *store.SQLiteStore,
+	agreement *store.CrossFedRecord,
+	chainID, bindingPeerID, requestPeerID, domain, text string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	req := peerRBACV23Request(
+		t, m, ss, agreement, chainID, bindingPeerID, requestPeerID, domain, text,
+	)
+	rec := httptest.NewRecorder()
+	m.handleQuery(rec, req)
+	return rec
+}
+
+func peerRBACQuery(
+	t *testing.T,
+	m *Manager,
+	ss *store.SQLiteStore,
+	agreement *store.CrossFedRecord,
+	chainID, agentID, domain, text string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	return peerRBACQueryForPeer(
+		t, m, ss, agreement, chainID, agentID, agentID, domain, text,
+	)
+}
+
 func TestPeerRBACQueryAuthoritativeDynamicReadAndWrongAgent(t *testing.T) {
 	m, ss, bs := newDrainTestManager(t)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", []string{"legacy.only"}, 4)
 	seedCommitted(t, ss, "rbac-memory", "rbac.shared", "directional peer rbac content")
-	if err := bs.SetMemoryClassification("rbac-memory", 0); err != nil {
-		t.Fatal(err)
-	}
+	publishFederationSQLiteTestRecord(t, ss, bs, "rbac-memory", 0)
 	if _, err := m.ReplacePeerRBACPolicy(context.Background(), "chain-peer", []store.PeerRBACDomainPermission{
 		{Domain: "rbac", Read: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	allowed := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "rbac.shared", "directional")
+	allowed := peerRBACQuery(t, m, ss, agreement, "chain-peer", peerID, "rbac.shared", "directional")
 	if allowed.Code != http.StatusOK {
 		t.Fatalf("RBAC read outside legacy tx-33 domain denied: %d %s", allowed.Code, allowed.Body.String())
 	}
@@ -261,7 +421,7 @@ func TestPeerRBACQueryAuthoritativeDynamicReadAndWrongAgent(t *testing.T) {
 	if err != nil || paused == nil || !paused.Paused || len(paused.Domains) != 1 {
 		t.Fatalf("pause result=%+v err=%v", paused, err)
 	}
-	deniedWhilePaused := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "rbac.shared", "directional")
+	deniedWhilePaused := peerRBACQuery(t, m, ss, agreement, "chain-peer", peerID, "rbac.shared", "directional")
 	if deniedWhilePaused.Code != http.StatusForbidden {
 		t.Fatalf("paused read status=%d, want 403", deniedWhilePaused.Code)
 	}
@@ -273,12 +433,15 @@ func TestPeerRBACQueryAuthoritativeDynamicReadAndWrongAgent(t *testing.T) {
 	if err != nil || resumed == nil || resumed.Paused || len(resumed.Domains) != 1 {
 		t.Fatalf("resume result=%+v err=%v", resumed, err)
 	}
-	allowedAgain := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "rbac.shared", "directional")
+	allowedAgain := peerRBACQuery(t, m, ss, agreement, "chain-peer", peerID, "rbac.shared", "directional")
 	if allowedAgain.Code != http.StatusOK {
 		t.Fatalf("resumed read status=%d body=%s", allowedAgain.Code, allowedAgain.Body.String())
 	}
 
-	wrongAgent := peerRBACQuery(t, m, agreement, "chain-peer", newPeerOperatorID(t), "rbac.shared", "directional")
+	wrongAgent := peerRBACQueryForPeer(
+		t, m, ss, agreement, "chain-peer", peerID, newPeerOperatorID(t),
+		"rbac.shared", "directional",
+	)
 	if wrongAgent.Code != http.StatusForbidden {
 		t.Fatalf("wrong operator status = %d, want 403", wrongAgent.Code)
 	}
@@ -288,7 +451,7 @@ func TestPeerRBACQueryAuthoritativeDynamicReadAndWrongAgent(t *testing.T) {
 	if _, err := m.ReplacePeerRBACPolicy(context.Background(), "chain-peer", nil); err != nil {
 		t.Fatal(err)
 	}
-	denied := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "rbac.shared", "directional")
+	denied := peerRBACQuery(t, m, ss, agreement, "chain-peer", peerID, "rbac.shared", "directional")
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("configured empty policy status = %d, want 403", denied.Code)
 	}
@@ -302,9 +465,7 @@ func TestPeerRBACQueryPropagatesRecoveredEvidenceLowerBound(t *testing.T) {
 	)
 	const memoryID = "rbac-recovered-evidence"
 	seedCommitted(t, ss, memoryID, "rbac.shared", "recovered evidence content")
-	if err := bs.SetMemoryClassification(memoryID, 0); err != nil {
-		t.Fatal(err)
-	}
+	publishFederationSQLiteTestRecord(t, ss, bs, memoryID, 0)
 	if _, err := m.ReplacePeerRBACPolicy(context.Background(), "chain-peer", []store.PeerRBACDomainPermission{
 		{Domain: "rbac", Read: true},
 	}); err != nil {
@@ -325,7 +486,7 @@ func TestPeerRBACQueryPropagatesRecoveredEvidenceLowerBound(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "rbac.shared", "recovered")
+	rec := peerRBACQuery(t, m, ss, agreement, "chain-peer", peerID, "rbac.shared", "recovered")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("query status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -367,10 +528,8 @@ func TestIncompleteV3PeerBindingNeverFallsBackToLegacyRead(t *testing.T) {
 		t.Fatalf("incomplete v3 binding error=%v, want binding mismatch", err)
 	}
 	seedCommitted(t, ss, "legacy-memory", "legacy.shared", "must not escape through fallback")
-	if err := bs.SetMemoryClassification("legacy-memory", 0); err != nil {
-		t.Fatal(err)
-	}
-	denied := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "legacy.shared", "escape")
+	publishFederationSQLiteTestRecord(t, ss, bs, "legacy-memory", 0)
+	denied := rawPeerRBACQuery(t, m, agreement, "chain-peer", peerID, "legacy.shared", "escape")
 	if denied.Code == http.StatusOK {
 		t.Fatalf("incomplete v3 binding fell back to tx-33: %s", denied.Body.String())
 	}
@@ -381,20 +540,14 @@ func TestPeerRBACReadRevokeWaitsForInFlightResponse(t *testing.T) {
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 	seedCommitted(t, ss, "rbac-memory", "rbac.shared", "leased read response")
-	if err := bs.SetMemoryClassification("rbac-memory", 0); err != nil {
-		t.Fatal(err)
-	}
+	publishFederationSQLiteTestRecord(t, ss, bs, "rbac-memory", 0)
 	if _, err := m.ReplacePeerRBACPolicy(context.Background(), "chain-peer", []store.PeerRBACDomainPermission{{Domain: "rbac", Read: true}}); err != nil {
 		t.Fatal(err)
 	}
-	body, err := json.Marshal(QueryRequest{Mode: ModeText, Query: "leased", DomainTag: "rbac.shared", TopK: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/fed/v1/query", bytes.NewReader(body))
-	req = req.WithContext(context.WithValue(req.Context(), peerCtxKey{}, &peerIdentity{
-		ChainID: "chain-peer", AgentID: peerID, Agreement: agreement,
-	}))
+	req := peerRBACV23Request(
+		t, m, ss, agreement, "chain-peer", peerID, peerID,
+		"rbac.shared", "leased",
+	)
 	bw := newBlockingResponseWriter()
 	served := make(chan struct{})
 	go func() {
@@ -425,7 +578,13 @@ func TestPeerRBACReadRevokeWaitsForInFlightResponse(t *testing.T) {
 	if bw.status != http.StatusOK {
 		t.Fatalf("authorized in-flight response status=%d", bw.status)
 	}
-	denied := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "rbac.shared", "leased")
+	var inFlight QueryResponse
+	if err := json.Unmarshal(bw.body.Bytes(), &inFlight); err != nil ||
+		len(inFlight.Results) != 1 ||
+		inFlight.Results[0].MemoryID != "rbac-memory" {
+		t.Fatalf("authorized in-flight response=%+v err=%v", inFlight, err)
+	}
+	denied := peerRBACQuery(t, m, ss, agreement, "chain-peer", peerID, "rbac.shared", "leased")
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("post-revoke query status=%d want 403", denied.Code)
 	}
@@ -436,20 +595,14 @@ func TestPeerRBACPauseWaitsForInFlightReadAndDeniesNextRequest(t *testing.T) {
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-pause", peerID, "host", nil, 4)
 	seedCommitted(t, ss, "pause-memory", "rbac.shared", "leased pause response")
-	if err := bs.SetMemoryClassification("pause-memory", 0); err != nil {
-		t.Fatal(err)
-	}
+	publishFederationSQLiteTestRecord(t, ss, bs, "pause-memory", 0)
 	if _, err := m.ReplacePeerRBACPolicy(context.Background(), "chain-pause", []store.PeerRBACDomainPermission{{Domain: "rbac", Read: true}}); err != nil {
 		t.Fatal(err)
 	}
-	body, err := json.Marshal(QueryRequest{Mode: ModeText, Query: "leased", DomainTag: "rbac.shared", TopK: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/fed/v1/query", bytes.NewReader(body))
-	req = req.WithContext(context.WithValue(req.Context(), peerCtxKey{}, &peerIdentity{
-		ChainID: "chain-pause", AgentID: peerID, Agreement: agreement,
-	}))
+	req := peerRBACV23Request(
+		t, m, ss, agreement, "chain-pause", peerID, peerID,
+		"rbac.shared", "leased",
+	)
 	bw := newBlockingResponseWriter()
 	served := make(chan struct{})
 	go func() {
@@ -480,7 +633,13 @@ func TestPeerRBACPauseWaitsForInFlightReadAndDeniesNextRequest(t *testing.T) {
 	if bw.status != http.StatusOK {
 		t.Fatalf("authorized in-flight response status=%d", bw.status)
 	}
-	denied := peerRBACQuery(t, m, agreement, "chain-pause", peerID, "rbac.shared", "leased")
+	var inFlight QueryResponse
+	if err := json.Unmarshal(bw.body.Bytes(), &inFlight); err != nil ||
+		len(inFlight.Results) != 1 ||
+		inFlight.Results[0].MemoryID != "pause-memory" {
+		t.Fatalf("authorized in-flight response=%+v err=%v", inFlight, err)
+	}
+	denied := peerRBACQuery(t, m, ss, agreement, "chain-pause", peerID, "rbac.shared", "leased")
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("post-pause query status=%d want 403", denied.Code)
 	}
@@ -508,14 +667,12 @@ func TestPeerRBACQueryLegacyFallbackAndClassificationCeiling(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedCommitted(t, ss, "legacy-memory", "legacy.shared", "legacy fallback content")
-	if err := bs.SetMemoryClassification("legacy-memory", 0); err != nil {
-		t.Fatal(err)
+	publishFederationSQLiteTestRecord(t, ss, bs, "legacy-memory", 0)
+	legacy := rawPeerRBACQuery(t, m, agreement, "chain-peer", peerID, "legacy.shared", "fallback")
+	if legacy.Code != http.StatusForbidden {
+		t.Fatalf("app-v23 accepted an unsigned legacy query: status=%d body=%s", legacy.Code, legacy.Body.String())
 	}
-	legacy := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "legacy.shared", "fallback")
-	if legacy.Code != http.StatusOK {
-		t.Fatalf("legacy fallback status = %d body=%s", legacy.Code, legacy.Body.String())
-	}
-	wrongOperator := peerRBACQuery(t, m, agreement, "chain-peer", newPeerOperatorID(t), "legacy.shared", "fallback")
+	wrongOperator := rawPeerRBACQuery(t, m, agreement, "chain-peer", newPeerOperatorID(t), "legacy.shared", "fallback")
 	if wrongOperator.Code != http.StatusForbidden {
 		t.Fatalf("legacy fallback accepted a non-ceremony operator: status=%d body=%s", wrongOperator.Code, wrongOperator.Body.String())
 	}
@@ -528,7 +685,7 @@ func TestPeerRBACQueryLegacyFallbackAndClassificationCeiling(t *testing.T) {
 	if err := bs.SetMemoryClassification("legacy-memory", 1); err != nil {
 		t.Fatal(err)
 	}
-	ceiling := peerRBACQuery(t, m, agreement, "chain-peer", peerID, "legacy.shared", "fallback")
+	ceiling := peerRBACQuery(t, m, ss, agreement, "chain-peer", peerID, "legacy.shared", "fallback")
 	if ceiling.Code != http.StatusOK {
 		t.Fatalf("classification query status = %d", ceiling.Code)
 	}
@@ -564,9 +721,7 @@ func TestLegacyQueryAndStatusReleasedAfterCompletedRevokeAreDenied(t *testing.T)
 			}
 			if endpoint == "query" {
 				seedCommitted(t, ss, "legacy-revoke-memory", "legacy.shared", "stale treaty must not disclose this")
-				if err := bs.SetMemoryClassification("legacy-revoke-memory", 0); err != nil {
-					t.Fatal(err)
-				}
+				publishFederationSQLiteTestRecord(t, ss, bs, "legacy-revoke-memory", 0)
 			}
 
 			blocked := &blockingPeerValueContext{

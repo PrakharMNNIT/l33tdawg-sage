@@ -92,6 +92,21 @@ func canonicalAgentIDFromPrefixedKey(key, prefix []byte) (string, bool) {
 // budget. Later claims and blocks continue deterministic expiry-order pruning.
 const maxScopedAgentProofPrunePerClaim = 8
 
+type authorizationMutationHookState struct {
+	mu   sync.RWMutex
+	hook func(remoteChainID string) func()
+}
+
+func (s *authorizationMutationHookState) acquire() (
+	func(string) func(), func(),
+) {
+	if s == nil {
+		return nil, func() {}
+	}
+	s.mu.RLock()
+	return s.hook, s.mu.RUnlock
+}
+
 // BadgerStore manages on-chain state in BadgerDB.
 type BadgerStore struct {
 	db *badger.DB
@@ -104,6 +119,14 @@ type BadgerStore struct {
 	// event is crossing the network under the old access decision.
 	domainOwnershipGate    *sync.RWMutex
 	domainOwnershipMutated bool
+	authorizationMutated   bool
+	authorizationPeers     map[string]struct{}
+	// authorizationMutationHook lets the federation transport publish and
+	// cancel a bounded linked-message delivery before consensus authorization
+	// changes become visible. It returns a release callback and deliberately
+	// keeps this store independent of the federation package.
+	// An empty remoteChainID denotes a node-global authorization mutation.
+	authorizationMutationHooks *authorizationMutationHookState
 
 	// Startup index repair is constructor-local, but the exported Ensure
 	// methods remain safe if an operator tool calls them concurrently. The
@@ -111,6 +134,13 @@ type BadgerStore struct {
 	// progress keys before either sidecar is trusted.
 	indexBackfillMu                    sync.Mutex
 	legacyIndexBackfillMarkersScrubbed bool
+
+	// appV23MigrationMu serializes construction of the crash-recoverable
+	// pre-activation migration stage. Transaction-scoped clones share the
+	// pointer: the stage is written durably outside the speculative block
+	// transaction, then atomically promoted by its activation marker.
+	appV23MigrationMu    *sync.Mutex
+	appV23StageFaultHook func(int) error
 
 	// txn is non-nil only on a transaction-scoped clone returned by
 	// BeginConsensusTransaction. Keeping the transaction on a clone (rather
@@ -230,11 +260,16 @@ func (s *BadgerStore) BeginConsensusTransaction(mutationHook func(int)) *BadgerS
 		panic("store: nested consensus transaction")
 	}
 	return &BadgerStore{
-		db:                     s.db,
-		domainOwnershipGate:    s.domainOwnershipGate,
-		txn:                    s.db.NewTransaction(true),
-		mutationHook:           mutationHook,
-		domainOwnershipMutated: false,
+		db:                         s.db,
+		domainOwnershipGate:        s.domainOwnershipGate,
+		appV23MigrationMu:          s.appV23MigrationMu,
+		appV23StageFaultHook:       s.appV23StageFaultHook,
+		authorizationMutationHooks: s.authorizationMutationHooks,
+		txn:                        s.db.NewTransaction(true),
+		mutationHook:               mutationHook,
+		domainOwnershipMutated:     false,
+		authorizationMutated:       false,
+		authorizationPeers:         make(map[string]struct{}),
 	}
 }
 
@@ -251,6 +286,83 @@ func (s *BadgerStore) LockDomainOwnershipRead() func() {
 	return s.domainOwnershipGate.RUnlock
 }
 
+// WithOrderedPublicationBarrier executes a legacy in-place state transition
+// under the same global lock order used by post-app-v20 Commit:
+// authorization/delivery leases -> domain ownership -> caller publication.
+// The callback receives a shallow store handle whose nested governed writes
+// bypass those two already-held process gates; it shares the same Badger DB and
+// all other state. The handle must not escape the callback.
+//
+// This exists for the historical pre-app-v20 FinalizeBlock path, which mutates
+// Badger incrementally. Taking the caller's runtime lock first would deadlock
+// with bounded federation readers that already hold a domain/delivery lease
+// and then inspect an application-version gate.
+func (s *BadgerStore) WithOrderedPublicationBarrier(
+	acquirePublication func() func(),
+	fn func(*BadgerStore) error,
+) error {
+	if s == nil || fn == nil {
+		return errors.New("store: ordered publication barrier requires a store and callback")
+	}
+	if s.txn != nil {
+		return errors.New("store: ordered publication barrier is unavailable inside a consensus transaction")
+	}
+
+	releaseAuthorization := func() {}
+	hook, releaseHookState := s.authorizationMutationHooks.acquire()
+	defer releaseHookState()
+	if hook != nil {
+		releaseAuthorization = hook("")
+		if releaseAuthorization == nil {
+			return errors.New("store: authorization publication hook returned a nil release function")
+		}
+	}
+	defer releaseAuthorization()
+
+	if s.domainOwnershipGate != nil {
+		s.domainOwnershipGate.Lock()
+		defer s.domainOwnershipGate.Unlock()
+	}
+
+	if acquirePublication != nil {
+		releasePublication := acquirePublication()
+		if releasePublication == nil {
+			return errors.New("store: publication lock returned a nil release function")
+		}
+		defer releasePublication()
+	}
+
+	// Construct the barrier-scoped handle field-by-field. Copying BadgerStore
+	// by value also copies indexBackfillMu after first use, which is invalid and
+	// caught by go vet. Only immutable/shared dependencies belong on this
+	// non-transactional nested handle; the outer function already owns the
+	// publication and authorization locks.
+	scoped := &BadgerStore{
+		db:                         s.db,
+		domainOwnershipGate:        nil,
+		authorizationMutationHooks: &authorizationMutationHookState{},
+		appV23MigrationMu:          s.appV23MigrationMu,
+		appV23StageFaultHook:       s.appV23StageFaultHook,
+	}
+	return fn(scoped)
+}
+
+// SetAuthorizationMutationHook installs the process-local publication hook
+// used by app-v23 federation. Configure it during startup, before concurrent
+// consensus execution begins.
+func (s *BadgerStore) SetAuthorizationMutationHook(
+	hook func(remoteChainID string) func(),
+) {
+	if s != nil {
+		if s.authorizationMutationHooks == nil {
+			s.authorizationMutationHooks = &authorizationMutationHookState{}
+		}
+		s.authorizationMutationHooks.mu.Lock()
+		s.authorizationMutationHooks.hook = hook
+		s.authorizationMutationHooks.mu.Unlock()
+	}
+}
+
 func (s *BadgerStore) withDomainOwnershipMutation(fn func() error) error {
 	if s.txn != nil {
 		s.domainOwnershipMutated = true
@@ -264,6 +376,46 @@ func (s *BadgerStore) withDomainOwnershipMutation(fn func() error) error {
 	return fn()
 }
 
+func (s *BadgerStore) withFederationAuthorizationMutation(
+	fn func() error,
+) error {
+	if s.txn != nil {
+		s.authorizationMutated = true
+		return s.withDomainOwnershipMutation(fn)
+	}
+	releaseAuthorization := func() {}
+	hook, releaseHookState := s.authorizationMutationHooks.acquire()
+	defer releaseHookState()
+	if hook != nil {
+		releaseAuthorization = hook("")
+	}
+	defer releaseAuthorization()
+	return s.withDomainOwnershipMutation(fn)
+}
+
+func (s *BadgerStore) withPeerFederationAuthorizationMutation(
+	remoteChainID string, fn func() error,
+) error {
+	if remoteChainID == "" {
+		return s.withFederationAuthorizationMutation(fn)
+	}
+	if s.txn != nil {
+		if s.authorizationPeers == nil {
+			s.authorizationPeers = make(map[string]struct{})
+		}
+		s.authorizationPeers[remoteChainID] = struct{}{}
+		return s.withDomainOwnershipMutation(fn)
+	}
+	releaseAuthorization := func() {}
+	hook, releaseHookState := s.authorizationMutationHooks.acquire()
+	defer releaseHookState()
+	if hook != nil {
+		releaseAuthorization = hook(remoteChainID)
+	}
+	defer releaseAuthorization()
+	return s.withDomainOwnershipMutation(fn)
+}
+
 // InConsensusTransaction reports whether this handle is the transaction-scoped
 // clone used by the app-v20 FinalizeBlock/Commit boundary. It lets the ABCI layer
 // apply post-fork full-record limits without changing historical store behavior.
@@ -273,6 +425,30 @@ func (s *BadgerStore) InConsensusTransaction() bool {
 
 // CommitConsensusTransaction atomically publishes every staged mutation.
 func (s *BadgerStore) CommitConsensusTransaction() error {
+	return s.CommitConsensusTransactionWithPublication(nil, nil, nil)
+}
+
+// CommitConsensusTransactionWithPublication publishes a speculative consensus
+// transaction and a caller-owned runtime view under one explicit lock order:
+// federation authorization leases -> domain ownership gate -> runtime
+// publication gate. acquirePublication must return its unlock function. The
+// store acquires it before beforeCommit runs or txn.Commit makes any staged key
+// visible, holds it through Sync, invokes publish only after durability
+// succeeds, then releases it before the domain/authorization leases.
+//
+// This shape prevents mixed durable/runtime views and the inverse-order
+// deadlock that would occur if the caller took its runtime gate before a
+// federated request released the domain read lease. A nil acquire/publish pair
+// preserves the standalone store contract used outside SageApp. The SQL mirror
+// is necessarily a separate database: SageApp flushes it in beforeCommit, and
+// every app-v23 content-serving path additionally calls
+// ValidateMemoryProjection so a pre-Badger or crash-orphaned row stays hidden
+// until replay publishes the exact canonical snapshot.
+func (s *BadgerStore) CommitConsensusTransactionWithPublication(
+	acquirePublication func() func(),
+	beforeCommit func() error,
+	publish func(),
+) error {
 	if s.txn == nil {
 		return errors.New("store: no consensus transaction to commit")
 	}
@@ -281,9 +457,49 @@ func (s *BadgerStore) CommitConsensusTransaction() error {
 		s.DiscardConsensusTransaction()
 		return err
 	}
-	if s.domainOwnershipMutated && s.domainOwnershipGate != nil {
-		s.domainOwnershipGate.Lock()
-		defer s.domainOwnershipGate.Unlock()
+	if s.authorizationMutated || len(s.authorizationPeers) > 0 {
+		releaseAuthorization := func() {}
+		hook, releaseHookState := s.authorizationMutationHooks.acquire()
+		defer releaseHookState()
+		if hook != nil {
+			if s.authorizationMutated {
+				releaseAuthorization = hook("")
+			} else {
+				remoteChainIDs := make([]string, 0, len(s.authorizationPeers))
+				for remoteChainID := range s.authorizationPeers {
+					remoteChainIDs = append(remoteChainIDs, remoteChainID)
+				}
+				sort.Strings(remoteChainIDs)
+				releases := make([]func(), 0, len(remoteChainIDs))
+				for _, remoteChainID := range remoteChainIDs {
+					releases = append(releases, hook(remoteChainID))
+				}
+				releaseAuthorization = func() {
+					for i := len(releases) - 1; i >= 0; i-- {
+						releases[i]()
+					}
+				}
+			}
+		}
+		defer releaseAuthorization()
+	}
+	if s.domainOwnershipMutated {
+		if s.domainOwnershipGate != nil {
+			s.domainOwnershipGate.Lock()
+			defer s.domainOwnershipGate.Unlock()
+		}
+	}
+	if acquirePublication != nil {
+		releasePublication := acquirePublication()
+		if releasePublication == nil {
+			return errors.New("store: consensus publication lock returned a nil release function")
+		}
+		defer releasePublication()
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			return err
+		}
 	}
 	if err := s.txn.Commit(); err != nil {
 		return err
@@ -295,6 +511,9 @@ func (s *BadgerStore) CommitConsensusTransaction() error {
 	// boundary.
 	if err := s.db.Sync(); err != nil {
 		return fmt.Errorf("sync consensus transaction: %w", err)
+	}
+	if publish != nil {
+		publish()
 	}
 	return nil
 }
@@ -345,7 +564,12 @@ func NewBadgerStore(path string) (*BadgerStore, error) {
 		return nil, fmt.Errorf("open badger: %w", err)
 	}
 
-	store := &BadgerStore{db: db, domainOwnershipGate: &sync.RWMutex{}}
+	store := &BadgerStore{
+		db:                         db,
+		domainOwnershipGate:        &sync.RWMutex{},
+		appV23MigrationMu:          &sync.Mutex{},
+		authorizationMutationHooks: &authorizationMutationHookState{},
+	}
 
 	// Backfill the multi-org agent→orgs reverse index from the authoritative
 	// org_member forward index. Cheap, idempotent — required for in-place
@@ -380,7 +604,10 @@ func OpenBadgerStoreReadOnly(path string) (*BadgerStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open badger read-only: %w", err)
 	}
-	return &BadgerStore{db: db, domainOwnershipGate: &sync.RWMutex{}}, nil
+	return &BadgerStore{
+		db: db, domainOwnershipGate: &sync.RWMutex{},
+		authorizationMutationHooks: &authorizationMutationHookState{},
+	}, nil
 }
 
 // OpenBadgerStoreWithoutMigrations opens an existing Badger database writable
@@ -405,7 +632,10 @@ func OpenBadgerStoreWithoutMigrations(path string) (*BadgerStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open badger without migrations: %w", err)
 	}
-	return &BadgerStore{db: db, domainOwnershipGate: &sync.RWMutex{}}, nil
+	return &BadgerStore{
+		db: db, domainOwnershipGate: &sync.RWMutex{},
+		authorizationMutationHooks: &authorizationMutationHookState{},
+	}, nil
 }
 
 // memoryKey returns the BadgerDB key for a memory's on-chain state.
@@ -546,6 +776,28 @@ type MemoryHashEntry struct {
 	Status      string
 }
 
+// MemoryDisclosureState is the canonical, single-snapshot state a serving
+// projection must match before app-v23 may disclose a SQL memory row. The
+// presence flags preserve compatibility with records created before the
+// corresponding projections existed; memory:<id> itself is always required.
+//
+// Reading these fields in one Badger transaction is load-bearing. Separate
+// getters could straddle a Commit and authorize a combination of hash, status,
+// domain, author, and classification that was never committed together.
+type MemoryDisclosureState struct {
+	ContentHash             []byte
+	Status                  string
+	Domain                  string
+	DomainRecorded          bool
+	Author                  string
+	AuthorRecorded          bool
+	AuthorPrincipal         string
+	AuthorPrincipalRecorded bool
+	Classification          uint8
+	ClassificationRecorded  bool
+	CoCommitRecorded        bool
+}
+
 // SetMemoryHash stores or updates a memory's on-chain hash and status.
 func (s *BadgerStore) SetMemoryHash(memoryID string, contentHash []byte, status string) error {
 	return s.update(func(txn *badger.Txn) error {
@@ -594,6 +846,133 @@ func (s *BadgerStore) GetMemoryHash(memoryID string) (contentHash []byte, status
 		return nil, "", fmt.Errorf("memory not found: %s", memoryID)
 	}
 	return
+}
+
+// GetMemoryDisclosureState returns one canonical publication snapshot for a
+// memory. A SQL row written before the matching Badger Commit (or left behind
+// by a crash between the two stores) has no matching state and must remain
+// hidden until replay publishes memory:<id>. Missing legacy domain/author/class
+// projections are represented explicitly; classification retains the historic
+// INTERNAL default only after the required memory record has been found.
+func (s *BadgerStore) GetMemoryDisclosureState(memoryID string) (*MemoryDisclosureState, error) {
+	if strings.TrimSpace(memoryID) == "" {
+		return nil, errors.New("memory disclosure state requires a memory id")
+	}
+	state := &MemoryDisclosureState{Classification: uint8(ClearanceInternal)}
+	err := s.view(func(txn *badger.Txn) error {
+		item, getErr := txn.Get(memoryKey(memoryID))
+		if getErr != nil {
+			return getErr
+		}
+		if valueErr := item.Value(func(val []byte) error {
+			var decodeErr error
+			state.ContentHash, state.Status, decodeErr = decodeMemoryHashEntry(val)
+			return decodeErr
+		}); valueErr != nil {
+			return valueErr
+		}
+
+		if item, getErr = txn.Get(memoryDomainKey(memoryID)); getErr == nil {
+			if valueErr := item.Value(func(val []byte) error {
+				state.Domain = string(val)
+				state.DomainRecorded = true
+				return nil
+			}); valueErr != nil {
+				return valueErr
+			}
+		} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
+			return getErr
+		}
+
+		if item, getErr = txn.Get(memoryAuthorKey(memoryID)); getErr == nil {
+			if valueErr := item.Value(func(val []byte) error {
+				state.Author = string(val)
+				state.AuthorRecorded = true
+				return nil
+			}); valueErr != nil {
+				return valueErr
+			}
+		} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
+			return getErr
+		}
+
+		if item, getErr = txn.Get(memoryAuthorPrincipalKey(memoryID)); getErr == nil {
+			if valueErr := item.Value(func(val []byte) error {
+				state.AuthorPrincipal = string(val)
+				state.AuthorPrincipalRecorded = true
+				return nil
+			}); valueErr != nil {
+				return valueErr
+			}
+		} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
+			return getErr
+		}
+
+		coCommitCore := false
+		if item, getErr = txn.Get(cocommitCoreKey(memoryID)); getErr == nil {
+			if valueErr := item.Value(func(val []byte) error {
+				if len(val) != sha256.Size {
+					return errors.New("invalid co-commit core hash")
+				}
+				coCommitCore = true
+				return nil
+			}); valueErr != nil {
+				return valueErr
+			}
+		} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
+			return getErr
+		}
+		coCommitShared := false
+		if item, getErr = txn.Get(cocommitSharedKey(memoryID)); getErr == nil {
+			if valueErr := item.Value(func(val []byte) error {
+				if len(val) != 4 {
+					return errors.New("invalid co-commit schema marker")
+				}
+				coCommitShared = true
+				return nil
+			}); valueErr != nil {
+				return valueErr
+			}
+		} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
+			return getErr
+		}
+		if coCommitCore != coCommitShared {
+			return errors.New("incomplete co-commit disclosure state")
+		}
+		state.CoCommitRecorded = coCommitCore
+
+		if item, getErr = txn.Get(memClassKey(memoryID)); getErr == nil {
+			if valueErr := item.Value(func(val []byte) error {
+				if len(val) != 1 {
+					return errors.New("invalid classification entry")
+				}
+				if val[0] > uint8(ClearanceTopSecret) {
+					return fmt.Errorf("invalid classification level %d", val[0])
+				}
+				state.Classification = val[0]
+				state.ClassificationRecorded = true
+				return nil
+			}); valueErr != nil {
+				return valueErr
+			}
+		} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
+			return getErr
+		}
+		return nil
+	})
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return nil, fmt.Errorf("memory disclosure state not found: %s", memoryID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if state.AuthorPrincipalRecorded &&
+		(!state.DomainRecorded || !state.AuthorRecorded || !state.ClassificationRecorded) {
+		return nil, fmt.Errorf(
+			"app-v23 memory disclosure state is incomplete: %s", memoryID,
+		)
+	}
+	return state, nil
 }
 
 // SetNonce stores or updates an agent's nonce.
@@ -662,6 +1041,36 @@ func isIndexBackfillProgressKey(key []byte) bool {
 	return consensuskeys.IsAppHashExcludedLocalKey(key)
 }
 
+func (s *BadgerStore) visitPromotedAppV23Stage(
+	txn *badger.Txn,
+	visit func(key, value []byte) error,
+) error {
+	active, err := appV23MigrationActiveTxn(txn)
+	if err != nil || !active {
+		return err
+	}
+	scan := func(stageTxn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = consensuskeys.AppV23MigrationStagePrefix
+		opts.PrefetchValues = false
+		it := stageTxn.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(opts.Prefix); it.ValidForPrefix(opts.Prefix); it.Next() {
+			key := it.Item().KeyCopy(nil)
+			if err := it.Item().Value(func(value []byte) error {
+				return visit(key, value)
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if s.txn == nil {
+		return scan(txn)
+	}
+	return s.db.View(scan)
+}
+
 // ComputeAppHash computes a deterministic SHA-256 hash over all consensus
 // state. Exact legacy startup-migration marker keys are skipped defensively.
 // CRITICAL: This must be deterministic — sorted key iteration.
@@ -702,6 +1111,13 @@ func (s *BadgerStore) ComputeAppHash() ([]byte, error) {
 			}); valErr != nil {
 				return valErr
 			}
+		}
+		if err := s.visitPromotedAppV23Stage(txn, func(key, value []byte) error {
+			_, _ = h.Write(key)
+			_, _ = h.Write(value)
+			return nil
+		}); err != nil {
+			return err
 		}
 
 		return nil
@@ -758,6 +1174,13 @@ func (s *BadgerStore) ComputeAppHashExcludingState() ([]byte, error) {
 			}); valErr != nil {
 				return valErr
 			}
+		}
+		if err := s.visitPromotedAppV23Stage(txn, func(key, value []byte) error {
+			_, _ = h.Write(key)
+			_, _ = h.Write(value)
+			return nil
+		}); err != nil {
+			return err
 		}
 
 		return nil
@@ -826,6 +1249,13 @@ func (s *BadgerStore) ComputeAppHashExcludingBookkeeping() ([]byte, error) {
 			}); valErr != nil {
 				return valErr
 			}
+		}
+		if err := s.visitPromotedAppV23Stage(txn, func(key, value []byte) error {
+			_, _ = h.Write(key)
+			_, _ = h.Write(value)
+			return nil
+		}); err != nil {
+			return err
 		}
 
 		return nil
@@ -1144,6 +1574,10 @@ func memoryAuthorKey(memoryID string) []byte {
 	return []byte("memauthor:" + memoryID)
 }
 
+func memoryAuthorPrincipalKey(memoryID string) []byte {
+	return []byte("memauthorprincipal:" + memoryID)
+}
+
 // --- CoCommit (v11 / app-v15) key helpers + setters/getters ---
 //
 // All cocommit:* keys are keyed by the content-derived, height-free SharedID.
@@ -1156,7 +1590,10 @@ func memoryAuthorKey(memoryID string) []byte {
 
 func cocommitCoreKey(sharedID string) []byte      { return []byte("cocommit:core:" + sharedID) }
 func cocommitCoauthorsKey(sharedID string) []byte { return []byte("cocommit:coauthors:" + sharedID) }
-func cocommitSharedKey(sharedID string) []byte    { return []byte("cocommit:shared:" + sharedID) }
+func cocommitPrincipalsKey(sharedID string) []byte {
+	return []byte("cocommit:principals:" + sharedID)
+}
+func cocommitSharedKey(sharedID string) []byte { return []byte("cocommit:shared:" + sharedID) }
 
 func cocommitAnchorKey(sharedID, peerChainID string) []byte {
 	// sharedID is hex and peerChainID is a chain_id (charset [a-z2-7-]); neither
@@ -1235,6 +1672,61 @@ func (s *BadgerStore) GetCoCommitCoauthors(sharedID string) ([]byte, error) {
 		return nil, err
 	}
 	return blob, nil
+}
+
+// SetCoCommitPrincipals stores the canonical local identity projection of a
+// co-commit's signing keys. App-v23 uses it only for authorship equivalence:
+// a Root credential is normalized to Root's immutable principal at submit
+// time, so later credential rotations cannot make Root appear to be a distinct
+// corroborator of its own co-authored memory.
+func (s *BadgerStore) SetCoCommitPrincipals(sharedID string, principals []string) error {
+	if sharedID == "" || len(principals) == 0 || len(principals) > 64 ||
+		!sort.StringsAreSorted(principals) {
+		return errors.New("invalid co-commit principal projection")
+	}
+	for i, principalID := range principals {
+		if !isCanonicalAgentID(principalID) ||
+			(i > 0 && principals[i-1] == principalID) {
+			return errors.New("invalid co-commit principal projection")
+		}
+	}
+	encoded, err := json.Marshal(principals)
+	if err != nil {
+		return err
+	}
+	return s.update(func(txn *badger.Txn) error {
+		return s.txnSet(txn, cocommitPrincipalsKey(sharedID), encoded)
+	})
+}
+
+// HasCoCommitPrincipal checks the normalized authorship projection. A missing
+// record is expected for co-commits created before app-v23.
+func (s *BadgerStore) HasCoCommitPrincipal(sharedID, principalID string) (bool, error) {
+	if sharedID == "" || !isCanonicalAgentID(principalID) {
+		return false, errors.New("invalid co-commit principal lookup")
+	}
+	var principals []string
+	err := s.view(func(txn *badger.Txn) error {
+		item, getErr := txn.Get(cocommitPrincipalsKey(sharedID))
+		if getErr != nil {
+			return getErr
+		}
+		return item.Value(func(value []byte) error {
+			return json.Unmarshal(value, &principals)
+		})
+	})
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil || len(principals) == 0 || len(principals) > 64 ||
+		!sort.StringsAreSorted(principals) {
+		if err != nil {
+			return false, err
+		}
+		return false, errors.New("invalid co-commit principal projection")
+	}
+	i := sort.SearchStrings(principals, principalID)
+	return i < len(principals) && principals[i] == principalID, nil
 }
 
 // SetCoCommitAnchor records a peer's cross-attestation anchor
@@ -1412,8 +1904,10 @@ func decodeStringSliceBlob(val []byte, offset int) ([]string, int, error) {
 // No height/clock input — the value is a pure function of the arguments.
 func (s *BadgerStore) SetCrossFed(remoteChainID, endpoint string, peerPubKey []byte, maxClearance uint8, expiresAt int64, allowedDomains, allowedDepts []string, status string) error {
 	blob := encodeCrossFedBlob(endpoint, peerPubKey, maxClearance, expiresAt, status, allowedDomains, allowedDepts)
-	return s.update(func(txn *badger.Txn) error {
-		return s.txnSet(txn, crossFedKey(remoteChainID), blob)
+	return s.withPeerFederationAuthorizationMutation(remoteChainID, func() error {
+		return s.update(func(txn *badger.Txn) error {
+			return s.txnSet(txn, crossFedKey(remoteChainID), blob)
+		})
 	})
 }
 
@@ -1442,26 +1936,28 @@ func (s *BadgerStore) GetCrossFed(remoteChainID string) (endpoint string, peerPu
 // (mirrors UpdateFederationStatus; truncating the extended fields would drop the
 // transport coordinates).
 func (s *BadgerStore) UpdateCrossFedStatus(remoteChainID, newStatus string) error {
-	return s.update(func(txn *badger.Txn) error {
-		item, err := txn.Get(crossFedKey(remoteChainID))
-		if err != nil {
-			return err
-		}
-		var endpoint, status string
-		var peerPubKey []byte
-		var maxClearance uint8
-		var expiresAt int64
-		var allowedDomains, allowedDepts []string
-		if err := item.Value(func(val []byte) error {
-			var decErr error
-			endpoint, peerPubKey, maxClearance, expiresAt, status, allowedDomains, allowedDepts, decErr = decodeCrossFedBlob(val)
-			return decErr
-		}); err != nil {
-			return err
-		}
-		_ = status // replaced below
-		blob := encodeCrossFedBlob(endpoint, peerPubKey, maxClearance, expiresAt, newStatus, allowedDomains, allowedDepts)
-		return s.txnSet(txn, crossFedKey(remoteChainID), blob)
+	return s.withPeerFederationAuthorizationMutation(remoteChainID, func() error {
+		return s.update(func(txn *badger.Txn) error {
+			item, err := txn.Get(crossFedKey(remoteChainID))
+			if err != nil {
+				return err
+			}
+			var endpoint, status string
+			var peerPubKey []byte
+			var maxClearance uint8
+			var expiresAt int64
+			var allowedDomains, allowedDepts []string
+			if err := item.Value(func(val []byte) error {
+				var decErr error
+				endpoint, peerPubKey, maxClearance, expiresAt, status, allowedDomains, allowedDepts, decErr = decodeCrossFedBlob(val)
+				return decErr
+			}); err != nil {
+				return err
+			}
+			_ = status // replaced below
+			blob := encodeCrossFedBlob(endpoint, peerPubKey, maxClearance, expiresAt, newStatus, allowedDomains, allowedDepts)
+			return s.txnSet(txn, crossFedKey(remoteChainID), blob)
+		})
 	})
 }
 
@@ -1541,6 +2037,37 @@ func (s *BadgerStore) GetMemoryAuthor(memoryID string) (string, error) {
 		return "", err
 	}
 	return author, nil
+}
+
+// SetMemoryAuthorPrincipal records the immutable policy identity whose current
+// credential authored a memory. App-v23 keeps this separate from memauthor:
+// memauthor preserves exact signing-key provenance across Root handovers, while
+// this projection keeps self-corroboration and lifecycle authority continuous
+// across any number of credential generations.
+func (s *BadgerStore) SetMemoryAuthorPrincipal(memoryID, principalID string) error {
+	return s.update(func(txn *badger.Txn) error {
+		return s.txnSet(txn, memoryAuthorPrincipalKey(memoryID), []byte(principalID))
+	})
+}
+
+// GetMemoryAuthorPrincipal returns the app-v23 policy-author projection, or an
+// empty string for memories created before app-v23.
+func (s *BadgerStore) GetMemoryAuthorPrincipal(memoryID string) (string, error) {
+	var principal string
+	err := s.view(func(txn *badger.Txn) error {
+		item, getErr := txn.Get(memoryAuthorPrincipalKey(memoryID))
+		if getErr != nil {
+			return getErr
+		}
+		return item.Value(func(value []byte) error {
+			principal = string(value)
+			return nil
+		})
+	})
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return "", nil
+	}
+	return principal, err
 }
 
 // corroborationKey is "corrob:<memoryID>:<agentID>". agentID is fixed-length hex
@@ -1952,6 +2479,23 @@ func grantKey(domain, agentID string) []byte {
 	return []byte("grant:" + domain + ":" + agentID)
 }
 
+func parseCanonicalGrantKey(key []byte) (domain, agentID string, ok bool) {
+	const prefix = "grant:"
+	if !bytes.HasPrefix(key, []byte(prefix)) {
+		return "", "", false
+	}
+	separator := bytes.LastIndexByte(key, ':')
+	if separator <= len(prefix) || separator == len(key)-1 {
+		return "", "", false
+	}
+	domain = string(key[len(prefix):separator])
+	agentID = string(key[separator+1:])
+	if domain == "" || validateCanonicalAgentID("grant agent", agentID) != nil {
+		return "", "", false
+	}
+	return domain, agentID, true
+}
+
 // domainKey returns the BadgerDB key for a domain registry entry.
 func domainKey(name string) []byte {
 	return []byte("domain:" + name)
@@ -1992,6 +2536,9 @@ func decodeString(buf []byte, offset int) (string, int, error) {
 func (s *BadgerStore) SetAccessGrant(domain, agentID string, level uint8, expiresAt int64, granterID string) error {
 	return s.withDomainOwnershipMutation(func() error {
 		return s.update(func(txn *badger.Txn) error {
+			if err := validateAppV23GrantKeyComponentsTxn(txn, domain, agentID); err != nil {
+				return err
+			}
 			val := make([]byte, 1+8+4+len(granterID))
 			val[0] = level
 			binary.BigEndian.PutUint64(val[1:9], uint64(expiresAt)) // #nosec G115 -- expiry timestamp is always non-negative
@@ -2004,6 +2551,9 @@ func (s *BadgerStore) SetAccessGrant(domain, agentID string, level uint8, expire
 // GetAccessGrant retrieves an access grant from BadgerDB.
 func (s *BadgerStore) GetAccessGrant(domain, agentID string) (level uint8, expiresAt int64, granterID string, err error) {
 	err = s.view(func(txn *badger.Txn) error {
+		if validationErr := validateAppV23GrantKeyComponentsTxn(txn, domain, agentID); validationErr != nil {
+			return validationErr
+		}
 		var item *badger.Item
 		item, err = txn.Get(grantKey(domain, agentID))
 		if err != nil {
@@ -2030,6 +2580,9 @@ func (s *BadgerStore) GetAccessGrant(domain, agentID string) (level uint8, expir
 func (s *BadgerStore) DeleteAccessGrant(domain, agentID string) error {
 	return s.withDomainOwnershipMutation(func() error {
 		return s.update(func(txn *badger.Txn) error {
+			if err := validateAppV23GrantKeyComponentsTxn(txn, domain, agentID); err != nil {
+				return err
+			}
 			return s.txnDelete(txn, grantKey(domain, agentID))
 		})
 	})
@@ -2052,12 +2605,25 @@ func (s *BadgerStore) DeleteGrantsByDomain(domain string) (int, error) {
 	prefix := []byte("grant:" + domain + ":")
 	err := s.withDomainOwnershipMutation(func() error {
 		if err := s.view(func(txn *badger.Txn) error {
+			strictDomainComponent := false
+			if _, rootErr := txn.Get(appV23RootKey()); rootErr == nil {
+				strictDomainComponent = true
+			} else if !errors.Is(rootErr, badger.ErrKeyNotFound) {
+				return rootErr
+			}
 			opts := badger.DefaultIteratorOptions
 			opts.PrefetchValues = false
 			it := txn.NewIterator(opts)
 			defer it.Close()
 			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-				keys = append(keys, append([]byte{}, it.Item().Key()...))
+				key := it.Item().Key()
+				if strictDomainComponent {
+					keyDomain, _, canonical := parseCanonicalGrantKey(key)
+					if !canonical || keyDomain != domain {
+						continue
+					}
+				}
+				keys = append(keys, append([]byte{}, key...))
 			}
 			return nil
 		}); err != nil {
@@ -2084,12 +2650,24 @@ func (s *BadgerStore) CountGrantsByDomainUpTo(domain string, limit int) (count i
 	}
 	prefix := []byte("grant:" + domain + ":")
 	err = s.view(func(txn *badger.Txn) error {
+		strictDomainComponent := false
+		if _, rootErr := txn.Get(appV23RootKey()); rootErr == nil {
+			strictDomainComponent = true
+		} else if !errors.Is(rootErr, badger.ErrKeyNotFound) {
+			return rootErr
+		}
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		opts.Prefix = prefix
 		it := txn.NewIterator(opts)
 		defer it.Close()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			if strictDomainComponent {
+				keyDomain, _, canonical := parseCanonicalGrantKey(it.Item().Key())
+				if !canonical || keyDomain != domain {
+					continue
+				}
+			}
 			count++
 			if count > limit {
 				exceeded = true
@@ -2110,7 +2688,31 @@ func (s *BadgerStore) CountGrantsByDomainUpTo(domain string, limit int) (count i
 // site at the ABCI layer readable and to centralize the key naming.
 func (s *BadgerStore) SetSharedDomain(name string) error {
 	return s.withDomainOwnershipMutation(func() error {
-		return s.SetState("shared_domain:"+name, []byte{1})
+		return s.update(func(txn *badger.Txn) error {
+			if _, rootErr := txn.Get(appV23RootKey()); rootErr == nil {
+				if err := ValidateAppV23DomainName(name); err != nil {
+					return fmt.Errorf("invalid app-v23 shared domain: %w", err)
+				}
+				currentOwner := ""
+				if value, domainErr := s.appV23ReadEffectiveValueTxn(txn, domainKey(name)); domainErr == nil {
+					var decodeErr error
+					currentOwner, _, decodeErr = decodeString(value, 0)
+					if decodeErr != nil {
+						return decodeErr
+					}
+				} else if !errors.Is(domainErr, badger.ErrKeyNotFound) {
+					return domainErr
+				}
+				if err := s.appV23ValidateHomeDomainReleaseTxn(
+					txn, name, currentOwner, currentOwner, true,
+				); err != nil {
+					return err
+				}
+			} else if !errors.Is(rootErr, badger.ErrKeyNotFound) {
+				return rootErr
+			}
+			return s.txnSet(txn, stateKey("shared_domain:"+name), []byte{1})
+		})
 	})
 }
 
@@ -2319,13 +2921,26 @@ func (s *BadgerStore) ResolveOwningAncestor(domain string) (owner, ownedDomain s
 func (s *BadgerStore) RegisterDomain(name, ownerID, parentDomain string, height int64) error {
 	return s.withDomainOwnershipMutation(func() error {
 		return s.update(func(txn *badger.Txn) error {
-			if item, getErr := txn.Get(domainKey(name)); getErr == nil {
+			if _, rootErr := txn.Get(appV23RootKey()); rootErr == nil {
+				if err := ValidateAppV23DomainName(name); err != nil {
+					return fmt.Errorf("invalid app-v23 domain registration: %w", err)
+				}
+				if parentDomain != "" {
+					if err := ValidateAppV23DomainName(parentDomain); err != nil {
+						return fmt.Errorf("invalid app-v23 parent domain: %w", err)
+					}
+				}
+				if err := validateCanonicalAgentID("app-v23 domain owner", ownerID); err != nil {
+					return err
+				}
+			} else if !errors.Is(rootErr, badger.ErrKeyNotFound) {
+				return rootErr
+			}
+			if value, getErr := s.appV23ReadEffectiveValueTxn(txn, domainKey(name)); getErr == nil {
 				var existingOwner string
-				if err := item.Value(func(val []byte) error {
-					owner, _, decErr := decodeString(val, 0)
-					existingOwner = owner
-					return decErr
-				}); err == nil && existingOwner != "" {
+				owner, _, decErr := decodeString(value, 0)
+				existingOwner = owner
+				if decErr == nil && existingOwner != "" {
 					return ErrDomainAlreadyRegistered
 				}
 			} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
@@ -2346,6 +2961,36 @@ func (s *BadgerStore) RegisterDomain(name, ownerID, parentDomain string, height 
 func (s *BadgerStore) TransferDomain(name, newOwnerID, parentDomain string, height int64) error {
 	return s.withDomainOwnershipMutation(func() error {
 		return s.update(func(txn *badger.Txn) error {
+			if _, rootErr := txn.Get(appV23RootKey()); rootErr == nil {
+				if err := ValidateAppV23DomainName(name); err != nil {
+					return fmt.Errorf("invalid app-v23 transfer domain: %w", err)
+				}
+				if parentDomain != "" {
+					if err := ValidateAppV23DomainName(parentDomain); err != nil {
+						return fmt.Errorf("invalid app-v23 transfer parent domain: %w", err)
+					}
+				}
+				if err := validateCanonicalAgentID("app-v23 transfer owner", newOwnerID); err != nil {
+					return err
+				}
+				value, err := s.appV23ReadEffectiveValueTxn(txn, domainKey(name))
+				if err != nil {
+					return err
+				}
+				var currentOwner string
+				var decodeErr error
+				currentOwner, _, decodeErr = decodeString(value, 0)
+				if decodeErr != nil {
+					return decodeErr
+				}
+				if err := s.appV23ValidateHomeDomainReleaseTxn(
+					txn, name, currentOwner, newOwnerID, false,
+				); err != nil {
+					return err
+				}
+			} else if !errors.Is(rootErr, badger.ErrKeyNotFound) {
+				return rootErr
+			}
 			val := make([]byte, 4+len(newOwnerID)+4+len(parentDomain)+8)
 			offset := encodeString(val, 0, newOwnerID)
 			offset = encodeString(val, offset, parentDomain)
@@ -2359,15 +3004,13 @@ func (s *BadgerStore) TransferDomain(name, newOwnerID, parentDomain string, heig
 func (s *BadgerStore) GetDomainOwner(name string) (string, error) {
 	var ownerID string
 	err := s.view(func(txn *badger.Txn) error {
-		item, getErr := txn.Get(domainKey(name))
+		value, getErr := s.appV23ReadEffectiveValueTxn(txn, domainKey(name))
 		if getErr != nil {
 			return getErr
 		}
-		return item.Value(func(val []byte) error {
-			var decErr error
-			ownerID, _, decErr = decodeString(val, 0)
-			return decErr
-		})
+		var decErr error
+		ownerID, _, decErr = decodeString(value, 0)
+		return decErr
 	})
 	if err == badger.ErrKeyNotFound {
 		return "", fmt.Errorf("domain not found: %s", name)
@@ -2382,27 +3025,25 @@ func (s *BadgerStore) GetDomainOwner(name string) (string, error) {
 // the accessStore tables) will mislead callers into Code-34 rejections.
 func (s *BadgerStore) GetDomainOwnerAndMeta(name string) (ownerID, parent string, height int64, err error) {
 	err = s.view(func(txn *badger.Txn) error {
-		item, getErr := txn.Get(domainKey(name))
+		value, getErr := s.appV23ReadEffectiveValueTxn(txn, domainKey(name))
 		if getErr != nil {
 			return getErr
 		}
-		return item.Value(func(val []byte) error {
-			owner, off, decErr := decodeString(val, 0)
-			if decErr != nil {
-				return decErr
-			}
-			p, off, decErr := decodeString(val, off)
-			if decErr != nil {
-				return decErr
-			}
-			if len(val) < off+8 {
-				return fmt.Errorf("invalid domain entry: short height")
-			}
-			ownerID = owner
-			parent = p
-			height = int64(binary.BigEndian.Uint64(val[off : off+8])) // #nosec G115 -- height non-negative
-			return nil
-		})
+		owner, off, decErr := decodeString(value, 0)
+		if decErr != nil {
+			return decErr
+		}
+		p, off, decErr := decodeString(value, off)
+		if decErr != nil {
+			return decErr
+		}
+		if len(value) < off+8 {
+			return fmt.Errorf("invalid domain entry: short height")
+		}
+		ownerID = owner
+		parent = p
+		height = int64(binary.BigEndian.Uint64(value[off : off+8])) // #nosec G115 -- height non-negative
+		return nil
 	})
 	if err == badger.ErrKeyNotFound {
 		return "", "", 0, fmt.Errorf("domain not found: %s", name)
@@ -4872,6 +5513,9 @@ func (s *BadgerStore) GetMemoryClassification(memoryID string) (uint8, error) {
 			if len(val) != 1 {
 				return fmt.Errorf("invalid classification entry")
 			}
+			if val[0] > uint8(ClearanceTopSecret) {
+				return fmt.Errorf("invalid classification level %d", val[0])
+			}
 			classification = val[0]
 			return nil
 		})
@@ -5541,6 +6185,11 @@ func (s *BadgerStore) RegisterAgentWithCapabilities(agentID, name, role, bio, pr
 		return fmt.Errorf("marshal agent: %w", err)
 	}
 	return s.update(func(txn *badger.Txn) error {
+		if _, markerErr := txn.Get(appV23RootCredentialKey(agentID)); markerErr == nil {
+			return errors.New("CEREBRUM Root credential cannot be registered as an agent")
+		} else if !errors.Is(markerErr, badger.ErrKeyNotFound) {
+			return markerErr
+		}
 		return s.txnSet(txn, agentOnChainKey(agentID), data)
 	})
 }
@@ -5549,6 +6198,13 @@ func (s *BadgerStore) RegisterAgentWithCapabilities(agentID, name, role, bio, pr
 func (s *BadgerStore) GetRegisteredAgent(agentID string) (*OnChainAgent, error) {
 	var agent OnChainAgent
 	err := s.view(func(txn *badger.Txn) error {
+		if value, projectedErr := s.appV23ReadEffectiveValueTxn(
+			txn, appV23ProjectedAgentKey(agentID),
+		); projectedErr == nil {
+			return json.Unmarshal(value, &agent)
+		} else if !errors.Is(projectedErr, badger.ErrKeyNotFound) {
+			return projectedErr
+		}
 		item, err := txn.Get(agentOnChainKey(agentID))
 		if err != nil {
 			return err
@@ -5688,11 +6344,12 @@ func (s *BadgerStore) ValidateAppV20ResourceBounds(maxIdentifierBytes, maxMetada
 		return errors.New("app-v20 resource bounds must be positive")
 	}
 	singleSuffixPrefixes := [][]byte{
-		[]byte("memory:"), []byte("memdomain:"), []byte("memauthor:"), []byte("memclass:"),
+		[]byte("memory:"), []byte("memdomain:"), []byte("memauthor:"), []byte("memauthorprincipal:"), []byte("memclass:"),
 		[]byte("nonce:"), []byte("agent:"), []byte("validator:"), []byte("vstats:"),
 		[]byte("domain:"), []byte("org:"), []byte("access_req:"), []byte("federation:"),
 		[]byte("cross_fed:"), []byte("poew:"), []byte("cocommit:core:"),
 		[]byte("cocommit:shared:"), []byte("cocommit:coauthors:"),
+		[]byte("cocommit:principals:"),
 	}
 	fullRecordPrefixes := [][]byte{
 		[]byte("agent:"), []byte("org:"), []byte("org_member:"),
@@ -5756,7 +6413,9 @@ func (s *BadgerStore) ValidateAppV20ResourceBounds(maxIdentifierBytes, maxMetada
 				}); err != nil {
 					return err
 				}
-			case bytes.HasPrefix(key, []byte("memdomain:")), bytes.HasPrefix(key, []byte("memauthor:")):
+			case bytes.HasPrefix(key, []byte("memdomain:")),
+				bytes.HasPrefix(key, []byte("memauthor:")),
+				bytes.HasPrefix(key, []byte("memauthorprincipal:")):
 				if err := item.Value(func(value []byte) error {
 					if len(value) > maxIdentifierBytes {
 						return fmt.Errorf("legacy consensus identifier value for %q has %d bytes, app-v20 limit %d", key, len(value), maxIdentifierBytes)
@@ -6056,6 +6715,15 @@ func (s *BadgerStore) ListRegisteredAgents() ([]OnChainAgent, error) {
 				return json.Unmarshal(val, &agent)
 			}); err != nil {
 				continue
+			}
+			if value, projectedErr := s.appV23ReadEffectiveValueTxn(
+				txn, appV23ProjectedAgentKey(agent.AgentID),
+			); projectedErr == nil {
+				if err := json.Unmarshal(value, &agent); err != nil {
+					return err
+				}
+			} else if !errors.Is(projectedErr, badger.ErrKeyNotFound) {
+				return projectedErr
 			}
 			agents = append(agents, agent)
 		}

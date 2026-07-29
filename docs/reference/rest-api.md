@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.14.2. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.15.0. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -32,7 +32,7 @@ Include `X-Nonce` on current clients. If `X-Nonce` is absent, the server accepts
 - Body is capped at 1 MB before reading for signature verification (`auth.go:143`).
 - `X-Agent-ID` is the hex-encoded Ed25519 **public key** (32 bytes = 64 hex chars); it IS the agent identity on-chain.
 
-**Post-app-v17 consensus binding.** The REST process is not the trust boundary. Once app-v17 is active, a transaction whose outer node key differs from `X-Agent-ID` carries the exact `canonical` bytes above in the optional `ParsedTx.AgentRequest` wire tail. `FinalizeBlock` re-hashes those bytes to `AgentBodyHash`, re-verifies the Ed25519 proof, rejects proofs more than five minutes older than deterministic block time, and rebuilds the expected type-specific payload from the signed method, path, and JSON. Historical non-governance proofs intentionally remain valid when ahead of block time because SAGE mints no idle heartbeat blocks and the first block after a long idle period can lag the already wall-clock-validated REST request. App-v20 governance is narrower: every governance envelope containing any agent-proof material, including one whose embedded signer equals the outer validator, must carry the complete request and 8-byte nonce and must fall within **±5 minutes** of deterministic block time. For memory submissions, content/type/domain/confidence/classification/parent/task status stay action-bound while the embedding hash is node-derived and outer-signature-bound: v11.7.4 made the active node authoritative for vector generation after request authentication. A mismatch is rejected with code 109 before the action handler runs. A successful validation atomically claims an AppHash-folded proof fingerprint until its freshness window closes, so the same agent authorization cannot be wrapped in a second node transaction with a fresh outer nonce. Ordinary same-key non-governance transactions and **truly proofless** direct governance/upgrade-auto-voter transactions need no HTTP envelope: the outer signature binds the payload and app-v9's monotonic nonce prevents same-chain replay (`internal/abci/agent_proof.go`, `internal/store/badger.go`).
+**Post-app-v17 consensus binding.** The REST process is not the trust boundary. Once app-v17 is active, a transaction whose outer node key differs from `X-Agent-ID` carries the exact `canonical` bytes above in the optional `ParsedTx.AgentRequest` wire tail. `FinalizeBlock` re-hashes those bytes to `AgentBodyHash`, re-verifies the Ed25519 proof, rejects proofs more than five minutes older than deterministic block time, and rebuilds the expected type-specific payload from the signed method, path, and JSON. Historical non-governance proofs intentionally remain valid when ahead of block time because SAGE mints no idle heartbeat blocks and the first block after a long idle period can lag the already wall-clock-validated REST request. App-v20 governance is narrower: every governance envelope containing any agent-proof material, including one whose embedded signer equals the outer validator, must carry the complete request and 8-byte nonce and must fall within **±5 minutes** of deterministic block time. For memory submissions, content/type/domain/confidence/classification/parent/task status stay action-bound while the embedding hash is node-derived and outer-signature-bound: v11.7.4 made the active node authoritative for vector generation after request authentication. App-v23 adds one narrow deterministic exception: a task request may omit `domain_tag`, in which case both REST and consensus independently resolve the exact currently committed ordinary-agent home domain; an explicit domain remains byte-for-byte action-bound and is never remapped. A mismatch is rejected with code 109 before the action handler runs. A successful validation atomically claims an AppHash-folded proof fingerprint until its freshness window closes, so the same agent authorization cannot be wrapped in a second node transaction with a fresh outer nonce. Ordinary same-key non-governance transactions and **truly proofless** direct governance/upgrade-auto-voter transactions need no HTTP envelope: the outer signature binds the payload and app-v9's monotonic nonce prevents same-chain replay (`internal/abci/agent_proof.go`, `internal/store/badger.go`).
 
 The optional tail is emitted only after the app-v17 activation block commits. Before activation it is absent, preserving the exact bytes older validators re-encode and every historical block's replay behavior (`internal/tx/codec.go`, `api/rest/server.go`).
 
@@ -52,15 +52,17 @@ Submit a memory for BFT consensus. Blocks until `broadcast_tx_commit` returns (F
 |---|---|---|---|
 | `content` | string | yes | Natural-language memory text |
 | `memory_type` | string | yes | One of: `fact`, `observation`, `inference`, `task` |
-| `domain_tag` | string | yes | Domain label; agent must have write access |
+| `domain_tag` | string | yes* | Exact domain label; agent must have write access. *App-v23 task submissions by an active ordinary agent may omit it to use the currently committed owned home domain. Other memory types and pre-v23 requests still require it. Explicit values are never remapped.* |
 | `confidence_score` | float64 | yes | 0.0–1.0 inclusive |
 | `classification` | int | no | 0–4; see table below. **Omitting sends 0 (PUBLIC)** |
 | `embedding` | []float32 | no | Compatibility field. The node regenerates the vector from `content` with its currently selected provider so stale/foreign vector spaces cannot mix. |
 | `knowledge_triples` | []KnowledgeTriple | no | `{subject, predicate, object}` triples |
 | `parent_hash` | string | no | SHA-256 hex of parent memory for lineage |
-| `task_status` | string | no | For `task` type: `planned`, `in_progress`, `done`, `dropped` |
+| `task_status` | string | no | New `task` memories must omit this or send `planned`. Agents start or finish an assigned task through the task-status route after creation. |
+| `linked_memories` | []string | no | Related memory IDs for legacy/non-idempotent submission paths. App-v23 task creation rejects this field because links are not part of the canonical task transaction; create links separately after the task is confirmed. |
 | `tags` | []string | no | Up to 32 labels of 128 UTF-8 bytes each. Above app-v20 they are sorted/deduplicated into the signed tx; scoped-domain tags are also AppHash-covered and projection-recoverable. Ordinary-domain tags remain node-local. OR-filter on query/search. |
 | `provider` | string | no | Stored off-chain only; not on-chain |
+| `idempotency_key` | string | no | App-v23 tasks only; 1–128 visible ASCII bytes without spaces. If omitted, REST derives the same permanent semantic key as MCP from the exact signed agent ID, resolved domain, and task content. Repeating that semantic task returns the original receipt at its current status. Supply a fresh explicit key only to intentionally create another occurrence with identical content/domain. |
 
 **Classification values** (`internal/tx/types.go:84-90`):
 
@@ -74,16 +76,63 @@ Submit a memory for BFT consensus. Blocks until `broadcast_tx_commit` returns (F
 
 > **Critical:** An **omitted** `classification` field is deserialized as `0` (PUBLIC) by Go's JSON decoder and is stored as PUBLIC on-chain. This is the intended behavior since v6.8.6 — the prior code silently bumped `0→INTERNAL` at submission time, causing every cross-agent read of a PUBLIC memory to be blocked by the classification gate. (`internal/abci/app.go:960-969`). The codec still defaults old txs without a classification byte to INTERNAL for backward compatibility (`internal/tx/codec.go`), but new submissions from this REST endpoint are stored as-sent.
 
-**Response** (HTTP 201):
+**Success responses:**
+
+| HTTP | Meaning |
+|---|---|
+| `201 Created` | A new transaction committed and, for an app-v23 task, the exact assignee projection was confirmed. |
+| `200 OK` | The task's permanent idempotency key already had a committed receipt. The response returns the original `memory_id`, `tx_hash`, and height plus the task's current status, including `done` or `dropped`; no new task was created. |
+| `202 Accepted` | The transaction committed, but the exact local task projection could not be confirmed. This is not permission to resubmit: reconcile the returned `memory_id`. |
 
 ```json
 {
   "memory_id": "<uuid>",
   "tx_hash": "<hex>",
   "status": "proposed",
+  "task_status": "planned",
+  "committed": true,
+  "committed_height": 123,
+  "projection_confirmed": true,
+  "idempotency_key": "mcp-<sha256>",
   "embedding_provider": "ollama"
 }
 ```
+
+`committed:true` means `broadcast_tx_commit` returned successfully and the
+transaction is on-chain. It does **not** by itself prove that every serving
+projection is readable. `status:"proposed"` is the memory's governed lifecycle
+state, not an indication that the transaction is still pending.
+
+A confirmed replay adds `"idempotent_replay":true` and
+`"projection_confirmed":true`. A committed-but-unconfirmed task response is:
+
+```json
+{
+  "memory_id": "<exact committed uuid>",
+  "tx_hash": "<exact committed tx hash>",
+  "status": "committed_unconfirmed",
+  "task_status": "planned",
+  "committed": true,
+  "committed_height": 123,
+  "projection_confirmed": false,
+  "retryable": false,
+  "message": "The transaction committed, but the exact task projection could not be confirmed. Reconcile this memory_id; do not resubmit the task.",
+  "idempotency_key": "mcp-<sha256>"
+}
+```
+
+The node performs bounded exact-assignee projection confirmation before it
+chooses `201`, `200`, or `202`. An idempotent replay whose projection is still
+unconfirmed also returns `202` and adds `"idempotent_replay":true`.
+
+The key is permanently scoped to the effective policy principal. Its canonical
+binding covers that principal, exact assignee, stable memory ID, content hash,
+task type, exact resolved domain, confidence bits, content, parent hash,
+classification, initial `planned` status, and normalized tags. The node-owned
+embedding hash is deliberately excluded. Reusing a key with a different
+canonical payload is a stable `409`; keyed task creation rejects
+`knowledge_triples` and `linked_memories`, so links must be submitted after
+creation.
 
 If the selected provider is temporarily unavailable, the memory still commits
 without accepting the caller's possibly mismatched vector and the response adds
@@ -92,7 +141,45 @@ provider is healthy and the vault is unlocked.
 
 **Auth:** Ed25519 required. Agent must have write access to `domain_tag` if per-domain access control is configured (`memory_handler.go:425-428`). Observer-role agents are rejected.
 
-**Domain write denial (v11.8.4+):** A consensus rejection whose reason is specifically that the authenticated agent has no write access to the requested domain returns HTTP 403 with RFC 7807 type `https://sage.dev/errors/domain-write-denied`. Its sanitized detail directs the caller to grant level 2 (read + write) in CEREBRUM Access Controls or ask the domain owner; it exposes neither the agent ID nor domain-owner ID. MCP clients use the type to avoid treating a permanent ACL denial as a stale session and do not re-register or retry the write (`memory_handler.go`, `internal/mcp/server.go`).
+**Effective write denial:** A recognized preflight or consensus denial returns
+HTTP 403 with RFC 7807 type
+`https://sage.dev/errors/domain-write-denied` and the extensions
+`reason_code`, `remedy`, and `retryable:false`. `detail` is deliberately generic;
+neither it nor the extensions disclose the agent ID, requested domain, owner ID,
+raw capability mask, or raw consensus log. `retryable:false` means “do not
+automatically repeat this request”; the named operator action may make a later,
+new request valid.
+
+| `reason_code` | Effective cause | Exact `remedy` |
+|---|---|---|
+| `missing_write_grant` | No effective level-2 write grant | Submit to a domain this agent owns. If shared management is intended, a local Root/Admin can approve the agent as a Manager and place it in an Access Group covering the target domain. v11.15.0 has no direct level-2 grant editor. |
+| `foreign_write_restricted` | The effective named profile includes the deny-foreign-write restriction (app-v22 bit 8) | Assign a write-compatible named profile that permits foreign-domain writes, or submit to a domain this agent owns. |
+| `shared_write_restricted` | The effective named profile includes the deny-shared-write restriction (app-v22 bit 2) | Submit to the agent's owned non-shared home domain, or assign a named profile that permits shared-domain writes. |
+| `domain_claim_restricted` | The effective named profile includes the deny-domain-claim restriction (app-v22 bit 4) | Submit to a domain this agent already owns, or ask a local administrator to assign or reassign a non-shared domain; this profile cannot claim an unowned domain. |
+| `principal_pending_review` | Enrollment has not been approved | Approve the agent's enrollment and assign its role and named profile before submitting. |
+| `no_owned_home_domain` | Enrollment has no owned non-shared home domain | Complete enrollment by assigning an owned non-shared home domain, then submit there. |
+| `manager_scope_denied` | A manager write is outside its local authority scope | Use a local domain within this manager's authority scope, or ask a local admin to change the scope. |
+
+The classifier is intentionally narrow. A non-zero capability mask does not by
+itself invalidate a grant: only the matching effective restriction produces its
+reason code. Unknown structured codes and generic `access denied` or
+`not registered` responses remain opaque and untyped. A client recognizes a
+canonical denial only when the problem type and one of these seven codes match,
+the HTTP and problem status are both 403, and `retryable:false` is explicitly
+present. MCP derives the remedy from its local canonical table rather than
+trusting response text; only that complete contract suppresses re-registration
+and retry (`internal/authzdenial/write_denial.go`, `memory_handler.go`,
+`internal/mcp/server.go`).
+
+Other task-specific failures are also stable:
+
+- `409 https://sage.dev/errors/app-v23-required` when an explicit task key is
+  sent before app-v23;
+- `409` when the same key is already bound to a different canonical payload;
+- `503 https://sage.dev/errors/task-assignment-bridge-unavailable` before any
+  transaction is submitted when the node cannot durably stage the assignee; and
+- `503` without retry broadcast when the authoritative idempotency receipt
+  cannot be read.
 
 **curl example:**
 
@@ -157,8 +244,7 @@ Vector similarity search. Requires a precomputed embedding.
   "total_count": 1,
   "next_cursor": "",
   "filtered": {
-    "by": ["rbac_submitting_agents", "classification"],
-    "hidden_count": 3
+    "by": ["rbac_submitting_agents"]
   }
 }
 ```
@@ -181,11 +267,27 @@ fields are absent for closed rounds and legacy app-v17 challenges.
 
 `disputed` (`memory_handler.go`, `json:"disputed,omitempty"`) is present and `true` only for an app-v17 or app-v21 **challenged** memory that is still live and recallable while under dispute (set on all three recall paths: query, search, and hybrid). Because it is `omitempty`, its absence means "not disputed," which is why the committed example above omits it. When it is set, `confidence_score` already carries an extra query-time **disputed haircut** (the shared `store.DisputedConfidenceHaircut`, currently a `0.8` multiplier) layered on top of decay and corroboration. The store applies the same multiplier while enforcing `min_confidence`, so a returned result still satisfies the advertised floor after serialization. The haircut is presentation-only: it leaves the on-chain `status` (`challenged`) and the stored confidence untouched. Under legacy/app-v17 rules a personal one-holder domain resolves immediately, but post-app-v21 that same domain emits `disputed` whenever `k>0`; only `k=0` remains immediate. A challenged memory's on-chain `status` is `challenged`, already listed among the queryable `status_filter` values above.
 
-`min_confidence` is enforced against the **decayed** `confidence_score`, not the stored column. The store applies it over the full candidate set *before* the top-K trim, so: a result returned by a `min_confidence=X` query always satisfies `confidence_score >= X` (including federated results, which are re-checked against the floor on the requesting side); a corroboration-boosted memory whose stored value is below `X` but whose decayed value clears it is still returned; and `top_k` is filled with qualifying records rather than truncated. This full-corpus guarantee holds unconditionally only for `POST /v1/memory/query` on SQLite, whose `QuerySimilar` scans every candidate; on `/v1/memory/search` (FTS), `/v1/memory/hybrid` (via its FTS leaf), and on Postgres deployments the floor is instead evaluated over the top `decayFilterScanCap` (1000) rank/distance-ordered candidates, so a record that would qualify but ranks beyond that pool may not surface. Open tasks are exempt from decay, so an open task is judged by its stored confidence. (Prior to v11.2.0 the floor compared the stored column, which both leaked aged memories below the floor and dropped boosted ones above it.)
+`min_confidence` is enforced against the **decayed** `confidence_score`, not the stored column. The store applies it before the top-K trim, so: a result returned by a `min_confidence=X` query always satisfies `confidence_score >= X` (including federated results, which are re-checked against the floor on the requesting side); a corroboration-boosted memory whose stored value is below `X` but whose decayed value clears it is still returned; and `top_k` is filled with qualifying records rather than truncated. SQLite semantic recall scans every candidate. Before app-v23, SQLite FTS/hybrid and Postgres semantic recall use the bounded top `decayFilterScanCap` (1000) rank/distance candidates, so an otherwise qualifying record beyond that legacy pool may not surface. Once app-v23 is active, the authorization-aware ranked page walk evaluates the decay floor on each page too and continues until the visible `top_k` is filled or the stream is exhausted. Open tasks are exempt from decay, so an open task is judged by its stored confidence. (Prior to v11.2.0 the floor compared the stored column, which both leaked aged memories below the floor and dropped boosted ones above it.)
 
-`filtered` is present when agent-isolation RBAC or per-record classification gates silently hid records. Check the `X-SAGE-Filter-Applied` response header for the same info. Values in `by`: `rbac_submitting_agents`, `classification`.
+Once app-v23 is active, live record disclosure is also applied **before**
+`top_k` is consumed. SQLite semantic recall filters its complete ranked
+candidate set; SQLite text recall and Postgres semantic recall walk stable,
+bounded ranked pages until they fill the requested authorized result count or
+exhaust the stream. Query, search, and hybrid then repeat the disclosure check
+immediately before serialization. Revoked or above-clearance rows therefore do
+not starve later readable results, and no denied-row count is returned.
 
-**Access control stacking** (`memory_handler.go:638-697`): Domain access is checked first (agent's `DomainAccess` policy), then multi-org gate (if domain has a registered owner), then agent-isolation RBAC. These are alternatives — passing domain access disables agent isolation for that call.
+Before app-v23, `filtered` may include legacy `hidden_count`,
+`total_before_filter`, or `visible` counts. App-v23 never returns denied or raw
+inventory counts. Its optional `filtered.by` and
+`X-SAGE-Filter-Applied` header identify an authorization path that was applied;
+they are not proof that any particular row was hidden.
+
+Under app-v23 every record must pass the intersection of active enrollment, any
+immutable legacy visibility envelope, current domain/group/grant scope, and
+classification clearance. Domain access no longer disables a separate
+agent-isolation check, and neither authorship nor task assignment is a read
+bypass.
 
 **curl example:**
 
@@ -223,15 +325,16 @@ Full-text search (FTS5/BM25). Same access control as `/v1/memory/query`.
 
 ### `POST /v1/memory/hybrid`
 
-Fused FTS5 + vector search via Reciprocal Rank Fusion. Requires at least one of `query` or `embedding`. Supports query expansions for multi-variant recall.
+Fused FTS5 + vector search via Reciprocal Rank Fusion. Requires at least one of
+`query` or `embedding`. Supports query expansions for multi-variant recall.
 
-**Request body** (`memory_handler.go:1203-1216`):
+**Request body** (`memory_handler.go:2612-2637`):
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `query` | string | no* | Text query (* at least one of query/embedding required) |
 | `embedding` | []float32 | no* | Vector for similarity arm |
-| `expansions` | []HybridExpansion | no | Paraphrase variants; each has `query` + `embedding` |
+| `expansions` | []HybridExpansion | no | At most 8 paraphrase variants; each has `query` + `embedding` |
 | `domain_tag` | string | no | |
 | `provider` | string | no | |
 | `min_confidence` | float64 | no | |
@@ -240,6 +343,26 @@ Fused FTS5 + vector search via Reciprocal Rank Fusion. Requires at least one of 
 | `tags` | []string | no | |
 
 **Response:** Same shape as `/v1/memory/query`.
+
+The `expansions` array may contain at most eight entries. The limit is checked
+against the submitted array length before blank expansion entries are skipped;
+nine entries therefore return HTTP `422` even if one entry is empty.
+
+Under app-v23 a hybrid request has one shared budget of 8,192 raw live-
+authorization checks across the primary query, every expansion variant, and
+every text/vector store leaf behind those variants. The budget is not reset per
+variant or per leaf, so adding paraphrases cannot multiply the authorization
+scan allowance. Exhaustion returns HTTP `422` (`Hybrid query too broad`); reduce
+the expansion count or narrow domain/provider/tag/status filters.
+
+Governed hybrid execution fails closed. If any variant or store leaf cannot
+complete its live authorization decision, or if a decayed-confidence floor
+cannot be evaluated, the entire request returns the applicable error rather
+than HTTP `200` with a partial RRF result assembled from only the successful
+leaves.
+Unavailable app-v23 classification state returns HTTP `503`; an untyped
+internal leaf failure returns HTTP `500`. Only an ungoverned pre-app-v23 request
+without a decay floor may skip a failed expansion as best-effort enrichment.
 
 ---
 
@@ -271,7 +394,10 @@ Fetch a single memory with votes and corroborations.
 }
 ```
 
-Access control: agent-isolation RBAC + multi-org classification gate apply. Own memories always visible. 403 if agent cannot see the submitter or lacks org clearance for the memory's classification. (`memory_handler.go:1445-1490`)
+Under app-v23 the same live record-disclosure intersection used by recall and
+list applies to direct lookup. Authorship is immutable provenance, not current
+read authority: even the submitting agent receives `403` after its live domain,
+group, grant, enrollment, or clearance authority is revoked.
 
 ---
 
@@ -284,7 +410,7 @@ Paginated memory list with RBAC agent isolation. Read from off-chain store.
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `limit` | int | 50 | Max 200 |
-| `offset` | int | 0 | |
+| `offset` | int | 0 | App-v23 max 7,900 |
 | `domain` | string | | Filter by domain |
 | `tag` | string | | Filter by single tag |
 | `provider` | string | | |
@@ -292,13 +418,34 @@ Paginated memory list with RBAC agent isolation. Read from off-chain store.
 | `sort` | string | | Store-defined sort field |
 | `agent` | string | | Filter by submitting agent ID |
 
-**Response:** `{"memories": [...], "total": N, "limit": N, "offset": N, "filtered": {...}}`
+**Response:** `{"memories": [...], "total": N, "limit": N, "offset": N, "has_more": true, "total_exact": false, "filtered": {...}}`
+
+Under app-v23 the response also includes `has_more` and `total_exact`.
+Authorization is applied while walking bounded store pages, before the visible
+`offset`/`limit`. When `has_more` is `true`, `total` is the privacy-safe visible
+lower bound discovered so far (normally `offset + limit + 1`) and
+`total_exact` is `false`; it never exposes the underlying raw or denied count.
+When the authorized stream is exhausted, `total_exact` is `true` and `total` is
+the exact visible total. This avoids both revoked-prefix starvation and a
+full-inventory scan for the first page on mature nodes.
+One app-v23 request examines at most 8,192 raw authorization candidates. An
+offset above 7,900, or a sparse result that cannot fill the requested visible
+page within that budget, returns HTTP `422` (`Offset too large` or
+`Query too broad`). Narrow the domain/provider/tag/status/agent filters or page
+sequentially; repeating the same broad request does not increase the budget.
+
+The same 8,192-candidate ceiling applies wherever app-v23 must walk raw records
+before producing an authorization-filtered answer: ranked query/search/hybrid,
+validator pending-memory, assigned-task, and timeline candidate scans. These
+routes return HTTP `422` with an endpoint-specific `... query too broad`
+problem and advice to narrow the available filters. Denied/raw inventory counts
+are never returned with that failure.
 
 ---
 
 ### `GET /v1/memory/timeline`
 
-Memory creation counts grouped by time bucket. Agent isolation not applied to aggregate counts.
+Memory creation counts grouped by time bucket.
 
 **Query parameters:**
 
@@ -306,10 +453,23 @@ Memory creation counts grouped by time bucket. Agent isolation not applied to ag
 |---|---|---|---|
 | `domain` | string | | Filter |
 | `bucket` | string | `hour` | Time bucket size |
-| `from` | RFC3339 | now-24h | |
-| `to` | RFC3339 | now | |
+| `from` | RFC3339 | now-24h | App-v23 requires valid RFC3339 |
+| `to` | RFC3339 | now | App-v23 requires valid RFC3339 |
 
-**Response:** `{"buckets": [...]}`
+**Response:** `{"buckets": [...], "total": N}` where `total` is the sum of the
+currently visible bucket counts.
+
+Before app-v23 the historical no-domain aggregate is global. Under app-v23
+aggregate existence and timing are governed metadata: the handler walks stable,
+bounded memory pages across the exact requested range, applies the central live
+record-disclosure decision to every row, and counts only records currently
+visible to the caller. A concrete `domain` still requires current domain read
+authority. Corrupt or unavailable authorization state returns `503` rather than
+falling back to global counts. App-v23 limits one request to 31 days and 8,192
+raw candidates; a wider or excessively dense request returns `422` and must be
+narrowed by time or domain. Bucket strings preserve the selected backend's
+pre-v23 representation (SQLite date/week/month strings; PostgreSQL UTC
+`date_trunc` RFC3339 strings).
 
 ---
 
@@ -319,13 +479,48 @@ Open task memories (type=`task`, status != `done`/`dropped`).
 
 **Query parameters:** `domain`, `provider`
 
-**Response:** `{"tasks": [{memory_id, content, domain_tag, task_status, confidence_score, created_at}], "total": N}`
+**Response:** `{"tasks": [{memory_id, content, domain_tag, task_status, assignee, task_picked_up_by, task_picked_up_at, confidence_score, created_at}], "total": N}`.
+For a signed agent this is an assigned-only feed: `assignee` is the exact
+authenticated agent ID, and unassigned or differently assigned tasks are not
+returned. Assignment is necessary but not sufficient: each row must also pass
+the caller's current domain/group/grant and classification authority. `total`
+is the visible number returned, never an underlying or denied task count.
+
+Under app-v23, the built-in stores page the exact-assignee feed and apply live
+record disclosure before the 500-visible-task response ceiling. A revoked or
+above-clearance prefix therefore cannot make a later readable assigned task
+disappear. Pre-app-v23 callers retain the historical one-query behavior.
+Current-generation Admins may use this ordinary-agent surface only from
+localhost. Root and historical Root credentials are never task assignees;
+remote or stale Admin credentials are denied. A Manager's group Modify
+authority does not permit it to start or finish a teammate's task.
+
+MCP `sage_task` and `sage_backlog` use this scoped agent feed, never the local
+human `/v1/dashboard/tasks` board. When a new task omits `domain`, the MCP client
+reads the caller's app-v23 `home_domain` from `/v1/agent/me`; an explicit domain
+is submitted exactly as written and a foreign/unowned denial is returned
+unchanged. REST itself derives a permanent semantic task key when the caller
+omits one and confirms the exact assignee projection before returning `201`; a
+committed-but-unconfirmed projection returns `202` with
+`projection_confirmed:false` and must be reconciled, not resubmitted. MCP adds
+an immediate exact-assignee backlog readback before reporting a fresh task as
+created.
 
 ---
 
 ### `POST /v1/memory/{memory_id}/vote`
 
-Cast a validator vote on a proposed memory.
+Ask this node's local validator to cast its one vote on a proposed memory. This
+is a deliberate operator override, not an agent-voting endpoint: pre-app-v23
+only the configured governance operator may call it, and app-v23 accepts only
+the current CEREBRUM Root or a current local Admin from localhost. Member,
+Manager, stale-Admin, retired-Root, and remote callers receive `403` before the
+memory ID is looked up. A node without its live validator signing key returns
+`503`.
+
+The consensus transaction contains only the validator identity. The
+authorizing operator does not acquire separate voting power, and repeated calls
+through one node occupy that validator's same vote slot.
 
 **Request body:**
 
@@ -335,6 +530,9 @@ Cast a validator vote on a proposed memory.
 | `rationale` | string | no | Human-readable justification |
 
 **Response** (HTTP 200): `{"message": "Vote recorded successfully.", "tx_hash": "<hex>"}`
+
+Prefer the node's auto-voter for normal operation; use this route only for an
+intentional local override.
 
 ---
 
@@ -433,9 +631,15 @@ CEREBRUM operator board. Agents cannot set `planned` or reopen terminal work.
 
 | Field | Type | Required | Values |
 |---|---|---|---|
-| `task_status` | string | yes | `planned`, `in_progress`, `done`, `dropped` |
+| `task_status` | string | yes | Agent-authorized values: `in_progress`, `done`, `dropped`. `planned` is accepted by the parser but always rejected here as a local CEREBRUM operator action. |
 
 **Response** (HTTP 200): `{"memory_id": "...", "task_status": "..."}`
+
+The handler rechecks current domain write authority and classification/read
+authority before changing the row. `409` means the task is terminal or is not
+currently assigned to this exact agent. Current-generation Admins may act only
+from localhost; Root, historical Root, inactive/stale agents, and Managers
+targeting another assignee are denied.
 
 ---
 
@@ -542,6 +746,12 @@ Register agent on-chain. Idempotent — returns existing record if already regis
 
 **Response (existing, HTTP 200):** Same shape with `"status": "already_registered"`. `on_chain_height` is populated on both paths since v6.6.0.
 
+Under app-v23, self-registration never grants the requested privileged role.
+A new third-party key becomes a restricted, pending `member` with no active
+local enrollment or owned home domain until an Admin commits the atomic policy
+operation below. The immutable Root principal and every current or retired
+Root credential generation are rejected as ordinary registration targets.
+
 **curl example:**
 
 ```bash
@@ -577,7 +787,10 @@ Authenticated agent's profile, including the on-chain Proof-of-Experience
 quorum-weight factors. Since v8.6.0 the response also exposes the lifetime
 corroboration count and per-domain expertise; `accuracy`, `corr_count`, and
 `domain_expertise` are read from the authoritative on-chain `vstats:` /
-`vstats_domain:` records (not the off-chain mirror).
+`vstats_domain:` records (not the off-chain mirror). After app-v23 activation,
+only an active ordinary agent can use this route; the self response also carries
+its current local `role`, named `profile`, and owned `home_domain`. CEREBRUM Root
+has no ordinary agent profile.
 
 **Response** (HTTP 200):
 
@@ -586,6 +799,10 @@ corroboration count and per-domain expertise; `accuracy`, `corr_count`, and
   "agent_id": "<hex>",
   "display_name": "...",
   "domains": ["go-debugging", "sage-development"],
+  "role": "member",
+  "profile": "companion",
+  "home_domain": "voice-interface",
+  "enrollment_status": "active",
   "poe_weight": 0.82,
   "vote_count": 127,
   "accuracy": 0.91,
@@ -598,6 +815,9 @@ corroboration count and per-domain expertise; `accuracy`, `corr_count`, and
 - `accuracy` — global verdict-correctness EWMA (the α factor of the quorum weight).
 - `corr_count` — lifetime count of votes that matched a terminal verdict (the δ factor). **(v8.6.0+)**
 - `domain_expertise` — per-domain verdict-correctness EWMA (the β factor, from `vstats_domain:`), keyed by domain. Only present for domains the agent has actually voted in; omitted otherwise. **(v8.6.0+)**
+- `home_domain` — the exact app-v23 owned domain a write-capable agent may use
+  when an MCP write omits `domain`; explicitly requested domains are never
+  silently remapped.
 
 ---
 
@@ -607,13 +827,132 @@ Get a registered agent by ID. Auth required.
 
 **Response** (HTTP 200): `AgentEntry` object from off-chain store.
 
+Under app-v23, generic list, lookup, search, and `/me` routes treat the
+immutable Root principal and all Root credential generations as not-an-agent.
+Root is available only through the dedicated CEREBRUM authority projection and
+handover ceremony.
+
+---
+
+### App-v23 CEREBRUM access-control routes
+
+These loopback CEREBRUM routes expose the current policy model. Mutations
+require the current Root or an active same-machine Admin signing the exact
+action; Admin actions also carry a fresh, single-use Root elevation
+countersignature. Capability bits are returned only as diagnostics derived
+from the selected named profile.
+
+The Add Agent wizard is identity/connection enrollment only. It creates a
+restricted pending Member and deliberately does not collect, stage, or persist
+a requested role, clearance, or domain list that `AgentRegister` would discard.
+After registration, the operator uses Access Controls to approve role, named
+profile, clearance, and an owned compatible home domain atomically.
+
+App-v23 also treats canonical memory publication as a CEREBRUM read boundary.
+`GET /v1/dashboard/memory/list` (including text search), `/v1/dashboard/export`,
+`/v1/dashboard/memory/graph`, `/v1/dashboard/memory/{id}/related`,
+`/v1/dashboard/stats`, and `/v1/dashboard/memory/timeline` validate every
+candidate against its exact canonical hash/status/domain/author/classification
+projection before exposing content or aggregates. A SQL-only row, a tampered
+serving projection, or temporarily unavailable canonical state fails closed
+with a sanitized HTTP `503`; it is never silently skipped or exposed.
+Pre-app-v23 nodes retain their legacy projection behavior.
+
+| Method + path | Purpose |
+|---|---|
+| `GET /v1/dashboard/network/access` | Read Root/broker readiness plus non-Root agents, enrollment/role revisions, named profiles, Access Groups, linked-reader readiness, and separate linked-message consent readiness. |
+| `PUT /v1/dashboard/network/access/agents/{id}/policy` | Atomically approve or change a non-Root local agent's role, named profile, clearance, and compatible owned home domain. |
+| `PUT /v1/dashboard/network/access/groups/{groupID}` | Create or replace a consensus local Access Group using an expected-revision binding. |
+| `DELETE /v1/dashboard/network/access/groups/{groupID}` | Delete an Access Group using its expected revision. |
+| `GET /v1/dashboard/network/access/linked-readers` | List exact node-local federated linked-reader relations. |
+| `POST /v1/dashboard/network/access/linked-readers/eligibility` | Live-check one exact `remote_agent_id` on one active `remote_chain_id` before offering the manual-ID fallback; it is not a directory or presence query. |
+| `POST /v1/dashboard/network/access/linked-readers` | Attach, remove, or rebind an exact remote agent as a read-only relation; never creates local membership. |
+| `GET /v1/dashboard/network/access/linked-messages/candidates?remote_chain_id=...&local_agent_id=...` | Return bounded, host-signed exact remote-member offers for one local guest receiver; exposes IDs/group IDs only, never domains, names, or a peer roster. |
+| `GET /v1/dashboard/network/access/linked-messages/consent?remote_chain_id=...&remote_agent_id=...&local_agent_id=...` | Read the receiver-local, default-off consent and CAS revision for one exact currently linked remote-to-local agent tuple. |
+| `PUT /v1/dashboard/network/access/linked-messages/consent` | Set `accepting` for one exact tuple using `expected_revision`; never creates a read link, contact, group membership, domain grant, role, or write authority. |
+| `POST /v1/dashboard/network/access/root/handover` | Dedicated current-Root-only credential handover with irreversible confirmation, exact phrase, and expected Root generation. Returns the replacement recovery archive once with `Cache-Control: no-store`. |
+
+The roles are `member`, `manager`, and `admin`. Roles define verbs; consensus
+Access Groups define local scope; clearance caps readable classification; and
+the `standard`, `companion`, or `read_only` profile supplies hard restrictions
+(CEREBRUM displays the latter as “Read-only”).
+Root is a separate singleton authority, not another `admin`. Handover preserves
+the Root principal's domains, grants, groups, and readable history while new
+memories record the replacement credential as their exact author. Prior
+authorship and blocks are never rewritten.
+
+An upgraded node may also return `legacy_restricted` for an existing agent.
+This is an immutable migration review state, not a selectable fourth preset.
+The policy route rejects a request whose target profile is
+`legacy_restricted`; CEREBRUM instead shows one review action that replaces it
+with a normal named profile. Non-Root legacy Admins appear as Members with
+disposition `legacy_admin_review` until an explicit local Root-attested
+promotion. Bare mask-30 self-registrations without an owned non-shared domain
+or explicit level-1-or-higher grant remain inactive with `pending_review`.
+Domainless deny-claim agents and exact masks are otherwise preserved as
+described in
+[`app-v23-access-control-design.md`](app-v23-access-control-design.md).
+
+For an unchanged active migration baseline only, REST memory-submit preflight
+also preserves the app-v22 ability to write a shared domain when capability bit
+`2` is absent. This exception is Write-only, never Modify, and ends after any
+explicit role/enrollment policy revision. Fresh app-v23 agents require the
+normal shared-domain grant.
+
+The three linked-message candidate/consent routes are local CEREBRUM human-management
+routes, not agent data-plane APIs. Both the socket peer and Host must be
+loopback; encrypted nodes additionally require the local unlocked session (or
+an exact signed current local authority), while unencrypted nodes use the same
+same-origin CEREBRUM boundary. Input is bounded to canonical agent IDs and a
+valid 50-byte-or-shorter chain ID. Missing, stale, unrelated, inactive, Root,
+and non-group tuples all return the same not-found problem
+`linked_message_tuple_unavailable`. A missing consent projects as revision `0`,
+`accepting:false`; an explicit block retains its monotonic non-zero revision.
+Concurrent mutation returns `linked_message_consent_conflict` and requires a
+reload before retry.
+
+The candidates route is invoked only by an explicit one-host CEREBRUM action.
+Changing the selected local receiver performs no peer request, and CEREBRUM
+never fans that exact ID out across the connection list. Empty and failed
+candidate checks use the same no-offer presentation.
+
+The linked-reader eligibility route accepts
+`{"remote_chain_id":"<active-chain>","remote_agent_id":"<canonical-lowercase-id>"}`
+and returns
+`{"ok":true,"eligible":true,"remote_chain_id":"...","remote_agent_id":"..."}`
+only after the authenticated peer confirms that exact identity is an active
+ordinary agent. Missing, stale, Root, Admin, inactive, unavailable, and
+otherwise ineligible identities collapse to the same HTTP `409`
+`linked_reader_agent_ineligible` result, so the route is not an identity oracle.
+Invalid local request shapes return `400`; an inactive app-v23 node returns
+`409`; a build without the live eligibility adapter returns `501`.
+
 ---
 
 ### `PUT /v1/agent/{id}/permission`
 
-Set clearance, domain access, visibility, and—after governed app-v22
-activation—the consensus-enforced capability mask on an agent. PATCH semantics:
-omitted fields preserve their on-chain value (`api/rest/agent_handler.go`).
+**Retired at app-v23.** Once app-v23 is active this endpoint returns HTTP 410
+with problem code `app_v23_atomic_policy_required` and a machine-readable
+replacement:
+
+```json
+{
+  "replacement": {
+    "method": "PUT",
+    "path": "/v1/dashboard/network/access/agents/{id}/policy",
+    "target_agent_id": "<id>"
+  }
+}
+```
+
+App-v23 requires role, profile, clearance, capabilities, and home-domain
+approval to commit atomically through CEREBRUM; the legacy
+`AgentSetPermission` transaction is no longer a valid mutation path.
+
+Before app-v23, this endpoint sets clearance, domain access, visibility,
+and—after governed app-v22 activation—the consensus-enforced capability mask
+on an agent. PATCH semantics: omitted fields preserve their on-chain value
+(`api/rest/agent_handler.go`).
 
 **Auth rules** (`agent_handler.go:213-240`): Self-set OR global `role=admin` OR org admin in any org the target belongs to. ABCI re-checks independently.
 
@@ -685,7 +1024,14 @@ Grant domain access. Caller must own the domain or be admin. Broadcasts `TxTypeA
 
 **Response** (HTTP 201): `{"status": "granted", "tx_hash": "..."}`
 
-**CEREBRUM access matrix (v11.3):** Saving the per-agent Domain Access matrix in the dashboard (`PATCH /v1/dashboard/network/agents/{id}`) now issues REAL `AccessGrant`/`AccessRevoke` txs through this same consensus path - diffed against the actual on-chain grant state (`GetAccessGrant`), so it is idempotent and self-healing - and each tx is signed AS the domain owner (whom the consensus gate authorizes). Domains whose owner key is not on this node are reported as skipped, not silently dropped. Previously the matrix wrote only a cosmetic policy blob the access checks never read; the consensus grant/revoke handlers themselves are unchanged (no admin-bypass added). See `web/reassign_handler.go:116-226` and `concepts/rbac-orgs-federation.md`.
+**Historical CEREBRUM access matrix (v11.3–v11.14):** Saving the
+per-agent Domain Access matrix issued real `AccessGrant`/`AccessRevoke`
+transactions through this consensus path. App-v23 retires that matrix from the
+live Access Controls page in v11.15.0, so documentation and typed denials must
+not direct an operator to a nonexistent level-2 editor. The low-level consensus
+grant/revoke routes remain documented here for compatible clients; the shipped
+v11.15 CEREBRUM actions are owned-home-domain policy and, where shared
+management is intended, Root/Admin-approved Manager Access Groups.
 
 ---
 
@@ -1252,6 +1598,10 @@ Memories awaiting validator votes.
 
 **Response** (HTTP 200): `{"memories": [...]}`
 
+Under app-v23, `limit` counts visible records. The built-in stores walk stable,
+bounded pending-memory pages until that many live-authorized records are found
+or the stream is exhausted; denied records and their count are not disclosed.
+
 ---
 
 ### `GET /v1/validator/epoch`
@@ -1278,6 +1628,17 @@ Current epoch validator scores (PoE weights).
 
 Generate a vector embedding via the node's local provider (Ollama or hash fallback). Use this to avoid running a separate embedder.
 
+Ed25519 authentication is required. Once app-v23 is active, signature
+possession alone is not enrollment: the signer must be an active, approved,
+internally consistent local Member, Manager, or current-generation Admin.
+Members and Managers retain signed REST access over a network listener; Admin
+use remains localhost-only. Current and retired Root credentials, pending or
+inactive agents, and arbitrary self-generated keys receive HTTP 403 before the
+provider runs. Pre-app-v23 nodes retain the historical signed-key behavior.
+
+`POST /v1/embed/personal` is a compatibility alias with the exact same handler
+and authorization. It is not a separate unsigned browser endpoint.
+
 **Request body:**
 
 | Field | Type | Required |
@@ -1297,6 +1658,9 @@ Returns 503 if embedder not ready.
 ### `GET /v1/embed/info`
 
 Report the active embedding provider's capabilities. Clients use this to decide between vector query and FTS5 search paths (`embed_handler.go:47-81`).
+It uses the same Ed25519 and app-v23 active-agent authorization as
+`POST /v1/embed`, preventing unknown keys from probing provider, readiness, or
+vault-derived routing state.
 
 **Response** (HTTP 200):
 
@@ -1312,14 +1676,33 @@ When vault (at-rest encryption) is active, `semantic` is forced `true` even if n
 
 ### `POST /v1/mcp/tokens`
 
-Issue a bearer token for MCP clients that cannot sign Ed25519 requests (ChatGPT, Cursor, etc.). Ed25519 auth required (admin use). Token plaintext is shown **once only** — not stored, only its SHA-256 digest is persisted. HTTP MCP calls execute as the local node operator because that is the signing key held by the transport; tokens cannot impersonate another agent identity.
+Issue a bearer token for MCP clients that cannot sign Ed25519 requests
+(ChatGPT, Cursor, etc.). Ed25519 auth is required. Under app-v23 the issuer
+must be the exact current committed CEREBRUM Root or an active
+current-generation local Admin; the historical `agent.key` transport identity
+does not retain issuance authority after Root handover.
+
+The token plaintext is shown **once only**. Every app-v23 bearer mints and
+synchronously self-registers a distinct restricted Member identity pending
+CEREBRUM review; it never acts as Root/Admin or falls back to the issuer's key.
+Its private key is AES-256-GCM sealed under an HKDF-SHA256 key derived from the
+bearer plaintext and a per-row random salt, whether optional ledger encryption
+is on or off. This keeps the credential stable through ledger enable/disable,
+lock/unlock, and passphrase changes. SQLite stores the bearer SHA-256 only as
+its lookup/fingerprint value; that digest cannot decrypt the signing key.
+Authentication presents the plaintext transiently to unlock only its own row,
+then downstream REST calls sign as the token's distinct agent. Existing
+vault-sealed keyed rows remain compatible: while unlocked, their next valid
+bearer authentication atomically rewraps them into the transition-stable
+bearer envelope. Until that one-time migration, a locked vault fails them
+closed rather than falling back to Root.
 
 **Request body:**
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `name` | string | no | Human label, e.g. `chatgpt-laptop` |
-| `agent_id` | string | yes | The local node operator's 64-char hex Ed25519 pubkey |
+| `agent_id` | string | yes | The authorizing current Root/Admin's 64-char hex Ed25519 pubkey. The response `agent_id` is the newly minted distinct MCP agent. |
 
 **Response** (HTTP 201):
 
@@ -1354,18 +1737,47 @@ Revoke a token by ID. Idempotent.
 
 ### OAuth 2.0 Endpoints (root-level, no `/v1/` prefix)
 
-These support ChatGPT's MCP connector which requires a full OAuth 2.0 + PKCE flow. Not subject to Ed25519 auth. Mounted at the host root (`oauth_handlers.go:944-961`).
+These support ChatGPT's MCP connector which requires a full OAuth 2.0 + PKCE
+flow. Discovery, registration, public authorization entry, and token exchange
+are network-facing and not subject to Ed25519 request auth. Consent itself is
+not public: `/oauth/approve` is a localhost-only CEREBRUM route.
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/.well-known/oauth-authorization-server` | RFC 8414 discovery document |
 | `GET` | `/.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata |
 | `POST` | `/oauth/register` | RFC 7591 Dynamic Client Registration (10 reqs/IP/hour) |
-| `GET` | `/oauth/authorize` | Render PKCE consent screen (requires dashboard session when encryption on) |
-| `POST` | `/oauth/authorize` | Submit consent; mints bearer + issues auth code; redirects to `redirect_uri` |
+| `GET` | `/oauth/authorize` | Validate the DCR/PKCE request and redirect to an absolute loopback approval URL carrying only an opaque signed five-minute handoff |
+| `POST` | `/oauth/authorize` | Compatibility entry; remote requests still receive only the loopback handoff and cannot submit consent |
+| `GET` | `/oauth/approve` | Localhost-only consent page; resolves live Root/Admin authority and requires an unlocked CEREBRUM session when encryption is enabled |
+| `POST` | `/oauth/approve` | Localhost-only, CSRF-bound, single-use approval; re-resolves live authority, synchronously registers a distinct pending-review agent, then issues the authorization code |
 | `POST` | `/oauth/token` | Exchange auth code for bearer (`grant_type=authorization_code` only) |
 
 The `access_token` returned by `/oauth/token` is the same bearer accepted by `Authorization: Bearer <token>` on `/v1/mcp/sse` and `/v1/mcp/streamable`. Token lifetime is controlled by revocation (`DELETE /v1/mcp/tokens/{id}`), not expiry — `expires_in: 0` in the token response.
+
+The authorization-code table persists neither raw credential. It indexes a
+five-minute code by SHA-256 and seals the pending bearer with AES-256-GCM under
+a domain-separated HKDF-SHA256 key derived from the unpersisted raw code and a
+random per-row salt. The stored code digest, PKCE challenge, salt, and database
+ciphertext cannot recover the bearer. Successful redemption atomically
+consumes the code and wipes its delivery ciphertext and salt. Upgrade cannot
+retroactively protect an already-copied legacy plaintext row, so app-v23
+revokes its pending token, erases the row, and requires authorization to
+restart.
+
+The public handoff is an HMAC-authenticated opaque handle to process-local
+state: it contains no OAuth parameters, agent roster, key, CEREBRUM session,
+or bearer. It expires after five minutes and is consumed atomically by the
+first valid approval POST. Expired, tampered, and replayed handles fail closed.
+Pending handoffs are rate-limited per source and hard-capped at 2,048
+process-wide.
+The approval route checks the socket peer, `Host`, and forwarding metadata;
+Cloudflare's generated ingress configuration does not expose it. Public-host
+dashboard cookies are neither read nor required. With encryption off, the
+same-origin loopback CEREBRUM browser approves as current Root; with encryption
+on, it must also present a valid unlocked local session. Current Root/Admin
+signatures work only on localhost, while retired Root and remote proxy
+requests cannot reach consent.
 
 ---
 
@@ -1531,33 +1943,45 @@ caller actually won; a losing reader never receives the same work item.
 
 ### Task assignment and agent notices
 
-`GET /v1/dashboard/tasks?all=true&limit=N` is the local-human CEREBRUM Kanban feed; signed agents receive `403` and use the scoped backlog instead. It returns explicit `memory_type=task` records across `planned`, `in_progress`, `done`, and `dropped` on both SQLite and PostgreSQL; ordinary agent conversations/observations are not inferred as tasks. Historical task rows whose older writer did not persist `task_status` are returned with an empty status so CEREBRUM can ask the operator to classify each one—SAGE does not guess that unknown work is Planned or Done. New PostgreSQL inserts persist `TaskStatus`, matching SQLite. Each task also returns `task_status_updated_at`; CEREBRUM uses that lifecycle timestamp—not the task's original `created_at`—to keep Done/Dropped cards visible for seven days after their terminal transition. Manual Clear remains available before that window expires, while older cards can still be revealed with Show all (`web/handler.go:1919-1962`, `web/static/js/app.js:2328-2340`).
+`GET /v1/dashboard/tasks?all=true&limit=N` is the local-human CEREBRUM Kanban feed. Ordinary signed Member/Manager agents receive `403` and use the scoped backlog instead; a current Root or eligible current Admin signature may use the CEREBRUM board only through localhost. A current local Admin that is also the exact assignee may separately use the ordinary task feed/status route, while Root never may. The board returns explicit `memory_type=task` records across `planned`, `in_progress`, `done`, and `dropped` on both SQLite and PostgreSQL; ordinary agent conversations/observations are not inferred as tasks. Historical task rows whose older writer did not persist `task_status` are returned with an empty status so CEREBRUM can ask the operator to classify each one—SAGE does not guess that unknown work is Planned or Done. New PostgreSQL inserts persist `TaskStatus`, matching SQLite. Each task also returns `task_status_updated_at`; CEREBRUM uses that lifecycle timestamp—not the task's original `created_at`—to keep Done/Dropped cards visible for seven days after their terminal transition. Manual Clear remains available before that window expires, while older cards can still be revealed with Show all (`web/handler.go:1919-1962`, `web/static/js/app.js:2328-2340`).
 
-**Dashboard operator authority and local recovery (v11.14.2+):** Loopback
-source addresses, `Origin`, `Host`, and Fetch Metadata identify routing context,
-not a cryptographic person. Privileged CEREBRUM mutations therefore still
-require either (a) a valid dashboard cookie from an enabled, unlocked encrypted
-vault together with the local browser/CSRF checks, or (b) a request verified as
-the exact configured node-operator identity.
+**Dashboard operator authority and localhost boundary (v11.15.0+):** CEREBRUM
+is a same-machine human control plane, not a network administration service.
+The HTTP socket peer and `Host` must both be loopback for the SPA,
+authentication, recovery, and every session/headerless protected dashboard
+request. Browser requests additionally face the existing same-origin,
+Fetch-Metadata, and anti-rebinding checks. LAN, federated, cross-site, and
+rebinding-host requests cannot load or manage CEREBRUM.
 
-Vault encryption is off by default. To avoid stranding an existing personal
-installation before it can establish that session, the real loopback CEREBRUM
-browser has a deliberately narrower compatibility path: it can read the
-memory/search/graph, pipeline, task-board, agent-topology, event-stream, export,
-tags, related-memory, and boot-instruction views; enable the vault and receive
-the new session in that same response; and apply/restart official
-checksum-verified SAGE updates. Both the socket peer and HTTP Host must be
-loopback, and the request must carry browser-controlled same-origin Fetch
-Metadata or a local Origin fallback. This exception does not authorize ordinary
-memory/task/agent/federation/governance mutations.
+Vault encryption is optional and does not determine whether a local owner has
+authority. With encryption off, the real same-origin loopback CEREBRUM SPA acts
+as current Root and may perform the complete read and mutation surface,
+including RBAC, agent lifecycle, federation management, governance, memory,
+task, and settings operations. It does not need a synthetic password or a
+copied genesis key. With encryption on, that same local SPA must also present a
+valid unlocked vault session. A request signed by current Root or an eligible
+Admin can exercise its permitted CEREBRUM actions only through localhost;
+possession of an exported key on another machine does not make the dashboard
+remotely manageable.
 
-An unsigned background process with no browser metadata, a LAN browser, a
-cross-site browser, or an ordinary signed agent cannot enter that compatibility
-path. Signed non-operator agents remain on their scoped API surfaces. The
-boot-instructions GET also accepts a freshly signature-verified agent that is
-still active in the local registry for `sage_inception`; arbitrary
-unregistered keys and inactive/removed agents are denied
+Signed agent operations that historically live below `/v1/dashboard`—scoped
+task backlog/status, task notices, boot instructions, and applicable governance
+reads—remain remotely reachable only for active ordinary Member or Manager
+identities and retain their own exact authorization. Dedicated REST/MCP and
+federation data-plane routes likewise remain network APIs for eligible
+Member/Manager identities; this does not make a current Root or Admin credential
+network-usable. The common signed-REST boundary accepts current Root/Admin
+identity use only through localhost. Root is never an agent, task assignee, task
+notice recipient, or pipeline inbox identity; every current and retired Root
+credential is rejected from those agent-only surfaces. Pairing/claim redemption,
+public health, validator, and MCP-configuration routes keep their separately
+documented boundaries. Unsigned CLI-style localhost calls do not acquire human
+Root authority merely by connecting locally. The boot-instructions GET accepts
+a freshly signature-verified, consensus-enrolled Member/Manager that is still
+active in the local registry for `sage_inception`; arbitrary unregistered keys,
+pending/inactive agents, stale Admins, and Root credentials are denied
 (`web/handler.go:isCEREBRUMOperatorRequest`,
+`web/handler.go:isLoopbackCEREBRUMRequest`,
 `web/handler.go:isLoopbackCEREBRUMBrowserRequest`,
 `web/handler.go:bootInstructionsReadGate`).
 
@@ -1717,9 +2141,21 @@ peer-originated diagnostic text and is data, never an instruction or
 authorization to take a recovery action.
 `sage_turn` polls this route and returns actionable `pipe_delivery_updates`.
 
+Successful delivery and receiver claim/read receipts are deliberately not
+exposed in v11.15.0; that sender-queryable receipt state is deferred to v11.16.
+The local `/v1/pipe/{pipe_id}` workflow row and a clean inbox must not be
+presented as evidence that a remote recipient received or read a message.
+
 ---
 
 ## 11. Operational (No Auth)
+
+### `GET /metrics`
+
+Prometheus metrics for the `sage-gui` process. This endpoint is available only
+through a direct loopback socket with a loopback HTTP `Host`; forwarded/proxied
+requests and non-loopback REST clients receive HTTP 403. Binding `REST_ADDR` to
+a LAN address exposes governed data-plane routes, not node metrics.
 
 ### `GET /health`
 
@@ -1814,7 +2250,11 @@ the hinted interval, not as a per-agent rate-limit quota breach.
 
 ## Node Operator Bypass
 
-If the server has `nodeOperatorID` configured (`server.go:50-57`), requests signed with that key bypass agent-isolation RBAC (the cross-agent visibility filter) on all read paths. Domain access and classification gates still apply. This lifts the prefetch limit on nodes where the LLM's registered identity is separate from the operator key.
+Before app-v23, a configured `nodeOperatorID` can bypass the historical
+cross-agent submitter filter while domain and classification gates still apply.
+Under app-v23 it is not a provenance shortcut: the effective policy principal
+must still pass the central live enrollment, legacy-envelope,
+domain/group/grant, and clearance decision for every returned record.
 
 ---
 

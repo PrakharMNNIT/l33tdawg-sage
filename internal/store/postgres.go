@@ -285,6 +285,7 @@ var postgresTaskAssignmentSchema = []string{
 	`ALTER TABLE memories ADD COLUMN IF NOT EXISTS task_board_position BIGINT NOT NULL DEFAULT 0`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_assignee ON memories (assignee) WHERE assignee != ''`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_task_picked_up_by ON memories (task_picked_up_by) WHERE task_picked_up_by != ''`,
+	`CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at)`,
 	// FindByContentHash became a live query in v11.11 (it previously returned a
 	// constant false), and voter.Run evaluates it per pending memory on a 2s
 	// poll. Without this index that is a sequential scan of a table carrying
@@ -602,7 +603,7 @@ func (s *PostgresStore) GetMemory(ctx context.Context, memoryID string) (*memory
 	row := s.db.QueryRow(ctx,
 		`SELECT memory_id, submitting_agent, content, content_hash, embedding, embedding_hash,
 			memory_type, domain_tag, provider, confidence_score, status, parent_hash, created_at, committed_at, deprecated_at,
-			COALESCE(task_status, '')
+			COALESCE(task_status, ''), COALESCE(assignee, '')
 		FROM memories WHERE memory_id = $1`, memoryID)
 
 	var r memory.MemoryRecord
@@ -612,7 +613,7 @@ func (s *PostgresStore) GetMemory(ctx context.Context, memoryID string) (*memory
 
 	err := row.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
 		&emb, &r.EmbeddingHash, &mt, &r.DomainTag, &r.Provider, &r.ConfidenceScore,
-		&st, &parentHash, &r.CreatedAt, &r.CommittedAt, &r.DeprecatedAt, &taskStatus)
+		&st, &parentHash, &r.CreatedAt, &r.CommittedAt, &r.DeprecatedAt, &taskStatus, &r.Assignee)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, fmt.Errorf("memory not found: %s", memoryID)
@@ -720,57 +721,110 @@ func (s *PostgresStore) QuerySimilar(ctx context.Context, embedding []float32, o
 		query += " AND EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = memories.memory_id AND mt.tag IN (" + strings.Join(placeholders, ",") + "))"
 	}
 
-	scanLimit := opts.TopK
-	if opts.DecayFloor > 0 {
-		// Over-fetch: the decayed floor isn't a SQL predicate, so pull a bounded
-		// distance-ordered pool and filter it in Go below, before trimming to top_k.
-		scanLimit = decayFilterScanCap
+	scanRows := func(rows pgx.Rows, capacity int) ([]*memory.MemoryRecord, error) {
+		defer rows.Close()
+		results := make([]*memory.MemoryRecord, 0, capacity)
+		for rows.Next() {
+			var r memory.MemoryRecord
+			var mt, st, taskStatus string
+			var emb *pgvector.Vector
+			var parentHash *string
+			var distance float64
+
+			scanErr := rows.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
+				&emb, &mt, &r.DomainTag, &r.Provider, &r.ConfidenceScore,
+				&st, &parentHash, &r.CreatedAt, &r.CommittedAt, &r.DeprecatedAt, &taskStatus, &distance)
+			if scanErr != nil {
+				return nil, fmt.Errorf("scan row: %w", scanErr)
+			}
+
+			r.MemoryType = memory.MemoryType(mt)
+			r.Status = memory.MemoryStatus(st)
+			r.TaskStatus = memory.TaskStatus(taskStatus)
+			if emb != nil {
+				r.Embedding = emb.Slice()
+			}
+			if parentHash != nil {
+				r.ParentHash = *parentHash
+			}
+			results = append(results, &r)
+		}
+		return results, rows.Err()
 	}
-	query += fmt.Sprintf(" ORDER BY embedding <=> $1 LIMIT $%d", argIdx)
-	args = append(args, scanLimit)
-
-	rows, err := s.db.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query similar: %w", err)
-	}
-	defer rows.Close()
-
-	results := make([]*memory.MemoryRecord, 0)
-	for rows.Next() {
-		var r memory.MemoryRecord
-		var mt, st, taskStatus string
-		var emb *pgvector.Vector
-		var parentHash *string
-		var distance float64
-
-		scanErr := rows.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
-			&emb, &mt, &r.DomainTag, &r.Provider, &r.ConfidenceScore,
-			&st, &parentHash, &r.CreatedAt, &r.CommittedAt, &r.DeprecatedAt, &taskStatus, &distance)
-		if scanErr != nil {
-			return nil, fmt.Errorf("scan row: %w", scanErr)
+	filterPage := func(page []*memory.MemoryRecord) ([]*memory.MemoryRecord, error) {
+		if opts.DecayFloor > 0 {
+			counts, cErr := s.GetCorroborationCounts(ctx, recordIDs(page))
+			if cErr != nil {
+				return nil, fmt.Errorf("query similar decay floor: %w", cErr)
+			}
+			page = applyDecayFloor(page, opts.DecayFloor, opts.DecayNow, counts, opts.IncludeDisputed)
 		}
-
-		r.MemoryType = memory.MemoryType(mt)
-		r.Status = memory.MemoryStatus(st)
-		r.TaskStatus = memory.TaskStatus(taskStatus)
-		if emb != nil {
-			r.Embedding = emb.Slice()
-		}
-		if parentHash != nil {
-			r.ParentHash = *parentHash
-		}
-		results = append(results, &r)
+		return applyCandidateFilter(page, opts.CandidateFilter)
 	}
 
-	// Decayed-confidence floor (if any) over the over-fetched pool, before trim.
-	if opts.DecayFloor > 0 {
-		counts, cErr := s.GetCorroborationCounts(ctx, recordIDs(results))
-		if cErr != nil {
-			return nil, fmt.Errorf("query similar decay floor: %w", cErr)
+	if opts.CandidateFilter == nil {
+		scanLimit := opts.TopK
+		if opts.DecayFloor > 0 {
+			// Preserve the historical bounded decay-only over-fetch.
+			scanLimit = decayFilterScanCap
 		}
-		results = applyDecayFloor(results, opts.DecayFloor, opts.DecayNow, counts, opts.IncludeDisputed)
+		onePageQuery := query + fmt.Sprintf(" ORDER BY embedding <=> $1 LIMIT $%d", argIdx)
+		onePageArgs := append(args, scanLimit)
+		rows, queryErr := s.db.Query(ctx, onePageQuery, onePageArgs...)
+		if queryErr != nil {
+			return nil, fmt.Errorf("query similar: %w", queryErr)
+		}
+		results, queryErr := scanRows(rows, scanLimit)
+		if queryErr != nil {
+			return nil, queryErr
+		}
+		results, queryErr = filterPage(results)
+		if queryErr != nil {
+			return nil, queryErr
+		}
 		if len(results) > opts.TopK {
 			results = results[:opts.TopK]
+		}
+		return results, nil
+	}
+
+	// Authorization-aware app-v23 path. Page the distance-ordered stream with a
+	// deterministic tie-breaker until TopK visible rows are filled, but cap the
+	// total candidate walk so a sparse authorized tail cannot amplify one
+	// authenticated request into unbounded DB + live-policy work.
+	const candidatePageSize = 128
+	results := make([]*memory.MemoryRecord, 0, opts.TopK)
+	for offset := 0; len(results) < opts.TopK; offset += candidatePageSize {
+		if offset >= CandidateFilterScanBudget {
+			return nil, ErrCandidateFilterScanBudgetExceeded
+		}
+		pageQuery := query + fmt.Sprintf(
+			" ORDER BY embedding <=> $1, memory_id ASC LIMIT $%d OFFSET $%d",
+			argIdx, argIdx+1,
+		)
+		pageArgs := make([]any, len(args), len(args)+2)
+		copy(pageArgs, args)
+		pageArgs = append(pageArgs, candidatePageSize, offset)
+		rows, queryErr := s.db.Query(ctx, pageQuery, pageArgs...)
+		if queryErr != nil {
+			return nil, fmt.Errorf("query similar: %w", queryErr)
+		}
+		page, queryErr := scanRows(rows, candidatePageSize)
+		if queryErr != nil {
+			return nil, queryErr
+		}
+		rawCount := len(page)
+		page, queryErr = filterPage(page)
+		if queryErr != nil {
+			return nil, queryErr
+		}
+		remaining := opts.TopK - len(results)
+		if len(page) > remaining {
+			page = page[:remaining]
+		}
+		results = append(results, page...)
+		if rawCount < candidatePageSize {
+			break
 		}
 	}
 	return results, nil
@@ -829,7 +883,7 @@ func (s *PostgresStore) InsertVote(ctx context.Context, vote *ValidationVote) er
 func (s *PostgresStore) GetVotes(ctx context.Context, memoryID string) ([]*ValidationVote, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT id, memory_id, validator_id, decision, rationale, weight_at_vote, block_height, created_at
-		FROM validation_votes WHERE memory_id = $1 ORDER BY created_at`, memoryID)
+		FROM validation_votes WHERE memory_id = $1 ORDER BY created_at, id`, memoryID)
 	if err != nil {
 		return nil, fmt.Errorf("get votes: %w", err)
 	}
@@ -1045,6 +1099,50 @@ func (s *PostgresStore) GetPendingByDomain(ctx context.Context, domainTag string
 		r.MemoryType = memory.MemoryType(mt)
 		r.Status = memory.MemoryStatus(st)
 		results = append(results, &r)
+	}
+	return results, nil
+}
+
+// GetPendingByDomainPage is the stable, additive paging form used by app-v23
+// disclosure-aware REST reads. GetPendingByDomain remains byte-compatible for
+// historical callers.
+func (s *PostgresStore) GetPendingByDomainPage(
+	ctx context.Context,
+	domainTag string,
+	limit, offset int,
+) ([]*memory.MemoryRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT memory_id, submitting_agent, content, content_hash,
+			memory_type, domain_tag, confidence_score, status, created_at
+		FROM memories WHERE status = 'proposed' AND domain_tag LIKE $1
+		ORDER BY created_at ASC, memory_id ASC LIMIT $2 OFFSET $3`,
+		domainTag, limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get pending page: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]*memory.MemoryRecord, 0, limit)
+	for rows.Next() {
+		var r memory.MemoryRecord
+		var mt, st string
+		if scanErr := rows.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
+			&mt, &r.DomainTag, &r.ConfidenceScore, &st, &r.CreatedAt); scanErr != nil {
+			return nil, fmt.Errorf("scan pending page: %w", scanErr)
+		}
+		r.MemoryType = memory.MemoryType(mt)
+		r.Status = memory.MemoryStatus(st)
+		results = append(results, &r)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("get pending page rows: %w", rowsErr)
 	}
 	return results, nil
 }
@@ -1691,6 +1789,20 @@ func (s *PostgresStore) ListMemories(ctx context.Context, opts ListOptions) ([]*
 		args = append(args, opts.Tag)
 		argIdx++
 	}
+	if opts.CreatedFrom != "" {
+		filter := fmt.Sprintf(" AND created_at >= $%d", argIdx)
+		query += filter
+		countQuery += filter
+		args = append(args, opts.CreatedFrom)
+		argIdx++
+	}
+	if opts.CreatedTo != "" {
+		filter := fmt.Sprintf(" AND created_at <= $%d", argIdx)
+		query += filter
+		countQuery += filter
+		args = append(args, opts.CreatedTo)
+		argIdx++
+	}
 
 	switch opts.Sort {
 	case "oldest":
@@ -1699,6 +1811,9 @@ func (s *PostgresStore) ListMemories(ctx context.Context, opts ListOptions) ([]*
 		query += " ORDER BY confidence_score DESC"
 	default:
 		query += " ORDER BY created_at DESC"
+	}
+	if opts.StablePaging {
+		query += ", memory_id ASC"
 	}
 
 	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
@@ -1819,6 +1934,24 @@ func (s *PostgresStore) getStats(ctx context.Context, excludedPrefixes []string)
 // GetTimeline returns memory counts aggregated by time periods.
 func (s *PostgresStore) GetTimeline(ctx context.Context, from, to time.Time, domain string, bucket string) ([]TimelineBucket, error) {
 	return s.getTimeline(ctx, from, to, domain, bucket, nil)
+}
+
+func (s *PostgresStore) FormatTimelinePeriod(at time.Time, bucket string) string {
+	at = at.UTC()
+	switch bucket {
+	case "hour":
+		return at.Truncate(time.Hour).Format(time.RFC3339)
+	case "week":
+		weekday := (int(at.Weekday()) + 6) % 7
+		return time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC).
+			AddDate(0, 0, -weekday).Format(time.RFC3339)
+	case "month":
+		return time.Date(at.Year(), at.Month(), 1, 0, 0, 0, 0, time.UTC).
+			Format(time.RFC3339)
+	default:
+		return time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC).
+			Format(time.RFC3339)
+	}
 }
 
 func (s *PostgresStore) GetTimelineExcludingDomainPrefixes(
@@ -2373,6 +2506,80 @@ func (s *PostgresStore) GetOpenTasks(ctx context.Context, domain string, provide
 	return records, rows.Err()
 }
 
+// GetOpenTasksPage is the stable, additive paging form used by app-v23 REST.
+// The historical GetOpenTasks query remains unchanged for pre-v23 callers.
+func (s *PostgresStore) GetOpenTasksPage(
+	ctx context.Context,
+	domain, provider, assignee string,
+	limit, offset int,
+) ([]*memory.MemoryRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	query := `SELECT memory_id, submitting_agent, content, content_hash,
+		memory_type, domain_tag, COALESCE(provider, ''), confidence_score, status, parent_hash, COALESCE(task_status, ''),
+		COALESCE(assignee, ''), COALESCE(task_picked_up_by, ''), task_picked_up_at, task_status_updated_at,
+		created_at, committed_at, deprecated_at
+		FROM memories
+		WHERE memory_type = 'task'
+		AND task_status IN ('planned', 'in_progress')
+		AND status != 'deprecated'`
+	args := []any{}
+	argN := 1
+	if domain != "" {
+		query += fmt.Sprintf(" AND domain_tag = $%d", argN)
+		args = append(args, domain)
+		argN++
+	}
+	if assignee != "" {
+		query += fmt.Sprintf(" AND assignee = $%d", argN)
+		args = append(args, assignee)
+		argN++
+	} else if provider != "" {
+		query += fmt.Sprintf(" AND (provider = $%d OR provider = '')", argN)
+		args = append(args, provider)
+		argN++
+	}
+	query += fmt.Sprintf(
+		" ORDER BY created_at DESC, memory_id ASC LIMIT $%d OFFSET $%d",
+		argN, argN+1,
+	)
+	args = append(args, limit, offset)
+
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get open task page: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]*memory.MemoryRecord, 0, limit)
+	for rows.Next() {
+		var r memory.MemoryRecord
+		var mt, st, ts string
+		var parentHash *string
+		var pickedUpAt, statusUpdatedAt *time.Time
+		if scanErr := rows.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
+			&mt, &r.DomainTag, &r.Provider, &r.ConfidenceScore, &st, &parentHash, &ts,
+			&r.Assignee, &r.TaskPickedUpBy, &pickedUpAt, &statusUpdatedAt,
+			&r.CreatedAt, &r.CommittedAt, &r.DeprecatedAt); scanErr != nil {
+			return nil, fmt.Errorf("scan task page: %w", scanErr)
+		}
+		r.MemoryType = memory.MemoryType(mt)
+		r.Status = memory.MemoryStatus(st)
+		r.TaskStatus = memory.TaskStatus(ts)
+		r.TaskPickedUpAt = pickedUpAt
+		r.TaskStatusUpdatedAt = statusUpdatedAt
+		if parentHash != nil {
+			r.ParentHash = *parentHash
+		}
+		records = append(records, &r)
+	}
+	return records, rows.Err()
+}
+
 // GetAllTasks returns all task memories across all statuses for the Kanban board.
 func (s *PostgresStore) GetAllTasks(ctx context.Context, domain string, limit int) ([]*memory.MemoryRecord, error) {
 	if limit <= 0 {
@@ -2880,7 +3087,10 @@ func (s *PostgresStore) RemoveAgent(ctx context.Context, agentID string) error {
 }
 
 func (s *PostgresStore) UpdateAgentStatus(ctx context.Context, agentID, status string) error {
-	_, err := s.db.Exec(ctx, `UPDATE agents SET status=$1 WHERE agent_id=$2`, status, agentID)
+	_, err := s.db.Exec(ctx, `
+		UPDATE agents
+		SET status=$1, removed_at=CASE WHEN $1='active' THEN NULL ELSE removed_at END
+		WHERE agent_id=$2`, status, agentID)
 	if err != nil {
 		return fmt.Errorf("update agent status: %w", err)
 	}

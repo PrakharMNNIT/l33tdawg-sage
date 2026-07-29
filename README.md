@@ -51,6 +51,71 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.15.0
+
+**App-v23 replaces capability-bit administration with roles, security profiles,
+and Access Groups that match how people actually share a SAGE.** Members can
+read the domains owned by other active local members of their groups. Managers
+can also write and modify within those same group boundaries. Admins have
+sudo-equivalent authority over normal local data, policy, governance,
+federation, and CEREBRUM operations. Clearance remains the maximum
+classification an agent may read, and hard security-profile restrictions still
+override roles, groups, and grants.
+
+**CEREBRUM Root is now a separate, singleton authority rather than an agent
+card.** It cannot be dragged into groups, messaged, demoted, or removed through
+ordinary agent controls. A dedicated two-confirmation handover rotates the
+current Root credential while preserving the immutable Root authority over its
+existing domains, grants, and groups. Historical memories keep the exact
+credential that authored them; new Root memories record the new credential.
+No chain history is rewritten, no domain is bulk-transferred, and retired Root
+credentials can never become agents or Root again.
+
+**Federated agents are linked readers, never remote members.** A remote
+`agent@chain` may be attached to a local Access Group for live,
+classification-bounded reads only. It receives no Copy, Write, Modify, claim,
+ownership, grant, role, governance, or transitive-agent authority. Agent
+pipeline messages remain untrusted requests; any resulting memory action is a
+separate local decision made under the receiving agent's own identity.
+
+**First-party vendored companions no longer start mute.** A clean Mynah / SAGE
+Voice Bridge installation atomically binds its exact key, reviewed Companion
+profile, clearance, local enrollment, and owned non-shared home domain before
+readiness succeeds by starting its fresh vendored node directly at app-v23.
+Mynah has no released legacy population, so there is no Mynah-specific upgrade
+or repair path. Other agents stranded by app-v22's default mask `30` remain
+pending review until a local Admin completes the atomic onboarding operation;
+they cannot self-promote or claim a domain.
+
+**CEREBRUM now enforces the localhost-only promise already shown in its UI.**
+The human control plane, including authentication, recovery, RBAC, federation
+management, and the SPA itself, is unavailable over LAN or a federated link.
+On an unencrypted personal node, the real same-origin loopback SPA has complete
+Root control without inventing a password or copying the genesis key; when
+vault encryption is enabled, the same local surface additionally requires its
+unlocked session. Signed Admin/Root management is also local-only. Dedicated
+signed agent APIs, pairing/claim redemption, health, and federation data-plane
+traffic retain their designed network reachability.
+
+App-v23 activates only after the canonical predecessor ladder through app-v22,
+with the activation block retaining v22 semantics and v23 beginning at the next
+height. Replay and state sync preserve every historical AppHash while validating
+the new Root, role, enrollment, group, and revision invariants. Personal nodes
+automatically walk the governed ladder to the required app-v23
+security floor even when optional future auto-upgrades are disabled.
+Multi-validator networks must first install this exact binary on every
+validator, then activate app-v23 through their normal governed upgrade
+ceremony. Legacy or
+keyless MCP/OAuth bearers that could fall back to Root are revoked; current
+tokens require a distinct pending-review keyed identity. Vault-enabled nodes
+and unencrypted nodes both seal new token keys under the one-time bearer, so
+credentials survive optional ledger state changes, the stored database digest
+cannot decrypt them, and no bearer ever falls back to Root. Existing
+vault-sealed token rows migrate on their next unlocked use. Public OAuth
+authorization crosses an opaque,
+short-lived, single-use handoff into a localhost-only approval page—CEREBRUM,
+its cookies, and `/ui` are never exposed through the Cloudflare tunnel. SDK 11.15.0.
+
 ## What's New in v11.14.2
 
 **Emergency CEREBRUM and updater recovery patch.** Local installations with
@@ -831,7 +896,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.14.2`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.15.0`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

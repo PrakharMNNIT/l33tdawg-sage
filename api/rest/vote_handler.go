@@ -3,6 +3,7 @@ package rest
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -86,12 +87,16 @@ type CorroborateResponse struct {
 
 // AgentProfileResponse is the JSON body for GET /v1/agent/me.
 type AgentProfileResponse struct {
-	AgentID     string   `json:"agent_id"`
-	DisplayName string   `json:"display_name"`
-	Domains     []string `json:"domains"`
-	PoEWeight   float64  `json:"poe_weight"`
-	VoteCount   int64    `json:"vote_count"`
-	Accuracy    float64  `json:"accuracy"`
+	AgentID         string   `json:"agent_id"`
+	DisplayName     string   `json:"display_name"`
+	Domains         []string `json:"domains"`
+	Role            string   `json:"role,omitempty"`
+	Profile         string   `json:"profile,omitempty"`
+	HomeDomain      string   `json:"home_domain,omitempty"`
+	EnrollmentState string   `json:"enrollment_status,omitempty"`
+	PoEWeight       float64  `json:"poe_weight"`
+	VoteCount       int64    `json:"vote_count"`
+	Accuracy        float64  `json:"accuracy"`
 	// CorrCount is the validator's lifetime corroboration count (votes that
 	// matched a terminal verdict) — the δ factor of the PoE quorum weight,
 	// read from the authoritative on-chain vstats:<id> record. Not mirrored
@@ -121,6 +126,15 @@ type EpochResponse struct {
 
 // handleVoteMemory handles POST /v1/memory/{memory_id}/vote.
 func (s *Server) handleVoteMemory(w http.ResponseWriter, r *http.Request) {
+	// This endpoint is a deliberate operator override for this node's single
+	// validator vote. The HTTP caller does not gain an independent vote: the
+	// resulting transaction is signed solely by the configured validator key.
+	// Gate before parsing the target or body so ordinary agents cannot use the
+	// endpoint as a memory-existence oracle.
+	if !s.requireGovernanceOperator(w, r.Context()) {
+		return
+	}
+
 	memoryID := chi.URLParam(r, "memory_id")
 	if memoryID == "" {
 		writeProblem(w, http.StatusBadRequest, "Missing memory ID", "memory_id path parameter is required.")
@@ -160,11 +174,12 @@ func (s *Server) handleVoteMemory(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Embed agent's cryptographic proof for on-chain identity verification.
-	s.embedAgentAuth(r.Context(), voteTx)
-
-	// Sign the transaction with the node's signing key.
-	if err = tx.SignTx(voteTx, s.signingKey); err != nil {
+	// Keep memory votes on the validator identity plane. The local operator was
+	// authorized above, but embedding that agent proof would both misrepresent
+	// the on-chain voter and make a promoted app-v23 Admin inject a local
+	// elevation proof into a transaction consensus intentionally requires to
+	// remain validator-only.
+	if err = s.signTx(voteTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign vote tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -240,7 +255,7 @@ func (s *Server) handleChallengeMemory(w http.ResponseWriter, r *http.Request) {
 	s.embedAgentAuth(r.Context(), challengeTx)
 
 	// Sign the transaction with the node's signing key.
-	if err = tx.SignTx(challengeTx, s.signingKey); err != nil {
+	if err = s.signTx(challengeTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign challenge tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -320,7 +335,7 @@ func (s *Server) handleForgetMemory(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), challengeTx)
 
-	if err = tx.SignTx(challengeTx, s.signingKey); err != nil {
+	if err = s.signTx(challengeTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign forget tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -427,7 +442,7 @@ func (s *Server) handleReinstateMemory(w http.ResponseWriter, r *http.Request) {
 	}
 	s.embedAgentAuth(r.Context(), reinstateTx)
 
-	if err := tx.SignTx(reinstateTx, s.signingKey); err != nil {
+	if err := s.signTx(reinstateTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign reinstate tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -496,7 +511,7 @@ func (s *Server) handleCorroborateMemory(w http.ResponseWriter, r *http.Request)
 	s.embedAgentAuth(r.Context(), corrTx)
 
 	// Sign the transaction with the node's signing key.
-	if err = tx.SignTx(corrTx, s.signingKey); err != nil {
+	if err = s.signTx(corrTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign corroborate tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -538,10 +553,37 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusUnauthorized, "Unauthorized", "No agent ID in context.")
 		return
 	}
+	isRoot, rootErr := s.appV23IsRootIdentity(agentID)
+	if rootErr != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+			"Current CEREBRUM Root state is unavailable.")
+		return
+	}
+	if isRoot {
+		writeProblem(w, http.StatusNotFound, "Agent not found",
+			"CEREBRUM Root does not have an ordinary agent profile.")
+		return
+	}
+	if !s.requireAppV23ActiveOrdinaryAgent(w, agentID, "the self-profile agent API") {
+		return
+	}
 
 	resp := AgentProfileResponse{
 		AgentID: agentID,
 		Domains: []string{},
+	}
+	if s.isPostV23ForNextTx() {
+		enrollment, enrollmentErr := s.badgerStore.GetAppV23Enrollment(agentID)
+		roleState, roleErr := s.badgerStore.GetAppV23Role(agentID)
+		if enrollmentErr != nil || roleErr != nil || enrollment == nil || roleState == nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current local enrollment state is unavailable.")
+			return
+		}
+		resp.Role = roleState.Role
+		resp.Profile = enrollment.Profile
+		resp.HomeDomain = enrollment.HomeDomain
+		resp.EnrollmentState = "active"
 	}
 
 	if s.agentStore != nil {
@@ -651,9 +693,38 @@ func (s *Server) handleGetPending(w http.ResponseWriter, r *http.Request) {
 		domainTag = "%" // match all domains; the per-record filter below compartments
 	}
 
-	records, err := s.store.GetPendingByDomain(r.Context(), domainTag, limit)
+	var records []*memory.MemoryRecord
+	var err error
+	if s.isPostV23ForNextTx() {
+		if pager, ok := s.store.(store.PendingMemoryPageStore); ok {
+			records, err = s.collectAppV23VisibleRecords(
+				r.Context(), agentID, limit,
+				func(ctx context.Context, pageLimit, offset int) ([]*memory.MemoryRecord, error) {
+					return pager.GetPendingByDomainPage(
+						ctx, domainTag, pageLimit, offset,
+					)
+				},
+			)
+		} else {
+			// Compatibility fallback for external MemoryStore implementations.
+			// Built-in SQLite/Postgres stores implement the paging extension.
+			records, err = s.store.GetPendingByDomain(r.Context(), domainTag, limit)
+		}
+	} else {
+		records, err = s.store.GetPendingByDomain(r.Context(), domainTag, limit)
+	}
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to get pending memories")
+		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Pending-memory authorization state is unavailable; retry later.")
+			return
+		}
+		if errors.Is(err, errAppV23DisclosureScanBudget) {
+			writeProblem(w, http.StatusUnprocessableEntity, "Pending query too broad",
+				"Too many pending candidates require authorization; choose a domain filter.")
+			return
+		}
 		writeProblem(w, http.StatusInternalServerError, "Query error", "Failed to query pending memories.")
 		return
 	}
@@ -665,7 +736,19 @@ func (s *Server) handleGetPending(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
 		kept := records[:0]
 		for _, rec := range records {
-			if rec.SubmittingAgent != agentID {
+			if s.isPostV23ForNextTx() {
+				disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+					agentID, rec, now,
+				)
+				if disclosureErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+						"Pending-memory authorization state is unavailable; retry later.")
+					return
+				}
+				if !disclosure.Allowed {
+					continue
+				}
+			} else if rec.SubmittingAgent != agentID {
 				// Domain-read filter — only needed when no single domain was pre-gated.
 				if !domainAccessApproved && rec.DomainTag != "" {
 					if accessErr := s.checkDomainAccess(r.Context(), agentID, rec.DomainTag, "read"); accessErr != nil {

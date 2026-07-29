@@ -103,7 +103,7 @@ func (h *DashboardHandler) federatedAgentOwnedShareableDomains(ctx context.Conte
 		if !entry.CanShare {
 			continue
 		}
-		owner, _, resolveErr := h.BadgerStore.ResolveOwningAncestor(entry.Domain)
+		owner, _, resolveErr := h.resolveEffectiveOwningAncestor(entry.Domain)
 		if resolveErr == nil && strings.EqualFold(owner, agentID) {
 			owned = append(owned, entry.Domain)
 		}

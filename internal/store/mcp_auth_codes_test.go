@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -195,12 +196,168 @@ func TestAuthCode_BearerWipedAfterRedeem(t *testing.T) {
 	_, err := s.RedeemAuthCode(ctx, "code-w", verifier, "https://chat.openai.com/cb", "chatgpt")
 	require.NoError(t, err)
 
-	// Inspect the row directly — bearer_plaintext should be NULL after redeem.
+	// Inspect the row directly — both the obsolete plaintext column and the
+	// encrypted delivery material should be wiped after redeem.
 	row := s.conn.QueryRowContext(ctx,
-		`SELECT COALESCE(bearer_plaintext, '<NULL>'), COALESCE(used_at, '') FROM mcp_auth_codes WHERE code = ?`,
-		"code-w")
+		`SELECT COALESCE(bearer_plaintext, '<NULL>'), COALESCE(used_at, ''),
+		        length(COALESCE(delivery_sealed, X'')), length(COALESCE(delivery_salt, X''))
+		   FROM mcp_auth_codes WHERE code_sha256 = ?`,
+		oauthCodeDigest("code-w"))
 	var bearer, usedAt string
-	require.NoError(t, row.Scan(&bearer, &usedAt))
+	var sealedLen, saltLen int
+	require.NoError(t, row.Scan(&bearer, &usedAt, &sealedLen, &saltLen))
 	assert.Equal(t, "<NULL>", bearer, "bearer plaintext should be wiped after redeem")
 	assert.NotEmpty(t, usedAt, "used_at should be set after redeem")
+	assert.Zero(t, sealedLen, "delivery ciphertext should be wiped after redeem")
+	assert.Zero(t, saltLen, "delivery salt should be wiped after redeem")
+}
+
+func TestAuthCode_DatabaseHoldsNeitherRawCodeNorBearer(t *testing.T) {
+	s := newAuthCodeStore(t)
+	ctx := context.Background()
+	code := "RAW-AUTHORIZATION-CODE-NEVER-PERSIST"
+	bearer := "RAW-BEARER-NEVER-PERSIST"
+	verifier := "database-compromise-verifier-aaaaaaaaaaaa"
+	challenge := pkceChallenge(verifier)
+	require.NoError(t, s.IssueAuthCode(
+		ctx, code, "tok-sealed", challenge, "S256",
+		"https://chat.openai.com/cb", "chatgpt", "", bearer, time.Minute,
+	))
+
+	var storedCode, storedDigest, storedBearer, sealFormat string
+	var sealed, salt []byte
+	require.NoError(t, s.conn.QueryRowContext(ctx, `
+		SELECT code, code_sha256, COALESCE(bearer_plaintext, ''),
+		       delivery_sealed, delivery_salt, delivery_seal
+		  FROM mcp_auth_codes WHERE code_sha256 = ?`,
+		oauthCodeDigest(code),
+	).Scan(&storedCode, &storedDigest, &storedBearer, &sealed, &salt, &sealFormat))
+	require.Equal(t, oauthCodeDigest(code), storedCode)
+	require.Equal(t, oauthCodeDigest(code), storedDigest)
+	require.Empty(t, storedBearer)
+	require.Equal(t, oauthCodeDeliverySealV1, sealFormat)
+	require.NotEmpty(t, sealed)
+	require.Len(t, salt, oauthCodeDeliverySaltSize)
+	require.NotContains(t, string(sealed), bearer)
+
+	// A database attacker has the digest, salt, AAD fields, and ciphertext,
+	// but substituting the stored digest for the absent raw code cannot derive
+	// the delivery key.
+	_, err := openOAuthBearerForCode(
+		storedDigest,
+		salt,
+		oauthCodeDeliveryAAD(
+			"tok-sealed", storedDigest, challenge, "S256",
+			"https://chat.openai.com/cb", "chatgpt",
+		),
+		sealed,
+	)
+	require.Error(t, err)
+}
+
+func TestAuthCode_RestartRedemptionUsesRawCode(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "restart.db")
+	s, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	code := "restart-code-secret"
+	verifier := "restart-verifier-aaaaaaaaaaaaaaaaaaaa"
+	require.NoError(t, s.IssueAuthCode(
+		ctx, code, "tok-restart", pkceChallenge(verifier), "S256",
+		"https://chat.openai.com/cb", "chatgpt", "", "BEARER-RESTART", time.Minute,
+	))
+	require.NoError(t, s.Close())
+
+	reopened, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	bearer, err := reopened.RedeemAuthCode(
+		ctx, code, verifier, "https://chat.openai.com/cb", "chatgpt",
+	)
+	require.NoError(t, err)
+	require.Equal(t, "BEARER-RESTART", bearer)
+
+	_, err = reopened.RedeemAuthCode(
+		ctx, oauthCodeDigest(code), verifier, "https://chat.openai.com/cb", "chatgpt",
+	)
+	require.ErrorIs(t, err, ErrAuthCodeNotFound,
+		"the stored digest must not substitute for the raw authorization code")
+}
+
+func TestAuthCode_ConcurrentRedeemHasOneWinner(t *testing.T) {
+	s := newAuthCodeStore(t)
+	ctx := context.Background()
+	code := "concurrent-code"
+	verifier := "concurrent-verifier-aaaaaaaaaaaaaaaaa"
+	require.NoError(t, s.IssueAuthCode(
+		ctx, code, "tok-concurrent", pkceChallenge(verifier), "S256",
+		"https://chat.openai.com/cb", "chatgpt", "", "BEARER-CONCURRENT", time.Minute,
+	))
+
+	type result struct {
+		bearer string
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			bearer, err := s.RedeemAuthCode(
+				ctx, code, verifier, "https://chat.openai.com/cb", "chatgpt",
+			)
+			results <- result{bearer: bearer, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var successes, used int
+	for got := range results {
+		switch {
+		case got.err == nil:
+			successes++
+			require.Equal(t, "BEARER-CONCURRENT", got.bearer)
+		case errors.Is(got.err, ErrAuthCodeUsed):
+			used++
+		default:
+			require.NoError(t, got.err)
+		}
+	}
+	require.Equal(t, 1, successes)
+	require.Equal(t, 1, used)
+}
+
+func TestAuthCode_MigrationRevokesAndErasesLegacyPlaintextRows(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	s, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	require.NoError(t, s.InsertMCPToken(ctx, "tok-legacy-code", "legacy", "operator", mkDigest("LEGACY-BEARER")))
+	_, err = s.writeExecContext(ctx, `
+		INSERT INTO mcp_auth_codes (
+			code, code_sha256, token_id, code_challenge, code_challenge_method,
+			redirect_uri, client_id, expires_at, bearer_plaintext
+		) VALUES (?, NULL, ?, ?, 'S256', ?, ?, ?, ?)`,
+		"RAW-LEGACY-CODE", "tok-legacy-code", pkceChallenge("legacy-verifier"),
+		"https://chat.openai.com/cb", "chatgpt",
+		time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano), "LEGACY-BEARER",
+	)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+
+	reopened, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	var count int
+	require.NoError(t, reopened.conn.QueryRowContext(
+		ctx, `SELECT COUNT(*) FROM mcp_auth_codes WHERE token_id = ?`, "tok-legacy-code",
+	).Scan(&count))
+	require.Zero(t, count)
+	_, err = reopened.LookupMCPToken(ctx, mkDigest("LEGACY-BEARER"))
+	require.ErrorIs(t, err, ErrTokenRevoked)
 }

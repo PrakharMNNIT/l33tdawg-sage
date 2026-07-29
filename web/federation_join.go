@@ -23,11 +23,12 @@ import (
 
 // v11 real-TOTP federation JOIN ceremony - the dashboard (cookie-authed) proxy
 // for the guided guest/host wizards. The browser holds a dashboard session, not
-// the node operator's signing key, so it cannot call the agent-signed REST
-// endpoints; these routes run behind the dashboard auth middleware and drive the
-// federation Manager directly. Everything is OFF-consensus (the only chain
-// writes are the two operators' own tx-33/tx-34, fired inside the Manager after
-// each human confirmation).
+// a local control signing key, so it cannot call the agent-signed REST
+// endpoints; these routes run behind the dashboard auth middleware and drive
+// the federation Manager directly. Everything is OFF-consensus except each
+// node's tx-33/tx-34, fired inside the Manager after human confirmation. After
+// app-v23 the exact local Root/Admin who authorized the action remains the
+// consensus actor; Admin actions carry a one-action current-Root elevation.
 
 // FederationJoinDriver is the slice of the federation Manager the dashboard
 // consumes. An interface so this package need not depend on the concrete type
@@ -885,7 +886,28 @@ func (h *DashboardHandler) handleFedRevoke(w http.ResponseWriter, r *http.Reques
 	var hash string
 	var notifyResult *federation.RevokeAgreementResult
 	var err error
-	if driver, ok := h.Federation.(interface {
+	if h.appV23IsActive() {
+		actor, ok := h.requireAppV23ControlActor(w, r, false)
+		if !ok {
+			return
+		}
+		if driver, supported := h.Federation.(interface {
+			RevokeAgreementNotifyingAs(string, string) (*federation.RevokeAgreementResult, error)
+		}); supported {
+			notifyResult, err = driver.RevokeAgreementNotifyingAs(actor.ID, chain)
+			if notifyResult != nil {
+				hash = notifyResult.TxHash
+			}
+		} else if driver, supported := h.Federation.(interface {
+			RevokeAgreementAs(string, string) (string, error)
+		}); supported {
+			hash, err = driver.RevokeAgreementAs(actor.ID, chain)
+		} else {
+			fedWriteErr(w, http.StatusNotImplemented,
+				"Federation control cannot preserve the authenticated local Admin authority envelope.")
+			return
+		}
+	} else if driver, ok := h.Federation.(interface {
 		RevokeAgreementNotifying(string) (*federation.RevokeAgreementResult, error)
 	}); ok {
 		notifyResult, err = driver.RevokeAgreementNotifying(chain)
@@ -899,9 +921,14 @@ func (h *DashboardHandler) handleFedRevoke(w http.ResponseWriter, r *http.Reques
 		fedWriteErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	if _, notifying := h.Federation.(interface {
+	_, legacyNotifying := h.Federation.(interface {
 		RevokeAgreementNotifying(string) (*federation.RevokeAgreementResult, error)
-	}); notifying && notifyResult == nil {
+	})
+	_, actorNotifying := h.Federation.(interface {
+		RevokeAgreementNotifyingAs(string, string) (*federation.RevokeAgreementResult, error)
+	})
+	if ((h.appV23IsActive() && actorNotifying) ||
+		(!h.appV23IsActive() && legacyNotifying)) && notifyResult == nil {
 		fedWriteErr(w, http.StatusBadGateway, "Federation revoke returned no result.")
 		return
 	}
@@ -1060,12 +1087,34 @@ func (h *DashboardHandler) handleFedHostApprove(w http.ResponseWriter, r *http.R
 		fedWriteErr(w, http.StatusBadRequest, "Invalid request.")
 		return
 	}
-	err := h.Federation.HostApprove(chi.URLParam(r, "session_id"), body.TypedCode, federation.ScopeWire{
+	scope := federation.ScopeWire{
 		MaxClearance:   body.MaxClearance,
 		AllowedDomains: body.AllowedDomains,
 		Mode:           body.Mode,
 		Direction:      body.Direction,
-	})
+	}
+	var err error
+	if h.appV23IsActive() {
+		actor, ok := h.requireAppV23ControlActor(w, r, false)
+		if !ok {
+			return
+		}
+		driver, supported := h.Federation.(interface {
+			HostApproveAs(string, string, string, federation.ScopeWire) error
+		})
+		if !supported {
+			fedWriteErr(w, http.StatusNotImplemented,
+				"Federation control cannot preserve the authenticated local Admin authority envelope.")
+			return
+		}
+		err = driver.HostApproveAs(
+			actor.ID, chi.URLParam(r, "session_id"), body.TypedCode, scope,
+		)
+	} else {
+		err = h.Federation.HostApprove(
+			chi.URLParam(r, "session_id"), body.TypedCode, scope,
+		)
+	}
 	if err != nil {
 		fedWriteErr(w, http.StatusUnprocessableEntity, err.Error())
 		return
@@ -1199,12 +1248,35 @@ func (h *DashboardHandler) handleFedGuestConfirm(w http.ResponseWriter, r *http.
 	// guest's local tx-33, then the host's tx-33 over the peer listener.
 	ctx, cancel := context.WithTimeout(r.Context(), federation.JoinConfirmationOperationTimeout())
 	defer cancel()
-	txHash, err := h.Federation.GuestConfirm(ctx, body.SessionID, body.Endpoint, federation.ScopeWire{
+	scope := federation.ScopeWire{
 		MaxClearance:   body.HostScope.MaxClearance,
 		AllowedDomains: body.HostScope.AllowedDomains,
 		Mode:           body.HostScope.Mode,
 		Direction:      body.HostScope.Direction,
-	})
+	}
+	var txHash string
+	var err error
+	if h.appV23IsActive() {
+		actor, ok := h.requireAppV23ControlActor(w, r, false)
+		if !ok {
+			return
+		}
+		driver, supported := h.Federation.(interface {
+			GuestConfirmAs(context.Context, string, string, string, federation.ScopeWire) (string, error)
+		})
+		if !supported {
+			fedWriteErr(w, http.StatusNotImplemented,
+				"Federation control cannot preserve the authenticated local Admin authority envelope.")
+			return
+		}
+		txHash, err = driver.GuestConfirmAs(
+			ctx, actor.ID, body.SessionID, body.Endpoint, scope,
+		)
+	} else {
+		txHash, err = h.Federation.GuestConfirm(
+			ctx, body.SessionID, body.Endpoint, scope,
+		)
+	}
 	if err != nil {
 		fedWriteErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1240,6 +1312,13 @@ type groupRefreshDriver interface {
 }
 
 func (h *DashboardHandler) isSyncGroupOperatorRequest(r *http.Request) bool {
+	if h.appV23IsActive() {
+		// cfg.AgentKey remains the stable federation transport credential after
+		// Root handover. It is no longer a CEREBRUM control principal, so only
+		// the live Root/Admin resolution in isCEREBRUMOperatorRequest may
+		// authorize post-v23 group management.
+		return false
+	}
 	operatorID := strings.TrimSpace(h.NodeOperatorAgentID)
 	return operatorID != "" && verifiedDashboardAgentID(r.Context()) == operatorID
 }

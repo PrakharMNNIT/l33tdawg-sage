@@ -4,7 +4,7 @@
 # CometBFT + ABCI Docker network.
 #
 # Proves, with bounded waits and matched-height AppHash checks:
-#   1. A real signed fork ladder reaches app-v22, including the app-v20
+#   1. A real signed fork ladder reaches app-v23, including the app-v20
 #      governance-domain ceremony, with three genesis validators and one
 #      non-validator process. It then adds that process, updates its power,
 #      removes a different validator, and proves every H+2 Comet set transition
@@ -69,7 +69,11 @@ CHAOS_WORKDIR_READY=0
 V119_CHAOS_GENESIS_DIR=
 V119_CHAOS_DATA_DIR=
 V119_GOVERNANCE_OPERATOR_KEY=
+V119_GOVERNANCE_HEARTBEAT_KEY=
+V119_VALIDATOR_PROBE_KEY=
 export V119_GOVERNANCE_OPERATOR_ID=
+export V119_GOVERNANCE_HEARTBEAT_ID=
+export V119_VALIDATOR_PROBE_ID=
 
 dump_diagnostics() {
   "${COMPOSE[@]}" ps -a || true
@@ -429,10 +433,16 @@ print(",".join(sorted(items)))
 }
 
 fixture_client() {
+  fixture_client_with_key "${V119_GOVERNANCE_OPERATOR_KEY}" "$@"
+}
+
+fixture_client_with_key() {
+  local key_path=$1
+  shift
   docker run --rm --pull never --network "${NETWORK}" \
-    --mount "type=bind,source=${V119_GOVERNANCE_OPERATOR_KEY},target=/fixture/operator.key,readonly" \
+    --mount "type=bind,source=${key_path},target=/fixture/client.key,readonly" \
     --entrypoint /app/v119-governance-fixture \
-    sage-v119-chaos-abci:local --key /fixture/operator.key "$@"
+    sage-v119-chaos-abci:local --key /fixture/client.key "$@"
 }
 
 fixture_request() {
@@ -448,6 +458,40 @@ fixture_request() {
     request
 }
 
+fixture_request_with_key() {
+  local key_path=$1
+  local index=$2
+  local method=$3
+  local path=$4
+  local body=${5:-}
+  fixture_client_with_key "${key_path}" \
+    --node "${index}" \
+    --method "${method}" \
+    --path "${path}" \
+    --body "${body}" \
+    request
+}
+
+fixture_local_root_request() {
+  local index=$1
+  local method=$2
+  local path=$3
+  local body=${4:-}
+  # App-v23 intentionally rejects Root/CEREBRUM authority received through a
+  # container bridge, even when Docker published the host side on 127.0.0.1.
+  # Execute the release-only signed client inside the target ABCI container so
+  # the privileged request genuinely originates from that node's loopback.
+  # Feed the per-run key over stdin; never copy or persist it in the container.
+  "${COMPOSE[@]}" exec -T "abci${index}" \
+    /app/v119-governance-fixture \
+      --key /dev/stdin \
+      --local \
+      --method "${method}" \
+      --path "${path}" \
+      --body "${body}" \
+      request < "${V119_GOVERNANCE_OPERATOR_KEY}"
+}
+
 fixture_upgrade() {
   local target=$1
   docker run --rm --pull never --network "${NETWORK}" \
@@ -461,7 +505,7 @@ fixture_upgrade() {
 
 governance_context() {
   local index=$1
-  fixture_request "${index}" GET /v1/governance/context
+  fixture_local_root_request "${index}" GET /v1/governance/context
 }
 
 governance_propose() {
@@ -496,7 +540,7 @@ if power:
     payload["target_power"] = power
 print(json.dumps(payload, separators=(",", ":")))
 ' "${validator_id}" "${domain}" "${operation}" "${target_id}" "${target_pubkey}" "${target_power}")
-  fixture_request "${index}" POST /v1/governance/propose "${body}"
+  fixture_local_root_request "${index}" POST /v1/governance/propose "${body}"
 }
 
 governance_vote() {
@@ -521,7 +565,7 @@ print(json.dumps({
     "decision": "accept",
 }, separators=(",", ":")))
 ' "${validator_id}" "${domain}" "${proposal_id}")
-  fixture_request "${index}" POST /v1/governance/vote "${body}"
+  fixture_local_root_request "${index}" POST /v1/governance/vote "${body}"
 }
 
 governance_cancel() {
@@ -545,7 +589,7 @@ print(json.dumps({
     "proposal_id": sys.argv[3],
 }, separators=(",", ":")))
 ' "${validator_id}" "${domain}" "${proposal_id}")
-  fixture_request "${index}" POST /v1/governance/cancel "${body}"
+  fixture_local_root_request "${index}" POST /v1/governance/cancel "${body}"
 }
 
 assert_abci_validator_state() {
@@ -606,8 +650,12 @@ print("{}|{}|{}".format(
 }
 
 governance_heartbeat() {
-  fixture_request 0 PUT /v1/agent/update \
-    '{"name":"v11.9-chaos-operator","boot_bio":"bounded live validator lifecycle proof"}'
+  # The governance operator becomes CEREBRUM Root at app-v23 and Root is
+  # intentionally not an editable agent. Drive post-fork progress with the
+  # distinct legacy Member that app-v23 migrates into an active Standard local
+  # enrollment; never weaken the Root/agent boundary for a test heartbeat.
+  fixture_request_with_key "${V119_GOVERNANCE_HEARTBEAT_KEY}" 0 PUT /v1/agent/update \
+    '{"name":"v11.9-chaos-heartbeat","boot_bio":"bounded live validator lifecycle progress"}'
 }
 
 submit_governance_heartbeat_for_progress() {
@@ -858,8 +906,8 @@ restart_pair_and_converge() {
   wait_rpc "${RPC_PORTS[$index]}" 120
   wait_rest "${REST_PORTS[$index]}" 120
   assert_matched_apphash "${label}" 180
-  wait_all_app_version 22 180
-  echo "${label}: all four restarted applications remain on app-v22"
+  wait_all_app_version 23 180
+  echo "${label}: all four restarted applications remain on app-v23"
 }
 
 LAST_EXECUTION_HEIGHT=0
@@ -1190,30 +1238,63 @@ if ! docker run --rm --pull never --network none --entrypoint sh \
 fi
 
 V119_GOVERNANCE_OPERATOR_KEY=${CHAOS_WORKDIR}/governance-operator.key
-python3 - "${V119_GOVERNANCE_OPERATOR_KEY}" <<'PY'
+V119_GOVERNANCE_HEARTBEAT_KEY=${CHAOS_WORKDIR}/governance-heartbeat.key
+V119_VALIDATOR_PROBE_KEY=${CHAOS_WORKDIR}/validator-probe.key
+python3 - \
+  "${V119_GOVERNANCE_OPERATOR_KEY}" \
+  "${V119_GOVERNANCE_HEARTBEAT_KEY}" \
+  "${V119_VALIDATOR_PROBE_KEY}" <<'PY'
 import os
 import pathlib
 import sys
 
-path = pathlib.Path(sys.argv[1])
-path.write_bytes(os.urandom(32))
-path.chmod(0o644)
+for value in sys.argv[1:]:
+    path = pathlib.Path(value)
+    path.write_bytes(os.urandom(32))
+    path.chmod(0o644)
 PY
 export V119_GOVERNANCE_OPERATOR_ID=$(docker run --rm --pull never --network none \
   --mount "type=bind,source=${V119_GOVERNANCE_OPERATOR_KEY},target=/fixture/operator.key,readonly" \
   --entrypoint /app/v119-governance-fixture \
   sage-v119-chaos-abci:local --key /fixture/operator.key identity)
-if [ "${#V119_GOVERNANCE_OPERATOR_ID}" -ne 64 ]; then
-  echo "ERROR: per-run governance operator ID has an invalid length" >&2
+export V119_GOVERNANCE_HEARTBEAT_ID=$(docker run --rm --pull never --network none \
+  --mount "type=bind,source=${V119_GOVERNANCE_HEARTBEAT_KEY},target=/fixture/heartbeat.key,readonly" \
+  --entrypoint /app/v119-governance-fixture \
+  sage-v119-chaos-abci:local --key /fixture/heartbeat.key identity)
+export V119_VALIDATOR_PROBE_ID=$(docker run --rm --pull never --network none \
+  --mount "type=bind,source=${V119_VALIDATOR_PROBE_KEY},target=/fixture/validator-probe.key,readonly" \
+  --entrypoint /app/v119-governance-fixture \
+  sage-v119-chaos-abci:local --key /fixture/validator-probe.key identity)
+stdin_operator_id=$(docker run --rm --pull never -i --network none \
+  --entrypoint /app/v119-governance-fixture \
+  sage-v119-chaos-abci:local --key /dev/stdin identity \
+  < "${V119_GOVERNANCE_OPERATOR_KEY}")
+if [ "${stdin_operator_id}" != "${V119_GOVERNANCE_OPERATOR_ID}" ]; then
+  echo "ERROR: governance fixture stdin key transport changed the Root identity" >&2
   exit 1
 fi
-case "${V119_GOVERNANCE_OPERATOR_ID}" in
-  *[!0-9a-f]*)
-    echo "ERROR: per-run governance operator ID is not lowercase hexadecimal" >&2
+for identity in \
+  "${V119_GOVERNANCE_OPERATOR_ID}" \
+  "${V119_GOVERNANCE_HEARTBEAT_ID}" \
+  "${V119_VALIDATOR_PROBE_ID}"; do
+  if [ "${#identity}" -ne 64 ]; then
+    echo "ERROR: per-run fixture identity has an invalid length" >&2
     exit 1
-    ;;
-esac
-echo "validated frozen source ${SOURCE_ID} and generated an isolated per-run governance operator"
+  fi
+  case "${identity}" in
+    *[!0-9a-f]*)
+      echo "ERROR: per-run fixture identity is not lowercase hexadecimal" >&2
+      exit 1
+      ;;
+  esac
+done
+if [ "${V119_GOVERNANCE_OPERATOR_ID}" = "${V119_GOVERNANCE_HEARTBEAT_ID}" ] ||
+   [ "${V119_VALIDATOR_PROBE_ID}" = "${V119_GOVERNANCE_OPERATOR_ID}" ] ||
+   [ "${V119_VALIDATOR_PROBE_ID}" = "${V119_GOVERNANCE_HEARTBEAT_ID}" ]; then
+  echo "ERROR: governance Root, agent heartbeat, and validator probe identities must be distinct" >&2
+  exit 1
+fi
+echo "validated frozen source ${SOURCE_ID} and generated isolated per-run Root, agent, and validator-probe identities"
 
 node_version=$(docker run --rm sage-v119-chaos-node:local cometbft version | head -n 1 | sed 's/^v//')
 if [ "${node_version}" != "${COMETBFT_RUNTIME_VERSION}" ]; then
@@ -1292,6 +1373,14 @@ PY
     exit 1
   fi
 done
+
+for node_pubkey in "${NODE_PUBKEYS[@]}"; do
+  if [ "${V119_VALIDATOR_PROBE_ID}" = "${node_pubkey}" ]; then
+    echo "ERROR: disposable validator probe collides with a generated CometBFT validator" >&2
+    exit 1
+  fi
+done
+echo "validated disposable validator probe is distinct from all live process identities"
 
 # CometBFT's generated default power is not a stable fixture contract (some
 # supported generators emit 1, which cannot represent a positive 20% integer
@@ -1422,27 +1511,64 @@ echo "validated container-local P2P socket expiry (tcp_retries2=${P2P_TCP_RETRIE
 echo "--- registering the isolated per-run operator before the app-v9 admin gate ---"
 register_response=$(fixture_request 0 POST /v1/agent/register \
   '{"name":"v11.9-chaos-operator","role":"admin","boot_bio":"bounded live validator lifecycle proof","provider":"v11.9-fixture","p2p_address":""}')
-python3 - "${V119_GOVERNANCE_OPERATOR_ID}" "${register_response}" <<'PY'
+heartbeat_register_response=$(fixture_request_with_key \
+  "${V119_GOVERNANCE_HEARTBEAT_KEY}" 0 POST /v1/agent/register \
+  '{"name":"v11.9-chaos-heartbeat","role":"member","boot_bio":"bounded live validator lifecycle progress","provider":"v11.9-fixture","p2p_address":""}')
+python3 - \
+  "${V119_GOVERNANCE_OPERATOR_ID}" "${register_response}" \
+  "${V119_GOVERNANCE_HEARTBEAT_ID}" "${heartbeat_register_response}" <<'PY'
 import json
 import sys
 
 operator = sys.argv[1]
-response = json.loads(sys.argv[2])
-if response.get("agent_id") != operator or response.get("role") != "admin":
+operator_response = json.loads(sys.argv[2])
+heartbeat = sys.argv[3]
+heartbeat_response = json.loads(sys.argv[4])
+if operator_response.get("agent_id") != operator or operator_response.get("role") != "admin":
     raise SystemExit("operator registration did not commit the exact per-run admin identity")
-if int(response.get("on_chain_height") or 0) <= 0:
+if int(operator_response.get("on_chain_height") or 0) <= 0:
     raise SystemExit("operator registration omitted a positive committed height")
+if heartbeat_response.get("agent_id") != heartbeat or heartbeat_response.get("role") != "member":
+    raise SystemExit("heartbeat registration did not commit the exact per-run member identity")
+if int(heartbeat_response.get("on_chain_height") or 0) <= 0:
+    raise SystemExit("heartbeat registration omitted a positive committed height")
 PY
 
-echo "--- driving the real three-validator chain through signed app-v22 governance ---"
+echo "--- driving the real three-validator chain through signed app-v23 governance ---"
 # Fresh fixture stores begin at app-v1. Every fork gate is independent and a
 # skipped version can never be activated after a higher version commits, so the
 # real-process oracle must prove the complete one-at-a-time ladder.
-for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do
+for target in 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do
   fixture_upgrade "${target}"
   wait_all_app_version "${target}" 240
 done
-assert_matched_apphash "post-app-v22 activation" 180
+assert_matched_apphash "post-app-v23 activation" 180
+heartbeat_probe=$(governance_heartbeat)
+heartbeat_probe_hash=$(printf '%s' "${heartbeat_probe}" | python3 -c '
+import json, sys
+response = json.load(sys.stdin)
+if response.get("agent_id") != sys.argv[1] or response.get("status") != "updated":
+    raise SystemExit("post-app-v23 heartbeat did not execute as the enrolled Member")
+tx_hash = str(response.get("tx_hash") or "")
+if not tx_hash:
+    raise SystemExit("post-app-v23 heartbeat omitted its committed transaction hash")
+print(tx_hash)
+' "${V119_GOVERNANCE_HEARTBEAT_ID}")
+rpc_tx_height "${RPC_PORTS[0]}" "${heartbeat_probe_hash}" >/dev/null
+echo "validated app-v23 progress signer as the distinct enrolled Member identity"
+
+if remote_root_probe=$(fixture_request 0 GET /v1/governance/context 2>&1); then
+  echo "ERROR: app-v23 accepted CEREBRUM Root authority through the Docker bridge" >&2
+  exit 1
+fi
+case "${remote_root_probe}" in
+  *"HTTP 403"*"Local Root required"*) ;;
+  *)
+    echo "ERROR: bridged Root probe failed for an unexpected reason: ${remote_root_probe}" >&2
+    exit 1
+    ;;
+esac
+echo "validated app-v23 rejects Root authority outside the node-local loopback"
 
 governance_domain=
 for i in 0 1 2 3; do
@@ -1529,7 +1655,7 @@ echo "proved node2 absent from three effective validator sets and three post-res
 
 echo "--- proving the restarted removed node2 key cannot cast a governance vote ---"
 removed_vote_probe=$(governance_propose 0 add_validator \
-  "${V119_GOVERNANCE_OPERATOR_ID}" "${V119_GOVERNANCE_OPERATOR_ID}" "${INITIAL_POWER}")
+  "${V119_VALIDATOR_PROBE_ID}" "${V119_VALIDATOR_PROBE_ID}" "${INITIAL_POWER}")
 removed_vote_probe_id=$(printf '%s' "${removed_vote_probe}" | json_field proposal_id)
 if removed_vote_error=$(governance_vote 2 "${removed_vote_probe_id}" 2>&1); then
   echo "ERROR: removed node2 governance gateway contributed a vote after restart" >&2
@@ -1578,7 +1704,7 @@ for service in cometbft0 cometbft1 cometbft2 cometbft3; do
   remove_partition_firewall "${service}"
 done
 assert_matched_apphash "post-one-validator partition" 180
-wait_all_app_version 22 180
+wait_all_app_version 23 180
 
 echo "--- fault 2: post-removal stable-IP 2+2 split must halt both live halves ---"
 install_partition_firewall cometbft0 "${COMET_IPS[2]}" "${COMET_IPS[3]}"
@@ -1630,7 +1756,7 @@ governance_heartbeat >/dev/null
 governance_heartbeat >/dev/null
 wait_progress "${RPC_PORTS[0]}" "${halt_end[0]}" 2 120
 assert_matched_apphash "post-majority-partition heal" 180
-wait_all_app_version 22 180
+wait_all_app_version 23 180
 
 versions=()
 for port in "${RPC_PORTS[@]}"; do
@@ -1638,8 +1764,8 @@ for port in "${RPC_PORTS[@]}"; do
 done
 echo "application versions after fault phases: ${versions[*]}"
 for version in "${versions[@]}"; do
-  if [ "${version}" -ne 22 ]; then
-    echo "ERROR: live validator lifecycle/partition gate did not remain on app-v22" >&2
+  if [ "${version}" -ne 23 ]; then
+    echo "ERROR: live validator lifecycle/partition gate did not remain on app-v23" >&2
     exit 1
   fi
 done
@@ -1675,6 +1801,6 @@ for image in sage-v119-chaos-abci:local sage-v119-chaos-node:local; do
 done
 
 echo "=== v11.9 REAL MULTI-PROCESS FAULT GATE PASSED ==="
-echo "PASS: frozen source ${SOURCE_ID}; governed app-v22 activation; signed app-v20-scoped add/update/remove; exact H+2 validator powers; add/update/remove SIGKILL persistence; removed-key no-resurrection; stable-IP P2P partition/heal; strict post-removal 2+2 halt; exact live block/ABCI height/AppHash convergence"
+echo "PASS: frozen source ${SOURCE_ID}; governed app-v23 activation; signed app-v20-scoped add/update/remove; exact H+2 validator powers; add/update/remove SIGKILL persistence; removed-key no-resurrection; stable-IP P2P partition/heal; strict post-removal 2+2 halt; exact live block/ABCI height/AppHash convergence"
 echo "SCOPE: deploy/scripts/run-v11.9-multiprocess.sh supplies signed app-v20 formation/revision and pinned-ballot semantics"
 echo "STATE SYNC: set V119_REQUIRE_AUTHORIZED_STATE_SYNC=1 to require the integrated authorized provider-to-pristine-full-node transfer"

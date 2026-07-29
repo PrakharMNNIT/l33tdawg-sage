@@ -44,6 +44,8 @@ def sample_submit_response():
         "memory_id": "550e8400-e29b-41d4-a716-446655440000",
         "tx_hash": "deadbeef" * 8,
         "status": "proposed",
+        "committed": True,
+        "committed_height": 42,
     }
 
 

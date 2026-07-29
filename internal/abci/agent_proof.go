@@ -45,7 +45,7 @@ type signedAgentRequest struct {
 func (app *SageApp) enforceDelegatedAgentProof(
 	parsedTx *tx.ParsedTx,
 	consensusTime time.Time,
-	claim, postAppV20, postAppV22 bool,
+	claim, postAppV20, postAppV22, postAppV23 bool,
 ) error {
 	usesAgentIdentity := txUsesAgentIdentity(parsedTx.Type)
 	governanceProof := postAppV20 && isProofBearingGovernanceRequest(parsedTx)
@@ -87,7 +87,9 @@ func (app *SageApp) enforceDelegatedAgentProof(
 	if err != nil {
 		return err
 	}
-	if bindErr := app.verifySignedAgentAction(parsedTx, agentID, req, postAppV20, postAppV22); bindErr != nil {
+	if bindErr := app.verifySignedAgentAction(
+		parsedTx, agentID, req, postAppV20, postAppV22, postAppV23,
+	); bindErr != nil {
 		return fmt.Errorf("delegated agent action mismatch: %w", bindErr)
 	}
 
@@ -186,7 +188,11 @@ func txUsesAgentIdentity(txType tx.TxType) bool {
 		tx.TxTypeCoCommitSubmit,
 		tx.TxTypeCrossFedSet,
 		tx.TxTypeCrossFedRevoke,
-		tx.TxTypeMemoryReinstate:
+		tx.TxTypeMemoryReinstate,
+		tx.TxTypeLocalAgentApprove,
+		tx.TxTypeAgentRoleChange,
+		tx.TxTypeAccessGroupMutate,
+		tx.TxTypeRootCredentialRotate:
 		return true
 	default:
 		return false
@@ -507,7 +513,7 @@ func (app *SageApp) verifySignedAgentAction(
 	actual *tx.ParsedTx,
 	agentID string,
 	req signedAgentRequest,
-	bindMemoryTags, postAppV22 bool,
+	bindMemoryTags, postAppV22, postAppV23 bool,
 ) error { //nolint:gocyclo,maintidx // exhaustive protocol routing is intentionally centralized
 	expected := &tx.ParsedTx{Type: actual.Type}
 
@@ -534,8 +540,24 @@ func (app *SageApp) verifySignedAgentAction(
 		if err != nil {
 			return err
 		}
-		if body.Content == "" || body.DomainTag == "" || body.ConfidenceScore < 0 || body.ConfidenceScore > 1 || body.Classification < 0 || body.Classification > 4 {
+		if body.Content == "" || body.ConfidenceScore < 0 || body.ConfidenceScore > 1 || body.Classification < 0 || body.Classification > 4 {
 			return fmt.Errorf("signed memory submission fails the REST contract")
+		}
+		resolvedDomain := body.DomainTag
+		if resolvedDomain == "" {
+			if !postAppV23 || memoryType != tx.MemoryTypeTask {
+				return fmt.Errorf("signed memory submission fails the REST contract")
+			}
+			root, enrollment, _, actorErr := app.appV23Actor(agentID)
+			if actorErr != nil {
+				return fmt.Errorf("resolve app-v23 task home domain: %w", actorErr)
+			}
+			if root == nil || agentID == root.CredentialID ||
+				agentID == root.PrincipalID || enrollment == nil ||
+				enrollment.HomeDomain == "" {
+				return fmt.Errorf("signed app-v23 task has no eligible ordinary-agent home domain")
+			}
+			resolvedDomain = enrollment.HomeDomain
 		}
 		if actual.MemorySubmit == nil || !validRESTMemoryID(actual.MemorySubmit.MemoryID) {
 			return fmt.Errorf("memory submit has no valid server-generated UUID")
@@ -563,7 +585,7 @@ func (app *SageApp) verifySignedAgentAction(
 			// classification, parent, and task status below.
 			EmbeddingHash:   actual.MemorySubmit.EmbeddingHash,
 			MemoryType:      memoryType,
-			DomainTag:       body.DomainTag,
+			DomainTag:       resolvedDomain,
 			ConfidenceScore: body.ConfidenceScore,
 			Content:         body.Content,
 			ParentHash:      body.ParentHash,

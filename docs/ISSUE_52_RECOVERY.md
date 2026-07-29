@@ -82,6 +82,14 @@ otherwise). If yours was deleted or corrupted:
 
 > A regenerated genesis has a new `genesis_time`/hash, so this is only valid for a
 > single-node personal chain (a quorum's peers must share one genesis).
+>
+> **Do not move, delete, or regenerate `agent.key` as part of this recovery.**
+> That key is also the node's stable federation transport/operator identity, and
+> federation peers pin its public identity during JOIN. On any initialized node,
+> SAGE now refuses to start when the key is missing or corrupt instead of silently
+> creating a different identity. Restore the original key from backup. If it is
+> unrecoverable, treat this as a new node identity and explicitly re-pair every
+> federation peer; CEREBRUM Root handover does not rotate this transport key.
 
 ### If `repair-chain` says the chain index is locked
 

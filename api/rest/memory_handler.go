@@ -19,12 +19,14 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/l33tdawg/sage/api/rest/middleware"
+	"github.com/l33tdawg/sage/internal/authzdenial"
 	"github.com/l33tdawg/sage/internal/federation"
 	"github.com/l33tdawg/sage/internal/idfmt"
 	"github.com/l33tdawg/sage/internal/memory"
 	"github.com/l33tdawg/sage/internal/metrics"
 	"github.com/l33tdawg/sage/internal/store"
 	memorytags "github.com/l33tdawg/sage/internal/tags"
+	"github.com/l33tdawg/sage/internal/taskidempotency"
 	"github.com/l33tdawg/sage/internal/tx"
 )
 
@@ -47,20 +49,33 @@ type SubmitMemoryRequest struct {
 	// carried canonically by the transaction so scoped domains can recover the
 	// same query projection on every validator and after state sync.
 	Tags []string `json:"tags,omitempty"`
+	// IdempotencyKey is available for app-v23 task submissions. It is covered
+	// by the caller's signed request and consensus-bound to the exact task and
+	// assignee.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // SubmitMemoryResponse is the JSON body for a successful submission.
 type SubmitMemoryResponse struct {
-	MemoryID          string `json:"memory_id"`
-	TxHash            string `json:"tx_hash"`
-	Status            string `json:"status"`
-	EmbeddingProvider string `json:"embedding_provider,omitempty"`
-	EmbeddingQueued   bool   `json:"embedding_queued,omitempty"`
+	MemoryID            string `json:"memory_id"`
+	TxHash              string `json:"tx_hash"`
+	Status              string `json:"status"`
+	TaskStatus          string `json:"task_status,omitempty"`
+	Committed           bool   `json:"committed"`
+	CommittedHeight     int64  `json:"committed_height"`
+	ProjectionConfirmed *bool  `json:"projection_confirmed,omitempty"`
+	Retryable           *bool  `json:"retryable,omitempty"`
+	Message             string `json:"message,omitempty"`
+	IdempotencyKey      string `json:"idempotency_key,omitempty"`
+	IdempotentReplay    bool   `json:"idempotent_replay,omitempty"`
+	EmbeddingProvider   string `json:"embedding_provider,omitempty"`
+	EmbeddingQueued     bool   `json:"embedding_queued,omitempty"`
 }
 
 // QueryMemoryRequest is the JSON body for POST /v1/memory/query.
 type QueryMemoryRequest struct {
-	Embedding []float32 `json:"embedding"`
+	Embedding         []float32 `json:"embedding"`
+	EmbeddingProvider string    `json:"embedding_provider,omitempty"`
 	// Query is optional for local vector search, but lets federated semantic
 	// recall ask peers for hybrid vector+text coverage. The text arm is the
 	// deterministic fallback when two SAGEs use different embedding spaces.
@@ -80,6 +95,57 @@ type QueryMemoryRequest struct {
 	// ("*" = all active). Both default off — local behaviour is unchanged.
 	Federated      bool     `json:"federated,omitempty"`
 	FederateChains []string `json:"federate_chains,omitempty"`
+	// FederationContext is mandatory for app-v23 federated recall. Because it
+	// lives inside the caller-signed REST body, a peer operator cannot replay
+	// the proof from another source chain or after a destination policy rotates.
+	FederationContext *FederatedRecallProofContext `json:"federation_context,omitempty"`
+}
+
+type FederatedRecallProofContext struct {
+	SourceChainID     string            `json:"source_chain_id"`
+	AgreementBindings map[string]string `json:"agreement_bindings"`
+	QueryChallenges   map[string]string `json:"query_challenges"`
+}
+
+func federationPlanFields(ctx *FederatedRecallProofContext) (map[string]string, map[string]string) {
+	if ctx == nil {
+		return nil, nil
+	}
+	return ctx.AgreementBindings, ctx.QueryChallenges
+}
+
+func (s *Server) requireFederatedEmbeddingProvider(
+	federated bool,
+	chains []string,
+	embedding []float32,
+	requested string,
+) error {
+	if !s.isPostV23ForNextTx() || (!federated && len(chains) == 0) || len(embedding) == 0 {
+		return nil
+	}
+	active := s.activeEmbeddingProvider()
+	if requested == "" {
+		return errors.New("embedding_provider is required for app-v23 federated vector recall")
+	}
+	if active == "" || requested != active {
+		return errors.New("embedding_provider does not match this node's active embedding vector space")
+	}
+	return nil
+}
+
+// recallMemoryClassification preserves the historical best-effort behavior
+// before app-v23, but once clearance is consensus-enforced it fails closed on
+// corrupt/unreadable classification state. Treating an error as PUBLIC (the
+// uint8 zero value) would disclose content above the caller's clearance.
+func (s *Server) recallMemoryClassification(memoryID string) (uint8, error) {
+	if s.badgerStore == nil {
+		return 0, nil
+	}
+	classification, err := s.badgerStore.GetMemoryClassification(memoryID)
+	if err != nil && s.isPostV23ForNextTx() {
+		return 0, err
+	}
+	return classification, nil
 }
 
 // QueryMemoryResponse is the JSON body for a successful query.
@@ -370,9 +436,297 @@ func checkDomainAccessWithCapabilities(ctx context.Context, agentStore store.Age
 }
 
 func (s *Server) checkDomainAccess(ctx context.Context, agentID, domain, action string) error {
+	if s.isPostV23ForNextTx() {
+		currentErr := checkAppV23DomainAccess(s.badgerStore, agentID, domain, action)
+		if action != "read" || s.badgerStore == nil {
+			return currentErr
+		}
+		policyID, err := appV23PolicyPrincipal(s.badgerStore, agentID)
+		if err != nil {
+			return errors.New("app-v23 access-control state is invalid")
+		}
+		legacy, err := s.badgerStore.AppV23LegacyReadCompatibility(
+			policyID, domain, 0, time.Now(),
+		)
+		if err != nil {
+			return errors.New("app-v23 access-control state is invalid")
+		}
+		if legacy.ExplicitDomainRestriction && !legacy.Allowed {
+			return fmt.Errorf("agent does not have read access to domain '%s'", domain)
+		}
+		if currentErr == nil || legacy.Allowed {
+			return nil
+		}
+		return currentErr
+	}
 	return checkDomainAccessWithCapabilities(
 		ctx, s.agentStore, s.badgerStore, agentID, domain, action, s.isPostV22ForNextTx(),
 	)
+}
+
+// appV23PolicyPrincipal maps only the current Root credential to its immutable
+// policy principal and rejects the retired Root credential. Callers still
+// retain the original authenticated credential for signature provenance and
+// for AuthorizeAppV23LocalDomain.
+func appV23PolicyPrincipal(badgerStore *store.BadgerStore, credentialID string) (string, error) {
+	if badgerStore == nil || credentialID == "" {
+		return "", errors.New("app-v23 access-control state is unavailable")
+	}
+	root, err := badgerStore.GetAppV23Root()
+	if err != nil {
+		return "", err
+	}
+	if root != nil && credentialID == root.CredentialID {
+		return root.PrincipalID, nil
+	}
+	if root != nil {
+		wasRoot, markerErr := badgerStore.IsAppV23RootCredential(credentialID)
+		if markerErr != nil {
+			return "", markerErr
+		}
+		if wasRoot {
+			return "", errors.New("authenticated credential is a retired Root credential")
+		}
+	}
+	return credentialID, nil
+}
+
+// checkAppV23DomainAccess is the shared REST-side projection of app-v23 local
+// data authority. Consensus remains authoritative for mutations; this helper
+// prevents read endpoints and early write diagnostics from silently falling
+// back to the historical empty-allowlist-means-everything behavior.
+//
+// Access Groups and ordinary grants are a union. Hard profile restrictions are
+// evaluated first by AuthorizeAppV23LocalDomain and cannot be bypassed by a
+// level-2/3 grant.
+func checkAppV23DomainAccess(badgerStore *store.BadgerStore, agentID, domain, action string) error {
+	if badgerStore == nil || agentID == "" || domain == "" {
+		return errors.New("app-v23 access-control state is unavailable")
+	}
+	var verb store.AppV23DomainVerb
+	var grantLevel uint8
+	switch action {
+	case "read":
+		verb, grantLevel = store.AppV23VerbRead, 1
+	case "write":
+		verb, grantLevel = store.AppV23VerbWrite, 2
+	case "modify":
+		verb, grantLevel = store.AppV23VerbModify, 3
+	default:
+		return fmt.Errorf("unsupported app-v23 domain action %q", action)
+	}
+	if action == "write" {
+		return checkAppV23EffectiveWriteAccess(badgerStore, agentID, domain, time.Now())
+	}
+	policyID, err := appV23PolicyPrincipal(badgerStore, agentID)
+	if err != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	enrollment, err := badgerStore.GetAppV23Enrollment(policyID)
+	if err != nil || enrollment == nil || !enrollment.Active {
+		return errors.New("agent enrollment is pending local review")
+	}
+	shared, err := badgerStore.IsAppV23SharedDomain(domain)
+	if err != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	decision, err := badgerStore.AuthorizeAppV23LocalDomain(
+		agentID, domain, verb, shared,
+	)
+	if err != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	if decision.ExplicitDeny {
+		return fmt.Errorf("the agent's named security profile denies %s access", action)
+	}
+	if decision.Allowed {
+		return nil
+	}
+	hasGrant, err := badgerStore.HasAppV23AccessOrAncestor(
+		domain, agentID, grantLevel, time.Now(), shared,
+	)
+	if err == nil && hasGrant {
+		return nil
+	}
+	return fmt.Errorf("agent does not have %s access to domain '%s'", action, domain)
+}
+
+func appV23WriteDenial(code authzdenial.Code) error {
+	if _, ok := authzdenial.Definition(code); !ok {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	return fmt.Errorf("access denied: denial_code=%s", code)
+}
+
+// appV23OmittedTaskDomain resolves only the narrow app-v23 task convenience:
+// an active ordinary agent may omit domain_tag and let the node select the
+// home domain already committed in its enrollment. Explicit domains are never
+// rewritten, and consensus independently derives the same value from the
+// signed request plus AppHash-covered enrollment state.
+func appV23OmittedTaskDomain(
+	badgerStore *store.BadgerStore,
+	agentID string,
+) (string, error) {
+	if badgerStore == nil || agentID == "" {
+		return "", errors.New("app-v23 access-control state is unavailable")
+	}
+	enrollment, err := badgerStore.GetAppV23Enrollment(agentID)
+	if err != nil {
+		return "", errors.New("app-v23 access-control state is invalid")
+	}
+	if enrollment == nil || !enrollment.Active {
+		return "", appV23WriteDenial(authzdenial.CodePrincipalPendingReview)
+	}
+	if enrollment.HomeDomain == "" {
+		return "", appV23WriteDenial(authzdenial.CodeNoOwnedHomeDomain)
+	}
+	return enrollment.HomeDomain, nil
+}
+
+// checkAppV23EffectiveWriteAccess mirrors the app-v23 consensus write
+// decision so REST preflight returns the same stable seven-code denial
+// taxonomy. It is advisory only; FinalizeBlock remains authoritative and
+// re-evaluates the decision against the committed state.
+func checkAppV23EffectiveWriteAccess(
+	badgerStore *store.BadgerStore,
+	credentialID, domain string,
+	at time.Time,
+) error {
+	root, err := badgerStore.GetAppV23Root()
+	if err != nil || root == nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	policyID, err := appV23PolicyPrincipal(badgerStore, credentialID)
+	if err != nil {
+		return appV23WriteDenial(authzdenial.CodePrincipalPendingReview)
+	}
+	enrollment, err := badgerStore.GetAppV23Enrollment(policyID)
+	if err != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	if enrollment == nil || !enrollment.Active {
+		return appV23WriteDenial(authzdenial.CodePrincipalPendingReview)
+	}
+	role, err := badgerStore.GetAppV23Role(policyID)
+	if err != nil || role == nil ||
+		store.ValidateAppV23Policy(
+			role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+		) != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	if policyID != root.PrincipalID && role.Role == store.AppV23RoleAdmin &&
+		enrollment.RootGeneration != root.Generation {
+		return appV23WriteDenial(authzdenial.CodePrincipalPendingReview)
+	}
+	if enrollment.Profile == store.AppV23ProfileReadOnly {
+		return appV23WriteDenial(authzdenial.CodeForeignWriteRestricted)
+	}
+	if credentialID != root.CredentialID &&
+		(enrollment.HomeDomain != "" ||
+			!store.AppV23AllowsMigratedDomainless(
+				enrollment.Profile, enrollment.Capabilities,
+			)) {
+		homeShared, sharedErr := badgerStore.IsAppV23SharedDomain(enrollment.HomeDomain)
+		homeOwner, _, ownerErr := badgerStore.ResolveAppV23OwningAncestor(enrollment.HomeDomain)
+		if enrollment.HomeDomain == "" || sharedErr != nil || homeShared ||
+			ownerErr != nil || homeOwner != credentialID {
+			return appV23WriteDenial(authzdenial.CodeNoOwnedHomeDomain)
+		}
+	}
+
+	shared, err := badgerStore.IsAppV23SharedDomain(domain)
+	if err != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	if shared && enrollment.Capabilities.Has(store.AgentCapabilityDenySharedDomainWrite) {
+		return appV23WriteDenial(authzdenial.CodeSharedWriteRestricted)
+	}
+	if shared {
+		if role.Role == store.AppV23RoleAdmin {
+			return nil
+		}
+		grandfathered, grandfatherErr :=
+			badgerStore.AppV23AllowsGrandfatheredSharedWrite(policyID)
+		if grandfatherErr != nil {
+			return errors.New("app-v23 access-control state is invalid")
+		}
+		if grandfathered {
+			return nil
+		}
+		hasGrant, grantErr := badgerStore.HasAppV23AccessOrAncestor(
+			domain, credentialID, 2, at, true,
+		)
+		if grantErr != nil {
+			return errors.New("app-v23 access-control state is invalid")
+		}
+		if hasGrant {
+			return nil
+		}
+		decision, decisionErr := badgerStore.AuthorizeAppV23LocalDomain(
+			credentialID, domain, store.AppV23VerbWrite, true,
+		)
+		if decisionErr != nil {
+			return errors.New("app-v23 access-control state is invalid")
+		}
+		if decision.ExplicitDeny {
+			return errors.New("app-v23 access-control state is invalid")
+		}
+		if decision.Allowed {
+			return nil
+		}
+		if role.Role == store.AppV23RoleManager {
+			return appV23WriteDenial(authzdenial.CodeManagerScopeDenied)
+		}
+		return appV23WriteDenial(authzdenial.CodeMissingWriteGrant)
+	}
+
+	owner, _, err := badgerStore.ResolveAppV23OwningAncestor(domain)
+	if err != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	if owner == "" {
+		if enrollment.Capabilities.Has(store.AgentCapabilityDenyDomainClaim) {
+			return appV23WriteDenial(authzdenial.CodeDomainClaimRestricted)
+		}
+		if role.Role == store.AppV23RoleAdmin {
+			return nil
+		}
+		if (enrollment.Profile == store.AppV23ProfileStandard ||
+			enrollment.Profile == store.AppV23ProfileLegacyRestricted) &&
+			(role.Role == store.AppV23RoleMember ||
+				role.Role == store.AppV23RoleManager) {
+			return nil
+		}
+		return appV23WriteDenial(authzdenial.CodeDomainClaimRestricted)
+	}
+	if owner == credentialID || role.Role == store.AppV23RoleAdmin {
+		return nil
+	}
+	if enrollment.Capabilities.Has(store.AgentCapabilityDenyForeignDomainWrite) {
+		return appV23WriteDenial(authzdenial.CodeForeignWriteRestricted)
+	}
+	hasGrant, err := badgerStore.HasAppV23AccessOrAncestor(
+		domain, credentialID, 2, at, false,
+	)
+	if err != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	if hasGrant {
+		return nil
+	}
+	decision, err := badgerStore.AuthorizeAppV23LocalDomain(
+		credentialID, domain, store.AppV23VerbWrite, false,
+	)
+	if err != nil || decision.ExplicitDeny {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	if decision.Allowed {
+		return nil
+	}
+	if role.Role == store.AppV23RoleManager {
+		return appV23WriteDenial(authzdenial.CodeManagerScopeDenied)
+	}
+	return appV23WriteDenial(authzdenial.CodeMissingWriteGrant)
 }
 
 // --- Agent Isolation (RBAC) --------------------------------------------------
@@ -383,6 +737,53 @@ func (s *Server) checkDomainAccess(ctx context.Context, agentID, domain, action 
 func (s *Server) resolveVisibleAgents(agentID string) ([]string, bool) {
 	if agentID == "" {
 		return nil, true // No identity = legacy/internal, allow all
+	}
+
+	// App-v23 visibility is domain-derived, not submitter-derived. Validate the
+	// current credential against policy state before considering any historical
+	// node-operator shortcut.
+	if s.isPostV23ForNextTx() && s.badgerStore != nil {
+		root, rootErr := s.badgerStore.GetAppV23Root()
+		if rootErr != nil || root == nil ||
+			(agentID == root.PrincipalID && root.CredentialID != root.PrincipalID) {
+			return []string{agentID}, false
+		}
+		policyID, policyErr := appV23PolicyPrincipal(s.badgerStore, agentID)
+		if policyErr != nil {
+			return []string{agentID}, false
+		}
+		enrollment, err := s.badgerStore.GetAppV23Enrollment(policyID)
+		if err != nil || enrollment == nil || !enrollment.Active {
+			return []string{agentID}, false
+		}
+		role, err := s.badgerStore.GetAppV23Role(policyID)
+		if err != nil || role == nil ||
+			store.ValidateAppV23Policy(
+				role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+			) != nil ||
+			(policyID != root.PrincipalID && role.Role == store.AppV23RoleAdmin &&
+				enrollment.RootGeneration != root.Generation) {
+			return []string{agentID}, false
+		}
+		visibleAgents, restricted, visibilityErr :=
+			s.badgerStore.AppV23LegacyVisibleAgents(policyID)
+		if visibilityErr != nil {
+			return []string{agentID}, false
+		}
+		if restricted {
+			if visibleAgents == "*" {
+				return nil, true
+			}
+			var list []string
+			if json.Unmarshal([]byte(visibleAgents), &list) != nil {
+				return []string{agentID}, false
+			}
+			allowed := make([]string, 1, 1+len(list))
+			allowed[0] = agentID
+			allowed = append(allowed, list...)
+			return allowed, false
+		}
+		return nil, true
 	}
 
 	// v7.1: the node operator (whoever signs with ~/.sage/agent.key) bypasses
@@ -458,10 +859,71 @@ func (s *Server) resolveVisibleAgents(agentID string) ([]string, bool) {
 	return allowed, false
 }
 
+func (s *Server) appV23LegacyVisibilityRestricted(agentID string) bool {
+	if !s.isPostV23ForNextTx() || s.badgerStore == nil || agentID == "" {
+		return false
+	}
+	policyID, err := appV23PolicyPrincipal(s.badgerStore, agentID)
+	if err != nil {
+		return true
+	}
+	_, restricted, err := s.badgerStore.AppV23LegacyVisibleAgents(policyID)
+	return err != nil || restricted
+}
+
 // hasMemoryReadAccess applies app-v22's domain-independent read capability
 // without turning it into a clearance bypass. A companion may discover and
 // recall every domain, but records above its on-chain clearance remain hidden.
 func (s *Server) hasMemoryReadAccess(domain, agentID string, classification uint8, at time.Time) (bool, error) {
+	if s.isPostV23ForNextTx() && s.badgerStore != nil {
+		policyID, policyErr := appV23PolicyPrincipal(s.badgerStore, agentID)
+		if policyErr != nil {
+			return false, policyErr
+		}
+		enrollment, err := s.badgerStore.GetAppV23Enrollment(policyID)
+		if err != nil || enrollment == nil || !enrollment.Active {
+			return false, nil
+		}
+		legacy, err := s.badgerStore.AppV23LegacyReadCompatibility(
+			policyID, domain, classification, at,
+		)
+		if err != nil {
+			return false, err
+		}
+		if legacy.ExplicitDomainRestriction && !legacy.Allowed {
+			return false, nil
+		}
+		if classification > enrollment.Clearance {
+			// Current app-v23 authority remains bounded by enrollment
+			// clearance. The migration-only org/federation path may instead
+			// rely on its immutable per-membership clearance, exactly as v22
+			// did, so do not discard a baseline-approved result here.
+			return legacy.Allowed, nil
+		}
+		shared, err := s.badgerStore.IsAppV23SharedDomain(domain)
+		if err != nil {
+			return false, err
+		}
+		decision, err := s.badgerStore.AuthorizeAppV23LocalDomain(
+			agentID, domain, store.AppV23VerbRead, shared,
+		)
+		if err != nil {
+			return false, err
+		}
+		if decision.ExplicitDeny {
+			return false, nil
+		}
+		currentAllowed := decision.Allowed
+		if !currentAllowed {
+			currentAllowed, err = s.badgerStore.HasAppV23AccessOrAncestor(
+				domain, agentID, 1, at, shared,
+			)
+			if err != nil {
+				return false, err
+			}
+		}
+		return currentAllowed || legacy.Allowed, nil
+	}
 	if s.isPostV22ForNextTx() && s.badgerStore != nil {
 		if _, _, err := s.badgerStore.GetRegisteredAgentCapabilities(agentID); err != nil {
 			return false, fmt.Errorf("agent capability policy is invalid: %w", err)
@@ -522,23 +984,84 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 			"memory_type must be one of: fact, observation, inference, task.")
 		return
 	}
-	if req.DomainTag == "" {
-		writeProblem(w, http.StatusBadRequest, "Missing domain tag", "domain_tag is required.")
-		return
-	}
+	agentID := middleware.ContextAgentID(r.Context())
 	if req.ConfidenceScore < 0 || req.ConfidenceScore > 1 {
 		writeProblem(w, http.StatusBadRequest, "Invalid confidence score",
 			"confidence_score must be between 0 and 1.")
 		return
 	}
+	if req.IdempotencyKey != "" && req.MemoryType != string(memory.TypeTask) {
+		writeProblem(w, http.StatusBadRequest, "Invalid idempotency key", "idempotency_key is supported only for task memories.")
+		return
+	}
+	explicitTaskIdempotency := req.IdempotencyKey != ""
+	if explicitTaskIdempotency {
+		if validationErr := taskidempotency.ValidateKey(req.IdempotencyKey); validationErr != nil {
+			writeProblem(w, http.StatusBadRequest, "Invalid idempotency key", validationErr.Error())
+			return
+		}
+		if !s.isPostV23ForNextTx() {
+			writeProblemTyped(
+				w,
+				http.StatusConflict,
+				"https://sage.dev/errors/app-v23-required",
+				"App-v23 required",
+				"Durable task idempotency requires app-v23. Upgrade the node before retrying with idempotency_key.",
+			)
+			return
+		}
+	}
 
-	agentID := middleware.ContextAgentID(r.Context())
 	if req.MemoryType == string(memory.TypeTask) {
+		if !s.requireAppV23ActiveOrdinaryAgent(
+			w, agentID, "ordinary REST task submission",
+		) {
+			return
+		}
 		if req.TaskStatus == "" {
 			req.TaskStatus = string(memory.TaskStatusPlanned)
 		}
 		if req.TaskStatus != string(memory.TaskStatusPlanned) {
 			writeProblem(w, http.StatusBadRequest, "Invalid initial task status", "A new task must enter consensus as planned; its assigned agent may start it after creation.")
+			return
+		}
+	}
+	if req.DomainTag == "" {
+		if req.MemoryType != string(memory.TypeTask) || !s.isPostV23ForNextTx() {
+			writeProblem(w, http.StatusBadRequest, "Missing domain tag", "domain_tag is required.")
+			return
+		}
+		req.DomainTag, err = appV23OmittedTaskDomain(s.badgerStore, agentID)
+		if err != nil {
+			if denial, ok := authzdenial.Classify(err); ok {
+				writeEffectiveWriteDenial(w, denial)
+			} else {
+				writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+					"The node cannot resolve the agent's approved home domain.")
+			}
+			return
+		}
+	}
+	if req.MemoryType == string(memory.TypeTask) &&
+		s.isPostV23ForNextTx() &&
+		req.IdempotencyKey == "" {
+		req.IdempotencyKey, err = taskidempotency.SemanticKey(
+			agentID, req.DomainTag, req.Content,
+		)
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "Invalid task identity", err.Error())
+			return
+		}
+	}
+	if req.IdempotencyKey != "" {
+		if !explicitTaskIdempotency {
+			if validateErr := taskidempotency.ValidateKey(req.IdempotencyKey); validateErr != nil {
+				writeProblem(w, http.StatusBadRequest, "Invalid idempotency key", validateErr.Error())
+				return
+			}
+		}
+		if len(req.KnowledgeTriples) > 0 || len(req.LinkedMemories) > 0 {
+			writeProblem(w, http.StatusBadRequest, "Unsupported idempotent task payload", "knowledge_triples and linked_memories are not part of the canonical task transaction; submit links separately after task creation.")
 			return
 		}
 	}
@@ -549,7 +1072,11 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 	// one a restarted node emits, and MCP clients burn a full re-registration
 	// and retry cycle against an ACL that will never yield.
 	if accessErr := s.checkDomainAccess(r.Context(), agentID, req.DomainTag, "write"); accessErr != nil {
-		writeProblemTyped(w, http.StatusForbidden, domainWriteDeniedProblemType, "Access denied", accessErr.Error())
+		if denial, ok := authzdenial.Classify(accessErr); ok {
+			writeEffectiveWriteDenial(w, denial)
+		} else {
+			writeProblem(w, http.StatusForbidden, "Access denied", "memory write access denied")
+		}
 		return
 	}
 
@@ -569,6 +1096,19 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 	embeddingProvider := s.embedderStampFor(req.Embedding)
 
 	memoryID := generateUUID()
+	taskPolicyPrincipal := ""
+	if req.IdempotencyKey != "" && s.isPostV23ForNextTx() {
+		taskPolicyPrincipal, err = appV23PolicyPrincipal(s.badgerStore, agentID)
+		if err != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Task idempotency unavailable", "The node cannot resolve the caller's current policy principal.")
+			return
+		}
+		memoryID, err = taskidempotency.MemoryID(taskPolicyPrincipal, req.IdempotencyKey)
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "Invalid idempotency key", err.Error())
+			return
+		}
+	}
 
 	// Compute content hash.
 	contentHash := sha256.Sum256([]byte(req.Content))
@@ -617,12 +1157,48 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 			Tags:            consensusTags,
 		},
 	}
+	taskPayloadDigest := ""
+	if req.IdempotencyKey != "" && s.isPostV23ForNextTx() {
+		payloadDigest, digestErr := taskidempotency.PayloadDigest(
+			taskPolicyPrincipal, agentID, submitTx.MemorySubmit,
+		)
+		if digestErr != nil {
+			writeProblem(w, http.StatusBadRequest, "Invalid idempotent task payload", digestErr.Error())
+			return
+		}
+		taskPayloadDigest = taskidempotency.Hex(payloadDigest)
+		releaseTaskIdempotency := s.acquireTaskIdempotencyLock(
+			taskPolicyPrincipal, req.IdempotencyKey,
+		)
+		defer releaseTaskIdempotency()
+		if s.writeTaskIdempotencyReplayIfCommitted(
+			w, req, taskPolicyPrincipal, agentID, taskPayloadDigest,
+		) {
+			return
+		}
+	}
+	if req.MemoryType == string(memory.TypeTask) &&
+		s.isPostV23ForNextTx() &&
+		s.suppCache == nil {
+		// A committed idempotency receipt may be replayed without the
+		// process-local assignment bridge, but a first write must never use
+		// the key as a bridge bypass. The authoritative replay lookup above
+		// runs first; reaching here means this is a new task.
+		writeProblemTyped(
+			w,
+			http.StatusServiceUnavailable,
+			"https://sage.dev/errors/task-assignment-bridge-unavailable",
+			"Task assignment unavailable",
+			"The node cannot durably stage the task assignee. No transaction was submitted; retry after the node is repaired.",
+		)
+		return
+	}
 
 	// Embed agent's cryptographic proof for on-chain identity verification.
 	s.embedAgentAuth(r.Context(), submitTx)
 
 	// Sign the transaction with the node's signing key.
-	if err = tx.SignTx(submitTx, s.signingKey); err != nil {
+	if err = s.signTx(submitTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign submit tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -644,24 +1220,43 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 		if req.MemoryType == string(memory.TypeTask) {
 			taskAssignee = agentID
 		}
-		s.suppCache.Put(memoryID, &memory.SupplementaryData{
+		supplementary := &memory.SupplementaryData{
 			Embedding:         req.Embedding,
 			EmbeddingHash:     embeddingHash,
 			Provider:          req.Provider,
 			Assignee:          taskAssignee,
 			EmbeddingProvider: embeddingProvider,
 			KnowledgeTriples:  req.KnowledgeTriples,
-		})
+		}
+		if req.MemoryType == string(memory.TypeTask) {
+			if lifetimeCache, ok := s.suppCache.(SuppCacheLifetimeWriter); ok {
+				lifetimeCache.PutFor(
+					memoryID,
+					supplementary,
+					broadcastTxCommitTimeout()+30*time.Second,
+				)
+			} else {
+				s.suppCache.Put(memoryID, supplementary)
+			}
+		} else {
+			s.suppCache.Put(memoryID, supplementary)
+		}
 	}
 
 	// Broadcast via CometBFT RPC and wait for block finalization.
 	// broadcast_tx_commit blocks until the block containing this tx is committed,
 	// meaning ABCI Commit has already flushed the memory to the offchain store.
-	txHash, err := s.broadcastTxCommit(encoded)
+	txHash, committedHeight, err := s.broadcastTxCommitWithHeight(encoded)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to broadcast submit tx")
-		status, publicMsg := broadcastErrorPublic(err)
+		if req.IdempotencyKey != "" && s.isPostV23ForNextTx() &&
+			s.writeTaskIdempotencyReplayIfCommitted(
+				w, req, taskPolicyPrincipal, agentID, taskPayloadDigest,
+			) {
+			return
+		}
 		if isMempoolFullErr(err) {
+			status, publicMsg := broadcastErrorPublic(err)
 			// Chain backpressure, not a client fault: tell the writer when
 			// to come back (one block interval drains the mempool) and
 			// stamp the distinct problem type so this 429 is
@@ -672,13 +1267,50 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 			writeProblemTyped(w, status, mempoolFullProblemType, "Mempool full", publicMsg)
 			return
 		}
-		if isDomainWriteDeniedErr(err) {
-			writeProblemTyped(w, status, domainWriteDeniedProblemType, "Domain write access denied",
-				"This agent does not have write access to the requested domain. Grant level 2 (read + write) in CEREBRUM Access Controls, or ask the domain owner.")
+		if denial, ok := authzdenial.Classify(err); ok {
+			writeEffectiveWriteDenial(w, denial)
 			return
 		}
+		status, publicMsg := broadcastErrorPublic(err)
 		writeProblem(w, status, "Broadcast error", publicMsg)
 		return
+	}
+
+	taskProjectionConfirmed := (*bool)(nil)
+	if req.MemoryType == string(memory.TypeTask) && s.isPostV23ForNextTx() {
+		confirmed := s.confirmCommittedTaskProjection(
+			memoryID,
+			req.DomainTag,
+			agentID,
+			memory.TaskStatus(req.TaskStatus),
+		)
+		if confirmed && taskPolicyPrincipal != "" {
+			confirmed = s.reconcileCommittedTaskTags(memoryID, req.Tags)
+		}
+		taskProjectionConfirmed = &confirmed
+		if !confirmed {
+			retryable := false
+			s.logger.Error().
+				Str("memory_id", memoryID).
+				Str("tx_hash", txHash).
+				Int64("committed_height", committedHeight).
+				Msg("task transaction committed but exact assignee projection was not confirmed")
+			writeJSON(w, http.StatusAccepted, SubmitMemoryResponse{
+				MemoryID:            memoryID,
+				TxHash:              txHash,
+				Status:              "committed_unconfirmed",
+				TaskStatus:          req.TaskStatus,
+				Committed:           true,
+				CommittedHeight:     committedHeight,
+				ProjectionConfirmed: taskProjectionConfirmed,
+				Retryable:           &retryable,
+				Message:             "The transaction committed, but the exact task projection could not be confirmed. Reconcile this memory_id; do not resubmit the task.",
+				IdempotencyKey:      req.IdempotencyKey,
+				EmbeddingProvider:   embeddingProvider,
+				EmbeddingQueued:     len(req.Embedding) == 0,
+			})
+			return
+		}
 	}
 
 	metrics.MemoriesTotal.WithLabelValues(req.MemoryType, req.DomainTag, string(memory.StatusProposed)).Inc()
@@ -734,12 +1366,88 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, SubmitMemoryResponse{
-		MemoryID:          memoryID,
-		TxHash:            txHash,
-		Status:            string(memory.StatusProposed),
-		EmbeddingProvider: embeddingProvider,
-		EmbeddingQueued:   len(req.Embedding) == 0,
+		MemoryID:            memoryID,
+		TxHash:              txHash,
+		Status:              string(memory.StatusProposed),
+		TaskStatus:          req.TaskStatus,
+		Committed:           true,
+		CommittedHeight:     committedHeight,
+		ProjectionConfirmed: taskProjectionConfirmed,
+		IdempotencyKey:      req.IdempotencyKey,
+		EmbeddingProvider:   embeddingProvider,
+		EmbeddingQueued:     len(req.Embedding) == 0,
 	})
+}
+
+// confirmCommittedTaskProjection refuses to turn a chain commit into a false
+// "task added" response until the exact local serving row is present with the
+// immutable creator assignment. The short poll covers bounded projection
+// scheduling jitter; it never resubmits and therefore cannot duplicate a task.
+func (s *Server) confirmCommittedTaskProjection(
+	memoryID, domain, assignee string,
+	status memory.TaskStatus,
+) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		tasks, err := s.store.GetOpenTasks(ctx, domain, "", assignee)
+		if err == nil {
+			for _, task := range tasks {
+				if task != nil &&
+					task.MemoryID == memoryID &&
+					task.MemoryType == memory.TypeTask &&
+					task.DomainTag == domain &&
+					task.TaskStatus == status &&
+					task.Assignee == assignee {
+					return true
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// confirmCommittedTaskRecord verifies the immutable task identity and assignee
+// directly by memory_id. Unlike GetOpenTasks, this remains authoritative after
+// the task reaches done or dropped, so a delayed retry cannot misreport a
+// durable terminal task as an unconfirmed commit.
+func (s *Server) confirmCommittedTaskRecord(
+	memoryID, domain, assignee string,
+) (memory.TaskStatus, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		task, err := s.store.GetMemory(ctx, memoryID)
+		if err == nil &&
+			task != nil &&
+			task.MemoryID == memoryID &&
+			task.MemoryType == memory.TypeTask &&
+			task.DomainTag == domain &&
+			task.Assignee == assignee {
+			switch task.TaskStatus {
+			case memory.TaskStatusPlanned,
+				memory.TaskStatusInProgress,
+				memory.TaskStatusDone,
+				memory.TaskStatusDropped:
+				return task.TaskStatus, true
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return "", false
+		case <-ticker.C:
+		}
+	}
 }
 
 // setDecayFloor moves a min_confidence request onto the store's DECAYED-confidence
@@ -756,6 +1464,56 @@ func setDecayFloor(opts *store.QueryOptions, now time.Time) {
 		opts.DecayNow = now
 		opts.MinConfidence = 0
 	}
+}
+
+const appV23DisclosureRecallScanLimit = 100
+
+func requestedRecallTopK(topK int) int {
+	if topK <= 0 {
+		return 10
+	}
+	if topK > appV23DisclosureRecallScanLimit {
+		return appV23DisclosureRecallScanLimit
+	}
+	return topK
+}
+
+// disclosureRecallTopK over-fetches only after app-v23, then the handler
+// applies live per-record authority and trims back to the caller's requested
+// size. Revoked rows therefore cannot starve later authorized candidates.
+func (s *Server) disclosureRecallTopK(topK int) int {
+	if s.isPostV23ForNextTx() {
+		return appV23DisclosureRecallScanLimit
+	}
+	return topK
+}
+
+// appV23RecallCandidateFilter moves live disclosure ahead of the store's TopK
+// consumption. Ranked stores keep walking bounded pages until they fill TopK
+// with authorized rows or exhaust the stream. Handlers still re-evaluate every
+// returned record immediately before serialization to close revocation races.
+func (s *Server) appV23RecallCandidateFilter(
+	agentID string,
+	at time.Time,
+) func(*memory.MemoryRecord) (bool, error) {
+	if !s.isPostV23ForNextTx() {
+		return nil
+	}
+	return func(rec *memory.MemoryRecord) (bool, error) {
+		disclosure, err := s.evaluateAppV23RecordDisclosure(agentID, rec, at)
+		if err != nil {
+			return false, appV23RecordDisclosureError(err)
+		}
+		return disclosure.Allowed, nil
+	}
+}
+
+func trimRecallResults(results []*MemoryResult, topK int) []*MemoryResult {
+	limit := requestedRecallTopK(topK)
+	if len(results) > limit {
+		return results[:limit]
+	}
+	return results
 }
 
 // initialConfidencePtr returns a pointer to a stored (undecayed) confidence for the
@@ -895,6 +1653,12 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing embedding", "embedding is required for similarity search.")
 		return
 	}
+	if providerErr := s.requireFederatedEmbeddingProvider(
+		req.Federated, req.FederateChains, req.Embedding, req.EmbeddingProvider,
+	); providerErr != nil {
+		writeProblem(w, http.StatusBadRequest, "Invalid embedding provider", providerErr.Error())
+		return
+	}
 
 	// Network agent domain access enforcement (read side)
 	// checkDomainAccess verifies the agent's DomainAccess policy (explicit allowlist).
@@ -928,10 +1692,11 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	// Resolve agent isolation RBAC — determines which agents' memories are visible
 	queryAgentID := middleware.ContextAgentID(r.Context())
 	allowedAgents, seeAll := s.resolveVisibleAgents(queryAgentID)
+	legacyVisibilityRestricted := s.appV23LegacyVisibilityRestricted(queryAgentID)
 
 	// If checkDomainAccess already approved read access for this domain,
 	// skip agent isolation — the agent is authorized to see everything in the domain.
-	if !seeAll && domainAccessApproved {
+	if !seeAll && !legacyVisibilityRestricted && domainAccessApproved {
 		seeAll = true
 	}
 
@@ -939,7 +1704,7 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	// (a) the agent has a direct grant on the domain, or
 	// (b) the agent has org-level access (clearance >= classification), or
 	// (c) the domain has no registered owner (no access policy = open visibility)
-	if !seeAll && req.DomainTag != "" && s.badgerStore != nil {
+	if !seeAll && !legacyVisibilityRestricted && req.DomainTag != "" && s.badgerStore != nil {
 		hasGrant, _ := s.badgerStore.HasAccess(req.DomainTag, queryAgentID, 1, time.Now())
 		if hasGrant {
 			seeAll = true
@@ -965,7 +1730,7 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 		VectorProvider: s.activeEmbeddingProvider(),
 		MinConfidence:  req.MinConfidence,
 		StatusFilter:   req.StatusFilter,
-		TopK:           req.TopK,
+		TopK:           s.disclosureRecallTopK(req.TopK),
 		Cursor:         req.Cursor,
 		Tags:           req.Tags,
 		// app-v17: keep disputed-but-live memories recallable (flagged + hair-cut
@@ -976,6 +1741,7 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	if filterApplied {
 		opts.SubmittingAgents = allowedAgents
 	}
+	opts.CandidateFilter = s.appV23RecallCandidateFilter(queryAgentID, start)
 	// min_confidence is a DECAYED-confidence floor (rest-api.md): hand it to the
 	// store as DecayFloor, which filters the decayed value over the full candidate
 	// set before the top-K trim, pinned to `start` so it matches what we serialize.
@@ -985,6 +1751,16 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	records, err = s.store.QuerySimilar(r.Context(), req.Embedding, opts)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to query memories")
+		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Memory classification state is unavailable; retry later.")
+			return
+		}
+		if errors.Is(err, store.ErrCandidateFilterScanBudgetExceeded) {
+			writeProblem(w, http.StatusUnprocessableEntity, "Recall query too broad",
+				"Too many candidates require authorization; choose a domain, provider, tag, or tighter status filter.")
+			return
+		}
 		writeProblem(w, http.StatusInternalServerError, "Query error", "Failed to query memories.")
 		return
 	}
@@ -1011,41 +1787,53 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	results := make([]*MemoryResult, 0, len(records))
 	hiddenByClassification := 0
 	for _, rec := range records {
-		// Per-record domain-read filter — parity with list/tasks/pending. On the
-		// no-domain path the store returns candidates across ALL domains; a seeAll
-		// caller (visible_agents "*", TopSecret, operator) must not receive content
-		// from a domain it has no read grant on. Skipped for own records and when a
-		// concrete domain was already gated up front.
-		if rec.SubmittingAgent != queryAgentID && req.DomainTag == "" && rec.DomainTag != "" {
-			if accessErr := s.checkDomainAccess(r.Context(), queryAgentID, rec.DomainTag, "read"); accessErr != nil {
+		var memClass uint8
+		if s.isPostV23ForNextTx() {
+			disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+				queryAgentID, rec, now,
+			)
+			if disclosureErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+					"Memory classification state is unavailable; retry later.")
+				return
+			}
+			if !disclosure.Allowed {
+				hiddenByClassification++
 				continue
 			}
-		}
-		// Classification gate: check agent clearance >= memory classification
-		// Only enforce when domain has a registered owner (backward compat for pre-RBAC setups)
-		var memClass uint8
-		if s.badgerStore != nil {
-			memClass, _ = s.badgerStore.GetMemoryClassification(rec.MemoryID)
-			if memClass > 0 {
-				domainOwner, domErr := s.badgerStore.GetDomainOwner(rec.DomainTag)
-				if domErr == nil && domainOwner != "" {
-					hasAccess, _ := s.hasMemoryReadAccess(rec.DomainTag, queryAgentID, memClass, now)
-					if !hasAccess && rec.SubmittingAgent != queryAgentID {
-						// v6.8.6 observability: log every hide so operators can
-						// detect missing org-bootstrap (the failure mode is silent
-						// otherwise — the response carries `filtered.by` but
-						// server logs gave no per-record reason). Info-level so
-						// it survives default log config.
-						s.logger.Info().
-							Str("memory_id", rec.MemoryID).
-							Str("domain", rec.DomainTag).
-							Str("submitter", idfmt.Prefix(rec.SubmittingAgent)).
-							Str("querier", idfmt.Prefix(queryAgentID)).
-							Str("domain_owner", idfmt.Prefix(domainOwner)).
-							Uint8("classification", memClass).
-							Msg("classification gate hid memory: querier has no shared-org path to writer at required clearance")
-						hiddenByClassification++
-						continue // Skip memories the agent can't access
+			memClass = disclosure.Classification
+		} else {
+			// Preserve the pre-v23 author exception and historical classification
+			// behavior byte-for-byte. App-v23 uses the centralized decision above.
+			if rec.SubmittingAgent != queryAgentID && req.DomainTag == "" && rec.DomainTag != "" {
+				if accessErr := s.checkDomainAccess(r.Context(), queryAgentID, rec.DomainTag, "read"); accessErr != nil {
+					continue
+				}
+			}
+			if s.badgerStore != nil {
+				var classErr error
+				memClass, classErr = s.recallMemoryClassification(rec.MemoryID)
+				if classErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+						"Memory classification state is unavailable; retry later.")
+					return
+				}
+				if memClass > 0 {
+					domainOwner, domErr := s.badgerStore.GetDomainOwner(rec.DomainTag)
+					if domErr == nil && domainOwner != "" {
+						hasAccess, _ := s.hasMemoryReadAccess(rec.DomainTag, queryAgentID, memClass, now)
+						if !hasAccess && rec.SubmittingAgent != queryAgentID {
+							s.logger.Info().
+								Str("memory_id", rec.MemoryID).
+								Str("domain", rec.DomainTag).
+								Str("submitter", idfmt.Prefix(rec.SubmittingAgent)).
+								Str("querier", idfmt.Prefix(queryAgentID)).
+								Str("domain_owner", idfmt.Prefix(domainOwner)).
+								Uint8("classification", memClass).
+								Msg("classification gate hid memory: querier has no shared-org path to writer at required clearance")
+							hiddenByClassification++
+							continue
+						}
 					}
 				}
 			}
@@ -1085,8 +1873,7 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 		applyChallengeRoundProgress(result, progress, hasProgress)
 		results = append(results, result)
 	}
-	// The store enforced the decayed floor over the full candidate set and filled
-	// top_k, so there is nothing to drop or cap here.
+	results = trimRecallResults(results, req.TopK)
 
 	// Update agent's last activity timestamp on recall
 	if queryAgentID != "" && s.agentStore != nil {
@@ -1121,21 +1908,28 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 		Results:    results,
 		TotalCount: len(results),
 	}
+	if s.isPostV23ForNextTx() {
+		hiddenByClassification = 0
+	}
 	setFilterInfo(w, &resp, filterApplied, hiddenByClassification)
 
 	federatedMode := federation.ModeSemantic
 	if req.Query != "" {
 		federatedMode = federation.ModeHybrid
 	}
+	agreementBindings, queryChallenges := federationPlanFields(req.FederationContext)
 	s.mergeFederatedRecall(r, &resp, req.Federated, req.FederateChains, &federation.QueryRequest{
-		Mode:              federatedMode,
-		Query:             req.Query,
-		Embedding:         req.Embedding,
-		EmbeddingProvider: s.activeEmbeddingProvider(),
-		DomainTag:         req.DomainTag,
-		MinConfidence:     req.MinConfidence,
-		TopK:              req.TopK,
-		Tags:              req.Tags,
+		Mode:                  federatedMode,
+		Query:                 req.Query,
+		Embedding:             req.Embedding,
+		EmbeddingProvider:     req.EmbeddingProvider,
+		Provider:              req.Provider,
+		DomainTag:             req.DomainTag,
+		MinConfidence:         req.MinConfidence,
+		TopK:                  req.TopK,
+		Tags:                  req.Tags,
+		PlanAgreementBindings: agreementBindings,
+		PlanChallenges:        queryChallenges,
 	})
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1209,9 +2003,26 @@ func (s *Server) mergeFederatedRecall(r *http.Request, resp *QueryMemoryResponse
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), fedRecallTimeout())
 	defer cancel()
+	// app-v23 forwards the original caller proof verbatim. The remote node
+	// independently verifies this signature and compares the signed recall body
+	// with the transport query; the local node operator cannot substitute a
+	// different agent or broaden its domain.
+	if proof := middleware.ContextAgentAuth(r.Context()); proof != nil {
+		fedReq.AgentProof = &federation.QueryAgentProof{
+			AgentID:          callerID,
+			Signature:        append([]byte(nil), proof.Signature...),
+			Timestamp:        proof.Timestamp,
+			Nonce:            append([]byte(nil), proof.Nonce...),
+			CanonicalRequest: append([]byte(nil), proof.CanonicalRequest...),
+		}
+	}
 
 	targets := chains
-	if s.nodeOperatorID == "" || callerID != s.nodeOperatorID {
+	privilegedTopology := s.nodeOperatorID != "" && callerID == s.nodeOperatorID
+	if s.isPostV23ForNextTx() {
+		privilegedTopology = s.callerIsOperatorOrAdmin(r.Context(), callerID)
+	}
+	if !privilegedTopology {
 		targets = s.federationRecallTargets(ctx, chains, fedReq.DomainTag)
 		if len(targets) == 0 {
 			resp.Federation = &FederationInfo{
@@ -1377,6 +2188,29 @@ func (s *Server) federationCallerCanRead(ctx context.Context, callerID, domain s
 	if callerID == "" {
 		return false, 0
 	}
+	if s.isPostV23ForNextTx() {
+		active, err := s.appV23ActiveOrdinaryAgent(callerID)
+		if err != nil || !active {
+			return false, 0
+		}
+	}
+	if s.isPostV23ForNextTx() && s.badgerStore != nil {
+		if domain == "" {
+			return false, 0
+		}
+		policyID, policyErr := appV23PolicyPrincipal(s.badgerStore, callerID)
+		if policyErr != nil {
+			return false, 0
+		}
+		enrollment, err := s.badgerStore.GetAppV23Enrollment(policyID)
+		if err != nil || enrollment == nil || !enrollment.Active {
+			return false, 0
+		}
+		if err := checkAppV23DomainAccess(s.badgerStore, callerID, domain, "read"); err != nil {
+			return false, int(enrollment.Clearance)
+		}
+		return true, int(enrollment.Clearance)
+	}
 	if s.nodeOperatorID != "" && callerID == s.nodeOperatorID {
 		return true, 4
 	}
@@ -1507,8 +2341,9 @@ type SearchMemoryRequest struct {
 	TopK          int      `json:"top_k,omitempty"`
 	Tags          []string `json:"tags,omitempty"`
 	// v11 federated recall opt-in — see QueryMemoryRequest.
-	Federated      bool     `json:"federated,omitempty"`
-	FederateChains []string `json:"federate_chains,omitempty"`
+	Federated         bool                         `json:"federated,omitempty"`
+	FederateChains    []string                     `json:"federate_chains,omitempty"`
+	FederationContext *FederatedRecallProofContext `json:"federation_context,omitempty"`
 }
 
 // handleSearchMemory handles POST /v1/memory/search — FTS5 full-text search.
@@ -1552,12 +2387,13 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	// Agent isolation RBAC
 	queryAgentID := middleware.ContextAgentID(r.Context())
 	allowedAgents, seeAll := s.resolveVisibleAgents(queryAgentID)
+	legacyVisibilityRestricted := s.appV23LegacyVisibilityRestricted(queryAgentID)
 
-	if !seeAll && domainAccessApproved {
+	if !seeAll && !legacyVisibilityRestricted && domainAccessApproved {
 		seeAll = true
 	}
 
-	if !seeAll && req.DomainTag != "" && s.badgerStore != nil {
+	if !seeAll && !legacyVisibilityRestricted && req.DomainTag != "" && s.badgerStore != nil {
 		hasGrant, _ := s.badgerStore.HasAccess(req.DomainTag, queryAgentID, 1, time.Now())
 		if hasGrant {
 			seeAll = true
@@ -1581,7 +2417,7 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 		Provider:      req.Provider,
 		MinConfidence: req.MinConfidence,
 		StatusFilter:  req.StatusFilter,
-		TopK:          req.TopK,
+		TopK:          s.disclosureRecallTopK(req.TopK),
 		Tags:          req.Tags,
 		// app-v17: keep disputed-but-live memories recallable (flagged + hair-cut
 		// at serialize). A no-op unless the caller's filter is "committed".
@@ -1591,6 +2427,7 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	if filterApplied {
 		opts.SubmittingAgents = allowedAgents
 	}
+	opts.CandidateFilter = s.appV23RecallCandidateFilter(queryAgentID, start)
 	// min_confidence is a DECAYED-confidence floor (rest-api.md): hand it to the
 	// store as DecayFloor, which filters the decayed value over the full candidate
 	// set before the top-K trim, pinned to `start` so it matches what we serialize.
@@ -1599,6 +2436,16 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	records, err := s.store.SearchByText(r.Context(), req.Query, opts)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to search memories")
+		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Memory classification state is unavailable; retry later.")
+			return
+		}
+		if errors.Is(err, store.ErrCandidateFilterScanBudgetExceeded) {
+			writeProblem(w, http.StatusUnprocessableEntity, "Search query too broad",
+				"Too many candidates require authorization; choose a domain, provider, tag, or tighter status filter.")
+			return
+		}
 		writeProblem(w, http.StatusInternalServerError, "Search error", err.Error())
 		return
 	}
@@ -1635,8 +2482,28 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		var memClass uint8
-		if s.badgerStore != nil {
-			memClass, _ = s.badgerStore.GetMemoryClassification(rec.MemoryID)
+		if s.isPostV23ForNextTx() {
+			disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+				queryAgentID, rec, now,
+			)
+			if disclosureErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+					"Memory classification state is unavailable; retry later.")
+				return
+			}
+			if !disclosure.Allowed {
+				hiddenByClassification++
+				continue
+			}
+			memClass = disclosure.Classification
+		} else if s.badgerStore != nil {
+			var classErr error
+			memClass, classErr = s.recallMemoryClassification(rec.MemoryID)
+			if classErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+					"Memory classification state is unavailable; retry later.")
+				return
+			}
 			if memClass > 0 {
 				domainOwner, domErr := s.badgerStore.GetDomainOwner(rec.DomainTag)
 				if domErr == nil && domainOwner != "" {
@@ -1688,7 +2555,7 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 		applyChallengeRoundProgress(result, progress, hasProgress)
 		results = append(results, result)
 	}
-	// The store enforced the decayed floor and filled top_k; nothing to cap here.
+	results = trimRecallResults(results, req.TopK)
 
 	// Update agent last activity
 	if queryAgentID != "" && s.agentStore != nil {
@@ -1722,15 +2589,22 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 		Results:    results,
 		TotalCount: len(results),
 	}
+	if s.isPostV23ForNextTx() {
+		hiddenByClassification = 0
+	}
 	setFilterInfo(w, &resp, filterApplied, hiddenByClassification)
 
+	agreementBindings, queryChallenges := federationPlanFields(req.FederationContext)
 	s.mergeFederatedRecall(r, &resp, req.Federated, req.FederateChains, &federation.QueryRequest{
-		Mode:          federation.ModeText,
-		Query:         req.Query,
-		DomainTag:     req.DomainTag,
-		MinConfidence: req.MinConfidence,
-		TopK:          req.TopK,
-		Tags:          req.Tags,
+		Mode:                  federation.ModeText,
+		Query:                 req.Query,
+		Provider:              req.Provider,
+		DomainTag:             req.DomainTag,
+		MinConfidence:         req.MinConfidence,
+		TopK:                  req.TopK,
+		Tags:                  req.Tags,
+		PlanAgreementBindings: agreementBindings,
+		PlanChallenges:        queryChallenges,
 	})
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1747,18 +2621,20 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 // one final list. Callers must include both the text and embedding for each
 // expansion so SAGE doesn't need to know which embedder generated the primary.
 type HybridSearchMemoryRequest struct {
-	Query         string            `json:"query"`
-	Embedding     []float32         `json:"embedding"`
-	Expansions    []HybridExpansion `json:"expansions,omitempty"`
-	DomainTag     string            `json:"domain_tag,omitempty"`
-	Provider      string            `json:"provider,omitempty"`
-	MinConfidence float64           `json:"min_confidence,omitempty"`
-	StatusFilter  string            `json:"status_filter,omitempty"`
-	TopK          int               `json:"top_k,omitempty"`
-	Tags          []string          `json:"tags,omitempty"`
+	Query             string            `json:"query"`
+	Embedding         []float32         `json:"embedding"`
+	EmbeddingProvider string            `json:"embedding_provider,omitempty"`
+	Expansions        []HybridExpansion `json:"expansions,omitempty"`
+	DomainTag         string            `json:"domain_tag,omitempty"`
+	Provider          string            `json:"provider,omitempty"`
+	MinConfidence     float64           `json:"min_confidence,omitempty"`
+	StatusFilter      string            `json:"status_filter,omitempty"`
+	TopK              int               `json:"top_k,omitempty"`
+	Tags              []string          `json:"tags,omitempty"`
 	// v11 federated recall opt-in — see QueryMemoryRequest.
-	Federated      bool     `json:"federated,omitempty"`
-	FederateChains []string `json:"federate_chains,omitempty"`
+	Federated         bool                         `json:"federated,omitempty"`
+	FederateChains    []string                     `json:"federate_chains,omitempty"`
+	FederationContext *FederatedRecallProofContext `json:"federation_context,omitempty"`
 }
 
 // HybridExpansion carries a single paraphrase/entity/temporal variant of the
@@ -1769,6 +2645,11 @@ type HybridExpansion struct {
 	Query     string    `json:"query"`
 	Embedding []float32 `json:"embedding"`
 }
+
+// maxHybridExpansions bounds authenticated query fan-out. Expansion recall is
+// best-effort relevance enrichment, not an unbounded batch API; without a cap a
+// single signed request could multiply SQL/vector and live authorization work.
+const maxHybridExpansions = 8
 
 // handleHybridSearchMemory handles POST /v1/memory/hybrid.
 // Runs SearchByText and QuerySimilar in parallel and fuses them via RRF.
@@ -1784,6 +2665,17 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	if req.Query == "" && len(req.Embedding) == 0 {
 		writeProblem(w, http.StatusBadRequest, "Missing inputs",
 			"hybrid search requires at least one of `query` or `embedding`")
+		return
+	}
+	if len(req.Expansions) > maxHybridExpansions {
+		writeProblem(w, http.StatusUnprocessableEntity, "Too many hybrid expansions",
+			fmt.Sprintf("hybrid search accepts at most %d expansion variants per request", maxHybridExpansions))
+		return
+	}
+	if err := s.requireFederatedEmbeddingProvider(
+		req.Federated, req.FederateChains, req.Embedding, req.EmbeddingProvider,
+	); err != nil {
+		writeProblem(w, http.StatusBadRequest, "Invalid embedding provider", err.Error())
 		return
 	}
 
@@ -1812,12 +2704,13 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 
 	queryAgentID := middleware.ContextAgentID(r.Context())
 	allowedAgents, seeAll := s.resolveVisibleAgents(queryAgentID)
+	legacyVisibilityRestricted := s.appV23LegacyVisibilityRestricted(queryAgentID)
 
-	if !seeAll && domainAccessApproved {
+	if !seeAll && !legacyVisibilityRestricted && domainAccessApproved {
 		seeAll = true
 	}
 
-	if !seeAll && req.DomainTag != "" && s.badgerStore != nil {
+	if !seeAll && !legacyVisibilityRestricted && req.DomainTag != "" && s.badgerStore != nil {
 		hasGrant, _ := s.badgerStore.HasAccess(req.DomainTag, queryAgentID, 1, time.Now())
 		if hasGrant {
 			seeAll = true
@@ -1842,7 +2735,7 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 		VectorProvider: s.activeEmbeddingProvider(),
 		MinConfidence:  req.MinConfidence,
 		StatusFilter:   req.StatusFilter,
-		TopK:           req.TopK,
+		TopK:           s.disclosureRecallTopK(req.TopK),
 		Tags:           req.Tags,
 		// app-v17: keep disputed-but-live memories recallable (flagged + hair-cut
 		// at serialize). A no-op unless the caller's filter is "committed".
@@ -1852,6 +2745,7 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	if filterApplied {
 		opts.SubmittingAgents = allowedAgents
 	}
+	opts.CandidateFilter = s.appV23RecallCandidateFilter(queryAgentID, start)
 	// min_confidence is a DECAYED-confidence floor (rest-api.md): hand it to the
 	// store as DecayFloor. Carried on the fused opts, both hybrid sub-queries filter
 	// the decayed value before their trim, pinned to `start` for serialize-parity.
@@ -1860,6 +2754,16 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	records, err := s.runHybridWithExpansions(r.Context(), req, opts)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to hybrid-search memories")
+		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Memory classification state is unavailable; retry later.")
+			return
+		}
+		if errors.Is(err, store.ErrCandidateFilterScanBudgetExceeded) {
+			writeProblem(w, http.StatusUnprocessableEntity, "Hybrid query too broad",
+				"Too many candidates require authorization; choose a domain, provider, tag, or tighter status filter.")
+			return
+		}
 		writeProblem(w, http.StatusInternalServerError, "Hybrid search error", err.Error())
 		return
 	}
@@ -1895,8 +2799,28 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 			}
 		}
 		var memClass uint8
-		if s.badgerStore != nil {
-			memClass, _ = s.badgerStore.GetMemoryClassification(rec.MemoryID)
+		if s.isPostV23ForNextTx() {
+			disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+				queryAgentID, rec, now,
+			)
+			if disclosureErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+					"Memory classification state is unavailable; retry later.")
+				return
+			}
+			if !disclosure.Allowed {
+				hiddenByClassification++
+				continue
+			}
+			memClass = disclosure.Classification
+		} else if s.badgerStore != nil {
+			var classErr error
+			memClass, classErr = s.recallMemoryClassification(rec.MemoryID)
+			if classErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+					"Memory classification state is unavailable; retry later.")
+				return
+			}
 			if memClass > 0 {
 				domainOwner, domErr := s.badgerStore.GetDomainOwner(rec.DomainTag)
 				if domErr == nil && domainOwner != "" {
@@ -1948,7 +2872,7 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 		applyChallengeRoundProgress(result, progress, hasProgress)
 		results = append(results, result)
 	}
-	// The store enforced the decayed floor and filled top_k; nothing to cap here.
+	results = trimRecallResults(results, req.TopK)
 
 	if queryAgentID != "" && s.agentStore != nil {
 		if updateErr := s.agentStore.UpdateAgentLastSeen(r.Context(), queryAgentID, time.Now()); updateErr != nil {
@@ -1980,17 +2904,24 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 		Results:    results,
 		TotalCount: len(results),
 	}
+	if s.isPostV23ForNextTx() {
+		hiddenByClassification = 0
+	}
 	setFilterInfo(w, &resp, filterApplied, hiddenByClassification)
 
+	agreementBindings, queryChallenges := federationPlanFields(req.FederationContext)
 	s.mergeFederatedRecall(r, &resp, req.Federated, req.FederateChains, &federation.QueryRequest{
-		Mode:              federation.ModeHybrid,
-		Query:             req.Query,
-		Embedding:         req.Embedding,
-		EmbeddingProvider: s.activeEmbeddingProvider(),
-		DomainTag:         req.DomainTag,
-		MinConfidence:     req.MinConfidence,
-		TopK:              req.TopK,
-		Tags:              req.Tags,
+		Mode:                  federation.ModeHybrid,
+		Query:                 req.Query,
+		Embedding:             req.Embedding,
+		EmbeddingProvider:     req.EmbeddingProvider,
+		Provider:              req.Provider,
+		DomainTag:             req.DomainTag,
+		MinConfidence:         req.MinConfidence,
+		TopK:                  req.TopK,
+		Tags:                  req.Tags,
+		PlanAgreementBindings: agreementBindings,
+		PlanChallenges:        queryChallenges,
 	})
 
 	writeJSON(w, http.StatusOK, resp)
@@ -2013,6 +2944,24 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 
 	// Agent isolation RBAC check: can this agent see this memory's author?
 	agentID := middleware.ContextAgentID(r.Context())
+	var appV23Classification *uint8
+	if s.isPostV23ForNextTx() {
+		disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+			agentID, rec, time.Now(),
+		)
+		if disclosureErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Memory authorization state is unavailable; retry later.")
+			return
+		}
+		if !disclosure.Allowed {
+			writeProblem(w, http.StatusForbidden, "Access denied",
+				"You do not currently have read access to this memory.")
+			return
+		}
+		classification := disclosure.Classification
+		appV23Classification = &classification
+	}
 	if agentID != rec.SubmittingAgent {
 		allowedAgents, seeAll := s.resolveVisibleAgents(agentID)
 		if !seeAll {
@@ -2101,7 +3050,9 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	// silently reporting every record as PUBLIC (0). Guarded on badgerStore like
 	// that gate, since some deployment modes run without it.
 	var memClass uint8
-	if s.badgerStore != nil {
+	if appV23Classification != nil {
+		memClass = *appV23Classification
+	} else if s.badgerStore != nil {
 		memClass, _ = s.badgerStore.GetMemoryClassification(memoryID)
 	}
 
@@ -2325,26 +3276,12 @@ func broadcastErrorPublic(err error) (int, string) {
 // ("everyone slow down") from a per-agent quota breach ("you slow down").
 const mempoolFullProblemType = "https://sage.dev/errors/mempool-full"
 
-// domainWriteDeniedProblemType distinguishes a permanent, domain-scoped ACL
-// rejection from the generic 403 that an MCP client may see while a restarted
-// node is rebuilding session identity. The response remains sanitized: it
-// exposes neither the caller's ID nor the domain owner's ID.
-const domainWriteDeniedProblemType = "https://sage.dev/errors/domain-write-denied"
-
 // isMempoolFullErr reports whether a broadcast error is CometBFT's
 // mempool-is-full rejection. The detail arrives in the JSON-RPC error.data
 // field ("mempool is full: number of txs N (max: M)"), which
 // broadcastTxCommitWithHeight folds into the wrapped error string.
 func isMempoolFullErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "mempool is full")
-}
-
-// isDomainWriteDeniedErr matches the consensus rejection emitted specifically
-// by processMemorySubmit when an authenticated agent lacks level-2 authority.
-// Other access-denied errors retain their opaque response and compatibility
-// retry path because they may describe a stale session after a node restart.
-func isDomainWriteDeniedErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "has no write access to domain")
 }
 
 func memoryTypeToTx(mt string) tx.MemoryType {
@@ -2385,10 +3322,31 @@ func (s *Server) handleUpdateTaskStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	agentID := middleware.ContextAgentID(r.Context())
-	if agentID == "" || s.agentStore == nil {
+	credentialID := middleware.ContextAgentID(r.Context())
+	if credentialID == "" || s.agentStore == nil {
 		writeProblem(w, http.StatusForbidden, "Active agent required", "A registered active agent identity is required.")
 		return
+	}
+	agentID := credentialID
+	if s.isPostV23ForNextTx() {
+		active, activeErr := s.appV23ActiveOrdinaryAgent(credentialID)
+		if activeErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Current local agent policy state could not be resolved.")
+			return
+		}
+		if !active {
+			writeProblem(w, http.StatusForbidden, "Active agent required",
+				"Task status is an ordinary-agent action; CEREBRUM Root and inactive or stale identities cannot claim or complete tasks.")
+			return
+		}
+		var policyErr error
+		agentID, policyErr = appV23PolicyPrincipal(s.badgerStore, credentialID)
+		if policyErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Current Root policy state could not be resolved.")
+			return
+		}
 	}
 	agent, err := s.agentStore.GetAgent(r.Context(), agentID)
 	if err != nil || agent == nil || agent.Status != "active" || agent.RemovedAt != nil {
@@ -2400,11 +3358,27 @@ func (s *Server) handleUpdateTaskStatus(w http.ResponseWriter, r *http.Request) 
 		writeProblem(w, http.StatusNotFound, "Task not found", "No task was found with that ID.")
 		return
 	}
-	if accessErr := s.checkDomainAccess(r.Context(), agentID, rec.DomainTag, "read"); accessErr != nil {
+	taskAction := "read"
+	if s.isPostV23ForNextTx() {
+		taskAction = "write"
+	}
+	if accessErr := s.checkDomainAccess(r.Context(), credentialID, rec.DomainTag, taskAction); accessErr != nil {
 		writeProblem(w, http.StatusForbidden, "Access denied", accessErr.Error())
 		return
 	}
-	if reader, ok := s.store.(interface {
+	if s.isPostV23ForNextTx() {
+		disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+			credentialID, rec, time.Now(),
+		)
+		if disclosureErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable", "Task authorization could not be verified; retry later.")
+			return
+		}
+		if !disclosure.Allowed {
+			writeProblem(w, http.StatusForbidden, "Access denied", "No verified read access to this task.")
+			return
+		}
+	} else if reader, ok := s.store.(interface {
 		GetMemoryClassificationLocal(context.Context, string) (int, error)
 	}); ok {
 		classification, classErr := reader.GetMemoryClassificationLocal(r.Context(), memoryID)
@@ -2417,7 +3391,7 @@ func (s *Server) handleUpdateTaskStatus(w http.ResponseWriter, r *http.Request) 
 				writeProblem(w, http.StatusForbidden, "Access denied", "No verified read access to this classified task.")
 				return
 			}
-			allowed, accessErr := s.hasMemoryReadAccess(rec.DomainTag, agentID, uint8(classification), time.Now())
+			allowed, accessErr := s.hasMemoryReadAccess(rec.DomainTag, credentialID, uint8(classification), time.Now())
 			if accessErr != nil || !allowed {
 				writeProblem(w, http.StatusForbidden, "Access denied", "No verified read access to this classified task.")
 				return
@@ -2477,10 +3451,20 @@ func (s *Server) handleLinkMemories(w http.ResponseWriter, r *http.Request) {
 		req.LinkType = "related"
 	}
 
-	agentID := middleware.ContextAgentID(r.Context())
-	if agentID == "" || s.agentStore == nil || s.badgerStore == nil {
+	credentialID := middleware.ContextAgentID(r.Context())
+	if credentialID == "" || s.agentStore == nil || s.badgerStore == nil {
 		writeProblem(w, http.StatusForbidden, "Active agent required", "A registered active agent identity is required.")
 		return
+	}
+	agentID := credentialID
+	if s.isPostV23ForNextTx() {
+		var policyErr error
+		agentID, policyErr = appV23PolicyPrincipal(s.badgerStore, credentialID)
+		if policyErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Current Root policy state could not be resolved.")
+			return
+		}
 	}
 	agent, err := s.agentStore.GetAgent(r.Context(), agentID)
 	onChainAgent, onChainErr := s.badgerStore.GetRegisteredAgent(agentID)
@@ -2497,7 +3481,7 @@ func (s *Server) handleLinkMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	allowedSubmitters, seeAll := s.resolveVisibleAgents(agentID)
+	allowedSubmitters, seeAll := s.resolveVisibleAgents(credentialID)
 	if !seeAll &&
 		(!containsAgentID(allowedSubmitters, source.SubmittingAgent) ||
 			!containsAgentID(allowedSubmitters, target.SubmittingAgent)) {
@@ -2505,34 +3489,50 @@ func (s *Server) handleLinkMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if accessErr := s.checkDomainAccess(r.Context(), agentID, source.DomainTag, "modify"); accessErr != nil {
+	if accessErr := s.checkDomainAccess(r.Context(), credentialID, source.DomainTag, "modify"); accessErr != nil {
 		writeProblem(w, http.StatusForbidden, "Access denied", "Modify access to the source memory is required.")
 		return
 	}
-	sourceOwner, ownerErr := s.badgerStore.IsDomainOwnerOrAncestor(source.DomainTag, agentID)
-	sourceModify, modifyErr := s.badgerStore.HasAccessOrAncestor(source.DomainTag, agentID, 3, time.Now())
-	if ownerErr != nil || modifyErr != nil || (!sourceOwner && !sourceModify && onChainAgent.Role != "admin") {
-		writeProblem(w, http.StatusForbidden, "Access denied", "Modify access to the source memory is required.")
-		return
+	if !s.isPostV23ForNextTx() {
+		sourceOwner, ownerErr := s.badgerStore.IsDomainOwnerOrAncestor(source.DomainTag, agentID)
+		sourceModify, modifyErr := s.badgerStore.HasAccessOrAncestor(source.DomainTag, agentID, 3, time.Now())
+		if ownerErr != nil || modifyErr != nil || (!sourceOwner && !sourceModify && onChainAgent.Role != "admin") {
+			writeProblem(w, http.StatusForbidden, "Access denied", "Modify access to the source memory is required.")
+			return
+		}
 	}
 
 	for _, rec := range []*memory.MemoryRecord{source, target} {
-		if accessErr := s.checkDomainAccess(r.Context(), agentID, rec.DomainTag, "read"); accessErr != nil {
+		if accessErr := s.checkDomainAccess(r.Context(), credentialID, rec.DomainTag, "read"); accessErr != nil {
 			writeProblem(w, http.StatusForbidden, "Access denied", "Read access to both memories is required.")
 			return
 		}
-		if onChainAgent.Role == "admin" {
-			continue
-		}
-		classification, classErr := s.badgerStore.GetMemoryClassification(rec.MemoryID)
-		if classErr != nil {
-			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable", "Memory authorization could not be verified; retry later.")
-			return
-		}
-		allowed, accessErr := s.hasMemoryReadAccess(rec.DomainTag, agentID, classification, time.Now())
-		if accessErr != nil || !allowed {
-			writeProblem(w, http.StatusForbidden, "Access denied", "Read access to both memories is required.")
-			return
+		if s.isPostV23ForNextTx() {
+			disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+				credentialID, rec, time.Now(),
+			)
+			if disclosureErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable", "Memory authorization could not be verified; retry later.")
+				return
+			}
+			if !disclosure.Allowed {
+				writeProblem(w, http.StatusForbidden, "Access denied", "Read access to both memories is required.")
+				return
+			}
+		} else {
+			if onChainAgent.Role == "admin" {
+				continue
+			}
+			classification, classErr := s.badgerStore.GetMemoryClassification(rec.MemoryID)
+			if classErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable", "Memory authorization could not be verified; retry later.")
+				return
+			}
+			allowed, accessErr := s.hasMemoryReadAccess(rec.DomainTag, credentialID, classification, time.Now())
+			if accessErr != nil || !allowed {
+				writeProblem(w, http.StatusForbidden, "Access denied", "Read access to both memories is required.")
+				return
+			}
 		}
 	}
 
@@ -2563,6 +3563,9 @@ func (s *Server) handleGetOpenTasks(w http.ResponseWriter, r *http.Request) {
 	provider := r.URL.Query().Get("provider")
 
 	agentID := middleware.ContextAgentID(r.Context())
+	if !s.requireAppV23ActiveOrdinaryAgent(w, agentID, "the open-task agent API") {
+		return
+	}
 
 	// Per-domain read ACL — parity with /v1/memory/list and the query/hybrid
 	// recall path. This handler returns full task CONTENT, so without the gate an
@@ -2592,22 +3595,64 @@ func (s *Server) handleGetOpenTasks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tasks, err := s.store.GetOpenTasks(r.Context(), domain, provider, agentID)
+	var tasks []*memory.MemoryRecord
+	var err error
+	if s.isPostV23ForNextTx() {
+		if pager, ok := s.store.(store.OpenTaskPageStore); ok {
+			tasks, err = s.collectAppV23VisibleRecords(
+				r.Context(), agentID, 500,
+				func(ctx context.Context, limit, offset int) ([]*memory.MemoryRecord, error) {
+					return pager.GetOpenTasksPage(
+						ctx, domain, provider, agentID, limit, offset,
+					)
+				},
+			)
+		} else {
+			// Compatibility fallback for external MemoryStore implementations.
+			// Built-in SQLite/Postgres stores implement the paging extension.
+			tasks, err = s.store.GetOpenTasks(r.Context(), domain, provider, agentID)
+		}
+	} else {
+		tasks, err = s.store.GetOpenTasks(r.Context(), domain, provider, agentID)
+	}
 	if err != nil {
+		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Task authorization state is unavailable; retry later.")
+			return
+		}
+		if errors.Is(err, errAppV23DisclosureScanBudget) {
+			writeProblem(w, http.StatusUnprocessableEntity, "Task query too broad",
+				"Too many task candidates require authorization; choose a domain or provider filter.")
+			return
+		}
 		writeProblem(w, http.StatusInternalServerError, "Failed to get tasks", err.Error())
 		return
 	}
 
 	// Per-record gate — parity with handleListMemoriesAuth. Drops tasks whose
 	// domain the caller cannot read (covers the no-domain cross-domain board) and
-	// tasks classified above the caller's clearance. The submitter always sees its
-	// own tasks. Agent-isolation is intentionally NOT applied here: within a
-	// domain the caller can read, an open-task board is meant to be cross-agent.
+	// tasks classified above the caller's clearance. App-v23 deliberately has no
+	// authorship bypass. GetOpenTasks has already applied exact immutable-assignee
+	// isolation; this second pass protects tasks assigned to the caller but
+	// submitted by a different agent.
 	if s.badgerStore != nil {
 		now := time.Now()
 		kept := tasks[:0]
 		for _, rec := range tasks {
-			if rec.SubmittingAgent != agentID {
+			if s.isPostV23ForNextTx() {
+				disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+					agentID, rec, now,
+				)
+				if disclosureErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+						"Task authorization state is unavailable; retry later.")
+					return
+				}
+				if !disclosure.Allowed {
+					continue
+				}
+			} else if rec.SubmittingAgent != agentID {
 				// Domain-read filter — only needed when no single domain was pre-gated.
 				if domain == "" && rec.DomainTag != "" {
 					if accessErr := s.checkDomainAccess(r.Context(), agentID, rec.DomainTag, "read"); accessErr != nil {
@@ -2638,17 +3683,27 @@ func (s *Server) handleGetOpenTasks(w http.ResponseWriter, r *http.Request) {
 		Content         string  `json:"content"`
 		DomainTag       string  `json:"domain_tag"`
 		TaskStatus      string  `json:"task_status"`
+		Assignee        string  `json:"assignee"`
+		TaskPickedUpBy  string  `json:"task_picked_up_by,omitempty"`
+		TaskPickedUpAt  string  `json:"task_picked_up_at,omitempty"`
 		ConfidenceScore float64 `json:"confidence_score"`
 		CreatedAt       string  `json:"created_at"`
 	}
 
 	results := make([]taskResult, 0, len(tasks))
 	for _, t := range tasks {
+		pickedUpAt := ""
+		if t.TaskPickedUpAt != nil {
+			pickedUpAt = t.TaskPickedUpAt.UTC().Format(time.RFC3339)
+		}
 		results = append(results, taskResult{
 			MemoryID:        t.MemoryID,
 			Content:         t.Content,
 			DomainTag:       t.DomainTag,
 			TaskStatus:      string(t.TaskStatus),
+			Assignee:        t.Assignee,
+			TaskPickedUpBy:  t.TaskPickedUpBy,
+			TaskPickedUpAt:  pickedUpAt,
 			ConfidenceScore: t.ConfidenceScore,
 			CreatedAt:       t.CreatedAt.Format("2006-01-02T15:04:05Z"),
 		})
@@ -2678,6 +3733,82 @@ func truncateContent(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+const appV23MaxVisibleOffset = 7_900
+
+var errAppV23VisibleOffsetTooLarge = errors.New("offset exceeds the app-v23 visible pagination limit")
+
+// listAppV23VisibleMemories paginates after live authorization, rather than
+// applying SQL offset/limit first. That makes total/offset/limit describe only
+// records the caller may currently read and prevents revoked rows from starving
+// a page. Each store read is bounded and the walk stops after one extra visible
+// row, so mature nodes do not pay a full-inventory scan merely to render page 1.
+// `total` is therefore an authorization-safe lower bound while hasMore is true;
+// it becomes exact only when the filtered stream is exhausted.
+func (s *Server) listAppV23VisibleMemories(
+	ctx context.Context,
+	opts store.ListOptions,
+	agentID string,
+) ([]*memory.MemoryRecord, int, bool, bool, error) {
+	requestedLimit, requestedOffset := opts.Limit, opts.Offset
+	if requestedOffset < 0 {
+		return nil, 0, false, false, errors.New("offset must not be negative")
+	}
+	if requestedOffset > appV23MaxVisibleOffset {
+		return nil, 0, false, false, errAppV23VisibleOffsetTooLarge
+	}
+	scan := opts
+	scan.Limit = 200
+	scan.Offset = 0
+	scan.StablePaging = true
+	// Keep only the requested page plus one look-ahead row. Even a large but
+	// valid offset therefore consumes O(limit), not O(offset), memory.
+	visible := make([]*memory.MemoryRecord, 0, requestedLimit+1)
+	visibleSeen := 0
+	now := time.Now()
+	exhausted := false
+	for {
+		if scan.Offset >= appV23DisclosureScanBudget {
+			return nil, 0, false, false, errAppV23DisclosureScanBudget
+		}
+		scan.Limit = min(200, appV23DisclosureScanBudget-scan.Offset)
+		batch, total, err := s.store.ListMemories(ctx, scan)
+		if err != nil {
+			return nil, 0, false, false, err
+		}
+		batchExhaustsStream := len(batch) < scan.Limit || scan.Offset+len(batch) >= total
+		for _, rec := range batch {
+			disclosure, err := s.evaluateAppV23RecordDisclosure(agentID, rec, now)
+			if err != nil {
+				return nil, 0, false, false, appV23RecordDisclosureError(err)
+			}
+			if disclosure.Allowed {
+				visibleSeen++
+				if visibleSeen > requestedOffset {
+					visible = append(visible, rec)
+				}
+				if len(visible) > requestedLimit {
+					break
+				}
+			}
+		}
+		if len(visible) > requestedLimit {
+			exhausted = batchExhaustsStream
+			break
+		}
+		scan.Offset += len(batch)
+		if batchExhaustsStream {
+			exhausted = true
+			break
+		}
+	}
+	totalVisibleLowerBound := visibleSeen
+	hasMore := len(visible) > requestedLimit
+	if hasMore {
+		visible = visible[:requestedLimit]
+	}
+	return visible, totalVisibleLowerBound, hasMore, exhausted, nil
+}
+
 // handleListMemoriesAuth handles GET /v1/memory/list (authenticated, agent-isolated).
 // Mirrors the dashboard list endpoint but applies RBAC agent isolation.
 func (s *Server) handleListMemoriesAuth(w http.ResponseWriter, r *http.Request) {
@@ -2686,7 +3817,22 @@ func (s *Server) handleListMemoriesAuth(w http.ResponseWriter, r *http.Request) 
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	offset, _ := strconv.Atoi(q.Get("offset"))
+	offset := 0
+	if rawOffset := q.Get("offset"); rawOffset != "" {
+		var offsetErr error
+		offset, offsetErr = strconv.Atoi(rawOffset)
+		if offsetErr != nil || offset < 0 {
+			writeProblem(w, http.StatusBadRequest, "Invalid offset",
+				"offset must be a non-negative integer.")
+			return
+		}
+	}
+	postV23 := s.isPostV23ForNextTx()
+	if postV23 && offset > appV23MaxVisibleOffset {
+		writeProblem(w, http.StatusUnprocessableEntity, "Offset too large",
+			fmt.Sprintf("offset must not exceed %d under app-v23; narrow the query or page sequentially.", appV23MaxVisibleOffset))
+		return
+	}
 
 	agentID := middleware.ContextAgentID(r.Context())
 	domainFilter := q.Get("domain")
@@ -2721,12 +3867,13 @@ func (s *Server) handleListMemoriesAuth(w http.ResponseWriter, r *http.Request) 
 	}
 
 	allowedAgents, seeAll := s.resolveVisibleAgents(agentID)
+	legacyVisibilityRestricted := s.appV23LegacyVisibilityRestricted(agentID)
 
 	// Grant-aware override: if listing a specific domain, skip agent isolation when:
 	// (a) the agent has a direct grant on the domain, or
 	// (b) the agent has org-level access (clearance >= classification), or
 	// (c) the domain has no registered owner (no access policy = open visibility)
-	if !seeAll && domainFilter != "" && s.badgerStore != nil {
+	if !seeAll && !legacyVisibilityRestricted && domainFilter != "" && s.badgerStore != nil {
 		hasGrant, _ := s.badgerStore.HasAccess(domainFilter, agentID, 1, time.Now())
 		if hasGrant {
 			seeAll = true
@@ -2761,9 +3908,31 @@ func (s *Server) handleListMemoriesAuth(w http.ResponseWriter, r *http.Request) 
 		opts.SubmittingAgents = allowedAgents
 	}
 
-	records, total, err := s.store.ListMemories(r.Context(), opts)
+	var records []*memory.MemoryRecord
+	var total int
+	var hasMore, totalExact bool
+	var err error
+	if postV23 {
+		records, total, hasMore, totalExact, err = s.listAppV23VisibleMemories(
+			r.Context(), opts, agentID,
+		)
+	} else {
+		records, total, err = s.store.ListMemories(r.Context(), opts)
+	}
 	if err != nil {
-		writeProblem(w, http.StatusInternalServerError, "Query error", err.Error())
+		status := http.StatusInternalServerError
+		title := "Query error"
+		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
+			status = http.StatusServiceUnavailable
+			title = "Authorization unavailable"
+		} else if errors.Is(err, errAppV23VisibleOffsetTooLarge) {
+			status = http.StatusUnprocessableEntity
+			title = "Offset too large"
+		} else if errors.Is(err, errAppV23DisclosureScanBudget) {
+			status = http.StatusUnprocessableEntity
+			title = "Query too broad"
+		}
+		writeProblem(w, status, title, err.Error())
 		return
 	}
 
@@ -2773,10 +3942,10 @@ func (s *Server) handleListMemoriesAuth(w http.ResponseWriter, r *http.Request) 
 	// records whose domain the caller cannot read (a seeAll caller — visible_agents
 	// "*", TopSecret, operator — otherwise gets PUBLIC content from domains it has
 	// no grant on). The classification gate then drops records classified above the
-	// caller's clearance even within a readable domain. The submitter always sees
-	// its own records.
+	// caller's clearance even within a readable domain. App-v23 deliberately has
+	// no authorship bypass.
 	hiddenByClassification := 0
-	if s.badgerStore != nil {
+	if s.badgerStore != nil && !postV23 {
 		now := time.Now()
 		kept := records[:0]
 		for _, rec := range records {
@@ -2812,7 +3981,15 @@ func (s *Server) handleListMemoriesAuth(w http.ResponseWriter, r *http.Request) 
 		"offset":   offset,
 	}
 
-	if filterApplied || hiddenByClassification > 0 {
+	if s.isPostV23ForNextTx() {
+		body["has_more"] = hasMore
+		body["total_exact"] = totalExact
+		if filterApplied {
+			info := &FilterInfo{By: []string{filterBySubmittingAgts}}
+			w.Header().Set(filterHeader, filterBySubmittingAgts)
+			body["filtered"] = info
+		}
+	} else if filterApplied || hiddenByClassification > 0 {
 		applied := make([]string, 0, 2)
 		info := &FilterInfo{}
 		if filterApplied {
@@ -2844,9 +4021,131 @@ func (s *Server) handleListMemoriesAuth(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, body)
 }
 
-// handleTimelineAuth handles GET /v1/memory/timeline (authenticated, agent-isolated).
-// Mirrors the dashboard timeline endpoint. Timeline aggregation is domain-level
-// so agent isolation is not applied to counts, but only authenticated agents can call it.
+const (
+	appV23TimelineMaxRange      = 31 * 24 * time.Hour
+	appV23TimelineMaxRawRecords = appV23DisclosureScanBudget
+)
+
+var errAppV23TimelineWorkLimit = errors.New("app-v23 timeline work limit exceeded")
+
+func appV23TimelinePeriod(at time.Time, bucket string, postgresShape bool) string {
+	at = at.UTC()
+	if postgresShape {
+		switch bucket {
+		case "hour":
+			return at.Truncate(time.Hour).Format(time.RFC3339)
+		case "week":
+			weekday := (int(at.Weekday()) + 6) % 7
+			return time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC).
+				AddDate(0, 0, -weekday).Format(time.RFC3339)
+		case "month":
+			return time.Date(at.Year(), at.Month(), 1, 0, 0, 0, 0, time.UTC).
+				Format(time.RFC3339)
+		default:
+			return time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC).
+				Format(time.RFC3339)
+		}
+	}
+	switch bucket {
+	case "hour":
+		return at.Truncate(time.Hour).Format("2006-01-02T15:00:00Z")
+	case "week":
+		// Match SQLite strftime("%Y-W%W"): Monday starts the week and days
+		// before the first Monday belong to week 00.
+		yearStart := time.Date(at.Year(), time.January, 1, 0, 0, 0, 0, time.UTC)
+		firstMondayOffset := (8 - int(yearStart.Weekday())) % 7
+		yearDay := at.YearDay() - 1
+		week := 0
+		if yearDay >= firstMondayOffset {
+			week = ((yearDay - firstMondayOffset) / 7) + 1
+		}
+		return fmt.Sprintf("%04d-W%02d", at.Year(), week)
+	case "month":
+		return at.Format("2006-01")
+	default:
+		return at.Format("2006-01-02")
+	}
+}
+
+// getAppV23VisibleTimeline applies the same per-record live disclosure decision
+// as list/query before counting. Aggregate existence and timing are governed
+// metadata: a denied record must not increment a public bucket. Raw store pages
+// stay bounded and deterministic; unlike the ordinary list route, aggregation
+// intentionally walks the complete requested time range to produce exact counts.
+func (s *Server) getAppV23VisibleTimeline(
+	ctx context.Context,
+	agentID string,
+	from, to time.Time,
+	domain, bucket string,
+) ([]store.TimelineBucket, error) {
+	const pageSize = 200
+	formatter, hasFormatter := s.store.(store.TimelinePeriodFormatter)
+	// SQLite stores RFC3339Nano as text, whose optional fractional component is
+	// not perfectly lexicographic at a whole-second boundary. Widen the SQL
+	// range by one second and apply the exact time predicate below.
+	opts := store.ListOptions{
+		DomainTag:    domain,
+		CreatedFrom:  from.UTC().Add(-time.Second).Format(time.RFC3339Nano),
+		CreatedTo:    to.UTC().Add(time.Second).Format(time.RFC3339Nano),
+		Limit:        pageSize,
+		Sort:         "oldest",
+		StablePaging: true,
+	}
+	counts := make(map[string]int)
+	now := time.Now()
+	for {
+		batch, total, err := s.store.ListMemories(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		if total > appV23TimelineMaxRawRecords ||
+			opts.Offset > appV23TimelineMaxRawRecords-len(batch) {
+			return nil, errAppV23TimelineWorkLimit
+		}
+		for _, rec := range batch {
+			if rec.CreatedAt.Before(from) || rec.CreatedAt.After(to) {
+				continue
+			}
+			disclosure, disclosureErr := s.evaluateAppV23RecordDisclosure(
+				agentID, rec, now,
+			)
+			if disclosureErr != nil {
+				return nil, appV23RecordDisclosureError(disclosureErr)
+			}
+			if disclosure.Allowed {
+				period := appV23TimelinePeriod(rec.CreatedAt, bucket, false)
+				if hasFormatter {
+					period = formatter.FormatTimelinePeriod(rec.CreatedAt, bucket)
+				}
+				counts[period]++
+			}
+		}
+		opts.Offset += len(batch)
+		if len(batch) < pageSize || opts.Offset >= total || len(batch) == 0 {
+			break
+		}
+	}
+
+	periods := make([]string, 0, len(counts))
+	for period := range counts {
+		periods = append(periods, period)
+	}
+	sort.Strings(periods)
+	buckets := make([]store.TimelineBucket, 0, len(periods))
+	for _, period := range periods {
+		buckets = append(buckets, store.TimelineBucket{
+			Period: period,
+			Count:  counts[period],
+			Domain: domain,
+		})
+	}
+	return buckets, nil
+}
+
+// handleTimelineAuth handles GET /v1/memory/timeline. Before app-v23 the
+// historical aggregate route is preserved. App-v23 treats aggregate
+// existence/timing as governed data and counts only records that pass the
+// caller's current live disclosure decision.
 func (s *Server) handleTimelineAuth(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	domain := q.Get("domain")
@@ -2858,9 +4157,10 @@ func (s *Server) handleTimelineAuth(w http.ResponseWriter, r *http.Request) {
 	// Per-domain read ACL — parity with the other domain-keyed reads. The buckets
 	// are aggregate counts (no content), but submission volume over time for a
 	// domain is still a metadata signal the caller should hold a read grant for.
-	// Global (no-domain) counts stay ungated. checkDomainAccess is the operative
-	// per-domain gate; the multi-org block below mirrors query/list for shape-parity
-	// (a no-op once checkDomainAccess approves a concrete domain).
+	// Pre-v23 global (no-domain) counts retain their historical behavior. Under
+	// app-v23 the per-record aggregation below filters both global and scoped
+	// timelines through current disclosure authority. checkDomainAccess is the
+	// operative up-front gate for a concrete domain.
 	agentID := middleware.ContextAgentID(r.Context())
 	domainAccessApproved := false
 	if domain != "" {
@@ -2885,23 +4185,74 @@ func (s *Server) handleTimelineAuth(w http.ResponseWriter, r *http.Request) {
 	from := time.Now().Add(-24 * time.Hour)
 	to := time.Now()
 	if v := q.Get("from"); v != "" {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
+		t, parseErr := time.Parse(time.RFC3339, v)
+		if parseErr != nil {
+			if s.isPostV23ForNextTx() {
+				writeProblem(w, http.StatusBadRequest, "Invalid timeline range",
+					"from must be an RFC3339 timestamp.")
+				return
+			}
+		} else {
 			from = t
 		}
 	}
 	if v := q.Get("to"); v != "" {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
+		t, parseErr := time.Parse(time.RFC3339, v)
+		if parseErr != nil {
+			if s.isPostV23ForNextTx() {
+				writeProblem(w, http.StatusBadRequest, "Invalid timeline range",
+					"to must be an RFC3339 timestamp.")
+				return
+			}
+		} else {
 			to = t
 		}
 	}
+	if s.isPostV23ForNextTx() {
+		if from.After(to) {
+			writeProblem(w, http.StatusBadRequest, "Invalid timeline range",
+				"from must be earlier than or equal to to.")
+			return
+		}
+		if to.Sub(from) > appV23TimelineMaxRange {
+			writeProblem(w, http.StatusUnprocessableEntity, "Timeline range too large",
+				"App-v23 governed timelines are limited to 31 days per request; choose a narrower range.")
+			return
+		}
+	}
 
-	buckets, err := s.store.GetTimeline(r.Context(), from, to, domain, bucket)
+	var buckets []store.TimelineBucket
+	var err error
+	if s.isPostV23ForNextTx() {
+		buckets, err = s.getAppV23VisibleTimeline(
+			r.Context(), agentID, from, to, domain, bucket,
+		)
+	} else {
+		buckets, err = s.store.GetTimeline(r.Context(), from, to, domain, bucket)
+	}
 	if err != nil {
+		if errors.Is(err, errAppV23TimelineWorkLimit) {
+			writeProblem(w, http.StatusUnprocessableEntity, "Timeline result too large",
+				"The governed timeline contains too many records to authorize safely; choose a narrower range or domain.")
+			return
+		}
+		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
+			writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
+				"Timeline authorization state is unavailable; retry later.")
+			return
+		}
 		writeProblem(w, http.StatusInternalServerError, "Query error", err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"buckets": buckets})
+	total := 0
+	for _, timelineBucket := range buckets {
+		total += timelineBucket.Count
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"buckets": buckets,
+		"total":   total,
+	})
 }
 
 // runHybridWithExpansions runs SearchHybrid once for the primary query plus
@@ -2909,6 +4260,28 @@ func (s *Server) handleTimelineAuth(w http.ResponseWriter, r *http.Request) {
 // list via RRF across variants. With no expansions the call collapses to a
 // single SearchHybrid invocation (zero overhead vs the v7.0 path).
 func (s *Server) runHybridWithExpansions(ctx context.Context, req HybridSearchMemoryRequest, opts store.QueryOptions) ([]*memory.MemoryRecord, error) {
+	if len(req.Expansions) > maxHybridExpansions {
+		return nil, fmt.Errorf(
+			"hybrid search accepts at most %d expansion variants per request",
+			maxHybridExpansions,
+		)
+	}
+
+	// One governed request gets one authorization budget across the primary,
+	// every expansion, and every store leaf behind SearchHybrid. Reusing the
+	// same closure is intentional: a caller cannot reset the live Badger/RBAC
+	// work ceiling merely by adding another paraphrase.
+	if candidateFilter := opts.CandidateFilter; candidateFilter != nil {
+		candidateChecks := 0
+		opts.CandidateFilter = func(rec *memory.MemoryRecord) (bool, error) {
+			if candidateChecks >= store.CandidateFilterScanBudget {
+				return false, store.ErrCandidateFilterScanBudgetExceeded
+			}
+			candidateChecks++
+			return candidateFilter(rec)
+		}
+	}
+
 	// Primary query always runs first; expansions follow. Each variant gets
 	// the same QueryOptions (domain, RBAC, filters) so the only thing that
 	// varies between calls is the query text + its embedding.
@@ -2941,14 +4314,20 @@ func (s *Server) runHybridWithExpansions(ctx context.Context, req HybridSearchMe
 
 	scores := make(map[string]float64)
 	records := make(map[string]*memory.MemoryRecord)
+	successfulVariants := 0
+	var firstVariantErr error
 
 	for _, v := range variants {
 		got, err := s.store.SearchHybrid(ctx, v.query, v.embedding, opts)
 		if err != nil {
-			// Under a decayed floor, fail closed: a swallowed leaf error would
-			// silently return a partial, floor-unenforced recall.
-			if opts.DecayFloor > 0 {
+			// Governed recall and decayed floors both fail closed. In
+			// particular, never turn an exhausted aggregate authorization
+			// budget into a misleading 200 with partial expansion results.
+			if opts.CandidateFilter != nil || opts.DecayFloor > 0 {
 				return nil, err
+			}
+			if firstVariantErr == nil {
+				firstVariantErr = err
 			}
 			// Otherwise a single variant failing shouldn't drop the whole recall —
 			// the user paid for an expansion, not a fragility tax. Log and continue
@@ -2956,6 +4335,7 @@ func (s *Server) runHybridWithExpansions(ctx context.Context, req HybridSearchMe
 			s.logger.Warn().Err(err).Str("variant_query", v.query).Msg("expansion variant SearchHybrid failed; skipping")
 			continue
 		}
+		successfulVariants++
 		for rank, rec := range got {
 			scores[rec.MemoryID] += 1.0 / float64(rrfKAcrossVariants+rank+1)
 			if _, ok := records[rec.MemoryID]; !ok {
@@ -2964,6 +4344,9 @@ func (s *Server) runHybridWithExpansions(ctx context.Context, req HybridSearchMe
 		}
 	}
 
+	if successfulVariants == 0 && firstVariantErr != nil {
+		return nil, firstVariantErr
+	}
 	if len(records) == 0 {
 		return nil, nil
 	}

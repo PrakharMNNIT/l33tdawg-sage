@@ -25,6 +25,93 @@ test('Access Controls is a first-class sidebar route', () => {
     assert.match(appSource, /accessMode \? 'access' : 'overview'/);
 });
 
+test('CEREBRUM Root is separate from agents and uses a two-stage one-time handover', () => {
+    const access = appSource.slice(
+        appSource.indexOf('function AppV23AccessControl()'),
+        appSource.indexOf('function NetworkPage('),
+    );
+    assert.match(access, /Root is this node’s owner, not an agent or an agent role/);
+    assert.match(access, /It stays out of agent lists and groups/);
+    assert.match(access, /does not promote an agent, move or copy domains or memories, or rewrite authorship/);
+    assert.match(access, /Historical memories and their original authors remain readable and unchanged/);
+    assert.match(access, /replacement immediately controls the same Root-owned domains/);
+    assert.match(access, /retires the current credential from CEREBRUM Root authority/);
+    assert.match(access, /federation connections keep this node’s separate stable transport identity and peer pins/);
+    assert.match(access, /Root handover does not rotate it/);
+    assert.match(access, /<details class="v23-root-diagnostics">/,
+        'credential identifiers belong in a collapsed diagnostic instead of the normal control hierarchy');
+    assert.match(access, /useModalDialog\(\(\) =>/);
+    assert.match(access, /ref=\$\{rootHandoverDialogRef\}/);
+    assert.match(access, /role="alertdialog" aria-modal="true" tabIndex="-1"/);
+    assert.match(access, /step \$\{rootHandoverStage\} of 2/);
+    assert.match(access, /I understand — continue/);
+    assert.match(access, /APPV23_ROOT_HANDOVER_PHRASE/);
+    assert.match(access, /Commit irreversible handover/);
+    assert.match(access, /result\.recovery_bundle/);
+    assert.doesNotMatch(access, /downloadBundle\(.*root/i);
+    assert.match(apiSource, /expected_generation: Number\(expectedGeneration\)/);
+    assert.match(apiSource, /\/v1\/dashboard\/network\/access\/root\/handover/);
+    assert.doesNotMatch(apiSource, /access\/root\/bundle/);
+});
+
+test('app-v23 access UI uses named policy choices and visibly separates local groups from federated readers', () => {
+    const access = appSource.slice(
+        appSource.indexOf('function AppV23AccessControl()'),
+        appSource.indexOf('function NetworkPage('),
+    );
+    assert.doesNotMatch(access, /type="checkbox"/,
+        'raw capability bits must never return as an editable checkbox wall');
+    assert.match(access, /role="group" aria-labelledby="v23-role-label"/);
+    assert.match(access, /role="group" aria-labelledby="v23-profile-label"/);
+    assert.match(access, /class="btn btn-primary" disabled=\$\{saveDisabled\}/);
+    assert.match(access, /<em>\$\{member\?\.role \|\| 'member'\}\$\{member\?\.needs_reauthorization/,
+        'group membership must expose the role that determines effective local authority');
+    assert.match(access, /Remote agents never join local groups/);
+    assert.match(access, /separate read-only link — never local membership/);
+    assert.match(access, /Federation messaging is controlled separately/);
+    assert.match(access, /addAdvertisedAgent\(contact\.agent_id/);
+    assert.match(access, /fetchAppV23LinkedReaderIdentities\(\)/);
+    assert.match(access, /'existing_link'/,
+        'durable linked-reader identities must remain browsable when live advertisement is blank');
+    assert.match(access, /Known exact address/);
+    assert.match(access, /64-character-agent-id@chain/);
+    assert.match(access, /checkAppV23LinkedReaderEligibility\(chain, id\)/);
+    assert.match(access, /peer must verify it live before it appears here, and Attach\/Rebind repeats the check/);
+    assert.match(access, /source: 'exact_address'/);
+    assert.doesNotMatch(access, /add(?:AdvertisedAgent)?\(connection\.peer_agent_id/,
+        'the JOIN transport/operator key may be Root and must never become a linked-reader target');
+    assert.match(access, /Add local agent menu/,
+        'drag and drop must keep an accessible non-pointer alternative');
+    assert.match(access, /v23-access-legend/);
+    assert.match(access, /v23-agent-choice local/);
+    assert.match(access, /v23-agent-pill federated/);
+    assert.match(cssSource, /\.v23-agent-choice\.local \{ border-left:/,
+        'same-node identity needs a solid non-color cue');
+    assert.match(cssSource, /\.v23-agent-pill\.federated[\s\S]*border-style: dashed;/,
+        'federated identity needs a different non-color cue as well as a different accent');
+    assert.match(access, /selected\.needs_reauthorization/);
+    assert.match(access, /Root handover suspended this delegated Admin/);
+    assert.match(access, /Admin suspended/);
+    assert.match(access, /suspended after Root handover/);
+    assert.match(access, /Reauthorize Admin/);
+});
+
+test('MCP setup copy describes the app-v23 restricted identity instead of obsolete Root inheritance', () => {
+    assert.doesNotMatch(appSource, /bearer (?:runs as|is) (?:an? )?(?:the )?local node operator/i);
+    assert.doesNotMatch(appSource, /node-operator access|administrator credential for this SAGE node/i);
+    assert.match(appSource, /separate restricted Member identity/);
+    assert.match(appSource, /never inherits the approving Root or Admin key/);
+});
+
+test('historical Root authors are labelled without becoming selectable graph agents', () => {
+    const brain = appSource.slice(appSource.indexOf('function BrainView('), appSource.indexOf('function MemoryDetail('));
+    const memoryDetail = appSource.slice(appSource.indexOf('function MemoryDetail('), appSource.indexOf('function SearchPage('));
+    assert.match(brain, /nodes\.filter\(n => !n\.agent_is_root\)/);
+    assert.match(memoryDetail, /<strong>\$\{m\.agent_label\}<\/strong>/);
+    assert.match(memoryDetail, /Immutable submitting-agent credential ID/);
+    assert.match(memoryDetail, /m\.agent \|\| m\.submitting_agent \|\| 'unknown'/);
+});
+
 test('Access Controls exposes the exact signer identity behind every grant', () => {
     const networkPage = appSource.slice(appSource.indexOf('function NetworkPage('), appSource.indexOf('function AddAgentWizard('));
     assert.match(networkPage, /class="agent-id-short"[^>]*>ID \$\{String\(agent\.agent_id/);
@@ -291,9 +378,10 @@ test('chain activity exposes committed RBAC changes and remains usable while emp
     assert.match(activity, /aria-label="Resize Chain Activity"/);
 });
 
-test('chain health recognizes app-v22 as the current consensus protocol', () => {
-    assert.match(appSource, /const appVerTone = appVer === '22'/);
-    assert.match(appSource, /Green when current \(22\)\./);
+test('chain health recognizes app-v23 as the current consensus protocol', () => {
+    assert.match(appSource, /const appVerTone = appVer === '23'/);
+    assert.match(appSource, /Green when current \(23\)\./);
+    assert.doesNotMatch(appSource, /appVer === '22'/);
     assert.doesNotMatch(appSource, /appVer === '15'/);
 });
 
@@ -718,9 +806,17 @@ test('access-control bulk actions stay scoped and saves expose consensus progres
     assert.doesNotMatch(network, /disabled=\$\{editRole === 'admin'\}/,
         'an admin still needs explicit level-3 grants, so its access matrix must remain editable');
     const addAgent = appSource.slice(appSource.indexOf('function AddAgentWizard('), appSource.indexOf('// PAGE_LABELS'));
-    assert.match(addAgent, /allowModify=\$\{false\}/);
-    assert.match(addAgent, /Level-3 Modify grants can be assigned after this agent is registered/,
-        'agent creation must not promise an unenforced Modify grant');
+    const createPayload = addAgent.slice(
+        addAgent.indexOf('const res = await createAgent({'),
+        addAgent.indexOf('});', addAgent.indexOf('const res = await createAgent({')) + 3
+    );
+    assert.doesNotMatch(addAgent, /<\$\{DomainAccessMatrix\}/,
+        'agent creation must not present a second, non-atomic domain-policy editor');
+    assert.doesNotMatch(createPayload, /\b(role|clearance_level|domain_access|security_profile|capability_mask)\s*:/,
+        'registration must carry identity metadata only, never unenforced access intent');
+    assert.match(addAgent, /restricted pending Member/);
+    assert.match(addAgent, /open Access Controls to approve the agent's role, named security profile, clearance, and owned home domain in one consensus transaction/,
+        'agent creation must direct the operator to the atomic post-registration policy approval');
 });
 
 test('federation keeps temporary pause separate from permanent revocation and makes peer revocation recoverable', () => {

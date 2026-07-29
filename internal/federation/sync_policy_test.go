@@ -576,23 +576,22 @@ func TestFreshGenerationActivateCannotEraseConcurrentPauseIntent(t *testing.T) {
 		_, pauseErr := m.SetPeerRBACPaused(context.Background(), "chain-peer", true)
 		pauseDone <- pauseErr
 	}()
-	require.Eventually(t, func() bool {
-		lease.stateMu.Lock()
-		defer lease.stateMu.Unlock()
-		return lease.pauseRequested && lease.pauseMutations == 1 && lease.pauseRevision > generation.pauseRevision
-	}, 2*time.Second, time.Millisecond, "Pause intent was not published while the fresh generation held delivery")
+	select {
+	case pauseErr := <-pauseDone:
+		require.NoError(t, pauseErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Pause did not complete while the fresh generation block was active")
+	}
+	lease.stateMu.Lock()
+	assert.True(t, lease.pauseRequested)
+	assert.Greater(t, lease.pauseRevision, generation.pauseRevision)
+	lease.stateMu.Unlock()
 
 	generation.Activate()
 	operatorPaused, generationBlocked := lease.deliveryBlocked()
 	assert.True(t, operatorPaused, "fresh-generation activation must preserve a concurrent operator Pause")
 	assert.False(t, generationBlocked, "Activate must release only the generation block")
 
-	select {
-	case pauseErr := <-pauseDone:
-		require.NoError(t, pauseErr)
-	case <-time.After(2 * time.Second):
-		t.Fatal("Pause did not finish after generation activation released the delivery lease")
-	}
 	policy, err := m.GetPeerRBACPolicy(context.Background(), "chain-peer")
 	require.NoError(t, err)
 	require.NotNil(t, policy)

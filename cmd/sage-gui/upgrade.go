@@ -13,8 +13,9 @@
 // are unreachable on a deployed chain.
 //
 // The command reuses the watchdog's exact signing/broadcast path
-// (buildUpgradeProposeTx → EncodeTx → broadcastTxSync, signed with the
-// operator's ~/.sage/agent.key) and adds the guards an operator action needs:
+// (buildUpgradeProposeTx → EncodeTx → broadcastTxSync, signed with the legacy
+// operator key before app-v23 and the current CEREBRUM Root thereafter) and
+// adds the guards an operator action needs:
 // strictly-sequential targets (current+1 only) and a canonical plan name.
 package main
 
@@ -23,11 +24,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -93,10 +96,10 @@ propose flags:
                     only app-v10 and permanently strand the skipped forks.
   --name <s>        Optional. Defaults to the canonical "app-v<target>" (which is
                     required); a non-canonical name is rejected.
-  --agent-key <p>   Sign the proposal with this key instead of $SAGE_HOME/agent.key.
+  --agent-key <p>   Explicitly override the default proposal identity.
                     Accepts an agent.key seed or a CometBFT priv_validator_key.json.
-                    Use past app-v8 when the chain-admin identity isn't your default
-                    agent.key (issue #34).
+                    At app-v23+ the default is the current CEREBRUM Root credential
+                    resolved from local key material, including recovery bundles.
   --rpc <url>       CometBFT RPC endpoint (default: $SAGE_COMET_RPC, else derived
                     from $SAGE_CMT_RPC_ADDR, else http://127.0.0.1:26657).
   --yes             Skip the confirmation prompt.
@@ -106,9 +109,10 @@ propose flags:
                     never arrives by itself (issue #41); a v10.5.2+ node pumps a
                     pending plan forward on its own, --wait does it interactively.
 
-The proposal is signed with $SAGE_HOME/agent.key (or the --agent-key file) and routed
-through the 2/3 governance quorum; validators auto-vote ACCEPT if they support the
-target. Run this on the node host where the key lives.
+The proposal is signed with the configured operator key before app-v23, and with the
+current CEREBRUM Root credential at app-v23+ (or the explicit --agent-key file). It is
+routed through the 2/3 governance quorum; validators auto-vote ACCEPT if they support
+the target. Run this on the node host where the key lives.
 
 Past app-v8 the proposer must be a chain-admin agent: the signing key's agent ID must
 hold Role==admin in the on-chain registry. On a standard node that is usually your
@@ -152,7 +156,11 @@ func runUpgradeStatus(args []string) error {
 	// Threshold is current >= 8: a propose is admin-gated only when made while the
 	// chain is ALREADY at app-v8+ (postAppV8Rules); the target-8 propose itself
 	// runs from app-v7 on the legacy self-activating path and needs no admin.
-	if current >= 8 {
+	if current >= 23 {
+		fmt.Printf("    sage-gui upgrade propose --target %d\n", current+1)
+		fmt.Println("    (app-v23+ resolves the current CEREBRUM Root credential from this machine's local")
+		fmt.Println("     key material; use --agent-key only for an explicitly reviewed local Admin override.)")
+	} else if current >= 8 {
 		fmt.Printf("    sage-gui upgrade propose --target %d\n", current+1)
 		fmt.Println("    (post-app-v8 the proposer must be a chain-admin agent — the signing key's agent ID must")
 		fmt.Println("     hold Role==admin on chain. Usually that's your operator agent.key once it has been used for")
@@ -171,7 +179,7 @@ func runUpgradePropose(args []string) error {
 	rpc := fs.String("rpc", defaultCometRPC(), "CometBFT RPC endpoint")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 	wait := fs.Bool("wait", false, "after the propose lands, heartbeat a quiescent chain until the fork activates (at app-v12+ an idle chain mints no blocks, so the activation height never arrives by itself)")
-	agentKeyPath := fs.String("agent-key", "", "sign with this key instead of $SAGE_HOME/agent.key (an agent.key seed or a CometBFT priv_validator_key.json); required past app-v8 where the proposer must be a chain-admin")
+	agentKeyPath := fs.String("agent-key", "", "explicit signing-key override (an agent.key seed or a CometBFT priv_validator_key.json); app-v23+ otherwise resolves the current local CEREBRUM Root credential")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -182,23 +190,21 @@ func runUpgradePropose(args []string) error {
 	// Warnings to stderr; the command's own output goes to stdout via fmt.Print.
 	logger := zerolog.New(os.Stderr).Level(zerolog.WarnLevel).With().Timestamp().Logger()
 
-	// Signing identity. Past app-v8, processUpgradePropose admin-gates the proposer
-	// (app.go, code 47): the tx-signing key's agent ID must have Role=="admin" on
-	// chain. The default $SAGE_HOME/agent.key is usually that identity once it has
-	// been materialized on chain (the gate reads BadgerDB with no SQL fallback), but
-	// on some deployments a different key is the admin — so --agent-key lets the
-	// operator sign as whichever key IS the chain-admin without hand-building the
-	// tx, the manual workaround issue #34 was filed about.
-	key, keySource, err := resolveProposeSigningKey(*agentKeyPath, logger)
-	if err != nil {
-		return err
-	}
-
 	readCtx, cancelRead := context.WithTimeout(context.Background(), 15*time.Second)
 	current, err := readChainAppVersion(readCtx, *rpc)
 	cancelRead()
 	if err != nil {
 		return fmt.Errorf("read chain app_version (is the node running? try --rpc): %w", err)
+	}
+
+	// Signing identity. An explicit --agent-key remains an operator override for
+	// a reviewed local Admin. The default becomes consensus-aware at app-v23:
+	// query the current Root credential and resolve exactly that local key,
+	// including a tx-39 recovery bundle. It must never silently reuse the stale
+	// genesis agent.key after Root rotation.
+	key, keySource, err := resolveProposeSigningKey(*agentKeyPath, current, *rpc, logger)
+	if err != nil {
+		return err
 	}
 
 	canonical, err := validateUpgradeTarget(current, *target, sageabci.MaxSupportedAppVersion(), *name)
@@ -366,7 +372,10 @@ func printProposeAcceptedGuidance(target uint64) {
 		// Threshold is target >= 8, NOT target+1 >= 8: a just-proposed target 7
 		// leaves the chain at app-v7, where the target-8 follow-up still takes the
 		// legacy self-activating path and needs no admin.
-		if target >= 8 {
+		if target >= 23 {
+			fmt.Println("  (app-v23+ automatically resolves the current CEREBRUM Root credential on this machine;")
+			fmt.Println("   use --agent-key only for an explicitly reviewed local Admin override)")
+		} else if target >= 8 {
 			fmt.Println("  (the chain will then be at app-v8+, so that propose must be signed by a chain-admin agent —")
 			fmt.Println("   pass --agent-key for the admin identity if it isn't your default agent.key)")
 		}
@@ -412,13 +421,16 @@ func retryProposeAfterBroadcastError(rpc string, encoded []byte) (res *broadcast
 	return nil, false
 }
 
-// resolveProposeSigningKey selects the key the propose tx is signed with and
-// returns it alongside a human-readable source label (for the confirm prompt and
-// error messages). When --agent-key is given it wins; otherwise the default
-// $SAGE_HOME/agent.key is used (the watchdog/REST RBAC key). Past app-v8 the
-// proposer must be a chain-admin agent (issue #34), which the default key often
-// isn't — hence the override.
-func resolveProposeSigningKey(agentKeyPath string, logger zerolog.Logger) (ed25519.PrivateKey, string, error) {
+// resolveProposeSigningKey selects the proposal identity and returns a
+// human-readable source label. Explicit --agent-key always wins. At app-v23+
+// the default is the exact current consensus Root credential resolved from
+// local key material; below app-v23 it is the configured legacy operator key.
+func resolveProposeSigningKey(
+	agentKeyPath string,
+	currentAppVersion uint64,
+	cometRPC string,
+	logger zerolog.Logger,
+) (ed25519.PrivateKey, string, error) {
 	if agentKeyPath != "" {
 		key, err := loadProposeSigningKey(agentKeyPath)
 		if err != nil {
@@ -426,11 +438,95 @@ func resolveProposeSigningKey(agentKeyPath string, logger zerolog.Logger) (ed255
 		}
 		return key, agentKeyPath, nil
 	}
-	key := loadOperatorAgentKey(logger)
-	if key == nil {
-		return nil, "", fmt.Errorf("no operator agent key at %s/agent.key — run this on the node host where the key lives, or pass --agent-key <path>", SageHome())
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		return nil, "", fmt.Errorf("load local config for upgrade signing: %w", err)
 	}
-	return key, filepath.Join(SageHome(), "agent.key"), nil
+	if currentAppVersion >= 23 {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		credentialID, queryErr := readCurrentAppV23RootCredential(ctx, cometRPC)
+		cancel()
+		if queryErr != nil {
+			return nil, "", fmt.Errorf("resolve current CEREBRUM Root for app-v23 upgrade signing: %w", queryErr)
+		}
+		key, ok := localAgentKeyResolverWithOperator(cfg.AgentKey)(credentialID)
+		if !ok || len(key) != ed25519.PrivateKeySize {
+			return nil, "", fmt.Errorf(
+				"this machine does not hold the current CEREBRUM Root credential %s; restore its recovery bundle or pass an explicitly reviewed local Admin with --agent-key",
+				credentialID,
+			)
+		}
+		pub, ok := key.Public().(ed25519.PublicKey)
+		if !ok || hex.EncodeToString(pub) != credentialID {
+			return nil, "", fmt.Errorf("resolved local key does not match current CEREBRUM Root credential %s", credentialID)
+		}
+		return key, "current CEREBRUM Root credential " + credentialID, nil
+	}
+
+	key := loadOperatorAgentKeyAt(cfg.AgentKey, logger)
+	if key == nil {
+		return nil, "", fmt.Errorf("no operator agent key at %s — run this on the node host where the key lives, or pass --agent-key <path>", cfg.AgentKey)
+	}
+	return key, cfg.AgentKey, nil
+}
+
+// readCurrentAppV23RootCredential asks the running ABCI app for only the
+// public credential ID in its committed Root record. Query values are base64
+// encoded by CometBFT's JSON-RPC facade.
+func readCurrentAppV23RootCredential(ctx context.Context, cometRPC string) (string, error) {
+	queryURL := strings.TrimRight(cometRPC, "/") + "/abci_query?path=" +
+		url.QueryEscape(`"/appv23/root"`)
+	req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, queryURL, nil)
+	if requestErr != nil {
+		return "", requestErr
+	}
+	resp, responseErr := http.DefaultClient.Do(req)
+	if responseErr != nil {
+		return "", responseErr
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("abci_query: HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Result struct {
+			Response struct {
+				Code  uint32 `json:"code"`
+				Log   string `json:"log"`
+				Value string `json:"value"`
+			} `json:"response"`
+		} `json:"result"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+	if decodeErr := json.NewDecoder(resp.Body).Decode(&out); decodeErr != nil {
+		return "", fmt.Errorf("decode app-v23 Root query: %w", decodeErr)
+	}
+	if out.Error != nil {
+		return "", fmt.Errorf("ABCI query error %d: %s", out.Error.Code, out.Error.Message)
+	}
+	if out.Result.Response.Code != 0 {
+		return "", fmt.Errorf("ABCI query rejected: %s", strings.TrimSpace(out.Result.Response.Log))
+	}
+	raw, valueErr := base64.StdEncoding.DecodeString(out.Result.Response.Value)
+	if valueErr != nil {
+		return "", fmt.Errorf("decode app-v23 Root query value: %w", valueErr)
+	}
+	var value struct {
+		CredentialID string `json:"credential_id"`
+	}
+	if decodeErr := json.Unmarshal(raw, &value); decodeErr != nil {
+		return "", fmt.Errorf("decode app-v23 Root state: %w", decodeErr)
+	}
+	credentialID := strings.TrimSpace(value.CredentialID)
+	decodedID, credentialErr := hex.DecodeString(credentialID)
+	if credentialErr != nil || len(decodedID) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("ABCI query returned an invalid CEREBRUM Root credential")
+	}
+	return credentialID, nil
 }
 
 // loadProposeSigningKey reads an operator-supplied signing-key file and parses

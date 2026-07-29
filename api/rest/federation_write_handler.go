@@ -8,7 +8,7 @@ import (
 	"github.com/l33tdawg/sage/internal/federation"
 )
 
-// handleCrossFedWrite reserves the node-operator control route without
+// handleCrossFedWrite reserves the local federation-control route without
 // accepting or forwarding a reusable ordinary AccessGrant. Such a grant is
 // agent-wide, not scoped to one trusted federation ceremony, so v11.9 returns
 // an explicit 501 before parsing an inner credential or dialing a peer.

@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	authmw "github.com/l33tdawg/sage/api/rest/middleware"
+	"github.com/l33tdawg/sage/internal/authzdenial"
 )
 
 func mockSageAPI(t *testing.T) *httptest.Server {
@@ -151,7 +152,7 @@ func mockSageAPI(t *testing.T) *httptest.Server {
 		})
 	})
 
-	mux.HandleFunc("/v1/dashboard/tasks", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"tasks": []map[string]any{
@@ -162,6 +163,7 @@ func mockSageAPI(t *testing.T) *httptest.Server {
 					"task_status":      "planned",
 					"confidence_score": 0.9,
 					"created_at":       "2024-01-01T00:00:00Z",
+					"assignee":         r.Header.Get("X-Agent-ID"),
 				},
 			},
 			"total": 1,
@@ -205,6 +207,80 @@ func TestSageRemember(t *testing.T) {
 	assert.Equal(t, "proposed", m["status"])
 	assert.Equal(t, "security", m["domain"])
 	assert.Equal(t, "fact", m["type"])
+}
+
+func TestAppV23OmittedMemoryTurnAndReflectionDomainsUseOwnedHome(t *testing.T) {
+	var submittedDomains []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": r.Header.Get("X-Agent-ID"), "role": "member",
+			"profile": "companion", "home_domain": "voice-interface",
+			"enrollment_status": "active",
+		})
+	})
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": false, "ready": true})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1}})
+	})
+	mux.HandleFunc("/v1/memory/pre-validate", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"memories": []map[string]any{}})
+	})
+	mux.HandleFunc("/v1/memory/search", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Domain string `json:"domain_tag"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		require.Equal(t, "voice-interface", req.Domain)
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Domain string `json:"domain_tag"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		submittedDomains = append(submittedDomains, req.Domain)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": fmt.Sprintf("mem-%d", len(submittedDomains)),
+			"status":    "proposed", "committed": true,
+			"committed_height": len(submittedDomains),
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+
+	remembered, err := s.toolRemember(context.Background(), map[string]any{
+		"content": "The display adapter works only after reconnecting its cable",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "voice-interface", remembered.(map[string]any)["domain"])
+
+	turned, err := s.toolTurn(context.Background(), map[string]any{
+		"topic":       "display adapter diagnosis",
+		"observation": "The display adapter recovered after reconnecting the cable firmly",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "voice-interface", turned.(map[string]any)["domain"])
+	require.Equal(t, true, turned.(map[string]any)["stored"])
+
+	reflected, err := s.toolReflect(context.Background(), map[string]any{
+		"task_summary": "Diagnosed the display adapter cable",
+		"dos":          "Check the physical connection before replacing hardware",
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, reflected.(map[string]any)["memories_stored"])
+	require.Equal(t, []string{
+		"voice-interface", "voice-interface", "voice-interface", "voice-interface",
+	}, submittedDomains)
 }
 
 func TestSageRemember_MissingContent(t *testing.T) {
@@ -487,6 +563,15 @@ func TestSageRecall_MissingQuery(t *testing.T) {
 
 func TestSageRecall_FederatedOptionsReachNodeAndSurfaceProvenance(t *testing.T) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/federation/recall-plan", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"protocol_version": 23, "source_chain_id": "chain-local",
+			"destinations":       []string{"chain-dkan-tii"},
+			"agreement_bindings": map[string]string{"chain-dkan-tii": strings.Repeat("ab", 32)},
+			"query_challenges":   map[string]string{"chain-dkan-tii": strings.Repeat("cd", 32)},
+			"expires_at":         map[string]int64{"chain-dkan-tii": time.Now().Add(time.Minute).Unix()},
+		})
+	})
 	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": true, "provider": "ollama", "ready": true})
 	})
@@ -878,7 +963,7 @@ func TestSageFindAgentCachedContactsHonorLocalReauthorization(t *testing.T) {
 func TestKeylessBearerCannotUseOperatorSignedFederatedTools(t *testing.T) {
 	_, operatorKey, _ := ed25519.GenerateKey(nil)
 	s := NewServer("http://127.0.0.1:1", operatorKey)
-	middleware := authmw.MCPBearerAuthMiddleware(func(context.Context, string) (string, ed25519.PrivateKey, error) {
+	middleware := authmw.MCPBearerAuthMiddleware(func(context.Context, string, string) (string, ed25519.PrivateKey, error) {
 		return "restricted-agent", nil, nil // legacy keyless bearer
 	})
 	h := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1362,9 +1447,12 @@ func TestSageTaskCreatesPlannedAssignedThenStartsAsExactOwner(t *testing.T) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 		submittedStatus = req.TaskStatus
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"memory_id": "task-new", "status": "proposed"})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "task-new", "status": "proposed",
+			"committed": true, "committed_height": 17, "tx_hash": "task-tx",
+		})
 	})
-	mux.HandleFunc("/v1/dashboard/tasks/task-new/status", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/memory/task-new/task-status", func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodPut, r.Method)
 		var req struct {
 			TaskStatus string `json:"task_status"`
@@ -1372,6 +1460,17 @@ func TestSageTaskCreatesPlannedAssignedThenStartsAsExactOwner(t *testing.T) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 		startedStatus = req.TaskStatus
 		_ = json.NewEncoder(w).Encode(map[string]any{"memory_id": "task-new", "task_status": req.TaskStatus})
+	})
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "tii-sage", r.URL.Query().Get("domain"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tasks": []map[string]any{{
+				"memory_id": "task-new", "domain_tag": "tii-sage",
+				"task_status": startedStatus, "assignee": r.Header.Get("X-Agent-ID"),
+			}},
+			"total": 1,
+		})
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
@@ -1385,6 +1484,652 @@ func TestSageTaskCreatesPlannedAssignedThenStartsAsExactOwner(t *testing.T) {
 	require.Equal(t, "planned", submittedStatus)
 	require.Equal(t, "in_progress", startedStatus)
 	require.Equal(t, s.agentID, result.(map[string]any)["assignee"])
+	require.Equal(t, true, result.(map[string]any)["committed"])
+	require.EqualValues(t, 17, result.(map[string]any)["committed_height"])
+}
+
+func TestSageTaskReturnsCommittedUnconfirmedWithoutBlindRetry(t *testing.T) {
+	var submitCalls, backlogCalls, statusCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, _ *http.Request) {
+		submitCalls++
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "task-unconfirmed", "status": "committed_unconfirmed",
+			"committed": true, "committed_height": 29, "tx_hash": "task-tx-29",
+			"projection_confirmed": false, "retryable": false,
+			"message": "Reconcile this memory_id; do not resubmit the task.",
+		})
+	})
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, _ *http.Request) {
+		backlogCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []any{}, "total": 0})
+	})
+	mux.HandleFunc("/v1/memory/task-unconfirmed/task-status", func(
+		w http.ResponseWriter, _ *http.Request,
+	) {
+		statusCalls++
+		http.Error(w, "must not start an unconfirmed projection", http.StatusConflict)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	got, err := s.toolTask(context.Background(), map[string]any{
+		"content": "do not duplicate this", "domain": "tii-sage",
+		"status": "in_progress",
+	})
+	require.NoError(t, err)
+	result := got.(map[string]any)
+	require.Equal(t, "committed_unconfirmed", result["status"])
+	require.Equal(t, "reconcile", result["action"])
+	require.Equal(t, "task-unconfirmed", result["memory_id"])
+	require.Equal(t, false, result["projection_confirmed"])
+	require.Equal(t, false, result["retryable"])
+	require.NotEmpty(t, result["idempotency_key"])
+	require.Equal(t, "derived", result["idempotency_key_source"])
+	require.Equal(t, "permanent_semantic", result["idempotency_contract"])
+	require.Equal(t, 1, submitCalls)
+	require.Zero(t, backlogCalls)
+	require.Zero(t, statusCalls)
+	require.NotContains(t, result["message"], "Task tracked")
+}
+
+func TestSageTaskFreshInvocationReusesDeterministicKeyAfterLostResponse(t *testing.T) {
+	var submitCalls int
+	var keys []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		submitCalls++
+		var body struct {
+			IdempotencyKey string `json:"idempotency_key"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		keys = append(keys, body.IdempotencyKey)
+		if submitCalls == 1 {
+			hijacker, ok := w.(http.Hijacker)
+			require.True(t, ok)
+			conn, _, err := hijacker.Hijack()
+			require.NoError(t, err)
+			require.NoError(t, conn.Close())
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "task-stable", "status": "proposed",
+			"committed": true, "committed_height": 33, "tx_hash": "stable-tx",
+			"idempotency_key": body.IdempotencyKey, "idempotent_replay": true,
+		})
+	})
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tasks": []map[string]any{{
+				"memory_id": "task-stable", "domain_tag": "tii-sage",
+				"task_status": "planned", "assignee": r.Header.Get("X-Agent-ID"),
+			}},
+			"total": 1,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	params := map[string]any{"content": "recover this task", "domain": "tii-sage"}
+	first, err := s.toolTask(context.Background(), params)
+	require.Nil(t, first)
+	require.Error(t, err, "a severed first response is intentionally ambiguous")
+
+	second, err := s.toolTask(context.Background(), params)
+	require.NoError(t, err)
+	require.Equal(t, "task-stable", second.(map[string]any)["memory_id"])
+	require.Equal(t, true, second.(map[string]any)["idempotent_replay"])
+	require.Equal(t, 2, submitCalls)
+	require.Len(t, keys, 2)
+	require.NotEmpty(t, keys[0])
+	require.Equal(t, keys[0], keys[1], "a fresh tool invocation must address the same consensus receipt")
+}
+
+func TestSageTaskIdempotentReplayReturnsTerminalTaskWithoutBacklogLookup(t *testing.T) {
+	var backlogCalls, statusCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "task-terminal", "status": "proposed", "task_status": "done",
+			"committed": true, "committed_height": 44, "tx_hash": "terminal-tx",
+			"projection_confirmed": true, "idempotent_replay": true,
+			"idempotency_key": "terminal-key",
+		})
+	})
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, _ *http.Request) {
+		backlogCalls++
+		http.Error(w, "terminal task must not require open backlog lookup", http.StatusConflict)
+	})
+	mux.HandleFunc("/v1/memory/task-terminal/task-status", func(
+		w http.ResponseWriter, _ *http.Request,
+	) {
+		statusCalls++
+		http.Error(w, "terminal task must not be moved backwards", http.StatusConflict)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	got, err := s.toolTask(context.Background(), map[string]any{
+		"content": "already completed", "domain": "tii-sage",
+		"status": "in_progress", "idempotency_key": "terminal-key",
+	})
+	require.NoError(t, err)
+	result := got.(map[string]any)
+	require.Equal(t, "task-terminal", result["memory_id"])
+	require.Equal(t, "done", result["task_status"])
+	require.Equal(t, "existing", result["action"])
+	require.Equal(t, true, result["idempotent_replay"])
+	require.Equal(t, true, result["deduplicated"])
+	require.Equal(t, "explicit", result["idempotency_key_source"])
+	require.Equal(t, "permanent_explicit_key", result["idempotency_contract"])
+	require.Contains(t, result["message"], "no new task was created")
+	require.Zero(t, backlogCalls)
+	require.Zero(t, statusCalls)
+}
+
+func TestSageTaskPlannedIdempotentReplayReportsExistingAndPreservesStartTransition(t *testing.T) {
+	tests := []struct {
+		name            string
+		requestedStatus string
+		wantStatus      string
+		wantStatusCalls int
+	}{
+		{name: "planned replay remains planned", wantStatus: "planned"},
+		{
+			name:            "planned replay may be started",
+			requestedStatus: "in_progress", wantStatus: "in_progress",
+			wantStatusCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				backlogCalls int
+				statusCalls  int
+				backlogState = "planned"
+			)
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1}})
+			})
+			mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					IdempotencyKey string `json:"idempotency_key"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				require.NotEmpty(t, body.IdempotencyKey)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"memory_id": "task-planned-replay", "status": "proposed",
+					"task_status": "planned", "committed": true,
+					"committed_height": 45, "tx_hash": "planned-replay-tx",
+					"projection_confirmed": true, "idempotent_replay": true,
+					"idempotency_key": body.IdempotencyKey,
+				})
+			})
+			mux.HandleFunc("/v1/memory/task-planned-replay/task-status", func(
+				w http.ResponseWriter, r *http.Request,
+			) {
+				statusCalls++
+				var body struct {
+					TaskStatus string `json:"task_status"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				require.Equal(t, "in_progress", body.TaskStatus)
+				backlogState = body.TaskStatus
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"memory_id": "task-planned-replay", "task_status": backlogState,
+				})
+			})
+			mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, r *http.Request) {
+				backlogCalls++
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"tasks": []map[string]any{{
+						"memory_id": "task-planned-replay", "domain_tag": "tii-sage",
+						"task_status": backlogState, "assignee": r.Header.Get("X-Agent-ID"),
+					}},
+					"total": 1,
+				})
+			})
+			ts := httptest.NewServer(mux)
+			defer ts.Close()
+
+			_, priv, _ := ed25519.GenerateKey(nil)
+			s := NewServer(ts.URL, priv)
+			params := map[string]any{
+				"content": "existing planned work", "domain": "tii-sage",
+			}
+			if tc.requestedStatus != "" {
+				params["status"] = tc.requestedStatus
+			}
+			got, err := s.toolTask(context.Background(), params)
+			require.NoError(t, err)
+			result := got.(map[string]any)
+			require.Equal(t, "task-planned-replay", result["memory_id"])
+			require.Equal(t, tc.wantStatus, result["task_status"])
+			require.Equal(t, "existing", result["action"])
+			require.Equal(t, true, result["idempotent_replay"])
+			require.Equal(t, true, result["deduplicated"])
+			require.Equal(t, "derived", result["idempotency_key_source"])
+			require.Equal(t, "permanent_semantic", result["idempotency_contract"])
+			require.Contains(t, result["message"], "no new task was created")
+			require.Equal(t, 1, backlogCalls)
+			require.Equal(t, tc.wantStatusCalls, statusCalls)
+		})
+	}
+}
+
+func TestSageTaskDerivedKeyPermanentlyDeduplicatesTerminalAndExplicitNewKeyCreatesAnother(t *testing.T) {
+	const explicitOccurrenceKey = "check-hdmi-2026-08-01"
+	var (
+		submitCalls   int
+		backlogCalls  int
+		derivedKey    string
+		submittedKeys []string
+		backlogID     string
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		submitCalls++
+		var body struct {
+			Content        string `json:"content"`
+			DomainTag      string `json:"domain_tag"`
+			IdempotencyKey string `json:"idempotency_key"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, "[TASK] Check the HDMI port", body.Content)
+		require.Equal(t, "technical/hardware", body.DomainTag)
+		submittedKeys = append(submittedKeys, body.IdempotencyKey)
+
+		response := map[string]any{
+			"status": "proposed", "committed": true,
+			"projection_confirmed": true, "idempotency_key": body.IdempotencyKey,
+		}
+		switch body.IdempotencyKey {
+		case explicitOccurrenceKey:
+			backlogID = "task-second-occurrence"
+			response["memory_id"] = backlogID
+			response["task_status"] = "planned"
+			response["committed_height"] = 52
+			response["tx_hash"] = "tx-second-occurrence"
+			w.WriteHeader(http.StatusCreated)
+		default:
+			if derivedKey == "" {
+				derivedKey = body.IdempotencyKey
+				require.NotEmpty(t, derivedKey)
+				backlogID = "task-original"
+				response["memory_id"] = backlogID
+				response["task_status"] = "planned"
+				response["committed_height"] = 50
+				response["tx_hash"] = "tx-original"
+				w.WriteHeader(http.StatusCreated)
+			} else {
+				require.Equal(t, derivedKey, body.IdempotencyKey,
+					"identical semantic input must retain its permanent derived key")
+				response["memory_id"] = "task-original"
+				response["task_status"] = "done"
+				response["committed_height"] = 50
+				response["tx_hash"] = "tx-original"
+				response["idempotent_replay"] = true
+			}
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(response))
+	})
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, r *http.Request) {
+		backlogCalls++
+		require.Equal(t, "technical/hardware", r.URL.Query().Get("domain"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tasks": []map[string]any{{
+				"memory_id": backlogID, "domain_tag": "technical/hardware",
+				"task_status": "planned", "assignee": r.Header.Get("X-Agent-ID"),
+			}},
+			"total": 1,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	semanticTask := map[string]any{
+		"content": "Check the HDMI port", "domain": "technical/hardware",
+	}
+
+	firstRaw, err := s.toolTask(context.Background(), semanticTask)
+	require.NoError(t, err)
+	first := firstRaw.(map[string]any)
+	require.Equal(t, "task-original", first["memory_id"])
+	require.Equal(t, "created", first["action"])
+	require.Equal(t, "derived", first["idempotency_key_source"])
+	require.Equal(t, "permanent_semantic", first["idempotency_contract"])
+	require.Equal(t, derivedKey, first["idempotency_key"])
+	require.Contains(t, first["message"], "later identical calls return this task")
+
+	replayRaw, err := s.toolTask(context.Background(), semanticTask)
+	require.NoError(t, err)
+	replay := replayRaw.(map[string]any)
+	require.Equal(t, first["memory_id"], replay["memory_id"])
+	require.Equal(t, "done", replay["task_status"])
+	require.Equal(t, "existing", replay["action"])
+	require.Equal(t, true, replay["idempotent_replay"])
+	require.Equal(t, true, replay["deduplicated"])
+	require.Equal(t, "derived", replay["idempotency_key_source"])
+	require.Equal(t, "permanent_semantic", replay["idempotency_contract"])
+	require.Equal(t, first["idempotency_key"], replay["idempotency_key"])
+	require.Contains(t, replay["message"], "no new task was created")
+	require.Contains(t, replay["message"], "new explicit idempotency_key")
+
+	occurrenceParams := map[string]any{
+		"content": "Check the HDMI port", "domain": "technical/hardware",
+		"idempotency_key": explicitOccurrenceKey,
+	}
+	occurrenceRaw, err := s.toolTask(context.Background(), occurrenceParams)
+	require.NoError(t, err)
+	occurrence := occurrenceRaw.(map[string]any)
+	require.Equal(t, "task-second-occurrence", occurrence["memory_id"])
+	require.NotEqual(t, first["memory_id"], occurrence["memory_id"])
+	require.Equal(t, "created", occurrence["action"])
+	require.Equal(t, explicitOccurrenceKey, occurrence["idempotency_key"])
+	require.Equal(t, "explicit", occurrence["idempotency_key_source"])
+	require.Equal(t, "permanent_explicit_key", occurrence["idempotency_contract"])
+	require.NotContains(t, occurrence, "deduplicated")
+
+	require.Equal(t, 3, submitCalls)
+	require.Equal(t, 2, backlogCalls,
+		"terminal replay must not depend on the open-task backlog")
+	require.Equal(t, derivedKey, submittedKeys[0])
+	require.Equal(t, submittedKeys[0], submittedKeys[1])
+	require.Equal(t, explicitOccurrenceKey, submittedKeys[2])
+}
+
+func TestCompanionTaskDefaultsToHomeCommitsAndImmediatelyAppearsInScopedBacklog(t *testing.T) {
+	var (
+		committed       []map[string]any
+		submitCalls     int
+		selfPolicyCalls int
+		dashboardCalls  int
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		selfPolicyCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": r.Header.Get("X-Agent-ID"), "role": "member",
+			"profile": "companion", "home_domain": "voice-interface",
+			"enrollment_status": "active",
+		})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		submitCalls++
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		domain, _ := req["domain_tag"].(string)
+		if domain != "voice-interface" {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type": authzdenial.ProblemTypeURI, "title": "Domain write denied",
+				"status": http.StatusForbidden, "detail": "The requested write is not permitted.",
+				"reason_code": authzdenial.CodeForeignWriteRestricted, "retryable": false,
+			})
+			return
+		}
+		task := map[string]any{
+			"memory_id": "task-home", "content": req["content"],
+			"domain_tag": domain, "task_status": req["task_status"],
+			"assignee": r.Header.Get("X-Agent-ID"),
+		}
+		committed = append(committed, task)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "task-home", "status": "proposed", "tx_hash": "tx-home",
+			"committed": true, "committed_height": 23,
+		})
+	})
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		domain := r.URL.Query().Get("domain")
+		visible := make([]map[string]any, 0, len(committed))
+		for _, task := range committed {
+			if (domain == "" || task["domain_tag"] == domain) &&
+				task["assignee"] == r.Header.Get("X-Agent-ID") {
+				visible = append(visible, task)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"tasks": visible, "total": len(visible)})
+	})
+	mux.HandleFunc("/v1/dashboard/tasks", func(w http.ResponseWriter, _ *http.Request) {
+		dashboardCalls++
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title":  "Local operator required",
+			"detail": "The CEREBRUM task board is a local-human surface.",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+
+	created, err := s.toolTask(context.Background(), map[string]any{
+		"content": "Check the HDMI port and cables",
+	})
+	require.NoError(t, err)
+	createdTask := created.(map[string]any)
+	require.Equal(t, "voice-interface", createdTask["domain"])
+	require.Equal(t, "task-home", createdTask["memory_id"])
+	require.Equal(t, true, createdTask["committed"])
+	require.EqualValues(t, 23, createdTask["committed_height"])
+	require.Equal(t, s.agentID, createdTask["assignee"])
+
+	backlogResult, err := s.toolBacklog(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	backlog := backlogResult.(map[string]any)
+	require.Equal(t, 1, backlog["total_open"])
+	byDomain := backlog["tasks_by_domain"].(map[string][]map[string]any)
+	require.Len(t, byDomain["voice-interface"], 1)
+	require.Equal(t, "task-home", byDomain["voice-interface"][0]["memory_id"])
+	require.Zero(t, dashboardCalls, "agent tools must not call the human CEREBRUM task route")
+
+	var humanBoard map[string]any
+	err = s.doSignedJSON(context.Background(), http.MethodGet, "/v1/dashboard/tasks", nil, &humanBoard)
+	require.Error(t, err)
+	require.True(t, isAPIStatus(err, http.StatusForbidden))
+	require.Equal(t, 1, dashboardCalls)
+
+	denied, err := s.toolTask(context.Background(), map[string]any{
+		"content": "Do not silently remap this", "domain": "technical/hardware",
+	})
+	require.Nil(t, denied)
+	require.Error(t, err)
+	require.ErrorContains(t, err, string(authzdenial.CodeForeignWriteRestricted))
+	require.ErrorContains(t, err, "retryable=false")
+	require.Equal(t, 2, submitCalls, "typed permanent denial must not retry")
+	require.Equal(t, 1, selfPolicyCalls, "an explicit domain must not query or remap through home policy")
+	require.Len(t, committed, 1, "foreign-domain denial must not create a task")
+}
+
+func TestSageTaskPreAppV23RetriesOnlyImplicitIdempotencyWithoutKey(t *testing.T) {
+	submitCalls := 0
+	committed := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"embedding": []float32{0.1, 0.2, 0.3},
+		})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		submitCalls++
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		if _, hasKey := req["idempotency_key"]; hasKey {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":   "https://sage.dev/errors/app-v23-required",
+				"title":  "App-v23 required",
+				"status": http.StatusConflict,
+				"detail": "Durable task idempotency requires app-v23.",
+			})
+			return
+		}
+		committed = true
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "legacy-task",
+			"status":    "proposed", "task_status": "planned",
+			"tx_hash": "legacy-tx", "committed": true,
+			"committed_height": 22,
+		})
+	})
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, r *http.Request) {
+		tasks := []map[string]any{}
+		if committed {
+			tasks = append(tasks, map[string]any{
+				"memory_id": "legacy-task", "content": "[TASK] Legacy compatible",
+				"domain_tag": "legacy.tasks", "task_status": "planned",
+				"assignee": r.Header.Get("X-Agent-ID"),
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tasks": tasks,
+			"total": len(tasks),
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+
+	created, err := s.toolTask(context.Background(), map[string]any{
+		"content": "Legacy compatible",
+		"domain":  "legacy.tasks",
+	})
+	require.NoError(t, err)
+	result := created.(map[string]any)
+	require.Equal(t, "legacy-task", result["memory_id"])
+	require.Equal(t, true, result["committed"])
+	require.Equal(t, "legacy_non_idempotent", result["idempotency_contract"])
+	require.NotContains(t, result, "idempotency_key")
+	require.NotContains(t, result, "idempotency_key_source")
+	require.Equal(t, 2, submitCalls,
+		"the typed app-v23 preflight is non-committing and may be retried once without the implicit key")
+
+	denied, err := s.toolTask(context.Background(), map[string]any{
+		"content":         "Explicit identity must not be discarded",
+		"domain":          "legacy.tasks",
+		"idempotency_key": "explicit-v23-only-key",
+	})
+	require.Nil(t, denied)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "App-v23 required")
+	require.Equal(t, 3, submitCalls,
+		"an explicit idempotency key must fail once and never be silently stripped")
+}
+
+func TestSageTaskPreAppV23FallbackRequiresCanonicalProblem(t *testing.T) {
+	tests := []struct {
+		name        string
+		httpStatus  int
+		bodyStatus  any
+		contentType string
+	}{
+		{
+			name:        "wrong HTTP status",
+			httpStatus:  http.StatusInternalServerError,
+			bodyStatus:  http.StatusConflict,
+			contentType: "application/problem+json",
+		},
+		{
+			name:        "wrong problem status",
+			httpStatus:  http.StatusConflict,
+			bodyStatus:  http.StatusInternalServerError,
+			contentType: "application/problem+json",
+		},
+		{
+			name:        "wrong content type",
+			httpStatus:  http.StatusConflict,
+			bodyStatus:  http.StatusConflict,
+			contentType: "application/json",
+		},
+		{
+			name:        "missing problem status",
+			httpStatus:  http.StatusConflict,
+			bodyStatus:  nil,
+			contentType: "application/problem+json",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			submitCalls := 0
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"embedding": []float32{0.1, 0.2, 0.3},
+				})
+			})
+			mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+				submitCalls++
+				var req map[string]any
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+				require.Contains(t, req, "idempotency_key",
+					"a non-canonical problem must never trigger an unkeyed retry")
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(tc.httpStatus)
+				problem := map[string]any{
+					"type":   "https://sage.dev/errors/app-v23-required",
+					"title":  "App-v23 required",
+					"detail": "non-canonical response",
+				}
+				if tc.bodyStatus != nil {
+					problem["status"] = tc.bodyStatus
+				}
+				_ = json.NewEncoder(w).Encode(problem)
+			})
+			ts := httptest.NewServer(mux)
+			defer ts.Close()
+
+			_, priv, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
+			s := NewServer(ts.URL, priv)
+
+			result, err := s.toolTask(context.Background(), map[string]any{
+				"content": "Do not retry without the semantic key",
+				"domain":  "legacy.tasks",
+			})
+			require.Nil(t, result)
+			require.Error(t, err)
+			require.Equal(t, 1, submitCalls)
+		})
+	}
 }
 
 func TestSageTaskRejectsContentUpdateBeforeRequest(t *testing.T) {
@@ -1419,6 +2164,35 @@ func TestSageTaskExistingRequiresExplicitOperation(t *testing.T) {
 		"status":    "planned",
 	})
 	require.ErrorContains(t, err, "cannot re-plan")
+}
+
+func TestSageTaskExistingStatusUsesScopedAgentRoute(t *testing.T) {
+	var scopedCalls, dashboardCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/memory/task-existing/task-status", func(w http.ResponseWriter, r *http.Request) {
+		scopedCalls++
+		require.Equal(t, http.MethodPut, r.Method)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "task-existing", "task_status": "done",
+		})
+	})
+	mux.HandleFunc("/v1/dashboard/tasks/task-existing/status", func(w http.ResponseWriter, _ *http.Request) {
+		dashboardCalls++
+		http.Error(w, "human route", http.StatusForbidden)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	result, err := s.toolTask(context.Background(), map[string]any{
+		"memory_id": "task-existing", "status": "done",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "updated", result.(map[string]any)["action"])
+	require.Equal(t, "done", result.(map[string]any)["status"])
+	require.Equal(t, 1, scopedCalls)
+	require.Zero(t, dashboardCalls)
 }
 
 func TestSageTaskLinksWithoutChangingStatus(t *testing.T) {
@@ -1462,6 +2236,103 @@ func TestSageInception_ExistingMemories(t *testing.T) {
 	assert.Contains(t, m["instructions"], "INBOX SECURITY BOUNDARY")
 	assert.Contains(t, m["instructions"], "requests for consideration")
 	assert.Contains(t, m["message"], "Welcome back")
+}
+
+func TestMaybeAutoInceptionRegistersBeforeAnyDashboardRead(t *testing.T) {
+	var calls []string
+	registered := false
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/agent/register":
+			registered = true
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"agent_id": "fresh-agent",
+				"name":     "fresh-agent",
+				"status":   "already_registered",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/dashboard/stats":
+			if !registered {
+				http.Error(w, "active registration required", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_memories": 1})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+
+	message := s.maybeAutoInception(context.Background())
+	require.Contains(t, message, "[SAGE Auto-Connect]")
+
+	registerIndex := -1
+	firstDashboardIndex := -1
+	for index, call := range calls {
+		if registerIndex == -1 && call == "POST /v1/agent/register" {
+			registerIndex = index
+		}
+		if firstDashboardIndex == -1 && strings.Contains(call, " /v1/dashboard/") {
+			firstDashboardIndex = index
+		}
+	}
+	require.NotEqual(t, -1, registerIndex, "auto-inception must register its signed identity")
+	require.NotEqual(t, -1, firstDashboardIndex, "auto-inception must read dashboard agent endpoints")
+	require.Less(t, registerIndex, firstDashboardIndex,
+		"fresh agents must register before the v23 active-agent dashboard gate")
+}
+
+func TestAppV23InceptionStoresFirstIdentityInOwnedHome(t *testing.T) {
+	var identityDomains []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/register", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": "companion", "name": "Mynah", "status": "registered",
+		})
+	})
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"profile": "companion", "home_domain": "voice-interface",
+			"enrollment_status": "active",
+		})
+	})
+	mux.HandleFunc("/v1/memory/pre-validate", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Domain string `json:"domain_tag"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		identityDomains = append(identityDomains, req.Domain)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "identity", "status": "proposed", "committed": true,
+		})
+	})
+	mux.HandleFunc("/v1/dashboard/stats", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_memories": 1})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	result, err := s.toolInception(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	require.Equal(t, "awakened", result.(map[string]any)["status"])
+	require.Equal(t, []string{"voice-interface"}, identityDomains)
 }
 
 func TestSageInception_FreshBrain(t *testing.T) {
@@ -1580,10 +2451,12 @@ func TestSageReflect_UnwritableDomainFailsLoudly(t *testing.T) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]any{
-			"type":   "https://sage.dev/errors/domain-write-denied",
-			"title":  "Access denied",
-			"status": http.StatusForbidden,
-			"detail": "agent does not have write access to domain 'sage-roadmap'",
+			"type":        "https://sage.dev/errors/domain-write-denied",
+			"title":       "Access denied",
+			"status":      http.StatusForbidden,
+			"detail":      "agent does not have write access to domain 'sage-roadmap'",
+			"reason_code": authzdenial.CodeMissingWriteGrant,
+			"retryable":   false,
 		})
 	})
 
@@ -2644,7 +3517,7 @@ func TestSageBacklogExposesCurrentAssignmentOwnership(t *testing.T) {
 	var agentID string
 	seenAgent := make(chan string, 1)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/dashboard/tasks", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/memory/tasks", func(w http.ResponseWriter, r *http.Request) {
 		requestAgent := r.Header.Get("X-Agent-ID")
 		seenAgent <- requestAgent
 		_ = json.NewEncoder(w).Encode(map[string]any{

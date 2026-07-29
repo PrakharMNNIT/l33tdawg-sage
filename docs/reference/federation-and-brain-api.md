@@ -1,17 +1,120 @@
-<!-- Verified against SAGE v11.14.2 code (2026-07-28). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
+<!-- Verified against SAGE v11.15.0 code (2026-07-29). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
 
 # SAGE Federation and Brain HTTP API Reference (v11)
 
 v11 adds two independent HTTP surfaces. v11.6 can carry the same mTLS HTTP protocol over direct HTTPS or libp2p, including NAT traversal and Circuit Relay v2 fallback. The dashboard JOIN wizard now exposes one topology-free flow: it prepares every usable Direct and Secure relay candidate and sends `transport:"auto"`. Preparation is not a reachability claim; the selected route is reported only after an authenticated exchange actually uses it. Current peers exchange and persist roaming routes over their authenticated agreement after signing, while older peers remain compatible through Direct. The relay is outside the trust boundary and sees only encrypted traffic.
 
-1. **Cross-network federation** - a directional read/copy exchange between two independent SAGE chains, plus a guided TOTP JOIN ceremony that establishes node trust. Mutable per-domain peer RBAC is separate from that ceremony. Write is reserved in the versioned wire shape but unavailable in v11.9/v11.10. The existing agent pipeline can also carry explicitly accepted agent-to-agent work over that trust edge; it remains off-consensus and is not remote memory Write. This spans three listeners: a dedicated peer-facing mTLS listener (`/fed/v1/*`), the node operator's REST control surface (`/v1/federation/*`), and a cookie-authed dashboard proxy (`/v1/dashboard/federation/*`).
+1. **Cross-network federation** - a directional read/copy exchange between two independent SAGE chains, plus a guided TOTP JOIN ceremony that establishes node trust. Mutable per-domain peer RBAC is separate from that ceremony. Write is reserved in the versioned wire shape but unavailable in v11.9/v11.10. The existing agent pipeline can also carry explicitly accepted agent-to-agent work over that trust edge; it remains off-consensus and is not remote memory Write. This spans three listeners: a dedicated peer-facing mTLS listener (`/fed/v1/*`), the signed local-control REST surface (`/v1/federation/*`), and a cookie-authed dashboard proxy (`/v1/dashboard/federation/*`).
 2. **The brain as a tool** - the memory "train of thought" endpoint (`GET /v1/dashboard/memory/{id}/related`) that powers the MRI click-to-explore board.
 
 ### The trust / consensus boundary (read this first)
 
-Federation transport, routing, policy, and foreign recall results are **OFF-consensus**. Borrowed query results are merged into REST responses only and never persisted. Treaty lifecycle reaches chain state through the two operators' own `TxTypeCrossFedSet` (tx-33) and `TxTypeCrossFedRevoke` (tx-34) broadcasts. A peer receipt (Mode-2) reaches chain state as signed bytes inside `TxTypeCoCommitAttest`. Domain-sync copies enter independently as ordinary locally signed `TxTypeMemorySubmit` (tx-1) transactions and pass the receiver's consensus/RBAC gates. Remote Write does **not** enter this path in v11.9: the reserved route returns an authenticated `501` and never dispatches a body to `/v1/memory/submit` (`internal/federation/remote_write.go:41-52`). Trust and authorization checks fail **closed** on an unreachable peer, revoked/expired/unknown agreement, missing remote CA, SPKI pin mismatch, peer-operator mismatch, or absent domain permission; Write remains unavailable regardless of credentials.
+Federation transport, routing, policy, and foreign recall results are **OFF-consensus**. Borrowed query results are merged into REST responses only and never persisted. Treaty lifecycle reaches chain state through each node's own `TxTypeCrossFedSet` (tx-33) and `TxTypeCrossFedRevoke` (tx-34) broadcasts. Before app-v23 those Manager-originated transactions retain the historical operator signer; after app-v23 they resolve and sign with the exact currently committed CEREBRUM Root credential. A peer receipt (Mode-2) reaches chain state as signed bytes inside `TxTypeCoCommitAttest` and remains bound to the peer-pinned transport/coauthor identity. Domain-sync copies enter independently as ordinary locally authorized `TxTypeMemorySubmit` (tx-1) transactions and pass the receiver's consensus/RBAC gates; after app-v23 this new local write is likewise signed by current Root while its remote origin remains immutable SyncItem provenance. Remote Write does **not** enter this path in v11.9: the reserved route returns an authenticated `501` and never dispatches a body to `/v1/memory/submit` (`internal/federation/remote_write.go:41-52`). Trust and authorization checks fail **closed** on an unreachable peer, revoked/expired/unknown agreement, missing current Root key, missing remote CA, SPKI pin mismatch, peer-operator mismatch, or absent domain permission; Write remains unavailable regardless of credentials.
 
 **The JOIN ceremony's peer-auth anchor is HUMAN** - an in-person / on-camera QR scan (or a spoken-code fallback). The TOTP factor proves co-possession of a shared seed and bilateral consent; it does **not** prove the secret reached the right peer. Do not read the ceremony as machine-authenticated key exchange. CEREBRUM opens the common guest path directly on the reciprocal scan and progressively discloses remote/address fallbacks. It presents the remaining six-digit value as one short fingerprint check against a swapped or relayed QR, not as another login factor or protocol counter (`web/static/js/app.js`, `GuestJoinWizard`, `FedCodeCompare`).
+
+### Stable node transport identity versus CEREBRUM Root
+
+`config.yaml`'s `agent_key_file` (normally `~/.sage/agent.key`) is the stable
+node federation transport credential (and historical pre-v23 operator
+credential). JOIN freezes that exact public key at each peer alongside the
+chain, CA pin, and policy epoch. App-v23
+CEREBRUM Root is a separate authority lifecycle: the same credential may be
+the initial Root on a fresh/legacy node, but Root handover does not rotate the
+transport key, rewrite agreements, or change peer pins. The retired Root
+credential has no Root authority after handover; it remains usable only in the
+domain-separated federation transport role peers already pinned.
+
+That separation applies in both directions. Outbound `/fed/v1/*` request
+signatures, JOIN attestations, agreement peer pins, co-commit receipts, sync
+origin signatures, and mTLS identity continue to use the stable transport key.
+Manager-originated local consensus mutations do not: after app-v23, tx-33,
+tx-34, and a receiver's new local Copy `MemorySubmit` resolve the exact current
+Root from the local CEREBRUM key vault for each build. If Root state or that
+exact key is unavailable, the mutation fails before broadcast; there is no
+fallback to the retired transport credential. A promoted local Admin may drive
+the local REST control surface and receives the normal one-action Root
+elevation where that REST transaction preserves the Admin as actor.
+
+A genuinely fresh node may generate `agent_key_file` once. If genesis,
+CometBFT identity/state, SQLite/Badger state, or federation trust material
+already exists, a missing or malformed file is a recovery failure. Startup
+does not create a replacement or start the federation Manager, because a new
+key would be rejected by every existing peer. Restore the original key from
+backup. If it is unrecoverable, create a new node identity and explicitly
+re-pair every peer. Encryption does not change this rule: the memory vault may
+be locked or unlocked, while the peer-pinned transport credential remains the
+same local key (`cmd/sage-gui/federation_transport_identity.go`;
+`cmd/sage-gui/node.go`; `internal/federation/manager.go`).
+
+### App-v23 federated linked readers
+
+Once app-v23 is active, runtime agent recall requires Federation Protocol v23;
+there is no downgrade to the earlier operator-only query envelope. A federated
+agent is never inserted into a local Access Group's member set. Instead, a
+local Admin may attach the exact `agent@chain` as a node-local linked reader to
+one local group. The relation is signed by that active Admin and binds the
+remote chain, agent, peer operator/CA, agreement and policy generation, group,
+and host-selected maximum classification
+(`internal/store/federated_group_guests.go`;
+`internal/federation/v23_guest.go`).
+
+Each recall starts with an authenticated destination plan that supplies an
+exact agreement-binding digest and one durable, short-lived, single-use query
+challenge. The original remote agent then signs the canonical local recall
+request, including source and destination chain, exact destination list,
+agreement binding, challenge, mode, domain, query/vector/provider, filters, and
+limits. The destination independently verifies that nested proof after the
+ordinary outer peer-operator, mTLS CA-pin, active agreement, and policy checks.
+Disclosure is the intersection of the linked-reader ceiling, current local
+group domain scope, active peer Read policy, agreement clearance, and the
+record's classification. Missing storage, stale generation, paused/revoked
+policy, expired/replayed challenge, unknown vector provider, Admin demotion, or
+any envelope mismatch fails closed (`internal/federation/query_v23.go`;
+`internal/federation/v23_guest.go`;
+`internal/store/federated_query_challenges.go`).
+
+Linked readers receive live Read only. They never receive local membership,
+Copy, Write, Modify, claim, ownership, grants, roles, governance, or transitive
+remote-agent access. `/fed/v1/write` remains `501`.
+
+Messaging across the same relation is a separate `linked-v23` pipeline mode
+and starts blocked. The receiver's local CEREBRUM operator accepts one exact
+`(remote_chain_id, remote_source_agent_id, local_target_agent_id)` tuple using
+a monotonic compare-and-swap revision. If `X@Laptop-B` is linked to Laptop A's
+group containing B and C, Laptop A may allow X-to-B without allowing X-to-C.
+B-to-X requires a separate receiver-local consent on Laptop B. Neither
+direction creates a pipeline contact, domain grant, local membership, role, or
+write authority. Laptop B obtains eligible B/C-to-X choices only through a
+bounded authenticated host query: Laptop A returns signed exact relation
+offers containing IDs and group IDs, never domains, names, or a roster; Laptop
+B verifies each offer before projecting its own consent revision.
+The CEREBRUM control never auto-queries every connection: selecting local X is
+purely local, then the operator chooses one host node and explicitly checks
+that host's bounded signed offers. Empty and failed checks have the same
+no-offer presentation and cannot be used as peer-presence telemetry.
+Its message candidates are separate from generic advertised/read-link
+identities. Local-hosted candidates require an active, current-bound exact link
+whose Access Group contains the chosen local receiver; remote-hosted offers
+retain and are filtered by that exact receiver ID. A receiver change therefore
+cannot reuse an offer minted for another local agent.
+
+The signed pipeline event binds the exact linked-reader row, host group and
+revision, direction, source, target, active agreement digest, and receiver
+consent revision. Send, admission, claim, completion, and result all revalidate
+those bindings. A missing/disabled/stale consent, Root identity, directory-only
+match, group change, read-link pause/revoke, policy pause, agreement expiry, or
+re-pair fails closed. A known exact address remains useful for routing but
+directory visibility and `peer_agent_id` are never authorization
+(`internal/federation/v23_linked_messaging.go`;
+`internal/store/federated_linked_message_consent.go`).
+
+Messages remain untrusted request transport and delegate no memory authority;
+any mutation is a new local action by the receiving agent under that agent's
+own policy. Revoke, expiry, re-pair, or generation drift moves the read
+relation out of active use and requires an explicit rebind rather than
+silently resurrecting old access (`internal/federation/v23_guest_control.go`;
+`internal/federation/remote_write.go`).
 
 ### Trust and directional peer RBAC
 
@@ -146,7 +249,7 @@ Authenticated reachability / identity and permission preflight (`handleStatus`,
 | `time` | int64 | serving node's unix time |
 | `capabilities` | []string | optional features. A SQLite-backed v11.13.5 node advertises `sync`, `federated-pipeline-v1`, and `federated-pipeline-contact-lookup-v1`; it never advertises reserved `write-v1`. |
 | `peer_rbac_grant` | object, optional | the serving node's current `{policy_version, paused, domains:[{domain,read,write,copy}]}` snapshot, disclosed only to the exact bound peer; present with zero rows means deny-all. While paused, current peers see `paused:true` and an empty domain list; the empty list also keeps older peers fail-closed. The versioned `write` member is always false in v11.9 (`internal/federation/peer_rbac.go:313-330`). |
-| `pipe_contacts` | object, optional | Compatible v1 peer-scoped projection of domain owners and **active local agents with current level-1 Read access** for shared Read/Copy domains. After app-v22, `ReadAllDomains` also qualifies an active reviewed target, while `DenyFederatedPipe` excludes a target even when it owns the domain. Without the advisory `X-Sage-Capabilities: federated-pipeline-contact-lookup-v1` request header it is a deterministic valid subset: eligible effective owners plus a stable first 128 active-agent candidates, bounded again to 1,024 contacts and 1 MiB. This keeps old consumers safe without a roster-wide RBAC scan. A lookup-capable requester receives the policy/capability preflight without this roster (and locally caps that compact response at 1 MiB), then uses the bounded live lookup route below. A v11.13.0 peer ignores that advisory header; if its historic full status exceeds the compact cap, the requester retries its normal legacy status once through a single-worker compatibility lane and filters it immediately. |
+| `pipe_contacts` | object, optional | Compatible v1 peer-scoped projection of domain owners and **active local agents with current level-1 Read access** for shared Read/Copy domains. App-v23 named profiles retain the app-v22 `ReadAllDomains` / `DenyFederatedPipe` bits as derived compatibility restrictions: ReadAll qualifies an active reviewed target, while the deny excludes a target even when it owns the domain. Without the advisory `X-Sage-Capabilities: federated-pipeline-contact-lookup-v1` request header it is a deterministic valid subset: eligible effective owners plus a stable first 128 active-agent candidates, bounded again to 1,024 contacts and 1 MiB. This keeps old consumers safe without a roster-wide RBAC scan. A lookup-capable requester receives the policy/capability preflight without this roster (and locally caps that compact response at 1 MiB), then uses the bounded live lookup route below. A v11.13.0 peer ignores that advisory header; if its historic full status exceeds the compact cap, the requester retries its normal legacy status once through a single-worker compatibility lane and filters it immediately. |
 | `sharing_grant` | object, optional | legacy compatibility envelope (`allowed_domains`, `max_clearance`) |
 
 ### `POST /fed/v1/pipe/event`
@@ -165,22 +268,22 @@ reroute a friendly alias, relabel another source chain's proof, extend its TTL,
 or substitute the agent (`api/rest/pipe_handler.go:132-321`,
 `internal/federation/pipe_transport.go:72-169`, `:371-463`).
 
-After app-v22, an operator may grant a co-located companion
-`ReadAllDomains`. That capability satisfies the sender's local
+Under app-v23, the named Companion profile derives the app-v22
+`ReadAllDomains` compatibility restriction. It satisfies the sender's local
 caller/domain intersection for authenticated contact discovery without
 bypassing numeric memory clearance. Federated inbox messaging remains enabled
-for the standard companion mask (`15`); the independent
+for that profile; the independent
 `DenyFederatedPipe` bit (`16`) makes targeted recipient discovery, cached
 contact reauthorization, resolve, and send fail closed for that caller. The
 general federation view still returns authorized peer/domain topology but
 suppresses its remote-agent contact roster. Return results follow the same
 durable pipeline to the originating SAGE. The outbox re-checks the source
-agent's live consensus mask before every network delivery and holds that
+agent's live consensus profile/restrictions before every network delivery and holds that
 authorization lease through the side effect, so enabling the deny bit also
 parks queued payloads and cannot return while an older payload remains in
 flight. Results travel back to the originating SAGE
 and appear through `sage_turn`/`sage_inbox`
-(`internal/store/agent_capabilities.go`; `api/rest/pipe_handler.go`;
+(`internal/store/appv23_local_rbac.go`; `internal/store/agent_capabilities.go`; `api/rest/pipe_handler.go`;
 `api/rest/federation_handler.go`).
 
 ### `POST /fed/v1/pipe/contacts/lookup`
@@ -448,25 +551,28 @@ grace so an authenticated identical confirmation can recover a lost response.
 
 ## 2. Federation REST - `/v1/federation/*` (Ed25519-authed)
 
-These routes sit inside the standard signed `/v1/` group. Trust, policy, and
-outbound peer mutations require the **exact node operator** identity
-(`requireNodeOperator`). The ordinary-agent discovery routes are read-only and
+These routes sit inside the standard signed `/v1/` group. Before app-v23,
+trust, policy, and outbound peer controls require the historical **exact node
+operator** identity. After app-v23 the stable transport key no longer grants
+local control: the same gate requires current CEREBRUM Root or a
+current-generation local Admin, and the privileged REST boundary also requires
+localhost. The ordinary-agent discovery routes are read-only and
 caller-filtered.
 
 ### Cross_fed agreement builder (tx-33 / tx-34)
 
 | Method + path | Handler | Auth | Purpose |
 |---|---|---|---|
-| `POST /v1/federation/cross` | `handleCrossFedSet` (`federation_handler.go:69-193`) | Exact node operator + on-chain authz | Stage remote CA, derive SPKI pin, broadcast tx-33 CrossFedSet with that pin as `PeerPubKey`. |
-| `GET /v1/federation/cross` | `handleCrossFedList` (`federation_handler.go:266-297`) | Exact node operator | List on-chain agreements (reads chain state directly; works without the transport wired). |
-| `POST /v1/federation/cross/{chain_id}/revoke` | `handleCrossFedRevoke` (`federation_handler.go:229-318`) | Exact node operator + on-chain authz | Best-effort notify the exact active peer, then broadcast local tx-34 and purge the connection generation. |
-| `GET /v1/federation/cross/{chain_id}/status` | `handleCrossFedPeerStatus` (`federation_handler.go:299-333`) | Exact node operator | Live reachability preflight against the peer's `/fed/v1/status`. |
+| `POST /v1/federation/cross` | `handleCrossFedSet` (`federation_handler.go`) | Pre-v23 exact operator; app-v23 current local Root/Admin + on-chain authz | Stage remote CA, derive SPKI pin, broadcast tx-33 CrossFedSet with that pin as `PeerPubKey`. |
+| `GET /v1/federation/cross` | `handleCrossFedList` (`federation_handler.go`) | Pre-v23 exact operator; app-v23 current local Root/Admin | List on-chain agreements (reads chain state directly; works without the transport wired). |
+| `POST /v1/federation/cross/{chain_id}/revoke` | `handleCrossFedRevoke` (`federation_handler.go`) | Pre-v23 exact operator; app-v23 current local Root/Admin + on-chain authz | Best-effort notify the exact active peer, then broadcast local tx-34 and purge the connection generation. |
+| `GET /v1/federation/cross/{chain_id}/status` | `handleCrossFedPeerStatus` (`federation_handler.go`) | Pre-v23 exact operator; app-v23 current local Root/Admin | Live reachability preflight against the peer's `/fed/v1/status`. |
 | `GET /v1/federation/available` | `handleFederationAvailable` | Registered Ed25519 caller | Probe at most 64 active peers with at most eight concurrent workers and return only the remote read/copy subtrees, contacts, and saved-copy summary intersecting this caller's local ACL. Optional `agent_name` and `agent_limit` (default 20, 1–20) use compact status preflight plus a bounded remote substring contact lookup; that named form returns only the peer label and matching contacts, not general policy, capabilities, subtree, or sync metadata. App-v22 `DenyFederatedPipe` suppresses contacts from the general form and makes the named form return empty before probing peers. Never returns endpoints, CA pins, agreement generations, secrets, or mutation controls. |
 | `POST /v1/federation/contacts/authorize` | `handleFederatedContactAuthorize` | Registered Ed25519 caller | Local-only reauthorization of supplied chain/domain contact pairs. Returns only input pairs whose agreement remains active/unexpired and whose domain is still readable by this caller; it neither probes a peer nor discloses contacts. |
-| `POST /v1/federation/cross/{chain_id}/write` | `handleCrossFedWrite` (`api/rest/federation_write_handler.go:11-25`) | Ed25519 + exact node operator | Reserved compatibility surface. After operator and chain-id validation it returns `501` before parsing an inner credential or dialing a peer. |
-| `GET/PUT /v1/federation/cross/{chain_id}/sync` | `handleSyncDomainsGet/Set` (`api/rest/federation_handler.go:342-576`, `656-746`) | Ed25519 + exact node operator | Read or replace local v3 Publish/Subscribe lanes; true legacy links retain their `domains` contract. |
+| `POST /v1/federation/cross/{chain_id}/write` | `handleCrossFedWrite` (`api/rest/federation_write_handler.go`) | Ed25519 + pre-v23 exact operator or app-v23 current local Root/Admin | Reserved compatibility surface. After authority and chain-id validation it returns `501` before parsing an inner credential or dialing a peer. |
+| `GET/PUT /v1/federation/cross/{chain_id}/sync` | `handleSyncDomainsGet/Set` (`api/rest/federation_handler.go`) | Ed25519 + pre-v23 exact operator or app-v23 current local Root/Admin | Read or replace local v3 Publish/Subscribe lanes; true legacy links retain their `domains` contract. |
 
-**`CrossFedSetRequest`** (`federation_handler.go:47-59`): `remote_chain_id` (≤50 chars), `endpoint` (`https://host[:port]`, no path/query/fragment), `remote_ca_pem`, `max_clearance` (0-4), `allowed_domains` (required; `["*"]` = chain-admin treaty), `allowed_depts` (v11.0 accepts only `["*"]` or empty - dept scoping not yet enforced), `expires_at` (optional, must be future). The remote CA is **staged** and only committed after the tx is authorized on-chain, so an unauthorized set can never overwrite a live pinned CA (`federation_handler.go:133-186`).
+**`CrossFedSetRequest`** (`federation_handler.go`): `remote_chain_id` (≤50 chars), `endpoint` (`https://host[:port]`, no path/query/fragment), `remote_ca_pem`, `max_clearance` (0-4), `allowed_domains` (required; `["*"]` = chain-admin treaty), `allowed_depts` (v11.0 accepts only `["*"]` or empty - dept scoping not yet enforced), `expires_at` (optional, must be future). The remote CA is **staged** and only committed after the tx is authorized on-chain, so an unauthorized set can never overwrite a live pinned CA. App-v23 consensus requires current Root/Admin for both concrete and wildcard scopes; the historical pre-v23 concrete-domain owner exception remains only on the replay-compatible branch (`api/rest/federation_handler.go`; `internal/abci/app.go`).
 
 Agreement generation changes are process-wide serialized across Manager and
 REST control surfaces. The lease covers tx-33 through its matching CA/JOIN
@@ -489,8 +595,9 @@ adds the authenticated peer's `network_name`, `capabilities`,
 `peer_rbac_grant` (or legacy `sharing_grant`), and `pipe_contacts` when
 advertised. These additions give operator MCP clients read-only discovery of
 the same directional remote disclosure CEREBRUM consumes; the route remains
-exact-node-operator-only and never returns or mutates this node's outbound
-policy (`api/rest/federation_handler.go:405-456`). The error response remains
+pre-v23 exact-operator/app-v23 current-local-Root-or-Admin only and never
+returns or mutates this node's outbound policy
+(`api/rest/federation_handler.go`). The error response remains
 `{remote_chain_id, reachable:false, error}` with `502`; `reachable` stays a bool
 across both branches by design.
 
@@ -531,9 +638,10 @@ remote node to mutate its chain (`api/rest/federation_handler.go:252-279`;
 `internal/federation/revoke_notice.go:113-150`).
 
 `POST …/write` reserves the path and `RemoteWriteRequest` wire type for
-compatibility and requires the exact configured node operator. In v11.9 the
-control handler returns `501` before parsing any inner credential or calling a
-transport implementation (`api/rest/federation_write_handler.go:11-25`). The
+compatibility. Its local controller is the exact configured node operator
+before app-v23 and current local Root/Admin after app-v23. In v11.9 the control
+handler returns `501` before parsing any inner credential or calling a
+transport implementation (`api/rest/federation_write_handler.go`). The
 Manager's separately reserved `WritePeer` method likewise returns the typed
 capability-unavailable error before agreement lookup or network dial
 (`internal/federation/remote_write.go:41-45`). Once operator authentication and
@@ -542,10 +650,13 @@ same fail-closed `501`; its contents are never interpreted.
 
 ### JOIN ceremony - operator localhost control surface
 
-Node-operator-only (`federationJoinReady`,
-`api/rest/federation_join_handler.go`); off-consensus. Each endpoint drives the
-federation Manager, which performs the peer-facing `/fed/v1/join/*` calls and
-fires the operator's own compatibility tx-33 after human confirmation. This
+Historical node-operator-only before app-v23; current local Root/Admin after
+app-v23 (`federationJoinReady`, `api/rest/federation_join_handler.go`);
+off-consensus except for activation. Each endpoint drives the federation
+Manager, which performs the peer-facing `/fed/v1/join/*` calls and fires this
+node's compatibility tx-33 after human confirmation. Post-v23 that tx actor is
+current Root, resolved again at build time; the JOIN identity and pins remain
+the stable transport credential. This
 low-level API retains the historical scope-shaped fields, but the Manager
 accepts only the trust-only empty-domain values documented above. Mutable
 authorization belongs to the post-JOIN permission endpoints.
@@ -575,7 +686,9 @@ submission so same-tick clicks share one request.
 The browser holds a dashboard session, not the operator's signing key, so it
 cannot call the Ed25519-signed REST endpoints. The complete federation surface
 is therefore mounted behind the stricter local-operator gate: an authenticated
-CEREBRUM operator session or an exact node-operator-signed request. Ordinary
+CEREBRUM operator session or, before app-v23, an exact node-operator-signed
+request; after app-v23 an agent-signed privileged request must be current local
+Root/Admin. Ordinary
 dashboard-authenticated agents cannot inspect ceremonies or change peer policy
 (`web/federation_join.go:71-102`, `1021-1037`). Everything remains
 off-consensus except the ordinary transactions explicitly described here.
@@ -721,9 +834,10 @@ Powers the MRI click-to-explore "train of thought" board. Cookie-authed dashboar
 Copy is opt-in store-and-forward replication of committed memories in concrete
 domain subtrees over the authenticated federation transport. It is not implied
 by trust or Read. Everything about routing and copy policy is off-consensus (no
-fork); accepted copies enter the receiving chain as ordinary locally signed
-`TxTypeMemorySubmit` transactions and pass the receiver's normal consensus
-gates.
+fork); accepted copies enter the receiving chain as ordinary locally
+authorized `TxTypeMemorySubmit` transactions and pass the receiver's normal
+consensus gates. The historical operator signs before app-v23; current
+CEREBRUM Root signs after app-v23.
 
 ### Source permission and receiver choice
 
@@ -795,8 +909,10 @@ JOIN revocation closes every lane. Legacy pairwise and legacy group-relay paths
 retain their historical tx-33 treaty gates. All paths then enforce
 `classification <= max_clearance`, idempotency through the `sync_origin`
 ledger, cross-domain duplicate protection, vault-locked retry behavior, and
-ordinary locally signed submission
-(`internal/federation/sync_server.go:169-226`, `516-533`).
+ordinary locally authorized submission. After app-v23 the receiver resolves
+current Root for this new local `MemorySubmit`; it never grants the remote
+origin or retired transport key a local write identity
+(`internal/federation/sync_server.go`).
 
 Group member/domain removals also commit an audit-only subchain-head anchor as
 an ordinary fact in the reserved `sage-syncaudit-<group_id>` namespace. This is

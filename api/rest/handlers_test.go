@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -63,6 +64,10 @@ type mockMemoryStore struct {
 	challengeCountErr error
 	// incompleteEvidence marks recovery-built lower-bound projections.
 	incompleteEvidence map[string]bool
+	// getOpenTasksHook lets projection-confirmation tests materialize or fail a
+	// task on a specific readback attempt without changing production timing.
+	getOpenTasksHook func()
+	getOpenTasksErr  error
 }
 
 func newMockMemoryStore() *mockMemoryStore {
@@ -124,7 +129,11 @@ func (m *mockMemoryStore) QuerySimilar(_ context.Context, embedding []float32, o
 	for _, rec := range m.memories {
 		results = append(results, rec)
 	}
-	results = m.applyStoreFilters(results, opts)
+	var err error
+	results, err = m.applyStoreFilters(results, opts)
+	if err != nil {
+		return nil, err
+	}
 	if opts.TopK > 0 && len(results) > opts.TopK {
 		results = results[:opts.TopK]
 	}
@@ -140,7 +149,11 @@ func (m *mockMemoryStore) SearchByText(_ context.Context, query string, opts sto
 			results = append(results, rec)
 		}
 	}
-	results = m.applyStoreFilters(results, opts)
+	var err error
+	results, err = m.applyStoreFilters(results, opts)
+	if err != nil {
+		return nil, err
+	}
 	if opts.TopK > 0 && len(results) > opts.TopK {
 		results = results[:opts.TopK]
 	}
@@ -154,10 +167,10 @@ func (m *mockMemoryStore) SearchByText(_ context.Context, query string, opts sto
 // handlers move min_confidence onto DecayFloor and zero MinConfidence; keeping both
 // here means a regression that forgets to zero MinConfidence (re-starving
 // corroboration-boosted memories) is caught end-to-end.
-func (m *mockMemoryStore) applyStoreFilters(recs []*memory.MemoryRecord, opts store.QueryOptions) []*memory.MemoryRecord {
-	if opts.MinConfidence <= 0 && opts.DecayFloor <= 0 {
-		return recs
-	}
+func (m *mockMemoryStore) applyStoreFilters(
+	recs []*memory.MemoryRecord,
+	opts store.QueryOptions,
+) ([]*memory.MemoryRecord, error) {
 	now := opts.DecayNow
 	if now.IsZero() {
 		now = time.Now()
@@ -171,9 +184,18 @@ func (m *mockMemoryStore) applyStoreFilters(recs []*memory.MemoryRecord, opts st
 			memory.ComputeConfidenceForRecord(r, now, len(m.corroborations[r.MemoryID])) < opts.DecayFloor {
 			continue
 		}
+		if opts.CandidateFilter != nil {
+			allowed, err := opts.CandidateFilter(r)
+			if err != nil {
+				return nil, err
+			}
+			if !allowed {
+				continue
+			}
+		}
 		out = append(out, r)
 	}
-	return out
+	return out, nil
 }
 
 func (m *mockMemoryStore) SearchHybrid(ctx context.Context, query string, embedding []float32, opts store.QueryOptions) ([]*memory.MemoryRecord, error) {
@@ -244,6 +266,19 @@ func (m *mockMemoryStore) GetCorroborations(_ context.Context, memoryID string) 
 
 func (m *mockMemoryStore) GetPendingByDomain(_ context.Context, domainTag string, limit int) ([]*memory.MemoryRecord, error) {
 	return m.pendingRecords, nil
+}
+
+func (m *mockMemoryStore) GetPendingByDomainPage(
+	_ context.Context, _ string, limit, offset int,
+) ([]*memory.MemoryRecord, error) {
+	if offset >= len(m.pendingRecords) {
+		return []*memory.MemoryRecord{}, nil
+	}
+	end := offset + limit
+	if end > len(m.pendingRecords) {
+		end = len(m.pendingRecords)
+	}
+	return m.pendingRecords[offset:end], nil
 }
 
 func (m *mockMemoryStore) OldestProposedCreatedAt(_ context.Context) (time.Time, bool, error) {
@@ -329,6 +364,12 @@ func (m *mockMemoryStore) GetLinksAmong(_ context.Context, _ []string) ([]memory
 }
 
 func (m *mockMemoryStore) GetOpenTasks(_ context.Context, _ string, _ string, _ string) ([]*memory.MemoryRecord, error) {
+	if m.getOpenTasksHook != nil {
+		m.getOpenTasksHook()
+	}
+	if m.getOpenTasksErr != nil {
+		return nil, m.getOpenTasksErr
+	}
 	var tasks []*memory.MemoryRecord
 	for _, rec := range m.memories {
 		if rec.MemoryType == memory.TypeTask && rec.IsOpenTask() {
@@ -336,6 +377,38 @@ func (m *mockMemoryStore) GetOpenTasks(_ context.Context, _ string, _ string, _ 
 		}
 	}
 	return tasks, nil
+}
+
+func (m *mockMemoryStore) GetOpenTasksPage(
+	_ context.Context, domain string, _ string, assignee string, limit, offset int,
+) ([]*memory.MemoryRecord, error) {
+	var tasks []*memory.MemoryRecord
+	for _, rec := range m.memories {
+		if rec.MemoryType != memory.TypeTask || !rec.IsOpenTask() {
+			continue
+		}
+		if domain != "" && rec.DomainTag != domain {
+			continue
+		}
+		if assignee != "" && rec.Assignee != assignee {
+			continue
+		}
+		tasks = append(tasks, rec)
+	}
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].CreatedAt.Equal(tasks[j].CreatedAt) {
+			return tasks[i].MemoryID < tasks[j].MemoryID
+		}
+		return tasks[i].CreatedAt.After(tasks[j].CreatedAt)
+	})
+	if offset >= len(tasks) {
+		return []*memory.MemoryRecord{}, nil
+	}
+	end := offset + limit
+	if end > len(tasks) {
+		end = len(tasks)
+	}
+	return tasks[offset:end], nil
 }
 
 func (m *mockMemoryStore) SetTaskAssignee(_ context.Context, _, _ string) error { return nil }
@@ -545,6 +618,40 @@ func TestSubmitMemory(t *testing.T) {
 	// Note: memory is no longer stored directly by the REST handler.
 	// It is written by ABCI Commit after consensus finalizes the block.
 	// This test verifies the REST layer correctly broadcasts and returns.
+}
+
+func TestSubmitTaskIdempotencyKeyRequiresAppV23(t *testing.T) {
+	broadcasts := 0
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		broadcasts++
+		http.Error(w, "pre-v23 idempotency preflight must not broadcast", http.StatusInternalServerError)
+	}))
+	defer cometMock.Close()
+	srv, _, _ := newTestServer(t, cometMock.URL)
+	body := []byte(`{
+		"content": "must not become ambiguously idempotent",
+		"memory_type": "task",
+		"domain_tag": "tii-sage",
+		"confidence_score": 0.9,
+		"task_status": "planned",
+		"idempotency_key": "pre-v23-task"
+	}`)
+	req, _ := signedRequest(t, http.MethodPost, "/v1/memory/submit", body)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusConflict, rr.Code, rr.Body.String())
+	require.Equal(t, "application/problem+json", rr.Header().Get("Content-Type"))
+	var problem struct {
+		Type   string `json:"type"`
+		Status int    `json:"status"`
+		Title  string `json:"title"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &problem))
+	require.Equal(t, "https://sage.dev/errors/app-v23-required", problem.Type)
+	require.Equal(t, http.StatusConflict, problem.Status)
+	require.Equal(t, "App-v23 required", problem.Title)
+	require.Zero(t, broadcasts, "the typed app-v23 preflight must fail before CometBFT broadcast")
 }
 
 func TestSubmitMemory_RegeneratesVectorFromActiveProvider(t *testing.T) {
@@ -1189,7 +1296,8 @@ func TestVoteMemory(t *testing.T) {
 	}
 
 	body := []byte(`{"decision":"accept","rationale":"Looks correct"}`)
-	req, _ := signedRequest(t, http.MethodPost, "/v1/memory/vote-target/vote", body)
+	req, operatorID := signedRequest(t, http.MethodPost, "/v1/memory/vote-target/vote", body)
+	configureTestGovernanceGateway(t, srv, operatorID)
 	rr := httptest.NewRecorder()
 	srv.Router().ServeHTTP(rr, req)
 
@@ -1210,7 +1318,8 @@ func TestVoteMemory_InvalidDecision(t *testing.T) {
 	}
 
 	body := []byte(`{"decision":"maybe"}`)
-	req, _ := signedRequest(t, http.MethodPost, "/v1/memory/vote-target/vote", body)
+	req, operatorID := signedRequest(t, http.MethodPost, "/v1/memory/vote-target/vote", body)
+	configureTestGovernanceGateway(t, srv, operatorID)
 	rr := httptest.NewRecorder()
 	srv.Router().ServeHTTP(rr, req)
 

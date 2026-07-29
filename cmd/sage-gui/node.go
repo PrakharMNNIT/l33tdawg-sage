@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -25,10 +26,14 @@ import (
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/config"
+	cmtcryptoed "github.com/cometbft/cometbft/crypto/ed25519"
+	cmtjson "github.com/cometbft/cometbft/libs/json"
 	cmtlog "github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/libs/protoio"
 	"github.com/cometbft/cometbft/node"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/privval"
+	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	cmttypes "github.com/cometbft/cometbft/types"
 	cmttime "github.com/cometbft/cometbft/types/time"
 	"github.com/go-chi/chi/v5"
@@ -77,6 +82,21 @@ func resolveRetainBlocks(configured int64, quorumEnabled bool) int64 {
 	default:
 		return configured
 	}
+}
+
+func scopedProjectionReadinessStatus(records int, vaultLocked bool) metrics.ScopedProjectionStatus {
+	status := metrics.ScopedProjectionStatus{
+		Required: records > 0 || vaultLocked,
+		Records:  records,
+	}
+	if vaultLocked {
+		status.Detail = "vault locked; scoped serving projection rebuild deferred"
+		return status
+	}
+	if records == 0 {
+		status.OK = true
+	}
+	return status
 }
 
 var errCoordinatedRestart = errors.New("coordinated restart requested")
@@ -134,6 +154,21 @@ func runServe(startupProof string) (rerr error) {
 		Str("embedding", cfg.Embedding.Provider).
 		Msg("starting SAGE Personal node")
 
+	// Resolve paths and prove the vendored origin before starting even the local
+	// native-shell endpoint. A failed direct-v23 preflight must be observational:
+	// no socket, PID, directory, key, recovery, migration, or config mutation.
+	cometHome := filepath.Join(cfg.DataDir, "cometbft")
+	badgerPath := filepath.Join(cfg.DataDir, "badger")
+	sqlitePath := filepath.Join(cfg.DataDir, "sage.db")
+	vendoredChainIDRecovered := false
+	if cfg.VendoredAgentBootstrap != nil {
+		configuredChainIDWasEmpty := cfg.ChainID == ""
+		if preflightErr := preflightVendoredStartup(cometHome, cfg); preflightErr != nil {
+			return fmt.Errorf("preflight first-party app-v23 genesis: %w", preflightErr)
+		}
+		vendoredChainIDRecovered = configuredChainIDWasEmpty && cfg.ChainID != ""
+	}
+
 	// The native shell is additive: failure to create its per-user control
 	// endpoint must not take the daemon, browser CEREBRUM, CLI, or MCP down.
 	// The endpoint starts only after main owns the existing instance lock.
@@ -155,11 +190,6 @@ func runServe(startupProof string) (rerr error) {
 		}()
 		logger.Info().Str("endpoint", nativeControl.Endpoint()).Msg("native shell control endpoint ready for negotiation")
 	}
-
-	// Ensure directories exist
-	cometHome := filepath.Join(cfg.DataDir, "cometbft")
-	badgerPath := filepath.Join(cfg.DataDir, "badger")
-	sqlitePath := filepath.Join(cfg.DataDir, "sage.db")
 
 	// Do not create the canonical Badger directory until activation recovery has
 	// inspected the crash layout. A missing live directory can be intentional.
@@ -191,6 +221,23 @@ func runServe(startupProof string) (rerr error) {
 	stateSyncRecoveryComplete := true
 	if mkErr := os.MkdirAll(badgerPath, 0700); mkErr != nil {
 		return fmt.Errorf("create dir %s: %w", badgerPath, mkErr)
+	}
+	// cfg.AgentKey is the stable node federation transport credential.
+	// It may also be the genesis Root credential on an older/fresh node, but Root
+	// handover does not rotate this transport identity: peers pin its exact public
+	// key during JOIN. Generate it only before any node identity exists. Once
+	// genesis, agreement, or crash-surviving store state exists, missing/corrupt
+	// material is a recovery event and startup must never mint a replacement.
+	federationTransportKey, transportKeyErr := loadStableFederationTransportKey(
+		cfg.AgentKey, SageHome(), cfg.DataDir, cometHome,
+	)
+	if transportKeyErr != nil {
+		return fmt.Errorf("load stable node federation transport identity: %w", transportKeyErr)
+	}
+	if transportID := federationTransportKeyLabel(federationTransportKey); transportID != "" {
+		logger.Info().
+			Str("transport_operator_id", transportID[:16]+"...").
+			Msg("loaded stable node federation transport identity")
 	}
 	pidPath := filepath.Join(SageHome(), "sage.pid")
 	pidValue := strconv.Itoa(os.Getpid())
@@ -225,6 +272,9 @@ func runServe(startupProof string) (rerr error) {
 			return fmt.Errorf("reload config after network join: %w", reloadErr)
 		}
 		cfg = reloaded
+		if verifyErr := verifyStableFederationTransportKey(cfg.AgentKey, federationTransportKey); verifyErr != nil {
+			return fmt.Errorf("preserve local transport identity across network join: %w", verifyErr)
+		}
 	}
 
 	// Auto-migrate on version upgrade: backup SQLite, reset chain state
@@ -252,7 +302,7 @@ func runServe(startupProof string) (rerr error) {
 	// Initialize CometBFT config (seeds a brand-new chain's genesis with the operator
 	// admin) and, if a prior admin-less genesis survived a reset, re-inject the seed.
 	// One helper so the heal step can't be dropped from serve unnoticed (issue #52).
-	if initErr := ensureGenesisSeedWithKey(cometHome, cfg.AgentKey, logger); initErr != nil {
+	if initErr := ensureGenesisSeedWithConfig(cometHome, cfg, logger); initErr != nil {
 		return initErr
 	}
 
@@ -264,7 +314,9 @@ func runServe(startupProof string) (rerr error) {
 	// destructive re-genesis. New chains minted a unique id in ensureGenesisSeed
 	// above. One-shot: after the first reconcile cfg.ChainID matches and no
 	// further write occurs.
-	if genChainID, cidErr := readChainIDFromGenesis(cometHome); cidErr == nil && genChainID != "" && genChainID != cfg.ChainID {
+	if genChainID, cidErr := readChainIDFromGenesis(cometHome); cidErr == nil &&
+		genChainID != "" &&
+		(genChainID != cfg.ChainID || vendoredChainIDRecovered) {
 		cfg.ChainID = genChainID // in-memory, for this running process
 		// persistChainID writes ONLY the chain_id delta, preserving the raw
 		// (un-expanded) paths in config.yaml — SaveConfig(cfg) here would bake the
@@ -338,6 +390,13 @@ func runServe(startupProof string) (rerr error) {
 	health := metrics.NewHealthChecker()
 	health.Version = version
 	health.SetPostgresHealth(true) // SQLite is always "healthy"
+	if cfg.VendoredAgentBootstrap != nil {
+		health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
+			Required: true,
+			OK:       false,
+			State:    "checking",
+		})
+	}
 
 	// Optional cross-encoder reranker on the hybrid recall path. Off by
 	// default; operator turns it on with SAGE_RERANK_ENABLED=1 and
@@ -464,6 +523,17 @@ func runServe(startupProof string) (rerr error) {
 	if domainErr := app.SetExpectedGovernanceDelegationDomain(cfg.ChainID); domainErr != nil {
 		return fmt.Errorf("configure app-v20 governance domain from genesis chain_id: %w", domainErr)
 	}
+	vaultLockedAtStartup := sqliteStore.VaultLocked()
+	if vaultLockedAtStartup {
+		if isolationErr := validateLockedVaultConsensusStartup(
+			ctx,
+			cfg,
+			filepath.Join(cometHome, "config", "genesis.json"),
+			app,
+		); isolationErr != nil {
+			return isolationErr
+		}
+	}
 	retainBlocks := resolveRetainBlocks(cfg.RetainBlocks, cfg.Quorum.Enabled)
 	if retainBlocks > 0 {
 		app.SetRetainBlocks(retainBlocks)
@@ -498,6 +568,14 @@ func runServe(startupProof string) (rerr error) {
 		// Personal mode: single validator, fast blocks, no P2P
 		cometCfg.Consensus.TimeoutCommit = 1 * time.Second
 		cometCfg.P2P.ListenAddress = cmtP2PAddr("tcp://127.0.0.1:26656")
+		if vaultLockedAtStartup {
+			isolateLockedPersonalP2P(cometCfg.P2P)
+		}
+	}
+	if vaultLockedAtStartup {
+		if replayErr := validateLockedVaultCometReplaySafety(ctx, cometCfg, app); replayErr != nil {
+			return replayErr
+		}
 	}
 
 	pv := privval.LoadFilePV(
@@ -552,6 +630,9 @@ func runServe(startupProof string) (rerr error) {
 		return configureStateSyncApplicationBundle(application, version, retainBlocks, cfg.ChainID)
 	}); err != nil {
 		return fmt.Errorf("configure state-sync application bundles: %w", err)
+	}
+	if vaultLockedAtStartup {
+		bootRuntime.SetLocalTxAdmissionBlocked(true)
 	}
 	badgerOwnedByRuntime = true
 	defer func() {
@@ -649,6 +730,30 @@ func runServe(startupProof string) (rerr error) {
 	if badgerStore == nil {
 		return errors.New("normal-serving SAGE app has no Badger store")
 	}
+	// Fresh direct-v23 Init has now completed, and a state-sync receiver has been
+	// sealed. Verify immutable vendored provenance and current write readiness
+	// before sidecars, migrations, watchdogs, voters, or serving workers start.
+	if cfg.VendoredAgentBootstrap != nil {
+		if readinessErr := verifyAppV23VendoredAgentReadiness(
+			cfg.VendoredAgentBootstrap,
+			localAgentKeyResolverWithOperator(cfg.AgentKey),
+			badgerStore,
+		); readinessErr != nil {
+			health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
+				Required: true,
+				State:    "blocked",
+			})
+			return fmt.Errorf("first-party app-v23 companion is not ready: %w", readinessErr)
+		}
+		health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
+			Required: true,
+			OK:       true,
+			State:    "ready",
+		})
+		logger.Info().
+			Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
+			Msg("first-party app-v23 companion enrollment is ready")
+	}
 
 	// Everything below may capture concrete app/store references because the
 	// acquire above permanently freezes boot bundle replacement.
@@ -688,16 +793,14 @@ func runServe(startupProof string) (rerr error) {
 			health.SetScopedProjectionStatus(metrics.ScopedProjectionStatus{Required: true, Detail: listErr.Error()})
 			return 0, listErr
 		}
-		status := metrics.ScopedProjectionStatus{Required: len(contents) > 0, Records: len(contents)}
-		if len(contents) == 0 {
-			status.OK = true
-			health.SetScopedProjectionStatus(status)
-			return 0, nil
-		}
+		status := scopedProjectionReadinessStatus(len(contents), sqliteStore.VaultLocked())
 		if sqliteStore.VaultLocked() {
-			status.Detail = "vault locked; scoped serving projection rebuild deferred"
 			health.SetScopedProjectionStatus(status)
 			return 0, fmt.Errorf("%s", status.Detail)
+		}
+		if len(contents) == 0 {
+			health.SetScopedProjectionStatus(status)
+			return 0, nil
 		}
 		rebuilt, rebuildErr := app.RebuildScopedProjection(rebuildCtx)
 		status.Rebuilt = rebuilt
@@ -806,7 +909,7 @@ func runServe(startupProof string) (rerr error) {
 	// Backfill on_chain_height and first_seen for agents already registered on-chain
 	// but missing these fields in SQLite (upgrade path from v3.5 → v3.7.6+)
 	signingKeyForMigrate := loadNodeSigningKey(cometCfg.PrivValidatorKeyFile(), logger)
-	migrateAgentsOnChainAtStartup(
+	if migrationErr := migrateAgentsOnChainAtStartup(
 		ctx,
 		sqliteStore,
 		badgerStore,
@@ -814,7 +917,29 @@ func runServe(startupProof string) (rerr error) {
 		signingKeyForMigrate,
 		cfg.Quorum.Enabled,
 		logger,
-	)
+	); migrationErr != nil {
+		return fmt.Errorf(
+			"reconcile consensus agent serving projection: %w",
+			migrationErr,
+		)
+	}
+
+	// Resolve every local agent credential this machine actually holds. This is
+	// constructed before the upgrade watchdog because app-v23 Root rotation must
+	// take effect for unattended governance immediately, without a process
+	// restart or a fallback to the historical genesis agent.key.
+	baseAgentKeyResolver := localAgentKeyResolverWithOperator(cfg.AgentKey)
+	resolveLocalAgentKey := func(agentID string) (ed25519.PrivateKey, bool) {
+		if bootstrap := cfg.VendoredAgentBootstrap; bootstrap != nil {
+			if key, ok := parseKeyFile(bootstrap.AgentKeyFile); ok {
+				if public, publicOK := key.Public().(ed25519.PublicKey); publicOK &&
+					hex.EncodeToString(public) == agentID {
+					return key, true
+				}
+			}
+		}
+		return baseAgentKeyResolver(agentID)
+	}
 
 	// v7.5 upgrade watchdog: auto-propose an UpgradePlan when the
 	// running binary's embedded TargetAppVersion exceeds the chain's
@@ -823,15 +948,26 @@ func runServe(startupProof string) (rerr error) {
 	startUpgradeWatchdog(ctx, upgradeWatchdogConfig{
 		BinaryVersion: version,
 		ChainID:       cfg.ChainID,
-		AgentKey:      loadOperatorAgentKeyAt(cfg.AgentKey, logger),
 		CometRPC:      cometRPC,
 		Logger:        logger,
+		ResolveSigningKey: func() (ed25519.PrivateKey, error) {
+			return currentUpgradeSigningKey(
+				badgerStore,
+				app.IsAppV23ActiveForNextTx,
+				resolveLocalAgentKey,
+				cfg.AgentKey,
+				logger,
+			)
+		},
 		// v10.5.1 auto-advance: personal nodes walk the fork ladder to the
 		// binary ceiling automatically (issue #40 follow-up — updating the
 		// binary now brings the chain up to date too). Quorum clusters keep
-		// the legacy target-6 watchdog; disable_auto_upgrade opts out.
-		PersonalMode: !cfg.Quorum.Enabled,
-		AutoAdvance:  !cfg.DisableAutoUpgrade,
+		// the legacy target-6 watchdog. v11.15.0 makes app-v23 the minimum
+		// personal-node security floor; disable_auto_upgrade can stop later
+		// optional movement but cannot strand this release on app-v22.
+		PersonalMode:       !cfg.Quorum.Enabled,
+		AutoAdvance:        !cfg.DisableAutoUpgrade,
+		RequiredAppVersion: 23,
 		// v10.5.2 (issue #41): in-process pending-plan accessor for the
 		// always-on pump and the auto-advance pre-check. GetUpgradePlan's
 		// ErrNoUpgradePlan is flattened to nil by readPendingPlan.
@@ -865,7 +1001,46 @@ func runServe(startupProof string) (rerr error) {
 	restServer.SetPostV17ForNextTxAccessor(app.IsAppV17ActiveForNextTx)
 	restServer.SetPostV20ForNextTxAccessor(app.IsAppV20ActiveForNextTx)
 	restServer.SetPostV22ForNextTxAccessor(app.IsAppV22ActiveForNextTx)
+	restServer.SetPostV23ForNextTxAccessor(app.IsAppV23ActiveForNextTx)
 	restServer.SetGovernanceDomainAccessor(app.GovernanceDelegationDomain)
+	// App-v23 Root is a non-delegable local credential. Before v23, legacy
+	// keyless MCP bearers intentionally fell back to cfg.AgentKey; at activation
+	// that identity is the initial CEREBRUM Root credential. A later Root handover
+	// retires its Root authority but deliberately leaves its separate JOIN-frozen
+	// federation transport role unchanged. Gate issuance and lookup synchronously
+	// on the live app version, then durably revoke those rows at boot/activation.
+	sqliteStore.SetMCPTokenKeyedIdentityRequirement(app.IsAppV23ActiveForNextTx)
+	revokeLegacyMCPBearers := func() bool {
+		revoked, err := sqliteStore.RevokeAppV23LegacyMCPBearers(ctx)
+		if err != nil {
+			logger.Warn().Err(err).Msg("app-v23 legacy MCP bearer revocation incomplete")
+			return false
+		}
+		if revoked > 0 {
+			logger.Warn().Int64("revoked", revoked).Msg("app-v23 revoked legacy MCP bearers that could inherit Root")
+		}
+		return true
+	}
+	legacyMCPRevocationComplete := false
+	if app.IsAppV23ActiveForNextTx() {
+		legacyMCPRevocationComplete = revokeLegacyMCPBearers()
+	}
+	if !legacyMCPRevocationComplete {
+		startWorker(func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if app.IsAppV23ActiveForNextTx() && revokeLegacyMCPBearers() {
+						return
+					}
+				}
+			}
+		})
+	}
 
 	// v7.1: tell the REST layer which ed25519 public key identifies the local
 	// node operator. Requests signed with this key bypass the cross-agent
@@ -947,6 +1122,12 @@ func runServe(startupProof string) (rerr error) {
 	}
 	dashboard.Encrypted.Store(cfg.Encryption.Enabled)
 	dashboard.VaultLocked.Store(cfg.Encryption.Enabled && !vaultUnlocked)
+	dashboard.OnVaultUnlocked = func(_ string) {
+		// publishUnlockedVault attaches the vault to SQLite before invoking this
+		// callback, so no CheckTx can observe admission open with a locked
+		// projection.
+		bootRuntime.SetLocalTxAdmissionBlocked(false)
+	}
 	// The health watchdog signals every healthy probe, not only startup. This
 	// makes vector repair eventual after a late Ollama start or transient provider
 	// outage without a full-store UI poll or a manual "Finish setup" click.
@@ -1011,6 +1192,7 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.AppV19ActiveFn = app.IsAppV19ActiveForNextTx // app-v19: local-agents-default-READ flip (off-consensus)
 	dashboard.AppV20ActiveFn = app.IsAppV20ActiveForNextTx
 	dashboard.AppV22ActiveFn = app.IsAppV22ActiveForNextTx
+	dashboard.AppV23ActiveFn = app.IsAppV23ActiveForNextTx
 	dashboard.GovernanceDomainFn = app.GovernanceDelegationDomain
 	dashboard.StrictRBAC = cfg.RBAC.Strict // opt-out of the app-v19 default-read flip
 	// Embeddings setup: flip the config to the bundled Ollama + nomic-embed-text
@@ -1062,18 +1244,19 @@ func runServe(startupProof string) (rerr error) {
 	if validatorSigningKey != nil {
 		dashboard.SigningKey = validatorSigningKey
 	}
-	// The operator/admin key (~/.sage/agent.key) authorizes admin-gated actions.
-	// After app-v20 governance keeps this key as an embedded exact-action proof
-	// while the live validator key above remains the outer proposer/voter;
-	// pre-v20 GovPropose and non-governance DomainReassign retain their direct
-	// historical signing path. Owner-scoped AccessGrant/AccessRevoke resolve the
-	// domain-owner key. Memory submits still use the validator outer key so
-	// authorship (submitting_agent) stays immutable.
+	// The stable operator/transport key (~/.sage/agent.key) authorizes legacy
+	// pre-v23 admin-gated actions. After app-v20 governance keeps this key as an
+	// embedded exact-action proof while the live validator key above remains the
+	// outer proposer/voter; pre-v20 GovPropose and non-governance DomainReassign
+	// retain their direct historical signing path. App-v23 Root authority is
+	// resolved separately after any handover. Owner-scoped AccessGrant/
+	// AccessRevoke resolve the domain-owner key. Memory submits still use the
+	// validator outer key so authorship (submitting_agent) stays immutable.
 	if adminKey := adminSigningKeyAt(cfg.AgentKey); adminKey != nil {
 		dashboard.AdminSigningKey = adminKey
 	}
-	dashboard.ResolveAgentKeyFn = localAgentKeyResolverWithOperator(cfg.AgentKey)
-
+	dashboard.ResolveAgentKeyFn = resolveLocalAgentKey
+	restServer.SetAppV23RootKeyResolver(dashboard.ResolveAgentKeyFn)
 	// Create redeployment orchestrator and wire it to the dashboard
 	redeployer := orchestrator.NewRedeployer(sqliteStore, nodeCtrl, logger)
 	dashboard.Redeployer = redeployer
@@ -1173,9 +1356,14 @@ func runServe(startupProof string) (rerr error) {
 	// pubkey, so an unauthenticated tunnel visitor never sees the operator's
 	// full identity.
 	oauthHandler.HasDashboardCookie = dashboard.HasValidSessionCookie
-	// NodeOperatorAgentID is the identity that OAuth-issued bearers will run
-	// as. The HTTP MCP transport signs every outgoing REST call with the
-	// node's signing key, so this label always matches reality.
+	// Public /oauth/authorize never renders CEREBRUM through the tunnel. It
+	// hands an opaque short-lived handle to this loopback-only approval origin,
+	// where live committed Root/Admin authority is resolved on the exact GET
+	// and POST. NodeOperatorAgentID remains only a pre-v23 compatibility value;
+	// it is never consulted after Root handover.
+	oauthHandler.IsLocalApproval = dashboard.IsLocalCEREBRUMRequest
+	oauthHandler.ResolveControlActor = dashboard.ResolveOAuthControlActor
+	oauthHandler.LocalApprovalBaseURL = oauthLocalApprovalBaseURL(cfg.RESTAddr)
 	oauthHandler.NodeOperatorAgentID = operatorAgentID
 	rest.MountOAuthRoutes(r, oauthHandler)
 	logger.Info().Msg("OAuth 2.0 + PKCE wrapper enabled (/.well-known/oauth-authorization-server, /oauth/authorize, /oauth/token)")
@@ -1183,14 +1371,13 @@ func runServe(startupProof string) (rerr error) {
 	// Start background memory cleanup loop
 	trackDone(memory.StartCleanupLoop(ctx, sqliteStore))
 
-	// Embedding endpoint override — use configured provider, not just Ollama
-	r.Post("/v1/embed/personal", handleEmbedPersonal(embedProvider))
-
 	// Prometheus scrape endpoint. amid serves this via internal/metrics's
 	// dedicated metrics server; sage-gui has no such listener, so the default
 	// registry (sage_voter_running, sage_proposed_oldest_age_seconds, …) is
-	// exposed on the same loopback-bound dashboard mux as everything else here.
-	r.Method(http.MethodGet, "/metrics", promhttp.Handler())
+	// exposed on the combined mux behind an explicit loopback boundary. The
+	// REST listener may intentionally bind non-loopback for signed agent and
+	// federation data-plane traffic.
+	r.Method(http.MethodGet, "/metrics", loopbackOnlyMetrics(promhttp.Handler()))
 
 	// Preview builds represented peer Write with an ordinary AccessGrant. That
 	// credential is reusable through public REST or raw Comet even when the
@@ -1239,31 +1426,38 @@ func runServe(startupProof string) (rerr error) {
 
 	certsDir := filepath.Join(SageHome(), "certs")
 
-	// v11 federation transport: wire the manager BEFORE any listener serves
-	// requests (the TLS REST listener below mounts the same router). The
-	// OUTBOUND side (federated recall, receipt delivery) needs no inbound
-	// listener — only active cross_fed agreements; the dedicated inbound mTLS
-	// listener starts after cert auto-generation, and only when
-	// federation.enabled is set.
+	// v11 federation transport: wire the manager BEFORE any listener serves.
+	// federationTransportKey is the stable JOIN-frozen node transport identity,
+	// not a lookup of the current rotatable app-v23 CEREBRUM Root credential. Wire
+	// it before requests can reach either listener (the TLS REST listener below
+	// mounts the same router). The OUTBOUND side (federated recall, receipt
+	// delivery) needs no inbound listener — only active cross_fed agreements; the
+	// dedicated inbound mTLS listener starts after cert auto-generation, and only
+	// when federation.enabled is set.
 	var fedMgr *federation.Manager
-	if fedAgentKey, akErr := loadOrGenerateKey(cfg.AgentKey); akErr != nil {
-		logger.Warn().Err(akErr).Msg("agent key unavailable — federation transport disabled")
+	if keyErr := verifyStableFederationTransportKey(cfg.AgentKey, federationTransportKey); keyErr != nil {
+		return fmt.Errorf("start federation transport: %w", keyErr)
 	} else if cfg.ChainID == "" {
 		logger.Warn().Msg("no chain_id in genesis/config — federation transport disabled")
 	} else {
 		fedMgr = federation.NewManager(federation.Config{
-			Disabled:         !cfg.Federation.Enabled,
-			LocalChainID:     cfg.ChainID,
-			NetworkName:      sanitizeNetworkName(cfg.NetworkName),
-			CertsDir:         certsDir,
-			CometRPC:         cometRPC,
-			AgentKey:         fedAgentKey,
-			Badger:           badgerStore,
-			MemStore:         sqliteStore,
-			PostV20ForNextTx: app.IsAppV20ActiveForNextTx,
-			PostV22ForNextTx: app.IsAppV22ActiveForNextTx,
-			PostV8ForAccess:  app.IsPostV8Fork,
-			Logger:           logger,
+			Disabled:            !cfg.Federation.Enabled,
+			LocalChainID:        cfg.ChainID,
+			NetworkName:         sanitizeNetworkName(cfg.NetworkName),
+			CertsDir:            certsDir,
+			CometRPC:            cometRPC,
+			AgentKey:            federationTransportKey,
+			Badger:              badgerStore,
+			MemStore:            sqliteStore,
+			FederatedGuestStore: sqliteStore,
+			LocalGroupResolver:  badgerStore,
+			QueryChallengeStore: sqliteStore,
+			RootKeyResolver:     dashboard.ResolveAgentKeyFn,
+			PostV20ForNextTx:    app.IsAppV20ActiveForNextTx,
+			PostV22ForNextTx:    app.IsAppV22ActiveForNextTx,
+			PostV23ForNextTx:    app.IsAppV23ActiveForNextTx,
+			PostV8ForAccess:     app.IsPostV8Fork,
+			Logger:              logger,
 		})
 		restServer.SetFederation(fedMgr)
 		// The dashboard drives the guided JOIN wizards (cookie-authed) by calling
@@ -1288,6 +1482,15 @@ func runServe(startupProof string) (rerr error) {
 		if restoredSeeds > 0 {
 			logger.Info().Int("agreements", restoredSeeds).Msg("federation: restored peer seeds into cache after boot")
 		}
+		dashboard.OnVaultUnlocked = chainFederationVaultUnlock(
+			dashboard.OnVaultUnlocked,
+			fedMgr,
+			func(restored int) {
+				logger.Info().
+					Int("agreements", restored).
+					Msg("federation: refreshed encrypted peer seeds after vault unlock")
+			},
+		)
 		// Federation Off is a complete network kill switch: no listener, recall,
 		// receipts, sync drainer, route refresh, or relay reservations.
 		// SetSyncNotifier MUST follow StartSyncDrainer (it nudges the channel the
@@ -1949,6 +2152,17 @@ func restBaseURL(addr string) string {
 	return "http://" + addr
 }
 
+// oauthLocalApprovalBaseURL is deliberately loopback even when the REST API
+// listener is configured on a wildcard/LAN address. Cloudflare may expose
+// discovery, token exchange, registration, and /oauth/authorize, but browser
+// approval always crosses onto this same-machine origin.
+func oauthLocalApprovalBaseURL(addr string) string {
+	if _, port, err := net.SplitHostPort(addr); err == nil {
+		return "http://" + net.JoinHostPort("127.0.0.1", port)
+	}
+	return "http://127.0.0.1:8080"
+}
+
 // cmtRPCAddr returns the CometBFT RPC listen address. Overridable via
 // SAGE_CMT_RPC_ADDR so two personal nodes can coexist on one host; the default
 // preserves the historical tcp://127.0.0.1:26657. This is transport only — the
@@ -1993,6 +2207,88 @@ func genesisInitialAdminAppStateForKey(keyPath string) json.RawMessage {
 	return json.RawMessage(`{"sage":{"initial_admin":"` + admin + `"}}`)
 }
 
+// genesisAppStateForVendoredAgent builds the app-v23 first-party bootstrap
+// manifest for a brand-new personal chain. Both locally-held principals sign
+// the exact chain-bound manifest. The companion key may be generated at the
+// configured path on first launch, allowing a bundled application to consume
+// the same stable identity without any manual CEREBRUM ceremony.
+func genesisAppStateForVendoredAgent(
+	chainID, rootKeyPath string,
+	bootstrap *VendoredAgentBootstrapConfig,
+	validatorID string,
+	validatorPower int64,
+) (json.RawMessage, error) {
+	if bootstrap == nil {
+		// Preserve the legacy issue-#52 behavior exactly: an unavailable
+		// operator key omits app_state. A configured first-party bootstrap is
+		// stricter and fails startup below.
+		return genesisInitialAdminAppStateForKey(rootKeyPath), nil
+	}
+
+	rootPath := filepath.Clean(expandTilde(rootKeyPath))
+	agentPath := filepath.Clean(expandTilde(bootstrap.AgentKeyFile))
+	if rootPath == agentPath {
+		return nil, errors.New("vendored agent key must be distinct from the CEREBRUM root key")
+	}
+	if err := os.MkdirAll(filepath.Dir(rootPath), 0700); err != nil {
+		return nil, fmt.Errorf("create CEREBRUM root key directory: %w", err)
+	}
+	rootKey, err := loadOrGenerateKey(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("load CEREBRUM root key: %w", err)
+	}
+	if mkdirErr := os.MkdirAll(filepath.Dir(agentPath), 0700); mkdirErr != nil {
+		return nil, fmt.Errorf("create vendored agent key directory: %w", mkdirErr)
+	}
+	agentKey, err := loadOrGenerateKey(agentPath)
+	if err != nil {
+		return nil, fmt.Errorf("load vendored agent key: %w", err)
+	}
+	rootPublic, rootOK := rootKey.Public().(ed25519.PublicKey)
+	agentPublic, agentOK := agentKey.Public().(ed25519.PublicKey)
+	if !rootOK || !agentOK {
+		return nil, errors.New("vendored bootstrap requires Ed25519 keys")
+	}
+
+	manifest := sageabci.AppV23GenesisManifest{
+		Version:   sageabci.AppV23GenesisManifestVersion,
+		RootID:    hex.EncodeToString(rootPublic),
+		AgentID:   hex.EncodeToString(agentPublic),
+		Profile:   store.AppV23ProfileCompanion,
+		Clearance: bootstrap.Clearance,
+		Capabilities: uint32(store.AgentCapabilityReadAllDomains |
+			store.AgentCapabilityDenySharedDomainWrite |
+			store.AgentCapabilityDenyDomainClaim |
+			store.AgentCapabilityDenyForeignDomainWrite),
+		HomeDomain:  strings.TrimSpace(bootstrap.HomeDomain),
+		ValidatorID: validatorID, ValidatorPower: validatorPower,
+	}
+	signBytes := sageabci.AppV23GenesisManifestSignBytes(chainID, manifest)
+	manifest.RootSignature = hex.EncodeToString(ed25519.Sign(rootKey, signBytes))
+	manifest.AgentSignature = hex.EncodeToString(ed25519.Sign(agentKey, signBytes))
+	if _, verifyErr := sageabci.VerifyAppV23GenesisManifest(chainID, manifest); verifyErr != nil {
+		return nil, fmt.Errorf("verify vendored bootstrap manifest: %w", verifyErr)
+	}
+	appState, err := json.Marshal(struct {
+		Sage struct {
+			InitialAdmin    string                         `json:"initial_admin"`
+			AppV23Bootstrap sageabci.AppV23GenesisManifest `json:"app_v23_bootstrap"`
+		} `json:"sage"`
+	}{
+		Sage: struct {
+			InitialAdmin    string                         `json:"initial_admin"`
+			AppV23Bootstrap sageabci.AppV23GenesisManifest `json:"app_v23_bootstrap"`
+		}{
+			InitialAdmin:    manifest.RootID,
+			AppV23Bootstrap: manifest,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode vendored bootstrap app state: %w", err)
+	}
+	return appState, nil
+}
+
 // ensureOperatorAdminID returns the lowercase-hex ed25519 public key of the node
 // operator's ~/.sage/agent.key, GENERATING the key (32-byte seed form, via the
 // canonical loadOrGenerateKey) if it does not yet exist — `serve` does not
@@ -2027,8 +2323,29 @@ func ensureGenesisSeed(cometHome string, logger zerolog.Logger) error {
 }
 
 func ensureGenesisSeedWithKey(cometHome, keyPath string, logger zerolog.Logger) error {
-	if err := initCometBFTConfigWithKey(cometHome, keyPath); err != nil {
+	return ensureGenesisSeedWithBootstrap(cometHome, keyPath, nil, logger)
+}
+
+func ensureGenesisSeedWithConfig(cometHome string, cfg *Config, logger zerolog.Logger) error {
+	if cfg == nil {
+		return errors.New("initialize genesis: config is required")
+	}
+	return ensureGenesisSeedWithBootstrap(cometHome, cfg.AgentKey, cfg.VendoredAgentBootstrap, logger)
+}
+
+func ensureGenesisSeedWithBootstrap(
+	cometHome, keyPath string,
+	bootstrap *VendoredAgentBootstrapConfig,
+	logger zerolog.Logger,
+) error {
+	if err := initCometBFTConfigWithBootstrap(cometHome, keyPath, bootstrap); err != nil {
 		return fmt.Errorf("init CometBFT: %w", err)
+	}
+	if bootstrap != nil {
+		// Direct-v23 genesis is immutable and was either freshly created above or
+		// read-only preflighted by runServe. The legacy height-0 healer must never
+		// rewrite it into an issue-#52 lookalike.
+		return nil
 	}
 	// Strictly gated on height-0 (block store wiped) so a live chain's genesis hash is
 	// never disturbed. Runs AFTER migrateOnUpgrade's reset.
@@ -2135,6 +2452,430 @@ func initCometBFTConfig(home string) error {
 }
 
 func initCometBFTConfigWithKey(home, keyPath string) error {
+	return initCometBFTConfigWithBootstrap(home, keyPath, nil)
+}
+
+func preflightExistingVendoredGenesis(cometHome string, cfg *Config) error {
+	if cfg == nil || cfg.VendoredAgentBootstrap == nil {
+		return nil
+	}
+	genesisPath := filepath.Join(cometHome, "config", "genesis.json")
+	if _, statErr := os.Stat(genesisPath); errors.Is(statErr, os.ErrNotExist) {
+		dataDir := strings.TrimSpace(cfg.DataDir)
+		if dataDir == "" {
+			dataDir = filepath.Dir(cometHome)
+		}
+		evidence, evidenceErr := persistedNodeIdentityEvidence(
+			SageHome(),
+			dataDir,
+			cometHome,
+		)
+		if evidenceErr != nil {
+			return fmt.Errorf("prove fresh direct app-v23 origin: %w", evidenceErr)
+		}
+		if evidence != "" {
+			return fmt.Errorf(
+				"direct app-v23 genesis is missing but %s survives; refusing to mint a replacement identity before recovery",
+				evidence,
+			)
+		}
+		// The generic transport helper permits an empty Badger directory because
+		// runServe creates it immediately before first-launch key generation. This
+		// earlier vendored preflight runs before that mutation, so even an empty
+		// pre-existing Badger path is an ambiguous partial launch and must fail.
+		if _, lstatErr := os.Lstat(filepath.Join(dataDir, "badger")); lstatErr == nil {
+			return errors.New(
+				"direct app-v23 genesis is missing but a Badger chain state path survives; refusing to mint a replacement identity before recovery",
+			)
+		} else if !errors.Is(lstatErr, os.ErrNotExist) {
+			return fmt.Errorf("inspect fresh direct app-v23 Badger path: %w", lstatErr)
+		}
+		if preflightErr := preflightFreshVendoredKeys(cfg); preflightErr != nil {
+			return preflightErr
+		}
+		return nil
+	} else if statErr != nil {
+		return fmt.Errorf("inspect existing genesis: %w", statErr)
+	}
+	genesis, genesisErr := cmttypes.GenesisDocFromFile(genesisPath)
+	if genesisErr != nil {
+		return fmt.Errorf("read existing genesis: %w", genesisErr)
+	}
+	if genesis.ConsensusParams == nil ||
+		genesis.ConsensusParams.Version.App != sageabci.AppV23GenesisAppVersion {
+		return errors.New("existing genesis is not a direct app-v23 origin")
+	}
+	if cfg.ChainID != "" && genesis.ChainID != cfg.ChainID {
+		return fmt.Errorf(
+			"existing direct app-v23 genesis chain_id %q does not match configured chain_id %q",
+			genesis.ChainID,
+			cfg.ChainID,
+		)
+	}
+	if len(genesis.Validators) != 1 {
+		return errors.New("direct app-v23 genesis requires exactly one validator")
+	}
+	validator := genesis.Validators[0]
+	if _, ok := validator.PubKey.(cmtcryptoed.PubKey); !ok ||
+		len(validator.PubKey.Bytes()) != ed25519.PublicKeySize ||
+		validator.Power <= 0 {
+		return errors.New("direct app-v23 genesis validator is not a canonical positive-power Ed25519 validator")
+	}
+	var appState struct {
+		Sage struct {
+			InitialAdmin    string                          `json:"initial_admin"`
+			AppV23Bootstrap *sageabci.AppV23GenesisManifest `json:"app_v23_bootstrap,omitempty"`
+		} `json:"sage"`
+	}
+	if decodeErr := json.Unmarshal(genesis.AppState, &appState); decodeErr != nil ||
+		appState.Sage.AppV23Bootstrap == nil {
+		return errors.New("existing genesis lacks the direct app-v23 bootstrap manifest")
+	}
+	manifest := appState.Sage.AppV23Bootstrap
+	if _, manifestErr := sageabci.VerifyAppV23GenesisManifest(genesis.ChainID, *manifest); manifestErr != nil {
+		return fmt.Errorf("verify existing direct app-v23 manifest: %w", manifestErr)
+	}
+	validatorID := hex.EncodeToString(validator.PubKey.Bytes())
+	if manifest.ValidatorID != validatorID ||
+		manifest.ValidatorPower != validator.Power {
+		return errors.New("existing direct app-v23 validator does not match its signed manifest")
+	}
+	localValidatorID, available, validatorErr := localVendoredValidatorID(cometHome)
+	if validatorErr != nil {
+		return fmt.Errorf("verify local direct app-v23 validator key: %w", validatorErr)
+	}
+	if !available {
+		return errors.New("local validator key is missing for existing direct app-v23 genesis")
+	}
+	if localValidatorID != manifest.ValidatorID {
+		return errors.New("local validator key does not match existing direct app-v23 genesis")
+	}
+	if stateErr := validateVendoredValidatorState(
+		filepath.Join(cometHome, "data", "priv_validator_state.json"),
+		validator.PubKey.(cmtcryptoed.PubKey),
+		genesis.ChainID,
+	); stateErr != nil {
+		return fmt.Errorf("verify local direct app-v23 validator signing state: %w", stateErr)
+	}
+	if nodeKeyErr := validateVendoredNodeKey(
+		filepath.Join(cometHome, "config", "node_key.json"),
+	); nodeKeyErr != nil {
+		return fmt.Errorf("verify local direct app-v23 peer identity: %w", nodeKeyErr)
+	}
+	if appState.Sage.InitialAdmin != manifest.RootID {
+		return errors.New("existing direct app-v23 initial Root does not match its manifest")
+	}
+	transportKey, transportErr := readFederationTransportKey(cfg.AgentKey)
+	if transportErr != nil {
+		return fmt.Errorf("read immutable direct app-v23 Root/transport key: %w", transportErr)
+	}
+	if appV23AgentIDForKey(transportKey) != manifest.RootID {
+		return errors.New("configured stable transport key does not match immutable direct app-v23 genesis Root")
+	}
+	agentKey, agentOK := parseKeyFile(cfg.VendoredAgentBootstrap.AgentKeyFile)
+	if !agentOK || appV23AgentIDForKey(agentKey) != manifest.AgentID {
+		return errors.New("configured first-party agent key does not match existing direct app-v23 genesis")
+	}
+	if manifest.Profile != store.AppV23ProfileCompanion ||
+		manifest.Capabilities != 15 ||
+		manifest.HomeDomain != cfg.VendoredAgentBootstrap.HomeDomain ||
+		manifest.Clearance != cfg.VendoredAgentBootstrap.Clearance {
+		return errors.New("configured first-party policy does not match existing direct app-v23 genesis")
+	}
+	if cfg.ChainID == "" {
+		// genesis.json is authoritative once every signed identity, validator,
+		// local key, and policy binding above has passed. Keep this recovery
+		// in-memory; the normal later reconcile flow owns config.yaml persistence.
+		cfg.ChainID = genesis.ChainID
+	}
+	return nil
+}
+
+func preflightFreshVendoredKeys(cfg *Config) error {
+	if cfg == nil || cfg.VendoredAgentBootstrap == nil {
+		return nil
+	}
+	readOptional := func(path, label string) (ed25519.PrivateKey, bool, error) {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		} else if err != nil {
+			return nil, false, fmt.Errorf("inspect pre-provisioned %s: %w", label, err)
+		}
+		data, err := os.ReadFile(path) //nolint:gosec // configured local identity path
+		if err != nil {
+			return nil, false, fmt.Errorf("read pre-provisioned %s: %w", label, err)
+		}
+		key, err := decodeEd25519PrivateKey(data)
+		if err != nil {
+			return nil, false, fmt.Errorf("validate pre-provisioned %s: %w", label, err)
+		}
+		return key, true, nil
+	}
+	rootKey, rootPresent, err := readOptional(cfg.AgentKey, "CEREBRUM Root/transport key")
+	if err != nil {
+		return err
+	}
+	agentKey, agentPresent, err := readOptional(
+		cfg.VendoredAgentBootstrap.AgentKeyFile,
+		"first-party agent key",
+	)
+	if err != nil {
+		return err
+	}
+	if rootPresent && agentPresent &&
+		appV23AgentIDForKey(rootKey) == appV23AgentIDForKey(agentKey) {
+		return errors.New("pre-provisioned first-party agent key must be distinct from the CEREBRUM Root/transport key")
+	}
+	return nil
+}
+
+// localVendoredValidatorID reads the configured CometBFT private-validator
+// identity without invoking CometBFT's panic/exit-on-malformed loader and
+// without creating or rewriting any key material. The private key is the
+// authority: the redundant public key and address fields must agree with it.
+func localVendoredValidatorID(cometHome string) (string, bool, error) {
+	keyPath := filepath.Join(cometHome, "config", "priv_validator_key.json")
+	keyJSON, err := os.ReadFile(keyPath) //nolint:gosec // fixed path under the configured Comet home
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var key privval.FilePVKey
+	if err := cmtjson.Unmarshal(keyJSON, &key); err != nil {
+		return "", false, fmt.Errorf("decode private-validator key: %w", err)
+	}
+	if key.PrivKey == nil {
+		return "", false, errors.New("private-validator key has no private key")
+	}
+	privateKey, ok := key.PrivKey.(cmtcryptoed.PrivKey)
+	if !ok || len(privateKey) != ed25519.PrivateKeySize {
+		return "", false, errors.New("private-validator key is not canonical Ed25519")
+	}
+	derivedPrivate := ed25519.NewKeyFromSeed(privateKey[:ed25519.SeedSize])
+	if !bytes.Equal(derivedPrivate, privateKey) {
+		return "", false, errors.New("private-validator private key public component does not match its seed")
+	}
+	derived := cmtcryptoed.PubKey(append([]byte(nil), derivedPrivate[ed25519.SeedSize:]...))
+	if key.PubKey == nil ||
+		!bytes.Equal(key.PubKey.Bytes(), derived.Bytes()) ||
+		!bytes.Equal(key.Address, derived.Address()) {
+		return "", false, errors.New("private-validator public identity does not match its private key")
+	}
+	return hex.EncodeToString(derived.Bytes()), true, nil
+}
+
+func validateVendoredValidatorState(
+	path string,
+	validatorKey cmtcryptoed.PubKey,
+	chainID string,
+) error {
+	stateJSON, err := os.ReadFile(path) //nolint:gosec // fixed path under configured Comet home
+	if err != nil {
+		return err
+	}
+	if err := validateStrictJSONObjectKeys(
+		stateJSON,
+		[]string{"height", "round", "step"},
+		[]string{"signature", "signbytes"},
+	); err != nil {
+		return fmt.Errorf("decode private-validator signing state: %w", err)
+	}
+	var state privval.FilePVLastSignState
+	if err := cmtjson.Unmarshal(stateJSON, &state); err != nil {
+		return fmt.Errorf("decode private-validator signing state: %w", err)
+	}
+	if state.Height < 0 || state.Round < 0 || state.Step < 0 || state.Step > 3 {
+		return errors.New("private-validator signing state has invalid height, round, or step")
+	}
+	hasSignature := len(state.Signature) > 0
+	hasSignBytes := len(state.SignBytes) > 0
+	if hasSignature != hasSignBytes {
+		return errors.New("private-validator signing state must contain both signature and signbytes or neither")
+	}
+	if state.Height == 0 {
+		if state.Round != 0 || state.Step != 0 || hasSignature {
+			return errors.New("height-zero private-validator signing state must be pristine")
+		}
+		return nil
+	}
+	if state.Step == 0 || !hasSignature {
+		return errors.New("positive-height private-validator signing state lacks a signed consensus step")
+	}
+	if len(state.Signature) != ed25519.SignatureSize {
+		return errors.New("private-validator signing state has an invalid Ed25519 signature length")
+	}
+	if len(validatorKey) != ed25519.PublicKeySize ||
+		!validatorKey.VerifySignature(state.SignBytes, state.Signature) {
+		return errors.New("private-validator signing state signature does not match the genesis validator")
+	}
+	if err := validateVendoredValidatorSignBytes(state, chainID); err != nil {
+		return fmt.Errorf("private-validator signing state signbytes are not canonical: %w", err)
+	}
+	return nil
+}
+
+func validateVendoredValidatorSignBytes(
+	state privval.FilePVLastSignState,
+	chainID string,
+) error {
+	if chainID == "" {
+		return errors.New("chain_id is empty")
+	}
+	switch state.Step {
+	case 1:
+		var proposal cmtproto.CanonicalProposal
+		if err := protoio.UnmarshalDelimited(state.SignBytes, &proposal); err != nil {
+			return fmt.Errorf("decode canonical proposal: %w", err)
+		}
+		if proposal.Type != cmtproto.ProposalType {
+			return fmt.Errorf("proposal has signed-message type %d", proposal.Type)
+		}
+		if proposal.ChainID != chainID {
+			return errors.New("proposal chain_id does not match genesis")
+		}
+		if proposal.Height != state.Height ||
+			proposal.Round != int64(state.Round) {
+			return errors.New("proposal height/round do not match signing state")
+		}
+		canonical, err := protoio.MarshalDelimited(&proposal)
+		if err != nil {
+			return fmt.Errorf("re-encode canonical proposal: %w", err)
+		}
+		if !bytes.Equal(canonical, state.SignBytes) {
+			return errors.New("proposal encoding is non-canonical or contains unknown fields")
+		}
+	case 2, 3:
+		var vote cmtproto.CanonicalVote
+		if err := protoio.UnmarshalDelimited(state.SignBytes, &vote); err != nil {
+			return fmt.Errorf("decode canonical vote: %w", err)
+		}
+		expectedType := cmtproto.PrevoteType
+		if state.Step == 3 {
+			expectedType = cmtproto.PrecommitType
+		}
+		if vote.Type != expectedType {
+			return fmt.Errorf(
+				"vote type %d does not match signing step %d",
+				vote.Type,
+				state.Step,
+			)
+		}
+		if vote.ChainID != chainID {
+			return errors.New("vote chain_id does not match genesis")
+		}
+		if vote.Height != state.Height ||
+			vote.Round != int64(state.Round) {
+			return errors.New("vote height/round do not match signing state")
+		}
+		canonical, err := protoio.MarshalDelimited(&vote)
+		if err != nil {
+			return fmt.Errorf("re-encode canonical vote: %w", err)
+		}
+		if !bytes.Equal(canonical, state.SignBytes) {
+			return errors.New("vote encoding is non-canonical or contains unknown fields")
+		}
+	default:
+		return fmt.Errorf("unsupported signing step %d", state.Step)
+	}
+	return nil
+}
+
+func validateVendoredNodeKey(path string) error {
+	nodeKey, err := p2p.LoadNodeKey(path)
+	if err != nil {
+		return err
+	}
+	if nodeKey == nil || nodeKey.PrivKey == nil {
+		return errors.New("CometBFT peer identity has no private key")
+	}
+	privateKey, ok := nodeKey.PrivKey.(cmtcryptoed.PrivKey)
+	if !ok || len(privateKey) != ed25519.PrivateKeySize {
+		return errors.New("CometBFT peer identity is not canonical Ed25519")
+	}
+	derived := ed25519.NewKeyFromSeed(privateKey[:ed25519.SeedSize])
+	if !bytes.Equal(derived, privateKey) {
+		return errors.New("CometBFT peer identity public component does not match its seed")
+	}
+	return nil
+}
+
+func validateStrictJSONObjectKeys(data []byte, required, optional []string) error {
+	allowed := make(map[string]bool, len(required)+len(optional))
+	for _, key := range required {
+		allowed[key] = true
+	}
+	for _, key := range optional {
+		allowed[key] = false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	start, startErr := decoder.Token()
+	if startErr != nil {
+		return startErr
+	}
+	if delimiter, ok := start.(json.Delim); !ok || delimiter != '{' {
+		return errors.New("expected a JSON object")
+	}
+	seen := make(map[string]struct{}, len(allowed))
+	for decoder.More() {
+		token, tokenErr := decoder.Token()
+		if tokenErr != nil {
+			return tokenErr
+		}
+		key, ok := token.(string)
+		if !ok {
+			return errors.New("JSON object key is not a string")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("duplicate field %q", key)
+		}
+		if _, known := allowed[key]; !known {
+			return fmt.Errorf("unknown field %q", key)
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if decodeErr := decoder.Decode(&value); decodeErr != nil {
+			return decodeErr
+		}
+	}
+	end, endErr := decoder.Token()
+	if endErr != nil {
+		return endErr
+	}
+	if delimiter, ok := end.(json.Delim); !ok || delimiter != '}' {
+		return errors.New("unterminated JSON object")
+	}
+	if _, trailingErr := decoder.Token(); !errors.Is(trailingErr, io.EOF) {
+		if trailingErr == nil {
+			return errors.New("JSON object has trailing data")
+		}
+		return trailingErr
+	}
+	for _, key := range required {
+		if _, ok := seen[key]; !ok {
+			return fmt.Errorf("missing required field %q", key)
+		}
+	}
+	return nil
+}
+
+func preflightVendoredStartup(cometHome string, cfg *Config) error {
+	if err := preflightExistingVendoredGenesis(cometHome, cfg); err != nil {
+		return err
+	}
+	if _, err := os.Stat(pendingJoinPath()); err == nil {
+		return errors.New("configured first-party app-v23 node cannot apply a pending quorum join")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect pending quorum join: %w", err)
+	}
+	return nil
+}
+
+func initCometBFTConfigWithBootstrap(
+	home, keyPath string,
+	bootstrap *VendoredAgentBootstrapConfig,
+) error {
 	configDir := filepath.Join(home, "config")
 	dataDir := filepath.Join(home, "data")
 
@@ -2190,8 +2931,20 @@ func initCometBFTConfigWithKey(home, keyPath string) error {
 	// This is a single-validator genesis (quorum join overwrites it with a shared
 	// genesis that carries no app_state, so quorum is unaffected). InitChain only
 	// honours the seed for single-validator chains.
-	if admin := genesisInitialAdminAppStateForKey(keyPath); admin != nil {
-		genDoc.AppState = admin
+	validatorID := hex.EncodeToString(pv.Key.PubKey.Bytes())
+	appState, appStateErr := genesisAppStateForVendoredAgent(
+		chainID, keyPath, bootstrap, validatorID, 10,
+	)
+	if appStateErr != nil {
+		return fmt.Errorf("build genesis app_state: %w", appStateErr)
+	}
+	genDoc.AppState = appState
+	if bootstrap != nil {
+		// Declare the same protocol origin that the dual-signed InitChain
+		// manifest activates. InitChain returns this value again so CometBFT's
+		// pre-InitChain Info handshake and persisted consensus state converge
+		// before block 1.
+		genDoc.ConsensusParams.Version.App = sageabci.AppV23GenesisAppVersion
 	}
 	if err := genDoc.ValidateAndComplete(); err != nil {
 		return fmt.Errorf("validate genesis: %w", err)
@@ -2386,36 +3139,6 @@ func createEmbeddingProvider(cfg *Config, logger zerolog.Logger) embedding.Provi
 		}
 		logger.Info().Int("dimension", dim).Msg("using hash-based pseudo-embeddings")
 		return embedding.NewHashProvider(dim)
-	}
-}
-
-// handleEmbedPersonal returns an HTTP handler for the personal embedding endpoint.
-func handleEmbedPersonal(provider embedding.Provider) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
-		var req struct {
-			Text string `json:"text"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
-			return
-		}
-		if req.Text == "" {
-			http.Error(w, `{"error":"text is required"}`, http.StatusBadRequest)
-			return
-		}
-
-		emb, err := provider.Embed(r.Context(), req.Text)
-		if err != nil {
-			http.Error(w, `{"error":"embedding failed"}`, http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"embedding": emb,
-			"dimension": provider.Dimension(),
-		})
 	}
 }
 
@@ -2716,32 +3439,7 @@ func mountMCPHTTPTransport(r chi.Router, sqliteStore *store.SQLiteStore, cfg *Co
 
 	transport := mcp.NewHTTPTransport(mcpServer)
 
-	// Bearer-auth lookup: take the SHA-256 digest the middleware computed,
-	// hand it to SQLite, return the agent_id. Translate the store's
-	// ErrTokenRevoked into the middleware-side sentinel so 401 vs 500 are
-	// distinguishable.
-	bearerLookup := func(ctx context.Context, tokenSHA256 string) (string, ed25519.PrivateKey, error) {
-		agentID, priv, err := sqliteStore.LookupMCPTokenSigner(ctx, tokenSHA256)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return "", nil, err
-			}
-			if errors.Is(err, store.ErrTokenRevoked) {
-				return "", nil, middleware.ErrMCPTokenRevoked
-			}
-			// Fail closed on anything else (DB error, or a KEYED token whose vault
-			// is locked — LookupMCPTokenSigner never degrades a keyed token to the
-			// operator identity).
-			return "", nil, err
-		}
-		if priv == nil {
-			// Legacy keyless token: no per-token signer, so run as the node
-			// operator signed with the transport key (pre-v11.8 behavior).
-			return transportAgentID, nil, nil
-		}
-		// KEYED token: act as the token's own on-chain identity.
-		return agentID, priv, nil
-	}
+	bearerLookup := mcpBearerSignerLookup(sqliteStore, transportAgentID)
 
 	// IMPORTANT: register the transport endpoints as FLAT paths, not via
 	// r.Route("/v1/mcp", ...). Using a sub-route here mounts a subrouter
@@ -2761,6 +3459,45 @@ func mountMCPHTTPTransport(r chi.Router, sqliteStore *store.SQLiteStore, cfg *Co
 
 	logger.Info().Msg("HTTP MCP transport enabled (/v1/mcp/sse, /v1/mcp/streamable)")
 	return transport
+}
+
+// mcpBearerSignerLookup resolves the bearer to the only key permitted to sign
+// its downstream REST calls. Legacy keyless tokens retain their pre-v23
+// operator fallback only while the store's live app-version policy allows it.
+// App-v23's explicit legacy-disabled sentinel is presented as revoked rather
+// than an internal error so clients fail closed with a stable 401.
+func mcpBearerSignerLookup(
+	sqliteStore *store.SQLiteStore,
+	transportAgentID string,
+) middleware.MCPTokenLookupFn {
+	return func(
+		ctx context.Context,
+		bearerPlaintext, tokenSHA256 string,
+	) (string, ed25519.PrivateKey, error) {
+		agentID, priv, err := sqliteStore.LookupMCPTokenSignerWithBearer(
+			ctx, bearerPlaintext, tokenSHA256,
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", nil, err
+			}
+			if errors.Is(err, store.ErrTokenRevoked) ||
+				errors.Is(err, store.ErrTokenLegacyDisabled) {
+				return "", nil, middleware.ErrMCPTokenRevoked
+			}
+			// Fail closed on anything else (DB error, or a KEYED token whose vault
+			// is locked — LookupMCPTokenSigner never degrades a keyed token to the
+			// operator identity).
+			return "", nil, err
+		}
+		if priv == nil {
+			// Legacy keyless token: no per-token signer, so run as the node
+			// operator signed with the transport key (pre-v11.8 behavior).
+			return transportAgentID, nil, nil
+		}
+		// KEYED token: act as the token's own on-chain identity.
+		return agentID, priv, nil
+	}
 }
 
 // readNodeOperatorKey returns the hex-encoded ed25519 public key derived from

@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,39 @@ type SyncPolicyGenerationMutation struct {
 	once          sync.Once
 }
 
+// linkedAuthorizationMutation blocks every existing linked delivery while a
+// consensus-local agent/group authorization input is published. New per-peer
+// deliveries also observe the global block before registering their bounded
+// request cancellation.
+type linkedAuthorizationMutation struct {
+	manager *Manager
+	leases  []*syncPolicyDeliveryLease
+	once    sync.Once
+}
+
+func (g *linkedAuthorizationMutation) finish() {
+	if g == nil || g.manager == nil {
+		return
+	}
+	g.once.Do(func() {
+		g.manager.syncPolicyDeliveryLeasesMu.Lock()
+		if g.manager.linkedAuthorizationBlocks > 0 {
+			g.manager.linkedAuthorizationBlocks--
+		}
+		for _, lease := range g.leases {
+			lease.stateMu.Lock()
+			if lease.generationBlocks > 0 {
+				lease.generationBlocks--
+			}
+			lease.stateMu.Unlock()
+		}
+		g.manager.syncPolicyDeliveryLeasesMu.Unlock()
+		for i := len(g.leases) - 1; i >= 0; i-- {
+			g.leases[i].mu.Unlock()
+		}
+	})
+}
+
 func (g *SyncPolicyGenerationMutation) finish(resetOperatorPause bool) {
 	if g == nil || g.lease == nil {
 		return
@@ -67,7 +101,6 @@ func (g *SyncPolicyGenerationMutation) finish(resetOperatorPause bool) {
 			g.lease.generationBlocks--
 		}
 		g.lease.stateMu.Unlock()
-		g.lease.mu.Unlock()
 	})
 }
 
@@ -168,16 +201,32 @@ type Config struct {
 	CertsDir string
 	// CometRPC is the local CometBFT RPC base URL for broadcasting attest txs.
 	CometRPC string
-	// AgentKey is the node operator's ed25519 key (~/.sage/agent.key). It signs
-	// outbound federation requests and CommitReceipts — for receipts it must be
-	// a DECLARED coauthor of the SharedID (the peer's attest handler enforces
-	// that bind on-chain).
+	// AgentKey is the stable node federation transport credential (normally
+	// cfg.agent_key_file / ~/.sage/agent.key; historically also the pre-v23
+	// operator signer). JOIN freezes this exact public key at every peer, so it
+	// is intentionally independent of app-v23 CEREBRUM Root rotation and must
+	// never be silently regenerated on an initialized node. It signs outbound
+	// federation requests and CommitReceipts — for receipts it must be a
+	// DECLARED coauthor of the SharedID (the peer's attest handler enforces that
+	// bind on-chain). Post-v23 local consensus control resolves Root separately.
 	AgentKey ed25519.PrivateKey
 	// Badger is the on-chain state store — cross_fed agreements, cocommit
 	// cores/coauthors/anchors, memory classifications. READ-ONLY here.
 	Badger *store.BadgerStore
 	// MemStore serves the actual memory content for peer queries.
 	MemStore store.MemoryStore
+	// FederatedGuestStore is node-local capability storage. Group membership is
+	// deliberately not stored here; LocalGroupResolver owns that consensus fact.
+	FederatedGuestStore FederatedGuestStore
+	LocalGroupResolver  LocalGroupDomainResolver
+	// QueryChallengeStore persists destination-issued, single-use recall
+	// challenges. A v23 capability is never advertised without it.
+	QueryChallengeStore FederatedQueryChallengeStore
+	// RootKeyResolver returns the private key for the exact current app-v23 root
+	// credential. It is consulted at mint time so tx-39 rotation never leaves
+	// the node signing elevation tokens or local federation consensus mutations
+	// with a stale boot-time AgentKey.
+	RootKeyResolver func(credentialID string) (ed25519.PrivateKey, bool)
 	// PostV20ForNextTx gates the backward-compatible MemorySubmit tag extension.
 	// It must remain absent before activation because older validators reproduce
 	// the historical payload without that extension when checking signatures.
@@ -186,6 +235,10 @@ type Config struct {
 	// The outbox re-checks this immediately before each network delivery so a
 	// queued payload cannot escape after an operator enables the deny bit.
 	PostV22ForNextTx func() bool
+	// PostV23ForNextTx is the live consensus activation gate. Off-consensus
+	// federation must not advertise or accept v23 semantics before every
+	// validator evaluates the corresponding app version.
+	PostV23ForNextTx func() bool
 	// PostV8ForAccess reports whether the live chain uses the ancestor-aware
 	// access semantics. Federated inbox contacts must mirror the access check
 	// that governs a local agent's current domain read capability.
@@ -196,17 +249,23 @@ type Config struct {
 // Manager is the off-consensus federation transport: trust resolution,
 // the mTLS listener's handlers, the outbound client, and receipt exchange.
 type Manager struct {
-	localChainID     string
-	certsDir         string
-	cometRPC         string
-	agentKey         ed25519.PrivateKey
-	agentPub         ed25519.PublicKey
-	badger           *store.BadgerStore
-	memStore         store.MemoryStore
-	postV20ForNextTx func() bool
-	postV22ForNextTx func() bool
-	postV8ForAccess  func() bool
-	logger           zerolog.Logger
+	localChainID        string
+	certsDir            string
+	cometRPC            string
+	agentKey            ed25519.PrivateKey
+	agentPub            ed25519.PublicKey
+	badger              *store.BadgerStore
+	memStore            store.MemoryStore
+	federatedGuestStore FederatedGuestStore
+	localGroupResolver  LocalGroupDomainResolver
+	queryChallengeStore FederatedQueryChallengeStore
+	rootKeyResolverMu   sync.RWMutex
+	rootKeyResolver     func(string) (ed25519.PrivateKey, bool)
+	postV20ForNextTx    func() bool
+	postV22ForNextTx    func() bool
+	postV23ForNextTx    func() bool
+	postV8ForAccess     func() bool
+	logger              zerolog.Logger
 
 	// peerDialFn is the optional v11.6 connectivity seam. It may handle a
 	// remote chain via a libp2p stream; handled=false preserves the original
@@ -241,8 +300,9 @@ type Manager struct {
 	// of chains that ever held an active agreement AND sent a request (peerAuth
 	// gates on ActiveAgreement first, so an attacker can't add shards) — empty
 	// shards aren't actively reaped, but that ceiling is operator-scale.
-	replayMu sync.Mutex
-	seenSigs map[string]map[string]int64
+	replayMu             sync.Mutex
+	seenSigs             map[string]map[string]int64
+	seenQueryAgentProofs map[string]int64
 
 	// caMu guards caCache — parsed pinned CAs keyed by "chainID:hexpin", so the
 	// mTLS handshake and per-request verify don't re-read+parse the CA from disk
@@ -270,12 +330,29 @@ type Manager struct {
 	pipeEventPushFn       func(ctx context.Context, remoteChainID string, event *PipeEvent) (*PipeEventResponse, error)
 	pipeTargetResolveFn   func(ctx context.Context, target string) (*RemotePipeTarget, error)
 	pipeResultPreflightFn func(ctx context.Context, msg *store.PipelineMessage, outbox *store.PipelineTransportOutbox) error
+	// linkedResultBeforePushHook is a deterministic race-test barrier after
+	// no-payload peer preflight and before result bytes enter the envelope.
+	linkedResultBeforePushHook func(remoteChainID string)
+	// federatedGuestEligibilityFn is a narrow test seam for the live,
+	// peer-authenticated exact-agent oracle. Production always leaves it nil
+	// and uses the signed mTLS route; nil must never mean allow.
+	federatedGuestEligibilityFn func(ctx context.Context, remoteChainID, remoteAgentID string) error
+	// linkedRelationRevalidateFn is a test-only seam for the no-lock remote
+	// host freshness callback. Nil production always uses signed mTLS.
+	linkedRelationRevalidateFn func(
+		ctx context.Context,
+		agreement *store.CrossFedRecord,
+		relation *LinkedMessageRelation,
+	) error
+	linkedRevalidationMu  sync.Mutex
+	linkedRevalidationSem map[string]chan struct{}
 	// syncPolicyDeliveryLeases linearize outbound policy-label disclosure with
 	// Pause per remote chain. The map mutex is held only for lookup/creation;
 	// each per-peer lease may span a bounded network request without blocking an
 	// unrelated peer or either node's inbound SQLite policy writer.
 	syncPolicyDeliveryLeasesMu sync.Mutex
 	syncPolicyDeliveryLeases   map[string]*syncPolicyDeliveryLease
+	linkedAuthorizationBlocks  int
 	// syncPolicyFinalGateHook is a deterministic test barrier immediately before
 	// the delivery-vs-pause lease. It is nil in production.
 	syncPolicyFinalGateHook func(remoteChainID string)
@@ -460,7 +537,81 @@ func (m *Manager) BeginSyncPolicyGenerationMutation(remoteChainID string) *SyncP
 	lease.stateMu.Lock()
 	pauseRevision := lease.pauseRevision
 	lease.stateMu.Unlock()
+	// The block, not ownership of mu, is the generation mutation's durable
+	// exclusion boundary. Release mu after every older delivery has drained so
+	// an in-process consensus commit may take the same lease through the global
+	// authorization hook without recursively deadlocking. New deliveries take
+	// mu and then fail closed on generationBlocks until Activate/Restore/Retire.
+	lease.mu.Unlock()
 	return &SyncPolicyGenerationMutation{lease: lease, pauseRevision: pauseRevision}
+}
+
+func (m *Manager) beginAllLinkedAuthorizationMutation() func() {
+	m.syncPolicyDeliveryLeasesMu.Lock()
+	m.linkedAuthorizationBlocks++
+	chainIDs := make([]string, 0, len(m.syncPolicyDeliveryLeases))
+	for chainID := range m.syncPolicyDeliveryLeases {
+		chainIDs = append(chainIDs, chainID)
+	}
+	sort.Strings(chainIDs)
+	leases := make([]*syncPolicyDeliveryLease, 0, len(chainIDs))
+	for _, chainID := range chainIDs {
+		lease := m.syncPolicyDeliveryLeases[chainID]
+		lease.stateMu.Lock()
+		lease.generationBlocks++
+		cancel := lease.cancel
+		lease.stateMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		leases = append(leases, lease)
+	}
+	m.syncPolicyDeliveryLeasesMu.Unlock()
+	for _, lease := range leases {
+		lease.mu.Lock()
+	}
+	mutation := &linkedAuthorizationMutation{manager: m, leases: leases}
+	return mutation.finish
+}
+
+func (m *Manager) beginPeerLinkedAuthorizationMutation(
+	remoteChainID string,
+) func() {
+	generation := m.BeginSyncPolicyGenerationMutation(remoteChainID)
+	return generation.Restore
+}
+
+// beginLinkedDelivery takes only the cancellable per-peer delivery lease. It
+// never holds SQLite policy, Badger authorization, or contact locks across
+// network I/O. A mutation publishes its block and cancels this context before
+// waiting for the lease, so once the mutation returns no stale payload remains
+// in flight.
+func (m *Manager) beginLinkedDelivery(
+	ctx context.Context,
+	remoteChainID string,
+) (context.Context, func(), error) {
+	lease := m.syncPolicyDeliveryLease(remoteChainID)
+	lease.mu.Lock()
+	m.syncPolicyDeliveryLeasesMu.Lock()
+	globalBlocked := m.linkedAuthorizationBlocks > 0
+	m.syncPolicyDeliveryLeasesMu.Unlock()
+	paused, generationBlocked := lease.deliveryBlocked()
+	if globalBlocked || paused || generationBlocked {
+		lease.mu.Unlock()
+		return nil, func() {}, ErrFederatedPipeSuspended
+	}
+	deliveryCtx, cancel := context.WithCancel(ctx)
+	if lease.registerCancel(cancel) {
+		lease.clearCancel(cancel)
+		cancel()
+		lease.mu.Unlock()
+		return nil, func() {}, ErrFederatedPipeSuspended
+	}
+	return deliveryCtx, func() {
+		lease.clearCancel(cancel)
+		cancel()
+		lease.mu.Unlock()
+	}, nil
 }
 
 // PeerDialFunc returns a stream-backed connection for remoteChainID. handled
@@ -559,11 +710,17 @@ func NewManager(cfg Config) *Manager {
 		agentPub:                    pub,
 		badger:                      cfg.Badger,
 		memStore:                    cfg.MemStore,
+		federatedGuestStore:         cfg.FederatedGuestStore,
+		localGroupResolver:          cfg.LocalGroupResolver,
+		queryChallengeStore:         cfg.QueryChallengeStore,
+		rootKeyResolver:             cfg.RootKeyResolver,
 		postV20ForNextTx:            cfg.PostV20ForNextTx,
 		postV22ForNextTx:            cfg.PostV22ForNextTx,
+		postV23ForNextTx:            cfg.PostV23ForNextTx,
 		postV8ForAccess:             cfg.PostV8ForAccess,
 		logger:                      cfg.Logger.With().Str("component", "federation").Logger(),
 		seenSigs:                    make(map[string]map[string]int64),
+		seenQueryAgentProofs:        make(map[string]int64),
 		caCache:                     make(map[string]*x509.Certificate),
 		broadcastSem:                make(chan struct{}, maxConcurrentReceiptBroadcasts),
 		legacyPipeStatusFallbackSem: make(chan struct{}, maxConcurrentLegacyPipeStatusFallbacks),
@@ -575,6 +732,36 @@ func NewManager(cfg Config) *Manager {
 		routeRefreshLast:            make(map[string]time.Time),
 	}
 	m.transportDisabled.Store(cfg.Disabled)
+	if m.federatedGuestStore == nil {
+		if guestStore, ok := cfg.MemStore.(FederatedGuestStore); ok {
+			m.federatedGuestStore = guestStore
+		}
+	}
+	if m.queryChallengeStore == nil {
+		if challengeStore, ok := cfg.MemStore.(FederatedQueryChallengeStore); ok {
+			m.queryChallengeStore = challengeStore
+		}
+	}
+	if m.badger != nil {
+		m.badger.SetAuthorizationMutationHook(
+			func(remoteChainID string) func() {
+				if remoteChainID == "" {
+					return m.beginAllLinkedAuthorizationMutation()
+				}
+				return m.beginPeerLinkedAuthorizationMutation(remoteChainID)
+			},
+		)
+	}
+	if sqliteStore, ok := cfg.MemStore.(*store.SQLiteStore); ok {
+		sqliteStore.SetFederationAuthorizationMutationHook(
+			func(remoteChainID string) func() {
+				if remoteChainID == "" {
+					return m.beginAllLinkedAuthorizationMutation()
+				}
+				return m.beginPeerLinkedAuthorizationMutation(remoteChainID)
+			},
+		)
+	}
 	// Production governance proof is read from the durable consensus state. Tests
 	// may replace the seam, but production never defaults to a permissive stub.
 	m.controllerGovGate = m.passedControllerGovernance

@@ -13,39 +13,46 @@ package store
 //
 // Storage model:
 //   - Codes are 32 random bytes, base64-url-encoded — opaque to the client.
-//     We persist them in plaintext (NOT hashed): they're 5-min-TTL,
-//     single-use, and a SHA-256 layer adds nothing here. Compromise of the
-//     codes table without the matching code_verifier is also useless thanks
-//     to PKCE.
+//     Only SHA-256(code) is persisted. The raw code is also the key material
+//     for a short-lived AES-GCM delivery envelope containing the bearer, so a
+//     database snapshot has neither credential needed to authenticate.
 //   - PKCE: SHA-256(code_verifier) base64url-no-pad is sent up-front as
 //     `code_challenge` (S256 only). On redeem, the client presents the
 //     verifier; we recompute the hash and compare in constant time.
 //   - Single-use is enforced via the partial-WHERE update at redeem time:
-//     UPDATE mcp_auth_codes SET used_at=now WHERE code=? AND used_at IS NULL
+//     UPDATE mcp_auth_codes SET used_at=now WHERE code_sha256=? AND used_at IS NULL
 //     (RowsAffected==0 ⇒ already-used or vanished — treat as used).
 //   - TTL is enforced at redeem with `expires_at > now`; expired rows are
-//     left for a periodic purge (none yet — at 5min TTL the table stays
-//     trivially small).
-//   - The bearer plaintext is attached to the auth-code row at /authorize
-//     time (it was just minted in the same request, so we have it in
-//     memory). On successful redeem we wipe the column. The window where a
-//     plaintext bearer sits in the DB is bounded by the auth-code TTL.
+//     revoked and removed by the periodic purge.
+//   - The bearer plaintext exists only in memory. Its encrypted delivery
+//     envelope and salt are wiped on successful redemption.
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/hkdf"
 )
 
-// MCPAuthCode is the persisted auth-code row. Bearer plaintext is held only
-// in the bearer_plaintext column for the brief window between /authorize
-// and /token, then wiped on redeem.
+const (
+	oauthCodeDeliverySealV1   = "code-hkdf-aes256gcm-v1"
+	oauthCodeDeliverySaltSize = 32
+)
+
+// MCPAuthCode is the persisted auth-code row. Code is the SHA-256 digest of
+// the one-shot authorization code; neither the raw code nor bearer is stored.
 type MCPAuthCode struct {
 	Code                string
 	TokenID             string
@@ -80,11 +87,14 @@ var (
 	ErrAuthCodeUnsupportedMethod = errors.New("oauth code_challenge_method unsupported")
 )
 
-// migrateMCPAuthCodes creates the mcp_auth_codes table on first boot. Idempotent.
-func (s *SQLiteStore) migrateMCPAuthCodes(ctx context.Context) {
-	_, _ = s.writeExecContext(ctx, `
+// migrateMCPAuthCodes creates the mcp_auth_codes table on first boot. It is
+// idempotent and security-critical: callers must fail startup if a migration
+// cannot establish the no-plaintext schema or revoke legacy plaintext rows.
+func (s *SQLiteStore) migrateMCPAuthCodes(ctx context.Context) error {
+	if _, err := s.writeExecContext(ctx, `
 	CREATE TABLE IF NOT EXISTS mcp_auth_codes (
 		code                  TEXT PRIMARY KEY,
+		code_sha256           TEXT,
 		token_id              TEXT NOT NULL,
 		code_challenge        TEXT NOT NULL,
 		code_challenge_method TEXT NOT NULL DEFAULT 'S256',
@@ -94,32 +104,88 @@ func (s *SQLiteStore) migrateMCPAuthCodes(ctx context.Context) {
 		expires_at            TEXT NOT NULL,
 		used_at               TEXT,
 		bearer_plaintext      TEXT,
+		delivery_sealed       BLOB,
+		delivery_salt         BLOB,
+		delivery_seal         TEXT NOT NULL DEFAULT '',
 		created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-	)`)
-	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_token ON mcp_auth_codes(token_id)`)
-	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_expires ON mcp_auth_codes(expires_at)`)
-
-	// Migration safety: in case a future release adds a column ordering it
-	// before bearer_plaintext, sniff pragma_table_info and ALTER if missing.
-	row := s.conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pragma_table_info('mcp_auth_codes') WHERE name='bearer_plaintext'`)
-	var count int
-	if err := row.Scan(&count); err == nil && count == 0 {
-		_, _ = s.writeExecContext(ctx, `ALTER TABLE mcp_auth_codes ADD COLUMN bearer_plaintext TEXT`)
+	)`); err != nil {
+		return fmt.Errorf("create oauth auth-code table: %w", err)
 	}
+	if _, err := s.writeExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_token ON mcp_auth_codes(token_id)`); err != nil {
+		return fmt.Errorf("create oauth auth-code token index: %w", err)
+	}
+	if _, err := s.writeExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_expires ON mcp_auth_codes(expires_at)`); err != nil {
+		return fmt.Errorf("create oauth auth-code expiry index: %w", err)
+	}
+
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{"bearer_plaintext", `ALTER TABLE mcp_auth_codes ADD COLUMN bearer_plaintext TEXT`},
+		{"code_sha256", `ALTER TABLE mcp_auth_codes ADD COLUMN code_sha256 TEXT`},
+		{"delivery_sealed", `ALTER TABLE mcp_auth_codes ADD COLUMN delivery_sealed BLOB`},
+		{"delivery_salt", `ALTER TABLE mcp_auth_codes ADD COLUMN delivery_salt BLOB`},
+		{"delivery_seal", `ALTER TABLE mcp_auth_codes ADD COLUMN delivery_seal TEXT NOT NULL DEFAULT ''`},
+	} {
+		row := s.conn.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM pragma_table_info('mcp_auth_codes') WHERE name = ?`, column.name)
+		var count int
+		if err := row.Scan(&count); err != nil {
+			return fmt.Errorf("inspect oauth auth-code column %s: %w", column.name, err)
+		}
+		if count == 0 {
+			if _, err := s.writeExecContext(ctx, column.sql); err != nil {
+				return fmt.Errorf("add oauth auth-code column %s: %w", column.name, err)
+			}
+		}
+	}
+	if _, err := s.writeExecContext(ctx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_auth_codes_digest ON mcp_auth_codes(code_sha256) WHERE code_sha256 IS NOT NULL`); err != nil {
+		return fmt.Errorf("create oauth auth-code digest index: %w", err)
+	}
+
+	// A legacy in-flight row contains both the raw authorization code and raw
+	// bearer. It cannot be made safe in place: a copied pre-upgrade database
+	// already contains both credentials. Revoke its token and force the client
+	// to restart authorization, then erase the plaintext row. Used legacy rows
+	// are erased as well. New rows always carry code_sha256.
+	tx, unlock, err := s.beginTxLocked(ctx)
+	if err != nil {
+		return fmt.Errorf("begin oauth auth-code legacy revocation: %w", err)
+	}
+	defer unlock()
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(ctx, `UPDATE mcp_tokens
+		SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+		WHERE id IN (
+			SELECT token_id FROM mcp_auth_codes
+			WHERE code_sha256 IS NULL OR code_sha256 = ''
+		)`); err != nil {
+		return fmt.Errorf("revoke legacy plaintext oauth bearer: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx,
+		`DELETE FROM mcp_auth_codes WHERE code_sha256 IS NULL OR code_sha256 = ''`); err != nil {
+		return fmt.Errorf("erase legacy plaintext oauth auth code: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit oauth auth-code legacy revocation: %w", err)
+	}
+	return nil
 }
 
 // IssueAuthCode persists a freshly-minted authorization code bound to the
-// given mcp_tokens row plus the bearer plaintext. The caller is responsible
+// given mcp_tokens row plus an encrypted bearer delivery envelope. The caller is responsible
 // for generating the random code value (32 bytes base64url is the
-// convention) — we just store it.
+// convention). The raw code is never stored.
 //
 // `ttl` is the lifetime from now() until the code is unredeemable. RFC 6749
 // §4.1.2 recommends ~10 minutes maximum; SAGE uses 5 minutes.
 //
-// `bearerPlaintext` is the just-minted bearer that /token will return. It
-// lives in the row only until /token redeems (UsedAt != NULL → wiped) or
-// the row is purged.
+// `bearerPlaintext` is the just-minted bearer that /token will return. It is
+// sealed with a key derived from the raw code and a per-row random salt.
 //
 // Returns an error if the code already exists (PRIMARY KEY collision —
 // astronomically unlikely with 32 random bytes).
@@ -138,26 +204,120 @@ func (s *SQLiteStore) IssueAuthCode(
 	if method != "S256" {
 		return ErrAuthCodeUnsupportedMethod
 	}
+	codeDigest := oauthCodeDigest(code)
+	salt := make([]byte, oauthCodeDeliverySaltSize)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return fmt.Errorf("generate oauth delivery salt: %w", err)
+	}
+	aad := oauthCodeDeliveryAAD(
+		tokenID, codeDigest, codeChallenge, method, redirectURI, clientID,
+	)
+	sealed, err := sealOAuthBearerForCode(code, salt, aad, bearerPlaintext)
+	if err != nil {
+		return err
+	}
 	expiresAt := time.Now().UTC().Add(ttl).Format("2006-01-02T15:04:05.999999999Z07:00")
-	_, err := s.writeExecContext(ctx,
+	_, err = s.writeExecContext(ctx,
 		`INSERT INTO mcp_auth_codes
-		   (code, token_id, code_challenge, code_challenge_method, redirect_uri, client_id, state, expires_at, bearer_plaintext)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		code, tokenID, codeChallenge, method, redirectURI, clientID, state, expiresAt, bearerPlaintext)
+		   (code, code_sha256, token_id, code_challenge, code_challenge_method,
+		    redirect_uri, client_id, state, expires_at, bearer_plaintext,
+		    delivery_sealed, delivery_salt, delivery_seal)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+		codeDigest, codeDigest, tokenID, codeChallenge, method, redirectURI,
+		clientID, state, expiresAt, sealed, salt, oauthCodeDeliverySealV1)
 	if err != nil {
 		return fmt.Errorf("insert auth code: %w", err)
 	}
 	return nil
 }
 
+func oauthCodeDigest(code string) string {
+	sum := sha256.Sum256([]byte(code))
+	return hex.EncodeToString(sum[:])
+}
+
+func oauthCodeDeliveryAAD(tokenID, codeDigest, challenge, method, redirectURI, clientID string) []byte {
+	return []byte(strings.Join([]string{
+		"sage:oauth-code-bearer-delivery:v1",
+		tokenID,
+		codeDigest,
+		challenge,
+		method,
+		redirectURI,
+		clientID,
+	}, "|"))
+}
+
+func oauthCodeDeliveryKey(code string, salt []byte) ([]byte, error) {
+	if code == "" || len(salt) != oauthCodeDeliverySaltSize {
+		return nil, errors.New("invalid oauth delivery envelope inputs")
+	}
+	key := make([]byte, 32)
+	reader := hkdf.New(
+		sha256.New,
+		[]byte(code),
+		salt,
+		[]byte("sage:oauth-code:bearer-delivery-envelope:v1"),
+	)
+	if _, err := io.ReadFull(reader, key); err != nil {
+		return nil, fmt.Errorf("derive oauth delivery key: %w", err)
+	}
+	return key, nil
+}
+
+func sealOAuthBearerForCode(code string, salt, aad []byte, bearer string) ([]byte, error) {
+	key, err := oauthCodeDeliveryKey(code, salt)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("create oauth delivery cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create oauth delivery AEAD: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("generate oauth delivery nonce: %w", err)
+	}
+	return gcm.Seal(nonce, nonce, []byte(bearer), aad), nil
+}
+
+func openOAuthBearerForCode(code string, salt, aad, sealed []byte) (string, error) {
+	key, err := oauthCodeDeliveryKey(code, salt)
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("create oauth delivery cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create oauth delivery AEAD: %w", err)
+	}
+	if len(sealed) < gcm.NonceSize()+gcm.Overhead() {
+		return "", errors.New("oauth bearer delivery envelope is truncated")
+	}
+	plaintext, err := gcm.Open(nil, sealed[:gcm.NonceSize()], sealed[gcm.NonceSize():], aad)
+	if err != nil {
+		return "", errors.New("authorization code does not unlock bearer delivery")
+	}
+	return string(plaintext), nil
+}
+
 // DeleteAuthCode removes an unredeemed authorization code during an issuance
-// rollback. It lets the OAuth handler erase the bearer plaintext when a later
-// redirect-sink validation cannot complete. Missing rows are a harmless no-op.
+// rollback. It lets the OAuth handler erase the bearer-delivery ciphertext
+// when a later redirect-sink validation cannot complete. Missing rows are a
+// harmless no-op.
 func (s *SQLiteStore) DeleteAuthCode(ctx context.Context, code string) error {
 	if code == "" {
 		return nil
 	}
-	if _, err := s.writeExecContext(ctx, `DELETE FROM mcp_auth_codes WHERE code = ?`, code); err != nil {
+	if _, err := s.writeExecContext(ctx,
+		`DELETE FROM mcp_auth_codes WHERE code_sha256 = ?`, oauthCodeDigest(code)); err != nil {
 		return fmt.Errorf("delete auth code: %w", err)
 	}
 	return nil
@@ -167,7 +327,8 @@ func (s *SQLiteStore) DeleteAuthCode(ctx context.Context, code string) error {
 //  1. Look up the code (must exist, not used, not expired).
 //  2. Confirm the redirect_uri provided at /token matches the one bound at /authorize.
 //  3. Confirm SHA-256(code_verifier) base64url-no-pad equals the stored code_challenge.
-//  4. Atomically mark the code used and wipe the bearer_plaintext column.
+//  4. Derive the delivery key from the raw code, decrypt the bearer, then
+//     atomically mark the code used and wipe the delivery material.
 //
 // Returns the bearer plaintext on success.
 func (s *SQLiteStore) RedeemAuthCode(
@@ -178,15 +339,21 @@ func (s *SQLiteStore) RedeemAuthCode(
 		return "", fmt.Errorf("code, code_verifier, redirect_uri, client_id are required")
 	}
 
-	// 1. Load the row.
+	// 1. Load the row by the digest of the raw code.
+	codeDigest := oauthCodeDigest(code)
 	row := s.conn.QueryRowContext(ctx, `
-		SELECT code_challenge, code_challenge_method, redirect_uri, client_id,
-		       expires_at, COALESCE(used_at, ''), COALESCE(bearer_plaintext, '')
+		SELECT token_id, code_challenge, code_challenge_method, redirect_uri, client_id,
+		       expires_at, COALESCE(used_at, ''), COALESCE(delivery_sealed, X''),
+		       COALESCE(delivery_salt, X''), COALESCE(delivery_seal, '')
 		  FROM mcp_auth_codes
-		 WHERE code = ?`, code)
+		 WHERE code_sha256 = ?`, codeDigest)
 
-	var codeChallenge, method, storedRedirect, storedClientID, expiresAtStr, usedAtStr, bearer string
-	if scanErr := row.Scan(&codeChallenge, &method, &storedRedirect, &storedClientID, &expiresAtStr, &usedAtStr, &bearer); scanErr != nil {
+	var tokenID, codeChallenge, method, storedRedirect, storedClientID, expiresAtStr, usedAtStr, sealFormat string
+	var sealed, salt []byte
+	if scanErr := row.Scan(
+		&tokenID, &codeChallenge, &method, &storedRedirect, &storedClientID,
+		&expiresAtStr, &usedAtStr, &sealed, &salt, &sealFormat,
+	); scanErr != nil {
 		if errors.Is(scanErr, sql.ErrNoRows) {
 			return "", ErrAuthCodeNotFound
 		}
@@ -215,16 +382,32 @@ func (s *SQLiteStore) RedeemAuthCode(
 	if subtle.ConstantTimeCompare([]byte(computed), []byte(codeChallenge)) != 1 {
 		return "", ErrAuthCodePKCEMismatch
 	}
+	if sealFormat != oauthCodeDeliverySealV1 {
+		return "", fmt.Errorf("unsupported oauth bearer delivery envelope %q", sealFormat)
+	}
+	bearer, err := openOAuthBearerForCode(
+		code,
+		salt,
+		oauthCodeDeliveryAAD(
+			tokenID, codeDigest, codeChallenge, method, storedRedirect, storedClientID,
+		),
+		sealed,
+	)
+	if err != nil {
+		return "", err
+	}
 
-	// 3. Single-use mark — atomic. Also wipe the bearer plaintext so the
-	// row is harmless once redeemed.
+	// 3. Single-use mark — atomic. Also wipe all delivery material so the row
+	// is harmless once redeemed.
 	res, execErr := s.writeExecContext(ctx, `
 		UPDATE mcp_auth_codes
 		   SET used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-		       bearer_plaintext = NULL
-		 WHERE code = ? AND client_id = ? AND redirect_uri = ?
+		       bearer_plaintext = NULL,
+		       delivery_sealed = NULL,
+		       delivery_salt = NULL
+		 WHERE code_sha256 = ? AND client_id = ? AND redirect_uri = ?
 		   AND used_at IS NULL
-		   AND julianday(expires_at) > julianday('now')`, code, clientID, redirectURI)
+		   AND julianday(expires_at) > julianday('now')`, codeDigest, clientID, redirectURI)
 	if execErr != nil {
 		return "", fmt.Errorf("mark auth code used: %w", execErr)
 	}
@@ -233,7 +416,10 @@ func (s *SQLiteStore) RedeemAuthCode(
 		// The UPDATE is the authority. This follow-up only distinguishes an
 		// expiry-boundary loss from a concurrent successful claimant.
 		var usedAt, expiresAt string
-		checkErr := s.conn.QueryRowContext(ctx, `SELECT COALESCE(used_at, ''), expires_at FROM mcp_auth_codes WHERE code = ?`, code).Scan(&usedAt, &expiresAt)
+		checkErr := s.conn.QueryRowContext(ctx,
+			`SELECT COALESCE(used_at, ''), expires_at FROM mcp_auth_codes WHERE code_sha256 = ?`,
+			codeDigest,
+		).Scan(&usedAt, &expiresAt)
 		if errors.Is(checkErr, sql.ErrNoRows) {
 			return "", ErrAuthCodeNotFound
 		}
@@ -249,11 +435,6 @@ func (s *SQLiteStore) RedeemAuthCode(
 		return "", ErrAuthCodeUsed
 	}
 
-	if bearer == "" {
-		// Issue-time invariant violated: code row had no bearer attached.
-		// Should never happen — IssueAuthCode rejects empty bearers.
-		return "", fmt.Errorf("auth code has no bound bearer (data corruption)")
-	}
 	return bearer, nil
 }
 

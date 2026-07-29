@@ -33,6 +33,7 @@ func newDrainTestManager(t *testing.T) (*Manager, *store.SQLiteStore, *store.Bad
 	require.NoError(t, err)
 	return &Manager{
 		localChainID: "chain-local",
+		certsDir:     filepath.Join(dir, "certs"),
 		agentKey:     priv,
 		agentPub:     pub,
 		badger:       bs,
@@ -53,16 +54,35 @@ func seedCommitted(t *testing.T, ms *store.SQLiteStore, id, domain, content stri
 	require.NoError(t, seedCommittedMemory(context.Background(), ms, id, domain, content, sum[:]))
 }
 
+func seedPublishedCommitted(
+	t *testing.T,
+	ms *store.SQLiteStore,
+	bs *store.BadgerStore,
+	id, domain, content string,
+) {
+	t.Helper()
+	seedCommitted(t, ms, id, domain, content)
+	projectedClass, err := ms.GetMemoryClassificationLocal(context.Background(), id)
+	require.NoError(t, err)
+	publishFederationSQLiteTestRecord(t, ms, bs, id, uint8(projectedClass))
+	record, err := ms.GetMemory(context.Background(), id)
+	require.NoError(t, err)
+	canonical, err := bs.ValidateMemoryProjection(record)
+	require.NoError(t, err)
+	require.Equal(t, uint8(projectedClass), canonical.Classification)
+	require.Equal(t, int(canonical.Classification), projectedClass)
+}
+
 func TestListSyncCandidatesSubtreeAndExclusions(t *testing.T) {
 	ctx := context.Background()
-	_, ms, _ := newDrainTestManager(t)
+	_, ms, bs := newDrainTestManager(t)
 
-	seedCommitted(t, ms, "m-hr", "hr", "hr fact")
-	seedCommitted(t, ms, "m-hr-pub", "hr.public", "hr public fact")
-	seedCommitted(t, ms, "m-eng", "eng", "eng fact")         // outside consent
-	seedCommitted(t, ms, "m-queued", "hr", "queued fact")    // already queued
-	seedCommitted(t, ms, "m-copy", "hr", "synced copy fact") // a copy: never re-forward
-	seedCommitted(t, ms, "m-audit", "SAGE-SYNCAUDIT-GRP-ABC", "protocol anchor")
+	seedPublishedCommitted(t, ms, bs, "m-hr", "hr", "hr fact")
+	seedPublishedCommitted(t, ms, bs, "m-hr-pub", "hr.public", "hr public fact")
+	seedPublishedCommitted(t, ms, bs, "m-eng", "eng", "eng fact")         // outside consent
+	seedPublishedCommitted(t, ms, bs, "m-queued", "hr", "queued fact")    // already queued
+	seedPublishedCommitted(t, ms, bs, "m-copy", "hr", "synced copy fact") // a copy: never re-forward
+	seedPublishedCommitted(t, ms, bs, "m-audit", "SAGE-SYNCAUDIT-GRP-ABC", "protocol anchor")
 	_, err := ms.EnqueueSyncOutbox(ctx, "chain-b", "m-queued")
 	require.NoError(t, err)
 	require.NoError(t, ms.RecordSyncOrigin(ctx, store.SyncOrigin{
@@ -93,11 +113,12 @@ func TestListSyncCandidatesSubtreeAndExclusions(t *testing.T) {
 func TestSyncDrainEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	m, ms, bs := newDrainTestManager(t)
+	m.postV23ForNextTx = func() bool { return true }
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
 
-	seedCommitted(t, ms, "m-1", "hr", "first shared fact")
-	seedCommitted(t, ms, "m-2", "hr.public", "second shared fact")
+	seedPublishedCommitted(t, ms, bs, "m-1", "hr", "first shared fact")
+	seedPublishedCommitted(t, ms, bs, "m-2", "hr.public", "second shared fact")
 
 	var pushed []SyncItem
 	m.syncPushFn = func(_ context.Context, chain string, req *SyncPushRequest) (*SyncPushResponse, error) {
@@ -123,6 +144,52 @@ func TestSyncDrainEndToEnd(t *testing.T) {
 	pushed = nil
 	m.syncTick(ctx, ms)
 	assert.Empty(t, pushed)
+}
+
+func TestSyncDrainDefersSQLOnlyProjectionUntilCanonicalPublication(t *testing.T) {
+	ctx := context.Background()
+	m, ms, bs := newDrainTestManager(t)
+	m.postV23ForNextTx = func() bool { return true }
+	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
+	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
+
+	sum := sha256.Sum256([]byte("crash-window fact"))
+	require.NoError(t, seedCommittedMemory(
+		ctx, ms, "m-sql-only", "hr", "crash-window fact", sum[:],
+	))
+
+	pushes := 0
+	m.syncPushFn = func(_ context.Context, _ string, req *SyncPushRequest) (*SyncPushResponse, error) {
+		pushes += len(req.Items)
+		return &SyncPushResponse{}, nil
+	}
+	m.syncTick(ctx, ms)
+	assert.Zero(t, pushes, "an unpublished SQL projection must never cross federation")
+	pending, err := ms.ListSyncOutbox(ctx, "chain-b", store.SyncStatePending, 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "m-sql-only", pending[0].MemoryID)
+	assert.Equal(t, "canonical memory publication pending", pending[0].LastError)
+	assert.Zero(t, pending[0].Attempts, "publication lag must not burn delivery attempts")
+
+	projectedClass, err := ms.GetMemoryClassificationLocal(ctx, "m-sql-only")
+	require.NoError(t, err)
+	publishFederationSQLiteTestRecord(t, ms, bs, "m-sql-only", uint8(projectedClass))
+	require.NoError(t, ms.MarkSyncOutboxRetry(
+		ctx, "chain-b", "m-sql-only", 0, time.Now().Add(-time.Second), "canonical replay completed",
+	))
+	m.syncPushFn = func(_ context.Context, _ string, req *SyncPushRequest) (*SyncPushResponse, error) {
+		pushes += len(req.Items)
+		return &SyncPushResponse{Results: []SyncItemResult{{
+			OriginMemoryID: "m-sql-only",
+			Outcome:        SyncOutcomeAccepted,
+		}}}, nil
+	}
+	m.syncTick(ctx, ms)
+	assert.Equal(t, 1, pushes, "the same outbox row must self-heal after canonical replay")
+	counts, err := ms.CountSyncOutboxByState(ctx, "chain-b")
+	require.NoError(t, err)
+	assert.Equal(t, 1, counts[store.SyncStateDelivered])
 }
 
 func TestReconcileRetiredFederationStatePurgesOnlyDefinitiveRetirement(t *testing.T) {
@@ -245,7 +312,7 @@ func TestSyncDrainV3RequiresCopyGrantAndRecipientSubscription(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	seedCommitted(t, ms, "m-v3", "tii.project", "copy outside the legacy treaty")
+	seedPublishedCommitted(t, ms, bs, "m-v3", "tii.project", "copy outside the legacy treaty")
 	var pushed []SyncItem
 	m.syncPushFn = func(_ context.Context, _ string, req *SyncPushRequest) (*SyncPushResponse, error) {
 		pushed = append(pushed, req.Items...)
@@ -265,7 +332,7 @@ func TestSyncDrainV3RequiresCopyGrantAndRecipientSubscription(t *testing.T) {
 		{Domain: "tii", Read: true},
 	})
 	require.NoError(t, err)
-	seedCommitted(t, ms, "m-no-copy", "tii.project", "copy permission revoked")
+	seedPublishedCommitted(t, ms, bs, "m-no-copy", "tii.project", "copy permission revoked")
 	pushed = nil
 	m.syncTick(ctx, ms)
 	assert.Empty(t, pushed)
@@ -278,7 +345,7 @@ func TestSyncDrainV3RequiresCopyGrantAndRecipientSubscription(t *testing.T) {
 	_, err = ms.ApplyRemoteDirectionalSyncPolicy(ctx, "chain-b", "epoch-v3",
 		SyncPolicyVersionPeerRBAC, 2, "remote-2", nil, nil)
 	require.NoError(t, err)
-	seedCommitted(t, ms, "m-no-subscribe", "tii.project", "recipient unsubscribed")
+	seedPublishedCommitted(t, ms, bs, "m-no-subscribe", "tii.project", "recipient unsubscribed")
 	pushed = nil
 	m.syncTick(ctx, ms)
 	assert.Empty(t, pushed)
@@ -327,7 +394,7 @@ func TestSyncDrainReplicatesMemoryTags(t *testing.T) {
 	m, ms, bs := newDrainTestManager(t)
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
-	seedCommitted(t, ms, "m-tags", "hr", "tagged shared fact")
+	seedPublishedCommitted(t, ms, bs, "m-tags", "hr", "tagged shared fact")
 	require.NoError(t, ms.SetTags(ctx, "m-tags", []string{"eurorack", "oscillator"}))
 	require.NoError(t, func() error { _, err := ms.EnqueueSyncOutbox(ctx, "chain-b", "m-tags"); return err }())
 
@@ -346,7 +413,7 @@ func TestSyncDrainerStopWaitsAndRecoversClaim(t *testing.T) {
 	m, ms, bs := newDrainTestManager(t)
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
-	seedCommitted(t, ms, "m-stop", "hr", "shutdown-safe fact")
+	seedPublishedCommitted(t, ms, bs, "m-stop", "hr", "shutdown-safe fact")
 	entered := make(chan struct{})
 	m.syncPushFn = func(ctx context.Context, _ string, _ *SyncPushRequest) (*SyncPushResponse, error) {
 		close(entered)
@@ -380,7 +447,7 @@ func TestSyncPolicyRemovalWaitsForInflightPush(t *testing.T) {
 	m, ms, bs := newDrainTestManager(t)
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
-	seedCommitted(t, ms, "m-policy-race", "hr", "policy race fact")
+	seedPublishedCommitted(t, ms, bs, "m-policy-race", "hr", "policy race fact")
 	m.syncScan(ctx, ms, mustDrainAgreement(t, m, "chain-b"), []string{"hr"})
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -420,7 +487,7 @@ func TestSyncDataWaitsForHostPolicyAcknowledgement(t *testing.T) {
 	// Simulate a widened host snapshot that has not reached the guest yet.
 	_, err := ms.ApplySyncPolicy(ctx, "chain-b", "epoch", 1, "hash", []string{"hr"})
 	require.NoError(t, err)
-	seedCommitted(t, ms, "m-policy-first", "hr", "policy must arrive first")
+	seedPublishedCommitted(t, ms, bs, "m-policy-first", "hr", "policy must arrive first")
 	m.syncScan(ctx, ms, mustDrainAgreement(t, m, "chain-b"), []string{"hr"})
 	pushes := 0
 	m.syncPushFn = func(_ context.Context, _ string, _ *SyncPushRequest) (*SyncPushResponse, error) {
@@ -452,9 +519,9 @@ func TestSyncDrainOutcomeMapping(t *testing.T) {
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
 
-	seedCommitted(t, ms, "m-ok", "hr", "accepted fact")
-	seedCommitted(t, ms, "m-dup", "hr", "cross domain dup fact")
-	seedCommitted(t, ms, "m-retry", "hr", "retry fact")
+	seedPublishedCommitted(t, ms, bs, "m-ok", "hr", "accepted fact")
+	seedPublishedCommitted(t, ms, bs, "m-dup", "hr", "cross domain dup fact")
+	seedPublishedCommitted(t, ms, bs, "m-retry", "hr", "retry fact")
 
 	m.syncPushFn = func(_ context.Context, _ string, req *SyncPushRequest) (*SyncPushResponse, error) {
 		results := make([]SyncItemResult, len(req.Items))
@@ -499,7 +566,7 @@ func TestSyncDrainUnsupportedPeerParksRows(t *testing.T) {
 	m, ms, bs := newDrainTestManager(t)
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
-	seedCommitted(t, ms, "m-1", "hr", "fact for old peer")
+	seedPublishedCommitted(t, ms, bs, "m-1", "hr", "fact for old peer")
 
 	m.syncPushFn = func(_ context.Context, _ string, _ *SyncPushRequest) (*SyncPushResponse, error) {
 		return nil, ErrSyncUnsupported
@@ -513,16 +580,17 @@ func TestSyncDrainUnsupportedPeerParksRows(t *testing.T) {
 	assert.True(t, pending[0].NextAttemptAt.After(time.Now().Add(50*time.Minute)), "1h floor backoff")
 }
 
-func TestSyncDrainSendTimeGates(t *testing.T) {
+func TestSyncDrainSendTimeGatesFailClosedOnProjectionMutation(t *testing.T) {
 	ctx := context.Background()
 	m, ms, bs := newDrainTestManager(t)
+	m.postV23ForNextTx = func() bool { return true }
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
 
 	// Queue a row whose memory then gets re-domained out of scope, and one
 	// whose classification is raised above the ceiling.
-	seedCommitted(t, ms, "m-moved", "hr", "will be re-domained")
-	seedCommitted(t, ms, "m-secret", "hr", "will be reclassified")
+	seedPublishedCommitted(t, ms, bs, "m-moved", "hr", "will be re-domained")
+	seedPublishedCommitted(t, ms, bs, "m-secret", "hr", "will be reclassified")
 	_, err := ms.EnqueueSyncOutbox(ctx, "chain-b", "m-moved")
 	require.NoError(t, err)
 	_, err = ms.EnqueueSyncOutbox(ctx, "chain-b", "m-secret")
@@ -541,9 +609,14 @@ func TestSyncDrainSendTimeGates(t *testing.T) {
 	m.syncTick(ctx, ms)
 
 	assert.Zero(t, pushes, "both rows must be dropped at send time, never pushed")
-	rejected, err := ms.ListSyncOutbox(ctx, "chain-b", store.SyncStateRejected, 10)
+	pending, err := ms.ListSyncOutbox(ctx, "chain-b", store.SyncStatePending, 10)
 	require.NoError(t, err)
-	assert.Len(t, rejected, 2)
+	require.Len(t, pending, 2)
+	for _, row := range pending {
+		assert.Contains(t, row.LastError, "canonical",
+			"projection divergence must remain retryable for consensus repair")
+		assert.Zero(t, row.Attempts)
+	}
 }
 
 func TestSyncDeliveringRowsRecoverOnStartup(t *testing.T) {
@@ -579,7 +652,7 @@ func TestSyncBringUpRaceSelfHeals(t *testing.T) {
 	m, ms, bs := newDrainTestManager(t)
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
-	seedCommitted(t, ms, "m-early", "hr", "pushed before peer consented")
+	seedPublishedCommitted(t, ms, bs, "m-early", "hr", "pushed before peer consented")
 
 	// Round 1: the receiver has not configured consent yet -> not_consented.
 	consented := false
@@ -619,7 +692,7 @@ func TestSyncAttemptsCapFailsRow(t *testing.T) {
 	m, ms, bs := newDrainTestManager(t)
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
-	seedCommitted(t, ms, "m-stuck", "hr", "peer keeps saying retry")
+	seedPublishedCommitted(t, ms, bs, "m-stuck", "hr", "peer keeps saying retry")
 
 	m.syncPushFn = func(_ context.Context, _ string, req *SyncPushRequest) (*SyncPushResponse, error) {
 		results := make([]SyncItemResult, len(req.Items))
@@ -651,7 +724,7 @@ func TestSyncOfflinePeerNeverGivesUp(t *testing.T) {
 	m, ms, bs := newDrainTestManager(t)
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
-	seedCommitted(t, ms, "m-away", "hr", "written while the peer was offline")
+	seedPublishedCommitted(t, ms, bs, "m-away", "hr", "written while the peer was offline")
 
 	// Peer is unreachable: SyncPush returns a transport error every time.
 	m.syncPushFn = func(_ context.Context, _ string, _ *SyncPushRequest) (*SyncPushResponse, error) {
@@ -686,8 +759,8 @@ func TestSyncResultsMatchedByOriginNotIndex(t *testing.T) {
 	m, ms, bs := newDrainTestManager(t)
 	seedDrainAgreement(t, bs, "chain-b", 2, "hr")
 	require.NoError(t, ms.SetSyncDomains(ctx, "chain-b", []string{"hr"}))
-	seedCommitted(t, ms, "aaa", "hr", "first")
-	seedCommitted(t, ms, "bbb", "hr", "second")
+	seedPublishedCommitted(t, ms, bs, "aaa", "hr", "first")
+	seedPublishedCommitted(t, ms, bs, "bbb", "hr", "second")
 
 	// Peer returns results in REVERSED order with distinct outcomes: aaa
 	// accepted, bbb cross-domain-dup. Index-based mapping would swap them.

@@ -37,11 +37,16 @@ type MCPTokenInfo struct {
 }
 
 // MCPTokenLookupFn is a function adapter so callers can wire the SQLite
-// store's method without forcing the interface above on it. It returns the
-// resolved agent ID and, for a KEYED token, the per-token ed25519 signing key so
-// downstream REST calls sign as the token's OWN on-chain identity. A nil signer
-// means a legacy keyless token — the caller falls back to the node operator key.
-type MCPTokenLookupFn func(ctx context.Context, tokenSHA256 string) (agentID string, signer ed25519.PrivateKey, err error)
+// store's method without forcing the interface above on it. The bearer
+// plaintext remains transient at this authentication boundary and permits an
+// unencrypted app-v23 node to unlock only that token's bearer-derived AEAD
+// envelope. The SHA-256 digest remains the indexed database lookup key and
+// safe request fingerprint. Implementations must never persist or return the
+// plaintext. A nil signer means a legacy pre-v23 keyless token.
+type MCPTokenLookupFn func(
+	ctx context.Context,
+	bearerPlaintext, tokenSHA256 string,
+) (agentID string, signer ed25519.PrivateKey, err error)
 
 type mcpTokenFingerprintKeyType struct{}
 
@@ -76,9 +81,9 @@ func ContextMCPSigner(ctx context.Context) ed25519.PrivateKey {
 //
 // The lookup callback is responsible for consulting the storage layer and
 // returning the agent ID associated with the token (or an error). Storage
-// implementations should hash the token before lookup; the middleware
-// passes the SHA-256 hex digest already, so the callback works directly
-// against the persisted form.
+// implementations receive both the transient bearer and its SHA-256 hex
+// digest. The digest is safe for lookup/session binding; the plaintext exists
+// only long enough to unlock a bearer-derived token-key envelope.
 //
 // If the lookup returns ErrTokenRevoked (sentinel forwarded from the store),
 // we 401. Any other store error 500s — which prevents accidentally
@@ -129,7 +134,7 @@ func MCPBearerAuthMiddleware(lookup MCPTokenLookupFn) func(http.Handler) http.Ha
 			digest := sha256.Sum256([]byte(token))
 			digestHex := hex.EncodeToString(digest[:])
 
-			agentID, signer, err := lookup(r.Context(), digestHex)
+			agentID, signer, err := lookup(r.Context(), token, digestHex)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					writeMCPUnauthorized(w, r, "Invalid bearer token",

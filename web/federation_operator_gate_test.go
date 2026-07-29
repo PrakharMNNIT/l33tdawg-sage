@@ -31,6 +31,31 @@ func TestFederationOperatorGateAllowsAuthenticatedHeaderlessLoopbackWebView(t *t
 	}
 }
 
+func TestFederationOperatorGateAllowsUnencryptedLoopbackSameOriginCEREBRUM(t *testing.T) {
+	for _, host := range []string{"localhost:8080", "127.0.0.1:8080", "[::1]:8080"} {
+		t.Run(host, func(t *testing.T) {
+			h, _ := newTestHandler(t)
+			req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/settings/federation", nil)
+			req.Host = host
+			req.RemoteAddr = "127.0.0.1:54321"
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			switch host {
+			case "[::1]:8080":
+				req.Header.Set("Origin", "http://[::1]:8080")
+			default:
+				req.Header.Set("Origin", "http://"+host)
+			}
+			w := httptest.NewRecorder()
+
+			h.federationOperatorGate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})).ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusNoContent, w.Code, w.Body.String())
+		})
+	}
+}
+
 func TestFederationOperatorGateRejectsUnsafeHeaderlessRequests(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -38,6 +63,8 @@ func TestFederationOperatorGateRejectsUnsafeHeaderlessRequests(t *testing.T) {
 		session    string
 		host       string
 		remoteAddr string
+		origin     string
+		secFetch   string
 	}{
 		{
 			name:       "missing session",
@@ -53,24 +80,28 @@ func TestFederationOperatorGateRejectsUnsafeHeaderlessRequests(t *testing.T) {
 			remoteAddr: "127.0.0.1:54321",
 		},
 		{
-			name:       "unencrypted node",
+			name:       "unencrypted unsigned process",
 			session:    "valid-webview-session",
 			host:       "localhost:8080",
 			remoteAddr: "127.0.0.1:54321",
 		},
 		{
-			name:       "non-loopback source",
+			name:       "encrypted LAN browser with valid session",
 			encrypted:  true,
 			session:    "valid-webview-session",
 			host:       "192.168.1.10:8080",
 			remoteAddr: "192.168.1.20:54321",
+			origin:     "http://192.168.1.10:8080",
+			secFetch:   "same-origin",
 		},
 		{
-			name:       "dns rebinding host",
+			name:       "encrypted DNS rebinding browser with valid session",
 			encrypted:  true,
 			session:    "valid-webview-session",
 			host:       "attacker.example:8080",
 			remoteAddr: "127.0.0.1:54321",
+			origin:     "http://attacker.example:8080",
+			secFetch:   "same-origin",
 		},
 	}
 
@@ -85,6 +116,12 @@ func TestFederationOperatorGateRejectsUnsafeHeaderlessRequests(t *testing.T) {
 			req.RemoteAddr = tt.remoteAddr
 			if tt.session != "" {
 				req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: tt.session})
+			}
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+			if tt.secFetch != "" {
+				req.Header.Set("Sec-Fetch-Site", tt.secFetch)
 			}
 			w := httptest.NewRecorder()
 

@@ -224,7 +224,7 @@ func (s *Server) handleCoCommitSubmit(w http.ResponseWriter, r *http.Request) {
 		CoCommitSubmit: env,
 	}
 	s.embedAgentAuth(r.Context(), submitTx)
-	if signErr := tx.SignTx(submitTx, s.signingKey); signErr != nil {
+	if signErr := s.signTx(submitTx); signErr != nil {
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
 	}
@@ -276,8 +276,9 @@ func (s *Server) handleCoCommitReceiptSend(w http.ResponseWriter, r *http.Reques
 		writeProblem(w, http.StatusNotImplemented, "Federation disabled", "The federation transport is not wired on this node.")
 		return
 	}
-	// Receipt delivery pushes an operator-key-signed receipt to peers; it has no
-	// other authz, so gate it to the node operator (consistent with peer status).
+	// Receipt delivery pushes a stable transport-key-signed receipt to peers.
+	// Local control follows the historical operator before app-v23 and current
+	// local Root/Admin after app-v23 (consistent with peer status).
 	if !s.requireNodeOperator(w, r) {
 		return
 	}

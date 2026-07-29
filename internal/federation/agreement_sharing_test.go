@@ -3,6 +3,8 @@ package federation
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 )
 
@@ -230,16 +233,16 @@ func TestUpdateAgreementSharingCannotReactivateConcurrentRevoke(t *testing.T) {
 	}
 }
 
-func TestUpdateAgreementSharingNarrowingWaitsForLegacyQueryResponse(t *testing.T) {
+func TestUpdateAgreementSharingNarrowingWaitsForV23QueryResponse(t *testing.T) {
 	m, ss, bs := newDrainTestManager(t)
 	peerID := newPeerOperatorID(t)
-	pin := bytes.Repeat([]byte{0x68}, 32)
-	if err := bs.SetCrossFed("chain-peer", "https://peer.example:8444", pin,
-		4, 0, []string{"legacy"}, nil, "active"); err != nil {
-		t.Fatal(err)
-	}
-	oldAgreement, err := m.ActiveAgreement("chain-peer")
-	if err != nil {
+	oldAgreement := configurePeerRBACConnection(
+		t, m, ss, bs, "chain-peer", peerID, "host", []string{"legacy"}, 4,
+	)
+	if _, err := m.ReplacePeerRBACPolicy(
+		context.Background(), "chain-peer",
+		[]store.PeerRBACDomainPermission{{Domain: "legacy", Read: true}},
+	); err != nil {
 		t.Fatal(err)
 	}
 	seedCommitted(t, ss, "legacy-leased-memory", "legacy.shared", "legacy leased response")
@@ -247,16 +250,17 @@ func TestUpdateAgreementSharingNarrowingWaitsForLegacyQueryResponse(t *testing.T
 		t.Fatal(classificationErr)
 	}
 
-	body, err := json.Marshal(QueryRequest{
-		Mode: ModeText, Query: "leased", DomainTag: "legacy.shared", TopK: 10,
+	req := peerRBACV23Request(
+		t, m, ss, oldAgreement, "chain-peer", peerID, peerID,
+		"legacy.shared", "leased",
+	)
+	m.SetRootKeyResolver(func(credentialID string) (ed25519.PrivateKey, bool) {
+		return m.agentKey, credentialID == hex.EncodeToString(m.agentPub)
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/fed/v1/query", bytes.NewReader(body))
-	req = req.WithContext(context.WithValue(req.Context(), peerCtxKey{}, &peerIdentity{
-		ChainID: "chain-peer", AgentID: peerID, Agreement: oldAgreement,
-	}))
+	staleAfterNarrowing := peerRBACV23Request(
+		t, m, ss, oldAgreement, "chain-peer", peerID, peerID,
+		"legacy.shared", "leased",
+	)
 	bw := newBlockingResponseWriter()
 	queryDone := make(chan struct{})
 	go func() {
@@ -266,7 +270,7 @@ func TestUpdateAgreementSharingNarrowingWaitsForLegacyQueryResponse(t *testing.T
 	select {
 	case <-bw.entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("legacy query did not reach its response write")
+		t.Fatal("v23 query did not reach its response write")
 	}
 
 	broadcastEntered := make(chan struct{})
@@ -305,7 +309,7 @@ func TestUpdateAgreementSharingNarrowingWaitsForLegacyQueryResponse(t *testing.T
 	select {
 	case <-queryDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("legacy query did not finish after its response was released")
+		t.Fatal("v23 query did not finish after its response was released")
 	}
 	var updateErr error
 	if !earlyReturn {
@@ -323,16 +327,13 @@ func TestUpdateAgreementSharingNarrowingWaitsForLegacyQueryResponse(t *testing.T
 		t.Fatalf("agreement narrowing: %v", updateErr)
 	}
 	if bw.status != http.StatusOK {
-		t.Fatalf("in-flight legacy query status=%d, want 200", bw.status)
+		t.Fatalf("in-flight v23 query status=%d, want 200", bw.status)
 	}
 
-	newAgreement, err := m.ActiveAgreement("chain-peer")
-	if err != nil {
-		t.Fatal(err)
-	}
-	denied := peerRBACQuery(t, m, newAgreement, "chain-peer", peerID, "legacy.shared", "leased")
+	denied := httptest.NewRecorder()
+	m.handleQuery(denied, staleAfterNarrowing)
 	if denied.Code != http.StatusForbidden {
-		t.Fatalf("post-narrow legacy query status=%d want 403; body=%s", denied.Code, denied.Body.String())
+		t.Fatalf("post-narrow stale v23 query status=%d want 403; body=%s", denied.Code, denied.Body.String())
 	}
 }
 

@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class MemoryType(str, Enum):
@@ -105,21 +105,66 @@ class MemoryRecord(BaseModel):
 class MemorySubmitRequest(BaseModel):
     content: str
     memory_type: MemoryType
-    domain_tag: str
+    domain_tag: str | None
     confidence_score: float = Field(ge=0, le=1)
     embedding: list[float] | None = None
     knowledge_triples: list[KnowledgeTriple] | None = None
     parent_hash: str | None = None
     tags: list[str] | None = None
+    provider: str | None = None
+    task_status: TaskStatus | None = None
+    linked_memories: list[str] | None = None
+    idempotency_key: str | None = None
     # Per-record clearance level 0-4 (PUBLIC, INTERNAL, CONFIDENTIAL, SECRET,
     # TOP SECRET). When omitted the server stores the memory as PUBLIC (0).
     classification: int | None = None
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not 1 <= len(value.encode("utf-8")) <= 128:
+            raise ValueError("idempotency_key must contain 1-128 bytes")
+        if any(ord(char) < 0x21 or ord(char) > 0x7E for char in value):
+            raise ValueError(
+                "idempotency_key must contain only visible ASCII without spaces"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_submission_shape(self) -> MemorySubmitRequest:
+        if self.memory_type != MemoryType.task and not self.domain_tag:
+            raise ValueError("domain_tag is required for non-task memories")
+        if self.memory_type != MemoryType.task:
+            if self.task_status is not None:
+                raise ValueError("task_status is supported only for task memories")
+            if self.idempotency_key is not None:
+                raise ValueError("idempotency_key is supported only for task memories")
+        else:
+            if self.task_status not in (None, TaskStatus.planned):
+                raise ValueError("new tasks must enter consensus as planned")
+            if self.knowledge_triples or self.linked_memories:
+                raise ValueError(
+                    "app-v23 tasks cannot include knowledge_triples or linked_memories"
+                )
+        return self
 
 
 class MemorySubmitResponse(BaseModel):
     memory_id: str
     tx_hash: str
     status: str
+    task_status: str | None = None
+    committed: bool | None = None
+    committed_height: int | None = None
+    projection_confirmed: bool | None = None
+    retryable: bool | None = None
+    message: str | None = None
+    idempotency_key: str | None = None
+    idempotent_replay: bool = False
+    embedding_provider: str | None = None
+    embedding_queued: bool = False
 
 
 class MemoryQueryRequest(BaseModel):
@@ -132,10 +177,20 @@ class MemoryQueryRequest(BaseModel):
     tags: list[str] | None = None
 
 
+class FilterInfo(BaseModel):
+    by: list[str] = Field(default_factory=list)
+    # Legacy/pre-app-v23 nodes may expose these counts. App-v23 nodes omit
+    # denied/raw inventory counts.
+    total_before_filter: int | None = None
+    visible: int | None = None
+    hidden_count: int | None = None
+
+
 class MemoryQueryResponse(BaseModel):
     results: list[MemoryRecord]
     next_cursor: str | None = None
     total_count: int
+    filtered: FilterInfo | None = None
 
 
 class MemoryListResponse(BaseModel):
@@ -143,6 +198,9 @@ class MemoryListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+    has_more: bool | None = None
+    total_exact: bool | None = None
+    filtered: FilterInfo | None = None
 
 
 class TimelineBucket(BaseModel):
@@ -153,6 +211,7 @@ class TimelineBucket(BaseModel):
 
 class TimelineResponse(BaseModel):
     buckets: list[TimelineBucket]
+    total: int
 
 
 class TaskRecord(BaseModel):
@@ -162,6 +221,9 @@ class TaskRecord(BaseModel):
     task_status: str
     confidence_score: float
     created_at: datetime
+    assignee: str | None = None
+    task_picked_up_by: str | None = None
+    task_picked_up_at: datetime | None = None
 
 
 class TaskListResponse(BaseModel):

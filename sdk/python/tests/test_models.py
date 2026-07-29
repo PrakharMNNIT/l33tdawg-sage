@@ -169,6 +169,156 @@ def test_submit_request_valid():
     assert req.content == "Test memory content"
 
 
+def test_submit_request_allows_app_v23_task_home_domain_omission():
+    from sage_sdk.models import MemorySubmitRequest
+
+    req = MemorySubmitRequest(
+        content="Check the HDMI port",
+        memory_type="task",
+        domain_tag=None,
+        confidence_score=0.9,
+    )
+    assert "domain_tag" not in req.model_dump(exclude_none=True)
+
+
+def test_submit_request_rejects_non_task_domain_omission():
+    from sage_sdk.models import MemorySubmitRequest
+
+    with pytest.raises(Exception):
+        MemorySubmitRequest(
+            content="A fact still needs an exact domain",
+            memory_type="fact",
+            domain_tag=None,
+            confidence_score=0.9,
+        )
+
+
+def test_submit_request_validates_task_idempotency_shape():
+    from sage_sdk.models import MemorySubmitRequest
+
+    req = MemorySubmitRequest(
+        content="Check the HDMI port",
+        memory_type="task",
+        domain_tag="hardware",
+        confidence_score=0.9,
+        idempotency_key="check-hdmi-2026-08-01",
+        task_status="planned",
+    )
+    assert req.idempotency_key == "check-hdmi-2026-08-01"
+
+    with pytest.raises(Exception):
+        MemorySubmitRequest(
+            content="Check the HDMI port",
+            memory_type="task",
+            domain_tag="hardware",
+            confidence_score=0.9,
+            idempotency_key="contains a space",
+        )
+
+    with pytest.raises(Exception):
+        MemorySubmitRequest(
+            content="Check the HDMI port",
+            memory_type="task",
+            domain_tag="hardware",
+            confidence_score=0.9,
+            task_status="in_progress",
+        )
+
+    with pytest.raises(Exception):
+        MemorySubmitRequest(
+            content="Check the HDMI port",
+            memory_type="task",
+            domain_tag="hardware",
+            confidence_score=0.9,
+            linked_memories=["memory-1"],
+        )
+
+
+def test_submit_response_preserves_app_v23_durability_fields():
+    from sage_sdk.models import MemorySubmitResponse
+
+    response = MemorySubmitResponse.model_validate(
+        {
+            "memory_id": "task-1",
+            "tx_hash": "abc123",
+            "status": "committed_unconfirmed",
+            "task_status": "planned",
+            "committed": True,
+            "committed_height": 99,
+            "projection_confirmed": False,
+            "retryable": False,
+            "message": "Reconcile this memory_id; do not resubmit the task.",
+            "idempotency_key": "mcp-derived",
+            "idempotent_replay": True,
+        }
+    )
+    assert response.committed is True
+    assert response.projection_confirmed is False
+    assert response.retryable is False
+    assert response.idempotent_replay is True
+
+
+def test_list_response_preserves_authorization_safe_pagination(sample_memory):
+    from sage_sdk.models import MemoryListResponse
+
+    response = MemoryListResponse.model_validate(
+        {
+            "memories": [sample_memory],
+            "total": 2,
+            "limit": 1,
+            "offset": 0,
+            "has_more": True,
+            "total_exact": False,
+            "filtered": {"by": ["rbac_submitting_agents"]},
+        }
+    )
+    assert response.has_more is True
+    assert response.total_exact is False
+    assert response.filtered is not None
+    assert response.filtered.hidden_count is None
+
+
+def test_timeline_response_preserves_visible_total():
+    from sage_sdk.models import TimelineResponse
+
+    response = TimelineResponse.model_validate(
+        {
+            "buckets": [
+                {
+                    "period": "2026-07-30T01:00:00Z",
+                    "count": 2,
+                    "domain": "hardware",
+                }
+            ],
+            "total": 2,
+        }
+    )
+    assert response.total == 2
+    assert response.buckets[0].count == 2
+    assert response.buckets[0].domain == "hardware"
+
+
+def test_task_record_preserves_assignment_fields():
+    from sage_sdk.models import TaskRecord
+
+    task = TaskRecord.model_validate(
+        {
+            "memory_id": "task-1",
+            "content": "Check HDMI",
+            "domain_tag": "hardware",
+            "task_status": "in_progress",
+            "confidence_score": 0.9,
+            "created_at": "2026-07-30T00:00:00Z",
+            "assignee": "a" * 64,
+            "task_picked_up_by": "a" * 64,
+            "task_picked_up_at": "2026-07-30T00:01:00Z",
+        }
+    )
+    assert task.assignee == "a" * 64
+    assert task.task_picked_up_by == "a" * 64
+    assert task.task_picked_up_at is not None
+
+
 def test_gov_proposal_parses_created_at():
     # The server stamps governance_proposals.created_at (NOT NULL DEFAULT
     # RFC3339) and emits it as `created_at` on both the list

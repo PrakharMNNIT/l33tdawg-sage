@@ -200,6 +200,8 @@ func TestHandleEmbed_ModelerReportsActualModel(t *testing.T) {
 
 	assert.Equal(t, "Alibaba-NLP/gte-Qwen2-1.5B-instruct", resp.Model,
 		"/v1/embed must report the provider's actual model, not the hardcoded default")
+	assert.Equal(t, "ollama:Alibaba-NLP/gte-Qwen2-1.5B-instruct:1536", resp.EmbeddingProvider,
+		"/v1/embed must report the exact vector-space identifier the caller signs")
 	assert.Equal(t, 1536, resp.Dimension)
 }
 
@@ -228,4 +230,5 @@ func TestHandleEmbed_FallsBackForNonModeler(t *testing.T) {
 
 	assert.Equal(t, "nomic-embed-text", resp.Model,
 		"non-Modeler provider must preserve the legacy default model string")
+	assert.Equal(t, "hash", resp.EmbeddingProvider)
 }

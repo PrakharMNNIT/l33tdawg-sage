@@ -24,8 +24,13 @@ test('release-facing version metadata stays aligned', () => {
   const exact = [
     ['sdk/python/pyproject.toml', `version = "${version}"`],
     ['sdk/python/src/sage_sdk/__init__.py', `__version__ = "${version}"`],
+    ['api/openapi.yaml', `version: ${version}`],
+    ['desktop/sage-shell/Cargo.toml', `version = "${version}"`],
+    ['desktop/sage-shell/Cargo.lock', `name = "sage-shell"\nversion = "${version}"`],
+    ['desktop/sage-shell/tauri.conf.json', `"version": "${version}"`],
     ['web/static/js/app.js', `const SAGE_VERSION = 'v${version}';`],
     ['README.md', `## What's New in v${version}`],
+    ['README.md', 'App-v23 replaces capability-bit administration'],
     ['README.md', `SDK ${version}.`],
     ['README.md', `ghcr.io/l33tdawg/sage:${version}`],
     ['sdk/python/README.md', `SAGE v${version} SDK`],
@@ -37,6 +42,8 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/reference/python-sdk.md', `Version:** ${version}`],
     ['docs/reference/rest-api.md', `Reconciled through SAGE v${version}`],
     ['docs/reference/concepts/rbac-orgs-federation.md', `reconciled through SAGE v${version}`],
+    ['docs/reference/app-v23-access-control-design.md', `SAGE v${version}`],
+    ['internal/abci/app.go', 'const maxSupportedAppVersion uint64 = 23'],
     [
       'docs/ROADMAP.md',
       version.includes('-')
@@ -46,5 +53,79 @@ test('release-facing version metadata stays aligned', () => {
   ];
   for (const [path, marker] of exact) {
     assert.ok(read(path).includes(marker), `${path} is missing current version marker: ${marker}`);
+  }
+});
+
+test('v11.15 app-v23 public contract markers stay release-visible', () => {
+  const openapi = read('api/openapi.yaml');
+  for (const marker of [
+    'committed_unconfirmed',
+    'projection_confirmed:',
+    'idempotent_replay:',
+    'DomainWriteDeniedProblem:',
+    'has_more:',
+    'total_exact:',
+    'receipts are explicitly deferred to v11.16.',
+  ]) {
+    assert.ok(openapi.includes(marker), `OpenAPI is missing app-v23 contract marker: ${marker}`);
+  }
+
+  const readme = read('README.md');
+  const environment = read('docs/reference/environment-variables.md');
+  assert.match(readme, /Mynah has no released legacy population/);
+  assert.doesNotMatch(readme, /Existing installations stranded by app-v22/);
+  assert.doesNotMatch(environment, /appv23_vendored_repair\.go/);
+  assert.match(environment, /not an upgraded-node repair selector/);
+});
+
+test('hybrid expansion authorization contract stays release-visible', () => {
+  const section = (path, start, end) => {
+    const body = read(path);
+    const from = body.indexOf(start);
+    assert.notEqual(from, -1, `${path} is missing contract section start: ${start}`);
+    const to = body.indexOf(end, from + start.length);
+    assert.notEqual(to, -1, `${path} is missing contract section end: ${end}`);
+    return body.slice(from, to);
+  };
+  const hybridSchema = section(
+    'api/openapi.yaml',
+    '    MemoryHybridRequest:',
+    '    FilterInfo:',
+  );
+  const hybridRoute = section(
+    'api/openapi.yaml',
+    '  /v1/memory/hybrid:',
+    '  /v1/memory/list:',
+  );
+
+  assert.match(hybridSchema, /expansions:\n\s+type: array\n\s+maxItems: 8/);
+  assert.match(hybridSchema, /one 8,192-candidate live\s+authorization budget is shared/);
+  assert.match(hybridRoute, /never returns a 200\s+response containing partial fused results/);
+
+  for (const [path, contract] of [
+    [
+      'docs/reference/rest-api.md',
+      section('docs/reference/rest-api.md', '### `POST /v1/memory/hybrid`', '### `GET /v1/memory/{memory_id}`'),
+    ],
+    [
+      'docs/reference/python-sdk.md',
+      section('docs/reference/python-sdk.md', '#### `hybrid()`', '#### `get_memory()`'),
+    ],
+    [
+      'docs/reference/mcp-tools.md',
+      section('docs/reference/mcp-tools.md', '### sage_turn', '### sage_reflect'),
+    ],
+    [
+      'sdk/python/README.md',
+      section(
+        'sdk/python/README.md',
+        '# Hybrid BM25/vector recall with optional query expansions',
+        '# Get a single memory',
+      ),
+    ],
+  ]) {
+    assert.match(contract, /at most (?:eight|8)/i, `${path} is missing the expansion cap`);
+    assert.match(contract, /8,192/, `${path} is missing the aggregate authorization budget`);
+    assert.match(contract, /partial/i, `${path} is missing fail-closed partial-result semantics`);
   }
 });

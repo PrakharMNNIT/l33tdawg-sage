@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 )
 
@@ -77,7 +78,7 @@ func (s *Server) handleDeptRegister(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), deptTx)
 
-	err = tx.SignTx(deptTx, s.signingKey)
+	err = s.signTx(deptTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign dept register tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -172,6 +173,9 @@ func (s *Server) handleDeptAddMember(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing agent ID", "agent_id is required")
 		return
 	}
+	if s.rejectAppV23RootAgentTarget(w, req.AgentID) {
+		return
+	}
 	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
 		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 department membership changes require a global admin.")
 		return
@@ -201,7 +205,7 @@ func (s *Server) handleDeptAddMember(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), addTx)
 
-	err = tx.SignTx(addTx, s.signingKey)
+	err = s.signTx(addTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign dept add member tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -236,6 +240,9 @@ func (s *Server) handleDeptRemoveMember(w http.ResponseWriter, r *http.Request) 
 		writeProblem(w, http.StatusBadRequest, "Missing parameters", "org_id, dept_id, and agent_id path parameters are required")
 		return
 	}
+	if s.rejectAppV23RootAgentTarget(w, agentToRemove) {
+		return
+	}
 	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
 		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 department membership changes require a global admin.")
 		return
@@ -254,7 +261,7 @@ func (s *Server) handleDeptRemoveMember(w http.ResponseWriter, r *http.Request) 
 
 	s.embedAgentAuth(r.Context(), removeTx)
 
-	err := tx.SignTx(removeTx, s.signingKey)
+	err := s.signTx(removeTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign dept remove member tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -302,5 +309,21 @@ func (s *Server) handleListDeptMembers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, members)
+	filtered := make([]*store.DeptMemberEntry, 0, len(members))
+	for _, member := range members {
+		if member == nil {
+			continue
+		}
+		isRoot, rootErr := s.appV23IsRootIdentity(member.AgentID)
+		if rootErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current CEREBRUM Root state is unavailable.")
+			return
+		}
+		if isRoot {
+			continue
+		}
+		filtered = append(filtered, member)
+	}
+	writeJSON(w, http.StatusOK, filtered)
 }

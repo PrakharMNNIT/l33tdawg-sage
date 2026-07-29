@@ -992,14 +992,7 @@ func loadOrGenerateKey(path string) (ed25519.PrivateKey, error) {
 		if err != nil {
 			return nil, err
 		}
-		switch len(data) {
-		case ed25519.SeedSize:
-			return ed25519.NewKeyFromSeed(data), nil
-		case ed25519.PrivateKeySize:
-			return ed25519.PrivateKey(data), nil
-		default:
-			return nil, fmt.Errorf("invalid key file size: %d bytes (expected 32 or 64)", len(data))
-		}
+		return decodeEd25519PrivateKey(data)
 	}
 	key, err := readKey()
 	if err == nil {

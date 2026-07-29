@@ -46,6 +46,17 @@ type ScopedProjectionStatus struct {
 	Detail   string `json:"detail,omitempty"`
 }
 
+// VendoredAgentEnrollmentStatus reports whether an explicitly configured
+// first-party companion has its exact committed app-v23 policy. A configured
+// companion is a serving dependency: advertising readiness while it remains
+// mute would hide a broken installation behind an otherwise healthy node.
+type VendoredAgentEnrollmentStatus struct {
+	Checked  bool   `json:"checked"`
+	Required bool   `json:"required"`
+	OK       bool   `json:"ok"`
+	State    string `json:"state,omitempty"`
+}
+
 // HealthChecker tracks the health status of dependencies.
 type HealthChecker struct {
 	postgresOK atomic.Bool
@@ -53,6 +64,7 @@ type HealthChecker struct {
 	embedder   atomic.Value // EmbedderStatus, set by SetEmbedderHealth
 	voter      atomic.Value // VoterStatus, set by SetVoterStatus
 	scoped     atomic.Value // ScopedProjectionStatus, set by recovery wiring
+	vendored   atomic.Value // VendoredAgentEnrollmentStatus, set by bootstrap/repair wiring
 	Version    string
 }
 
@@ -107,6 +119,21 @@ func (h *HealthChecker) scopedProjectionStatus() ScopedProjectionStatus {
 	return ScopedProjectionStatus{}
 }
 
+// SetVendoredAgentEnrollmentStatus records the first-party companion's exact
+// enrollment state. State is a finite, non-sensitive machine label suitable
+// for readiness responses; detailed repair failures stay in local logs.
+func (h *HealthChecker) SetVendoredAgentEnrollmentStatus(s VendoredAgentEnrollmentStatus) {
+	s.Checked = true
+	h.vendored.Store(s)
+}
+
+func (h *HealthChecker) vendoredAgentEnrollmentStatus() VendoredAgentEnrollmentStatus {
+	if v, ok := h.vendored.Load().(VendoredAgentEnrollmentStatus); ok {
+		return v
+	}
+	return VendoredAgentEnrollmentStatus{}
+}
+
 // SetPostgresHealth updates the PostgreSQL health status.
 func (h *HealthChecker) SetPostgresHealth(ok bool) {
 	h.postgresOK.Store(ok)
@@ -148,6 +175,7 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 	cmtOK := h.cometbftOK.Load()
 	emb := h.embedderStatus()
 	scoped := h.scopedProjectionStatus()
+	vendored := h.vendoredAgentEnrollmentStatus()
 
 	status := "ready"
 	httpStatus := http.StatusOK
@@ -161,6 +189,11 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		// Canonical scoped content exists but the local serving projection is
 		// absent, locked, or failed verification. Reporting ready here would let
 		// a state-synced replica silently serve an incomplete selected domain.
+		status = "not_ready"
+		httpStatus = http.StatusServiceUnavailable
+	case vendored.Required && (!vendored.Checked || !vendored.OK):
+		// A configured first-party application must not be reported ready until
+		// its exact consensus enrollment and owned home domain are confirmed.
 		status = "not_ready"
 		httpStatus = http.StatusServiceUnavailable
 	case emb.Checked && emb.Semantic && !emb.OK:
@@ -184,6 +217,7 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		"cometbft":          cmtOK,
 		"embedder":          emb,
 		"scoped_projection": scoped,
+		"vendored_agent":    vendored,
 		// Informational voter/backlog block — never gates the status above
 		// (a voter-less node is legitimate; peers may vote memories through).
 		"voter": h.voterStatus(),

@@ -18,7 +18,7 @@ import (
 
 const (
 	// Format is the CometBFT Snapshot.Format value for the first SAGE
-// consensus-only canonical latest-visible state format.
+	// consensus-only canonical latest-visible state format.
 	Format uint32 = 1
 
 	metadataVersion byte = 1

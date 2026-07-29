@@ -188,3 +188,33 @@ func TestReadiness_ScopedProjectionRequiredFailsClosed(t *testing.T) {
 		t.Fatalf("verified scoped projection must recover readiness, got %d %v", code, body["status"])
 	}
 }
+
+func TestReadiness_VendoredAgentEnrollmentFailsClosedUntilExactPolicyIsReady(t *testing.T) {
+	h := NewHealthChecker()
+	h.SetPostgresHealth(true)
+	h.SetCometBFTHealth(true)
+
+	h.SetVendoredAgentEnrollmentStatus(VendoredAgentEnrollmentStatus{
+		Required: true,
+		State:    "repairing",
+	})
+	code, body := readiness(t, h, "")
+	if code != http.StatusServiceUnavailable || body["status"] != "not_ready" {
+		t.Fatalf("unconfirmed vendored enrollment must be 503, got %d %v", code, body["status"])
+	}
+	vendored, _ := body["vendored_agent"].(map[string]any)
+	if vendored == nil || vendored["required"] != true || vendored["ok"] != false ||
+		vendored["state"] != "repairing" {
+		t.Fatalf("vendored enrollment status missing or wrong: %v", body["vendored_agent"])
+	}
+
+	h.SetVendoredAgentEnrollmentStatus(VendoredAgentEnrollmentStatus{
+		Required: true,
+		OK:       true,
+		State:    "ready",
+	})
+	code, body = readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "ready" {
+		t.Fatalf("confirmed vendored enrollment must recover readiness, got %d %v", code, body["status"])
+	}
+}

@@ -3,13 +3,18 @@ package rest
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -54,6 +59,8 @@ type Server struct {
 	OnEvent                       EventCallback      // Optional: called when notable events occur
 	suppCache                     SuppCacheWriter    // Bridges off-chain data (embeddings) to ABCI for consensus-first writes
 	mempool                       *mempoolSampler    // TTL-cached CometBFT mempool depth for backpressure signals
+	taskIdempotencyMu             sync.Mutex
+	taskIdempotencyLocks          map[string]*taskIdempotencyLock
 
 	// nodeOperatorID is the hex-encoded ed25519 public key of the local
 	// node operator (~/.sage/agent.key). When a request's X-Agent-ID
@@ -98,6 +105,15 @@ type Server struct {
 	// postV22ForNextTxFn gates construction of consensus-enforced agent
 	// capability masks. nil is fail-closed.
 	postV22ForNextTxFn func() bool
+	// postV23ForNextTxFn gates local enrollment, mutable roles, and Access
+	// Group-derived read authority. nil preserves the historical REST policy.
+	postV23ForNextTxFn func() bool
+	// appV23RootKeyResolver is the local-only CEREBRUM broker seam. It resolves
+	// the exact current root credential without exposing it to the caller, so a
+	// promoted Admin's authenticated request can receive an action-bound,
+	// height-bounded countersignature before the validator signs the outer tx.
+	// nil makes promoted-Admin transaction construction fail closed.
+	appV23RootKeyResolver func(string) (ed25519.PrivateKey, bool)
 
 	// federation is the v11 OFF-consensus transport (recall proxy, co-commit
 	// receipt exchange, cross-fed agreement setup). nil disables every
@@ -138,6 +154,14 @@ type FederationService interface {
 // for the ABCI app to pick up during FinalizeBlock. Implemented by abci.SupplementaryCache.
 type SuppCacheWriter interface {
 	Put(memoryID string, data *memory.SupplementaryData)
+}
+
+// SuppCacheLifetimeWriter is implemented by supplementary bridges that can
+// retain a staged record for the full commit-confirmation window. Task
+// assignment is off-chain projection data: expiring it while
+// broadcast_tx_commit is still waiting would commit an unassigned task.
+type SuppCacheLifetimeWriter interface {
+	PutFor(memoryID string, data *memory.SupplementaryData, retainFor time.Duration)
 }
 
 // PreValidateResult holds one validator's pre-validation result.
@@ -254,6 +278,253 @@ func (s *Server) SetPostV22ForNextTxAccessor(fn func() bool) {
 
 func (s *Server) isPostV22ForNextTx() bool {
 	return s.postV22ForNextTxFn != nil && s.postV22ForNextTxFn()
+}
+
+// SetPostV23ForNextTxAccessor wires the dynamic app-v23 local enrollment,
+// role, and Access Group gate. Callers should pass
+// app.IsAppV23ActiveForNextTx.
+func (s *Server) SetPostV23ForNextTxAccessor(fn func() bool) {
+	s.postV23ForNextTxFn = fn
+}
+
+func (s *Server) isPostV23ForNextTx() bool {
+	return s.postV23ForNextTxFn != nil && s.postV23ForNextTxFn()
+}
+
+// appV23IsRootIdentity keeps the sovereign node credential out of every
+// ordinary-agent REST surface. Once app-v23 is active, inability to read the
+// current Root fails closed so a transient store fault cannot leak it.
+func (s *Server) appV23IsRootIdentity(agentID string) (bool, error) {
+	if !s.isPostV23ForNextTx() {
+		return false, nil
+	}
+	if s.badgerStore == nil {
+		return false, fmt.Errorf("consensus Root state unavailable")
+	}
+	root, err := s.badgerStore.GetAppV23Root()
+	if err != nil {
+		return false, fmt.Errorf("read current CEREBRUM Root: %w", err)
+	}
+	if root == nil {
+		return false, fmt.Errorf("current CEREBRUM Root is missing")
+	}
+	wasRoot, err := s.badgerStore.IsAppV23RootCredential(agentID)
+	if err != nil {
+		return false, fmt.Errorf("read CEREBRUM Root credential history: %w", err)
+	}
+	return wasRoot || agentID == root.PrincipalID || agentID == root.CredentialID, nil
+}
+
+// appV23ActiveOrdinaryAgent is the shared REST roster gate for agent-only
+// surfaces. SQLite discoverability is not enrollment: after app-v23 an agent
+// must have one active, internally consistent consensus enrollment and must
+// not be any current or historical Root credential.
+func (s *Server) appV23ActiveOrdinaryAgent(agentID string) (bool, error) {
+	if !s.isPostV23ForNextTx() {
+		return true, nil
+	}
+	if s.badgerStore == nil {
+		return false, fmt.Errorf("consensus access-control state unavailable")
+	}
+	isRoot, err := s.appV23IsRootIdentity(agentID)
+	if err != nil || isRoot {
+		return false, err
+	}
+	enrollment, err := s.badgerStore.GetAppV23Enrollment(agentID)
+	if err != nil {
+		return false, fmt.Errorf("read local enrollment: %w", err)
+	}
+	role, err := s.badgerStore.GetAppV23Role(agentID)
+	if err != nil {
+		return false, fmt.Errorf("read local role: %w", err)
+	}
+	if enrollment == nil || role == nil || !enrollment.Active ||
+		enrollment.AgentID != agentID || role.AgentID != agentID ||
+		enrollment.Profile == store.AppV23ProfileRoot ||
+		store.ValidateAppV23Policy(
+			role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+		) != nil {
+		return false, nil
+	}
+	root, err := s.badgerStore.GetAppV23Root()
+	if err != nil || root == nil {
+		return false, fmt.Errorf("read current CEREBRUM Root")
+	}
+	if role.Role == store.AppV23RoleAdmin &&
+		enrollment.RootGeneration != root.Generation {
+		return false, nil
+	}
+	registered, err := s.badgerStore.GetRegisteredAgent(agentID)
+	if err != nil {
+		return false, fmt.Errorf("read registered agent: %w", err)
+	}
+	if registered == nil || registered.AgentID != agentID ||
+		registered.Role != role.Role ||
+		registered.Clearance != enrollment.Clearance ||
+		registered.Capabilities != enrollment.Capabilities {
+		return false, nil
+	}
+	return true, nil
+}
+
+// requireAppV23ActiveOrdinaryAgent is the shared HTTP boundary for surfaces
+// where the caller acts as an agent rather than as the local human CEREBRUM
+// operator. Root is permanently excluded; inactive, stale, and inconsistent
+// enrollments fail closed. The outer app-v23 REST locality middleware remains
+// responsible for keeping current Admin usable only from its own node.
+func (s *Server) requireAppV23ActiveOrdinaryAgent(
+	w http.ResponseWriter,
+	agentID, surface string,
+) bool {
+	if !s.isPostV23ForNextTx() {
+		return true
+	}
+	isRoot, err := s.appV23IsRootIdentity(agentID)
+	if err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+			"Current CEREBRUM Root state is unavailable.")
+		return false
+	}
+	if isRoot {
+		writeProblemTyped(w, http.StatusForbidden,
+			"https://sage.dev/errors/root-not-agent",
+			"Root is not an agent",
+			"CEREBRUM Root cannot use "+surface+".")
+		return false
+	}
+	active, err := s.appV23ActiveOrdinaryAgent(agentID)
+	if err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+			"Current local enrollment state is unavailable.")
+		return false
+	}
+	if !active {
+		writeProblemTyped(w, http.StatusForbidden,
+			"https://sage.dev/errors/active-agent-required",
+			"Active agent required",
+			surface+" is available only to an active ordinary agent on this SAGE.")
+		return false
+	}
+	return true
+}
+
+func (s *Server) rejectAppV23RootAgentTarget(w http.ResponseWriter, agentID string) bool {
+	isRoot, err := s.appV23IsRootIdentity(agentID)
+	if err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+			"Current CEREBRUM Root state is unavailable.")
+		return true
+	}
+	if isRoot {
+		writeProblem(w, http.StatusForbidden, "Root is not an agent",
+			"CEREBRUM Root cannot be used as an organization or department member.")
+		return true
+	}
+	return false
+}
+
+// SetAppV23RootKeyResolver wires the local CEREBRUM countersignature broker.
+// The resolver must return a key only when it exactly produces the requested
+// committed credential ID. Generic REST callers never receive the key.
+func (s *Server) SetAppV23RootKeyResolver(
+	resolver func(string) (ed25519.PrivateKey, bool),
+) {
+	s.appV23RootKeyResolver = resolver
+}
+
+// signTx adds the local app-v23 elevation proof required by every promoted
+// Admin action, then signs the outer consensus envelope with the validator key.
+// Root and non-Admin principals retain their normal envelopes. Consensus is
+// still authoritative; this broker is only the usable local proof producer.
+func (s *Server) signTx(parsed *tx.ParsedTx) error {
+	if err := s.embedAppV23LocalElevation(parsed); err != nil {
+		return err
+	}
+	return tx.SignTx(parsed, s.signingKey)
+}
+
+func (s *Server) embedAppV23LocalElevation(parsed *tx.ParsedTx) error {
+	if !s.isPostV23ForNextTx() {
+		return nil
+	}
+	if parsed == nil {
+		return fmt.Errorf("app-v23 elevation: missing transaction")
+	}
+	if parsed.LocalElevation != nil {
+		return fmt.Errorf("app-v23 elevation: caller-supplied elevation is forbidden")
+	}
+	if len(parsed.AgentPubKey) != ed25519.PublicKeySize {
+		return nil
+	}
+	actorID := hex.EncodeToString(parsed.AgentPubKey)
+	if s.badgerStore == nil {
+		return fmt.Errorf("app-v23 elevation: consensus state is unavailable")
+	}
+	root, err := s.badgerStore.GetAppV23Root()
+	if err != nil || root == nil {
+		return fmt.Errorf("app-v23 elevation: current CEREBRUM Root is unavailable")
+	}
+	if actorID == root.CredentialID {
+		return nil
+	}
+	enrollment, err := s.badgerStore.GetAppV23Enrollment(actorID)
+	if err != nil {
+		return fmt.Errorf("app-v23 elevation: read Admin enrollment: %w", err)
+	}
+	role, err := s.badgerStore.GetAppV23Role(actorID)
+	if err != nil {
+		return fmt.Errorf("app-v23 elevation: read Admin role: %w", err)
+	}
+	if enrollment == nil || role == nil || !enrollment.Active ||
+		role.Role != store.AppV23RoleAdmin {
+		return nil
+	}
+	if enrollment.RootGeneration != root.Generation ||
+		store.ValidateAppV23Policy(
+			role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+		) != nil {
+		return fmt.Errorf("app-v23 elevation: Admin enrollment is stale or invalid")
+	}
+	if s.appV23RootKeyResolver == nil {
+		return fmt.Errorf("app-v23 elevation: local CEREBRUM broker is unavailable")
+	}
+	rootKey, ok := s.appV23RootKeyResolver(root.CredentialID)
+	if !ok || len(rootKey) != ed25519.PrivateKeySize {
+		return fmt.Errorf("app-v23 elevation: current Root credential is unavailable")
+	}
+	rootPublic, ok := rootKey.Public().(ed25519.PublicKey)
+	if !ok || hex.EncodeToString(rootPublic) != root.CredentialID {
+		return fmt.Errorf("app-v23 elevation: resolved Root credential does not match consensus")
+	}
+	heightBytes, err := s.badgerStore.GetState("height")
+	if err != nil || len(heightBytes) != 8 {
+		return fmt.Errorf("app-v23 elevation: committed consensus height is unavailable")
+	}
+	committedHeight := int64(binary.BigEndian.Uint64(heightBytes)) // #nosec G115 -- consensus heights are bounded positive int64.
+	if committedHeight < 0 {
+		return fmt.Errorf("app-v23 elevation: committed consensus height is invalid")
+	}
+	nextHeight := committedHeight + 1
+	nonceBytes := make([]byte, 16)
+	if _, nonceErr := rand.Read(nonceBytes); nonceErr != nil {
+		return fmt.Errorf("app-v23 elevation: generate nonce: %w", nonceErr)
+	}
+	proof := &tx.LocalElevationProof{
+		RootGeneration:   root.Generation,
+		ValidFromHeight:  nextHeight,
+		ValidUntilHeight: nextHeight + store.AppV23MaxElevationWindow,
+		Nonce:            hex.EncodeToString(nonceBytes),
+	}
+	actionBytes, err := tx.PayloadBytes(parsed)
+	if err != nil {
+		return fmt.Errorf("app-v23 elevation: encode action: %w", err)
+	}
+	proof.Signature = ed25519.Sign(
+		rootKey,
+		tx.AppV23ElevationSignBytes(root.Scope, actorID, parsed.Type, actionBytes, proof),
+	)
+	parsed.LocalElevation = proof
+	return nil
 }
 
 // loadValidatorSigningKey loads the CometBFT validator private key so that
@@ -404,6 +675,7 @@ func (s *Server) setupRouter() chi.Router {
 	// Authenticated API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Ed25519AuthMiddleware)
+		r.Use(s.appV23LocalAdminBoundary)
 		r.Get("/v1/agents/lookup", s.handleFindRegisteredAgents)
 
 		// Memory endpoints
@@ -433,15 +705,20 @@ func (s *Server) setupRouter() chi.Router {
 		// Caller-filtered, read-only federation discovery for ordinary agents.
 		// All trust/policy/copy mutations stay on operator-only routes below.
 		r.Get("/v1/federation/available", s.handleFederationAvailable)
+		r.Post("/v1/federation/recall-plan", s.handleFederationRecallPlan)
+		r.Post("/v1/federation/guests/prepare", s.handleFederatedGuestPrepare)
+		r.Post("/v1/federation/guests/elevation", s.handleFederatedGuestElevation)
+		r.Post("/v1/federation/guests/commit", s.handleFederatedGuestCommit)
+		r.Get("/v1/federation/guests", s.handleFederatedGuestList)
 		r.Post("/v1/federation/contacts/authorize", s.handleFederatedContactAuthorize)
 		r.Post("/v1/federation/cross/{chain_id}/write", s.handleCrossFedWrite)
-		// v11.6 host-controlled domain sync (off-consensus; operator-only)
+		// v11.6 host-controlled domain sync (off-consensus; local federation control)
 		r.Put("/v1/federation/cross/{chain_id}/sync", s.handleSyncDomainsSet)
 		r.Get("/v1/federation/cross/{chain_id}/sync", s.handleSyncDomainsGet)
 		r.Get("/v1/federation/cross/{chain_id}/sync/status", s.handleSyncStatus)
 
-		// v11 real-TOTP JOIN ceremony - the operator's localhost control surface
-		// (the guided guest/host wizards). Node-operator-only; off-consensus.
+		// v11 real-TOTP JOIN ceremony - the localhost control surface used by
+		// the guided guest/host wizards. Post-v23 follows current Root/Admin.
 		r.Post("/v1/federation/join/host/create", s.handleJoinHostCreate)
 		r.Post("/v1/federation/join/host/scan-return", s.handleJoinHostScanReturn)
 		r.Get("/v1/federation/join/host/{session_id}", s.handleJoinHostStatus)
@@ -471,9 +748,13 @@ func (s *Server) setupRouter() chi.Router {
 		// cap so writers can self-throttle without polling raw CometBFT RPC.
 		r.Get("/v1/chain/backpressure", s.handleChainBackpressure)
 
-		// Embedding endpoints (local Ollama, no cloud)
-		r.Post("/v1/embed", s.handleEmbed)
-		r.Get("/v1/embed/info", s.handleEmbedInfo)
+		// Embedding endpoints (local Ollama, no cloud). /personal is the
+		// historical sage-gui alias; keep it on the exact same authenticated,
+		// enrolled implementation so a non-loopback bind never exposes a
+		// second unauthenticated embedding service.
+		r.With(s.appV23EmbedBoundary).Post("/v1/embed", s.handleEmbed)
+		r.With(s.appV23EmbedBoundary).Post("/v1/embed/personal", s.handleEmbed)
+		r.With(s.appV23EmbedBoundary).Get("/v1/embed/info", s.handleEmbedInfo)
 
 		// Access control endpoints
 		r.Post("/v1/access/request", s.handleAccessRequest)
@@ -508,15 +789,19 @@ func (s *Server) setupRouter() chi.Router {
 		r.Delete("/v1/org/{org_id}/dept/{dept_id}/member/{agent_id}", s.handleDeptRemoveMember)
 		r.Get("/v1/org/{org_id}/dept/{dept_id}/members", s.handleListDeptMembers)
 
-		// Pipeline endpoints
-		r.Post("/v1/pipe/resolve", s.handlePipeResolve)
-		r.Post("/v1/pipe/send", s.handlePipeSend)
-		r.Get("/v1/pipe/inbox", s.handlePipeInbox)
-		r.Get("/v1/pipe/updates", s.handlePipeUpdates)
-		r.Put("/v1/pipe/{pipe_id}/claim", s.handlePipeClaim)
-		r.Put("/v1/pipe/{pipe_id}/result", s.handlePipeResult)
-		r.Get("/v1/pipe/{pipe_id}", s.handlePipeStatus)
-		r.Get("/v1/pipe/results", s.handlePipeResults)
+		// Pipeline endpoints are agent-to-agent only. CEREBRUM Root is a
+		// sovereign authority credential, never an inbox/contact identity.
+		r.Group(func(r chi.Router) {
+			r.Use(s.appV23PipelineAgentBoundary)
+			r.Post("/v1/pipe/resolve", s.handlePipeResolve)
+			r.Post("/v1/pipe/send", s.handlePipeSend)
+			r.Get("/v1/pipe/inbox", s.handlePipeInbox)
+			r.Get("/v1/pipe/updates", s.handlePipeUpdates)
+			r.Put("/v1/pipe/{pipe_id}/claim", s.handlePipeClaim)
+			r.Put("/v1/pipe/{pipe_id}/result", s.handlePipeResult)
+			r.Get("/v1/pipe/{pipe_id}", s.handlePipeStatus)
+			r.Get("/v1/pipe/results", s.handlePipeResults)
+		})
 
 		// Governance endpoints
 		r.Get("/v1/governance/context", s.handleGovernanceContext)
@@ -538,6 +823,192 @@ func (s *Server) setupRouter() chi.Router {
 	})
 
 	return r
+}
+
+// appV23LocalAdminBoundary enforces the one host fact consensus cannot prove:
+// Root and promoted Admin authority are usable only from the machine running
+// this SAGE node. Every authenticated REST read and mutation passes this
+// middleware; ordinary Members/Managers retain their existing network posture.
+//
+// Both the socket peer and Host must be loopback. Forwarding headers are
+// deny-only corroboration: they can prove that a loopback reverse-proxy socket
+// carried a remote request, but can never turn a non-loopback request local.
+func (s *Server) appV23LocalAdminBoundary(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.isPostV23ForNextTx() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if s.badgerStore == nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Consensus access-control state is unavailable.")
+			return
+		}
+		actorID := middleware.ContextAgentID(r.Context())
+		root, err := s.badgerStore.GetAppV23Root()
+		if err != nil || root == nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current CEREBRUM Root state is unavailable.")
+			return
+		}
+		if actorID == root.CredentialID {
+			if !isAppV23LoopbackControlRequest(r) {
+				writeProblem(w, http.StatusForbidden, "Local Root required",
+					"CEREBRUM Root requests are accepted only through localhost on this machine.")
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		if actorID == root.PrincipalID && root.CredentialID != root.PrincipalID {
+			writeProblem(w, http.StatusForbidden, "Current Root required",
+				"The authenticated credential is no longer the current CEREBRUM Root.")
+			return
+		}
+		enrollment, err := s.badgerStore.GetAppV23Enrollment(actorID)
+		if err != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Local enrollment state is unavailable.")
+			return
+		}
+		role, err := s.badgerStore.GetAppV23Role(actorID)
+		if err != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Local role state is unavailable.")
+			return
+		}
+		if enrollment == nil || role == nil || !enrollment.Active ||
+			role.Role != store.AppV23RoleAdmin {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if enrollment.RootGeneration != root.Generation ||
+			store.ValidateAppV23Policy(
+				role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+			) != nil {
+			writeProblem(w, http.StatusForbidden, "Current local Admin required",
+				"The authenticated Admin approval belongs to an obsolete Root generation.")
+			return
+		}
+		if !isAppV23LoopbackControlRequest(r) {
+			writeProblem(w, http.StatusForbidden, "Local Admin required",
+				"Promoted Admin requests are accepted only through localhost on this machine.")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isAppV23LoopbackControlRequest(r *http.Request) bool {
+	if r == nil || !appV23SocketAddressIsLoopback(r.RemoteAddr) ||
+		!appV23HostIsLoopback(r.Host) {
+		return false
+	}
+	if !appV23ForwardedIPListIsLoopback(r.Header.Values("X-Forwarded-For")) ||
+		!appV23ForwardedIPListIsLoopback(r.Header.Values("X-Real-IP")) ||
+		!appV23ForwardedHostListIsLoopback(r.Header.Values("X-Forwarded-Host")) ||
+		!appV23RFCForwardedIsLoopback(r.Header.Values("Forwarded")) {
+		return false
+	}
+	return true
+}
+
+func appV23SocketAddressIsLoopback(address string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(address))
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func appV23HostIsLoopback(raw string) bool {
+	host := strings.TrimSpace(raw)
+	if host == "" {
+		return false
+	}
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func appV23ForwardedIPListIsLoopback(values []string) bool {
+	for _, value := range values {
+		for _, entry := range strings.Split(value, ",") {
+			entry = strings.Trim(strings.TrimSpace(entry), `"`)
+			if entry == "" || !appV23ForwardedAddressIsLoopback(entry) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func appV23ForwardedHostListIsLoopback(values []string) bool {
+	for _, value := range values {
+		for _, entry := range strings.Split(value, ",") {
+			if !appV23HostIsLoopback(strings.Trim(strings.TrimSpace(entry), `"`)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func appV23ForwardedAddressIsLoopback(raw string) bool {
+	value := strings.Trim(strings.TrimSpace(raw), `"`)
+	if value == "" || strings.EqualFold(value, "unknown") || strings.HasPrefix(value, "_") {
+		return false
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	value = strings.TrimPrefix(strings.TrimSuffix(value, "]"), "[")
+	if strings.EqualFold(value, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(value)
+	return ip != nil && ip.IsLoopback()
+}
+
+func appV23RFCForwardedIsLoopback(values []string) bool {
+	for _, value := range values {
+		for _, element := range strings.Split(value, ",") {
+			for _, parameter := range strings.Split(element, ";") {
+				name, raw, found := strings.Cut(strings.TrimSpace(parameter), "=")
+				if !found {
+					return false
+				}
+				switch strings.ToLower(strings.TrimSpace(name)) {
+				case "for":
+					if !appV23ForwardedAddressIsLoopback(raw) {
+						return false
+					}
+				case "host":
+					if !appV23HostIsLoopback(strings.Trim(strings.TrimSpace(raw), `"`)) {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+func (s *Server) appV23PipelineAgentBoundary(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		agentID := middleware.ContextAgentID(r.Context())
+		if !s.requireAppV23ActiveOrdinaryAgent(w, agentID, "agent pipeline work") {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // embedAgentAuth copies the authenticated agent's cryptographic proof from the

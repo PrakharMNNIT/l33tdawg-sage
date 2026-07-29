@@ -41,6 +41,30 @@ func newTestHandler(t *testing.T) (*DashboardHandler, *store.SQLiteStore) {
 
 func testRouter(h *DashboardHandler) *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			// httptest.NewRequest uses example.com and 192.0.2.1 as placeholders.
+			// Most historical dashboard tests model the local CEREBRUM caller and
+			// predate the explicit peer+Host boundary, so translate only that exact
+			// untouched pair. Security tests that set either value keep their
+			// deliberate local, LAN, or rebinding shape.
+			if req.Host == "example.com" && req.RemoteAddr == "192.0.2.1:1234" {
+				req.Host = "localhost:8080"
+				req.RemoteAddr = "127.0.0.1:54321"
+				// Historical handler tests model browser use of the local
+				// CEREBRUM dashboard. Supply the browser metadata that those
+				// tests predate; security tests which deliberately model a
+				// headerless native process set their network shape explicitly.
+				if strings.TrimSpace(req.Header.Get("X-Agent-ID")) == "" &&
+					strings.TrimSpace(req.Header.Get("Origin")) == "" &&
+					strings.TrimSpace(req.Header.Get("Sec-Fetch-Site")) == "" {
+					req.Header.Set("Origin", "http://localhost:8080")
+					req.Header.Set("Sec-Fetch-Site", "same-origin")
+				}
+			}
+			next.ServeHTTP(w, req)
+		})
+	})
 	h.RegisterRoutes(r)
 	return r
 }
@@ -64,7 +88,7 @@ func insertTestMemory(t *testing.T, s *store.SQLiteStore, id, domain string) {
 
 func insertTestTask(t *testing.T, s *store.SQLiteStore, id, domain, provider string) {
 	t.Helper()
-	h := sha256.Sum256([]byte("task-" + id))
+	h := sha256.Sum256([]byte("[TASK] " + id))
 	rec := &memory.MemoryRecord{
 		MemoryID:        id,
 		SubmittingAgent: "author-agent",
@@ -153,6 +177,174 @@ func TestUnencryptedLoopbackCEREBRUMCanReadMemories(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 	assert.Contains(t, rr.Body.String(), "loopback-target")
+}
+
+func TestCEREBRUMUIIsLoopbackOnly(t *testing.T) {
+	h, _ := newTestHandler(t)
+	router := testRouter(h)
+	clients := []struct {
+		name       string
+		remoteAddr string
+		host       string
+		loopback   bool
+	}{
+		{
+			name:       "loopback CEREBRUM",
+			remoteAddr: "127.0.0.1:54321",
+			host:       "localhost:8080",
+			loopback:   true,
+		},
+		{
+			name:       "IPv6 loopback CEREBRUM",
+			remoteAddr: "[::1]:54321",
+			host:       "[::1]:8080",
+			loopback:   true,
+		},
+		{
+			name:       "LAN CEREBRUM",
+			remoteAddr: "192.168.1.20:54321",
+			host:       "192.168.1.10:8080",
+		},
+		{
+			name:       "DNS rebinding host",
+			remoteAddr: "127.0.0.1:54321",
+			host:       "attacker.example:8080",
+		},
+	}
+	paths := []struct {
+		path           string
+		loopbackStatus int
+	}{
+		{path: "/", loopbackStatus: http.StatusFound},
+		{path: "/ui/", loopbackStatus: http.StatusOK},
+		{path: "/ui/launch", loopbackStatus: http.StatusFound},
+		{path: "/ui/presence", loopbackStatus: http.StatusOK},
+	}
+	for _, client := range clients {
+		for _, path := range paths {
+			t.Run(client.name+" "+path.path, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodGet, path.path, nil)
+				req.RemoteAddr = client.remoteAddr
+				req.Host = client.host
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				wantStatus := http.StatusNotFound
+				if client.loopback {
+					wantStatus = path.loopbackStatus
+				}
+				require.Equal(t, wantStatus, rec.Code, rec.Body.String())
+			})
+		}
+	}
+}
+
+func TestCEREBRUMHumanControlEntryPointsAreLoopbackOnly(t *testing.T) {
+	h, _ := newTestHandler(t)
+	router := testRouter(h)
+	entryPoints := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/v1/dashboard/auth/login"},
+		{method: http.MethodPost, path: "/v1/dashboard/auth/lock"},
+		{method: http.MethodGet, path: "/v1/dashboard/auth/check"},
+		{method: http.MethodPost, path: "/v1/dashboard/settings/ledger/recover"},
+	}
+	for _, entry := range entryPoints {
+		t.Run(entry.method+" "+entry.path, func(t *testing.T) {
+			for _, client := range []struct {
+				name       string
+				remoteAddr string
+				host       string
+				hidden     bool
+			}{
+				{
+					name:       "local",
+					remoteAddr: "127.0.0.1:54321",
+					host:       "localhost:8080",
+				},
+				{
+					name:       "LAN",
+					remoteAddr: "192.168.1.20:54321",
+					host:       "192.168.1.10:8080",
+					hidden:     true,
+				},
+				{
+					name:       "rebinding",
+					remoteAddr: "127.0.0.1:54321",
+					host:       "attacker.example:8080",
+					hidden:     true,
+				},
+			} {
+				req := httptest.NewRequest(entry.method, entry.path, bytes.NewReader([]byte(`{}`)))
+				req.Header.Set("Content-Type", "application/json")
+				req.RemoteAddr = client.remoteAddr
+				req.Host = client.host
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				if client.hidden {
+					require.Equal(t, http.StatusNotFound, rec.Code, client.name+": "+rec.Body.String())
+				} else {
+					require.NotEqual(t, http.StatusNotFound, rec.Code, client.name+": "+rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestCEREBRUMRejectsRemoteRequestsForwardedThroughLoopbackProxy(t *testing.T) {
+	h, _ := newTestHandler(t)
+	router := testRouter(h)
+
+	for _, proxyEvidence := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "X-Forwarded-For", key: "X-Forwarded-For", value: "198.51.100.8"},
+		{name: "X-Real-IP", key: "X-Real-IP", value: "198.51.100.8"},
+		{name: "X-Forwarded-Host", key: "X-Forwarded-Host", value: "sage.example.com"},
+		{
+			name: "Forwarded", key: "Forwarded",
+			value: `for=198.51.100.8;host="localhost:8080"`,
+		},
+	} {
+		for _, routeClass := range []struct {
+			name   string
+			method string
+			path   string
+			body   []byte
+		}{
+			{name: "UI", method: http.MethodGet, path: "/ui/"},
+			{name: "authentication", method: http.MethodGet, path: "/v1/dashboard/auth/check"},
+			{
+				name: "recovery", method: http.MethodPost,
+				path: "/v1/dashboard/settings/ledger/recover", body: []byte(`{}`),
+			},
+			{
+				name: "protected dashboard", method: http.MethodGet,
+				path: "/v1/dashboard/settings/onboarding",
+			},
+		} {
+			t.Run(proxyEvidence.name+"/"+routeClass.name, func(t *testing.T) {
+				req := httptest.NewRequest(
+					routeClass.method, routeClass.path, bytes.NewReader(routeClass.body),
+				)
+				req.RemoteAddr = "127.0.0.1:54321"
+				req.Host = "localhost:8080"
+				req.Header.Set("Origin", "http://localhost:8080")
+				req.Header.Set("Sec-Fetch-Site", "same-origin")
+				req.Header.Set(proxyEvidence.key, proxyEvidence.value)
+				if len(routeClass.body) > 0 {
+					req.Header.Set("Content-Type", "application/json")
+				}
+
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+			})
+		}
+	}
 }
 
 func TestUnencryptedCEREBRUMOperatorCompatibilityIsLoopbackBrowserOnly(t *testing.T) {
@@ -435,6 +627,7 @@ func TestDashboardPresenceTracksLiveSSEClients(t *testing.T) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodGet, "/ui/presence", nil)
 		req.RemoteAddr = "127.0.0.1:54321"
+		req.Host = "localhost:8080"
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 		require.Equal(t, http.StatusOK, w.Code)
@@ -783,8 +976,13 @@ func TestTaskBoardAllTrueRejectsSignedAgentCaller(t *testing.T) {
 	h, s := newTestHandler(t)
 	r := testRouter(h)
 	insertTestTask(t, s, "public-board-task", "public-work", "codex")
-	_, priv, err := ed25519pkg.GenerateKey(nil)
+	pub, priv, err := ed25519pkg.GenerateKey(nil)
 	require.NoError(t, err)
+	require.NoError(t, s.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: hex.EncodeToString(pub),
+		Name:    "task-board-agent",
+		Status:  "active",
+	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/tasks?all=true&limit=10000", nil)
 	signAgentGET(t, req, priv)
@@ -887,12 +1085,16 @@ func TestTaskOperatorSurfacesRejectAgentsAndUnauthenticatedLANCallers(t *testing
 	createBody := []byte(`{"content":"agent bypass","domain":"work"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/tasks", bytes.NewReader(createBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 	signAgentRequest(t, req, priv, createBody)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
 
 	req = httptest.NewRequest(http.MethodDelete, "/v1/dashboard/memory/guarded-task", nil)
+	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 	signAgentRequest(t, req, priv, nil)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -906,6 +1108,8 @@ func TestTaskOperatorSurfacesRejectAgentsAndUnauthenticatedLANCallers(t *testing
 		httptest.NewRequest(http.MethodGet, "/v1/dashboard/tasks", nil),
 		httptest.NewRequest(http.MethodPut, "/v1/dashboard/tasks/guarded-task/status", bytes.NewReader(statusBody)),
 	} {
+		req.Host = "localhost:8080"
+		req.RemoteAddr = "127.0.0.1:54321"
 		if req.Method == http.MethodPut {
 			req.Header.Set("Content-Type", "application/json")
 		}
@@ -922,10 +1126,10 @@ func TestTaskOperatorSurfacesRejectAgentsAndUnauthenticatedLANCallers(t *testing
 	req.RemoteAddr = "192.168.1.20:54321"
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+	require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
 }
 
-func TestTaskBoardAllowsAuthenticatedEncryptedLANSession(t *testing.T) {
+func TestTaskBoardRejectsAuthenticatedEncryptedLANSession(t *testing.T) {
 	h, s := newTestHandler(t)
 	insertTestTask(t, s, "lan-task", "work", "codex")
 	h.Encrypted.Store(true)
@@ -938,7 +1142,7 @@ func TestTaskBoardAllowsAuthenticatedEncryptedLANSession(t *testing.T) {
 	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "valid-lan-session"})
 	w := httptest.NewRecorder()
 	h.handleGetTasks(w, req)
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
 }
 
 func TestCreateTaskConsensusFailureDoesNotInsertPhantom(t *testing.T) {
@@ -2169,6 +2373,7 @@ func TestHandleUpdateAgent_PermissionsRejectSignedAgentWithoutOverride(t *testin
 	req.Header.Set("Origin", "http://localhost:8080")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 	signAgentRequest(t, req, callerKey, body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -2197,6 +2402,7 @@ func TestHandleCreateAgentRejectsSignedAgentWithoutSideEffects(t *testing.T) {
 	req.Header.Set("Origin", "http://localhost:8080")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 	signAgentRequest(t, req, callerKey, body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -2260,6 +2466,7 @@ func TestHandleUpdateAgent_AdminOverrideRejectsSignedAgent(t *testing.T) {
 	req.Header.Set("Origin", "http://localhost:8080")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 	signAgentRequest(t, req, callerKey, body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -2284,6 +2491,8 @@ func TestHandleUpdateAgent_AdminOverrideRejectsNoOriginCaller(t *testing.T) {
 	require.NoError(t, err)
 	req := httptest.NewRequest(http.MethodPatch, "/v1/dashboard/network/agents/agent-override-target", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

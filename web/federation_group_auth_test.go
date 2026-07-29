@@ -190,8 +190,9 @@ func TestFederationGroupSurfaceRequiresVerifiedNodeOperator(t *testing.T) {
 				t.Fatalf("nonoperator status=%d", got)
 			}
 
-			// Neither a raw local process nor forged same-origin browser headers
-			// are operator credentials without a valid encrypted session.
+			// A raw local process is not an operator. On an encryption-off
+			// personal node, the strict loopback same-origin CEREBRUM browser is
+			// the operator surface because there is no password session to hold.
 			for _, browser := range []bool{false, true} {
 				req = httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 				req.RemoteAddr = "127.0.0.1:43210"
@@ -201,6 +202,9 @@ func TestFederationGroupSurfaceRequiresVerifiedNodeOperator(t *testing.T) {
 					req.Header.Set("Sec-Fetch-Site", "same-origin")
 				}
 				want := http.StatusForbidden
+				if browser {
+					want = http.StatusNotImplemented
+				}
 				if got := call(req); got != want {
 					t.Fatalf("unsigned loopback browser=%v status=%d want=%d", browser, got, want)
 				}

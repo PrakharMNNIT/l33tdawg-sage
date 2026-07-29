@@ -359,11 +359,17 @@ func computeAppHashStandalone(badgerPath string) ([]byte, error) {
 	type kv struct{ key, val []byte }
 	var entries []kv
 	err = db.View(func(txn *badger.Txn) error {
+		_, markerErr := txn.Get([]byte(consensuskeys.AppV23MigrationState))
+		appV23Active := markerErr == nil
+		if markerErr != nil && !errors.Is(markerErr, badger.ErrKeyNotFound) {
+			return markerErr
+		}
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
-			if consensuskeys.IsAppHashExcludedLocalKey(item.Key()) {
+			if consensuskeys.IsAppHashExcludedLocalKey(item.Key()) &&
+				(!appV23Active || !consensuskeys.IsAppV23MigrationStageKey(item.Key())) {
 				continue
 			}
 			k := append([]byte(nil), item.Key()...)
@@ -419,11 +425,17 @@ func computeAppHashAllRulesStandalone(badgerPath string) ([]byte, error) {
 	legacy, v12, v13 := sha256.New(), sha256.New(), sha256.New()
 	statePrefix := []byte("state:")
 	err = db.View(func(txn *badger.Txn) error {
+		_, markerErr := txn.Get([]byte(consensuskeys.AppV23MigrationState))
+		appV23Active := markerErr == nil
+		if markerErr != nil && !errors.Is(markerErr, badger.ErrKeyNotFound) {
+			return markerErr
+		}
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
-			if consensuskeys.IsAppHashExcludedLocalKey(item.Key()) {
+			if consensuskeys.IsAppHashExcludedLocalKey(item.Key()) &&
+				(!appV23Active || !consensuskeys.IsAppV23MigrationStageKey(item.Key())) {
 				continue
 			}
 			k := append([]byte(nil), item.Key()...)

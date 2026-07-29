@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"net/http"
 	"regexp"
 	"sort"
@@ -113,6 +114,13 @@ func (h *DashboardHandler) handleMemoryRelated(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusNotFound, "memory not found")
 		return
 	}
+	if projectionErr := h.validateAppV23DashboardRecord(x); projectionErr != nil {
+		if writeAppV23DashboardProjectionFailure(w, projectionErr) {
+			return
+		}
+		writeError(w, http.StatusInternalServerError, projectionErr.Error())
+		return
+	}
 
 	// On-chain RBAC: an MCP agent request is restricted to its visible agents;
 	// the operator dashboard (cookie session, no X-Agent-ID) sees all.
@@ -137,11 +145,17 @@ func (h *DashboardHandler) handleMemoryRelated(w http.ResponseWriter, r *http.Re
 		relation string
 	}
 	pool := make(map[string]*acc)
+	var projectionErr error
 	bump := func(rec *memory.MemoryRecord, add float64, relation string) {
-		if rec == nil || rec.MemoryID == id || isCerebrumInternalMemoryDomain(rec.DomainTag) {
+		if projectionErr != nil || rec == nil || rec.MemoryID == id ||
+			isCerebrumInternalMemoryDomain(rec.DomainTag) {
 			return
 		}
 		if !seeAll && !allowed[rec.SubmittingAgent] {
+			return
+		}
+		if err := h.validateAppV23DashboardRecord(rec); err != nil {
+			projectionErr = err
 			return
 		}
 		e := pool[rec.MemoryID]
@@ -180,8 +194,21 @@ func (h *DashboardHandler) handleMemoryRelated(w http.ResponseWriter, r *http.Re
 	ftsOK := len(xWords) > 0
 	if ftsOK {
 		for _, word := range relatedContentWords(x.Content) {
-			hits, sErr := h.store.SearchByText(ctx, word, cerebrumQueryOptions(store.QueryOptions{TopK: relatedPerTerm}))
+			queryOpts := cerebrumQueryOptions(store.QueryOptions{TopK: relatedPerTerm})
+			if h.appV23IsActive() {
+				queryOpts.CandidateFilter = func(record *memory.MemoryRecord) (bool, error) {
+					if err := h.validateAppV23DashboardRecord(record); err != nil {
+						return false, err
+					}
+					return true, nil
+				}
+			}
+			hits, sErr := h.store.SearchByText(ctx, word, queryOpts)
 			if sErr != nil {
+				if errors.Is(sErr, errAppV23DashboardProjectionUnavailable) {
+					projectionErr = sErr
+					break
+				}
 				ftsOK = false // encrypted vault / FTS off - switch to in-process overlap
 				break
 			}
@@ -200,6 +227,13 @@ func (h *DashboardHandler) handleMemoryRelated(w http.ResponseWriter, r *http.Re
 					continue
 				}
 				seenCand[rec.MemoryID] = true
+				if !seeAll && !allowed[rec.SubmittingAgent] {
+					continue
+				}
+				if err := h.validateAppV23DashboardRecord(rec); err != nil {
+					projectionErr = err
+					return
+				}
 				if ov := overlapCount(xWords, wordSet(rec.Content)); ov > 0 {
 					bump(rec, float64(ov)*1.3, "similar")
 				}
@@ -224,6 +258,14 @@ func (h *DashboardHandler) handleMemoryRelated(w http.ResponseWriter, r *http.Re
 		for _, rec := range recs {
 			bump(rec, 0.25, "same-lobe")
 		}
+	}
+
+	if projectionErr != nil {
+		if writeAppV23DashboardProjectionFailure(w, projectionErr) {
+			return
+		}
+		writeError(w, http.StatusInternalServerError, projectionErr.Error())
+		return
 	}
 
 	items := make([]*acc, 0, len(pool))

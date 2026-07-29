@@ -226,6 +226,8 @@ func (m *Manager) ReplacePeerRBACPolicy(ctx context.Context, remoteChainID strin
 	if control.PeerAgentID != peerAgentID {
 		return nil, fmt.Errorf("%w: active sync peer differs from the recovered operator", store.ErrPeerRBACBindingMismatch)
 	}
+	releaseDelivery := m.beginPeerLinkedAuthorizationMutation(remoteChainID)
+	defer releaseDelivery()
 	return ss.ReplaceBoundPeerRBACPolicy(ctx, store.PeerRBACPolicy{
 		RemoteChainID: remoteChainID,
 		PeerAgentID:   peerAgentID,

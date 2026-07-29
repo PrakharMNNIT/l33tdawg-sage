@@ -128,7 +128,7 @@ func (m *Manager) anchorSubchain(ctx context.Context, ss *store.SQLiteStore, gro
 	}
 }
 
-// broadcastSubchainAnchor is the production anchor: an operator-signed
+// broadcastSubchainAnchor is the production anchor: a locally-authorized
 // TxTypeMemorySubmit carrying a (group, subchain, head) commitment into
 // sage-syncaudit-<group_id>, reusing the same buildSyncSubmitTx +
 // broadcastSyncSubmit path as an admitted copy (so nonce/encoding/duplicate

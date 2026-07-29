@@ -30,12 +30,24 @@ const (
 	maxFederatedContactAuthorizationBytes   = 256
 )
 
-// requireNodeOperator gates an off-consensus federation action that is performed
-// with the node OPERATOR's key (outbound signed calls) and has no other authz
-// (unlike the cross_fed set/revoke txs, which are authorized on-chain). Fails
-// closed when no operator id is configured. Mirrors the federated-recall gate.
+// requireNodeOperator gates local control of off-consensus federation work.
+// The historical name reflects the pre-v23 exact-node-operator rule. App-v23
+// separates that peer-pinned transport identity from CEREBRUM control, so only
+// current Root or a current-generation local Admin may drive these actions.
 func (s *Server) requireNodeOperator(w http.ResponseWriter, r *http.Request) bool {
 	callerID := middleware.ContextAgentID(r.Context())
+	if s.isPostV23ForNextTx() {
+		// The Manager performs transport authentication with the stable
+		// JOIN-pinned node key. The human/control authorization that asks it to
+		// do so follows the live Root/Admin roster and must not remain attached
+		// to a retired pre-handover Root credential.
+		if !s.callerIsOperatorOrAdmin(r.Context(), callerID) {
+			writeProblem(w, http.StatusForbidden, "CEREBRUM authority required",
+				"This federation action requires the current Root or a current local Admin.")
+			return false
+		}
+		return true
+	}
 	if s.nodeOperatorID == "" || callerID != s.nodeOperatorID {
 		writeProblem(w, http.StatusForbidden, "Operator only", "This federation action is restricted to the node operator.")
 		return false
@@ -44,14 +56,15 @@ func (s *Server) requireNodeOperator(w http.ResponseWriter, r *http.Request) boo
 }
 
 // v11 Mode-1 exchange agreement setup — the REST tx-builder for
-// TxTypeCrossFedSet/Revoke (33/34). This is the operator half of the
+// TxTypeCrossFedSet/Revoke (33/34). This is the local-control half of the
 // federation-JOIN ceremony: the peers exchange CA certificates + endpoints
 // out-of-band, then each side calls POST /v1/federation/cross, which persists
 // the remote CA on disk, computes its SPKI pin, and submits the terms tx with
-// that pin as PeerPubKey. AUTHORIZATION is enforced on-chain
-// (crossFedAuthorized: chain-admin or owner of every scoped domain) — the
-// REST layer only builds the tx. The self-federation guard lives HERE (and in
-// federation.ActiveAgreement), deliberately not in consensus.
+// that pin as PeerPubKey. Authorization is enforced on-chain: app-v23 requires
+// current Root/Admin, while the historical concrete-domain owner exception is
+// retained only before app-v23. The REST layer only builds the tx. The
+// self-federation guard lives HERE (and in federation.ActiveAgreement),
+// deliberately not in consensus.
 
 // CrossFedSetRequest is the JSON body for POST /v1/federation/cross.
 type CrossFedSetRequest struct {
@@ -220,7 +233,7 @@ func (s *Server) handleCrossFedSet(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	s.embedAgentAuth(r.Context(), setTx)
-	if signErr := tx.SignTx(setTx, s.signingKey); signErr != nil {
+	if signErr := s.signTx(setTx); signErr != nil {
 		rollbackCA()
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -274,9 +287,38 @@ func (s *Server) handleCrossFedRevoke(w http.ResponseWriter, r *http.Request) {
 	// tx-34, purge capabilities, and retain a human-readable local event. Keep
 	// the legacy REST transaction path below for deliberately transport-less
 	// deployments and small handler fakes.
+	if s.isPostV23ForNextTx() {
+		if notifier, ok := s.federation.(interface {
+			RevokeAgreementNotifyingAs(string, string) (*federation.RevokeAgreementResult, error)
+		}); ok {
+			result, err := notifier.RevokeAgreementNotifyingAs(
+				middleware.ContextAgentID(r.Context()), remoteChainID,
+			)
+			if err != nil {
+				s.logger.Error().Err(err).Str("remote", remoteChainID).Msg("cross_fed notifying revoke rejected")
+				writeProblem(w, http.StatusBadGateway, "Revoke rejected", err.Error())
+				return
+			}
+			if result == nil {
+				writeProblem(w, http.StatusBadGateway, "Revoke rejected", "Federation revoke returned no result.")
+				return
+			}
+			out := map[string]any{
+				"remote_chain_id": remoteChainID,
+				"tx_hash":         result.TxHash,
+				"status":          "revoked",
+				"peer_notified":   result.PeerNotified,
+			}
+			if result.NoticeError != "" {
+				out["notification_warning"] = result.NoticeError
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+	}
 	if notifier, ok := s.federation.(interface {
 		RevokeAgreementNotifying(string) (*federation.RevokeAgreementResult, error)
-	}); ok {
+	}); ok && !s.isPostV23ForNextTx() {
 		result, err := notifier.RevokeAgreementNotifying(remoteChainID)
 		if err != nil {
 			s.logger.Error().Err(err).Str("remote", remoteChainID).Msg("cross_fed notifying revoke rejected")
@@ -319,7 +361,7 @@ func (s *Server) handleCrossFedRevoke(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	s.embedAgentAuth(r.Context(), revokeTx)
-	if err := tx.SignTx(revokeTx, s.signingKey); err != nil {
+	if err := s.signTx(revokeTx); err != nil {
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
 	}
@@ -616,6 +658,12 @@ func (s *Server) federationRecallTargets(ctx context.Context, requested []string
 // never returns endpoints, CA pins, agreement generations, TOTP material, or
 // mutation controls.
 func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Request) {
+	callerID := middleware.ContextAgentID(r.Context())
+	if !s.requireAppV23ActiveOrdinaryAgent(
+		w, callerID, "ordinary federation discovery",
+	) {
+		return
+	}
 	if s.federation == nil || s.badgerStore == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"connections": []availableFederationConnection{},
@@ -624,7 +672,6 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
-	callerID := middleware.ContextAgentID(r.Context())
 	if callerID == "" {
 		writeProblem(w, http.StatusForbidden, "Access denied", "A registered agent identity is required for federation discovery.")
 		return
@@ -849,6 +896,16 @@ func (s *Server) availableFederationConnectionForCaller(
 // read a peer or disclose contacts: MCP uses it to revalidate its short-lived
 // in-memory cache after a local RBAC change.
 func (s *Server) handleFederatedContactAuthorize(w http.ResponseWriter, r *http.Request) {
+	callerID := middleware.ContextAgentID(r.Context())
+	if callerID == "" {
+		writeProblem(w, http.StatusForbidden, "Access denied", "A registered agent identity is required for federation contact authorization.")
+		return
+	}
+	if !s.requireAppV23ActiveOrdinaryAgent(
+		w, callerID, "federated contact authorization",
+	) {
+		return
+	}
 	var req struct {
 		Contacts []struct {
 			RemoteChainID string `json:"remote_chain_id"`
@@ -861,11 +918,6 @@ func (s *Server) handleFederatedContactAuthorize(w http.ResponseWriter, r *http.
 	}
 	if len(req.Contacts) > maxFederatedContactAuthorizationDomains {
 		writeProblem(w, http.StatusBadRequest, "Too many contacts", "at most 512 contacts may be authorized per request")
-		return
-	}
-	callerID := middleware.ContextAgentID(r.Context())
-	if callerID == "" {
-		writeProblem(w, http.StatusForbidden, "Access denied", "A registered agent identity is required for federation contact authorization.")
 		return
 	}
 	if !s.callerMayUseFederatedPipe(callerID) {
@@ -919,6 +971,12 @@ func (s *Server) callerMayUseFederatedPipe(callerID string) bool {
 	if callerID == "" {
 		return false
 	}
+	if s.isPostV23ForNextTx() {
+		active, err := s.appV23ActiveOrdinaryAgent(callerID)
+		if err != nil || !active {
+			return false
+		}
+	}
 	if !s.isPostV22ForNextTx() {
 		return true
 	}
@@ -951,7 +1009,37 @@ func (s *Server) federationVisibleRemoteScopes(ctx context.Context, callerID, re
 	if remoteScope == "" {
 		return nil
 	}
-	if s.nodeOperatorID != "" && callerID == s.nodeOperatorID {
+	postV23 := s.isPostV23ForNextTx()
+	if postV23 {
+		if s.badgerStore == nil {
+			return nil
+		}
+		root, err := s.badgerStore.GetAppV23Root()
+		if err != nil || root == nil ||
+			(callerID == root.PrincipalID && root.CredentialID != root.PrincipalID) {
+			return nil
+		}
+		if s.callerIsOperatorOrAdmin(ctx, callerID) {
+			return []string{remoteScope}
+		}
+		policyID, err := appV23PolicyPrincipal(s.badgerStore, callerID)
+		if err != nil {
+			return nil
+		}
+		enrollment, err := s.badgerStore.GetAppV23Enrollment(policyID)
+		if err != nil || enrollment == nil || !enrollment.Active {
+			return nil
+		}
+		role, err := s.badgerStore.GetAppV23Role(policyID)
+		if err != nil || role == nil ||
+			store.ValidateAppV23Policy(
+				role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+			) != nil {
+			return nil
+		}
+		callerID = policyID
+	}
+	if !postV23 && s.nodeOperatorID != "" && callerID == s.nodeOperatorID {
 		return []string{remoteScope}
 	}
 	var role, domainAccess string

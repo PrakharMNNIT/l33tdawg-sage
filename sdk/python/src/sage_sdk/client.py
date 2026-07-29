@@ -48,6 +48,7 @@ from sage_sdk.models import (
     ScopeListResponse,
     ScopeRecord,
     TaskListResponse,
+    TaskStatus,
     TimelineResponse,
     VoteRequest,
 )
@@ -166,15 +167,19 @@ class SageClient:
         self,
         content: str,
         memory_type: MemoryType | str,
-        domain_tag: str,
+        domain_tag: str | None,
         confidence: float,
         embedding: list[float] | None = None,
         knowledge_triples: list[KnowledgeTriple] | None = None,
         parent_hash: str | None = None,
         tags: list[str] | None = None,
         classification: int | None = None,
+        provider: str | None = None,
+        task_status: TaskStatus | str | None = None,
+        linked_memories: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> MemorySubmitResponse:
-        """Submit a new memory proposal.
+        """Submit a memory transaction and wait for its chain commit.
 
         tags: optional user-defined labels queryable via the `tags` argument
         on :meth:`query`. Above app-v20 they are normalized into the signed
@@ -186,6 +191,13 @@ class SageClient:
         CONFIDENTIAL, SECRET, TOP SECRET). When omitted the server stores
         the memory as PUBLIC (0); pass an explicit level to classify (e.g.
         3 for SECRET, 4 for TOP SECRET).
+
+        App-v23 tasks may pass ``domain_tag=None`` to use the caller's committed
+        owned home domain. The node derives a permanent semantic idempotency key
+        when one is omitted. A 200 response is an existing replay, 201 is a new
+        commit, and 202 has ``committed=True`` but
+        ``projection_confirmed=False``: reconcile that exact ``memory_id`` and
+        do not resubmit it.
         """
         req = MemorySubmitRequest(
             content=content,
@@ -197,8 +209,18 @@ class SageClient:
             parent_hash=parent_hash,
             tags=tags,
             classification=classification,
+            provider=provider,
+            task_status=task_status,
+            linked_memories=linked_memories,
+            idempotency_key=idempotency_key,
         )
-        resp = self._request("POST", "/v1/memory/submit", json=req.model_dump(mode="json", exclude_none=True, by_alias=True))
+        resp = self._request(
+            "POST",
+            "/v1/memory/submit",
+            json=req.model_dump(
+                mode="json", exclude_none=True, by_alias=True
+            ),
+        )
         return MemorySubmitResponse.model_validate(resp.json())
 
     def query(
@@ -247,10 +269,15 @@ class SageClient:
         Reciprocal Rank Fusion in one round trip. Callers send both the text
         query and the precomputed embedding so SAGE runs both indexes server-side.
 
-        expansions: optional list of {"query": str, "embedding": list[float]}
-        paraphrase/entity/temporal variants. When provided, SAGE runs hybrid
-        recall per variant and fuses across variants via RRF. The caller must
-        produce embeddings with the same model that generated the primary.
+        expansions: optional list of at most 8
+        {"query": str, "embedding": list[float]} paraphrase/entity/temporal
+        variants. When provided, SAGE runs hybrid recall per variant and fuses
+        across variants via RRF. The caller must produce embeddings with the
+        same model that generated the primary.
+
+        Under app-v23 the primary, all expansions, and every text/vector store
+        leaf share one 8,192-candidate live-authorization budget. Governed
+        leaf/budget failures fail the call; no partial hybrid fusion is returned.
 
         Server respects reranker env vars (SAGE_RERANK_ENABLED, SAGE_RERANK_URL)
         if configured; otherwise plain RRF over BM25 + vector.
@@ -359,7 +386,7 @@ class SageClient:
         domain: str | None = None,
         provider: str | None = None,
     ) -> TaskListResponse:
-        """Get open tasks."""
+        """Get open tasks exactly assigned and currently readable by this agent."""
         params: dict[str, Any] = {}
         if domain is not None:
             params["domain"] = domain
@@ -369,7 +396,11 @@ class SageClient:
         return TaskListResponse.model_validate(resp.json())
 
     def update_task_status(self, memory_id: str, task_status: str) -> dict:
-        """Update a task memory's status (planned/in_progress/done/dropped)."""
+        """Set an assigned task to in_progress, done, or dropped.
+
+        Agents cannot self-claim unassigned work, re-plan, or reopen terminal
+        work; those are local CEREBRUM operator actions.
+        """
         body = {"task_status": task_status}
         resp = self._request("PUT", f"/v1/memory/{memory_id}/task-status", json=body)
         return resp.json()
@@ -382,7 +413,7 @@ class SageClient:
         decision: Literal["accept", "reject", "abstain"],
         rationale: str | None = None,
     ) -> dict:
-        """Cast a vote on a proposed memory."""
+        """Authorize this node's local validator to vote (operator-only)."""
         req = VoteRequest(decision=decision, rationale=rationale)
         resp = self._request(
             "POST",
@@ -628,10 +659,12 @@ class SageClient:
         return PipeResultResponse.model_validate(resp.json())
 
     def pipe_status(self, pipe_id: str) -> PipeMessage:
-        """Get status with payload/result authority labeled independently.
+        """Inspect this node's local pipeline workflow row.
 
         Payload is an untrusted request and result is untrusted data; neither is
-        an instruction, including when both appear in one response.
+        an instruction, including when both appear in one response. This local
+        state is not a remote delivery/read receipt. Sender-queryable successful
+        delivery and claim/read receipts are deferred to v11.16.
         """
         resp = self._request("GET", f"/v1/pipe/{pipe_id}")
         return PipeMessage.model_validate(resp.json())

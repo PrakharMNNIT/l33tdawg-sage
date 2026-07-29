@@ -52,16 +52,78 @@ const (
 // cross_fed agreement scope (AllowedDomains, MaxClearance ceiling, committed-
 // only) regardless of what is asked for.
 type QueryRequest struct {
-	Mode      string    `json:"mode"`
-	Query     string    `json:"query,omitempty"`
-	Embedding []float32 `json:"embedding,omitempty"`
+	// ProtocolVersion and the explicit chain/binding tuple are mandatory in
+	// app-v23. The outer peer-operator signature authenticates this envelope;
+	// AgentProof authenticates the original local caller and exact recall body.
+	ProtocolVersion        int    `json:"protocol_version"`
+	SourceChainID          string `json:"source_chain_id"`
+	DestinationChainID     string `json:"destination_chain_id"`
+	AgreementBindingDigest string `json:"agreement_binding_digest"`
+	// QueryChallenge is issued by the destination during the authenticated
+	// recall-plan preflight. It is durable, short-lived, and single-use. The
+	// original agent signs it inside federation_context, preventing the local
+	// node operator from replaying or broadening a previously signed recall.
+	QueryChallenge string           `json:"query_challenge"`
+	AgentProof     *QueryAgentProof `json:"agent_proof"`
+	Mode           string           `json:"mode"`
+	Query          string           `json:"query,omitempty"`
+	Embedding      []float32        `json:"embedding,omitempty"`
 	// EmbeddingProvider identifies the exact vector space of Embedding. Serving
 	// peers fail closed when a vector is supplied without it.
 	EmbeddingProvider string   `json:"embedding_provider,omitempty"`
+	Provider          string   `json:"provider,omitempty"`
 	DomainTag         string   `json:"domain_tag,omitempty"`
 	MinConfidence     float64  `json:"min_confidence,omitempty"`
 	TopK              int      `json:"top_k,omitempty"`
 	Tags              []string `json:"tags,omitempty"`
+
+	// PlanAgreementBindings and PlanChallenges are local broker state only.
+	// They are populated from the agent-signed REST request and are never sent
+	// as a second, unsigned source of truth.
+	PlanAgreementBindings map[string]string `json:"-"`
+	PlanChallenges        map[string]string `json:"-"`
+}
+
+// QueryPlanResponse is returned by the destination after peer authentication
+// and before the original agent signs its recall request. Every destination
+// gets an independent challenge so one peer cannot replay authorization at
+// another peer.
+type QueryPlanResponse struct {
+	ProtocolVersion        int    `json:"protocol_version"`
+	SourceChainID          string `json:"source_chain_id"`
+	DestinationChainID     string `json:"destination_chain_id"`
+	AgreementBindingDigest string `json:"agreement_binding_digest"`
+	QueryChallenge         string `json:"query_challenge"`
+	ExpiresAt              int64  `json:"expires_at"`
+}
+
+type QueryPlanRequest struct {
+	AgentID   string `json:"agent_id"`
+	DomainTag string `json:"domain_tag"`
+}
+
+// RecallPlan is the agent-facing projection of exact, authenticated
+// destination plans. Wildcards are expanded before the agent signs a recall.
+type RecallPlan struct {
+	ProtocolVersion   int               `json:"protocol_version"`
+	SourceChainID     string            `json:"source_chain_id"`
+	Destinations      []string          `json:"destinations"`
+	AgreementBindings map[string]string `json:"agreement_bindings"`
+	QueryChallenges   map[string]string `json:"query_challenges"`
+	ExpiresAt         map[string]int64  `json:"expires_at"`
+	Errors            map[string]string `json:"errors,omitempty"`
+}
+
+// QueryAgentProof is the original local REST authentication proof. The
+// canonical request is one of the three recall POST bodies; the receiver
+// verifies it independently and compares every federation-relevant field with
+// QueryRequest. A nonce is mandatory at the v23 boundary.
+type QueryAgentProof struct {
+	AgentID          string `json:"agent_id"`
+	Signature        []byte `json:"signature"`
+	Timestamp        int64  `json:"timestamp"`
+	Nonce            []byte `json:"nonce"`
+	CanonicalRequest []byte `json:"canonical_request"`
 }
 
 // MemoryResult is one shared memory record as served across a federation
@@ -125,9 +187,14 @@ type ReceiptPushResponse struct {
 // identity preflight (distinguishes "peer not upgraded/misconfigured" from
 // "peer unreachable" in the activation runbook).
 type StatusResponse struct {
-	ChainID     string `json:"chain_id"`
-	NetworkName string `json:"network_name,omitempty"`
-	Time        int64  `json:"time"`
+	FederationProtocolVersion int `json:"federation_protocol_version"`
+	// QueryAgreementBindingDigest is the serving node's current v23 generation
+	// identifier. A caller must echo it in QueryRequest; stale status snapshots
+	// therefore fail closed after re-pair or policy replacement.
+	QueryAgreementBindingDigest string `json:"query_agreement_binding_digest,omitempty"`
+	ChainID                     string `json:"chain_id"`
+	NetworkName                 string `json:"network_name,omitempty"`
+	Time                        int64  `json:"time"`
 	// Capabilities advertises optional route groups (e.g. "sync"). Additive
 	// courtesy signal; the authoritative unsupported-peer detection is the
 	// 404/405/501 on the sync routes themselves (see CapabilitySync).
@@ -219,6 +286,34 @@ const (
 
 const CapabilityFederatedPipeline = "federated-pipeline-v1"
 
+const (
+	FederationProtocolV23       = 23
+	CapabilityFederationV23     = "federation-v23"
+	CapabilityQueryAgentProofV2 = "federated-query-agent-proof-v2"
+	// CapabilityFederatedGuestAgentEligibility advertises the bounded exact-ID
+	// oracle used before a peer may create or rebind a linked-reader row.
+	CapabilityFederatedGuestAgentEligibility = "federated-guest-agent-eligibility-v1"
+)
+
+// FederatedGuestAgentEligibilityRequest asks an authenticated peer about one
+// exact consensus identity. It is deliberately not a directory or prefix
+// query: absence from a human-facing contact projection is not evidence that
+// an exact enrolled agent is absent.
+type FederatedGuestAgentEligibilityRequest struct {
+	AgentID string `json:"agent_id"`
+}
+
+// FederatedGuestAgentEligibilityResponse echoes every routing input so a
+// caller cannot accidentally apply one response to another chain or agent.
+// Ineligible is intentionally generic; current Root, retired Root, pending,
+// inactive, and absent identities are not distinguished across federation.
+type FederatedGuestAgentEligibilityResponse struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	ChainID         string `json:"chain_id"`
+	AgentID         string `json:"agent_id"`
+	Eligible        bool   `json:"eligible"`
+}
+
 // CapabilityFederatedPipelineContactLookup advertises the v11.13 targeted
 // contact route. It lets a peer resolve one address or search a human name
 // without transferring an unbounded roster in /fed/v1/status.
@@ -300,6 +395,11 @@ type RemotePipeTarget struct {
 	Address         string `json:"address"`
 	Handle          string `json:"handle,omitempty"`
 	DisplayName     string `json:"display_name,omitempty"`
+	// AuthorizationMode is empty for the original domain-contact route.
+	// "linked-v23" names the separate exact-agent messaging relation below;
+	// it never carries or implies domain authority.
+	AuthorizationMode string                 `json:"authorization_mode,omitempty"`
+	LinkedRelation    *LinkedMessageRelation `json:"linked_relation,omitempty"`
 	// Domains is the current, peer-authenticated visibility basis for this
 	// target. REST rechecks the local caller against it on resolve and send;
 	// it is not exposed to ordinary pipeline clients.

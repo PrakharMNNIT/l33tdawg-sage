@@ -195,7 +195,7 @@ func (s *Server) handleGovPropose(w http.ResponseWriter, r *http.Request) {
 	s.embedAgentAuth(r.Context(), proposeTx)
 
 	// Sign the transaction with the node's signing key.
-	if err = tx.SignTx(proposeTx, s.signingKey); err != nil {
+	if err = s.signTx(proposeTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign gov propose tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -327,7 +327,7 @@ func (s *Server) handleGovVote(w http.ResponseWriter, r *http.Request) {
 	s.embedAgentAuth(r.Context(), voteTx)
 
 	// Sign the transaction with the node's signing key.
-	if err = tx.SignTx(voteTx, s.signingKey); err != nil {
+	if err = s.signTx(voteTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign gov vote tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -395,7 +395,7 @@ func (s *Server) handleGovCancel(w http.ResponseWriter, r *http.Request) {
 	s.embedAgentAuth(r.Context(), cancelTx)
 
 	// Sign the transaction with the node's signing key.
-	if err := tx.SignTx(cancelTx, s.signingKey); err != nil {
+	if err := s.signTx(cancelTx); err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign gov cancel tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
@@ -441,11 +441,24 @@ func (s *Server) requireGovernanceOperator(w http.ResponseWriter, ctx context.Co
 		writeProblem(w, http.StatusServiceUnavailable, "Governance unavailable", "The live CometBFT validator signing key is not configured.")
 		return false
 	}
+	callerID := middleware.ContextAgentID(ctx)
+	if s.isPostV23ForNextTx() {
+		// The startup governanceOperatorID is the same stable transport/operator
+		// key that may become a retired Root after handover. Live CEREBRUM
+		// authority follows consensus instead. appV23LocalAdminBoundary has
+		// already confined current Root/Admin requests to this machine.
+		if !s.callerIsOperatorOrAdmin(ctx, callerID) {
+			writeProblem(w, http.StatusForbidden, "Governance access denied",
+				"Only the current CEREBRUM Root or a current local Admin may authorize this validator's governance actions.")
+			return false
+		}
+		return true
+	}
 	if s.governanceOperatorID == "" {
 		writeProblem(w, http.StatusServiceUnavailable, "Governance unavailable", "The local node operator identity is not configured.")
 		return false
 	}
-	callerPub, err := auth.AgentIDToPublicKey(middleware.ContextAgentID(ctx))
+	callerPub, err := auth.AgentIDToPublicKey(callerID)
 	if err != nil || auth.PublicKeyToAgentID(callerPub) != s.governanceOperatorID {
 		writeProblem(w, http.StatusForbidden, "Governance access denied", "Only the local node operator may authorize this validator's governance actions.")
 		return false

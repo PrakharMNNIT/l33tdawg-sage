@@ -44,6 +44,81 @@ async def test_propose_memory(async_client, mock_api, sample_submit_response):
 
 
 @pytest.mark.asyncio
+async def test_propose_task_parses_confirmed_replay(
+    async_client, mock_api, sample_submit_response
+):
+    response = {
+        **sample_submit_response,
+        "task_status": "done",
+        "projection_confirmed": True,
+        "idempotency_key": "check-hdmi-2026-08-01",
+        "idempotent_replay": True,
+    }
+    mock_api.post("/v1/memory/submit").mock(
+        return_value=httpx.Response(200, json=response)
+    )
+    result = await async_client.propose(
+        content="Check the HDMI port",
+        memory_type="task",
+        domain_tag="hardware",
+        confidence=0.9,
+        idempotency_key="check-hdmi-2026-08-01",
+    )
+    assert result.task_status == "done"
+    assert result.idempotent_replay is True
+
+
+@pytest.mark.asyncio
+async def test_propose_task_parses_committed_unconfirmed(
+    async_client, mock_api, sample_submit_response
+):
+    response = {
+        **sample_submit_response,
+        "status": "committed_unconfirmed",
+        "task_status": "planned",
+        "projection_confirmed": False,
+        "retryable": False,
+        "message": "Reconcile this memory_id; do not resubmit the task.",
+        "idempotency_key": "mcp-derived-semantic-key",
+    }
+    mock_api.post("/v1/memory/submit").mock(
+        return_value=httpx.Response(202, json=response)
+    )
+    result = await async_client.propose(
+        content="Check the HDMI port",
+        memory_type="task",
+        domain_tag=None,
+        confidence=0.9,
+    )
+    assert result.committed is True
+    assert result.projection_confirmed is False
+    assert result.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_timeline_preserves_visible_total(async_client, mock_api):
+    mock_api.get("/v1/memory/timeline").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "buckets": [
+                    {
+                        "period": "2026-07-30T01:00:00Z",
+                        "count": 3,
+                        "domain": "hardware",
+                    }
+                ],
+                "total": 3,
+            },
+        )
+    )
+
+    result = await async_client.timeline(domain="hardware", bucket="hour")
+    assert result.total == 3
+    assert result.buckets[0].domain == "hardware"
+
+
+@pytest.mark.asyncio
 async def test_query_memories(async_client, mock_api, sample_query_response):
     mock_api.post("/v1/memory/query").mock(
         return_value=httpx.Response(200, json=sample_query_response)

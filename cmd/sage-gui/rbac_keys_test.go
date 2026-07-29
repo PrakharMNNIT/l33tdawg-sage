@@ -8,8 +8,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
+
+	"github.com/l33tdawg/sage/internal/store"
 )
+
+type testAppV23RootReader struct {
+	root *store.AppV23RootState
+	err  error
+}
+
+func (r *testAppV23RootReader) GetAppV23Root() (*store.AppV23RootState, error) {
+	return r.root, r.err
+}
 
 func testAgentKey(t *testing.T, seedByte byte) (ed25519.PrivateKey, string) {
 	t.Helper()
@@ -25,6 +37,22 @@ func writeTestAgentKey(t *testing.T, path string, key ed25519.PrivateKey) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 	require.NoError(t, os.WriteFile(path, key, 0o600))
+}
+
+func TestParseKeyFileRejectsIncoherentExpandedEd25519Key(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.key")
+	key, _ := testAgentKey(t, 0x10)
+	require.NoError(t, os.WriteFile(path, key, 0o600))
+	parsed, ok := parseKeyFile(path)
+	require.True(t, ok)
+	require.Equal(t, key, parsed)
+
+	corrupt := append([]byte(nil), key...)
+	corrupt[len(corrupt)-1] ^= 0xff
+	require.NoError(t, os.WriteFile(path, corrupt, 0o600))
+	parsed, ok = parseKeyFile(path)
+	require.False(t, ok)
+	require.Nil(t, parsed)
 }
 
 func TestLocalAgentKeyResolverCachesMissPerAgent(t *testing.T) {
@@ -54,6 +82,20 @@ func TestLocalAgentKeyResolverCachesMissPerAgent(t *testing.T) {
 	require.True(t, keyFound(resolver(agentA)))
 }
 
+func TestLocalAgentKeyResolverFindsCEREBRUMBundleKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	operatorKey, _ := testAgentKey(t, 0x51)
+	writeTestAgentKey(t, filepath.Join(home, "agent.key"), operatorKey)
+	bundleKey, bundleID := testAgentKey(t, 0x52)
+	writeTestAgentKey(t, filepath.Join(home, "bundles", bundleID, "agent.key"), bundleKey)
+
+	resolver := localAgentKeyResolverWithOperator(filepath.Join(home, "agent.key"))
+	resolved, ok := resolver(bundleID)
+	require.True(t, ok)
+	require.Equal(t, bundleKey, resolved)
+}
+
 func TestLocalAgentKeyResolverExpiresRotatedPositive(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SAGE_HOME", home)
@@ -76,6 +118,75 @@ func TestLocalAgentKeyResolverExpiresRotatedPositive(t *testing.T) {
 
 	nowAt = nowAt.Add(time.Second)
 	require.False(t, keyFound(resolver(oldAgent)), "rotated identity must disappear when its own cache entry expires")
+}
+
+func TestCurrentUpgradeSigningKeyTracksRotatedRootBundle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	oldKey, oldID := testAgentKey(t, 0x61)
+	newKey, newID := testAgentKey(t, 0x62)
+	operatorPath := filepath.Join(home, "agent.key")
+	writeTestAgentKey(t, operatorPath, oldKey)
+	writeTestAgentKey(t, filepath.Join(home, "bundles", newID, "agent.key"), newKey)
+
+	state := &testAppV23RootReader{root: &store.AppV23RootState{
+		PrincipalID: oldID, CredentialID: oldID, Generation: 1,
+	}}
+	resolver := localAgentKeyResolverWithOperator(operatorPath)
+	cfg := upgradeWatchdogConfig{
+		ResolveSigningKey: func() (ed25519.PrivateKey, error) {
+			return currentUpgradeSigningKey(state, func() bool { return true }, resolver, operatorPath, zerolog.Nop())
+		},
+	}
+
+	before, err := buildUpgradeProposeTx(cfg, 23)
+	require.NoError(t, err)
+	require.Equal(t, oldID, before.UpgradePropose.ProposerID)
+
+	state.root = &store.AppV23RootState{
+		PrincipalID: oldID, CredentialID: newID, Generation: 2,
+	}
+	after, err := buildUpgradeProposeTx(cfg, 24)
+	require.NoError(t, err)
+	require.Equal(t, newID, after.UpgradePropose.ProposerID)
+	require.Equal(t, ed25519.PublicKey(newKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(after.AgentPubKey))
+}
+
+func TestCurrentUpgradeSigningKeyFailsClosedAfterRootRotation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	oldKey, oldID := testAgentKey(t, 0x71)
+	_, newID := testAgentKey(t, 0x72)
+	operatorPath := filepath.Join(home, "agent.key")
+	writeTestAgentKey(t, operatorPath, oldKey)
+
+	state := &testAppV23RootReader{root: &store.AppV23RootState{
+		PrincipalID: oldID, CredentialID: newID, Generation: 2,
+	}}
+	_, err := currentUpgradeSigningKey(
+		state,
+		func() bool { return true },
+		localAgentKeyResolverWithOperator(operatorPath),
+		operatorPath,
+		zerolog.Nop(),
+	)
+	require.ErrorContains(t, err, "not held on this machine")
+}
+
+func TestCurrentUpgradeSigningKeyDoesNotFallbackWithoutV23Root(t *testing.T) {
+	home := t.TempDir()
+	oldKey, _ := testAgentKey(t, 0x73)
+	operatorPath := filepath.Join(home, "agent.key")
+	writeTestAgentKey(t, operatorPath, oldKey)
+
+	_, err := currentUpgradeSigningKey(
+		&testAppV23RootReader{},
+		func() bool { return true },
+		localAgentKeyResolverWithOperator(operatorPath),
+		operatorPath,
+		zerolog.Nop(),
+	)
+	require.ErrorContains(t, err, "no committed CEREBRUM Root")
 }
 
 func keyFound(_ ed25519.PrivateKey, ok bool) bool {

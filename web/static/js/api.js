@@ -281,6 +281,103 @@ export async function fetchAgents() {
     return data;
 }
 
+async function appV23AccessRequest(path, options = {}) {
+    const res = await fetch(`${API_BASE}${path}`, options);
+    let data = {};
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok) {
+        const error = new Error(data?.error || `Access-control request failed (${res.status})`);
+        error.code = data?.code || 'access_control_request_failed';
+        error.status = res.status;
+        throw error;
+    }
+    return data;
+}
+
+export async function fetchAppV23Access() {
+    return appV23AccessRequest('/v1/dashboard/network/access');
+}
+
+export async function updateAppV23AgentPolicy(id, policy) {
+    return appV23AccessRequest(`/v1/dashboard/network/access/agents/${encodeURIComponent(id)}/policy`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(policy),
+    });
+}
+
+export async function putAppV23AccessGroup(groupID, group) {
+    return appV23AccessRequest(`/v1/dashboard/network/access/groups/${encodeURIComponent(groupID)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(group),
+    });
+}
+
+export async function deleteAppV23AccessGroup(groupID, expectedRevision) {
+    return appV23AccessRequest(`/v1/dashboard/network/access/groups/${encodeURIComponent(groupID)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_revision: expectedRevision }),
+    });
+}
+
+export async function fetchAppV23LinkedReaders(remoteChainID, remoteAgentID) {
+    const query = new URLSearchParams({
+        remote_chain_id: remoteChainID,
+        remote_agent_id: remoteAgentID,
+    });
+    return appV23AccessRequest(`/v1/dashboard/network/access/linked-readers?${query.toString()}`);
+}
+
+export async function fetchAppV23LinkedReaderIdentities() {
+    return appV23AccessRequest('/v1/dashboard/network/access/linked-readers');
+}
+
+export async function checkAppV23LinkedReaderEligibility(remoteChainID, remoteAgentID) {
+    return appV23AccessRequest('/v1/dashboard/network/access/linked-readers/eligibility', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            remote_chain_id: remoteChainID,
+            remote_agent_id: remoteAgentID,
+        }),
+    });
+}
+
+export async function mutateAppV23LinkedReader(mutation) {
+    return appV23AccessRequest('/v1/dashboard/network/access/linked-readers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(mutation),
+    });
+}
+
+export async function fetchAppV23LinkedMessageConsent(remoteChainID, remoteAgentID, localAgentID) {
+    const query = new URLSearchParams({
+        remote_chain_id: remoteChainID,
+        remote_agent_id: remoteAgentID,
+        local_agent_id: localAgentID,
+    });
+    return appV23AccessRequest(`/v1/dashboard/network/access/linked-messages/consent?${query.toString()}`);
+}
+
+export async function fetchAppV23RemoteHostedMessageCandidates(remoteChainID, localAgentID) {
+    const query = new URLSearchParams({
+        remote_chain_id: remoteChainID,
+        local_agent_id: localAgentID,
+    });
+    return appV23AccessRequest(`/v1/dashboard/network/access/linked-messages/candidates?${query.toString()}`);
+}
+
+export async function putAppV23LinkedMessageConsent(consent) {
+    return appV23AccessRequest('/v1/dashboard/network/access/linked-messages/consent', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(consent),
+    });
+}
+
 export async function fetchAgent(id) {
     const res = await fetch(`${API_BASE}/v1/dashboard/network/agents/${id}`);
     return res.json();
@@ -384,6 +481,21 @@ export async function rotateAgentKey(agentId) {
         method: 'POST',
     });
     return res.json();
+}
+
+export async function handoverRootCredential(expectedGeneration, confirmationPhrase) {
+    const res = await fetch(`${API_BASE}/v1/dashboard/network/access/root/handover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            confirm_irreversible: true,
+            confirmation_phrase: confirmationPhrase,
+            expected_generation: Number(expectedGeneration),
+        }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Root handover failed');
+    return body;
 }
 
 // ─── Tags API ───

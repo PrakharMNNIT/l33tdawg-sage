@@ -25,10 +25,10 @@ func TestValidTransitions(t *testing.T) {
 		{StatusDeprecated, StatusProposed, false},
 		{StatusCommitted, StatusValidated, false},
 		// app-v17 two-phase challenge: `challenged` is reachable and reversible.
-		{StatusCommitted, StatusChallenged, true},   // fresh challenge (quorum >= 2)
-		{StatusChallenged, StatusCommitted, true},   // reinstate / withdraw
-		{StatusChallenged, StatusDeprecated, true},  // confirm
-		{StatusProposed, StatusChallenged, true},    // challenge a still-proposed memory
+		{StatusCommitted, StatusChallenged, true},  // fresh challenge (quorum >= 2)
+		{StatusChallenged, StatusCommitted, true},  // reinstate / withdraw
+		{StatusChallenged, StatusDeprecated, true}, // confirm
+		{StatusProposed, StatusChallenged, true},   // challenge a still-proposed memory
 		// Still invalid: deprecated is terminal.
 		{StatusDeprecated, StatusChallenged, false},
 		{StatusChallenged, StatusProposed, false},

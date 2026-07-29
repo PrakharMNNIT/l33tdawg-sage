@@ -607,7 +607,7 @@ func TestSyncPushNonceRaceRetriesOnce(t *testing.T) {
 
 // TestT2fWriteNeverWidens is T2(f): the WRITE-never-widens end-to-end invariant
 // (docs/v11.8-PLAN.md §8, plan T2(f)). A synced item is admitted ONLY by the
-// receiver's OWN operator-signed MemorySubmit (buildSyncSubmitTx), which
+// receiver's OWN locally-authorized MemorySubmit (buildSyncSubmitTx), which
 // FinalizeBlock re-validates. When the receiver's operator has NO write access to
 // the item's (non-owned) domain, the chain returns the SAME Code 11 "no write
 // access to domain" it always has (app.go processMemorySubmit write gate, level-2
@@ -645,7 +645,7 @@ func TestT2fWriteNeverWidens(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, isCopy, "a write-gated item is never persisted as a synced copy")
 
-	// The receiver's own operator-signed submit is required on EVERY attempt: a
+	// The receiver's own locally-authorized submit is required on EVERY attempt: a
 	// redelivery re-runs the write gate through a fresh broadcast rather than
 	// replaying a cached admission, so the sync path can never bypass the gate.
 	broadcastsAfterFirst := comet.calls.Load()

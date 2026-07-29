@@ -19,6 +19,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/l33tdawg/sage/internal/store"
 )
 
 // fakeCloudflared writes a tiny shell script to disk that mimics the
@@ -381,6 +383,7 @@ func TestWizard_MintTokenRequiresExactOperatorPrincipal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/mint-token", bytes.NewReader(body))
 			req.RemoteAddr = "127.0.0.1:43210"
+			req.Host = "localhost:8080"
 			if tc.key != nil {
 				signAgentRequest(t, req, tc.key, body)
 			}
@@ -392,6 +395,89 @@ func TestWizard_MintTokenRequiresExactOperatorPrincipal(t *testing.T) {
 	rows, err := tokenStore.ListMCPTokens(context.Background())
 	require.NoError(t, err)
 	require.Empty(t, rows, "unauthorized wizard calls must not mint any bearer")
+}
+
+func TestWizard_MintTokenV23UsesLiveLocalAuthorityAfterRootHandover(t *testing.T) {
+	fixture := newAppV23AccessFixture(t)
+	_, currentRootKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	currentRootID := agentIDForKey(currentRootKey)
+	require.NoError(t, fixture.badger.RotateAppV23RootCredential(1, currentRootID, 2))
+
+	_, adminKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	adminID := agentIDForKey(adminKey)
+	require.NoError(t, fixture.badger.RegisterAgentWithCapabilities(
+		adminID, "Current local Admin", store.AppV23RoleMember,
+		"", "test", "", 3, 0,
+	))
+	require.NoError(t, fixture.badger.ApproveAppV23LocalAgent(
+		store.AppV23LocalEnrollment{
+			AgentID: adminID, ApprovedBy: currentRootID, RootGeneration: 2,
+			Profile: store.AppV23ProfileStandard, HomeDomain: "admin-home",
+			Clearance: 4, Capabilities: store.AgentCapabilityReadAllDomains,
+			Active: true, UpdatedHeight: 3,
+		},
+		store.AppV23RoleAdmin, 0, 0,
+	))
+
+	h, tokenStore := newTestHandler(t)
+	h.BadgerStore = fixture.badger
+	h.AppV23ActiveFn = func() bool { return true }
+	h.AdminSigningKey = fixture.rootKey
+	h.NodeOperatorAgentID = fixture.rootID
+	h.ResolveAgentKeyFn = func(agentID string) (ed25519.PrivateKey, bool) {
+		switch agentID {
+		case fixture.rootID:
+			return fixture.rootKey, true
+		case currentRootID:
+			return currentRootKey, true
+		case adminID:
+			return adminKey, true
+		default:
+			return nil, false
+		}
+	}
+	router := testRouter(h)
+
+	mint := func(t *testing.T, name string, signer ed25519.PrivateKey, localBrowser bool) int {
+		t.Helper()
+		body, marshalErr := json.Marshal(map[string]string{"token_name": name})
+		require.NoError(t, marshalErr)
+		req := httptest.NewRequest(
+			http.MethodPost, "/v1/wizard/chatgpt/mint-token", bytes.NewReader(body),
+		)
+		req.Header.Set("Content-Type", "application/json")
+		req.Host = "localhost:8080"
+		req.RemoteAddr = "127.0.0.1:54321"
+		if localBrowser {
+			req.Header.Set("Origin", "http://localhost:8080")
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+		}
+		if len(signer) == ed25519.PrivateKeySize {
+			signAgentRequest(t, req, signer, body)
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// An unencrypted personal node has no vault cookie to present. Its exact
+	// same-origin loopback SPA is nevertheless the current Root control surface.
+	require.Equal(t, http.StatusCreated, mint(t, "current-root", nil, true))
+	require.Equal(t, http.StatusCreated, mint(t, "current-admin", adminKey, false))
+	require.Equal(t, http.StatusForbidden, mint(t, "retired-root", fixture.rootKey, false))
+
+	rows, err := tokenStore.ListMCPTokens(context.Background())
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "retired Root denial must not mint a bearer")
+	issuers := map[string]bool{}
+	for _, row := range rows {
+		issuers[row.IssuerID] = true
+	}
+	require.True(t, issuers[currentRootID], "unencrypted local SPA must issue as current Root")
+	require.True(t, issuers[adminID], "current local Admin must issue under its own authority")
+	require.False(t, issuers[fixture.rootID], "retired transport Root must never remain an MCP issuer")
 }
 
 // TestWizard_HappyPath_E2E threads through every step of the wizard

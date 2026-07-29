@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/l33tdawg/sage/internal/memory"
+	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 )
 
@@ -218,9 +219,21 @@ func (h *DashboardHandler) handleImportUpload(w http.ResponseWriter, r *http.Req
 // processImportRecords generates embeddings, broadcasts on-chain, and inserts memories.
 // Used by both the legacy one-shot import and the preview/confirm flow.
 func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.Request, records []*memory.MemoryRecord, source string, parseErrors []string) {
+	var controlActor *appV23ControlActor
+	if h.appV23IsActive() {
+		var ok bool
+		controlActor, ok = h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+	}
 	// Resolve the admin agent to attribute imported memories to.
 	targetAgent := importAgent
-	if agentStore, ok := h.store.(AgentStoreProvider); ok {
+	if controlActor != nil {
+		// Imported memories preserve the exact request credential as authorship
+		// provenance. Root's immutable principal remains authorization-only.
+		targetAgent = controlActor.ID
+	} else if agentStore, ok := h.store.(AgentStoreProvider); ok {
 		if agents, listErr := agentStore.ListAgents(r.Context()); listErr == nil {
 			for _, a := range agents {
 				if a.Role == "admin" && a.Status != "removed" {
@@ -263,12 +276,30 @@ func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.R
 			}
 		}
 
-		// Broadcast on-chain MemorySubmit through CometBFT consensus
-		if h.CometBFTRPC != "" && h.SigningKey != nil {
+		// Broadcast on-chain MemorySubmit through CometBFT consensus.
+		// App-v23 imports execute as the exact current Root/Admin request actor,
+		// wait for commit, and trust only the consensus-materialized projection.
+		if controlActor != nil {
+			shared, sharedErr := h.BadgerStore.IsAppV23SharedDomain(rec.DomainTag)
+			if sharedErr != nil {
+				parseErrors = append(parseErrors,
+					fmt.Sprintf("memory %s: target domain policy is unavailable", rec.MemoryID))
+				skipped++
+				continue
+			}
+			decision, authErr := h.BadgerStore.AuthorizeAppV23LocalDomain(
+				controlActor.ID, rec.DomainTag, store.AppV23VerbWrite,
+				shared,
+			)
+			if authErr != nil || decision.ExplicitDeny || !decision.Allowed {
+				parseErrors = append(parseErrors,
+					fmt.Sprintf("memory %s: current actor cannot write the target domain", rec.MemoryID))
+				skipped++
+				continue
+			}
 			submitTx := &tx.ParsedTx{
 				Type:      tx.TxTypeMemorySubmit,
-				Nonce:     tx.MonotonicNonce(h.SigningKey),
-				Timestamp: rec.CreatedAt,
+				Timestamp: time.Now(),
 				MemorySubmit: &tx.MemorySubmit{
 					MemoryID:        rec.MemoryID,
 					ContentHash:     rec.ContentHash,
@@ -280,18 +311,47 @@ func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.R
 					Classification:  tx.ClearanceLevel(1), // INTERNAL
 				},
 			}
-			embedDashboardAgentProof(submitTx, h.SigningKey)
-			if signErr := tx.SignTx(submitTx, h.SigningKey); signErr == nil {
-				if encoded, encErr := tx.EncodeTx(submitTx); encErr == nil {
-					_ = broadcastTxSync(h.CometBFTRPC, encoded)
+			if _, _, _, commitErr := h.signAndBroadcastAppV23Control(submitTx, controlActor); commitErr != nil {
+				parseErrors = append(parseErrors,
+					fmt.Sprintf("memory %s: consensus rejected the import", rec.MemoryID))
+				skipped++
+				continue
+			}
+			committed, readErr := h.store.GetMemory(r.Context(), rec.MemoryID)
+			if readErr != nil || committed == nil ||
+				committed.SubmittingAgent != controlActor.ID {
+				parseErrors = append(parseErrors,
+					fmt.Sprintf("memory %s: committed projection could not be confirmed", rec.MemoryID))
+				skipped++
+				continue
+			}
+		} else {
+			// Legacy compatibility lane. It remains byte-for-byte unchanged
+			// before app-v23; app-v23 never reaches this fire-and-forget path.
+			if h.CometBFTRPC != "" && h.SigningKey != nil {
+				submitTx := &tx.ParsedTx{
+					Type:      tx.TxTypeMemorySubmit,
+					Nonce:     tx.MonotonicNonce(h.SigningKey),
+					Timestamp: rec.CreatedAt,
+					MemorySubmit: &tx.MemorySubmit{
+						MemoryID: rec.MemoryID, ContentHash: rec.ContentHash,
+						EmbeddingHash: embeddingHash, MemoryType: tx.MemoryTypeObservation,
+						DomainTag: rec.DomainTag, ConfidenceScore: rec.ConfidenceScore,
+						Content: rec.Content, Classification: tx.ClearanceLevel(1),
+					},
+				}
+				embedDashboardAgentProof(submitTx, h.SigningKey)
+				if signErr := tx.SignTx(submitTx, h.SigningKey); signErr == nil {
+					if encoded, encErr := tx.EncodeTx(submitTx); encErr == nil {
+						_ = broadcastTxSync(h.CometBFTRPC, encoded)
+					}
 				}
 			}
-		}
-
-		if insertErr := h.store.InsertMemory(r.Context(), rec); insertErr != nil {
-			parseErrors = append(parseErrors, fmt.Sprintf("insert %s: %s", rec.MemoryID, insertErr.Error()))
-			skipped++
-			continue
+			if insertErr := h.store.InsertMemory(r.Context(), rec); insertErr != nil {
+				parseErrors = append(parseErrors, fmt.Sprintf("insert %s: %s", rec.MemoryID, insertErr.Error()))
+				skipped++
+				continue
+			}
 		}
 		imported++
 

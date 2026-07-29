@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/store"
 )
 
@@ -72,4 +74,58 @@ func TestGetAgent_OnChainPoESignals_ColdStart(t *testing.T) {
 
 	assert.Equal(t, int64(0), resp.CorrCount)
 	assert.Empty(t, resp.DomainExpertise, "no voting history -> no domain expertise emitted")
+}
+
+func TestAppV23GetAgentSelfExposesOnlyActiveOrdinaryHomePolicy(t *testing.T) {
+	srv, _, badger, agents := newRBACTestServer(t)
+	rootPub, _, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	companionPub, companionKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	rootID := auth.PublicKeyToAgentID(rootPub)
+	companionID := auth.PublicKeyToAgentID(companionPub)
+	require.NoError(t, badger.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: rootID, Scope: "self-home-policy",
+		AgentID: companionID, Profile: store.AppV23ProfileCompanion,
+		HomeDomain: "voice-interface", Clearance: 2, Capabilities: 15,
+		Height: 1, BootstrapDigest: "self-home-policy",
+	}))
+	agents.agents[companionID] = &store.AgentEntry{
+		AgentID: companionID, Name: "Mynah", Role: store.AppV23RoleMember,
+		Status: "active", Clearance: 2, Capabilities: 15,
+	}
+	srv.SetPostV23ForNextTxAccessor(func() bool { return true })
+
+	req := signedRequestAs(
+		t, companionKey, companionID, http.MethodGet, "/v1/agent/me", nil,
+	)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp AgentProfileResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.Equal(t, companionID, resp.AgentID)
+	require.Equal(t, store.AppV23RoleMember, resp.Role)
+	require.Equal(t, store.AppV23ProfileCompanion, resp.Profile)
+	require.Equal(t, "voice-interface", resp.HomeDomain)
+	require.Equal(t, "active", resp.EnrollmentState)
+
+	pendingPub, pendingKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	pendingID := auth.PublicKeyToAgentID(pendingPub)
+	require.NoError(t, badger.RegisterAgentWithCapabilities(
+		pendingID, "pending", store.AppV23RoleMember, "", "test", "", 2, 0,
+	))
+	agents.agents[pendingID] = &store.AgentEntry{
+		AgentID: pendingID, Name: "pending", Role: store.AppV23RoleMember,
+		Status: "active", Clearance: 2,
+	}
+	deniedReq := signedRequestAs(
+		t, pendingKey, pendingID, http.MethodGet, "/v1/agent/me", nil,
+	)
+	denied := httptest.NewRecorder()
+	srv.Router().ServeHTTP(denied, deniedReq)
+	require.Equal(t, http.StatusForbidden, denied.Code, denied.Body.String())
+	require.Contains(t, denied.Body.String(), "active-agent-required")
+	require.NotContains(t, denied.Body.String(), "home_domain")
 }

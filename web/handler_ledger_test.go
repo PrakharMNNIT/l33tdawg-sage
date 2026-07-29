@@ -174,9 +174,16 @@ func TestHandleConfirmRecoveryKeyBackupRejectsRemoteCallerWithoutSession(t *test
 }
 
 func TestVaultLoginTriggersScopedProjectionRecovery(t *testing.T) {
-	h, _ := newTestHandler(t)
+	h, sqliteStore := newTestHandler(t)
 	h.VaultKeyPath = filepath.Join(t.TempDir(), "vault.key")
 	h.RunBackground = func(fn func(context.Context)) { fn(context.Background()) }
+	sqliteStore.SetVaultExpected(true)
+	admissionOpened := 0
+	h.OnVaultUnlocked = func(string) {
+		require.True(t, sqliteStore.VaultActive(), "vault publication must precede admission")
+		require.False(t, sqliteStore.VaultLocked(), "admission must never open against a locked projection")
+		admissionOpened++
+	}
 	called := 0
 	h.ScopedProjectionRebuildFn = func(context.Context) (int, error) {
 		called++
@@ -193,6 +200,7 @@ func TestVaultLoginTriggersScopedProjectionRecovery(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 
 	_ = loginAfterEnable(t, r, "test-pass-123")
+	assert.Equal(t, 1, admissionOpened)
 	assert.Equal(t, 1, called, "unlock must retry the canonical scoped projection before readiness can recover")
 }
 

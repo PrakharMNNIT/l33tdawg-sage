@@ -45,6 +45,11 @@ func WriteCanonicalState(ctx context.Context, db *badger.DB, output io.Writer) e
 
 	var count uint64
 	err := db.View(func(txn *badger.Txn) error {
+		_, markerErr := txn.Get([]byte(consensuskeys.AppV23MigrationState))
+		appV23Active := markerErr == nil
+		if markerErr != nil && !errors.Is(markerErr, badger.ErrKeyNotFound) {
+			return markerErr
+		}
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		iterator := txn.NewIterator(opts)
@@ -59,7 +64,8 @@ func WriteCanonicalState(ctx context.Context, db *badger.DB, output io.Writer) e
 			// the two exact legacy dirty-tree markers defensively: they are excluded
 			// from every AppHash rule and must neither leak from a provider nor
 			// become an unauthenticated, AppHash-invisible receiver input.
-			if consensuskeys.IsAppHashExcludedLocalKey(key) {
+			if consensuskeys.IsAppHashExcludedLocalKey(key) &&
+				(!appV23Active || !consensuskeys.IsAppV23MigrationStageKey(key)) {
 				continue
 			}
 			if len(key) == 0 || len(key) > MaxCanonicalKeyBytes {
@@ -141,6 +147,8 @@ func RestoreCanonicalState(ctx context.Context, input io.Reader, db *badger.DB) 
 	defer batch.Cancel()
 	var previous []byte
 	var count uint64
+	var sawAppV23Marker bool
+	var sawAppV23Stage bool
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -183,7 +191,15 @@ func RestoreCanonicalState(ctx context.Context, input io.Reader, db *badger.DB) 
 		if _, err := io.ReadFull(input, key); err != nil {
 			return fmt.Errorf("read canonical state key: %w", err)
 		}
-		if consensuskeys.IsAppHashExcludedLocalKey(key) {
+		if bytes.Equal(key, []byte(consensuskeys.AppV23MigrationState)) {
+			sawAppV23Marker = true
+		}
+		if consensuskeys.IsAppV23MigrationStageKey(key) {
+			if !sawAppV23Marker {
+				return errors.New("canonical state contains app-v23 stage without activation marker")
+			}
+			sawAppV23Stage = true
+		} else if consensuskeys.IsAppHashExcludedLocalKey(key) {
 			return errors.New("canonical state contains excluded local bookkeeping")
 		}
 		if previous != nil && bytes.Compare(previous, key) >= 0 {
@@ -198,6 +214,9 @@ func RestoreCanonicalState(ctx context.Context, input io.Reader, db *badger.DB) 
 		}
 		previous = key
 		count++
+	}
+	if sawAppV23Stage && !sawAppV23Marker {
+		return errors.New("canonical state app-v23 stage is not activated")
 	}
 	if err := batch.Flush(); err != nil {
 		return fmt.Errorf("flush canonical state: %w", err)

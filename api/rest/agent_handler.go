@@ -44,18 +44,89 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		req.Role = "member"
 	}
 
-	agentID := middleware.ContextAgentID(r.Context())
+	credentialID := middleware.ContextAgentID(r.Context())
+	isRoot, rootErr := s.appV23IsRootIdentity(credentialID)
+	if rootErr != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+			"Current CEREBRUM Root state is unavailable.")
+		return
+	}
+	if isRoot {
+		writeProblem(w, http.StatusForbidden, "Root is not an agent",
+			"CEREBRUM Root cannot register or update an ordinary agent identity.")
+		return
+	}
+	agentID := credentialID
+	if s.isPostV23ForNextTx() {
+		var policyErr error
+		agentID, policyErr = appV23PolicyPrincipal(s.badgerStore, credentialID)
+		if policyErr != nil {
+			writeProblem(w, http.StatusForbidden, "Current Root required",
+				"The authenticated credential is not a current app-v23 policy principal.")
+			return
+		}
+	}
 
 	// Idempotent: check if already registered on-chain
 	if s.badgerStore != nil && s.badgerStore.IsAgentRegistered(agentID) {
 		existing, err := s.badgerStore.GetRegisteredAgent(agentID)
 		if err == nil {
 			name := existing.Name
+			registeredName := existing.RegisteredName
+			provider := existing.Provider
+			status := "already_registered"
+			approvalRequired := false
+			if s.isPostV23ForNextTx() {
+				enrollment, enrollmentErr := s.badgerStore.GetAppV23Enrollment(agentID)
+				if enrollmentErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Committed state unavailable",
+						"The local enrollment state could not be read.")
+					return
+				}
+				approvalRequired = enrollment == nil || !enrollment.Active
+				if approvalRequired {
+					status = "pending_review"
+				}
+			}
 
-			// Self-healing: if the dashboard (SQLite) has a different name than on-chain
-			// (e.g. admin renamed via GUI but the CometBFT broadcast failed), reconcile
-			// by pushing the SQLite name to on-chain state.
-			if s.agentStore != nil {
+			if s.agentStore != nil && s.isPostV23ForNextTx() && !approvalRequired {
+				// Direct app-v23 genesis and state sync commit the ordinary-agent
+				// roster before a node-local SQL projection exists. Repair that
+				// projection from consensus here as an idempotent self-heal.
+				// Request fields are authenticated display hints only; role,
+				// lifecycle, clearance, and capabilities always come from Badger.
+				projected, projectionErr := store.EnsureAppV23AgentProjection(
+					r.Context(),
+					s.agentStore,
+					s.badgerStore,
+					agentID,
+					&store.AgentEntry{
+						AgentID:        agentID,
+						Name:           req.Name,
+						RegisteredName: req.Name,
+						BootBio:        req.BootBio,
+						Provider:       req.Provider,
+						P2PAddress:     req.P2PAddress,
+					},
+				)
+				if projectionErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Agent projection unavailable",
+						"The agent is active in consensus, but its local serving projection could not be repaired.")
+					return
+				}
+				if projected.Name != "" {
+					name = projected.Name
+				}
+				if projected.RegisteredName != "" {
+					registeredName = projected.RegisteredName
+				}
+				if projected.Provider != "" {
+					provider = projected.Provider
+				}
+			} else if s.agentStore != nil && !s.isPostV23ForNextTx() {
+				// Legacy self-healing: if the dashboard (SQLite) has a different
+				// name than on-chain (e.g. an older GUI rename broadcast failed),
+				// push the SQLite name to on-chain state.
 				if sqliteAgent, agErr := s.agentStore.GetAgent(r.Context(), agentID); agErr == nil && sqliteAgent.Name != existing.Name {
 					name = sqliteAgent.Name
 					s.reconcileAgentName(agentID, sqliteAgent.Name, existing.BootBio)
@@ -63,13 +134,16 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 			}
 
 			writeJSON(w, http.StatusOK, map[string]any{
-				"agent_id":        existing.AgentID,
-				"name":            name,
-				"registered_name": existing.RegisteredName,
-				"role":            existing.Role,
-				"provider":        existing.Provider,
-				"status":          "already_registered",
-				"on_chain_height": existing.RegisteredAt,
+				"agent_id":          existing.AgentID,
+				"name":              name,
+				"registered_name":   registeredName,
+				"role":              existing.Role,
+				"provider":          provider,
+				"clearance":         existing.Clearance,
+				"capabilities":      existing.Capabilities,
+				"status":            status,
+				"approval_required": approvalRequired,
+				"on_chain_height":   existing.RegisteredAt,
 			})
 			return
 		}
@@ -91,7 +165,7 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), registerTx)
 
-	if err := tx.SignTx(registerTx, s.signingKey); err != nil {
+	if err := s.signTx(registerTx); err != nil {
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
 	}
@@ -117,19 +191,53 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	committed := &store.OnChainAgent{
+		AgentID: agentID, Name: req.Name, RegisteredName: req.Name,
+		Role: req.Role, Provider: req.Provider, RegisteredAt: height,
+	}
+	status := "registered"
+	approvalRequired := false
+	if s.badgerStore != nil {
+		actual, readErr := s.badgerStore.GetRegisteredAgent(agentID)
+		if readErr != nil || actual == nil {
+			if s.isPostV23ForNextTx() {
+				writeProblem(w, http.StatusServiceUnavailable, "Committed state unavailable",
+					"Registration committed, but its consensus policy could not be read. Retry the idempotent registration request.")
+				return
+			}
+		} else {
+			committed = actual
+		}
+	}
+	if s.isPostV23ForNextTx() {
+		enrollment, readErr := s.badgerStore.GetAppV23Enrollment(agentID)
+		if readErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Committed state unavailable",
+				"Registration committed, but its local enrollment state could not be read. Retry the idempotent registration request.")
+			return
+		}
+		approvalRequired = enrollment == nil || !enrollment.Active
+		if approvalRequired {
+			status = "pending_review"
+		}
+	}
 	if s.OnEvent != nil {
-		s.OnEvent("agent", agentID, "", fmt.Sprintf("Agent %q registered (%s)", req.Name, req.Role), nil)
+		s.OnEvent("agent", agentID, "",
+			fmt.Sprintf("Agent %q registered (%s; %s)", committed.Name, committed.Role, status), nil)
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"agent_id":        agentID,
-		"name":            req.Name,
-		"registered_name": req.Name,
-		"role":            req.Role,
-		"provider":        req.Provider,
-		"status":          "registered",
-		"tx_hash":         txHash,
-		"on_chain_height": height,
+		"agent_id":          committed.AgentID,
+		"name":              committed.Name,
+		"registered_name":   committed.RegisteredName,
+		"role":              committed.Role,
+		"provider":          committed.Provider,
+		"clearance":         committed.Clearance,
+		"capabilities":      committed.Capabilities,
+		"status":            status,
+		"approval_required": approvalRequired,
+		"tx_hash":           txHash,
+		"on_chain_height":   height,
 	})
 }
 
@@ -198,7 +306,7 @@ func (s *Server) registerMintedAgentIdentity(ctx context.Context, tokenPub ed255
 	if s.isPostV17ForNextTx() {
 		registerTx.AgentRequest = append([]byte(nil), canonical...)
 	}
-	if signErr := tx.SignTx(registerTx, s.signingKey); signErr != nil {
+	if signErr := s.signTx(registerTx); signErr != nil {
 		return "", 0, fmt.Errorf("sign register tx: %w", signErr)
 	}
 	encoded, err := tx.EncodeTx(registerTx)
@@ -221,6 +329,17 @@ func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agentID := middleware.ContextAgentID(r.Context())
+	isRoot, rootErr := s.appV23IsRootIdentity(agentID)
+	if rootErr != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+			"Current CEREBRUM Root state is unavailable.")
+		return
+	}
+	if isRoot {
+		writeProblem(w, http.StatusForbidden, "Root is not an agent",
+			"CEREBRUM Root metadata cannot be edited through the agent API.")
+		return
+	}
 
 	updateTx := &tx.ParsedTx{
 		Type:      tx.TxTypeAgentUpdate,
@@ -235,7 +354,7 @@ func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), updateTx)
 
-	if err := tx.SignTx(updateTx, s.signingKey); err != nil {
+	if err := s.signTx(updateTx); err != nil {
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
 	}
@@ -276,7 +395,7 @@ func (s *Server) reconcileAgentName(agentID, name, bio string) {
 			BootBio: bio,
 		},
 	}
-	if err := tx.SignTx(updateTx, s.signingKey); err != nil {
+	if err := s.signTx(updateTx); err != nil {
 		s.logger.Warn().Err(err).Str("agent_id", agentID).Msg("reconcile: failed to sign agent name update")
 		return
 	}
@@ -321,6 +440,23 @@ func (s *Server) handleAgentSetPermission(w http.ResponseWriter, r *http.Request
 	targetID := chi.URLParam(r, "id")
 	if targetID == "" {
 		writeProblem(w, http.StatusBadRequest, "Missing agent ID", "id path parameter is required.")
+		return
+	}
+	if s.isPostV23ForNextTx() {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusGone)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":   "https://sage.dev/errors/app-v23-atomic-agent-policy-required",
+			"title":  "Legacy agent permission endpoint retired",
+			"status": http.StatusGone,
+			"detail": "App-v23 requires role, profile, clearance, capabilities, and home-domain approval to be committed atomically through CEREBRUM.",
+			"code":   "app_v23_atomic_policy_required",
+			"replacement": map[string]string{
+				"method":          http.MethodPut,
+				"path":            "/v1/dashboard/network/access/agents/{id}/policy",
+				"target_agent_id": targetID,
+			},
+		})
 		return
 	}
 
@@ -464,7 +600,7 @@ func (s *Server) handleAgentSetPermission(w http.ResponseWriter, r *http.Request
 
 	s.embedAgentAuth(r.Context(), permTx)
 
-	if err := tx.SignTx(permTx, s.signingKey); err != nil {
+	if err := s.signTx(permTx); err != nil {
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
 		return
 	}
@@ -547,6 +683,32 @@ func (s *Server) callerIsOperatorOrAdmin(ctx context.Context, callerID string) b
 	if callerID == "" {
 		return false
 	}
+	if s.isPostV23ForNextTx() {
+		if s.badgerStore == nil {
+			return false
+		}
+		root, err := s.badgerStore.GetAppV23Root()
+		if err != nil || root == nil {
+			return false
+		}
+		if callerID == root.CredentialID {
+			return true
+		}
+		if callerID == root.PrincipalID && root.CredentialID != root.PrincipalID {
+			return false
+		}
+		enrollment, err := s.badgerStore.GetAppV23Enrollment(callerID)
+		if err != nil || enrollment == nil || !enrollment.Active ||
+			enrollment.RootGeneration != root.Generation {
+			return false
+		}
+		role, err := s.badgerStore.GetAppV23Role(callerID)
+		return err == nil && role != nil &&
+			role.Role == store.AppV23RoleAdmin &&
+			store.ValidateAppV23Policy(
+				role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+			) == nil
+	}
 	if s.nodeOperatorID != "" && callerID == s.nodeOperatorID {
 		return true
 	}
@@ -626,6 +788,16 @@ func (s *Server) handleGetRegisteredAgent(w http.ResponseWriter, r *http.Request
 		writeProblem(w, http.StatusServiceUnavailable, "Agent store unavailable", "Agent store not configured.")
 		return
 	}
+	isRoot, rootErr := s.appV23IsRootIdentity(id)
+	if rootErr != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+			"Current CEREBRUM Root state is unavailable.")
+		return
+	}
+	if isRoot {
+		writeProblem(w, http.StatusNotFound, "Agent not found", "No agent found with that ID.")
+		return
+	}
 
 	agent, err := s.agentStore.GetAgent(r.Context(), id)
 	if err != nil {
@@ -660,6 +832,18 @@ func (s *Server) handleListRegisteredAgents(w http.ResponseWriter, r *http.Reque
 	// credential exchangeable for the agent key seed) or per-agent ACL topology.
 	sanitized := make([]*store.AgentEntry, 0, len(agents))
 	for _, a := range agents {
+		if a == nil {
+			continue
+		}
+		isRoot, rootErr := s.appV23IsRootIdentity(a.AgentID)
+		if rootErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current CEREBRUM Root state is unavailable.")
+			return
+		}
+		if isRoot {
+			continue
+		}
 		s.overlayOnChainAgentPolicyForRead(a)
 		sanitized = append(sanitized, sanitizeAgentForRead(a, false))
 	}
@@ -710,6 +894,15 @@ func (s *Server) handleFindRegisteredAgents(w http.ResponseWriter, r *http.Reque
 	sanitized := make([]*store.AgentEntry, 0, len(agents))
 	for _, agent := range agents {
 		if agent != nil {
+			isRoot, rootErr := s.appV23IsRootIdentity(agent.AgentID)
+			if rootErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+					"Current CEREBRUM Root state is unavailable.")
+				return
+			}
+			if isRoot {
+				continue
+			}
 			sanitized = append(sanitized, sanitizeAgentForRead(agent, false))
 		}
 	}

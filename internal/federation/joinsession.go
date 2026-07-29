@@ -63,6 +63,7 @@ type JoinSession struct {
 	HostGrantExpiry    int64
 	HostGrantMode      string
 	HostGrantDirection string
+	HostControlActorID string
 
 	// Staged, un-committed material held between /join/request and /join/confirm.
 	// The guest CA is staged (pending sidecar) at request and committed only
@@ -438,6 +439,10 @@ type HostGrant struct {
 	Mode      string
 	Direction string
 	Scope     [32]byte // ScopeDigest of the above (recomputed identically by the guest)
+	// ControlActorID is the exact local Root/Admin principal whose approval
+	// caused the eventual host tx-33. It is frozen with the ceremony and
+	// revalidated immediately before consensus signing.
+	ControlActorID string
 }
 
 // ApproveWithCode is approval #1, done ATOMICALLY: under a single lock it
@@ -471,6 +476,7 @@ func (s *JoinStore) ApproveWithCode(id, typedCode string, grant HostGrant) (lock
 	js.HostGrantExpiry = grant.Expiry
 	js.HostGrantMode = grant.Mode
 	js.HostGrantDirection = grant.Direction
+	js.HostControlActorID = grant.ControlActorID
 	js.HostScope = grant.Scope
 	js.Approved = true
 	js.ApprovedE = js.attestation(grant.Scope)
@@ -576,12 +582,13 @@ func (s *JoinStore) CheckConfirm(id string, certSPKI, guestSig, guestAckSig []by
 		ApprovedE: js.ApprovedE,
 		Seed:      append([]byte(nil), js.Seed...),
 		HostGrant: HostGrant{
-			Clearance: js.HostGrantClearance,
-			Domains:   append([]string(nil), js.HostGrantDomains...),
-			Expiry:    js.HostGrantExpiry,
-			Mode:      js.HostGrantMode,
-			Direction: js.HostGrantDirection,
-			Scope:     js.HostScope,
+			Clearance:      js.HostGrantClearance,
+			Domains:        append([]string(nil), js.HostGrantDomains...),
+			Expiry:         js.HostGrantExpiry,
+			Mode:           js.HostGrantMode,
+			Direction:      js.HostGrantDirection,
+			Scope:          js.HostScope,
+			ControlActorID: js.HostControlActorID,
 		},
 		commitGuestCA:   js.commitGuestCA,
 		rollbackGuestCA: js.rollbackGuestCA,

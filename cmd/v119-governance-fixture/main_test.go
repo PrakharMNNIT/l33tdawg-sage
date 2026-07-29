@@ -80,6 +80,20 @@ func TestFixtureNodeBaseURLIsClosedOverFourInternalGateways(t *testing.T) {
 	}
 }
 
+func TestFixtureRequestBaseURLRequiresOneExplicitTransport(t *testing.T) {
+	t.Parallel()
+
+	if got, err := fixtureRequestBaseURL(-1, true); err != nil || got != "http://127.0.0.1:8080" {
+		t.Fatalf("local fixture URL = %q, %v", got, err)
+	}
+	if _, err := fixtureRequestBaseURL(0, true); err == nil {
+		t.Fatal("local fixture transport accepted a network node index")
+	}
+	if _, err := fixtureRequestBaseURL(-1, false); err == nil {
+		t.Fatal("network fixture transport accepted a missing node index")
+	}
+}
+
 func TestSignedRequestAuthenticatesExactRequest(t *testing.T) {
 	t.Parallel()
 

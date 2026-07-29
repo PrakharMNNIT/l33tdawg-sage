@@ -25,6 +25,62 @@ import (
 	"github.com/l33tdawg/sage/web"
 )
 
+type oauthFailingEntropyReader struct{}
+
+func (oauthFailingEntropyReader) Read([]byte) (int, error) {
+	return 0, errors.New("entropy unavailable")
+}
+
+func TestOAuth_ConsentFailsClosedWhenCSRFEntropyUnavailable(t *testing.T) {
+	h := NewOAuthHandler(nil, nil, nil)
+	h.random = oauthFailingEntropyReader{}
+	p := authorizeFormParams{
+		ClientID:            "client",
+		RedirectURI:         "https://chat.openai.com/cb",
+		CodeChallenge:       "challenge",
+		CodeChallengeMethod: "S256",
+		ResponseType:        "code",
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/oauth/approve", nil)
+	rr := httptest.NewRecorder()
+
+	h.renderConsent(rr, req, p, "actor", "", "/oauth/approve")
+
+	require.Equal(t, http.StatusInternalServerError, rr.Code)
+	require.NotContains(t, rr.Body.String(), `name="csrf_nonce"`)
+	_, err := h.issueApprovalHandoff(p)
+	require.ErrorContains(t, err, "generate approval handoff")
+}
+
+func TestOAuth_CSRFClockRollbackAllowsOnlyExplicitSkew(t *testing.T) {
+	h := NewOAuthHandler(nil, nil, nil)
+	issuedAt := time.Date(2026, time.July, 29, 8, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return issuedAt }
+	params := authorizeFormParams{
+		ClientID:            "clock-client",
+		RedirectURI:         "https://chat.openai.com/cb",
+		State:               "clock-state",
+		CodeChallenge:       "clock-challenge",
+		CodeChallengeMethod: "S256",
+		ResponseType:        "code",
+		ApprovalHandoff:     "clock-handoff",
+	}
+	nonce, err := h.signCSRFNonce(params)
+	require.NoError(t, err)
+
+	h.now = func() time.Time { return issuedAt.Add(-csrfClockSkew / 2) }
+	require.NoError(t, h.verifyCSRFNonce(params, nonce),
+		"a small backward clock correction must remain usable")
+
+	h.now = func() time.Time { return issuedAt.Add(-csrfClockSkew - time.Second) }
+	require.ErrorContains(t, h.verifyCSRFNonce(params, nonce), "issued in the future",
+		"a materially future-issued nonce must not gain an extended lifetime")
+
+	h.now = func() time.Time { return issuedAt.Add(csrfTTL + time.Second) }
+	require.ErrorContains(t, h.verifyCSRFNonce(params, nonce), "expired",
+		"expiry must use the handler clock rather than process-global time")
+}
+
 type cancelingAuthCodeStore struct {
 	*store.SQLiteStore
 	cancel               context.CancelFunc
@@ -192,10 +248,12 @@ func TestOAuth_EncryptionOffUnsignedLoopbackHeadersCannotConsent(t *testing.T) {
 		CodeChallenge:       pkceChallenge("local-operator-verifier-aaaaaaaa-bbbbbbbb"),
 		CodeChallengeMethod: "S256", ResponseType: "code", Scope: "mcp",
 	}
+	csrf, err := h.signCSRFNonce(p)
+	require.NoError(t, err)
 	form := url.Values{
 		"client_id": {p.ClientID}, "redirect_uri": {p.RedirectURI}, "state": {p.State},
 		"code_challenge": {p.CodeChallenge}, "code_challenge_method": {p.CodeChallengeMethod},
-		"response_type": {p.ResponseType}, "scope": {p.Scope}, "csrf_nonce": {h.signCSRFNonce(p)},
+		"response_type": {p.ResponseType}, "scope": {p.Scope}, "csrf_nonce": {csrf},
 		"token_name": {"unsigned-loopback"},
 	}
 	post := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
@@ -495,10 +553,9 @@ func TestOAuth_Authorize_NoAgentRosterPreAuth(t *testing.T) {
 	// No picker / dropdown / free-text input for agent_id.
 	assert.NotContains(t, body, `<select name="agent_id"`)
 	assert.NotContains(t, body, `name="agent_id"`)
-	// The operator label is the 8-char prefix of the test handler's
-	// NodeOperatorAgentID (64×'a' → "aaaaaaaa…").
-	assert.Contains(t, body, "aaaaaaaa")
-	// The full pubkey must NOT be rendered to an unauthenticated visitor.
+	assert.Contains(t, body, "distinct pending-review MCP agent")
+	// Neither a prefix nor the full approving authority is rendered.
+	assert.NotContains(t, body, "aaaaaaaa")
 	assert.NotContains(t, body, strings.Repeat("a", 64))
 }
 

@@ -308,7 +308,7 @@ func (s *SQLiteStore) migrateSyncGroupTables(ctx context.Context) {
 	// anti-rollback stamp (0 = active) mirroring sync_group_domain, so replaying the
 	// self-authored role_change that carries the subset is idempotent. This table is
 	// READ/SERVE/FAN-OUT ONLY: it is NEVER an input to any write-authz path (a synced
-	// item is still persisted only by the receiver's own operator-signed MemorySubmit).
+	// item is still persisted only by the receiver's own locally-authorized MemorySubmit).
 	_, _ = s.writeExecContext(ctx, `
 	CREATE TABLE IF NOT EXISTS sync_group_member_domain (
 		group_id         TEXT NOT NULL,

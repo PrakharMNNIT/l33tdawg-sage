@@ -1,6 +1,6 @@
 // CEREBRUM — Your SAGE Brain
 import { SSEClient } from './sse.js';
-import { fetchStats, fetchGraph, fetchMemories, deleteMemory, updateMemory, fetchHealth, fetchValidators, fetchScopes, fetchMcpConfig, checkAuth, login, recoverVault, lockSession, importMemories, importPreview, importConfirm, fetchCleanupSettings, saveCleanupSettings, runCleanup, fetchAgents, fetchAgent, createAgent, updateAgent, removeAgent, downloadBundle, fetchTemplates, fetchRedeployStatus, startRedeploy, createPairingCode, rotateAgentKey, fetchBootInstructions, saveBootInstructions, fetchLedgerStatus, enableLedger, changeLedgerPassphrase, disableLedger, fetchTags, fetchMemoryTags, setMemoryTags, fetchAutostart, setAutostart, checkForUpdate, applyUpdate, restartServer, fetchReranker, saveReranker, testReranker, detectReranker, fetchOnboarding, saveOnboarding,
+import { fetchStats, fetchGraph, fetchMemories, deleteMemory, updateMemory, fetchHealth, fetchValidators, fetchScopes, fetchMcpConfig, checkAuth, login, recoverVault, lockSession, importMemories, importPreview, importConfirm, fetchCleanupSettings, saveCleanupSettings, runCleanup, fetchAgents, fetchAppV23Access, updateAppV23AgentPolicy, putAppV23AccessGroup, deleteAppV23AccessGroup, fetchAppV23LinkedReaders, fetchAppV23LinkedReaderIdentities, checkAppV23LinkedReaderEligibility, mutateAppV23LinkedReader, fetchAppV23LinkedMessageConsent, fetchAppV23RemoteHostedMessageCandidates, putAppV23LinkedMessageConsent, fetchAgent, createAgent, updateAgent, removeAgent, downloadBundle, fetchTemplates, fetchRedeployStatus, startRedeploy, createPairingCode, rotateAgentKey, handoverRootCredential, fetchBootInstructions, saveBootInstructions, fetchLedgerStatus, enableLedger, changeLedgerPassphrase, disableLedger, fetchTags, fetchMemoryTags, setMemoryTags, fetchAutostart, setAutostart, checkForUpdate, applyUpdate, restartServer, fetchReranker, saveReranker, testReranker, detectReranker, fetchOnboarding, saveOnboarding,
 rerankerSetupStatus, rerankerSetupDownload, rerankerSetupStart, rerankerSetupStop, rerankerSetupInstallEngine, fetchTasks, updateTaskStatus, reorderTasks, createTask, assignTask, fetchUnregisteredAgents, mergeAgent, fetchRecallSettings, saveRecallSettings, fetchAgentDomains, reassignDomainOwnership, bulkUpdateMemories, fetchMemoryMode, saveMemoryMode, fetchPipeline, fetchPipelineStats, sendPipelineNote, fetchGovProposals, fetchGovProposalDetail, submitGovProposal, submitGovVote, wizardCheckCloudflared, wizardInstallCloudflared, wizardStartLogin, wizardLoginStatus, wizardCreateTunnel, wizardMintToken, connectProvider, connectRemoteUrl, fetchUpdateStatus, selectEmbeddingProvider,
 embeddingsStatus, checkOllamaEmbed, installOllamaRuntime, startOllamaRuntime, pullEmbedModel, reembedMemories, reembedProgress, enableSemanticEmbeddings,
 deprecateUnreadable, getRecoveryKey, confirmRecoveryKeyBackup, recoverOrphansPreview, recoverOrphans,
@@ -15,6 +15,25 @@ import { buildUpdateBanner } from './update-banner.js';
 import { computeReorderedColumn, applyColumnOrder } from './task-reorder.js';
 import { normalizeFederationJoinState } from './federation-flow.js';
 import { buildBrainDomainInventory } from './domain-inventory.js';
+import {
+    appV23PolicyDraft,
+    appV23CapabilityIndicators,
+    appV23NeedsHomeReapproval,
+    appV23PolicyChanged,
+    appV23ProfileDefaults,
+    appV23ProfileIsSelectable,
+    appV23ProfileNeedsReview,
+    appV23RoleDefaults,
+    appV23ClampLinkedClearance,
+    appV23GroupDropKind,
+    appV23LinkedClearanceCeiling,
+    APPV23_ROOT_HANDOVER_PHRASE,
+    appV23RootHandoverReady,
+} from './appv23-policy.js';
+import {
+    appV23BuildMessageCandidates,
+    appV23MessagePairIsProven,
+} from './appv23-linked-messages.js';
 import {
     classifyFederationFailure,
     federationConnectionRoute,
@@ -32,7 +51,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.14.2';
+const SAGE_VERSION = 'v11.15.0';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -1149,7 +1168,7 @@ function BrainView({ sse, onSelectMemory, timelineFilter }) {
             // Merge registered agents with agents discovered from graph data
             const registered = registeredAgentsRef.current;
             const knownIds = new Set(registered.map(a => a.agent_id));
-            const graphAgentIds = new Set(nodes.map(n => n.agent).filter(Boolean));
+            const graphAgentIds = new Set(nodes.filter(n => !n.agent_is_root).map(n => n.agent).filter(Boolean));
             const merged = [...registered];
             for (const aid of graphAgentIds) {
                 if (!knownIds.has(aid)) {
@@ -1270,6 +1289,7 @@ function BrainView({ sse, onSelectMemory, timelineFilter }) {
                         n.domain ? n.domain.toLowerCase() : '',
                         n.memory_type ? n.memory_type.toLowerCase() : '',
                         n.agent ? n.agent.toLowerCase() : '',
+                        n.agent_label ? n.agent_label.toLowerCase() : '',
                     ].join('\0'));
                 }
             }
@@ -2362,13 +2382,14 @@ function MemoryDetail({ memory, onClose, onDelete, onNavigate, onUpdate, inline 
     const displayMemory = memory || lastMemory;
     const agentId = displayMemory?.agent || displayMemory?.submitting_agent;
     useEffect(() => {
-        if (!agentId) return;
+        setAgentInfo(null);
+        if (!agentId || displayMemory?.agent_is_root) return;
         fetchAgents().then(data => {
             const agents = data.agents || [];
             const match = agents.find(a => a.agent_id === agentId);
             if (match) setAgentInfo(match);
         }).catch(() => {});
-    }, [agentId]);
+    }, [agentId, displayMemory?.agent_is_root]);
 
     // After closing animation completes, clear the last memory
     function handleTransitionEnd() {
@@ -2476,6 +2497,11 @@ function MemoryDetail({ memory, onClose, onDelete, onNavigate, onUpdate, inline 
                                 <span>${agentInfo.name}</span>
                                 <span class="agent-role-badge" style="margin-left:6px;font-size:9px;padding:1px 5px;">${agentInfo.role}</span>
                                 <span style="margin-left:4px;font-size:10px;color:var(--primary);">→</span>
+                            </span>
+                        ` : m.agent_label ? html`
+                            <span class="value" style="font-size:11px;word-break:break-all;">
+                                <strong>${m.agent_label}</strong>
+                                <code style="display:block;margin-top:3px;" title="Immutable submitting-agent credential ID">${m.agent || m.submitting_agent || 'unknown'}</code>
                             </span>
                         ` : html`
                             <span class="value" style="font-size: 11px; word-break: break-all;">${m.agent || m.submitting_agent || 'unknown'}</span>
@@ -3294,7 +3320,13 @@ function SearchPage() {
             if (search) params.q = search; // real server-side FTS/keyword search over the whole base
             const data = await fetchMemories(params);
             if (myReq !== reqSeq.current) return; // a newer load started; drop this stale response
-            const memories = data.memories || [];
+            const authorLabels = data.author_labels || {};
+            const memories = (data.memories || []).map(memory => {
+                const authorLabel = authorLabels[memory.submitting_agent] || '';
+                return authorLabel
+                    ? { ...memory, agent_label: authorLabel, agent_is_root: authorLabel === 'CEREBRUM Root' }
+                    : memory;
+            });
             setResults(memories);
             setTotal(data.total || memories.length);
             // Prune the bulk selection to what is actually on screen - a
@@ -3551,6 +3583,8 @@ function SearchPage() {
                                     memory_type: m.memory_type,
                                     created_at: m.created_at,
                                     agent: m.submitting_agent,
+                                    agent_label: m.agent_label,
+                                    agent_is_root: m.agent_is_root,
                                     corroboration_count: m.corroboration_count,
                                     content_hash: m.content_hash,
                                     committed_at: m.committed_at,
@@ -7589,8 +7623,9 @@ const CLEARANCE_LABELS = ['Public', 'Internal', 'Confidential', 'Secret', 'Top S
 // tab renders it read-only (no editable selector) to avoid reporting a "Saved"
 // that never reaches consensus.
 const ROLE_META = {
-    admin: { name: 'Admin', desc: 'Manages agents and network settings. Modify still requires a domain level-3 grant.' },
-    member: { name: 'Member', desc: 'Read/write within allowed domains. Cannot manage agents.' },
+    admin: { name: 'Admin', desc: 'Super-admin for this node: manages local agents and controls all local data. CEREBRUM Root remains separate.' },
+    manager: { name: 'Manager', desc: 'Member access, plus write and modify across its local Access Groups.' },
+    member: { name: 'Member', desc: 'Reads group teammates’ domains; writes only to its own domains or explicit grants.' },
     observer: { name: 'Observer', desc: 'Read-only. Can view memories but cannot submit.' },
 };
 const AGENT_EMOJIS = ['🤖', '🧠', '🎙️', '🔬', '👤', '🛡️', '📡', '🔮', '🦉', '🐺', '🌐', '💎'];
@@ -7843,6 +7878,1476 @@ function removeFromAllGroups(model, agentId) {
         .map(g => ({ ...g, members: g.members.filter(m => m !== agentId) }))
         .filter(g => g.members.length >= 1);
     return { ...model, groups };
+}
+
+const APPV23_ROLE_OPTIONS = [
+    {
+        key: 'member',
+        name: 'Member',
+        desc: 'Reads group members’ domains. Writes only to its own domains or explicit grants.',
+    },
+    {
+        key: 'manager',
+        name: 'Manager',
+        desc: 'Member access, plus write and modify across its local groups.',
+    },
+    {
+        key: 'admin',
+        name: 'Admin',
+        desc: 'Full control of this node’s agents and data. CEREBRUM Root remains separate.',
+    },
+];
+
+const APPV23_PROFILE_OPTIONS = [
+    {
+        key: 'standard',
+        name: 'Standard',
+        desc: 'Normal local agent. Its role and groups define authority.',
+    },
+    {
+        key: 'companion',
+        name: 'Companion',
+        desc: 'Local voice/app bridge: reads by clearance and writes only to its own home domain.',
+    },
+    {
+        key: 'read_only',
+        name: 'Read-only',
+        desc: 'Reads all local domains up to its clearance, but never writes or modifies.',
+    },
+];
+
+const APPV23_LEGACY_DECISION_KEY = 'sage.agentGroups.v1.appv23Decision';
+const APPV23_LEGACY_PROGRESS_KEY = 'sage.agentGroups.v1.appv23Progress';
+
+function loadAppV23LegacyProgress() {
+    try {
+        const parsed = JSON.parse(localStorage.getItem(APPV23_LEGACY_PROGRESS_KEY) || '{}');
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+function saveAppV23LegacyProgress(progress) {
+    try { localStorage.setItem(APPV23_LEGACY_PROGRESS_KEY, JSON.stringify(progress)); } catch (_) {}
+}
+
+function sameAppV23LegacyGroup(group, name, members) {
+    if (!group || group.name !== name) return false;
+    const current = [...(group.members || [])].sort();
+    return current.length === members.length && current.every((id, index) => id === members[index]);
+}
+
+function canonicalLegacyGroupID(raw, occupied) {
+    let base = String(raw || 'group').toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 48);
+    if (!base) base = 'group';
+    let candidate = `legacy-${base}`.slice(0, 64);
+    let suffix = 2;
+    while (occupied.has(candidate)) {
+        candidate = `${`legacy-${base}`.slice(0, 58)}-${suffix++}`;
+    }
+    occupied.add(candidate);
+    return candidate;
+}
+
+function AppV23AccessControl() {
+    const [state, setState] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState('');
+    const [selectedID, setSelectedID] = useState('');
+    const [draft, setDraft] = useState(null);
+    const [saving, setSaving] = useState(false);
+    const [groupBusy, setGroupBusy] = useState('');
+    const [dragAgentID, setDragAgentID] = useState('');
+    const [dragRemoteKey, setDragRemoteKey] = useState('');
+    const [newGroupName, setNewGroupName] = useState('');
+    const [remoteCandidates, setRemoteCandidates] = useState([]);
+    const [remoteConnections, setRemoteConnections] = useState([]);
+    const [selectedRemoteKey, setSelectedRemoteKey] = useState('');
+    const [manualRemoteAddress, setManualRemoteAddress] = useState('');
+    const [linkedGroupID, setLinkedGroupID] = useState('');
+    const [linkedClearance, setLinkedClearance] = useState(0);
+    const [linkedLinks, setLinkedLinks] = useState([]);
+    const [linkedBusy, setLinkedBusy] = useState('');
+    const [linkedError, setLinkedError] = useState('');
+    const [messageLocalID, setMessageLocalID] = useState('');
+    const [messagePeerOffers, setMessagePeerOffers] = useState([]);
+    const [selectedMessageRemoteKey, setSelectedMessageRemoteKey] = useState('');
+    const [messageConsent, setMessageConsent] = useState(null);
+    const [messageBusy, setMessageBusy] = useState(false);
+    const [messageOfferChainID, setMessageOfferChainID] = useState('');
+    const [messageOfferBusy, setMessageOfferBusy] = useState(false);
+    const [messageOfferStatus, setMessageOfferStatus] = useState('');
+    const [messageError, setMessageError] = useState('');
+    const [rootHandoverStage, setRootHandoverStage] = useState(0);
+    const [rootHandoverTyped, setRootHandoverTyped] = useState('');
+    const [rootHandoverBusy, setRootHandoverBusy] = useState(false);
+    const rootHandoverDialogRef = useModalDialog(() => {
+        if (rootHandoverBusy) return;
+        setRootHandoverStage(0);
+        setRootHandoverTyped('');
+    }, rootHandoverStage > 0);
+    const [legacyDecision, setLegacyDecision] = useState(() => {
+        try { return localStorage.getItem(APPV23_LEGACY_DECISION_KEY) || ''; } catch (_) { return ''; }
+    });
+    const legacyModel = loadAgentGroups();
+
+    const load = useCallback(async () => {
+        try {
+            const next = await fetchAppV23Access();
+            setState(next);
+            setError('');
+            const editable = (next.agents || [])[0];
+            setSelectedID(current => current && (next.agents || []).some(a => a.agent_id === current)
+                ? current
+                : (editable?.agent_id || ''));
+        } catch (e) {
+            setError(e.message || 'Could not load consensus access controls.');
+        } finally {
+            setLoading(false);
+        }
+    }, []);
+
+    useEffect(() => { load(); }, [load]);
+
+    useEffect(() => {
+        let cancelled = false;
+        if (state?.linked_readers?.status !== 'ready') {
+            setRemoteCandidates([]);
+            setSelectedRemoteKey('');
+            return () => { cancelled = true; };
+        }
+        (async () => {
+            try {
+                const [response, inventoryResponse] = await Promise.all([
+                    fedConnections(),
+                    fetchAppV23LinkedReaderIdentities().catch(() => ({ identities: [] })),
+                ]);
+                const connections = Array.isArray(response) ? response : (response?.connections || []);
+                if (!cancelled) setRemoteConnections(connections);
+                const discovered = new Map();
+                await Promise.all(connections.map(async connection => {
+                    const chain = String(connection.remote_chain_id || '').trim();
+                    if (!chain || connection.status === 'revoked') return;
+                    const addAdvertisedAgent = (agentID, label, source = 'advertised') => {
+                        const id = String(agentID || '').trim();
+                        if (!/^[a-f0-9]{64}$/.test(id)) return;
+                        const key = `${chain}\u0000${id}`;
+                        const prior = discovered.get(key);
+                        if (!prior) {
+                            discovered.set(key, {
+                                key, remote_chain_id: chain, remote_agent_id: id,
+                                label: label || `Agent ${id.slice(0, 8)}`,
+                                peer_name: connection.peer_name || chain,
+                                max_clearance: appV23LinkedClearanceCeiling(connection.max_clearance ?? 4),
+                                source,
+                            });
+                        } else if (source === 'advertised' && prior.source !== 'advertised') {
+                            discovered.set(key, { ...prior, source, label: label || prior.label });
+                        }
+                    };
+                    (Array.isArray(inventoryResponse?.identities) ? inventoryResponse.identities : [])
+                        .filter(identity => identity.remote_chain_id === chain)
+                        .forEach(identity => addAdvertisedAgent(
+                            identity.remote_agent_id,
+                            `Known linked agent ${String(identity.remote_agent_id || '').slice(0, 8)}`,
+                            'existing_link',
+                        ));
+                    try {
+                        const contacts = await fedPipeContactsGet(chain, true);
+                        const remote = contacts?.remote_contacts;
+                        (Array.isArray(remote?.contacts) ? remote.contacts : []).forEach(contact => {
+                            addAdvertisedAgent(contact.agent_id, contact.display_name || contact.handle);
+                        });
+                    } catch (_) {
+                        // A JOIN agreement proves a node transport/operator key,
+                        // not an ordinary remote agent. It may also be a current
+                        // or retired Root credential, so never cast
+                        // connection.peer_agent_id into a linked-reader target.
+                    }
+                }));
+                if (cancelled) return;
+                const next = Array.from(discovered.values()).sort((a, b) =>
+                    `${a.peer_name}/${a.label}`.localeCompare(`${b.peer_name}/${b.label}`));
+                setRemoteCandidates(next);
+                setSelectedRemoteKey(current => current && next.some(item => item.key === current)
+                    ? current
+                    : (next[0]?.key || ''));
+                setLinkedError('');
+            } catch (e) {
+                if (!cancelled) {
+                    setRemoteCandidates([]);
+                    setRemoteConnections([]);
+                    setLinkedError(e.message || 'Federated agent discovery is unavailable.');
+                }
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [state?.linked_readers?.status]);
+
+    const agents = state?.agents || [];
+    const localAgents = agents;
+    const selected = localAgents.find(a => a.agent_id === selectedID) || null;
+    const selectedRemote = remoteCandidates.find(item => item.key === selectedRemoteKey) || null;
+    const selectedRemoteMaxClearance = Number(selectedRemote?.max_clearance ?? 4);
+    const messageLocalCandidates = localAgents.filter(agent =>
+        agent.enrollment_active && !agent.needs_reauthorization &&
+        (Number(agent.capabilities || 0) & 16) === 0);
+    const messageLocal = messageLocalCandidates.find(agent =>
+        agent.agent_id === messageLocalID) || null;
+    const messageOfferHosts = remoteConnections.filter(connection =>
+        connection?.remote_chain_id && connection.status !== 'revoked');
+    const messageRemoteCandidates = appV23BuildMessageCandidates({
+        selectedLinkedRemote: selectedRemote,
+        linkedLinks,
+        groups: state?.groups || [],
+        localAgentID: messageLocalID,
+        peerHostedOffers: messagePeerOffers,
+    });
+    const selectedMessageRemote = messageRemoteCandidates.find(candidate =>
+        candidate.key === selectedMessageRemoteKey) || null;
+    const messagePairProven = appV23MessagePairIsProven(
+        selectedMessageRemote, messageLocalID,
+    );
+    const messageConsentMatches = !!messageConsent && messagePairProven &&
+        messageConsent.remote_chain_id === selectedMessageRemote.remote_chain_id &&
+        messageConsent.remote_agent_id === selectedMessageRemote.remote_agent_id &&
+        messageConsent.local_agent_id === messageLocalID;
+    const activeMessageConsent = messageConsentMatches ? messageConsent : null;
+    const addExactRemoteAddress = async () => {
+        const address = manualRemoteAddress.trim();
+        const separator = address.lastIndexOf('@');
+        const id = separator > 0 ? address.slice(0, separator) : '';
+        const chain = separator > 0 ? address.slice(separator + 1) : '';
+        if (!/^[a-f0-9]{64}$/.test(id) || !chain) {
+            setLinkedError('Enter the exact lowercase 64-character agent_id@chain address.');
+            return;
+        }
+        const connection = remoteConnections.find(item =>
+            item.remote_chain_id === chain && item.status !== 'revoked');
+        if (!connection) {
+            setLinkedError('That chain is not an active federated connection on this SAGE.');
+            return;
+        }
+        setLinkedBusy('eligibility:exact');
+        try {
+            await checkAppV23LinkedReaderEligibility(chain, id);
+            const key = `${chain}\u0000${id}`;
+            const candidate = {
+                key,
+                remote_chain_id: chain,
+                remote_agent_id: id,
+                label: `Exact agent ${id.slice(0, 8)}`,
+                peer_name: connection.peer_name || chain,
+                max_clearance: appV23LinkedClearanceCeiling(connection.max_clearance ?? 4),
+                source: 'exact_address',
+            };
+            setRemoteCandidates(current => current.some(item => item.key === key)
+                ? current
+                : [...current, candidate].sort((a, b) =>
+                    `${a.peer_name}/${a.label}`.localeCompare(`${b.peer_name}/${b.label}`)));
+            setSelectedRemoteKey(key);
+            setManualRemoteAddress('');
+            setLinkedError('');
+            showToast('Exact federated agent verified live.', 'success');
+        } catch (e) {
+            setLinkedError(e.message || 'The peer did not confirm this exact ordinary agent.');
+        } finally {
+            setLinkedBusy('');
+        }
+    };
+    useEffect(() => {
+        setLinkedClearance(current => Math.min(current, selectedRemoteMaxClearance));
+    }, [selectedRemoteKey, selectedRemoteMaxClearance]);
+    useEffect(() => {
+        if (!linkedGroupID && (state?.groups || []).length) {
+            setLinkedGroupID(state.groups[0].group_id);
+        } else if (linkedGroupID && !(state?.groups || []).some(group => group.group_id === linkedGroupID)) {
+            setLinkedGroupID(state?.groups?.[0]?.group_id || '');
+        }
+    }, [state?.groups?.map(group => group.group_id).join('|')]);
+    useEffect(() => {
+        let cancelled = false;
+        if (!selectedRemote || state?.linked_readers?.status !== 'ready') {
+            setLinkedLinks([]);
+            return () => { cancelled = true; };
+        }
+        // Never project the previous remote identity's linked groups while the
+        // newly selected exact identity is loading.
+        setLinkedLinks([]);
+        (async () => {
+            try {
+                const response = await fetchAppV23LinkedReaders(
+                    selectedRemote.remote_chain_id,
+                    selectedRemote.remote_agent_id,
+                );
+                if (!cancelled) {
+                    setLinkedLinks(Array.isArray(response?.links) ? response.links : []);
+                    setLinkedError('');
+                }
+            } catch (e) {
+                if (!cancelled) {
+                    setLinkedLinks([]);
+                    setLinkedError(e.message || 'Could not load Linked readers.');
+                }
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [selectedRemoteKey, state?.linked_readers?.status]);
+    useEffect(() => {
+        const ids = messageLocalCandidates.map(agent => agent.agent_id);
+        setMessageLocalID(current => current && ids.includes(current)
+            ? current
+            : ids.includes(selectedID) ? selectedID : (ids[0] || ''));
+    }, [
+        selectedRemoteKey,
+        selectedID,
+        linkedLinks.map(link =>
+            `${link?.guest?.group_id || ''}:${link?.guest?.revision || 0}:${link?.effective_state || ''}:${link?.binding_current === true}`,
+        ).join('|'),
+        messageLocalCandidates.map(agent => agent.agent_id).join('|'),
+    ]);
+    useEffect(() => {
+        const chainIDs = messageOfferHosts.map(connection => connection.remote_chain_id);
+        setMessageOfferChainID(current => current && chainIDs.includes(current)
+            ? current
+            : (chainIDs[0] || ''));
+    }, [
+        messageOfferHosts.map(connection =>
+            `${connection?.remote_chain_id || ''}:${connection?.status || ''}`,
+        ).join('|'),
+    ]);
+    useEffect(() => {
+        // Choosing a receiver is local UI state only. In particular, it must
+        // never trigger a peer request or reveal that exact local agent ID.
+        setMessagePeerOffers([]);
+        setSelectedMessageRemoteKey('');
+        setMessageConsent(null);
+        setMessageOfferStatus('');
+        setMessageError('');
+    }, [messageLocalID]);
+    useEffect(() => {
+        const keys = messageRemoteCandidates.map(candidate => candidate.key);
+        setSelectedMessageRemoteKey(current => current && keys.includes(current)
+            ? current
+            : (keys[0] || ''));
+    }, [
+        messageRemoteCandidates.map(candidate =>
+            `${candidate.key}:${candidate.authorization_source}:${candidate.group_ids.join(',')}`,
+        ).join('|'),
+    ]);
+    useEffect(() => {
+        if (selected) setDraft(appV23PolicyDraft(selected));
+    }, [
+        selected?.agent_id,
+        selected?.enrollment_revision,
+        selected?.role_revision,
+    ]);
+
+    const mutateDraft = (patch) => setDraft(current => ({ ...(current || {}), ...patch }));
+    const chooseRole = (role) => {
+        if (!draft) return;
+        mutateDraft(appV23RoleDefaults(role));
+    };
+    const chooseProfile = (profile) => {
+        if (!draft || !appV23ProfileIsSelectable(profile)) return;
+        mutateDraft(appV23ProfileDefaults(profile, draft.role));
+    };
+
+    const savePolicy = async () => {
+        if (!selected || !draft || saving) return;
+        setSaving(true);
+        try {
+            const result = await updateAppV23AgentPolicy(selected.agent_id, draft);
+            showToast(
+                result.mode === 'approve'
+                    ? 'Agent approved. Its role, profile, clearance, and home domain committed atomically.'
+                    : result.mode === 'reauthorize'
+                        ? 'Admin reauthorized for the current Root generation with fresh local consent.'
+                    : result.mode === 'reapprove'
+                        ? 'Agent consent and its owned home domain committed atomically.'
+                        : 'Agent policy committed atomically.',
+                'success',
+            );
+            await load();
+        } catch (e) {
+            showToast(e.message || 'The policy was not committed.', 'error', 9000);
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const saveGroup = async (group, members, name = group.name) => {
+        if (groupBusy) return;
+        setGroupBusy(group.group_id);
+        try {
+            await putAppV23AccessGroup(group.group_id, {
+                name,
+                members,
+                expected_revision: Number(group.revision || 0),
+            });
+            showToast(`Access Group “${name}” committed.`, 'success');
+            await load();
+        } catch (e) {
+            showToast(e.message || 'The group change was not committed.', 'error', 9000);
+        } finally {
+            setGroupBusy('');
+        }
+    };
+
+    const createGroup = async () => {
+        const name = newGroupName.trim();
+        if (!name || groupBusy) return;
+        const occupied = new Set((state.groups || []).map(g => g.group_id));
+        const stem = canonicalLegacyGroupID(name, new Set()).replace(/^legacy-/, 'group-');
+        let groupID = stem;
+        let suffix = 2;
+        while (occupied.has(groupID)) groupID = `${stem.slice(0, 60)}-${suffix++}`;
+        setGroupBusy(groupID);
+        try {
+            const initialMembers = selected?.enrollment_active ? [selected.agent_id] : [];
+            await putAppV23AccessGroup(groupID, {
+                name,
+                members: initialMembers,
+                expected_revision: 0,
+            });
+            setNewGroupName('');
+            showToast(`Access Group “${name}” created on-chain.`, 'success');
+            await load();
+        } catch (e) {
+            showToast(e.message || 'The group was not created.', 'error', 9000);
+        } finally {
+            setGroupBusy('');
+        }
+    };
+
+    const deleteGroup = async (group) => {
+        if (!await showConfirmation(
+            `Delete “${group.name}”? Its members immediately lose the access relationship supplied by this group.`,
+            { title: 'Delete Access Group', confirmLabel: 'Delete group', tone: 'danger' },
+        )) return;
+        setGroupBusy(group.group_id);
+        try {
+            await deleteAppV23AccessGroup(group.group_id, Number(group.revision || 0));
+            showToast(`Access Group “${group.name}” deleted.`, 'success');
+            await load();
+        } catch (e) {
+            showToast(e.message || 'The group was not deleted.', 'error', 9000);
+        } finally {
+            setGroupBusy('');
+        }
+    };
+
+    const dropIntoGroup = (group) => {
+        const dropKind = appV23GroupDropKind(dragAgentID, dragRemoteKey);
+        if (dropKind === 'linked_reader') {
+            const remote = remoteCandidates.find(item => item.key === dragRemoteKey);
+            setDragRemoteKey('');
+            if (!remote) return;
+            setSelectedRemoteKey(remote.key);
+            mutateLinkedReader(
+                'attach', group.group_id, 0,
+                appV23ClampLinkedClearance(linkedClearance, remote.max_clearance ?? 4),
+                remote,
+            );
+            return;
+        }
+        const agent = localAgents.find(a => a.agent_id === dragAgentID);
+        setDragAgentID('');
+        if (!agent || !agent.enrollment_active || group.members.includes(agent.agent_id)) return;
+        // Membership is intentionally additive. An agent may belong to several
+        // groups and its effective local authority is their union.
+        saveGroup(group, [...group.members, agent.agent_id].sort());
+    };
+
+    const decideLegacy = (decision) => {
+        setLegacyDecision(decision);
+        try { localStorage.setItem(APPV23_LEGACY_DECISION_KEY, decision); } catch (_) {}
+    };
+
+    const closeRootHandover = () => {
+        if (rootHandoverBusy) return;
+        setRootHandoverStage(0);
+        setRootHandoverTyped('');
+    };
+
+    const commitRootHandover = async () => {
+        if (rootHandoverBusy ||
+            !appV23RootHandoverReady(rootHandoverStage, rootHandoverTyped)) return;
+        setRootHandoverBusy(true);
+        try {
+            const result = await handoverRootCredential(
+                state?.root?.generation,
+                rootHandoverTyped,
+            );
+            if (!result.recovery_bundle) {
+                throw new Error('Root changed, but the one-time recovery bundle was not delivered. Do not retry; inspect local recovery storage.');
+            }
+            const raw = atob(result.recovery_bundle);
+            const bytes = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+            const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = result.bundle_filename || 'sage-cerebrum-root-recovery.zip';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+            setRootHandoverStage(0);
+            setRootHandoverTyped('');
+            showToast('Root handover committed. Existing Root domains stayed in place under the new operational credential. Secure the recovery bundle now.', 'success', 10000);
+            await load();
+        } catch (e) {
+            showToast(e.message || 'Root handover failed.', 'error', 10000);
+        } finally {
+            setRootHandoverBusy(false);
+        }
+    };
+
+    const importLegacyGroups = async () => {
+        if (groupBusy || !legacyModel.groups.length) return;
+        const eligible = new Set(localAgents.filter(a => a.enrollment_active).map(a => a.agent_id));
+        const agentByID = new Map(localAgents.map(agent => [agent.agent_id, agent]));
+        const preview = legacyModel.groups.map((group, index) => {
+            const included = [...new Set(group.members.filter(id => eligible.has(id)))].sort();
+            const dropped = [...new Set(group.members.filter(id => !eligible.has(id)))].sort();
+            return { group, index, included, dropped };
+        });
+        const previewText = preview.map(({ group, included, dropped }) => {
+            const members = included.map(id => {
+                const agent = agentByID.get(id);
+                return `${agent?.name || id.slice(0, 8)} (${agent?.role || 'member'})`;
+            }).join(', ') || 'no eligible members';
+            return `${group.name}: ${members}${dropped.length ? `; ${dropped.length} unavailable member${dropped.length === 1 ? '' : 's'} will be skipped` : ''}`;
+        }).join('\n');
+        if (!await showConfirmation(
+            `Import these browser drafts as real consensus access policy?\n\n${previewText}\n\nManagers shown above will gain write/modify authority within each imported group.`,
+            { title: 'Review legacy group import', confirmLabel: 'Import reviewed groups' },
+        )) return;
+        const knownGroups = new Map((state.groups || []).map(group => [group.group_id, group]));
+        const occupied = new Set(knownGroups.keys());
+        const progress = loadAppV23LegacyProgress();
+        const claimedIDs = new Set(Object.values(progress));
+        setGroupBusy('legacy-import');
+        try {
+            for (let index = 0; index < legacyModel.groups.length; index++) {
+                const oldGroup = legacyModel.groups[index];
+                const sourceKey = `${String(oldGroup.id || 'legacy')}:${index}:${String(oldGroup.name || '')}:${[...oldGroup.members].sort().join(',')}`;
+                const members = [...new Set(oldGroup.members.filter(id => eligible.has(id)))].sort();
+                const name = String(oldGroup.name || 'Imported group').trim().slice(0, 128) || 'Imported group';
+                let groupID = progress[sourceKey];
+                if (!groupID) {
+                    const baseID = canonicalLegacyGroupID(oldGroup.id, new Set());
+                    const exactPrior = [...knownGroups.values()]
+                        .filter(group => !claimedIDs.has(group.group_id))
+                        .filter(group => group.group_id === baseID || group.group_id.startsWith(`${baseID}-`))
+                        .sort((a, b) => a.group_id.localeCompare(b.group_id))
+                        .find(group => sameAppV23LegacyGroup(group, name, members));
+                    groupID = exactPrior?.group_id || canonicalLegacyGroupID(oldGroup.id, occupied);
+                } else {
+                    occupied.add(groupID);
+                }
+                const existing = knownGroups.get(groupID);
+                if (!sameAppV23LegacyGroup(existing, name, members)) {
+                    await putAppV23AccessGroup(groupID, {
+                        name,
+                        members,
+                        expected_revision: Number(existing?.revision || 0),
+                    });
+                    knownGroups.set(groupID, {
+                        group_id: groupID,
+                        name,
+                        members,
+                        revision: Number(existing?.revision || 0) + 1,
+                    });
+                }
+                // Persist only after the exact group is known to be committed.
+                // A crash before this write is still safe: the next run detects
+                // the exact committed group instead of inventing a suffixed copy.
+                progress[sourceKey] = groupID;
+                claimedIDs.add(groupID);
+                occupied.add(groupID);
+                saveAppV23LegacyProgress(progress);
+            }
+            decideLegacy('imported');
+            showToast(`${legacyModel.groups.length} legacy group${legacyModel.groups.length === 1 ? '' : 's'} reviewed and imported to consensus.`, 'success');
+            await load();
+        } catch (e) {
+            showToast(`${e.message || 'Import failed'} No unreviewed browser group was treated as access policy.`, 'error', 10000);
+        } finally {
+            setGroupBusy('');
+        }
+    };
+
+    const mutateLinkedReader = async (
+        operation,
+        groupID,
+        expectedRevision,
+        maxClassification = linkedClearance,
+        remote = selectedRemote,
+    ) => {
+        if (!remote || linkedBusy || !groupID) return;
+        setLinkedBusy(`${operation}:${groupID}`);
+        try {
+            await mutateAppV23LinkedReader({
+                operation,
+                group_id: groupID,
+                remote_chain_id: remote.remote_chain_id,
+                remote_agent_id: remote.remote_agent_id,
+                max_classification: appV23ClampLinkedClearance(
+                    maxClassification, remote.max_clearance ?? 4,
+                ),
+                expected_revision: Number(expectedRevision || 0),
+            });
+            const response = await fetchAppV23LinkedReaders(
+                remote.remote_chain_id,
+                remote.remote_agent_id,
+            );
+            if (remote.key === selectedRemoteKey || remote.key === selectedRemote?.key) {
+                setLinkedLinks(Array.isArray(response?.links) ? response.links : []);
+            }
+            setLinkedError('');
+            showToast(`Linked reader ${operation} committed locally.`, 'success');
+        } catch (e) {
+            setLinkedError(e.message || 'The Linked reader change was rejected.');
+            showToast(e.message || 'The Linked reader change was rejected.', 'error', 9000);
+        } finally {
+            setLinkedBusy('');
+        }
+    };
+
+    const loadRemoteHostedMessageOffers = async () => {
+        if (!messageOfferChainID || !messageLocalID || messageOfferBusy ||
+            state?.linked_messages?.status !== 'ready') return;
+        const selectedHost = messageOfferHosts.find(connection =>
+            connection.remote_chain_id === messageOfferChainID);
+        if (!selectedHost) return;
+        setMessageOfferBusy(true);
+        setMessageOfferStatus('');
+        try {
+            // This is intentionally the only peer-hosted candidate lookup in
+            // the UI: one explicit click, one selected host, one exact local
+            // receiver. Never turn receiver selection into network discovery.
+            const response = await fetchAppV23RemoteHostedMessageCandidates(
+                messageOfferChainID, messageLocalID,
+            );
+            const offered = (Array.isArray(response?.candidates) ? response.candidates : [])
+                .filter(candidate =>
+                    candidate.remote_chain_id === messageOfferChainID &&
+                    candidate.local_agent_id === messageLocalID &&
+                    Array.isArray(candidate.group_ids) &&
+                    candidate.group_ids.length > 0 &&
+                    /^[a-f0-9]{64}$/.test(candidate.remote_agent_id || ''))
+                .slice(0, 64)
+                .map(candidate => ({
+                    remote_chain_id: candidate.remote_chain_id,
+                    remote_agent_id: candidate.remote_agent_id,
+                    local_agent_id: candidate.local_agent_id,
+                    group_ids: Array.isArray(candidate.group_ids)
+                        ? candidate.group_ids
+                        : [],
+                    label: `Linked member ${candidate.remote_agent_id.slice(0, 8)}`,
+                    peer_name: selectedHost.peer_name || candidate.remote_chain_id,
+                }));
+            if (!offered.length) {
+                setMessagePeerOffers([]);
+                setSelectedMessageRemoteKey('');
+                setMessageOfferStatus('No current signed offers were returned.');
+                return;
+            }
+            setMessagePeerOffers(offered);
+            setMessageOfferStatus(
+                `${offered.length} current signed ${offered.length === 1 ? 'offer' : 'offers'} loaded from the selected host.`,
+            );
+        } catch (_) {
+            // Empty, unavailable, paused, stale, and unrelated all project the
+            // same result. This control is not a peer-status oracle.
+            setMessagePeerOffers([]);
+            setSelectedMessageRemoteKey('');
+            setMessageOfferStatus('No current signed offers were returned.');
+        } finally {
+            setMessageOfferBusy(false);
+        }
+    };
+
+    const loadExactMessageConsent = async () => {
+        if (!messagePairProven || !selectedMessageRemote || !messageLocalID || messageBusy ||
+            state?.linked_messages?.status !== 'ready') return;
+        setMessageBusy(true);
+        setMessageError('');
+        try {
+            const response = await fetchAppV23LinkedMessageConsent(
+                selectedMessageRemote.remote_chain_id,
+                selectedMessageRemote.remote_agent_id,
+                messageLocalID,
+            );
+            setMessageConsent(response?.consent || null);
+        } catch (e) {
+            setMessageConsent(null);
+            setMessageError(e.message || 'Could not load exact messaging consent.');
+        } finally {
+            setMessageBusy(false);
+        }
+    };
+
+    const setExactMessageConsent = async accepting => {
+        if (!messagePairProven || !selectedMessageRemote || !messageLocalID ||
+            !activeMessageConsent || messageBusy ||
+            state?.linked_messages?.status !== 'ready') return;
+        setMessageBusy(true);
+        try {
+            const response = await putAppV23LinkedMessageConsent({
+                remote_chain_id: selectedMessageRemote.remote_chain_id,
+                remote_agent_id: selectedMessageRemote.remote_agent_id,
+                local_agent_id: messageLocalID,
+                expected_revision: Number(activeMessageConsent.revision || 0),
+                accepting,
+            });
+            setMessageConsent(response?.consent || null);
+            setMessageError('');
+            showToast(
+                accepting
+                    ? 'Exact remote-to-local messaging allowed. Read access and domain authority did not change.'
+                    : 'Exact remote-to-local messaging blocked.',
+                'success',
+            );
+        } catch (e) {
+            setMessageError(e.message || 'The exact messaging consent was not changed.');
+            showToast(e.message || 'The exact messaging consent was not changed.', 'error', 9000);
+        } finally {
+            setMessageBusy(false);
+        }
+    };
+
+    if (loading) return html`<div class="v23-access-loading">Loading consensus access policy…</div>`;
+    if (error) return html`<div class="v23-access-banner danger"><strong>Access policy unavailable</strong><span>${error}</span><button class="btn" onClick=${load}>Retry</button></div>`;
+
+    const brokerReady = state?.broker?.available === true;
+    const mutationReady = state?.active === true && brokerReady;
+    const legacyProfileNeedsReview = appV23ProfileNeedsReview(selected);
+    const draftProfileSelectable = appV23ProfileIsSelectable(draft?.profile);
+    const homeReapproval = appV23NeedsHomeReapproval(selected, draft);
+    const legacyHomeReapproval = legacyProfileNeedsReview && homeReapproval;
+    const targetConsentReady = (!selected?.needs_approval && !homeReapproval) || selected?.local_key_available;
+    const homeReapprovalReady = !homeReapproval || !!draft?.home_domain?.trim();
+    const adminLocalReady = draft?.role !== 'admin' || selected?.local_key_available;
+    const policyDirty = !!selected && !!draft && appV23PolicyChanged(selected, draft);
+    const policyCommitNeeded = !!selected?.needs_approval || homeReapproval || policyDirty;
+    const saveDisabled = saving || !mutationReady || !targetConsentReady || !homeReapprovalReady ||
+        !adminLocalReady || !draft || !draftProfileSelectable || !policyCommitNeeded;
+    const capabilityIndicators = appV23CapabilityIndicators(draft || {});
+    const selectLocalAgent = async agentID => {
+        if (saving || agentID === selectedID) return;
+        if (policyDirty && !await showConfirmation(
+            'Discard the unsaved policy changes for this agent?',
+            { title: 'Discard policy changes?', confirmLabel: 'Discard changes', tone: 'danger' },
+        )) return;
+        setSelectedID(agentID);
+    };
+
+    return html`
+        <section class="v23-access-shell">
+            ${!state.active && html`
+                <div class="v23-access-banner warning">
+                    <strong>Upgrade required</strong>
+                    <span>These controls stay read-only until app-v23 is active. No app-v22 mask is changed off-chain.</span>
+                </div>
+            `}
+            ${state.active && !brokerReady && html`
+                <div class="v23-access-banner danger">
+                    <strong>Root broker unavailable</strong>
+                    <span>${state.broker?.message || 'This machine cannot resolve the currently committed Root credential.'}</span>
+                    <code>${state.broker?.reason_code || 'root_key_unavailable'}</code>
+                </div>
+            `}
+
+            <div class="v23-root-card">
+                <div class="v23-root-mark" aria-hidden="true">R</div>
+                <div>
+                    <div class="v23-eyebrow">Sovereign authority · this machine only</div>
+                    <h3>CEREBRUM Root</h3>
+                    <p>Root is this node’s owner, not an agent or an agent role. It stays out of agent lists and groups. A handover changes the key that controls the same Root-owned domains; existing memories, authors, and ownership history remain readable and unchanged.</p>
+                    <details class="v23-root-diagnostics">
+                        <summary>Authority record</summary>
+                        <div class="v23-mono">Principal ${state.root?.principal_id || 'not established'}</div>
+                        <div class="v23-mono">Current credential ${state.root?.credential_id || 'not established'} · generation ${state.root?.generation ?? '—'}</div>
+                    </details>
+                </div>
+                <div class="v23-root-actions">
+                    <span class="v23-root-badge">ROOT</span>
+                    <button class="btn btn-danger" disabled=${!mutationReady || rootHandoverBusy}
+                        onClick=${() => { setRootHandoverTyped(''); setRootHandoverStage(1); }}>
+                        Begin Root handover
+                    </button>
+                </div>
+            </div>
+
+            ${rootHandoverStage > 0 && html`
+                <div class="cerebrum-confirm-overlay">
+                    <div class="cerebrum-confirm-dialog v23-root-handover" ref=${rootHandoverDialogRef}
+                        role="alertdialog" aria-modal="true" tabIndex="-1"
+                        aria-labelledby="root-handover-title" aria-describedby="root-handover-warning">
+                        <div class="cerebrum-confirm-mark danger" aria-hidden="true">!</div>
+                        <h2 id="root-handover-title">Root credential handover · step ${rootHandoverStage} of 2</h2>
+                        ${rootHandoverStage === 1 ? html`
+                            <p id="root-handover-warning">
+                                This permanently retires the current credential from CEREBRUM Root authority at consensus generation ${state.root?.generation} and creates a replacement Root credential on this machine.
+                                It does not promote an agent, move or copy domains or memories, or rewrite authorship. The replacement immediately controls the same Root-owned domains and can write new memories there. Historical memories and their original authors remain readable and unchanged.
+                                Existing federation connections keep this node’s separate stable transport identity and peer pins; a normal Root handover does not require re-pairing. If that transport key may be compromised, revoke and re-pair those peers separately because Root handover does not rotate it.
+                                The handover cannot be undone. Losing the new recovery bundle can mean losing sovereign control of this node.
+                            </p>
+                            <div class="cerebrum-confirm-actions">
+                                <button class="btn" disabled=${rootHandoverBusy} onClick=${closeRootHandover}>Cancel</button>
+                                <button class="btn btn-danger" disabled=${rootHandoverBusy}
+                                    onClick=${() => setRootHandoverStage(2)}>
+                                    I understand — continue
+                                </button>
+                            </div>
+                        ` : html`
+                            <p id="root-handover-warning">
+                                Final check: type the exact phrase below. CEREBRUM will verify that the replacement key is stored and usable on this machine before committing the handover.
+                            </p>
+                            <code class="v23-root-phrase">${APPV23_ROOT_HANDOVER_PHRASE}</code>
+                            <label class="v23-field">
+                                <span>Exact confirmation phrase</span>
+                                <input value=${rootHandoverTyped} autocomplete="off" spellcheck="false"
+                                    autofocus
+                                    disabled=${rootHandoverBusy}
+                                    onInput=${event => setRootHandoverTyped(event.target.value)} />
+                            </label>
+                            <div class="cerebrum-confirm-actions">
+                                <button class="btn" disabled=${rootHandoverBusy}
+                                    onClick=${() => { setRootHandoverTyped(''); setRootHandoverStage(1); }}>
+                                    Back
+                                </button>
+                                <button class="btn btn-danger"
+                                    disabled=${rootHandoverBusy || !appV23RootHandoverReady(rootHandoverStage, rootHandoverTyped)}
+                                    onClick=${commitRootHandover}>
+                                    ${rootHandoverBusy ? 'Committing…' : 'Commit irreversible handover'}
+                                </button>
+                            </div>
+                        `}
+                    </div>
+                </div>
+            `}
+
+            <div class="v23-access-legend" aria-label="Identity and access legend">
+                <span class="local"><i aria-hidden="true"></i> Same-node agents</span>
+                <span class="federated"><i aria-hidden="true">↗</i> Federated read-only links</span>
+            </div>
+
+            <div class="v23-access-grid">
+                <div class="v23-agent-rail" aria-label="Local agents">
+                    <div class="v23-section-heading">
+                        <div>
+                            <div class="v23-eyebrow">Local principals</div>
+                            <h3>Agents</h3>
+                        </div>
+                        <span>${localAgents.length}</span>
+                    </div>
+                    ${localAgents.map(agent => html`
+                        <button class="v23-agent-choice local ${selectedID === agent.agent_id ? 'selected' : ''}"
+                            aria-current=${selectedID === agent.agent_id ? 'true' : undefined}
+                            disabled=${saving}
+                            onClick=${() => selectLocalAgent(agent.agent_id)}>
+                            <span class="agent-avatar">${agent.avatar || '\u{1F916}'}</span>
+                            <span class="v23-agent-choice-copy">
+                                <strong>${agent.name || `Agent ${agent.agent_id.slice(0, 8)}`}</strong>
+                                <small>${agent.role || 'member'} · clearance ${agent.clearance ?? 1}${agent.needs_reauthorization ? ' · suspended after Root handover' : ''}</small>
+                            </span>
+                            ${agent.needs_reauthorization
+                                ? html`<span class="v23-state-chip pending">Reauthorize</span>`
+                                : appV23ProfileNeedsReview(agent) || agent.needs_approval
+                                ? html`<span class="v23-state-chip pending">Review</span>`
+                                : html`<span class="v23-state-chip active">Active</span>`}
+                        </button>
+                    `)}
+                    ${localAgents.length === 0 && html`<p class="v23-empty">No registered local agents.</p>`}
+                </div>
+
+                <div class="v23-policy-panel">
+                    ${selected && draft ? html`
+                        <div class="v23-policy-title">
+                            <div>
+                                <div class="v23-eyebrow">Signer ${selected.agent_id.slice(0, 12)}…</div>
+                                <h3>${selected.name || 'Local agent'}</h3>
+                            </div>
+                            ${selected.needs_reauthorization
+                                ? html`<span class="v23-review-badge">Admin suspended</span>`
+                                : selected.needs_approval && !legacyProfileNeedsReview &&
+                                    html`<span class="v23-review-badge">Pending review</span>`}
+                        </div>
+
+                        ${legacyProfileNeedsReview && html`
+                            <div class="v23-legacy-profile-review" role="status">
+                                <span>
+                                    <strong>Legacy restrictions — review</strong>
+                                    ${draftProfileSelectable
+                                        ? legacyHomeReapproval
+                                            ? selected.local_key_available
+                                                ? 'A normal preset is selected. Enter a new owned home domain; saving will bind both to this agent’s signature.'
+                                                : 'A normal writable preset is selected, but this domainless legacy agent’s exact local key is unavailable. CEREBRUM cannot synthesize its consent.'
+                                            : 'A normal preset is selected. Review it below, then save to replace the migration-only restrictions.'
+                                        : 'This historical restriction set is preserved but cannot be edited or assigned again. Select Standard, Companion, or Read-only to replace it.'}
+                                </span>
+                                ${!draftProfileSelectable && html`
+                                    <button type="button" class="btn" disabled=${saving}
+                                        onClick=${() => chooseProfile('standard')}>
+                                        Use Standard preset
+                                    </button>
+                                `}
+                            </div>
+                        `}
+
+                        ${selected.needs_reauthorization && html`
+                            <div class="v23-inline-note ${selected.local_key_available ? 'warning' : 'danger'}">
+                                ${selected.local_key_available
+                                    ? 'Root handover suspended this delegated Admin. It has no effective Admin authority until the current Root reauthorizes it here with the agent’s fresh local consent signature.'
+                                    : 'Root handover suspended this delegated Admin, and its exact local key is unavailable. Reauthorization fails closed; CEREBRUM cannot restore or forge its Admin authority.'}
+                            </div>
+                        `}
+                        ${selected.needs_approval && !selected.needs_reauthorization && !legacyProfileNeedsReview && html`
+                            <div class="v23-inline-note ${selected.local_key_available ? '' : 'danger'}">
+                                ${selected.local_key_available
+                                    ? 'First approval will atomically commit role, profile, clearance, and home domain with this agent’s local consent signature.'
+                                    : 'This agent’s local key is unavailable. Approval fails closed; CEREBRUM will not forge consent or save a browser-only policy.'}
+                            </div>
+                        `}
+                        ${homeReapproval && !legacyProfileNeedsReview && html`
+                            <div class="v23-inline-note ${selected.local_key_available ? '' : 'danger'}">
+                                ${selected.local_key_available
+                                    ? 'Leaving Read-only is a fresh consent boundary. Role, profile, clearance, and an owned home domain will be committed together with this agent’s signature.'
+                                    : 'Leaving Read-only requires this agent’s exact local key and a new owned home domain. CEREBRUM will not synthesize its consent.'}
+                            </div>
+                        `}
+
+                        ${draftProfileSelectable && html`<div class="v23-control-block">
+                            <div class="v23-control-label" id="v23-role-label">Role <span>What this agent may do</span></div>
+                            <div class="v23-option-grid roles" role="group" aria-labelledby="v23-role-label">
+                                ${APPV23_ROLE_OPTIONS.map(option => html`
+                                    <button type="button" class="v23-option-card ${draft.role === option.key ? 'selected' : ''}"
+                                        disabled=${saving}
+                                        aria-pressed=${draft.role === option.key}
+                                        onClick=${() => chooseRole(option.key)}>
+                                        <strong>${option.name}</strong>
+                                        <span>${option.desc}</span>
+                                    </button>
+                                `)}
+                            </div>
+                        </div>`}
+
+                        <div class="v23-control-block">
+                            <div class="v23-control-label" id="v23-profile-label">Operating mode <span>Companion and Read-only are always Members</span></div>
+                            <div class="v23-option-grid profiles" role="group" aria-labelledby="v23-profile-label">
+                                ${APPV23_PROFILE_OPTIONS.map(option => html`
+                                    <button type="button" class="v23-option-card ${draft.profile === option.key ? 'selected' : ''}"
+                                        disabled=${saving}
+                                        aria-pressed=${draft.profile === option.key}
+                                        onClick=${() => chooseProfile(option.key)}>
+                                        <strong>${option.name}</strong>
+                                        <span>${option.desc}</span>
+                                    </button>
+                                `)}
+                            </div>
+                        </div>
+
+                        ${draftProfileSelectable && html`<div class="v23-policy-row">
+                            <label class="v23-field">
+                                <span>Clearance</span>
+                                <select value=${draft.clearance} disabled=${saving || draft.role === 'admin'}
+                                    onChange=${e => mutateDraft({ clearance: Number(e.target.value) })}>
+                                    <option value="0">0 · Public only</option>
+                                    <option value="1">1 · Internal</option>
+                                    <option value="2">2 · Confidential</option>
+                                    <option value="3">3 · Secret</option>
+                                    <option value="4">4 · Top Secret</option>
+                                </select>
+                            </label>
+                            ${(selected.needs_approval || homeReapproval) && draft.profile !== 'read_only' && html`
+                                <label class="v23-field">
+                                    <span>Owned home domain</span>
+                                    <input value=${draft.home_domain}
+                                        disabled=${saving}
+                                        onInput=${e => mutateDraft({ home_domain: e.target.value })}
+                                        placeholder="agent-home-domain" />
+                                    <small>Created atomically if it is unowned; never reassigned from another agent.</small>
+                                </label>
+                            `}
+                        </div>`}
+
+                        ${draftProfileSelectable && html`<details class="v23-advanced">
+                            <summary>Advanced · derived policy details <span>mask ${draft.capabilities}</span></summary>
+                            <p>Read-only audit view. Role and security profile select the complete consensus policy; raw restriction bits cannot be edited independently.</p>
+                            <div class="v23-switch-list">
+                                ${capabilityIndicators.map(item => html`
+                                    <div class="v23-switch-row">
+                                        <span>
+                                            <strong>${item.name}</strong>
+                                            <small>${item.desc}</small>
+                                        </span>
+                                        <span class="v23-derived-state ${item.enabled ? 'applied' : 'not-applied'}"
+                                            aria-label=${`${item.name}: ${item.enabled ? item.enabledLabel : item.disabledLabel}`}>
+                                            ${item.enabled ? item.enabledLabel : item.disabledLabel}
+                                        </span>
+                                    </div>
+                                `)}
+                            </div>
+                        </details>`}
+
+                        <div class="v23-save-row">
+                            <span role="status" aria-live="polite">${!state.active
+                                ? 'Waiting for app-v23'
+                                : !brokerReady
+                                    ? 'Root credential unavailable'
+                                    : !draftProfileSelectable
+                                        ? 'Select Standard, Companion, or Read-only'
+                                    : !targetConsentReady
+                                        ? 'Target consent key unavailable'
+                                        : !homeReapprovalReady
+                                            ? 'Owned home domain required for this preset'
+                                        : !adminLocalReady
+                                            ? 'Admin promotion requires this machine’s exact agent key'
+                                        : !policyCommitNeeded
+                                            ? 'No unsaved policy changes'
+                                            : 'Unsaved changes · applied only after consensus commit'}</span>
+                            <button class="btn btn-primary" disabled=${saveDisabled} onClick=${savePolicy}>
+                                ${saving
+                                    ? 'Committing…'
+                                    : !draftProfileSelectable
+                                        ? 'Review required'
+                                    : selected.needs_reauthorization
+                                        ? 'Reauthorize Admin'
+                                    : selected.needs_approval
+                                        ? 'Approve & activate'
+                                        : homeReapproval
+                                            ? 'Consent & activate'
+                                            : 'Save policy'}
+                            </button>
+                        </div>
+                    ` : html`<div class="v23-empty large">Select a local agent to review its policy.</div>`}
+                </div>
+            </div>
+
+            <div class="v23-groups-section">
+                <div class="v23-section-heading wide">
+                    <div>
+                        <div class="v23-eyebrow">Consensus Access Groups</div>
+                        <h3>Local sharing groups</h3>
+                        <p>Local teammates read each other’s owned domains. A Manager can also write and modify domains owned by local teammates in the same groups. Admins already control all local data.</p>
+                    </div>
+                    <form class="v23-create-group" onSubmit=${event => { event.preventDefault(); createGroup(); }}>
+                        <label class="sr-only" for="v23-new-group-name">New local group name</label>
+                        <input id="v23-new-group-name" value=${newGroupName} disabled=${!mutationReady || !!groupBusy}
+                            onInput=${e => setNewGroupName(e.target.value)}
+                            placeholder="New group name" />
+                        <button type="submit" class="btn" disabled=${!mutationReady || !!groupBusy || !newGroupName.trim()}>Create group</button>
+                    </form>
+                </div>
+
+                <div class="v23-agent-tray" aria-label="Approved local agents available for groups">
+                    <span>Drag a local agent into a group, or use its Add local agent menu</span>
+                    ${localAgents.filter(a => a.enrollment_active).map(agent => html`
+                        <div class="v23-agent-pill local" draggable="true"
+                            title=${`${agent.role || 'member'} · drag into a local group`}
+                            onDragStart=${() => setDragAgentID(agent.agent_id)}
+                            onDragEnd=${() => setDragAgentID('')}>
+                            ${agent.avatar || '\u{1F916}'} ${agent.name || agent.agent_id.slice(0, 8)}
+                            <em>${agent.role || 'member'}</em>
+                        </div>
+                    `)}
+                </div>
+
+                <div class="v23-group-grid">
+                    ${(state.groups || []).map(group => html`
+                        <article class="v23-group-card local ${dragAgentID ? 'drop-ready drop-local' : ''} ${dragRemoteKey ? 'drop-ready drop-linked' : ''}"
+                            aria-label=${`Local group ${group.name}`}
+                            onDragOver=${e => e.preventDefault()}
+                            onDrop=${e => { e.preventDefault(); dropIntoGroup(group); }}>
+                            <div class="v23-group-head">
+                                <input defaultValue=${group.name}
+                                    aria-label="Access Group name"
+                                    disabled=${groupBusy === group.group_id || !mutationReady}
+                                    onKeyDown=${e => {
+                                        if (e.key === 'Enter') e.currentTarget.blur();
+                                        if (e.key === 'Escape') {
+                                            e.currentTarget.value = group.name;
+                                            e.currentTarget.blur();
+                                        }
+                                    }}
+                                    onBlur=${e => {
+                                        const name = e.target.value.trim();
+                                        if (name && name !== group.name) saveGroup(group, group.members, name);
+                                    }} />
+                                <span aria-label=${`${group.members.length} local agent${group.members.length === 1 ? '' : 's'}`}>
+                                    ${group.members.length} agent${group.members.length === 1 ? '' : 's'}
+                                </span>
+                                <button class="v23-icon-btn danger" title="Delete group"
+                                    aria-label=${`Delete Access Group ${group.name}`}
+                                    disabled=${!!groupBusy || !mutationReady}
+                                    onClick=${() => deleteGroup(group)}>×</button>
+                            </div>
+                            ${(dragAgentID || dragRemoteKey) && html`
+                                <div class="v23-drop-intent" role="status">
+                                    ${dragRemoteKey
+                                        ? 'Drop to create a separate read-only link — never local membership'
+                                        : 'Drop to add this local agent as a teammate'}
+                                </div>
+                            `}
+                            <div class="v23-group-members">
+                                ${group.members.map(memberID => {
+                                    const member = localAgents.find(a => a.agent_id === memberID);
+                                    return html`
+                                        <div class="v23-member-chip local">
+                                            <span>${member?.avatar || '\u{1F916}'}</span>
+                                            <strong>${member?.name || memberID.slice(0, 8)}</strong>
+                                            <em>${member?.role || 'member'}${member?.needs_reauthorization ? ' · suspended' : ''}</em>
+                                            <button title="Remove from this group"
+                                                aria-label=${`Remove ${member?.name || memberID.slice(0, 8)} from ${group.name}`}
+                                                disabled=${!!groupBusy || !mutationReady}
+                                                onClick=${() => saveGroup(group, group.members.filter(id => id !== memberID))}>×</button>
+                                        </div>
+                                    `;
+                                })}
+                                ${group.members.length === 0 && html`<div class="v23-drop-empty">Add approved local agents</div>`}
+                                <label class="v23-field">
+                                    <span>Add local agent</span>
+                                    <select value=""
+                                        aria-label=${`Add a local agent to ${group.name}`}
+                                        disabled=${!!groupBusy || !mutationReady}
+                                        onChange=${e => {
+                                            const id = e.target.value;
+                                            if (id) saveGroup(group, [...group.members, id].sort());
+                                        }}>
+                                        <option value="">Choose an approved agent…</option>
+                                        ${localAgents
+                                            .filter(agent => agent.enrollment_active && !group.members.includes(agent.agent_id))
+                                            .map(agent => html`<option value=${agent.agent_id}>${agent.name || agent.agent_id.slice(0, 8)}</option>`)}
+                                    </select>
+                                </label>
+                            </div>
+                            <details class="v23-group-audit">
+                                <summary>Policy record</summary>
+                                <span>Revision ${group.revision} · updated at block ${group.updated_height}</span>
+                            </details>
+                        </article>
+                    `)}
+                    ${(state.groups || []).length === 0 && html`
+                        <div class="v23-empty group">No local groups yet. Create one, then add approved local agents.</div>
+                    `}
+                </div>
+            </div>
+
+            ${legacyModel.groups.length > 0 && !legacyDecision && html`
+                <div class="v23-legacy-review">
+                    <div>
+                        <div class="v23-eyebrow">Upgrade review required</div>
+                        <h3>${legacyModel.groups.length} browser-only group${legacyModel.groups.length === 1 ? '' : 's'} found</h3>
+                        <p>These old groups were visual layout only. They currently grant nothing and will never be silently converted into access policy.</p>
+                        <div class="v23-legacy-list">
+                            ${legacyModel.groups.map(group => html`
+                                <span>
+                                    <strong>${group.name}</strong> ·
+                                    ${group.members.filter(id => localAgents.some(agent => agent.agent_id === id && agent.enrollment_active)).length}
+                                    eligible ·
+                                    ${group.members.filter(id => !localAgents.some(agent => agent.agent_id === id && agent.enrollment_active)).length}
+                                    unavailable
+                                </span>
+                            `)}
+                        </div>
+                    </div>
+                    <div class="v23-legacy-actions">
+                        <button class="btn" disabled=${!!groupBusy || !mutationReady} onClick=${importLegacyGroups}>Review details & import</button>
+                        <button class="btn ghost" disabled=${!!groupBusy} onClick=${() => decideLegacy('ignored')}>Ignore drafts</button>
+                    </div>
+                </div>
+            `}
+
+            <div class="v23-linked-readers">
+                <div class="v23-linked-intro">
+                    <div class="v23-eyebrow">Federation · separate compartment</div>
+                    <h3>Linked readers</h3>
+                    <p>Remote agents never join local groups. A link lets them read that group up to the chosen classification; it never grants local membership, a local role, writes, or agent management. Federation messaging is controlled separately.</p>
+                </div>
+                ${state.linked_readers?.status !== 'ready' ? html`
+                    <div class="v23-linked-state">
+                        <span class="v23-state-chip pending">${state.linked_readers?.status || 'unavailable'}</span>
+                        <span>${state.linked_readers?.message || 'Linked-reader management is unavailable in this build.'}</span>
+                        <button class="btn" disabled>Add linked reader</button>
+                    </div>
+                ` : html`
+                    <div class="v23-linked-manager">
+                        <div class="v23-agent-tray">
+                            <span>Federated agents · drop onto a group to create a separate read-only link</span>
+                            ${remoteCandidates.map(remote => html`
+                                <div class="v23-agent-pill federated" draggable="true"
+                                    role="button" tabIndex="0"
+                                    aria-label=${`Federated agent ${remote.label}; maximum clearance ${remote.max_clearance}`}
+                                    onClick=${() => setSelectedRemoteKey(remote.key)}
+                                    onKeyDown=${e => {
+                                        if (e.key === 'Enter' || e.key === ' ') {
+                                            e.preventDefault();
+                                            setSelectedRemoteKey(remote.key);
+                                        }
+                                    }}
+                                    onDragStart=${() => {
+                                        setSelectedRemoteKey(remote.key);
+                                        setDragRemoteKey(remote.key);
+                                    }}
+                                    onDragEnd=${() => setDragRemoteKey('')}>
+                                    ↗ ${remote.label}
+                                </div>
+                            `)}
+                        </div>
+                        <div class="v23-linked-controls">
+                            <label>
+                                <span>Detected federated agent</span>
+                                <select value=${selectedRemoteKey} disabled=${!!linkedBusy}
+                                    onChange=${e => setSelectedRemoteKey(e.target.value)}>
+                                    ${remoteCandidates.length === 0 && html`<option value="">No advertised agents detected</option>`}
+                                    ${remoteCandidates.map(candidate => html`
+                                        <option value=${candidate.key}>
+                                            ${candidate.peer_name} · ${candidate.label} · ${candidate.remote_agent_id.slice(0, 8)}
+                                            ${candidate.source === 'existing_link' ? ' · existing link' : candidate.source === 'exact_address' ? ' · exact address' : ''}
+                                        </option>
+                                    `)}
+                                </select>
+                            </label>
+                            <div class="v23-field">
+                                <span>Known exact address</span>
+                                <div class="v23-exact-address">
+                                    <input value=${manualRemoteAddress}
+                                        disabled=${!!linkedBusy}
+                                        onInput=${event => setManualRemoteAddress(event.target.value)}
+                                        onKeyDown=${event => {
+                                            if (event.key === 'Enter') {
+                                                event.preventDefault();
+                                                addExactRemoteAddress();
+                                            }
+                                        }}
+                                        placeholder="64-character-agent-id@chain" />
+                                    <button class="btn ghost" disabled=${!!linkedBusy || !manualRemoteAddress.trim()}
+                                        onClick=${addExactRemoteAddress}>Use exact</button>
+                                </div>
+                                <small>Use this when directory discovery is blank but you already know the exact address. The peer must verify it live before it appears here, and Attach/Rebind repeats the check. A JOIN transport key is never accepted as an agent shortcut.</small>
+                            </div>
+                            <label>
+                                <span>Link to local group</span>
+                                <select value=${linkedGroupID} disabled=${!!linkedBusy || !(state.groups || []).length}
+                                    onChange=${e => setLinkedGroupID(e.target.value)}>
+                                    ${(state.groups || []).map(group => html`<option value=${group.group_id}>${group.name}</option>`)}
+                                    ${(state.groups || []).length === 0 && html`<option value="">Create a local group first</option>`}
+                                </select>
+                            </label>
+                            <label>
+                                <span>Maximum classification</span>
+                                <select value=${linkedClearance} disabled=${!!linkedBusy}
+                                    onChange=${e => setLinkedClearance(Number(e.target.value))}>
+                                    ${[
+                                        'Public only', 'Internal', 'Confidential', 'Secret', 'Top Secret',
+                                    ].slice(0, selectedRemoteMaxClearance + 1).map((label, value) =>
+                                        html`<option value=${value}>${value} · ${label}</option>`)}
+                                </select>
+                            </label>
+                            <button class="btn" disabled=${!mutationReady || !!linkedBusy || !selectedRemote || !linkedGroupID ||
+                                linkedLinks.some(link => link?.guest?.group_id === linkedGroupID)}
+                                onClick=${() => mutateLinkedReader('attach', linkedGroupID, 0, linkedClearance)}>
+                                ${linkedBusy.startsWith('attach:') ? 'Attaching…' : 'Attach read-only'}
+                            </button>
+                        </div>
+                        ${linkedError && html`<div class="v23-linked-error">${linkedError}</div>`}
+                        <div class="v23-linked-list">
+                            ${linkedLinks.map(link => {
+                                const guest = link.guest || {};
+                                const group = (state.groups || []).find(item => item.group_id === guest.group_id);
+                                const effective = link.effective_state || guest.state || 'unknown';
+                                return html`
+                                    <div class="v23-linked-row federated">
+                                        <div>
+                                            <strong>${group?.name || guest.group_id}</strong>
+                                            <small>Read-only · max ${CLEARANCE_LABELS[guest.max_classification] || 'Public'} · revision ${guest.revision}</small>
+                                        </div>
+                                        <span class="v23-state-chip ${effective === 'active' ? 'active' : 'pending'}">${effective.replace(/_/g, ' ')}</span>
+                                        <div class="v23-linked-actions">
+                                            ${effective === 'active' && html`
+                                                <button class="btn ghost" disabled=${!!linkedBusy || !mutationReady}
+                                                    onClick=${() => mutateLinkedReader('pause', guest.group_id, guest.revision, guest.max_classification)}>Pause</button>
+                                            `}
+                                            ${(effective === 'paused' || effective === 'rebind_required') && html`
+                                                <button class="btn" disabled=${!!linkedBusy || !mutationReady}
+                                                    onClick=${() => mutateLinkedReader('rebind', guest.group_id, guest.revision, guest.max_classification)}>
+                                                    ${effective === 'paused' ? 'Resume' : 'Rebind'}
+                                                </button>
+                                            `}
+                                            ${effective !== 'revoked' && html`
+                                                <button class="btn ghost" disabled=${!!linkedBusy || !mutationReady}
+                                                    onClick=${() => mutateLinkedReader('revoke', guest.group_id, guest.revision, guest.max_classification)}>Revoke</button>
+                                            `}
+                                        </div>
+                                    </div>
+                                `;
+                            })}
+                            ${selectedRemote && linkedLinks.length === 0 && html`
+                                <div class="v23-empty">This remote agent has no local group links.</div>
+                            `}
+                            {!selectedRemote && html`
+                                <div class="v23-empty">No federated agents are currently advertised. Refresh the connection under Federation.</div>
+                            `}
+                        </div>
+                    </div>
+                `}
+            </div>
+
+            <div class="v23-linked-messages">
+                <div class="v23-linked-intro">
+                    <div class="v23-eyebrow">Federation messaging · separate consent</div>
+                    <h3>Who may message this machine</h3>
+                    <p>A read link does not open an inbox. Choose one cyan remote agent and one green local receiver, then explicitly allow or block only that direction. This creates no group membership, domain access, contact, role, or write authority.</p>
+                </div>
+                ${state.linked_messages?.status !== 'ready' ? html`
+                    <div class="v23-linked-state">
+                        <span class="v23-state-chip pending">${state.linked_messages?.status || 'unavailable'}</span>
+                        <span>${state.linked_messages?.message || 'Exact linked-agent messaging consent is unavailable in this build.'}</span>
+                    </div>
+                ` : html`
+                    <div class="v23-message-manager">
+                        <div class="v23-message-offer-control">
+                            <label class="v23-field">
+                                <span>Host node to ask</span>
+                                <select value=${messageOfferChainID}
+                                    disabled=${messageOfferBusy || !messageOfferHosts.length}
+                                    onChange=${e => {
+                                        setMessageOfferChainID(e.target.value);
+                                        setMessageOfferStatus('');
+                                    }}>
+                                    ${messageOfferHosts.length === 0 && html`<option value="">No connected host nodes</option>`}
+                                    ${messageOfferHosts.map(connection => html`
+                                        <option value=${connection.remote_chain_id}>
+                                            ${connection.peer_name || connection.remote_chain_id} · ${connection.remote_chain_id}
+                                        </option>
+                                    `)}
+                                </select>
+                            </label>
+                            <button class="btn" disabled=${messageOfferBusy || !messageOfferChainID || !messageLocalID}
+                                onClick=${loadRemoteHostedMessageOffers}>
+                                ${messageOfferBusy ? 'Checking selected host…' : 'Check signed offers'}
+                            </button>
+                            <small>This deliberate check sends the selected green receiver ID to this one host only. Choosing a receiver never contacts peers.</small>
+                        </div>
+                        <div class="v23-message-flow" aria-label="Exact remote-to-local messaging direction">
+                            <div class="v23-message-principal federated">
+                                <span class="v23-message-dot"></span>
+                                <div>
+                                    <small>Remote sender</small>
+                                    <strong>${selectedMessageRemote?.label || 'No proven sender for this receiver'}</strong>
+                                    ${selectedMessageRemote && html`<code>${selectedMessageRemote.remote_agent_id.slice(0, 12)}@${selectedMessageRemote.remote_chain_id}</code>`}
+                                </div>
+                            </div>
+                            <span class="v23-message-arrow" aria-hidden="true">→</span>
+                            <div class="v23-message-principal local">
+                                <span class="v23-message-dot"></span>
+                                <div>
+                                    <small>Local receiver</small>
+                                    <strong>${messageLocal?.name || 'Choose a local teammate'}</strong>
+                                    ${messageLocal && html`<code>${messageLocal.agent_id.slice(0, 12)}</code>`}
+                                </div>
+                            </div>
+                        </div>
+                        <div class="v23-message-controls">
+                            <label class="v23-field">
+                                <span>Proven remote sender</span>
+                                <select value=${selectedMessageRemoteKey} disabled=${messageBusy || !!linkedBusy}
+                                    onChange=${e => {
+                                        setSelectedMessageRemoteKey(e.target.value);
+                                        setMessageConsent(null);
+                                        setMessageError('');
+                                    }}>
+                                    ${messageRemoteCandidates.length === 0 && html`<option value="">No current exact pair</option>`}
+                                    ${messageRemoteCandidates.map(candidate => html`
+                                        <option value=${candidate.key}>
+                                            ${candidate.label} · ${candidate.remote_agent_id.slice(0, 8)}@${candidate.remote_chain_id}
+                                            ${candidate.authorization_source === 'peer_hosted_offer'
+                                                ? ' · signed host offer'
+                                                : ' · active local link'}
+                                        </option>
+                                    `)}
+                                </select>
+                            </label>
+                            <label class="v23-field">
+                                <span>Local receiver</span>
+                                <select value=${messageLocalID} disabled=${messageBusy || !messageLocalCandidates.length}
+                                    onChange=${e => setMessageLocalID(e.target.value)}>
+                                    ${messageLocalCandidates.length === 0 && html`<option value="">No eligible local receivers</option>`}
+                                    ${messageLocalCandidates.map(agent => html`
+                                        <option value=${agent.agent_id}>
+                                            ${agent.name || agent.agent_id.slice(0, 8)} · ${agent.role}
+                                        </option>
+                                    `)}
+                                </select>
+                            </label>
+                        </div>
+                        ${messageOfferStatus && html`
+                            <div class="v23-message-offer-status" role="status">
+                                ${messageOfferStatus}
+                            </div>
+                        `}
+                        ${messageError && html`<div class="v23-linked-error">${messageError}</div>`}
+                        <div class="v23-message-review">
+                            <button class="btn ghost" disabled=${messageBusy || !messagePairProven || !messageLocal}
+                                onClick=${loadExactMessageConsent}>
+                                ${messageBusy ? 'Reviewing exact pair…' : 'Review exact pair'}
+                            </button>
+                            <span>
+                                ${messagePairProven
+                                    ? 'Consent is read only after this deliberate exact-pair check; changing either selector makes no peer request.'
+                                    : 'Choose a current active local link whose group contains this receiver, or explicitly load a receiver-bound signed host offer.'}
+                            </span>
+                        </div>
+                        <div class="v23-consent-control" aria-busy=${messageBusy}>
+                            <div>
+                                <span class="v23-state-chip ${activeMessageConsent?.accepting ? 'active' : 'blocked'}">
+                                    ${messageBusy
+                                        ? 'checking'
+                                        : !activeMessageConsent
+                                            ? 'review required'
+                                            : activeMessageConsent.accepting ? 'allowed' : 'blocked by default'}
+                                </span>
+                                <p>
+                                    ${!activeMessageConsent
+                                        ? 'Review this exact pair to load its local consent revision. A pair with no consent record is blocked by default.'
+                                        : activeMessageConsent.accepting
+                                        ? 'This exact remote agent may address this exact local receiver while the host-signed link, group membership, receiver consent, and federation agreement remain current.'
+                                        : 'No message is accepted for this exact pair. The read-only link, if any, is unchanged.'}
+                                </p>
+                            </div>
+                            <div class="v23-consent-actions" role="group" aria-label="Exact messaging consent">
+                                <button class="v23-consent-choice blocked ${activeMessageConsent && !activeMessageConsent.accepting ? 'selected' : ''}"
+                                    disabled=${messageBusy || !messagePairProven || !activeMessageConsent || !messageLocal || !mutationReady}
+                                    aria-pressed=${!!activeMessageConsent && !activeMessageConsent.accepting}
+                                    onClick=${() => setExactMessageConsent(false)}>
+                                    <strong>Block messages</strong>
+                                    <span>Safe default</span>
+                                </button>
+                                <button class="v23-consent-choice allowed ${activeMessageConsent?.accepting ? 'selected' : ''}"
+                                    disabled=${messageBusy || !messagePairProven || !activeMessageConsent || !messageLocal || !mutationReady}
+                                    aria-pressed=${!!activeMessageConsent?.accepting}
+                                    onClick=${() => setExactMessageConsent(true)}>
+                                    <strong>Allow exact pair</strong>
+                                    <span>Remote → local only</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="v23-message-footnote">
+                            To let ${messageLocal?.name || 'the local agent'} message ${selectedMessageRemote?.label || 'the remote agent'}, the operator on ${selectedMessageRemote?.remote_chain_id || 'the remote node'} must separately allow the reverse receiver-local pair there. Directory visibility is never used as authority.
+                        </div>
+                    </div>
+                `}
+            </div>
+        </section>
+    `;
 }
 
 // --- Network Page (Accordion) ---
@@ -8245,11 +9750,15 @@ function NetworkPage({ sse, accessMode = false }) {
         try {
             const res = await removeAgent(agent.agent_id, true);
             if (res.error) { showToast(res.error, 'error'); return; }
-            const rdRes = await startRedeploy('remove_agent', agent.agent_id);
-            if (rdRes.error) showToast('Agent removed but redeployment failed: ' + rdRes.error, 'warning');
-            else { setRedeployStatus(rdRes); if (rdRes.status !== 'completed') startRedeployPoll(); } // single-node: instant, no poll
+            if (res.redeploy_required !== false) {
+                const rdRes = await startRedeploy('remove_agent', agent.agent_id);
+                if (rdRes.error) showToast('Agent removed but redeployment failed: ' + rdRes.error, 'warning');
+                else { setRedeployStatus(rdRes); if (rdRes.status !== 'completed') startRedeployPoll(); } // single-node: instant, no poll
+            } else {
+                showToast('Agent deactivated on-chain and removed from every Access Group.', 'success');
+            }
             setShowRemoveConfirm(null); setExpandedId(null); loadAgents();
-        } catch (e) { showToast('Failed to remove agent', 'error'); }
+        } catch (e) { showToast(e.message || 'Failed to remove agent', 'error'); }
     }, [loadAgents, startRedeployPoll]);
 
     const handleRotateKey = useCallback(async (agent) => {
@@ -8257,11 +9766,19 @@ function NetworkPage({ sse, accessMode = false }) {
         try {
             const res = await rotateAgentKey(agent.agent_id);
             if (res.error) { showToast(res.error, 'error'); setRotating(false); return; }
-            const rdRes = await startRedeploy('rotate_key', res.new_agent_id);
-            if (rdRes.error) showToast('Key rotated but redeployment failed: ' + rdRes.error, 'warning');
-            else { setRedeployStatus(rdRes); if (rdRes.status !== 'completed') startRedeployPoll(); } // single-node: instant, no poll
+            if (res.new_agent_id) {
+                const downloaded = await downloadBundle(res.new_agent_id);
+                if (!downloaded) showToast('Rotation committed, but the recovery bundle could not be downloaded. Do not rotate again until it is secured.', 'warning', 10000);
+            }
+            if (res.redeploy_required !== false) {
+                const rdRes = await startRedeploy('rotate_key', res.new_agent_id);
+                if (rdRes.error) showToast('Key rotated but redeployment failed: ' + rdRes.error, 'warning');
+                else { setRedeployStatus(rdRes); if (rdRes.status !== 'completed') startRedeployPoll(); } // single-node: instant, no poll
+            } else {
+                showToast(res.message || 'Root credential rotation committed.', 'success', 9000);
+            }
             setShowRotateConfirm(null); setExpandedId(null); loadAgents();
-        } catch (e) { showToast('Failed to rotate key', 'error'); }
+        } catch (e) { showToast(e.message || 'Failed to rotate key', 'error'); }
         setRotating(false);
     }, [loadAgents, startRedeployPoll]);
 
@@ -8420,6 +9937,20 @@ function NetworkPage({ sse, accessMode = false }) {
     if (loading) return html`<div class="network-page"><p style="color:var(--text-muted);text-align:center;padding:40px;">Loading agents...</p></div>`;
 
     const isRedeploying = redeployStatus?.active === true;
+    if (accessMode) {
+        return html`
+            <div class="network-page fade-in access-mode">
+                ${isRedeploying && html`<div class="redeploy-banner"><span class="deploy-spinner"></span> Network reconfiguration in progress...</div>`}
+                <div class="network-header">
+                    <div>
+                        <h2>Access Controls <${HelpTip} text="Review and change local roles, security profiles, Access Groups, and read-only federated links. Every authority change is committed or fails closed." /><${PageHelp} section="network" label="Access controls guide" /></h2>
+                        <div class="network-header-sub">Local consensus groups and federated Linked readers remain separate.</div>
+                    </div>
+                </div>
+                <${AppV23AccessControl} />
+            </div>
+        `;
+    }
 
     return html`
         <div class="network-page fade-in ${accessMode ? 'access-mode' : ''}">
@@ -8429,6 +9960,8 @@ function NetworkPage({ sse, accessMode = false }) {
                     ? html`<div><h2>Access Controls <${HelpTip} text="Review and change each local agent's domain permissions, clearance, and visibility. Access grants are enforced on-chain." /><${PageHelp} section="network" label="Access controls guide" /></h2><div class="network-header-sub">Select an agent to manage its access · ${agents.length} agent${agents.length !== 1 ? 's' : ''} on this node</div></div>`
                     : html`<div><h2>Agents <${HelpTip} text="Manage the agents on your own SAGE node. Each agent is a separate participant in BFT consensus with its own permissions. Click any agent to expand its details and access. (To connect your whole node to ANOTHER SAGE, use Federation.)" /><${PageHelp} section="network" label="Agents guide" /></h2><div class="network-header-sub">${agents.length} agent${agents.length !== 1 ? 's' : ''} on this node</div></div>`}
             </div>
+
+            ${accessMode && html`<${AppV23AccessControl} />`}
 
 			<div class="gov-section">
                 <div class="gov-section-header">
@@ -8688,25 +10221,26 @@ function NetworkPage({ sse, accessMode = false }) {
                 </div>
             </div>
 
-            ${agents.length > 1 && html`<div class="agent-group-tip muted">Drag an agent onto another to group them — a handy way to arrange them by machine or purpose. Grouping is just for your view here; it changes nothing on the network.</div>`}
+            ${groupModel.groups.length > 0 && html`
+                <div class="agent-group-tip muted">
+                    Browser-only layout groups are retired. They grant nothing; review, import, or ignore them under Access Controls.
+                </div>
+            `}
             <div class="agent-list">
                 ${(() => {
-                    const grouped = groupModel.groups
-                        .map(g => ({ group: g, members: g.members.map(id => agents.find(a => a.agent_id === id)).filter(Boolean) }))
-                        .filter(x => x.members.length > 0);
-                    const groupedIds = new Set(grouped.flatMap(x => x.members.map(a => a.agent_id)));
-                    const ungrouped = agents.filter(a => !groupedIds.has(a.agent_id));
+                    // app-v23 groups are consensus Access Groups managed on the
+                    // Access Controls page. Historical localStorage groups stay
+                    // only as explicit migration drafts and never shape this list.
+                    const grouped = [];
+                    const ungrouped = agents;
                     const renderAgentRow = (agent) => {
                     const isExpanded = expandedId === agent.agent_id;
                     const isLastAdmin = agent.role === 'admin' && agents.filter(a => a.role === 'admin' && a.status !== 'removed').length <= 1;
                     return html`
                         <div key=${agent.agent_id} class="agent-group-item ${dropHint === 'agent:' + agent.agent_id ? 'drop-target' : ''} ${dragAgentId === agent.agent_id ? 'dragging' : ''}"
-                            onDragOver=${e => { if (dragAgentId && dragAgentId !== agent.agent_id) { e.preventDefault(); e.stopPropagation(); setDropHint('agent:' + agent.agent_id); } }}
-                            onDrop=${e => { if (dragAgentId && dragAgentId !== agent.agent_id) { e.preventDefault(); e.stopPropagation(); groupAgents(dragAgentId, agent.agent_id); setDropHint(null); } }}>
+                            >
                             <div class="agent-card-row ${isExpanded ? 'expanded' : ''}"
-                                draggable=${true}
-                                onDragStart=${e => { setDragAgentId(agent.agent_id); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'; }}
-                                onDragEnd=${() => { setDragAgentId(null); setDropHint(null); }}
+                                draggable=${false}
                                 onClick=${() => toggleExpand(agent)} role="button"
                                 aria-expanded=${isExpanded} tabIndex="0"
                                 onKeyDown=${e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExpand(agent); } }}>
@@ -8735,7 +10269,10 @@ function NetworkPage({ sse, accessMode = false }) {
                                 ${isExpanded && html`<div class="agent-expanded-inner">
                                     <div class="agent-tab-bar" role="tablist">
                                         <button class="agent-tab ${expandedTab === 'overview' ? 'active' : ''}" disabled=${accessSaving} onClick=${e => { e.stopPropagation(); setExpandedTab('overview'); setEditing(false); }}>Overview</button>
-                                        <button class="agent-tab ${expandedTab === 'access' ? 'active' : ''}" disabled=${accessSaving} onClick=${e => { e.stopPropagation(); setExpandedTab('access'); setEditing(false); }}>Access Control</button>
+                                        <button class="agent-tab" disabled=${accessSaving} onClick=${e => {
+                                            e.stopPropagation();
+                                            window.location.hash = '/access';
+                                        }}>Open Access Controls</button>
                                         <button class="agent-tab ${expandedTab === 'activity' ? 'active' : ''}" disabled=${accessSaving} onClick=${e => { e.stopPropagation(); setExpandedTab('activity'); setEditing(false); }}>Activity</button>
                                     </div>
 
@@ -8796,7 +10333,7 @@ function NetworkPage({ sse, accessMode = false }) {
                                         </div>
                                     `}
 
-                                    ${expandedTab === 'access' && html`
+                                    ${expandedTab === 'legacy-access-disabled' && html`
                                         <div>
                                             <div class="access-identity-note">
                                                 These permissions apply only to signer <span class="mono">${agent.agent_id}</span>.
@@ -9088,16 +10625,10 @@ function AddAgentWizard({ onClose, onCreated }) {
 
     // Step 1 state
     const [name, setName] = useState('');
-    const [role, setRole] = useState('member');
     const [avatar, setAvatar] = useState('🤖');
     const [bio, setBio] = useState('');
     const [provider, setProvider] = useState('');
     const [template, setTemplate] = useState('');
-
-    // Step 2 state
-    const [clearance, setClearance] = useState(1);
-    const [domainAccess, setDomainAccess] = useState({});
-    const [allDomains, setAllDomains] = useState([]);
 
     // Step 3 state
     const [connectMethod, setConnectMethod] = useState('local');
@@ -9113,9 +10644,6 @@ function AddAgentWizard({ onClose, onCreated }) {
         fetchTemplates().then(data => {
             if (data.templates) setTemplates(data.templates);
         });
-        fetchStats().then(data => {
-            if (data?.by_domain) setAllDomains(Object.keys(data.by_domain).sort());
-        }).catch(() => {});
     }, []);
 
     // Cleanup deploy poll on unmount
@@ -9130,9 +10658,7 @@ function AddAgentWizard({ onClose, onCreated }) {
 
     const applyTemplate = (t) => {
         setTemplate(t.name);
-        setRole(t.role);
         setBio(t.bio);
-        setClearance(t.clearance);
         setAvatar(t.avatar);
     };
 
@@ -9159,12 +10685,11 @@ function AddAgentWizard({ onClose, onCreated }) {
         setCreating(true);
         setError(null);
         try {
-            const daArr = Object.entries(domainAccess)
-                .filter(([_, v]) => v.read || v.write || v.modify)
-                .map(([domain, p]) => ({ domain, read: p.read, write: p.write, modify: p.modify }));
             const res = await createAgent({
-                name, role, avatar, boot_bio: bio,
-                clearance, domain_access: JSON.stringify(daArr),
+                // Registration carries identity metadata only. App-v23 always
+                // creates a restricted pending Member; access is approved later
+                // through the atomic policy route.
+                name, avatar, boot_bio: bio,
                 provider: provider || undefined,
             });
             if (res.error) {
@@ -9196,7 +10721,7 @@ function AddAgentWizard({ onClose, onCreated }) {
         setCreating(false);
     };
 
-    const stepLabels = ['Identity', 'Permissions', 'Connect', 'Deploy'];
+    const stepLabels = ['Identity', 'Access review', 'Connect', 'Deploy'];
 
     return html`
         <div class="wizard-overlay" onClick=${(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -9220,7 +10745,7 @@ function AddAgentWizard({ onClose, onCreated }) {
 
                     ${step === 1 && html`
                         <div class="wizard-field">
-                            <label>Template <${HelpTip} text="Templates pre-fill role, bio, and clearance for common agent types. Choose Custom for manual configuration." /></label>
+                            <label>Template <${HelpTip} text="Templates pre-fill the avatar and purpose for common agent types. Role, profile, clearance, and home-domain access are assigned separately after registration." /></label>
                             <select class="wizard-select" value=${template} onChange=${e => {
                                 const t = templates.find(t => t.name === e.target.value);
                                 if (t) applyTemplate(t);
@@ -9259,41 +10784,14 @@ function AddAgentWizard({ onClose, onCreated }) {
                     `}
 
                     ${step === 2 && html`
-                        <div class="wizard-field">
-                            <label>Role</label>
-                            <div class="role-selector">
-                                ${[
-                                    { key: 'admin', name: 'Admin', desc: 'Full access to everything.' },
-                                    { key: 'member', name: 'Member', desc: 'Read/write in allowed domains.' },
-                                    { key: 'observer', name: 'Observer', desc: 'Read-only access.' },
-                                ].map(r => html`
-                                    <div class="role-card ${role === r.key ? 'selected ' + r.key : ''}"
-                                        onClick=${() => setRole(r.key)}>
-                                        <div class="role-card-name">${r.name}</div>
-                                        <div class="role-card-desc">${r.desc}</div>
-                                    </div>
-                                `)}
-                            </div>
+                        <div class="summary-card">
+                            <div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:12px;">What registration does</div>
+                            <div class="summary-row"><span class="label">Initial role</span><span class="value">Restricted Member</span></div>
+                            <div class="summary-row"><span class="label">Access state</span><span class="value">Pending review</span></div>
                         </div>
-                        <div class="wizard-field">
-                            <label>Domain Access</label>
-                            <${DomainAccessMatrix}
-                                domains=${allDomains}
-                                domainAccess=${domainAccess}
-                                onChange=${setDomainAccess}
-                                disabled=${role === 'admin'}
-                                allowModify=${false}
-                            />
-                            ${role !== 'admin' && html`<div style="color:var(--text-muted);font-size:11px;margin-top:5px;">Level-3 Modify grants can be assigned after this agent is registered, under Access Controls.</div>`}
-                        </div>
-                        <div class="wizard-field">
-                            <label>Clearance Level <${HelpTip} text="Determines what sensitivity level of memories this agent can access. Higher clearance = access to more classified knowledge." /></label>
-                            <div class="clearance-row">
-                                <input type="range" min="0" max="4" value=${clearance} onInput=${e => setClearance(parseInt(e.target.value))} style="flex:1;" />
-                                <span class="clearance-label" style="color:${clearance >= 3 ? 'var(--danger)' : clearance >= 2 ? 'var(--warning)' : 'var(--text-dim)'};">
-                                    ${CLEARANCE_LABELS[clearance]}
-                                </span>
-                            </div>
+                        <div class="v23-inline-note" style="margin-top:14px;margin-bottom:0;">
+                            This wizard creates the agent identity and connection material only. It does not stage or remember a requested role, clearance, or domain list.
+                            After registration, open Access Controls to approve the agent's role, named security profile, clearance, and owned home domain in one consensus transaction.
                         </div>
                     `}
 
@@ -9325,10 +10823,9 @@ function AddAgentWizard({ onClose, onCreated }) {
                         <div class="summary-card" style="margin-top:16px;">
                             <div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:12px;">Summary</div>
                             <div class="summary-row"><span class="label">Name</span><span class="value">${name || '—'}</span></div>
-                            <div class="summary-row"><span class="label">Role</span><span class="value" style="text-transform:capitalize;">${role}</span></div>
+                            <div class="summary-row"><span class="label">Registration</span><span class="value">Restricted Member · pending review</span></div>
                             <div class="summary-row"><span class="label">Avatar</span><span class="value">${avatar}</span></div>
-                            <div class="summary-row"><span class="label">Clearance</span><span class="value">${CLEARANCE_LABELS[clearance]}</span></div>
-                            <div class="summary-row"><span class="label">Domains</span><span class="value">${role === 'admin' ? 'All (admin)' : (() => { const c = Object.values(domainAccess).filter(v => v.read || v.write || v.modify).length; return c > 0 ? c + ' domain' + (c !== 1 ? 's' : '') : 'None'; })()}</span></div>
+                            <div class="summary-row"><span class="label">Access policy</span><span class="value">Assign after registration</span></div>
                             <div class="summary-row"><span class="label">Connect</span><span class="value">${connectMethod === 'local' ? 'Local Project' : connectMethod === 'bundle' ? 'Bundle Download' : 'LAN Pairing'}</span></div>
                         </div>
 
@@ -9369,9 +10866,9 @@ function AddAgentWizard({ onClose, onCreated }) {
                                     : html`
                                         <div style="text-align:center;margin-bottom:16px;">
                                             <div style="font-size:48px;margin-bottom:12px;">✓</div>
-                                            <h3 style="font-size:18px;font-weight:700;color:var(--accent);margin-bottom:4px;">Agent Deployed</h3>
+                                            <h3 style="font-size:18px;font-weight:700;color:var(--accent);margin-bottom:4px;">Agent registered · review required</h3>
                                             <p style="font-size:13px;color:var(--text-dim);margin-bottom:20px;">
-                                                ${name} is live on the network. ${connectMethod === 'local' ? 'Run the install command in your project folder.' : connectMethod === 'bundle' ? 'Download the bundle to set up the agent.' : 'Use the pairing code on the target machine.'}
+                                                ${name} is a restricted pending Member. Complete setup, then open Access Controls to approve its role, security profile, clearance, and home domain in one consensus transaction. ${connectMethod === 'local' ? 'Run the install command in your project folder.' : connectMethod === 'bundle' ? 'Download the bundle to set up the agent.' : 'Use the pairing code on the target machine.'}
                                             </p>
                                         </div>
                                         ${deployStatus && deployStatus.status === 'completed' && html`
@@ -9396,7 +10893,7 @@ function AddAgentWizard({ onClose, onCreated }) {
                                                         Token expires in 24 hours. One-time use — the key is delivered securely and the token is invalidated.
                                                     </p>
                                                     <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">
-                                                        After running, restart your Claude Code session. The agent will connect with the identity and permissions you just configured.
+                                                        After running, restart your Claude Code session. The agent connects as a restricted Member until you approve its policy in Access Controls.
                                                     </p>
                                                 </div>
                                             `}
@@ -9446,7 +10943,12 @@ function AddAgentWizard({ onClose, onCreated }) {
                             }
                         `
                         : html`
-                            <div></div>
+                            <button class="btn" onClick=${() => {
+                                onCreated();
+                                window.location.hash = '/access';
+                            }} disabled=${deploying}>
+                                Open Access Controls
+                            </button>
                             <button class="btn btn-primary" onClick=${onCreated} disabled=${deploying}>
                                 ${deploying ? 'Deploying...' : 'Done'}
                             </button>
@@ -9982,7 +11484,7 @@ function RemoteAccessWizard({ agents, onClose, target }) {
                     ${step === 6 && html`
                         <div style="line-height:1.55;">
                             <h3 style="margin-top:0;">Mint a bearer token</h3>
-                            <p>The bearer is an administrator credential for this SAGE node. Remote HTTP MCP currently runs as the local node operator, and CEREBRUM records that identity honestly in the audit trail.</p>
+                            <p>CEREBRUM creates a separate restricted Member identity for this bearer. It starts pending review and never inherits the approving Root or Admin key.</p>
                             <div class="wizard-field">
                                 <label>Token name</label>
                                 <input class="wizard-input" value=${tokenName} onInput=${e => setTokenName(e.target.value)} placeholder=${forChatGPT ? 'chatgpt' : 'remote'} />
@@ -10110,7 +11612,7 @@ function CursorSetupPanel({ agents, onClose }) {
 
                     ${!mintedToken && html`
                         <h3 style="margin-top:18px;">1. Mint a bearer</h3>
-                        <p style="font-size:12px;color:var(--text-muted);">This bearer runs as the local node operator. Treat it like an administrator password and revoke it when the connection is no longer needed.</p>
+                        <p style="font-size:12px;color:var(--text-muted);">This bearer receives its own restricted Member identity pending review; it never runs as CEREBRUM Root or the approving Admin. Keep it private and revoke it when the connection is no longer needed.</p>
                         <div class="wizard-field">
                             <label>Token name</label>
                             <input class="wizard-input" value=${tokenName} onInput=${e => setTokenName(e.target.value)} placeholder="cursor" />
@@ -10413,7 +11915,7 @@ function RemoteConnectPanel({ agents, onOpenChatGPT }) {
                     : html`
                         ${!minted && html`
                             <h4 style="margin:14px 0 8px;">Mint a bearer for the other computer</h4>
-                            <p style="font-size:12px;color:var(--text-muted);">Remote HTTP MCP bearers run as the local node operator. Treat this as an administrator credential.</p>
+                            <p style="font-size:12px;color:var(--text-muted);">The bearer receives its own restricted Member identity pending review; it never inherits CEREBRUM Root or Admin authority.</p>
                                     <div class="wizard-field">
                                         <label>Token name</label>
                                         <input class="wizard-input" value=${tokenName} onInput=${e => setTokenName(e.target.value)} placeholder="remote" />
@@ -10426,7 +11928,7 @@ function RemoteConnectPanel({ agents, onOpenChatGPT }) {
                         ${minted && html`
                             <h4 style="margin:14px 0 8px;color:var(--accent-green);">✓ Token minted</h4>
                             <div class="warning-banner" style="margin-bottom:14px;">
-                                Save the bearer NOW — it's shown ONCE. It carries node-operator access; treat it like an administrator password.
+                                Save the bearer NOW — it's shown ONCE. It controls one restricted agent identity; keep it private like that agent’s password.
                             </div>
                             <${ChatGPTCopyField} label="MCP Server URL" value=${baseUrl} />
                             <${ChatGPTCopyField} label="Bearer token (save now!)" value=${minted.token} sensitive=${true} />
@@ -11487,8 +12989,8 @@ function OverviewPage({ sse }) {
     // report a consensus app version yet, so do not cry "behind" (amber) on it.
     // Only a real version below the v11 baseline is genuinely behind. During a
     // rolling activation the intermediate fork rungs remain neutral; the
-    // current protocol turns green only once the app-v22 gate is active.
-    const appVerTone = appVer === '22' ? 'healthy' : (appVerNum > 0 && appVerNum < 15 ? 'degraded' : 'neutral');
+    // current protocol turns green only once the app-v23 gate is active.
+    const appVerTone = appVer === '23' ? 'healthy' : (appVerNum > 0 && appVerNum < 15 ? 'degraded' : 'neutral');
     const appVerShown = (appVer && appVer !== '0') ? ('v' + appVer) : '--';
     const mempoolTxs = (chain && chain.mempool_txs != null) ? Number(chain.mempool_txs) : null;
     const mempoolHot = mempoolTxs != null && !isNaN(mempoolTxs) && mempoolTxs > 50;
@@ -11513,7 +13015,7 @@ function OverviewPage({ sse }) {
         tile(chain ? Number(chain.block_height || 0).toLocaleString() : '--', 'Block height', { color: '#10b981', title: 'Total blocks committed to the chain.' }),
         tile(fmtAge(blockElapsed), 'Last block age', { title: 'Time since the last committed block.', sub: chainIdle ? 'idle - not a stall' : '' }),
         tile(chain ? (chain.catching_up ? 'Catching up' : 'In sync') : '--', 'Sync state', { small: true, color: chain ? (chain.catching_up ? '#f59e0b' : '#10b981') : undefined }),
-        tile(appVerShown, 'App version', { small: true, color: appVerTone === 'healthy' ? '#10b981' : (appVerTone === 'degraded' ? '#f59e0b' : undefined), title: 'CometBFT app protocol version. Green when current (22).' }),
+        tile(appVerShown, 'App version', { small: true, color: appVerTone === 'healthy' ? '#10b981' : (appVerTone === 'degraded' ? '#f59e0b' : undefined), title: 'CometBFT app protocol version. Green when current (23).' }),
         tile(chainIdle ? 'Idle' : (blockRate ? blockRate.toFixed(1) + 's' : '--'), 'Block rate', { small: chainIdle, title: 'Seconds per block, derived client-side from height deltas.' }),
         tile(uptimeDisplay, 'Node uptime', { small: true, title: 'Time since this node process started.' }),
         tile(chain && chain.mempool_txs != null ? chain.mempool_txs : '--', 'Pending transactions', { color: mempoolHot ? '#f59e0b' : undefined, title: 'Unconfirmed transactions waiting in the mempool. Amber above 50 signals a backlog.' }),

@@ -75,6 +75,20 @@ func (m *Manager) pipelineDrain(ctx context.Context, ss *store.SQLiteStore) {
 func (m *Manager) deliverPipelineEvent(parent context.Context, ss *store.SQLiteStore, outbox *store.PipelineTransportOutbox) {
 	ctx, cancel := context.WithTimeout(parent, pipeDeliveryTimeout)
 	defer cancel()
+	if outbox != nil &&
+		outbox.AuthorizationMode == LinkedMessageAuthorizationMode {
+		deliveryCtx, releaseDelivery, leaseErr := m.beginLinkedDelivery(
+			ctx, outbox.RemoteChainID,
+		)
+		if leaseErr != nil {
+			m.recordPipelineDeliveryError(
+				ss, outbox, leaseErr, false, time.Duration(0),
+			)
+			return
+		}
+		defer releaseDelivery()
+		ctx = deliveryCtx
+	}
 	// Revoke, pause and policy replacement take the write side. For outbound
 	// sends the final contact resolution, network acknowledgement, and durable
 	// delivery outcome are one read-leased operation: once revoke returns, no
@@ -82,7 +96,8 @@ func (m *Manager) deliverPipelineEvent(parent context.Context, ss *store.SQLiteS
 	policyUnlock := func() {}
 	ownerUnlock := func() {}
 	contactUnlock := func() {}
-	if outbox != nil && outbox.EventKind == "send" {
+	if outbox != nil && outbox.EventKind == "send" &&
+		outbox.AuthorizationMode != LinkedMessageAuthorizationMode {
 		policyUnlock = ss.LockSyncPolicyRead()
 		if m.badger != nil {
 			ownerUnlock = m.badger.LockDomainOwnershipRead()
@@ -118,6 +133,48 @@ func (m *Manager) deliverPipelineEvent(parent context.Context, ss *store.SQLiteS
 		msg, getErr := ss.GetPipeline(ctx, outbox.PipeID)
 		if getErr != nil {
 			err = getErr
+		} else if outbox.AuthorizationMode == LinkedMessageAuthorizationMode {
+			// Linked-v23 never performs peer status, relation callback, event
+			// delivery, or acknowledgement while holding local policy/owner/
+			// contact leases. The destination repeats the live relation check
+			// at admission, so a revoke that wins after this staged local check
+			// still rejects the result before it is applied.
+			err = m.AuthorizeImportedPipe(ctx, msg)
+			if err == nil && !m.sourceMayUseFederatedPipe(outbox.SourceAgentID) {
+				err = errFederatedPipeSourceDenied
+			}
+			if err == nil {
+				preflight := m.pipeResultPreflightFn
+				if preflight == nil {
+					preflight = m.preflightPipelineResultPeer
+				}
+				err = preflight(ctx, msg, outbox)
+			}
+			if err == nil {
+				if hook := m.linkedResultBeforePushHook; hook != nil {
+					hook(outbox.RemoteChainID)
+				}
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				} else {
+					// Repeat receiver-local consent, enrollment, capability and
+					// relation checks after the no-payload peer handshake. The
+					// cancellable per-peer delivery lease linearizes this final
+					// gate with every participating control mutation.
+					err = m.AuthorizeImportedPipe(ctx, msg)
+				}
+			}
+			if err == nil {
+				event.Result = msg.Result
+				err = deliver()
+				event.Result = ""
+			}
+			if err == nil {
+				err = ss.MarkPipelineTransportDelivered(
+					context.Background(), outbox.EventID,
+				)
+				deliveryRecorded = err == nil
+			}
 		} else {
 			err = m.WithAuthorizedImportedPipe(ctx, msg, func() error {
 				if !m.sourceMayUseFederatedPipe(outbox.SourceAgentID) {
@@ -257,7 +314,16 @@ func (m *Manager) buildPipelineEvent(ctx context.Context, ss *store.SQLiteStore,
 		CreatedAt: outbox.CreatedAt, ExpiresAt: outbox.ExpiresAt,
 		PolicyEpoch: outbox.PolicyEpoch, AgreementID: outbox.AgreementID,
 		ContactID: outbox.ContactID, ContactRevision: outbox.ContactRevision,
-		Proof: outbox.Proof,
+		AuthorizationMode: outbox.AuthorizationMode,
+		Proof:             outbox.Proof,
+	}
+	if outbox.AuthorizationMode == LinkedMessageAuthorizationMode {
+		event.LinkedRelation, err = decodeLinkedMessageRelation(outbox.LinkedRelation)
+		if err != nil {
+			return nil, true, ErrFederatedPipeInvalid
+		}
+	} else if len(outbox.LinkedRelation) != 0 {
+		return nil, true, ErrFederatedPipeInvalid
 	}
 	if event.EventID != PipelineProofEventID(event.SourceChainID, event.Kind, event.Proof) {
 		return nil, true, fmt.Errorf("pipeline outbox event id no longer matches its agent proof")
@@ -268,11 +334,20 @@ func (m *Manager) buildPipelineEvent(ctx context.Context, ss *store.SQLiteStore,
 			msg.FromAgent != outbox.SourceAgentID || msg.ToAgent != outbox.TargetAgentID {
 			return nil, true, fmt.Errorf("outbound pipeline state no longer matches the send event")
 		}
-		resolve := m.pipeTargetResolveFn
-		if resolve == nil {
-			resolve = m.resolveRemotePipeTargetLive
+		var target *RemotePipeTarget
+		var resolveErr error
+		if outbox.AuthorizationMode == LinkedMessageAuthorizationMode {
+			target, resolveErr = m.ResolveRemoteLinkedPipeTarget(
+				ctx, outbox.SourceAgentID,
+				msg.ToAgent+"@"+msg.DestinationChainID,
+			)
+		} else {
+			resolve := m.pipeTargetResolveFn
+			if resolve == nil {
+				resolve = m.resolveRemotePipeTargetLive
+			}
+			target, resolveErr = resolve(ctx, msg.ToAgent+"@"+msg.DestinationChainID)
 		}
-		target, resolveErr := resolve(ctx, msg.ToAgent+"@"+msg.DestinationChainID)
 		if resolveErr != nil {
 			switch {
 			case errors.Is(resolveErr, ErrRemotePipeTargetUnavailable), errors.Is(resolveErr, ErrRemotePipeTargetNotAccepting),
@@ -284,7 +359,9 @@ func (m *Manager) buildPipelineEvent(ctx context.Context, ss *store.SQLiteStore,
 		}
 		if target.PolicyEpoch != outbox.PolicyEpoch || target.AgreementID != outbox.AgreementID ||
 			target.ContactID != outbox.ContactID || target.ContactRevision != outbox.ContactRevision ||
-			target.AgentID != outbox.TargetAgentID || target.ChainID != outbox.RemoteChainID {
+			target.AgentID != outbox.TargetAgentID || target.ChainID != outbox.RemoteChainID ||
+			target.AuthorizationMode != outbox.AuthorizationMode ||
+			!linkedMessageRelationEqual(target.LinkedRelation, event.LinkedRelation) {
 			return nil, true, ErrFederatedPipeInvalid
 		}
 		event.Intent, event.Payload = msg.Intent, msg.Payload

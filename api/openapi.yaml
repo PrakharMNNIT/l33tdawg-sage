@@ -1,10 +1,16 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.6.1
-  description: >-
-    (Sovereign) Agent Governed Experience — REST API for memory submission,
-    validation, and query.
+  version: 11.15.0
+  description: |-
+    (Sovereign) Agent Governed Experience — network REST API for memory
+    submission, validation, and query.
+
+    This machine-readable contract intentionally excludes the same-machine
+    human CEREBRUM control plane under `/v1/dashboard/**`. Those routes are
+    loopback-only management APIs, not remotely callable network APIs. Their
+    authoritative contract is the “App-v23 CEREBRUM access-control routes”
+    section of `docs/reference/rest-api.md`.
   contact:
     name: Dhillon Andrew Kannabhiran
     email: dhillon@levelupctf.com
@@ -275,8 +281,18 @@ components:
       required:
         - content
         - memory_type
-        - domain_tag
         - confidence_score
+      allOf:
+        - if:
+            properties:
+              memory_type:
+                const: task
+            required:
+              - memory_type
+          then: {}
+          else:
+            required:
+              - domain_tag
       properties:
         content:
           type: string
@@ -285,7 +301,11 @@ components:
           $ref: "#/components/schemas/MemoryType"
         domain_tag:
           type: string
-          description: Domain or topic tag.
+          description: >-
+            Exact domain or topic tag. Required except for an app-v23 task
+            submitted by an active ordinary agent; that narrow omission uses
+            the caller's currently committed owned home domain. Explicit
+            values are never remapped.
         confidence_score:
           type: number
           format: double
@@ -309,14 +329,27 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/KnowledgeTriple"
-          description: Optional knowledge graph triples.
+          description: >-
+            Optional knowledge graph triples. App-v23 task creation rejects
+            this field because it is not part of the canonical task receipt.
         parent_hash:
           type: string
           description: Hash of a parent memory for lineage tracking.
         task_status:
           type: string
+          enum:
+            - planned
           description: >-
-            For task-type memories: planned, in_progress, done, or dropped.
+            New task memories must enter consensus as planned. Omit this field
+            or send planned; use the task-status endpoint after creation.
+        linked_memories:
+          type: array
+          items:
+            type: string
+          description: >-
+            Related memory IDs for legacy submission paths. App-v23 task
+            creation rejects this field; create links after the task receipt
+            is confirmed.
         tags:
           type: array
           maxItems: 32
@@ -333,6 +366,18 @@ components:
         provider:
           type: string
           description: Stored off-chain only; not on-chain.
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[!-~]+$"
+          description: >-
+            App-v23 tasks only. Permanent creation identity containing visible
+            ASCII without spaces. When omitted, the node derives the same
+            semantic key as MCP from the exact signed agent ID, resolved
+            domain, and content. Reusing a key with a different canonical
+            payload returns 409. Use a fresh explicit key only to intentionally
+            create another occurrence with identical content and domain.
 
     MemoryQueryRequest:
       type: object
@@ -425,7 +470,11 @@ components:
     MemoryHybridRequest:
       type: object
       description: >-
-        At least one of `query` or `embedding` is required.
+        At least one of `query` or `embedding` is required. At most eight
+        expansion entries are accepted. Under app-v23 one 8,192-candidate live
+        authorization budget is shared by the primary query, every expansion,
+        and every text/vector store leaf. Governed leaf or budget failures fail
+        the whole request instead of returning partial fused results.
       properties:
         query:
           type: string
@@ -438,9 +487,12 @@ components:
           description: Vector for the similarity arm.
         expansions:
           type: array
+          maxItems: 8
           items:
             $ref: "#/components/schemas/HybridExpansion"
-          description: Paraphrase variants for multi-variant RRF recall.
+          description: >-
+            Up to eight paraphrase variants for multi-variant RRF recall. The
+            array-length limit is applied before blank variants are skipped.
         domain_tag:
           type: string
         provider:
@@ -464,7 +516,10 @@ components:
 
     FilterInfo:
       type: object
-      description: Surfaces server-side filters that hid data from the caller.
+      description: >-
+        Identifies authorization filters that were applied. Before app-v23 a
+        server may also emit legacy inventory counts. App-v23 omits denied/raw
+        counts, and presence of this object is not proof that a row was hidden.
       properties:
         by:
           type: array
@@ -475,10 +530,16 @@ components:
             classification.
         total_before_filter:
           type: integer
+          deprecated: true
+          description: Legacy/pre-app-v23 only; omitted by app-v23.
         visible:
           type: integer
+          deprecated: true
+          description: Legacy/pre-app-v23 only; omitted by app-v23.
         hidden_count:
           type: integer
+          deprecated: true
+          description: Legacy/pre-app-v23 only; omitted by app-v23.
 
     MemoryQueryResponse:
       type: object
@@ -495,7 +556,7 @@ components:
           description: Cursor for the next page, absent if no more results.
         total_count:
           type: integer
-          description: Total number of matching memories.
+          description: Number of visible memories returned in this response.
         filtered:
           $ref: "#/components/schemas/FilterInfo"
 
@@ -570,10 +631,12 @@ components:
         task_status:
           type: string
           enum:
-            - planned
             - in_progress
             - done
             - dropped
+          description: >-
+            Agent-authorized transitions. Re-planning/reopening is a local
+            CEREBRUM operator action and is not accepted by this route.
 
     TaskStatusUpdateResponse:
       type: object
@@ -665,6 +728,8 @@ components:
         - memory_id
         - tx_hash
         - status
+        - committed
+        - committed_height
       properties:
         memory_id:
           type: string
@@ -673,7 +738,55 @@ components:
           type: string
           description: CometBFT transaction hash (hex-encoded).
         status:
-          $ref: "#/components/schemas/MemoryStatus"
+          type: string
+          enum:
+            - proposed
+            - committed_unconfirmed
+          description: >-
+            Governed lifecycle status proposed after a confirmed projection,
+            or committed_unconfirmed when the task transaction is on-chain but
+            its exact local projection could not be confirmed.
+        task_status:
+          type: string
+          enum:
+            - planned
+            - in_progress
+            - done
+            - dropped
+          description: Current task workflow status. Replays may be terminal.
+        committed:
+          type: boolean
+          description: >-
+            True after broadcast_tx_commit proves the transaction committed.
+            This does not by itself prove the serving projection is confirmed.
+        committed_height:
+          type: integer
+          format: int64
+          description: Block height at which the submission committed.
+        projection_confirmed:
+          type: boolean
+          description: >-
+            For app-v23 tasks, whether the exact task/assignee serving
+            projection was confirmed. False is returned with HTTP 202.
+        retryable:
+          type: boolean
+          description: >-
+            False on committed_unconfirmed: reconcile the exact memory_id and
+            do not resubmit the task.
+        message:
+          type: string
+        idempotency_key:
+          type: string
+          description: >-
+            Permanent explicit or server-derived task identity. Present on
+            app-v23 task responses.
+        idempotent_replay:
+          type: boolean
+          description: True when no new transaction was created for this key.
+        embedding_provider:
+          type: string
+        embedding_queued:
+          type: boolean
 
     VoteResponse:
       type: object
@@ -735,6 +848,21 @@ components:
           items:
             type: string
           description: Distinct domain tags the agent has submitted memories under, ordered by participation frequency.
+        role:
+          type: string
+          enum: [member, manager, admin]
+          description: Current app-v23 local role. Present only after app-v23 activation.
+        profile:
+          type: string
+          enum: [standard, companion, read_only, legacy_restricted]
+          description: Current app-v23 named profile. Root never has an ordinary self profile.
+        home_domain:
+          type: string
+          description: The active app-v23 agent's owned non-shared home domain, when its profile is writable.
+        enrollment_status:
+          type: string
+          enum: [active]
+          description: Present only for an internally consistent approved app-v23 ordinary-agent enrollment.
         poe_weight:
           type: number
           format: double
@@ -1749,7 +1877,7 @@ components:
           example: healthy
         version:
           type: string
-          example: 1.0.0
+          example: 11.15.0
 
     ReadinessResponse:
       type: object
@@ -1816,6 +1944,43 @@ components:
           type: string
           format: uri
           description: URI reference identifying the specific occurrence.
+        reason_code:
+          type: string
+          description: Stable sanitized machine-readable denial reason, when available.
+        remedy:
+          type: string
+          description: Exact operator action that can make a later request valid.
+        retryable:
+          type: boolean
+          description: Whether automatically repeating the same request is safe.
+
+    DomainWriteDeniedProblem:
+      allOf:
+        - $ref: "#/components/schemas/ProblemDetails"
+        - type: object
+          required:
+            - reason_code
+            - remedy
+            - retryable
+          properties:
+            type:
+              const: https://sage.dev/errors/domain-write-denied
+            status:
+              const: 403
+            reason_code:
+              type: string
+              enum:
+                - missing_write_grant
+                - foreign_write_restricted
+                - shared_write_restricted
+                - domain_claim_restricted
+                - principal_pending_review
+                - no_owned_home_domain
+                - manager_scope_denied
+            remedy:
+              type: string
+            retryable:
+              const: false
 
   # -----------------------------------------------------------------------
   # Reusable responses
@@ -1886,8 +2051,28 @@ paths:
             schema:
               $ref: "#/components/schemas/MemorySubmitRequest"
       responses:
+        "200":
+          description: >-
+            Confirmed idempotent task replay. Returns the original
+            memory_id/tx_hash/height and current task status; no new task was
+            created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemorySubmitResponse"
+        "202":
+          description: >-
+            The task transaction committed but its exact task/assignee
+            projection was not confirmed. projection_confirmed and retryable
+            are false; reconcile the returned memory_id and do not resubmit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemorySubmitResponse"
         "201":
-          description: Memory submitted successfully.
+          description: >-
+            New memory transaction committed. For an app-v23 task the exact
+            assignee projection is confirmed.
           content:
             application/json:
               schema:
@@ -1896,8 +2081,28 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: >-
+            Memory write denied. A canonical permanent denial includes the
+            stable reason_code/remedy/retryable=false contract; unknown
+            denials remain generic Problem Details.
+          content:
+            application/problem+json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/DomainWriteDeniedProblem"
+                  - $ref: "#/components/schemas/ProblemDetails"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          description: >-
+            Task assignment bridge, idempotency receipt, or current
+            authorization state is unavailable. No new retry transaction is
+            broadcast when the authoritative receipt cannot be verified.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1924,6 +2129,15 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: >-
+            App-v23 authorization would require examining more than 8,192 raw
+            candidates. Narrow the domain, provider, tag, status, or other
+            filters before retrying.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1954,6 +2168,15 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: >-
+            App-v23 authorization would require examining more than 8,192 raw
+            candidates. Narrow the domain, provider, tag, status, or other
+            filters before retrying.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1963,7 +2186,13 @@ paths:
       summary: Fused FTS5 + vector search via Reciprocal Rank Fusion.
       description: >-
         At least one of `query` or `embedding` is required. Supports query
-        expansions for multi-variant recall.
+        expansions for multi-variant recall, with at most eight expansion
+        entries. Under app-v23 the primary query, all expansion variants, and
+        every text/vector store leaf share one 8,192-candidate live
+        authorization budget. Exhausting that budget returns 422. A governed
+        leaf failure fails the entire request (503 when authorization state is
+        unavailable, otherwise the applicable error) and never returns a 200
+        response containing partial fused results.
       tags:
         - Memory
       requestBody:
@@ -1983,6 +2212,26 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: >-
+            The request contains more than eight expansion entries, or app-v23
+            authorization across the primary query, all expansions, and all
+            text/vector leaves would require examining more than 8,192 raw
+            candidates. Reduce expansions or narrow the domain, provider, tag,
+            status, or other filters before retrying.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "503":
+          description: >-
+            Live authorization state needed by a governed hybrid leaf is
+            unavailable. The request fails closed; no partial fused result is
+            returned.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1990,6 +2239,14 @@ paths:
     get:
       operationId: listMemories
       summary: Paginated memory list with RBAC agent isolation.
+      description: >-
+        App-v23 applies live authorization before visible offset/limit. When
+        has_more is true, total is an authorization-safe visible lower bound
+        and total_exact is false. Once the visible stream is exhausted,
+        total_exact is true and total is exact. Denied/raw counts are never
+        returned. Visible offset is capped at 7,900 and one request examines at
+        most 8,192 raw authorization candidates. A broader request returns 422
+        Query too broad and must be narrowed.
       tags:
         - Memory
       parameters:
@@ -2004,6 +2261,9 @@ paths:
           schema:
             type: integer
             default: 0
+            minimum: 0
+            maximum: 7900
+          description: App-v23 maximum is 7,900 visible records.
         - name: domain
           in: query
           schema:
@@ -2043,14 +2303,38 @@ paths:
                       $ref: "#/components/schemas/MemoryRecord"
                   total:
                     type: integer
+                    description: >-
+                      Visible total or authorization-safe lower bound; inspect
+                      total_exact.
                   limit:
                     type: integer
                   offset:
                     type: integer
+                  has_more:
+                    type: boolean
+                    description: Whether another currently visible row exists.
+                  total_exact:
+                    type: boolean
+                    description: Whether total is the exact visible total.
                   filtered:
                     $ref: "#/components/schemas/FilterInfo"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: >-
+            Offset exceeds 7,900 or app-v23 authorization would require
+            examining more than 8,192 raw candidates. Narrow filters or page
+            sequentially.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "503":
+          description: Current app-v23 record authorization state is unavailable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -2058,6 +2342,15 @@ paths:
     get:
       operationId: getMemoryTimeline
       summary: Memory creation counts grouped by time bucket.
+      description: >-
+        Before app-v23, the historical no-domain aggregate is global. App-v23
+        treats aggregate existence/timing as governed metadata: it walks stable
+        bounded memory pages across the requested range, applies central live
+        record disclosure to every row, and counts only currently visible
+        records. RFC3339 bounds are limited to 31 days and 8,192 raw
+        candidates per request; overly wide/dense requests return 422.
+        Authorization-state failure returns 503. Bucket period strings preserve
+        the backend's historical SQLite or PostgreSQL representation.
       tags:
         - Memory
       parameters:
@@ -2090,13 +2383,43 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [buckets, total]
                 properties:
                   buckets:
                     type: array
                     items:
                       type: object
+                      required: [period, count]
+                      properties:
+                        period:
+                          type: string
+                        count:
+                          type: integer
+                        domain:
+                          type: string
+                  total:
+                    type: integer
+                    description: Sum of the currently visible bucket counts.
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "400":
+          description: Invalid or reversed RFC3339 timeline range.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: Timeline range or governed candidate set is too large.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "503":
+          description: Current app-v23 record authorization state is unavailable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -2104,6 +2427,15 @@ paths:
     get:
       operationId: getOpenTasks
       summary: Open task memories (type=task, status != done/dropped).
+      description: >-
+        Returns at most 500 open tasks whose assignee exactly matches the
+        authenticated agent and which also pass current live domain/group/grant
+        and classification authority. Unassigned and differently assigned work
+        is never returned. total is the visible count. Current-generation Admin
+        use is localhost-only; Root/history/stale identities are denied. Manager
+        group Modify authority never widens exact task assignment. App-v23
+        examines at most 8,192 raw authorization candidates; broader requests
+        return 422 and must be narrowed by domain or provider.
       tags:
         - Memory
       parameters:
@@ -2136,6 +2468,13 @@ paths:
                           type: string
                         task_status:
                           type: string
+                        assignee:
+                          type: string
+                        task_picked_up_by:
+                          type: string
+                        task_picked_up_at:
+                          type: string
+                          format: date-time
                         confidence_score:
                           type: number
                           format: double
@@ -2143,8 +2482,29 @@ paths:
                           type: string
                   total:
                     type: integer
+                    description: Number of visible exact-assignee tasks returned.
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: App-v23 caller is not an active ordinary agent.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: >-
+            App-v23 authorization would require examining more than 8,192 raw
+            task candidates. Narrow the domain or provider filter.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "503":
+          description: App-v23 local policy state is unavailable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -2208,6 +2568,10 @@ paths:
     get:
       operationId: getMemory
       summary: Retrieve a single memory by ID.
+      description: >-
+        App-v23 applies the same live enrollment, legacy-envelope,
+        domain/group/grant, and clearance decision as recall/list. Authorship
+        is provenance, not a read bypass.
       tags:
         - Memory
       parameters:
@@ -2221,15 +2585,29 @@ paths:
                 $ref: "#/components/schemas/MemoryRecord"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          description: Current app-v23 record authorization state is unavailable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
   /v1/memory/{memory_id}/vote:
     post:
       operationId: voteOnMemory
-      summary: Cast a validator vote on a proposed memory.
+      summary: Authorize this node's local validator to vote on a proposed memory.
+      description: >-
+        Deliberate local operator override for this node's single validator
+        vote; this is not an ordinary agent vote. Before app-v23 the caller
+        must be the configured governance operator. Under app-v23 the caller
+        must be the current CEREBRUM Root or a current local Admin and connect
+        through localhost. The node must have its live validator signing key.
       tags:
         - Memory
       parameters:
@@ -2251,12 +2629,16 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /v1/memory/{memory_id}/challenge:
     post:
@@ -2391,10 +2773,13 @@ paths:
       operationId: updateTaskStatus
       summary: Start or finish an owned task (off-chain only, no tx).
       description: >-
-        Requires an active signed agent with current task read access. in_progress
-        atomically claims an open unowned/self-owned task; done or dropped requires
-        the current assignee. Agents cannot set planned or reopen terminal work;
-        use the local CEREBRUM operator board for those transitions.
+        Requires an active signed agent that is already the task's exact
+        assignee and still has current domain write plus classification/read
+        authority. in_progress starts an assigned open task; unassigned work
+        requires local CEREBRUM handoff. done or dropped also requires the exact
+        assignee. Agents cannot set planned or reopen terminal work. Current
+        Admin use is localhost-only; Root/history/stale identities are denied,
+        and Manager group Modify does not widen assignment.
       tags:
         - Memory
       parameters:
@@ -2419,7 +2804,7 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "409":
-          description: Task is terminal or owned by another agent.
+          description: Task is terminal or not currently assigned to this exact agent.
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -2454,6 +2839,10 @@ paths:
     get:
       operationId: getAgentProfile
       summary: Retrieve the authenticated agent's profile.
+      description: >-
+        After app-v23 activation this self-scoped route is available only to an
+        active ordinary agent and includes its current role, named profile, and
+        owned home domain. CEREBRUM Root has no ordinary agent profile.
       tags:
         - Agent
       responses:
@@ -2465,6 +2854,18 @@ paths:
                 $ref: "#/components/schemas/AgentProfile"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: App-v23 caller is not an active ordinary agent.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "503":
+          description: App-v23 local policy state is unavailable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -2615,6 +3016,10 @@ paths:
     get:
       operationId: getPendingMemories
       summary: List memories awaiting validator votes.
+      description: >-
+        App-v23 applies live record authorization before returning pending
+        candidates and examines at most 8,192 raw candidates per request. A
+        broader request returns 422 and must be narrowed by domain.
       tags:
         - Validator
       parameters:
@@ -2648,6 +3053,14 @@ paths:
                 $ref: "#/components/schemas/PendingMemoriesResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: >-
+            App-v23 authorization would require examining more than 8,192 raw
+            pending candidates. Narrow the domain filter.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -3722,6 +4135,11 @@ paths:
     post:
       operationId: generateEmbedding
       summary: Generate a vector embedding via the node's local provider.
+      description: >-
+        Ed25519 authentication is required. After app-v23 activation the
+        signer must also be an active approved local Member, Manager, or
+        current-generation Admin. Admin use remains localhost-only; Root
+        credentials, pending/inactive agents, and unknown keys are denied.
       tags:
         - Embeddings
       requestBody:
@@ -3741,6 +4159,43 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: Embedder not ready.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /v1/embed/personal:
+    post:
+      operationId: generatePersonalEmbedding
+      summary: Compatibility alias for POST /v1/embed.
+      description: >-
+        Uses the exact same request, response, Ed25519 authentication, and
+        app-v23 active local-agent authorization as POST /v1/embed.
+      tags:
+        - Embeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmbedRequest"
+      responses:
+        "200":
+          description: Embedding generated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmbedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "503":
           description: Embedder not ready.
           content:
@@ -3755,7 +4210,9 @@ paths:
       description: >-
         Clients use this to decide between vector query and FTS5 search paths.
         When vault (at-rest encryption) is active, semantic is forced true even
-        if no embedder is configured.
+        if no embedder is configured. After app-v23 activation the signer must
+        be an active approved local agent under the same authorization boundary
+        as POST /v1/embed.
       tags:
         - Embeddings
       responses:
@@ -3767,6 +4224,8 @@ paths:
                 $ref: "#/components/schemas/EmbedInfoResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   # -- MCP Tokens ---------------------------------------------------------
   /v1/mcp/tokens:
@@ -4021,7 +4480,11 @@ paths:
   /v1/pipe/{pipe_id}:
     get:
       operationId: pipeStatus
-      summary: Get current status of a pipeline message.
+      summary: Inspect the current local workflow row for a pipeline message.
+      description: >-
+        This is local queue/workflow state, not proof of remote delivery or
+        reading. Sender-queryable successful-delivery and receiver claim/read
+        receipts are explicitly deferred to v11.16.
       tags:
         - Pipeline
       parameters:
@@ -4032,7 +4495,7 @@ paths:
             type: string
       responses:
         "200":
-          description: Pipeline message status.
+          description: Local pipeline workflow row; not a delivery/read receipt.
           content:
             application/json:
               schema:

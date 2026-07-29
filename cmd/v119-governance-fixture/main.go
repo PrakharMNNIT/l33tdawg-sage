@@ -31,6 +31,7 @@ const maxResponseBytes = 1 << 20
 func main() {
 	keyPath := flag.String("key", "", "path to a 32-byte Ed25519 seed or 64-byte private key")
 	nodeIndex := flag.Int("node", -1, "fixture ABCI node index (0-3) for request mode")
+	local := flag.Bool("local", false, "send request through this ABCI container's loopback listener")
 	method := flag.String("method", http.MethodGet, "HTTP method for request mode")
 	path := flag.String("path", "", "absolute REST path for request mode")
 	body := flag.String("body", "", "exact JSON body for request mode")
@@ -56,9 +57,9 @@ func main() {
 		}
 		fmt.Println(hex.EncodeToString(pub))
 	case "request":
-		baseURL, nodeErr := fixtureNodeBaseURL(*nodeIndex)
+		baseURL, nodeErr := fixtureRequestBaseURL(*nodeIndex, *local)
 		if nodeErr != nil || *path == "" || !strings.HasPrefix(*path, "/") {
-			fatal(errors.New("request mode requires --node 0..3 and an absolute --path"))
+			fatal(errors.New("request mode requires exactly one of --node 0..3 or --local, plus an absolute --path"))
 		}
 		response, requestErr := signedRequest(key, baseURL, strings.ToUpper(*method), *path, []byte(*body))
 		if requestErr != nil {
@@ -71,6 +72,16 @@ func main() {
 	default:
 		fatal(fmt.Errorf("unknown mode %q", args[0]))
 	}
+}
+
+func fixtureRequestBaseURL(index int, local bool) (string, error) {
+	if local {
+		if index != -1 {
+			return "", errors.New("--local cannot be combined with --node")
+		}
+		return "http://127.0.0.1:8080", nil
+	}
+	return fixtureNodeBaseURL(index)
 }
 
 func fixtureNodeBaseURL(index int) (string, error) {

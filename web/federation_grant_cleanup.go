@@ -20,7 +20,7 @@ import (
 // cleanup deliberately does not require the remote grantee's private key to be
 // local; trust revocation must work for a foreign peer.
 func (h *DashboardHandler) revokeFederationManagedGrant(domain, granteeID string) grantResult {
-	owner, ownedDomain, err := h.BadgerStore.ResolveOwningAncestor(domain)
+	owner, ownedDomain, err := h.resolveEffectiveOwningAncestor(domain)
 	if err != nil || owner == "" {
 		return grantResult{Domain: domain, Action: "skip", OK: false,
 			Code: "owner_missing", Error: "domain has no current on-chain owner; managed grant cleanup will retry"}
@@ -28,21 +28,52 @@ func (h *DashboardHandler) revokeFederationManagedGrant(domain, granteeID string
 
 	ownerLocal := false
 	var signer ed25519.PrivateKey
-	if h.ResolveAgentKeyFn != nil {
+	rootBrokerUsed := false
+	if h.appV23IsActive() {
+		root, rootKey, broker := h.appV23RootBrokerKey()
+		wasRoot := false
+		if h.BadgerStore != nil {
+			wasRoot, _ = h.BadgerStore.IsAppV23RootCredential(owner)
+		}
+		if broker.Available && root != nil &&
+			(wasRoot || owner == root.PrincipalID || owner == root.CredentialID) {
+			signer, ownerLocal, rootBrokerUsed = rootKey, true, true
+		}
+	}
+	if len(signer) != ed25519.PrivateKeySize && h.ResolveAgentKeyFn != nil {
 		signer, ownerLocal = h.ResolveAgentKeyFn(owner)
 	}
 	var expectedOwner, expectedOwnedDomain string
+	if rootBrokerUsed && agentIDForKey(signer) != owner {
+		// Root-owned domains keep the immutable Root principal as title holder.
+		// A rotated current credential exercises that authority, but cleanup
+		// remains bound to the exact owner/ancestor observed before signing.
+		expectedOwner, expectedOwnedDomain = owner, ownedDomain
+	}
 	if len(signer) != ed25519.PrivateKeySize {
 		if h.AppV18ActiveFn == nil || !h.AppV18ActiveFn() {
+			_, _, rootBroker := h.appV23RootBrokerKey()
 			return grantResult{Domain: domain, Action: "skip", OK: false,
 				Code: "override_not_active", Error: "current owner key is not local and administrator cleanup is waiting for app-v18",
 				OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal,
-				OverrideAvailable: len(h.AdminSigningKey) == ed25519.PrivateKeySize}
+				OverrideAvailable: rootBroker.Available ||
+					(!h.appV23IsActive() && len(h.AdminSigningKey) == ed25519.PrivateKeySize)}
 		}
-		signer = h.AdminSigningKey
+		if h.appV23IsActive() {
+			_, rootKey, broker := h.appV23RootBrokerKey()
+			if broker.Available {
+				signer = rootKey
+			}
+		} else if len(signer) != ed25519.PrivateKeySize {
+			signer = h.AdminSigningKey
+		}
 		if len(signer) != ed25519.PrivateKeySize {
+			message := "genesis admin signing key is unavailable for managed grant cleanup"
+			if h.appV23IsActive() {
+				message = "current CEREBRUM Root broker is unavailable for managed grant cleanup"
+			}
 			return grantResult{Domain: domain, Action: "skip", OK: false,
-				Code: "admin_key_unavailable", Error: "genesis admin signing key is unavailable for managed grant cleanup",
+				Code: "admin_key_unavailable", Error: message,
 				OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
 		}
 		expectedOwner, expectedOwnedDomain = owner, ownedDomain

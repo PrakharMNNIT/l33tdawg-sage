@@ -102,7 +102,7 @@ func (s *Server) handleDomainReassign(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), reassignTx)
 
-	err = tx.SignTx(reassignTx, s.signingKey)
+	err = s.signTx(reassignTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign domain reassign tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")

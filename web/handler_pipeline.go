@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,8 +32,14 @@ func (h *DashboardHandler) handlePipelineSend(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	req.ToAgent = strings.TrimSpace(req.ToAgent)
 	if req.ToAgent == "" {
 		writeError(w, http.StatusBadRequest, "to_agent is required")
+		return
+	}
+	if h.appV23IsRootIdentity(req.ToAgent) {
+		writeAppV23AccessError(w, http.StatusForbidden, "root_agent_surface_forbidden",
+			"CEREBRUM Root is not an agent and cannot receive pipeline messages.")
 		return
 	}
 	if req.Payload == "" {
@@ -121,6 +128,18 @@ func (h *DashboardHandler) handlePipelineList(w http.ResponseWriter, r *http.Req
 	if items == nil {
 		items = []*store.PipelineMessage{}
 	}
+	if h.appV23IsActive() {
+		filtered := make([]*store.PipelineMessage, 0, len(items))
+		for _, item := range items {
+			if item == nil ||
+				h.appV23IsRootIdentity(item.FromAgent) ||
+				h.appV23IsRootIdentity(item.ToAgent) {
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		items = filtered
+	}
 
 	// Enrich with agent names
 	agentNames := h.buildAgentNameMap(r.Context(), items)
@@ -152,10 +171,10 @@ func (h *DashboardHandler) buildAgentNameMap(ctx context.Context, items []*store
 	// Collect unique agent IDs
 	seen := make(map[string]bool)
 	for _, item := range items {
-		if item.FromAgent != "" && !seen[item.FromAgent] {
+		if item.FromAgent != "" && !h.appV23IsRootIdentity(item.FromAgent) && !seen[item.FromAgent] {
 			seen[item.FromAgent] = true
 		}
-		if item.ToAgent != "" && !seen[item.ToAgent] {
+		if item.ToAgent != "" && !h.appV23IsRootIdentity(item.ToAgent) && !seen[item.ToAgent] {
 			seen[item.ToAgent] = true
 		}
 	}

@@ -22,6 +22,7 @@ import (
 
 	authmw "github.com/l33tdawg/sage/api/rest/middleware"
 	"github.com/l33tdawg/sage/internal/auth"
+	"github.com/l33tdawg/sage/internal/authzdenial"
 	"github.com/l33tdawg/sage/internal/tlsca"
 )
 
@@ -606,10 +607,10 @@ func (s *Server) signedRequest(ctx context.Context, method, path string, body []
 	// never reconstruct.
 	//
 	// This shipped as a silent 401. Callers build paths as
-	// `"/v1/dashboard/tasks?" + q.Encode()`, and `url.Values{}.Encode()` returns
+	// `"/v1/memory/tasks?" + q.Encode()`, and `url.Values{}.Encode()` returns
 	// "" when every parameter is optional and none was set — so the client
-	// signed "/v1/dashboard/tasks?" while `validAgentSignature` rebuilt
-	// "/v1/dashboard/tasks" from `r.URL.Path` and an empty `r.URL.RawQuery`
+	// signed "/v1/memory/tasks?" while `validAgentSignature` rebuilt
+	// "/v1/memory/tasks" from `r.URL.Path` and an empty `r.URL.RawQuery`
 	// (web/handler.go:979). Only `sage_backlog` with no domain filter hit it,
 	// which is the default call, so the owner's backlog was unreadable while
 	// every other tool worked — and the model reported it as "your backlog is
@@ -640,20 +641,100 @@ func (s *Server) signedRequest(ctx context.Context, method, path string, body []
 	return s.httpClient.Do(req)
 }
 
+type signedRequestReplaySafety uint8
+
+const (
+	signedRequestSingleAttempt signedRequestReplaySafety = iota
+	signedRequestReplaySafe
+)
+
+// retryableReadOnlyGETPaths is deliberately an allowlist rather than treating
+// every GET as replay-safe. Some historical SAGE GET endpoints claim/acknowledge
+// rows while producing their response. Once the request reaches the server, a
+// lost response is indistinguishable from a pre-delivery transport failure, so
+// replaying one of those reads may consume a second item or hide the first.
+//
+// New GET call sites therefore stay single-shot until their exact route or
+// route template has been reviewed and added here.
+var retryableReadOnlyGETPaths = map[string]bool{
+	"/v1/agents/lookup":                        true,
+	"/v1/dashboard/governance/proposals":       true,
+	"/v1/dashboard/health":                     true,
+	"/v1/dashboard/settings/boot-instructions": true,
+	"/v1/dashboard/settings/memory-mode":       true,
+	"/v1/dashboard/settings/recall":            true,
+	"/v1/dashboard/stats":                      true,
+	"/v1/embed/info":                           true,
+	"/v1/federation/available":                 true,
+	"/v1/governance/context":                   true,
+	"/v1/memory/list":                          true,
+	"/v1/memory/tasks":                         true,
+	"/v1/memory/timeline":                      true,
+	"/v1/pipe/results":                         true,
+	"/v1/scopes":                               true,
+}
+
+// nonReplayableGETPaths documents the known GET endpoints whose successful
+// execution mutates server state. They would remain single-shot under the
+// fail-closed default even if omitted, but naming them prevents a future
+// reviewer from casually adding them to the read-only allowlist.
+var nonReplayableGETPaths = map[string]bool{
+	"/v1/dashboard/task-notifications": true,
+	"/v1/pipe/inbox":                   true,
+	"/v1/pipe/updates":                 true,
+}
+
 // retryableIdempotentPOSTPaths lists POST endpoints that are read-only or
 // otherwise idempotent, so a transient transport failure (e.g. a stale
-// keep-alive EOF) may be retried like a GET. Memory-submitting POSTs stay
-// single-shot: retrying those could double-commit.
+// keep-alive EOF) may be retried. Memory-submitting POSTs stay single-shot:
+// retrying those could double-commit.
 var retryableIdempotentPOSTPaths = map[string]bool{
 	"/v1/embed":                         true,
 	"/v1/pipe/resolve":                  true,
 	"/v1/federation/contacts/authorize": true,
+	"/v1/federation/recall-plan":        true,
+}
+
+func matchesSinglePathSegment(path, prefix string) bool {
+	suffix, ok := strings.CutPrefix(path, prefix)
+	return ok && suffix != "" && !strings.Contains(suffix, "/")
+}
+
+func classifySignedRequestReplay(method, path string) signedRequestReplaySafety {
+	path = strings.TrimSuffix(path, "?")
+	path, _, _ = strings.Cut(path, "?")
+
+	switch method {
+	case http.MethodGet:
+		if nonReplayableGETPaths[path] {
+			return signedRequestSingleAttempt
+		}
+		if retryableReadOnlyGETPaths[path] {
+			return signedRequestReplaySafe
+		}
+		if matchesSinglePathSegment(path, "/v1/agent/") ||
+			matchesSinglePathSegment(path, "/v1/dashboard/governance/proposals/") ||
+			matchesSinglePathSegment(path, "/v1/memory/") ||
+			matchesSinglePathSegment(path, "/v1/scopes/") {
+			return signedRequestReplaySafe
+		}
+		// GET /v1/pipe/{pipe_id} is a passive status/detail read. Keep it
+		// retryable without allowing future nested pipe actions by prefix.
+		if matchesSinglePathSegment(path, "/v1/pipe/") {
+			return signedRequestReplaySafe
+		}
+	case http.MethodPost:
+		if retryableIdempotentPOSTPaths[path] {
+			return signedRequestReplaySafe
+		}
+	}
+	return signedRequestSingleAttempt
 }
 
 // doSignedJSON makes a signed request and decodes the JSON response.
 func (s *Server) doSignedJSON(ctx context.Context, method, path string, body []byte, out any) error {
 	attempts := 1
-	if method == http.MethodGet || (method == http.MethodPost && retryableIdempotentPOSTPaths[path]) {
+	if classifySignedRequestReplay(method, path) == signedRequestReplaySafe {
 		attempts = 4
 	}
 	var resp *http.Response
@@ -696,17 +777,36 @@ func (s *Server) doSignedJSON(ctx context.Context, method, path string, body []b
 
 	if resp.StatusCode >= 400 {
 		var problem struct {
-			Type   string `json:"type"`
-			Title  string `json:"title"`
-			Detail string `json:"detail"`
+			Type       string `json:"type"`
+			Title      string `json:"title"`
+			Status     *int   `json:"status"`
+			Detail     string `json:"detail"`
+			ReasonCode string `json:"reason_code"`
+			Retryable  *bool  `json:"retryable"`
 		}
 		if json.Unmarshal(respBody, &problem) == nil && problem.Detail != "" {
-			return &apiProblemError{
-				Type:       problem.Type,
-				Title:      problem.Title,
-				Detail:     problem.Detail,
-				StatusCode: resp.StatusCode,
+			apiErr := &apiProblemError{
+				Type:          problem.Type,
+				Title:         problem.Title,
+				Detail:        problem.Detail,
+				ProblemStatus: problem.Status,
+				ContentType:   resp.Header.Get("Content-Type"),
+				StatusCode:    resp.StatusCode,
 			}
+			definition, validWriteDenial := authzdenial.ValidateProblem(
+				problem.Type, authzdenial.Code(problem.ReasonCode), problem.Retryable,
+			)
+			if validWriteDenial &&
+				resp.StatusCode == http.StatusForbidden &&
+				problem.Status != nil && *problem.Status == http.StatusForbidden &&
+				strings.HasPrefix(resp.Header.Get("Content-Type"), "application/problem+json") {
+				apiErr.ReasonCode = string(definition.Code)
+				apiErr.Remedy = definition.Remedy
+				apiErr.Retryable = definition.Retryable
+				apiErr.RetryableSet = true
+				apiErr.EffectiveWriteDenial = true
+			}
+			return apiErr
 		}
 		return &apiProblemError{
 			Title:      fmt.Sprintf("API error (HTTP %d)", resp.StatusCode),
@@ -726,19 +826,53 @@ func (s *Server) doSignedJSON(ctx context.Context, method, path string, body []b
 // Typed problem URIs let retry policy distinguish permanent application
 // denials from transient failures that happen to share an HTTP status.
 type apiProblemError struct {
-	Type       string
-	Title      string
-	Detail     string
-	StatusCode int
+	Type   string
+	Title  string
+	Detail string
+	// ProblemStatus and ContentType preserve the response's RFC 7807
+	// self-description. Retry paths that intentionally change a request must
+	// require these to agree with the HTTP status, rather than trusting a
+	// problem type URI copied into an arbitrary error response.
+	ProblemStatus *int
+	ContentType   string
+	ReasonCode    string
+	Remedy        string
+	Retryable     bool
+	// RetryableSet distinguishes an explicit false from an older response that
+	// omitted the extension.
+	RetryableSet         bool
+	EffectiveWriteDenial bool
+	StatusCode           int
 }
 
 func (e *apiProblemError) Error() string {
-	return fmt.Sprintf("%s: %s", e.Title, e.Detail)
+	message := fmt.Sprintf("%s: %s", e.Title, e.Detail)
+	if e.ReasonCode != "" {
+		message += fmt.Sprintf(" [reason_code=%s", e.ReasonCode)
+		if e.RetryableSet {
+			message += fmt.Sprintf(", retryable=%t", e.Retryable)
+		}
+		message += "]"
+	}
+	if e.Remedy != "" {
+		message += " Remedy: " + e.Remedy
+	}
+	return message
 }
 
 func isAPIStatus(err error, statusCode int) bool {
 	var problem *apiProblemError
 	return errors.As(err, &problem) && problem.StatusCode == statusCode
+}
+
+func isCanonicalAPIProblem(err error, problemType string, statusCode int) bool {
+	var problem *apiProblemError
+	return errors.As(err, &problem) &&
+		problem.Type == problemType &&
+		problem.StatusCode == statusCode &&
+		problem.ProblemStatus != nil &&
+		*problem.ProblemStatus == statusCode &&
+		strings.HasPrefix(problem.ContentType, "application/problem+json")
 }
 
 func isTransientMCPTransportErr(err error) bool {
@@ -778,15 +912,14 @@ var submitRehealBackoffs = []time.Duration{0, 750 * time.Millisecond}
 // future content-schema reject surfaces as "Broadcast error: request rejected")
 // and burn a needless re-handshake + retries on a write that can never succeed.
 //
-// A GENUINE, permanent ACL denial carries the same "access denied" text, so the
-// caller MUST bound the retry: a real denial simply fails again and is returned
-// with a clearer hint, rather than looping.
+// Typed effective denials are permanent for the attempt and return immediately.
+// An older server's untyped ACL denial carries the same "access denied" text as
+// a stale session, so that compatibility path remains strictly bounded.
 func isStaleSessionErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	var problem *apiProblemError
-	if errors.As(err, &problem) && problem.Type == domainWriteDeniedProblemTypeURI {
+	if isEffectiveWriteDenialErr(err) {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
@@ -801,7 +934,12 @@ func isStaleSessionErr(err error) bool {
 	return false
 }
 
-const domainWriteDeniedProblemTypeURI = "https://sage.dev/errors/domain-write-denied"
+func isEffectiveWriteDenialErr(err error) bool {
+	var problem *apiProblemError
+	return errors.As(err, &problem) && problem.EffectiveWriteDenial
+}
+
+const domainWriteDeniedProblemTypeURI = authzdenial.ProblemTypeURI
 
 // submitMemoryResilient POSTs /v1/memory/submit and, on a stale-session failure,
 // auto-heals the way a manual /mcp reconnect used to: it re-registers this agent
@@ -810,8 +948,9 @@ const domainWriteDeniedProblemTypeURI = "https://sage.dev/errors/domain-write-de
 // node restart under a live session surfaced to the agent as a bare
 // "Broadcast error: access denied" on every sage_turn store until the human ran
 // /mcp by hand. Writes that succeed on the first attempt — the overwhelming
-// common case — incur ZERO extra latency. A genuine permanent denial exhausts
-// the bounded retries and is returned with an actionable hint.
+// common case — incur ZERO extra latency. A typed permanent denial is never
+// re-registered or retried; only an older untyped denial uses the bounded
+// compatibility path.
 func (s *Server) submitMemoryResilient(ctx context.Context, submitReq []byte, out any) error {
 	err := s.doSignedJSON(ctx, "POST", "/v1/memory/submit", submitReq, out)
 	if err == nil || !isStaleSessionErr(err) {
@@ -842,6 +981,9 @@ func (s *Server) submitMemoryResilient(ctx context.Context, submitReq []byte, ou
 		// memory and only lost the response. Never resubmit an ambiguous POST;
 		// doing so would create a second UUID-backed proposal.
 		if !isStaleSessionErr(retryErr) {
+			if isEffectiveWriteDenialErr(retryErr) {
+				return retryErr
+			}
 			return fmt.Errorf("%w (memory submission may have reached SAGE; check recall before retrying)", retryErr)
 		}
 		err = retryErr

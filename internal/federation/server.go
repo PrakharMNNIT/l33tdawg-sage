@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -35,15 +36,19 @@ const (
 	// its authenticated-but-untrusted body well below the general memory route
 	// budget so a paired peer cannot turn directory discovery into a read DoS.
 	maxPipeContactLookupRequestBytes = 2 << 10
-	minPipeContactHumanSelectorRunes = 2
-	pipeContactLookupQueryTimeout    = 2 * time.Second
-	maxFedTopK                       = 50
-	defaultFedTopK                   = 10
-	maxTimestampSkew                 = 5 * time.Minute
+	// The linked-reader eligibility oracle accepts exactly one 64-hex ID.
+	// Keep its authenticated request budget independent of recall embeddings.
+	maxFederatedGuestEligibilityRequestBytes = 1 << 10
+	minPipeContactHumanSelectorRunes         = 2
+	pipeContactLookupQueryTimeout            = 2 * time.Second
+	maxFedTopK                               = 50
+	defaultFedTopK                           = 10
+	maxTimestampSkew                         = 5 * time.Minute
 	// maxReplayEntriesPerChain bounds each PEER CHAIN's replay shard. Total
 	// listener memory is bounded by (active peer chains × this) — and one
 	// peer's flood is confined to its own shard.
 	maxReplayEntriesPerChain = 4000
+	queryPlanTTL             = 90 * time.Second
 )
 
 type peerCtxKey struct{}
@@ -72,12 +77,18 @@ func (m *Manager) Router() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(m.peerAuth)
 		r.Get("/fed/v1/status", m.handleStatus)
+		r.Post("/fed/v1/query/plan", m.handleQueryPlan)
 		r.Post("/fed/v1/query", m.handleQuery)
 		r.Post("/fed/v1/write", m.handleRemoteWrite)
 		r.Post("/fed/v1/receipt", m.handleReceipt)
 		r.Post("/fed/v1/connection/revoke-notice", m.handleRevokeNotice)
 		r.Post("/fed/v1/pipe/event", m.handlePipeEvent)
 		r.Post("/fed/v1/pipe/contacts/lookup", m.handlePipeContactLookup)
+		r.Post("/fed/v1/pipe/linked/resolve", m.handleLinkedMessageResolve)
+		r.Post("/fed/v1/pipe/linked/revalidate", m.handleLinkedMessageRevalidate)
+		r.Post("/fed/v1/pipe/linked/consent-offer", m.handleLinkedMessageConsentOffer)
+		r.Post("/fed/v1/pipe/linked/consent-candidates", m.handleLinkedMessageConsentCandidates)
+		r.Post("/fed/v1/guest/agent/eligibility", m.handleFederatedGuestAgentEligibility)
 		r.Post("/fed/v1/sync/push", m.handleSyncPush)       // v11.5 domain sync
 		r.Post("/fed/v1/sync/digest", m.handleSyncDigest)   // v11.5 anti-entropy
 		r.Post("/fed/v1/sync/journal", m.handleSyncJournal) // v11.8 group journal exchange
@@ -195,8 +206,21 @@ func (m *Manager) peerAuth(next http.Handler) http.Handler {
 		}
 
 		bodyLimit := int64(maxFedBodyBytes)
-		if r.Method == http.MethodPost && r.URL.Path == "/fed/v1/pipe/contacts/lookup" {
-			bodyLimit = maxPipeContactLookupRequestBytes
+		if r.Method == http.MethodPost {
+			switch r.URL.Path {
+			case "/fed/v1/pipe/contacts/lookup":
+				bodyLimit = maxPipeContactLookupRequestBytes
+			case "/fed/v1/guest/agent/eligibility":
+				bodyLimit = maxFederatedGuestEligibilityRequestBytes
+			case "/fed/v1/pipe/linked/resolve":
+				bodyLimit = maxLinkedMessageResolveBytes
+			case "/fed/v1/pipe/linked/revalidate":
+				bodyLimit = maxLinkedMessageResolveBytes
+			case "/fed/v1/pipe/linked/consent-offer":
+				bodyLimit = maxLinkedMessageResolveBytes
+			case "/fed/v1/pipe/linked/consent-candidates":
+				bodyLimit = maxLinkedMessageResolveBytes
+			}
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 		body, err := io.ReadAll(r.Body)
@@ -506,6 +530,18 @@ func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
 		PeerRBACGrant: peerRBACGrant,
 		PipeContacts:  pipeContacts,
 	}
+	if _, readyErr := m.v23BindingReady(r.Context(), agreement, peer.AgentID); readyErr == nil {
+		if digest, digestErr := m.agreementBindingDigestV23(r.Context(), agreement, peer.AgentID); digestErr == nil {
+			response.FederationProtocolVersion = FederationProtocolV23
+			response.QueryAgreementBindingDigest = digest
+			response.Capabilities = append(response.Capabilities,
+				CapabilityFederationV23, CapabilityQueryAgentProofV2,
+				CapabilityFederatedGuestAgentEligibility)
+		}
+	} else {
+		m.logger.Debug().Err(readyErr).Str("peer", peer.ChainID).
+			Msg("federation status has no ready v23 query binding")
+	}
 	// The leases protect construction of one coherent authorization snapshot,
 	// not a peer-controlled socket write. Once the value is materialized, slow
 	// status readers must not delay consensus agent projection.
@@ -808,11 +844,100 @@ func pipeContactMatchesName(query string, contact PipeContact) (exact bool, part
 }
 
 // handleQuery serves a scoped read-only recall to an authenticated peer.
-// A configured directional peer-RBAC snapshot is authoritative for domain
-// scope, including an empty deny-all snapshot. Legacy connections without a
-// snapshot retain their tx-33 domain scope. The tx-33 MaxClearance ceiling is
-// retained in both cases as fail-closed legacy classification metadata until a
-// dedicated peer-RBAC clearance field exists.
+// app-v23 requires a nested original-agent proof and one signed, generation-
+// bound local guest link. Peer-wide tx-33/peer-RBAC scope is deliberately not a
+// fallback: a valid peer operator is transport authentication, not user access.
+// handleQueryPlan issues the exact destination state an original agent must
+// sign before a recall. The outer peer operator signature authenticates the
+// source node, but is never itself enough to consume this challenge or read.
+func (m *Manager) handleQueryPlan(w http.ResponseWriter, r *http.Request) {
+	peer := peerFromCtx(r.Context())
+	if peer == nil {
+		httpError(w, http.StatusForbidden, "unauthenticated")
+		return
+	}
+	var req QueryPlanRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		httpError(w, http.StatusBadRequest, "invalid trailing JSON")
+		return
+	}
+	if _, err := auth.AgentIDToPublicKey(req.AgentID); err != nil || req.DomainTag == "" {
+		httpError(w, http.StatusBadRequest, "valid agent_id and exact domain_tag are required")
+		return
+	}
+
+	ss := m.syncStore()
+	if ss == nil {
+		httpError(w, http.StatusServiceUnavailable, "federation v23 policy store is unavailable")
+		return
+	}
+	policyUnlock := ss.LockSyncPolicyRead()
+	defer policyUnlock()
+	if m.badger == nil {
+		httpError(w, http.StatusServiceUnavailable, "federation v23 authorization store is unavailable")
+		return
+	}
+	ownerUnlock := m.badger.LockDomainOwnershipRead()
+	defer ownerUnlock()
+
+	agreement, err := m.currentRequestAgreementBound(r.Context(), peer)
+	if err != nil {
+		httpError(w, http.StatusForbidden, "federation agreement is no longer active for this operator")
+		return
+	}
+	policy, err := m.v23BindingReady(r.Context(), agreement, peer.AgentID)
+	if err != nil || !peerRBACAllowsRead(policy, req.DomainTag) {
+		httpError(w, http.StatusForbidden, "peer Read grant is inactive for this domain")
+		return
+	}
+	digest, err := m.agreementBindingDigestV23(r.Context(), agreement, peer.AgentID)
+	if err != nil {
+		httpError(w, http.StatusForbidden, "federation v23 binding is unavailable")
+		return
+	}
+	if _, err := m.authorizeFederatedGuestRead(
+		r.Context(), peer, agreement, req.AgentID, req.DomainTag,
+	); err != nil {
+		httpError(w, http.StatusForbidden, "remote agent has no active linked-reader grant for this domain")
+		return
+	}
+
+	challengeBytes := make([]byte, 32)
+	if _, err := rand.Read(challengeBytes); err != nil {
+		httpError(w, http.StatusInternalServerError, "could not generate query challenge")
+		return
+	}
+	now := time.Now()
+	expiresAt := now.Add(queryPlanTTL).Unix()
+	challengeID := hex.EncodeToString(challengeBytes)
+	if err := m.queryChallengeStore.IssueFederatedQueryChallenge(r.Context(), store.FederatedQueryChallenge{
+		ChallengeID:            challengeID,
+		RemoteChainID:          peer.ChainID,
+		PeerAgentID:            peer.AgentID,
+		RequestedAgentID:       req.AgentID,
+		DomainTag:              req.DomainTag,
+		AgreementBindingDigest: digest,
+		ExpiresAt:              expiresAt,
+	}, now); err != nil {
+		m.logger.Warn().Err(err).Str("peer", peer.ChainID).Msg("federation v23 query plan denied")
+		httpError(w, http.StatusServiceUnavailable, "could not persist query challenge")
+		return
+	}
+	writeJSON(w, http.StatusOK, &QueryPlanResponse{
+		ProtocolVersion:        FederationProtocolV23,
+		SourceChainID:          peer.ChainID,
+		DestinationChainID:     m.localChainID,
+		AgreementBindingDigest: digest,
+		QueryChallenge:         challengeID,
+		ExpiresAt:              expiresAt,
+	})
+}
+
 func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 	peer := peerFromCtx(r.Context())
 	if peer == nil {
@@ -831,35 +956,29 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 		policyUnlock := ss.LockSyncPolicyRead()
 		defer policyUnlock()
 	}
+	// Global federation disclosure lock order is:
+	//   sync-policy lease -> Badger authorization/ownership lease -> SQL reads.
+	// Consensus group membership/domain ownership and the node-local guest link
+	// therefore remain one coherent authorization snapshot until the response
+	// has been completely written.
+	if m.badger != nil {
+		ownerUnlock := m.badger.LockDomainOwnershipRead()
+		defer ownerUnlock()
+	}
 	agreement, agreementErr := m.currentRequestAgreementBound(r.Context(), peer)
 	if agreementErr != nil {
 		httpError(w, http.StatusForbidden, "federation agreement is no longer active for this operator")
 		return
 	}
-	peerPolicy, policyErr := m.getPeerRBACPolicyForAgreement(r.Context(), agreement)
-	if policyErr != nil {
-		m.logger.Error().Err(policyErr).Str("peer", peer.ChainID).Msg("federation query peer RBAC lookup failed")
-		httpError(w, http.StatusInternalServerError, "peer RBAC lookup failed")
+	policy, policyErr := m.v23BindingReady(r.Context(), agreement, peer.AgentID)
+	if policyErr != nil || !peerRBACAllowsRead(policy, req.DomainTag) {
+		httpError(w, http.StatusForbidden, "peer Read grant is inactive for this domain")
 		return
 	}
-	if peerPolicy != nil && peerPolicy.PeerAgentID != peer.AgentID {
-		httpError(w, http.StatusForbidden, "requesting operator is not bound to this peer RBAC policy")
-		return
-	}
-
-	// Scope gate on the REQUESTED domain. Once peer RBAC is configured it fully
-	// replaces tx-33 AllowedDomains, and concrete domain rows mean an unscoped
-	// query is always denied. Legacy links keep the wildcard treaty behavior.
-	requestAllowed := peerRBACAllowsRead(peerPolicy, req.DomainTag)
-	if peerPolicy == nil {
-		requestAllowed = DomainAllowed(agreement.AllowedDomains, req.DomainTag)
-	}
-	if !requestAllowed {
-		if req.DomainTag == "" {
-			httpError(w, http.StatusForbidden, "a permitted domain_tag is required")
-		} else {
-			httpError(w, http.StatusForbidden, "domain read is not permitted")
-		}
+	guestCeiling, authErr := m.validateQueryEnvelopeV23(r.Context(), peer, agreement, &req)
+	if authErr != nil {
+		m.logger.Warn().Err(authErr).Str("peer", peer.ChainID).Msg("federation v23 query denied")
+		httpError(w, http.StatusForbidden, authErr.Error())
 		return
 	}
 
@@ -873,9 +992,36 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	opts := store.QueryOptions{
 		DomainTag:    req.DomainTag,
+		Provider:     req.Provider,
 		StatusFilter: string(memory.StatusCommitted), // committed-only, non-negotiable
 		TopK:         topK,
 		Tags:         req.Tags,
+	}
+	// Admission happens before TopK is consumed. Besides preventing denied rows
+	// from starving a valid page, ValidateMemoryProjection closes the
+	// SQL-before-Badger publication/crash window: an off-chain row is not
+	// federatable until its exact hash/status/domain/author snapshot exists in
+	// canonical state.
+	opts.CandidateFilter = func(rec *memory.MemoryRecord) (bool, error) {
+		if rec == nil || rec.Status != memory.StatusCommitted ||
+			!peerRBACAllowsRead(policy, rec.DomainTag) {
+			return false, nil
+		}
+		canonical, projectionErr := m.badger.ValidateMemoryProjection(rec)
+		if projectionErr != nil {
+			if errors.Is(projectionErr, store.ErrMemoryProjectionUnpublished) {
+				return false, nil
+			}
+			return false, projectionErr
+		}
+		recordCeiling, guestErr := m.authorizeFederatedGuestRead(
+			r.Context(), peer, agreement, req.AgentProof.AgentID, rec.DomainTag,
+		)
+		if guestErr != nil {
+			return false, nil
+		}
+		return canonical.Classification <= guestCeiling &&
+			canonical.Classification <= recordCeiling, nil
 	}
 	if len(req.Embedding) > 0 {
 		if req.EmbeddingProvider == "" {
@@ -950,21 +1096,24 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 			hidden++
 			continue
 		}
-		recordAllowed := peerRBACAllowsRead(peerPolicy, rec.DomainTag)
-		if peerPolicy == nil {
-			recordAllowed = DomainAllowed(agreement.AllowedDomains, rec.DomainTag)
-		}
-		if !recordAllowed {
+		if !peerRBACAllowsRead(policy, rec.DomainTag) {
 			hidden++
 			continue
 		}
-		// Fail CLOSED on a classification read error: GetMemoryClassification
-		// returns (0, err) on a corrupt/unreadable entry, and 0 ≤ every ceiling
-		// — swallowing the error would DISCLOSE an arbitrarily-classified record
-		// across the federation boundary. This is the sole clearance gate on the
-		// egress path, so an error hides the record.
-		memClass, classErr := m.badger.GetMemoryClassification(rec.MemoryID)
-		if classErr != nil || memClass > agreement.MaxClearance {
+		recordCeiling, guestErr := m.authorizeFederatedGuestRead(
+			r.Context(), peer, agreement, req.AgentProof.AgentID, rec.DomainTag,
+		)
+		if guestErr != nil {
+			hidden++
+			continue
+		}
+		// Re-check the exact canonical projection immediately before
+		// serialization so a concurrent consensus publication cannot swap the
+		// row's hash/status/domain/author underneath the pre-TopK decision.
+		canonical, projectionErr := m.badger.ValidateMemoryProjection(rec)
+		if projectionErr != nil ||
+			canonical.Classification > guestCeiling ||
+			canonical.Classification > recordCeiling {
 			hidden++
 			continue
 		}
@@ -987,7 +1136,7 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 			ChallengeCount:     challengeCounts[rec.MemoryID],
 			EvidenceCountsAvailable: corrErr == nil && challengeErr == nil &&
 				evidenceCompleteErr == nil && evidenceComplete[rec.MemoryID],
-			Classification: int(memClass),
+			Classification: int(canonical.Classification),
 			Status:         string(rec.Status),
 			CreatedAt:      rec.CreatedAt,
 			CommittedAt:    rec.CommittedAt,

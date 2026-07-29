@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -22,6 +23,14 @@ const maxPipelineProofBytes = 1 << 20
 
 const pipelineProofEnvelopeVersion = 1
 
+func pipelineLinkedRelationDigest(relation []byte) string {
+	if len(relation) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(relation)
+	return hex.EncodeToString(sum[:])
+}
+
 type pipelineProofEnvelope struct {
 	Version int                `json:"version"`
 	Proof   PipelineAgentProof `json:"proof"`
@@ -38,6 +47,8 @@ func (s *SQLiteStore) migratePipelineTransport(ctx context.Context) {
 		agreement_id      TEXT NOT NULL,
 		contact_id        TEXT NOT NULL,
 		contact_revision  TEXT NOT NULL,
+		authorization_mode TEXT NOT NULL DEFAULT '',
+		linked_relation   BLOB NOT NULL DEFAULT x'',
 		source_agent_id   TEXT NOT NULL,
 		target_agent_id   TEXT NOT NULL,
 		proof_signature   BLOB NOT NULL,
@@ -65,6 +76,8 @@ func (s *SQLiteStore) migratePipelineTransport(ctx context.Context) {
 		agreement_id    TEXT NOT NULL,
 		contact_id      TEXT NOT NULL,
 		contact_revision TEXT NOT NULL,
+		authorization_mode TEXT NOT NULL DEFAULT '',
+		linked_relation_digest TEXT NOT NULL DEFAULT '',
 		source_agent_id TEXT NOT NULL,
 		target_agent_id TEXT NOT NULL,
 		event_kind      TEXT NOT NULL,
@@ -90,6 +103,37 @@ func (s *SQLiteStore) migratePipelineTransport(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_pipe_transport_proof_once
 		ON pipeline_transport_dedup(remote_chain_id, event_kind, proof_hash)
 		WHERE proof_hash IS NOT NULL`)
+}
+
+// migratePipelineV23SecurityColumns is fatal and verified by initSchema.
+// Earlier pipeline migrations intentionally tolerate historical draft-table
+// differences; linked-v23 must never activate against a partial authorization
+// schema, so these columns use inspect-before-ALTER with only the exact
+// concurrent duplicate-column race tolerated.
+func (s *SQLiteStore) migratePipelineV23SecurityColumns(ctx context.Context) error {
+	for _, migration := range []struct {
+		table, column, statement string
+	}{
+		{"pipeline_messages", "federation_authorization_mode",
+			`ALTER TABLE pipeline_messages ADD COLUMN federation_authorization_mode TEXT NOT NULL DEFAULT ''`},
+		{"pipeline_messages", "federation_linked_relation",
+			`ALTER TABLE pipeline_messages ADD COLUMN federation_linked_relation BLOB NOT NULL DEFAULT x''`},
+		{"pipeline_transport_outbox", "authorization_mode",
+			`ALTER TABLE pipeline_transport_outbox ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT ''`},
+		{"pipeline_transport_outbox", "linked_relation",
+			`ALTER TABLE pipeline_transport_outbox ADD COLUMN linked_relation BLOB NOT NULL DEFAULT x''`},
+		{"pipeline_transport_dedup", "authorization_mode",
+			`ALTER TABLE pipeline_transport_dedup ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT ''`},
+		{"pipeline_transport_dedup", "linked_relation_digest",
+			`ALTER TABLE pipeline_transport_dedup ADD COLUMN linked_relation_digest TEXT NOT NULL DEFAULT ''`},
+	} {
+		if err := s.addSQLiteColumnIfMissing(
+			ctx, migration.table, migration.column, migration.statement,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validatePipelineAgentProof(proof PipelineAgentProof, sourceAgentID string) error {
@@ -124,6 +168,18 @@ func validatePipelineTransportOutbox(event *PipelineTransportOutbox) error {
 	if event.CreatedAt.IsZero() || event.ExpiresAt.IsZero() || !event.ExpiresAt.After(event.CreatedAt) {
 		return fmt.Errorf("federated pipeline transport lifetime is invalid")
 	}
+	switch event.AuthorizationMode {
+	case "":
+		if len(event.LinkedRelation) != 0 {
+			return fmt.Errorf("ordinary pipeline transport cannot carry a linked relation")
+		}
+	case "linked-v23":
+		if len(event.LinkedRelation) == 0 || len(event.LinkedRelation) > 16<<10 {
+			return fmt.Errorf("linked pipeline relation is invalid")
+		}
+	default:
+		return fmt.Errorf("unsupported pipeline authorization mode")
+	}
 	return nil
 }
 
@@ -147,14 +203,20 @@ func (s *SQLiteStore) insertPipelineTransport(ctx context.Context, event *Pipeli
 	if nextAttempt.IsZero() {
 		nextAttempt = event.CreatedAt
 	}
+	linkedRelation := event.LinkedRelation
+	if linkedRelation == nil {
+		linkedRelation = []byte{}
+	}
 	_, err = s.writeExecContext(ctx, `INSERT INTO pipeline_transport_outbox
 		(event_id, pipe_id, remote_chain_id, event_kind, policy_epoch, agreement_id,
-		 contact_id, contact_revision, source_agent_id, target_agent_id,
+		 contact_id, contact_revision, authorization_mode, linked_relation,
+		 source_agent_id, target_agent_id,
 		 proof_signature, proof_timestamp, proof_nonce, proof_canonical,
 		 state, attempts, next_attempt_at, created_at, expires_at, last_error)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		event.EventID, event.PipeID, event.RemoteChainID, event.EventKind, event.PolicyEpoch,
-		event.AgreementID, event.ContactID, event.ContactRevision, event.SourceAgentID,
+		event.AgreementID, event.ContactID, event.ContactRevision,
+		event.AuthorizationMode, linkedRelation, event.SourceAgentID,
 		event.TargetAgentID, []byte{}, int64(0), []byte{},
 		encryptedProof, state, event.Attempts, formatTime(nextAttempt), formatTime(event.CreatedAt),
 		formatTime(event.ExpiresAt), event.LastError)
@@ -165,7 +227,10 @@ func (s *SQLiteStore) InsertPipelineWithTransport(ctx context.Context, msg *Pipe
 	if msg == nil || event == nil || event.PipeID != msg.PipeID || msg.DestinationChainID == "" ||
 		event.RemoteChainID != msg.DestinationChainID || event.ContactID != msg.FederationContactID ||
 		event.ContactRevision != msg.FederationContactRevision || event.PolicyEpoch != msg.FederationPolicyEpoch ||
-		event.AgreementID != msg.FederationAgreementID || event.SourceAgentID != msg.FromAgent || event.TargetAgentID != msg.ToAgent {
+		event.AgreementID != msg.FederationAgreementID ||
+		event.AuthorizationMode != msg.FederationAuthorizationMode ||
+		!bytes.Equal(event.LinkedRelation, msg.FederationLinkedRelation) ||
+		event.SourceAgentID != msg.FromAgent || event.TargetAgentID != msg.ToAgent {
 		return fmt.Errorf("pipeline row and transport event binding mismatch")
 	}
 	return s.runPipelineTx(ctx, func(txStore OffchainStore) error {
@@ -188,6 +253,19 @@ func validatePipelineTransportDedup(dedup *PipelineTransportDedup) error {
 	if dedup.EventKind != "send" && dedup.EventKind != "result" {
 		return fmt.Errorf("unsupported federated pipeline dedup kind %q", dedup.EventKind)
 	}
+	switch dedup.AuthorizationMode {
+	case "":
+		if dedup.LinkedRelationDigest != "" {
+			return fmt.Errorf("ordinary pipeline dedup cannot carry a linked relation")
+		}
+	case "linked-v23":
+		decoded, err := hex.DecodeString(dedup.LinkedRelationDigest)
+		if err != nil || len(decoded) != 32 {
+			return fmt.Errorf("linked pipeline dedup relation digest is invalid")
+		}
+	default:
+		return fmt.Errorf("unsupported pipeline dedup authorization mode")
+	}
 	return nil
 }
 
@@ -202,7 +280,9 @@ func (s *SQLiteStore) AdmitFederatedPipeline(ctx context.Context, msg *PipelineM
 		dedup.SourceAgentID != msg.FromAgent || dedup.LocalPipeID != msg.PipeID ||
 		dedup.TargetAgentID != msg.ToAgent || dedup.EventKind != "send" ||
 		dedup.PolicyEpoch != msg.FederationPolicyEpoch || dedup.AgreementID != msg.FederationAgreementID ||
-		dedup.ContactID != msg.FederationContactID || dedup.ContactRevision != msg.FederationContactRevision {
+		dedup.ContactID != msg.FederationContactID || dedup.ContactRevision != msg.FederationContactRevision ||
+		dedup.AuthorizationMode != msg.FederationAuthorizationMode ||
+		dedup.LinkedRelationDigest != pipelineLinkedRelationDigest(msg.FederationLinkedRelation) {
 		return "", false, fmt.Errorf("imported pipeline row and dedup binding mismatch")
 	}
 	err = s.runPipelineTx(ctx, func(txStore OffchainStore) error {
@@ -239,10 +319,12 @@ func (s *SQLiteStore) AdmitFederatedPipeline(ctx context.Context, msg *PipelineM
 		}
 		if _, execErr := tx.writeExecContext(ctx, `INSERT INTO pipeline_transport_dedup
 			(remote_chain_id, policy_epoch, agreement_id, contact_id, contact_revision,
+			 authorization_mode, linked_relation_digest,
 			 source_agent_id, target_agent_id, event_kind, remote_pipe_id, content_hash,
 			 proof_hash, local_pipe_id, outcome, expires_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, dedup.RemoteChainID, dedup.PolicyEpoch,
-			dedup.AgreementID, dedup.ContactID, dedup.ContactRevision, dedup.SourceAgentID,
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, dedup.RemoteChainID, dedup.PolicyEpoch,
+			dedup.AgreementID, dedup.ContactID, dedup.ContactRevision,
+			dedup.AuthorizationMode, dedup.LinkedRelationDigest, dedup.SourceAgentID,
 			dedup.TargetAgentID, dedup.EventKind, dedup.RemotePipeID, dedup.ContentHash,
 			dedup.ProofHash, dedup.LocalPipeID, dedup.Outcome, formatTime(dedup.ExpiresAt)); execErr != nil {
 			return fmt.Errorf("insert pipeline transport dedup: %w", execErr)
@@ -273,6 +355,8 @@ func (s *SQLiteStore) CompleteFederatedPipelineWithTransport(ctx context.Context
 			event.RemoteChainID != msg.SourceChainID || event.PolicyEpoch != msg.FederationPolicyEpoch ||
 			event.AgreementID != msg.FederationAgreementID || event.ContactID != msg.FederationContactID ||
 			event.ContactRevision != msg.FederationContactRevision || event.TargetAgentID != msg.FromAgent ||
+			event.AuthorizationMode != msg.FederationAuthorizationMode ||
+			!bytes.Equal(event.LinkedRelation, msg.FederationLinkedRelation) ||
 			msg.ToAgent != agentID {
 			return fmt.Errorf("foreign pipeline row and result transport binding mismatch")
 		}
@@ -334,7 +418,9 @@ func (s *SQLiteStore) ApplyFederatedPipelineResult(ctx context.Context, pipeID, 
 		if msg.SourceChainID != "" || msg.DestinationChainID != dedup.RemoteChainID ||
 			msg.ToAgent != dedup.SourceAgentID || msg.FromAgent != dedup.TargetAgentID ||
 			msg.FederationPolicyEpoch != dedup.PolicyEpoch || msg.FederationAgreementID != dedup.AgreementID ||
-			msg.FederationContactID != dedup.ContactID || msg.FederationContactRevision != dedup.ContactRevision {
+			msg.FederationContactID != dedup.ContactID || msg.FederationContactRevision != dedup.ContactRevision ||
+			msg.FederationAuthorizationMode != dedup.AuthorizationMode ||
+			pipelineLinkedRelationDigest(msg.FederationLinkedRelation) != dedup.LinkedRelationDigest {
 			return fmt.Errorf("outbound pipeline row and federated result binding mismatch")
 		}
 		encryptedResult, encErr := tx.encryptContent(result)
@@ -352,10 +438,12 @@ func (s *SQLiteStore) ApplyFederatedPipelineResult(ctx context.Context, pipeID, 
 		}
 		_, insertErr := tx.writeExecContext(ctx, `INSERT INTO pipeline_transport_dedup
 			(remote_chain_id, policy_epoch, agreement_id, contact_id, contact_revision,
+			 authorization_mode, linked_relation_digest,
 			 source_agent_id, target_agent_id, event_kind, remote_pipe_id, content_hash,
 			 proof_hash, local_pipe_id, outcome, expires_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, dedup.RemoteChainID, dedup.PolicyEpoch,
-			dedup.AgreementID, dedup.ContactID, dedup.ContactRevision, dedup.SourceAgentID,
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, dedup.RemoteChainID, dedup.PolicyEpoch,
+			dedup.AgreementID, dedup.ContactID, dedup.ContactRevision,
+			dedup.AuthorizationMode, dedup.LinkedRelationDigest, dedup.SourceAgentID,
 			dedup.TargetAgentID, dedup.EventKind, dedup.RemotePipeID, dedup.ContentHash,
 			dedup.ProofHash, dedup.LocalPipeID, dedup.Outcome, formatTime(dedup.ExpiresAt))
 		return insertErr
@@ -369,6 +457,7 @@ func (s *SQLiteStore) ListPendingPipelineTransport(ctx context.Context, now time
 	}
 	rows, err := s.conn.QueryContext(ctx, `SELECT event_id, pipe_id, remote_chain_id,
 		event_kind, policy_epoch, agreement_id, contact_id, contact_revision,
+		authorization_mode, linked_relation,
 		source_agent_id, target_agent_id, proof_signature, proof_timestamp,
 		COALESCE(proof_nonce, x''), proof_canonical, state, attempts,
 		next_attempt_at, created_at, expires_at, delivered_at, last_error
@@ -402,7 +491,8 @@ func (s *SQLiteStore) scanPipelineTransport(scanner pipelineTransportScanner) (*
 	var delivered *string
 	if err := scanner.Scan(&event.EventID, &event.PipeID, &event.RemoteChainID,
 		&event.EventKind, &event.PolicyEpoch, &event.AgreementID, &event.ContactID,
-		&event.ContactRevision, &event.SourceAgentID, &event.TargetAgentID,
+		&event.ContactRevision, &event.AuthorizationMode, &event.LinkedRelation,
+		&event.SourceAgentID, &event.TargetAgentID,
 		&legacySignature, &legacyTimestamp, &legacyNonce,
 		&canonical, &event.State, &event.Attempts, &next, &created, &expires,
 		&delivered, &event.LastError); err != nil {
@@ -439,6 +529,7 @@ func (s *SQLiteStore) scanPipelineTransport(scanner pipelineTransportScanner) (*
 func (s *SQLiteStore) GetPipelineTransport(ctx context.Context, eventID string) (*PipelineTransportOutbox, error) {
 	row := s.conn.QueryRowContext(ctx, `SELECT event_id, pipe_id, remote_chain_id,
 		event_kind, policy_epoch, agreement_id, contact_id, contact_revision,
+		authorization_mode, linked_relation,
 		source_agent_id, target_agent_id, proof_signature, proof_timestamp,
 		COALESCE(proof_nonce, x''), proof_canonical, state, attempts,
 		next_attempt_at, created_at, expires_at, delivered_at, last_error

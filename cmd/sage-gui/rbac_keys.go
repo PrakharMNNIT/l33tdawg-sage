@@ -1,23 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/l33tdawg/sage/internal/store"
 )
 
 // This file wires the two signing identities the v11.3 RBAC reassign +
 // access-control surface needs, WITHOUT changing consensus:
 //
-//   - adminSigningKey  = ~/.sage/agent.key, the on-chain genesis admin
-//     (Role=="admin"). The dashboard normally signs with the CometBFT
-//     validator key, which is NOT a registered admin, so it cannot pass the
-//     admin gate on GovPropose / DomainReassign. Signing those two txs with
-//     the operator/admin key is the surgical fix (no BadgerDB admin write, no
-//     AppHash change, memory authorship still signed by the validator key).
+//   - adminSigningKey = the stable node operator/transport key at
+//     cfg.agent_key_file. Before app-v23 it is normally the on-chain genesis
+//     admin (Role=="admin"). App-v23 Root handover may retire that governance
+//     authority without rotating the JOIN-frozen transport identity; current
+//     Root signing is therefore resolved separately at action time.
 //
 //   - localAgentKeyResolver maps an on-chain agent id (hex(pubkey)) to the
 //     local Ed25519 key that produces it, over the keys this node already
@@ -35,20 +41,39 @@ func parseKeyFile(path string) (ed25519.PrivateKey, bool) {
 	if err != nil {
 		return nil, false
 	}
+	key, err := decodeEd25519PrivateKey(data)
+	return key, err == nil
+}
+
+// decodeEd25519PrivateKey accepts both SAGE's canonical 32-byte seed encoding
+// and the standard 64-byte seed||public encoding. The latter is redundant, so
+// accepting length alone would let damaged bytes advertise one Agent ID while
+// ed25519.Sign derives a signature from another. Always copy caller-owned bytes
+// so a later buffer mutation cannot change the resolved identity.
+func decodeEd25519PrivateKey(data []byte) (ed25519.PrivateKey, error) {
 	switch len(data) {
 	case ed25519.SeedSize:
-		return ed25519.NewKeyFromSeed(data), true
+		return ed25519.NewKeyFromSeed(append([]byte(nil), data...)), nil
 	case ed25519.PrivateKeySize:
-		return ed25519.PrivateKey(data), true
+		key := ed25519.PrivateKey(append([]byte(nil), data...))
+		derived := ed25519.NewKeyFromSeed(key[:ed25519.SeedSize])
+		if !bytes.Equal(derived, key) {
+			return nil, fmt.Errorf("invalid 64-byte Ed25519 private key: public component does not match seed")
+		}
+		return key, nil
 	default:
-		return nil, false
+		return nil, fmt.Errorf(
+			"invalid key file size: %d bytes (expected %d-byte Ed25519 seed or %d-byte private key)",
+			len(data), ed25519.SeedSize, ed25519.PrivateKeySize,
+		)
 	}
 }
 
-// adminSigningKeyAt loads the operator/admin key (normally ~/.sage/agent.key,
-// but the configured cfg.AgentKey path wins). This key is the on-chain genesis
-// admin; the dashboard uses it to sign the admin-gated governance +
-// domain-reassign txs. Returns nil if the key is absent.
+// adminSigningKeyAt loads the stable operator/transport key (normally
+// ~/.sage/agent.key, but the configured cfg.AgentKey path wins). It is the
+// legacy/pre-v23 genesis admin signer; app-v23 callers must resolve the current
+// Root credential instead of assuming this transport key still has authority.
+// Returns nil if the key is absent.
 func adminSigningKeyAt(path string) ed25519.PrivateKey {
 	k, ok := parseKeyFile(path)
 	if !ok {
@@ -59,7 +84,8 @@ func adminSigningKeyAt(path string) ed25519.PrivateKey {
 
 // localAgentKeyResolverWithOperator builds a resolver mapping agentID
 // (hex(pubkey)) -> the local private key that produces it, scanning the
-// operator key path plus ~/.sage/agent.key and ~/.sage/agents/<project>/agent.key.
+// operator key path plus ~/.sage/agent.key, installed-agent keys, and
+// CEREBRUM-created bundle keys.
 // The resolver only ever returns keys already held locally and never derives or
 // exposes key material; it reports (nil, false) for any agent whose key is not
 // on this node (e.g. a remote federated agent).
@@ -116,6 +142,15 @@ func localAgentKeyResolverWithOperatorCache(
 				add(filepath.Join(agentsDir, e.Name(), "agent.key"))
 			}
 		}
+		bundlesDir := filepath.Join(home, "bundles")
+		if entries, err := os.ReadDir(bundlesDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				add(filepath.Join(bundlesDir, e.Name(), "agent.key"))
+			}
+		}
 		return byID
 	}
 	return func(agentID string) (ed25519.PrivateKey, bool) {
@@ -148,4 +183,56 @@ func localAgentKeyResolverWithOperatorCache(
 		cache = next
 		return k, ok
 	}
+}
+
+type appV23RootStateReader interface {
+	GetAppV23Root() (*store.AppV23RootState, error)
+}
+
+// currentUpgradeSigningKey resolves the identity allowed to drive unattended
+// governance. Before app-v23 exists, the configured operator key retains the
+// historical behavior needed to climb the fork ladder. Once app-v23 is active,
+// only the exact current consensus Root credential is accepted; a missing
+// recovery-bundle key is an explicit failure, never a fallback to stale
+// ~/.sage/agent.key.
+func currentUpgradeSigningKey(
+	rootState appV23RootStateReader,
+	postV23 func() bool,
+	resolveLocalKey func(string) (ed25519.PrivateKey, bool),
+	legacyKeyPath string,
+	logger zerolog.Logger,
+) (ed25519.PrivateKey, error) {
+	if rootState == nil {
+		return nil, fmt.Errorf("consensus Root state reader unavailable")
+	}
+	root, err := rootState.GetAppV23Root()
+	if err != nil {
+		return nil, fmt.Errorf("read current CEREBRUM Root: %w", err)
+	}
+	if root == nil {
+		if postV23 != nil && postV23() {
+			return nil, fmt.Errorf("app-v23 is active but no committed CEREBRUM Root exists")
+		}
+		key := loadOperatorAgentKeyAt(legacyKeyPath, logger)
+		if key == nil {
+			return nil, fmt.Errorf("legacy operator agent key unavailable")
+		}
+		return key, nil
+	}
+	credentialID := strings.TrimSpace(root.CredentialID)
+	if credentialID == "" {
+		return nil, fmt.Errorf("committed CEREBRUM Root credential is empty")
+	}
+	if resolveLocalKey == nil {
+		return nil, fmt.Errorf("local CEREBRUM key resolver unavailable")
+	}
+	key, ok := resolveLocalKey(credentialID)
+	if !ok || len(key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("current CEREBRUM Root key %s is not held on this machine", credentialID)
+	}
+	pub, ok := key.Public().(ed25519.PublicKey)
+	if !ok || hex.EncodeToString(pub) != credentialID {
+		return nil, fmt.Errorf("local key does not match current CEREBRUM Root credential %s", credentialID)
+	}
+	return key, nil
 }

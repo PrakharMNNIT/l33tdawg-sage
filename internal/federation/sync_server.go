@@ -836,20 +836,25 @@ func (m *Manager) broadcastSyncSubmit(localID string, item *SyncItem) (string, s
 	return SyncOutcomeRetry, ""
 }
 
-// buildSyncSubmitTx constructs the operator-signed MemorySubmit for a synced
-// copy (the RevokeAgreement operator-auth pattern: agent proof over a
-// canonical body hash + timestamp, then the tx signature).
+// buildSyncSubmitTx constructs the locally-authorized MemorySubmit for a
+// synced copy. The remote transport identity remains recorded in SyncItem
+// provenance; after app-v23 the new local write is signed by current CEREBRUM
+// Root, never by a retired JOIN-frozen transport credential.
 func (m *Manager) buildSyncSubmitTx(localID string, item *SyncItem) ([]byte, error) {
 	contentHash, err := hex.DecodeString(item.ContentHash)
 	if err != nil {
 		return nil, fmt.Errorf("decode content hash: %w", err)
+	}
+	signingKey, signingPub, err := m.localConsensusSigningKey()
+	if err != nil {
+		return nil, fmt.Errorf("resolve sync submit authority: %w", err)
 	}
 	body := []byte("sync_admit:" + localID)
 	bodyHash := sha256.Sum256(body)
 	ts := time.Now().Unix()
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts)) // #nosec G115 -- ts non-negative
-	agentSig := ed25519.Sign(m.agentKey, append(append([]byte{}, bodyHash[:]...), tsBytes...))
+	agentSig := ed25519.Sign(signingKey, append(append([]byte{}, bodyHash[:]...), tsBytes...))
 
 	memType := syncMemoryTypeToTx(item.MemoryType)
 	confidence := item.ConfidenceScore
@@ -858,7 +863,7 @@ func (m *Manager) buildSyncSubmitTx(localID string, item *SyncItem) ([]byte, err
 	}
 	ptx := &tx.ParsedTx{
 		Type:      tx.TxTypeMemorySubmit,
-		Nonce:     tx.MonotonicNonce(m.agentKey),
+		Nonce:     tx.MonotonicNonce(signingKey),
 		Timestamp: time.Now(),
 		MemorySubmit: &tx.MemorySubmit{
 			MemoryID:        localID,
@@ -869,7 +874,7 @@ func (m *Manager) buildSyncSubmitTx(localID string, item *SyncItem) ([]byte, err
 			Content:         item.Content,
 			Classification:  tx.ClearanceLevel(item.Classification), // #nosec G115 -- validated 0-4
 		},
-		AgentPubKey:    m.agentPub,
+		AgentPubKey:    signingPub,
 		AgentSig:       agentSig,
 		AgentBodyHash:  bodyHash[:],
 		AgentTimestamp: ts,
@@ -877,7 +882,7 @@ func (m *Manager) buildSyncSubmitTx(localID string, item *SyncItem) ([]byte, err
 	if m.postV20ForNextTx != nil && m.postV20ForNextTx() {
 		ptx.MemorySubmit.Tags = append([]string(nil), item.Tags...)
 	}
-	if err := tx.SignTx(ptx, m.agentKey); err != nil {
+	if err := tx.SignTx(ptx, signingKey); err != nil {
 		return nil, fmt.Errorf("sign sync submit tx: %w", err)
 	}
 	return tx.EncodeTx(ptx)

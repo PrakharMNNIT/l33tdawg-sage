@@ -40,6 +40,7 @@ type projectionCrashResult struct {
 	AccessLogs     int    `json:"access_logs"`
 	GovProposals   int    `json:"gov_proposals"`
 	Receipts       int    `json:"receipts"`
+	Published      bool   `json:"published"`
 }
 
 func openProjectionCrashApp(t *testing.T, dataDir string) (*SageApp, *store.SQLiteStore) {
@@ -148,6 +149,11 @@ func projectionCrashSnapshot(t *testing.T, app *SageApp, dataDir string) project
 		{`SELECT COUNT(*) FROM abci_projection_batches`, &result.Receipts},
 	} {
 		require.NoError(t, db.QueryRowContext(context.Background(), item.query).Scan(item.target))
+	}
+	memoryID, _ := projectionCrashWrites()
+	if record, getErr := app.offchainStore.GetMemory(context.Background(), memoryID); getErr == nil {
+		_, projectionErr := app.badgerStore.ValidateMemoryProjection(record)
+		result.Published = projectionErr == nil
 	}
 	return result
 }
@@ -272,12 +278,16 @@ func TestAppV20SIGKILLAfterOffchainFlushReplaysWithoutProjectionDuplicates(t *te
 	before := readProjectionCrashResult(t, beforePath)
 	assert.Equal(t, int64(1), before.Height, "Badger Commit must remain behind the durable SQL batch")
 	requireOneProjectionBatch(t, before)
+	assert.False(t, before.Published,
+		"the durable SQL row must stay undisclosable until canonical replay publishes it")
 
 	_, replayPath := runProjectionCrashChild(t, "replay", dataDir, "")
 	replayed := readProjectionCrashResult(t, replayPath)
 	assert.Equal(t, int64(2), replayed.Height)
 	require.NotEmpty(t, replayed.AppHash)
 	requireOneProjectionBatch(t, replayed)
+	assert.True(t, replayed.Published,
+		"replay must make the exact SQL projection canonically disclosable")
 
 	_, reopenedPath := runProjectionCrashChild(t, "inspect", dataDir, "")
 	reopened := readProjectionCrashResult(t, reopenedPath)

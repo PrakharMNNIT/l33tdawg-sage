@@ -105,8 +105,9 @@ func TestWizardSecurityGate_DefenseInDepth(t *testing.T) {
 	_ = r // touched so the broader test setup compiles cleanly
 }
 
-// TestWizard_SameOriginBrowserNeedsOperatorSession verifies browser routing
-// headers alone do not authorize subprocess-driving wizard endpoints.
+// TestWizard_Allows_SameOriginBrowser verifies the encryption-off product
+// contract: the exact loopback, same-origin CEREBRUM SPA remains able to drive
+// its setup wizards without first enabling the optional vault.
 func TestWizard_Allows_SameOriginBrowser(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("wizard install path is POSIX-only")
@@ -126,7 +127,7 @@ func TestWizard_Allows_SameOriginBrowser(t *testing.T) {
 		req.RemoteAddr = "127.0.0.1:54321"
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		assert.Equal(t, http.StatusForbidden, w.Code, "same-origin from %s must still require operator authority", tc.origin)
+		assert.Equal(t, http.StatusOK, w.Code, "same-origin from %s should pass", tc.origin)
 	}
 }
 
@@ -164,6 +165,8 @@ func TestWizard_Allows_NoOrigin_CLI(t *testing.T) {
 	r := testRouter(h)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/wizard/chatgpt/check-cloudflared", nil)
+	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusForbidden, w.Code)

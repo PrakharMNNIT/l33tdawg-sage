@@ -234,7 +234,7 @@ func fakeComet(t *testing.T) (*httptest.Server, *[][]byte) {
 func insertCommitted(t *testing.T, c *testChain, id, domain, content string) {
 	t.Helper()
 	h := sha256.Sum256([]byte(content))
-	err := c.mem.InsertMemory(context.Background(), &memory.MemoryRecord{
+	record := &memory.MemoryRecord{
 		MemoryID:        id,
 		SubmittingAgent: hex.EncodeToString(c.agentPub),
 		Content:         content,
@@ -244,10 +244,53 @@ func insertCommitted(t *testing.T, c *testChain, id, domain, content string) {
 		ConfidenceScore: 0.9,
 		Status:          memory.StatusCommitted,
 		CreatedAt:       time.Now().Add(-time.Hour),
-	})
+	}
+	err := c.mem.InsertMemory(context.Background(), record)
 	if err != nil {
 		t.Fatalf("insert memory: %v", err)
 	}
+	publishFederationTestRecord(t, c.badger, record, 0)
+}
+
+// publishFederationTestRecord mirrors the canonical Badger envelope that
+// consensus publishes before a serving-layer row may cross a federation
+// boundary. SQL-only fixtures are intentionally undisclosable under app-v23.
+func publishFederationTestRecord(
+	t *testing.T,
+	badger *store.BadgerStore,
+	record *memory.MemoryRecord,
+	classification uint8,
+) {
+	t.Helper()
+	if err := badger.SetMemoryHash(
+		record.MemoryID, record.ContentHash, string(record.Status),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := badger.SetMemoryDomain(record.MemoryID, record.DomainTag); err != nil {
+		t.Fatal(err)
+	}
+	if err := badger.SetMemoryAuthor(record.MemoryID, record.SubmittingAgent); err != nil {
+		t.Fatal(err)
+	}
+	if err := badger.SetMemoryClassification(record.MemoryID, classification); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func publishFederationSQLiteTestRecord(
+	t *testing.T,
+	memories *store.SQLiteStore,
+	badger *store.BadgerStore,
+	memoryID string,
+	classification uint8,
+) {
+	t.Helper()
+	record, err := memories.GetMemory(context.Background(), memoryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishFederationTestRecord(t, badger, record, classification)
 }
 
 func seedCoCommit(t *testing.T, c *testChain, sharedID string, core []byte, coauthors []tx.CoCommitCoauthor) {
@@ -427,15 +470,17 @@ func TestFederatedQueryEndToEnd(t *testing.T) {
 	listener := startListener(t, b)
 	federate(t, b, a, "https://unused.invalid", []string{"shared"}, 2, 0) // B's terms about A
 	federate(t, a, b, listener.URL, []string{"shared"}, 2, 0)             // A's terms about B
+	enableV23Pair(t, a, b, []string{"shared"})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := a.mgr.QueryPeer(ctx, b.chainID, &QueryRequest{
+	query := planAndSignV23Query(t, a, b, &QueryRequest{
 		Mode:      ModeText,
 		Query:     "bridge protocol",
 		DomainTag: "shared.notes",
 		TopK:      5,
 	})
+	resp, err := a.mgr.QueryPeer(ctx, b.chainID, query)
 	if err != nil {
 		t.Fatalf("QueryPeer: %v", err)
 	}
@@ -448,16 +493,20 @@ func TestFederatedQueryEndToEnd(t *testing.T) {
 
 	// Vector federation must identify its exact space. An older/foreign caller
 	// that omits provenance fails closed instead of comparing mixed vectors.
-	if _, err := a.mgr.QueryPeer(ctx, b.chainID, &QueryRequest{
+	missingProvider := planAndSignV23Query(t, a, b, &QueryRequest{
 		Mode:      ModeSemantic,
 		Embedding: []float32{0.1, 0.2},
 		DomainTag: "shared.notes",
-	}); err == nil || !strings.Contains(err.Error(), "embedding_provider is required") {
+	})
+	if _, err := a.mgr.QueryPeer(ctx, b.chainID, missingProvider); err == nil || !strings.Contains(err.Error(), "embedding_provider") {
 		t.Fatalf("expected missing vector-space rejection, got %v", err)
 	}
 
 	// The proxy fan-out stamps provenance + chain-qualifies the author.
-	outcomes := a.mgr.FanOutRecall(ctx, nil, &QueryRequest{Mode: ModeText, Query: "bridge protocol", DomainTag: "shared.notes"})
+	fanoutQuery := planAndSignV23Query(t, a, b, &QueryRequest{
+		Mode: ModeText, Query: "bridge protocol", DomainTag: "shared.notes",
+	})
+	outcomes := a.mgr.FanOutRecall(ctx, nil, fanoutQuery)
 	if len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("fan-out: %+v", outcomes)
 	}
@@ -495,28 +544,29 @@ func TestHybridQueryFallsBackToTextAcrossEmbeddingProviders(t *testing.T) {
 	b := newTestChain(t, "provider-b")
 	content := "cross provider keyword fallback sentinel"
 	hash := sha256.Sum256([]byte(content))
-	if err := b.mem.InsertMemory(context.Background(), &memory.MemoryRecord{
+	record := &memory.MemoryRecord{
 		MemoryID: "provider-mismatch", SubmittingAgent: hex.EncodeToString(b.agentPub),
 		Content: content, ContentHash: hash[:], Embedding: []float32{1, 0},
 		EmbeddingProvider: "embedder-b", MemoryType: memory.TypeFact,
 		DomainTag: "shared.providers", ConfidenceScore: .9,
 		Status: memory.StatusCommitted, CreatedAt: time.Now(),
-	}); err != nil {
+	}
+	if err := b.mem.InsertMemory(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.badger.SetMemoryClassification("provider-mismatch", 0); err != nil {
-		t.Fatal(err)
-	}
+	publishFederationTestRecord(t, b.badger, record, 0)
 	listener := startListener(t, b)
 	federate(t, b, a, "https://unused.invalid", []string{"shared"}, 2, 0)
 	federate(t, a, b, listener.URL, []string{"shared"}, 2, 0)
+	enableV23Pair(t, a, b, []string{"shared"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	response, err := a.mgr.QueryPeer(ctx, b.chainID, &QueryRequest{
+	query := planAndSignV23Query(t, a, b, &QueryRequest{
 		Mode: ModeHybrid, Query: "keyword fallback sentinel",
 		Embedding: []float32{0, 1}, EmbeddingProvider: "embedder-a",
 		DomainTag: "shared.providers", TopK: 5,
 	})
+	response, err := a.mgr.QueryPeer(ctx, b.chainID, query)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,10 +586,14 @@ func TestClassificationCeilingHidesRecords(t *testing.T) {
 	listener := startListener(t, b)
 	federate(t, b, a, "https://unused.invalid", []string{"shared"}, 1, 0) // ceiling 1 < class 3
 	federate(t, a, b, listener.URL, []string{"shared"}, 1, 0)
+	enableV23Pair(t, a, b, []string{"shared"})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := a.mgr.QueryPeer(ctx, b.chainID, &QueryRequest{Mode: ModeText, Query: "classified bridge", DomainTag: "shared.notes"})
+	query := planAndSignV23Query(t, a, b, &QueryRequest{
+		Mode: ModeText, Query: "classified bridge", DomainTag: "shared.notes",
+	})
+	resp, err := a.mgr.QueryPeer(ctx, b.chainID, query)
 	if err != nil {
 		t.Fatalf("QueryPeer: %v", err)
 	}

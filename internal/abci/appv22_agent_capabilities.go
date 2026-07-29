@@ -8,14 +8,21 @@ import (
 )
 
 func (app *SageApp) postAppV22Fork(height int64) bool {
-	return app.appV22AppliedHeight > 0 && height > app.appV22AppliedHeight
+	return app.postAppV23GenesisRules(height) ||
+		app.appV22AppliedHeight > 0 && height > app.appV22AppliedHeight
 }
 
 func (app *SageApp) postAppV22Rules(height int64) bool {
-	return app.postAppV22Fork(height)
+	return app.postAppV22Fork(height) || app.postAppV23Fork(height)
 }
 
 func (app *SageApp) IsAppV22ActiveForNextTx() bool {
+	app.runtimeViewMu.RLock()
+	defer app.runtimeViewMu.RUnlock()
+	return app.isAppV22ActiveForNextTx()
+}
+
+func (app *SageApp) isAppV22ActiveForNextTx() bool {
 	return app.state != nil && app.postAppV22Rules(app.state.Height+1)
 }
 
@@ -138,6 +145,27 @@ func (app *SageApp) agentCapabilitiesAt(agentID string, height int64) (store.Age
 	if agentID == "" {
 		return 0, fmt.Errorf("app-v22 capability lookup requires an agent identity")
 	}
+	if app.postAppV23Rules(height) {
+		root, err := app.badgerStore.GetAppV23Root()
+		if err != nil {
+			return 0, fmt.Errorf("app-v23 root lookup for capability evaluation failed: %w", err)
+		}
+		if root == nil {
+			return 0, fmt.Errorf("app-v23 root lookup for capability evaluation returned no state")
+		}
+		switch agentID {
+		case root.CredentialID:
+			agentID = root.PrincipalID
+		default:
+			wasRoot, markerErr := app.badgerStore.IsAppV23RootCredential(agentID)
+			if markerErr != nil {
+				return 0, markerErr
+			}
+			if wasRoot {
+				return 0, store.ErrAppV23NeedsApproval
+			}
+		}
+	}
 	agent, err := app.badgerStore.GetRegisteredAgent(agentID)
 	if err != nil {
 		return 0, fmt.Errorf("app-v22 capability lookup for agent %s: %w", agentID, err)
@@ -155,7 +183,11 @@ func (app *SageApp) agentCapabilitiesAt(agentID string, height int64) (store.Age
 	return agent.Capabilities, nil
 }
 
-func (app *SageApp) isGlobalAdminAgent(agentID string) bool {
+func (app *SageApp) isGlobalAdminAgent(agentID string, height int64) bool {
+	if app.postAppV23Rules(height) {
+		_, _, role, actorErr := app.appV23Actor(agentID)
+		return actorErr == nil && role != nil && role.Role == store.AppV23RoleAdmin
+	}
 	agent, err := app.badgerStore.GetRegisteredAgent(agentID)
 	return err == nil && agent != nil && agent.Role == "admin"
 }

@@ -1,8 +1,8 @@
-Verified against SDK source for SAGE v11.14.2. Package: sage-agent-sdk.
+Verified against SDK source for SAGE v11.15.0. Package: sage-agent-sdk.
 
 # SAGE Python SDK Reference
 
-**Package:** `sage-agent-sdk` **Version:** 11.14.2
+**Package:** `sage-agent-sdk` **Version:** 11.15.0
 **Requires:** Python 3.10+ | httpx ≥ 0.25 | pydantic ≥ 2.0 | PyNaCl ≥ 1.5
 
 ```bash
@@ -136,19 +136,25 @@ Health calls bypass auth-header injection (raw `httpx.Client.get`).
 propose(
     content: str,
     memory_type: MemoryType | str,
-    domain_tag: str,
+    domain_tag: str | None,
     confidence: float,
     embedding: list[float] | None = None,
     knowledge_triples: list[KnowledgeTriple] | None = None,
     parent_hash: str | None = None,
     tags: list[str] | None = None,
     classification: int | None = None,
+    provider: str | None = None,
+    task_status: TaskStatus | str | None = None,
+    linked_memories: list[str] | None = None,
+    idempotency_key: str | None = None,
 ) -> MemorySubmitResponse
 ```
 
 `POST /v1/memory/submit`
 
-Submits a BFT memory proposal. The proposal enters consensus; status transitions to `committed` once the quorum approves.
+Submits a memory transaction and waits for `broadcast_tx_commit`. A successful
+response is already on-chain even though the governed memory lifecycle remains
+`status="proposed"`.
 
 - `memory_type`: `"fact"` | `"observation"` | `"inference"` | `"task"` (or `MemoryType` enum)
 - `confidence`: `0.0–1.0`
@@ -156,6 +162,16 @@ Submits a BFT memory proposal. The proposal enters consensus; status transitions
 - `knowledge_triples`: structured subject/predicate/object triples; `object_` field has alias `object` on the wire (source: `models.py:47`).
 - `tags`: up to 32 labels of 128 UTF-8 bytes each, queryable via `query(tags=...)`. Above app-v20 they are normalized into the signed transaction; scoped-domain tags are also AppHash-covered and restored during projection rebuild. Ordinary-domain tags remain node-local.
 - `classification`: per-record clearance level. When omitted, the field is excluded from the wire payload via `model_dump(exclude_none=True)` and the server stores the memory as PUBLIC (0) (source: `client.py:192`, `models.py:81`).
+- `domain_tag=None`: permitted only for an app-v23 task; the node resolves the
+  caller's currently committed owned home domain. Non-task omission is rejected
+  by the SDK before the request is sent.
+- `task_status`: new tasks accept only `planned` (or omission).
+- `idempotency_key`: app-v23 task identity, 1–128 visible ASCII bytes without
+  spaces. If omitted, the node derives a permanent semantic key from the exact
+  signed agent, resolved domain, and content. Supply a new explicit key only for
+  an intentional recurring occurrence.
+- App-v23 task creation rejects `knowledge_triples` and `linked_memories`;
+  create links after the task receipt is confirmed.
 
 **Classification levels:**
 
@@ -178,7 +194,16 @@ client.propose(
 )
 ```
 
-Returns `MemorySubmitResponse(memory_id, tx_hash, status)`.
+Returns `MemorySubmitResponse(memory_id, tx_hash, status, task_status,
+committed, committed_height, projection_confirmed, retryable, message,
+idempotency_key, idempotent_replay, embedding_provider, embedding_queued)`.
+
+- HTTP `201`: a new commit; app-v23 task projection confirmed.
+- HTTP `200`: confirmed permanent-key replay; no new task. The response carries
+  the original receipt and current task status, including terminal state.
+- HTTP `202`: transaction committed but exact task projection unconfirmed.
+  `committed=True`, `projection_confirmed=False`, and `retryable=False`;
+  reconcile that exact `memory_id` and do not resubmit.
 
 ---
 
@@ -204,6 +229,10 @@ Vector cosine similarity search.
 - `cursor`: opaque pagination token from `next_cursor`.
 
 Returns `MemoryQueryResponse(results: list[MemoryRecord], next_cursor: str | None, total_count: int)`.
+Under app-v23, query/search/hybrid authorization examines at most 8,192 raw
+candidates per node request. A broader result raises `SageValidationError`
+(HTTP `422`); narrow domain/provider/tag/status filters instead of retrying the
+same request.
 
 ---
 
@@ -227,8 +256,19 @@ hybrid(
 
 Fuses BM25/FTS5 keyword and vector cosine results via Reciprocal Rank Fusion in a single round-trip. The caller supplies both the text query and the precomputed embedding.
 
-- `expansions`: list of `{"query": str, "embedding": list[float]}` paraphrase/entity/temporal variants. SAGE runs hybrid recall per variant and fuses across all via RRF. Embeddings must use the same model as the primary vector (source: `client.py:241`).
+- `expansions`: at most 8 `{"query": str, "embedding": list[float]}`
+  paraphrase/entity/temporal variants. SAGE runs hybrid recall per variant and
+  fuses across all via RRF. The server counts submitted array entries before
+  skipping blanks, and embeddings must use the same model as the primary vector
+  (source: `client.py:256`).
 - Server respects `SAGE_RERANK_ENABLED` / `SAGE_RERANK_URL` env vars if configured; otherwise plain RRF.
+- Under app-v23, one 8,192 raw live-authorization-candidate budget is shared by
+  the primary query, every expansion, and every text/vector store leaf in the
+  node request. It is not a per-variant or per-leaf allowance. HTTP `422` means
+  reduce expansions or narrow domain/provider/tag/status filters.
+- Governed leaf, authorization-budget, and decay-floor failures fail the whole
+  call. The SDK raises the mapped `SageValidationError`/server error and does
+  not receive a `200` response containing partial RRF results.
 
 ---
 
@@ -261,7 +301,14 @@ list_memories(
 
 All params are query-string filters. `sort` accepted values: `"newest"`, `"oldest"`, `"confidence"`.
 
-Returns `MemoryListResponse(memories, total, limit, offset)`.
+Returns `MemoryListResponse(memories, total, limit, offset, has_more,
+total_exact, filtered)`. Under app-v23 authorization runs before visible
+offset/limit. While `has_more=True`, `total` is an authorization-safe visible
+lower bound and `total_exact=False`; it becomes exact only when the visible
+stream is exhausted. Denied/raw counts are never exposed. App-v23 caps visible
+`offset` at 7,900 and every authorization candidate walk at 8,192 raw records.
+A broader request raises `SageValidationError` for HTTP `422`; narrow the
+domain/provider/tag/status/agent filters or page sequentially.
 
 ---
 
@@ -278,9 +325,17 @@ timeline(
 
 `GET /v1/memory/timeline`
 
-Time-bucketed memory counts. `bucket`: `"hour"` | `"day"` | `"week"`. `from_time`/`to_time` are ISO 8601 strings sent as `from`/`to` query params.
+Time-bucketed memory counts. `bucket`: `"hour"` | `"day"` | `"week"`.
+`from_time`/`to_time` are ISO 8601 strings sent as `from`/`to` query params.
+Before app-v23 the historical no-domain aggregate is global. App-v23 applies
+central live record disclosure before counting, so every bucket contains only
+currently visible records; unavailable authorization state returns `503`.
+App-v23 requires RFC3339 bounds and limits a call to 31 days and 8,192 raw
+candidates; overly wide/dense requests return `422`.
 
-Returns `TimelineResponse(buckets: list[TimelineBucket])` where each bucket has `period`, `count`, `domain`.
+Returns `TimelineResponse(buckets: list[TimelineBucket], total: int)` where each
+bucket has `period`, `count`, `domain`, and `total` is the sum of the currently
+visible bucket counts.
 
 ---
 
@@ -325,7 +380,10 @@ vote(
 ) -> dict
 ```
 
-`POST /v1/memory/{memory_id}/vote`
+`POST /v1/memory/{memory_id}/vote`. This is a local validator-operator
+override, not an ordinary agent vote. The client key must be the configured
+governance operator before app-v23, or the current CEREBRUM Root/current local
+Admin on localhost after app-v23. The node must have its live validator key.
 
 ---
 
@@ -427,8 +485,14 @@ list_tasks(
 Returns only open tasks explicitly assigned to the authenticated agent ID as
 `TaskListResponse(tasks: list[TaskRecord], total)`. Provider is an optional
 authoring-client filter only when no agent identity is present; it never widens
-an authenticated agent's ownership scope. Each `TaskRecord` has `memory_id`,
-`content`, `domain_tag`, `task_status`, `confidence_score`, `created_at`.
+an authenticated agent's ownership scope. Assignment is necessary but not
+sufficient: every row must also pass current live domain/group/grant and
+classification authority. `total` is the visible returned count. Each
+`TaskRecord` has `memory_id`, `content`, `domain_tag`, `task_status`,
+`confidence_score`, `created_at`, `assignee`, `task_picked_up_by`, and
+`task_picked_up_at`. Current-generation Admin use is localhost-only; Root and
+historical Root are never assignees. Manager group Modify does not widen exact
+assignment.
 
 ---
 
@@ -440,10 +504,11 @@ update_task_status(memory_id: str, task_status: str) -> dict
 
 `PUT /v1/memory/{memory_id}/task-status`
 
-The API schema accepts `"planned"` | `"in_progress"` | `"done"` | `"dropped"`,
-but signed SDK callers are authorized only when the task's assignee exactly
-matches their verified agent ID. `planned`, unassigned pickup, and terminal
-reopen are local CEREBRUM operator actions and return HTTP 403/409 here.
+SDK callers may send `"in_progress"` | `"done"` | `"dropped"` only when the
+task's assignee exactly matches their verified agent ID and current domain
+write plus classification/read authority still holds. `planned`, unassigned
+pickup, and terminal reopen are local CEREBRUM operator actions and return HTTP
+403/409 here.
 
 ---
 
@@ -667,6 +732,10 @@ pipe_status(pipe_id: str) -> PipeMessage
 ```
 
 `GET /v1/pipe/{pipe_id}`
+
+This inspects the current node's local pipeline workflow row. It is not proof
+that a remote recipient received or read the message. Sender-queryable
+successful-delivery and claim/read receipts are explicitly deferred to v11.16.
 
 `PipeMessage` includes additive `source_chain_id`, `source_pipe_id`,
 `destination_chain_id`, `reply_source_chain_id`, policy/agreement/contact
@@ -1280,13 +1349,61 @@ Source: `sdk/python/src/sage_sdk/models.py`
 |---|---|---|
 | `content` | `str` | required |
 | `memory_type` | `MemoryType` | required |
-| `domain_tag` | `str` | required |
+| `domain_tag` | `str \| None` | required argument; `None` is valid only for an app-v23 task and is omitted from the wire |
 | `confidence_score` | `float` | required |
 | `embedding` | `list[float] \| None` | `None` |
 | `knowledge_triples` | `list[KnowledgeTriple] \| None` | `None` |
 | `parent_hash` | `str \| None` | `None` |
 | `tags` | `list[str] \| None` | `None` |
+| `provider` | `str \| None` | `None` |
+| `task_status` | `TaskStatus \| None` | `None`; new tasks accept only `planned` |
+| `linked_memories` | `list[str] \| None` | `None`; rejected for app-v23 task creation |
+| `idempotency_key` | `str \| None` | `None`; app-v23 task node derives permanent semantic key |
 | `classification` | `int \| None` | `None` → excluded from wire via `exclude_none=True` |
+
+---
+
+### `MemorySubmitResponse`
+
+| Field | Type | Notes |
+|---|---|---|
+| `memory_id` | `str` | Exact committed ID; reconcile this ID on HTTP 202 |
+| `tx_hash` | `str` | Original transaction hash, including replay |
+| `status` | `str` | `proposed` or `committed_unconfirmed` |
+| `task_status` | `str \| None` | Current task status; a replay may be terminal |
+| `committed` | `bool \| None` | Chain commit, not projection confirmation |
+| `committed_height` | `int \| None` | Original commit height |
+| `projection_confirmed` | `bool \| None` | False only for committed-unconfirmed task response |
+| `retryable` | `bool \| None` | False on committed-unconfirmed |
+| `message` | `str \| None` | Reconciliation guidance when needed |
+| `idempotency_key` | `str \| None` | Explicit or node-derived permanent task key |
+| `idempotent_replay` | `bool` | True means no new task was created |
+| `embedding_provider` | `str \| None` | Node-selected vector provider |
+| `embedding_queued` | `bool` | Node will repair a missing vector |
+
+---
+
+### Recall/list filter and pagination models
+
+`FilterInfo.by` identifies applied authorization paths. Its
+`total_before_filter`, `visible`, and `hidden_count` fields exist only for
+compatibility with pre-app-v23 nodes; app-v23 omits denied/raw inventory
+counts.
+
+`MemoryListResponse` adds `has_more: bool | None`,
+`total_exact: bool | None`, and `filtered: FilterInfo | None`. A current
+app-v23 response always supplies the first two fields. `MemoryQueryResponse`
+also preserves `filtered`; its `total_count` is the visible result count in that
+response.
+
+---
+
+### `TaskRecord`
+
+In addition to task content/domain/status/confidence/timestamp,
+`TaskRecord` preserves `assignee`, `task_picked_up_by`, and
+`task_picked_up_at`. They are optional only for compatibility with older
+servers.
 
 ---
 
@@ -1376,17 +1493,24 @@ Source: `sdk/python/src/sage_sdk/exceptions.py`
 
 ```
 SageError                  # base
-├── SageAuthError          # HTTP 401/403 — raised directly (not returned) by from_response
-└── SageAPIError           # all other 4xx/5xx
+└── SageAPIError           # all 4xx/5xx
+    ├── SageAuthError      # HTTP 401/403
     ├── SageNotFoundError  # HTTP 404
     └── SageValidationError # HTTP 422
 ```
 
-`SageAPIError` attributes: `status_code: int`, `detail: str`, `error_type: str | None`.
+`SageAPIError` attributes: `status_code: int`, `detail: str`,
+`error_type: str | None`, `reason_code: str | None`, `remedy: str | None`,
+and `retryable: bool | None`. `SageAuthError` is a `SageAPIError`, so callers
+may catch it specifically or through the API base class.
 
-**Auth errors:** `SageAPIError.from_response` *raises* `SageAuthError` for 401/403 rather than returning it, so `except SageAPIError` will not catch auth failures — catch `SageAuthError` explicitly.
-
-**ABCI Code 50** (`shared domain not ownable`): surfaces as HTTP 403 / `SageAuthError`. Detect by checking `str(e)` or the detail string for `"shared domain not ownable"` — there is no dedicated exception class (source: `exceptions.py:78`).
+Canonical app-v23 memory-write denials have
+`error_type="https://sage.dev/errors/domain-write-denied"`, one of the seven
+stable `reason_code` values, an exact `remedy`, and `retryable=False`. Branch on
+those fields, never on human-readable `detail`. For `missing_write_grant`,
+v11.15.0 directs the agent to its owned domain or, when broader shared
+management is intended, to a Root/Admin-approved Manager Access Group; it does
+not claim that CEREBRUM has a direct level-2 grant editor.
 
 ```python
 from sage_sdk.exceptions import SageError, SageAPIError, SageAuthError, SageNotFoundError, SageValidationError
@@ -1396,7 +1520,7 @@ try:
 except SageNotFoundError as e:
     print(e.detail)         # "memory not found"
 except SageAuthError as e:
-    print(str(e))           # "no write access" or clearance error
+    print(e.reason_code, e.remedy, e.retryable)
 except SageAPIError as e:
     print(e.status_code, e.detail)
 ```

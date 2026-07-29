@@ -86,6 +86,101 @@ func TestIdempotentReadRetriesDuringNodeStartup(t *testing.T) {
 		}, nil
 	})}
 	var out map[string]any
-	require.NoError(t, server.doSignedJSON(context.Background(), http.MethodGet, "/v1/status", nil, &out))
+	require.NoError(t, server.doSignedJSON(context.Background(), http.MethodGet, "/v1/dashboard/stats", nil, &out))
 	require.Equal(t, int32(3), attempts.Load())
+}
+
+func TestSignedRequestReplayClassificationFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		want   signedRequestReplaySafety
+	}{
+		{name: "safe dashboard read", method: http.MethodGet, path: "/v1/dashboard/stats", want: signedRequestReplaySafe},
+		{name: "safe memory detail", method: http.MethodGet, path: "/v1/memory/mem-1", want: signedRequestReplaySafe},
+		{name: "safe pipe detail", method: http.MethodGet, path: "/v1/pipe/pipe-1", want: signedRequestReplaySafe},
+		{name: "passive results projection", method: http.MethodGet, path: "/v1/pipe/results?limit=5", want: signedRequestReplaySafe},
+		{name: "destructive pipe inbox", method: http.MethodGet, path: "/v1/pipe/inbox?limit=5", want: signedRequestSingleAttempt},
+		{name: "destructive pipe updates", method: http.MethodGet, path: "/v1/pipe/updates?limit=5", want: signedRequestSingleAttempt},
+		{name: "destructive task notifications", method: http.MethodGet, path: "/v1/dashboard/task-notifications?limit=5", want: signedRequestSingleAttempt},
+		{name: "unknown get fails closed", method: http.MethodGet, path: "/v1/future/read", want: signedRequestSingleAttempt},
+		{name: "unknown nested memory get fails closed", method: http.MethodGet, path: "/v1/memory/mem-1/future-read", want: signedRequestSingleAttempt},
+		{name: "unknown nested pipe get fails closed", method: http.MethodGet, path: "/v1/pipe/pipe-1/future-read", want: signedRequestSingleAttempt},
+		{name: "unknown post fails closed", method: http.MethodPost, path: "/v1/future/query", want: signedRequestSingleAttempt},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, classifySignedRequestReplay(test.method, test.path))
+		})
+	}
+}
+
+func TestDestructiveGETsNeverRetryAmbiguousFailures(t *testing.T) {
+	paths := []string{
+		"/v1/pipe/inbox?limit=5",
+		"/v1/pipe/updates?limit=5",
+		"/v1/dashboard/task-notifications?limit=5",
+	}
+	for _, path := range paths {
+		t.Run(path+"/transport_error", func(t *testing.T) {
+			_, priv, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
+			server := NewServer("http://localhost:8080", priv)
+			var attempts atomic.Int32
+			server.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return nil, errors.New("unexpected EOF after request may have reached server")
+			})}
+
+			var out map[string]any
+			require.Error(t, server.doSignedJSON(context.Background(), http.MethodGet, path, nil, &out))
+			require.Equal(t, int32(1), attempts.Load())
+		})
+
+		t.Run(path+"/retryable_http_status", func(t *testing.T) {
+			_, priv, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
+			server := NewServer("http://localhost:8080", priv)
+			var attempts atomic.Int32
+			server.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Body:       io.NopCloser(strings.NewReader(`{"detail":"response unavailable after mutation"}`)),
+					Header:     make(http.Header),
+				}, nil
+			})}
+
+			var out map[string]any
+			require.Error(t, server.doSignedJSON(context.Background(), http.MethodGet, path, nil, &out))
+			require.Equal(t, int32(1), attempts.Load())
+		})
+	}
+}
+
+func TestPassivePipelineResultsRemainsRetryable(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	server := NewServer("http://localhost:8080", priv)
+	var attempts atomic.Int32
+	server.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		if attempts.Add(1) == 1 {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader(`{"detail":"node starting"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"items":[],"count":0}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	var out map[string]any
+	require.NoError(t, server.doSignedJSON(
+		context.Background(), http.MethodGet, "/v1/pipe/results?limit=5", nil, &out,
+	))
+	require.Equal(t, int32(2), attempts.Load())
 }

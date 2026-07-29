@@ -316,11 +316,11 @@ func (h *DashboardHandler) handleRecoverLedger(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Attach vault to the store and unlock.
-	if vs, ok := h.store.(VaultStore); ok {
-		vs.SetVault(v)
+	// Attach the vault before opening any locked-startup transaction latch.
+	if err := h.publishUnlockedVault(v, body.NewPassphrase); err != nil {
+		writeError(w, http.StatusInternalServerError, "vault recovered but serving projection could not be unlocked")
+		return
 	}
-	h.VaultLocked.Store(false)
 	h.startPostUnlockRepairs()
 	// Recovery is an unauthenticated route because the recovery key is the
 	// credential. Once it succeeds, establish the ordinary dashboard session in

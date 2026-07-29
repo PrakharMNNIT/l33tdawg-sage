@@ -36,3 +36,21 @@ func TestSupplementaryCachePopRejectsExpiredData(t *testing.T) {
 	assert.Nil(t, cache.Pop("expired"))
 	assert.Empty(t, cache.items)
 }
+
+func TestSupplementaryCachePutForSurvivesDefaultExpiryWindow(t *testing.T) {
+	cache := NewSupplementaryCache()
+	cache.PutFor(
+		"slow-task",
+		&memory.SupplementaryData{Assignee: "mynah"},
+		2*time.Minute,
+	)
+
+	cache.mu.Lock()
+	cache.items["slow-task"].storedAt = time.Now().Add(-61 * time.Second)
+	cache.pruneExpiredLocked(time.Now())
+	cache.mu.Unlock()
+
+	staged := cache.Pop("slow-task")
+	require.NotNil(t, staged)
+	assert.Equal(t, "mynah", staged.Assignee)
+}

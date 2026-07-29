@@ -6,10 +6,10 @@
 // invariant in processUpgradePropose causes subsequent ticks to be
 // no-ops once a plan lands.
 //
-// Identity model: the proposal is signed with the node operator's
-// agent key (the same key the REST server uses for RBAC). This matches
-// the existing verifyAgentIdentity contract on processUpgradePropose
-// without inventing a new node-validator-signature path.
+// Identity model: before app-v23 the proposal is signed with the node
+// operator's agent key. Once app-v23 is active it is signed with the currently
+// committed CEREBRUM Root credential, resolved afresh for every tx so a Root
+// rotation cannot leave the watchdog using a stale genesis key.
 package main
 
 import (
@@ -69,10 +69,17 @@ const upgradeTargetAppVersion uint64 = 6
 type upgradeWatchdogConfig struct {
 	BinaryVersion string             // ldflags-injected version string
 	ChainID       string             // authoritative CometBFT genesis chain_id
-	AgentKey      ed25519.PrivateKey // operator's signing key
+	AgentKey      ed25519.PrivateKey // legacy/static signing key fallback
 	CometRPC      string             // e.g. "http://127.0.0.1:26657"
 	TickInterval  time.Duration      // default 30s if zero
 	Logger        zerolog.Logger
+
+	// ResolveSigningKey returns the signing identity for this individual tx.
+	// The serving node wires this to consensus Root state plus the local key
+	// resolver. It deliberately runs at build time rather than startup: tx-39
+	// can rotate Root while the watchdog is walking the fork ladder. Nil keeps
+	// legacy tests and explicit CLI --agent-key callers on AgentKey.
+	ResolveSigningKey func() (ed25519.PrivateKey, error)
 
 	// PersonalMode is true on a single-validator node (quorum disabled). Only
 	// personal nodes auto-advance past the legacy target-6 behavior: the node
@@ -83,8 +90,16 @@ type upgradeWatchdogConfig struct {
 
 	// AutoAdvance enables the v10.5.1 personal-mode ladder walk (the
 	// "clicking update brings the chain up to date" fix, issue #40 follow-up).
-	// Wired from config: disable_auto_upgrade inverts it.
+	// Wired from config: disable_auto_upgrade inverts it above the mandatory
+	// release floor.
 	AutoAdvance bool
+
+	// RequiredAppVersion is the minimum consensus security floor this binary
+	// must reach on a personal node even when the operator disabled optional
+	// automatic upgrades. It never bypasses the sequential fork ladder and is
+	// deliberately ignored for quorum networks, where every activation remains
+	// a governed multi-validator decision.
+	RequiredAppVersion uint64
 
 	// PendingPlan reads the chain's pending UpgradePlan straight from the
 	// node's store: (nil, nil) when none is pending. Wired in-process by
@@ -118,7 +133,7 @@ func startUpgradeWorker(cfg upgradeWatchdogConfig, fn func()) {
 // Returns false if the watchdog won't run (target == current, key
 // missing, etc.) so the caller can log accordingly.
 func startUpgradeWatchdog(ctx context.Context, cfg upgradeWatchdogConfig) bool {
-	if cfg.AgentKey == nil {
+	if cfg.AgentKey == nil && cfg.ResolveSigningKey == nil {
 		cfg.Logger.Debug().Msg("upgrade watchdog: no agent key, skipping")
 		return false
 	}
@@ -132,16 +147,20 @@ func startUpgradeWatchdog(ctx context.Context, cfg upgradeWatchdogConfig) bool {
 	// quiescent chain is frozen governance regardless of how it was proposed.
 	startPendingPlanPump(ctx, cfg)
 
-	// v10.5.1 personal-mode auto-advance: walk the governance fork ladder to
-	// the binary's compiled ceiling instead of stopping at the legacy PoE
-	// target. Replaces (supersedes) the legacy loop on personal nodes.
-	if cfg.PersonalMode && cfg.AutoAdvance {
+	// Personal-mode auto-advance walks either to the compiled ceiling or, when
+	// optional automation is disabled, only to this release's mandatory
+	// security floor. A personal node is its whole validator set, so the ladder
+	// still uses the ordinary governed proposal/activation path rather than a
+	// local state rewrite.
+	autoAdvanceCeiling := personalAutoAdvanceCeiling(cfg, sageabci.MaxSupportedAppVersion())
+	if cfg.PersonalMode && autoAdvanceCeiling > 1 {
 		startUpgradeWorker(cfg, func() { runAutoAdvance(ctx, cfg, interval) })
 		cfg.Logger.Info().
-			Uint64("max_app_version", sageabci.MaxSupportedAppVersion()).
+			Uint64("target_app_version", autoAdvanceCeiling).
+			Bool("optional_auto_advance", cfg.AutoAdvance).
 			Str("binary_version", cfg.BinaryVersion).
 			Dur("interval", interval).
-			Msg("v10.5.1 upgrade auto-advance armed — personal node will walk the fork ladder to the binary ceiling")
+			Msg("personal-node upgrade ladder armed")
 		return true
 	}
 
@@ -234,6 +253,19 @@ func pickAutoAdvanceTarget(current, maxSupported uint64) uint64 {
 	}
 }
 
+func personalAutoAdvanceCeiling(cfg upgradeWatchdogConfig, maxSupported uint64) uint64 {
+	if !cfg.PersonalMode {
+		return 0
+	}
+	if cfg.AutoAdvance {
+		return maxSupported
+	}
+	if cfg.RequiredAppVersion > maxSupported {
+		return maxSupported
+	}
+	return cfg.RequiredAppVersion
+}
+
 func runAutoAdvance(ctx context.Context, cfg upgradeWatchdogConfig, interval time.Duration) {
 	// First tick on a short delay so the chain has time to start producing.
 	first := time.NewTimer(10 * time.Second)
@@ -244,7 +276,10 @@ func runAutoAdvance(ctx context.Context, cfg upgradeWatchdogConfig, interval tim
 	case <-first.C:
 	}
 
-	maxSupported := sageabci.MaxSupportedAppVersion()
+	maxSupported := personalAutoAdvanceCeiling(cfg, sageabci.MaxSupportedAppVersion())
+	if maxSupported <= 1 {
+		return
+	}
 	adminEnsured := false
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -454,7 +489,11 @@ func sendHeartbeatTx(ctx context.Context, cfg upgradeWatchdogConfig) {
 // open-door admin self-grant and as the heartbeat tx. Mirrors the agent-proof
 // format signAgentProof/verifyAgentIdentity expect.
 func buildOperatorRegisterTx(cfg upgradeWatchdogConfig) ([]byte, error) {
-	pub, ok := cfg.AgentKey.Public().(ed25519.PublicKey)
+	signingKey, err := resolveUpgradeSigningKey(cfg)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := signingKey.Public().(ed25519.PublicKey)
 	if !ok {
 		return nil, fmt.Errorf("agent key public type assertion failed")
 	}
@@ -464,11 +503,11 @@ func buildOperatorRegisterTx(cfg upgradeWatchdogConfig) ([]byte, error) {
 	ts := time.Now().Unix()
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts)) // #nosec G115 -- ts non-negative
-	sig := ed25519.Sign(cfg.AgentKey, append(append([]byte{}, bodyHash[:]...), tsBytes...))
+	sig := ed25519.Sign(signingKey, append(append([]byte{}, bodyHash[:]...), tsBytes...))
 
 	ptx := &tx.ParsedTx{
 		Type:      tx.TxTypeAgentRegister,
-		Nonce:     tx.MonotonicNonce(cfg.AgentKey),
+		Nonce:     tx.MonotonicNonce(signingKey),
 		Timestamp: time.Unix(ts, 0),
 		AgentRegister: &tx.AgentRegister{
 			AgentID: hex.EncodeToString(pub),
@@ -481,7 +520,7 @@ func buildOperatorRegisterTx(cfg upgradeWatchdogConfig) ([]byte, error) {
 		AgentBodyHash:  bodyHash[:],
 		AgentTimestamp: ts,
 	}
-	if err := tx.SignTx(ptx, cfg.AgentKey); err != nil {
+	if err := tx.SignTx(ptx, signingKey); err != nil {
 		return nil, fmt.Errorf("sign outer tx: %w", err)
 	}
 	return tx.EncodeTx(ptx)
@@ -593,7 +632,11 @@ func maybeProposeUpgrade(ctx context.Context, cfg upgradeWatchdogConfig) bool {
 // operator `upgrade propose` subcommand passes a validated, strictly-sequential
 // target to reach the governance-gated app-v7…app-v10 forks. See issue #32.
 func buildUpgradeProposeTx(cfg upgradeWatchdogConfig, target uint64) (*tx.ParsedTx, error) {
-	pub, ok := cfg.AgentKey.Public().(ed25519.PublicKey)
+	signingKey, err := resolveUpgradeSigningKey(cfg)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := signingKey.Public().(ed25519.PublicKey)
 	if !ok {
 		return nil, fmt.Errorf("agent key public type assertion failed")
 	}
@@ -615,7 +658,7 @@ func buildUpgradeProposeTx(cfg upgradeWatchdogConfig, target uint64) (*tx.Parsed
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(ts)) // #nosec G115 -- ts non-negative
 	message := append(append([]byte{}, bodyHash[:]...), tsBytes...)
-	sig := ed25519.Sign(cfg.AgentKey, message)
+	sig := ed25519.Sign(signingKey, message)
 
 	binarySHA, _ := computeSelfBinarySHA256()
 	var governanceDomain string
@@ -629,7 +672,7 @@ func buildUpgradeProposeTx(cfg upgradeWatchdogConfig, target uint64) (*tx.Parsed
 
 	ptx := &tx.ParsedTx{
 		Type:           tx.TxTypeUpgradePropose,
-		Nonce:          tx.MonotonicNonce(cfg.AgentKey), // strictly increasing per signing key (app-v9 consensus nonce gate)
+		Nonce:          tx.MonotonicNonce(signingKey), // strictly increasing per signing key (app-v9 consensus nonce gate)
 		Timestamp:      time.Unix(ts, 0),
 		AgentPubKey:    pub,
 		AgentSig:       sig,
@@ -645,10 +688,29 @@ func buildUpgradeProposeTx(cfg upgradeWatchdogConfig, target uint64) (*tx.Parsed
 		},
 	}
 	// Outer tx-level signature for CheckTx (separate from the agent proof).
-	if err := tx.SignTx(ptx, cfg.AgentKey); err != nil {
+	if err := tx.SignTx(ptx, signingKey); err != nil {
 		return nil, fmt.Errorf("sign outer tx: %w", err)
 	}
 	return ptx, nil
+}
+
+func resolveUpgradeSigningKey(cfg upgradeWatchdogConfig) (ed25519.PrivateKey, error) {
+	key := cfg.AgentKey
+	if cfg.ResolveSigningKey != nil {
+		resolved, err := cfg.ResolveSigningKey()
+		if err != nil {
+			return nil, fmt.Errorf("resolve upgrade signing key: %w", err)
+		}
+		key = resolved
+	}
+	if len(key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("upgrade signing key unavailable")
+	}
+	pub, ok := key.Public().(ed25519.PublicKey)
+	if !ok || len(pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("upgrade signing key has invalid public key")
+	}
+	return key, nil
 }
 
 // loadOperatorAgentKey reads ~/.sage/agent.key and returns it as an
@@ -673,10 +735,6 @@ func loadOperatorAgentKeyAt(path string, logger zerolog.Logger) ed25519.PrivateK
 		logger.Warn().Int("size", len(data)).Msg("upgrade watchdog: agent.key has unexpected length")
 		return nil
 	}
-}
-
-func loadOperatorAgentKey(logger zerolog.Logger) ed25519.PrivateKey {
-	return loadOperatorAgentKeyAt(filepath.Join(SageHome(), "agent.key"), logger)
 }
 
 // computeSelfBinarySHA256 hashes the running binary's bytes so the

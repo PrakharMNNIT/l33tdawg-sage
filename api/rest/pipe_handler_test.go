@@ -3,10 +3,13 @@ package rest
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,12 +29,31 @@ import (
 
 type remotePipeResolver struct {
 	*fakeFederation
-	target *federation.RemotePipeTarget
-	err    error
+	target             *federation.RemotePipeTarget
+	err                error
+	linkedTarget       *federation.RemotePipeTarget
+	linkedErr          error
+	linkedSourceAgent  string
+	linkedTargetString string
 }
 
 func (r *remotePipeResolver) ResolveRemotePipeTarget(context.Context, string) (*federation.RemotePipeTarget, error) {
 	return r.target, r.err
+}
+
+func (r *remotePipeResolver) ResolveRemoteLinkedPipeTarget(
+	_ context.Context,
+	sourceAgentID, target string,
+) (*federation.RemotePipeTarget, error) {
+	r.linkedSourceAgent = sourceAgentID
+	r.linkedTargetString = target
+	if r.linkedErr != nil {
+		return nil, r.linkedErr
+	}
+	if r.linkedTarget == nil {
+		return nil, federation.ErrRemotePipeTargetNotFound
+	}
+	return r.linkedTarget, nil
 }
 
 func (r *remotePipeResolver) NudgePipelineTransport() {}
@@ -52,6 +74,195 @@ func decodeProblem(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
 	var problem map[string]any
 	require.NoError(t, json.NewDecoder(rr.Body).Decode(&problem))
 	return problem
+}
+
+func configurePostV23PipeRoot(t *testing.T, s *Server, memStore *store.SQLiteStore) (string, string, string, string) {
+	t.Helper()
+	rootPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	companionPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	retiredPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	currentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	rootID := fmt.Sprintf("%x", rootPub)
+	retiredID := fmt.Sprintf("%x", retiredPub)
+	currentID := fmt.Sprintf("%x", currentPub)
+	companionID := fmt.Sprintf("%x", companionPub)
+	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "pipe-v23-badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = badger.CloseBadger() })
+	require.NoError(t, badger.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: rootID, Scope: "pipe-test", AgentID: companionID,
+		Profile: store.AppV23ProfileStandard, HomeDomain: "companion-home",
+		Clearance: 1, Height: 1, BootstrapDigest: strings.Repeat("01", 32),
+	}))
+	require.NoError(t, badger.RotateAppV23RootCredential(1, retiredID, 2))
+	require.NoError(t, badger.RotateAppV23RootCredential(2, currentID, 3))
+	s.badgerStore = badger
+	s.SetPostV23ForNextTxAccessor(func() bool { return true })
+	for _, agent := range []*store.AgentEntry{
+		{AgentID: rootID, Name: "root-principal", Provider: "root-principal-provider", Status: "active"},
+		{AgentID: retiredID, Name: "root-retired", Provider: "root-retired-provider", Status: "active"},
+		{AgentID: currentID, Name: "root-current", Provider: "root-current-provider", Status: "active"},
+	} {
+		require.NoError(t, memStore.CreateAgent(context.Background(), agent))
+	}
+	return rootID, retiredID, currentID, companionID
+}
+
+func TestAppV23PipeRejectsAndHidesEveryRootGeneration(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	rootPrincipal, retiredRoot, currentRoot, _ := configurePostV23PipeRoot(t, s, memStore)
+
+	nextReached := false
+	boundary := s.appV23PipelineAgentBoundary(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		nextReached = true
+	}))
+	for _, caller := range []string{rootPrincipal, retiredRoot, currentRoot} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/pipe/inbox", nil)
+		req = req.WithContext(middleware.WithAgentID(req.Context(), caller))
+		boundary.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusForbidden, rr.Code, rr.Body.String())
+		require.Equal(t, "https://sage.dev/errors/root-not-agent", decodeProblem(t, rr)["type"])
+	}
+	require.False(t, nextReached)
+
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{name: "exact immutable principal", body: map[string]any{"to": rootPrincipal}},
+		{name: "exact retired generation", body: map[string]any{"to": retiredRoot}},
+		{name: "exact current credential", body: map[string]any{"to": currentRoot}},
+		{name: "principal name", body: map[string]any{"to": "root-principal"}},
+		{name: "retired provider", body: map[string]any{"to": "root-retired-provider"}},
+		{name: "current provider", body: map[string]any{"to": "root-current-provider"}},
+	} {
+		t.Run("resolve "+tc.name, func(t *testing.T) {
+			body, err := json.Marshal(tc.body)
+			require.NoError(t, err)
+			rr := httptest.NewRecorder()
+			pipeRouterAs(s, "ordinary-caller").ServeHTTP(rr,
+				httptest.NewRequest(http.MethodPost, "/v1/pipe/resolve", bytes.NewReader(body)))
+			require.Equal(t, http.StatusNotFound, rr.Code, rr.Body.String())
+		})
+	}
+
+	for _, target := range []string{rootPrincipal, retiredRoot, currentRoot} {
+		body, err := json.Marshal(map[string]any{"to_agent": target, "payload": "must not queue"})
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+		pipeRouterAs(s, "ordinary-caller").ServeHTTP(rr,
+			httptest.NewRequest(http.MethodPost, "/v1/pipe/send", bytes.NewReader(body)))
+		require.Equal(t, http.StatusNotFound, rr.Code, rr.Body.String())
+	}
+	pipes, err := memStore.ListPipelines(context.Background(), "", 10)
+	require.NoError(t, err)
+	require.Empty(t, pipes)
+}
+
+func TestAppV23PipelineBoundaryRequiresActiveOrdinaryEnrollment(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	_, _, currentRoot, companionID := configurePostV23PipeRoot(t, s, memStore)
+	nextReached := false
+	boundary := s.appV23PipelineAgentBoundary(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		nextReached = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	call := func(agentID string) *httptest.ResponseRecorder {
+		nextReached = false
+		req := httptest.NewRequest(http.MethodGet, "/v1/pipe/inbox", nil)
+		req = req.WithContext(middleware.WithAgentID(req.Context(), agentID))
+		rr := httptest.NewRecorder()
+		boundary.ServeHTTP(rr, req)
+		return rr
+	}
+
+	active := call(companionID)
+	require.Equal(t, http.StatusNoContent, active.Code, active.Body.String())
+	assert.True(t, nextReached)
+
+	pendingPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pendingID := fmt.Sprintf("%x", pendingPub)
+	require.NoError(t, s.badgerStore.RegisterAgentWithCapabilities(
+		pendingID, "pending", store.AppV23RoleMember, "", "", "", 1,
+		store.DefaultSelfRegisteredAgentCapabilities,
+	))
+	pending := call(pendingID)
+	require.Equal(t, http.StatusForbidden, pending.Code, pending.Body.String())
+	assert.False(t, nextReached)
+	pendingBody := pending.Body.String()
+	assert.Equal(t, "https://sage.dev/errors/active-agent-required", decodeProblem(t, pending)["type"])
+
+	require.NoError(t, s.badgerStore.ApproveAppV23LocalAgent(
+		store.AppV23LocalEnrollment{
+			AgentID: companionID, Active: false, Profile: store.AppV23ProfileStandard,
+			ApprovedBy: currentRoot, RootGeneration: 3, UpdatedHeight: 4,
+		},
+		store.AppV23RoleMember, 1, 1,
+	))
+	inactive := call(companionID)
+	require.Equal(t, http.StatusForbidden, inactive.Code, inactive.Body.String())
+	assert.False(t, nextReached)
+	assert.Equal(t, pendingBody, inactive.Body.String(),
+		"pending and retired/inactive ordinary credentials must be non-enumerating")
+}
+
+func TestAppV23LocalPipeTargetsRequireActiveOrdinaryEnrollment(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	_, _, currentRoot, companionID := configurePostV23PipeRoot(t, s, memStore)
+	require.NoError(t, memStore.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: companionID, Name: "Active companion", Provider: "companion-provider",
+		Role: store.AppV23RoleMember, Status: "active",
+	}))
+
+	resolve := func(to string) *httptest.ResponseRecorder {
+		body, err := json.Marshal(map[string]any{"to": to})
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+		pipeRouterAs(s, "caller").ServeHTTP(rr,
+			httptest.NewRequest(http.MethodPost, "/v1/pipe/resolve", bytes.NewReader(body)))
+		return rr
+	}
+	send := func(body map[string]any) *httptest.ResponseRecorder {
+		raw, err := json.Marshal(body)
+		require.NoError(t, err)
+		rr := httptest.NewRecorder()
+		pipeRouterAs(s, "caller").ServeHTTP(rr,
+			httptest.NewRequest(http.MethodPost, "/v1/pipe/send", bytes.NewReader(raw)))
+		return rr
+	}
+	require.Equal(t, http.StatusOK, resolve(companionID).Code)
+	require.Equal(t, http.StatusOK, resolve("companion-provider").Code)
+	require.Equal(t, http.StatusCreated, send(map[string]any{
+		"to_agent": companionID, "payload": "before retirement",
+	}).Code)
+
+	require.NoError(t, s.badgerStore.ApproveAppV23LocalAgent(
+		store.AppV23LocalEnrollment{
+			AgentID: companionID, Active: false, Profile: store.AppV23ProfileStandard,
+			ApprovedBy: currentRoot, RootGeneration: 3, UpdatedHeight: 4,
+		},
+		store.AppV23RoleMember, 1, 1,
+	))
+	for _, target := range []string{companionID, "Active companion", "companion-provider"} {
+		rr := resolve(target)
+		require.Equal(t, http.StatusNotFound, rr.Code, "%s: %s", target, rr.Body.String())
+	}
+	for _, body := range []map[string]any{
+		{"to_agent": companionID, "payload": "must not queue"},
+		{"to_provider": "companion-provider", "payload": "must not queue"},
+	} {
+		rr := send(body)
+		require.Equal(t, http.StatusNotFound, rr.Code, rr.Body.String())
+	}
+	pipes, err := memStore.ListPipelines(context.Background(), "", 10)
+	require.NoError(t, err)
+	require.Len(t, pipes, 1, "only the pre-retirement message may exist")
 }
 
 func TestHandlePipeSend_PayloadTooLarge(t *testing.T) {
@@ -134,6 +345,134 @@ func TestHandlePipeSend_QualifiedRemoteTargetStoresExactProvenance(t *testing.T)
 	inbox, err := memStore.GetInbox(context.Background(), remoteAgentID, "", 5)
 	require.NoError(t, err)
 	assert.Empty(t, inbox, "a queued remote target must never appear in a local inbox")
+}
+
+func TestLinkedV23ResolveAndSendPersistCallerBoundRelation(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	localSender := strings.Repeat("12", 32)
+	remoteAgentID := strings.Repeat("ab", 32)
+	relation := &federation.LinkedMessageRelation{
+		Version:     federation.LinkedMessageRelationVersion,
+		Direction:   federation.LinkedMessageMemberToGuest,
+		HostChainID: "chain-local", PeerChainID: "chain-peer",
+		SourceAgentID: localSender, TargetAgentID: remoteAgentID,
+		GroupRevision: 2, HostAgreementDigest: strings.Repeat("aa", 32),
+		ReceiverConsentRevision: 3,
+		Guest: store.FederatedGroupGuest{
+			GroupID: "linked-team", RemoteChainID: "chain-peer",
+			RemoteAgentID: remoteAgentID, State: store.FederatedGuestStateActive,
+		},
+	}
+	target := &federation.RemotePipeTarget{
+		ChainID: "chain-peer", AgentID: remoteAgentID,
+		ContactID: strings.Repeat("cd", 32), ContactRevision: strings.Repeat("de", 32),
+		PolicyEpoch: "epoch-linked", AgreementID: strings.Repeat("ef", 32),
+		Address:           remoteAgentID + "@chain-peer",
+		AuthorizationMode: federation.LinkedMessageAuthorizationMode,
+		LinkedRelation:    relation,
+	}
+	resolver := &remotePipeResolver{
+		fakeFederation: &fakeFederation{},
+		// The same exact remote identity also exists as an ordinary contact,
+		// but that contact exposes no caller-visible domain. Exact linked-v23
+		// authorization must win this collision instead of being shadowed.
+		target: &federation.RemotePipeTarget{
+			ChainID: "chain-peer", AgentID: remoteAgentID,
+			ContactID: strings.Repeat("44", 32), ContactRevision: strings.Repeat("55", 32),
+			PolicyEpoch: "ordinary-epoch", AgreementID: strings.Repeat("66", 32),
+		},
+		linkedTarget: target,
+	}
+	s.SetFederation(resolver)
+	s.nodeOperatorID = localSender
+	exact := remoteAgentID + "@chain-peer"
+
+	resolveBody, err := json.Marshal(map[string]any{"to": exact})
+	require.NoError(t, err)
+	resolveRR := httptest.NewRecorder()
+	pipeRouterAs(s, localSender).ServeHTTP(resolveRR,
+		httptest.NewRequest(http.MethodPost, "/v1/pipe/resolve", bytes.NewReader(resolveBody)))
+	require.Equal(t, http.StatusOK, resolveRR.Code, resolveRR.Body.String())
+	assert.Equal(t, localSender, resolver.linkedSourceAgent)
+	assert.Equal(t, exact, resolver.linkedTargetString)
+
+	sendBody, err := json.Marshal(map[string]any{
+		"to_agent": remoteAgentID, "source_chain_id": "chain-local",
+		"destination_chain_id": "chain-peer", "payload": "linked work",
+	})
+	require.NoError(t, err)
+	sendReq := httptest.NewRequest(http.MethodPost, "/v1/pipe/send", bytes.NewReader(sendBody))
+	sendReq = sendReq.WithContext(middleware.WithAgentAuth(sendReq.Context(), &middleware.AgentAuthProof{
+		Signature: make([]byte, ed25519.SignatureSize), Timestamp: time.Now().Unix(),
+		Nonce: []byte("12345678"), CanonicalRequest: append([]byte("POST /v1/pipe/send\n"), sendBody...),
+	}))
+	sendRR := httptest.NewRecorder()
+	pipeRouterAs(s, localSender).ServeHTTP(sendRR, sendReq)
+	require.Equal(t, http.StatusCreated, sendRR.Code, sendRR.Body.String())
+	var response struct {
+		PipeID string `json:"pipe_id"`
+	}
+	require.NoError(t, json.NewDecoder(sendRR.Body).Decode(&response))
+	relationBytes, err := json.Marshal(relation)
+	require.NoError(t, err)
+	msg, err := memStore.GetPipeline(context.Background(), response.PipeID)
+	require.NoError(t, err)
+	assert.Equal(t, federation.LinkedMessageAuthorizationMode, msg.FederationAuthorizationMode)
+	assert.JSONEq(t, string(relationBytes), string(msg.FederationLinkedRelation))
+	pending, err := memStore.ListPendingPipelineTransport(
+		context.Background(), time.Now().Add(time.Minute), 10,
+	)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, federation.LinkedMessageAuthorizationMode, pending[0].AuthorizationMode)
+	assert.JSONEq(t, string(relationBytes), string(pending[0].LinkedRelation))
+}
+
+func TestLinkedV23ResultOutboxPreservesOriginalRelation(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	recipient := strings.Repeat("22", 32)
+	foreignAgent := strings.Repeat("33", 32)
+	relationBytes := []byte(`{"version":1,"direction":"guest_to_member","binding":"exact"}`)
+	now := time.Now().UTC()
+	require.NoError(t, memStore.InsertPipeline(context.Background(), &store.PipelineMessage{
+		PipeID: "pipe-linked-imported", FromAgent: foreignAgent, ToAgent: recipient,
+		Payload: "linked request", Status: "pending",
+		SourceChainID: "chain-peer", SourcePipeID: "peer-linked-pipe",
+		FederationPolicyEpoch:       "epoch-linked",
+		FederationAgreementID:       strings.Repeat("aa", 32),
+		FederationContactID:         strings.Repeat("bb", 32),
+		FederationContactRevision:   strings.Repeat("cc", 32),
+		FederationAuthorizationMode: federation.LinkedMessageAuthorizationMode,
+		FederationLinkedRelation:    append([]byte(nil), relationBytes...),
+		CreatedAt:                   now, ExpiresAt: now.Add(time.Hour),
+	}))
+	require.NoError(t, memStore.ClaimPipeline(
+		context.Background(), "pipe-linked-imported", recipient,
+	))
+	s.SetFederation(&remotePipeResolver{fakeFederation: &fakeFederation{}})
+	body, err := json.Marshal(map[string]any{
+		"result": "linked reply", "source_pipe_id": "peer-linked-pipe",
+		"source_chain_id": "chain-local",
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequest(
+		http.MethodPut, "/v1/pipe/pipe-linked-imported/result", bytes.NewReader(body),
+	)
+	req = req.WithContext(middleware.WithAgentAuth(req.Context(), &middleware.AgentAuthProof{
+		Signature: make([]byte, ed25519.SignatureSize), Timestamp: time.Now().Unix(),
+		Nonce: []byte("12345678"), CanonicalRequest: append([]byte("PUT /v1/pipe/pipe-linked-imported/result\n"), body...),
+	}))
+	rr := httptest.NewRecorder()
+	pipeRouterAs(s, recipient).ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	pending, err := memStore.ListPendingPipelineTransport(
+		context.Background(), time.Now().Add(time.Minute), 10,
+	)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "result", pending[0].EventKind)
+	assert.Equal(t, federation.LinkedMessageAuthorizationMode, pending[0].AuthorizationMode)
+	assert.JSONEq(t, string(relationBytes), string(pending[0].LinkedRelation))
 }
 
 func TestHandlePipeSend_QualifiedRemoteTargetNeverFallsBackLocal(t *testing.T) {

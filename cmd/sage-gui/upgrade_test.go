@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	sageabci "github.com/l33tdawg/sage/internal/abci"
 	"github.com/l33tdawg/sage/internal/tx"
 )
@@ -287,6 +289,61 @@ func TestUpgradePropose_AgentKey(t *testing.T) {
 	}
 	if !strings.Contains(msg, "Role==admin") {
 		t.Errorf("error should explain the chain-admin requirement; got: %v", err)
+	}
+}
+
+func TestResolveProposeSigningKeyUsesCurrentRotatedRootBundle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	oldKey, _ := testAgentKey(t, 0x81)
+	newKey, newID := testAgentKey(t, 0x82)
+	writeTestAgentKey(t, filepath.Join(home, "agent.key"), oldKey)
+	writeTestAgentKey(t, filepath.Join(home, "bundles", newID, "agent.key"), newKey)
+
+	value, err := json.Marshal(map[string]string{"credential_id": newID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/abci_query", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("path"); got != `"/appv23/root"` {
+			t.Errorf("query path = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{"response": map[string]any{
+				"code": 0, "value": base64.StdEncoding.EncodeToString(value),
+			}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	got, source, err := resolveProposeSigningKey("", 23, srv.URL, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("resolve current Root: %v", err)
+	}
+	if !got.Public().(ed25519.PublicKey).Equal(newKey.Public()) {
+		t.Fatal("default app-v23 proposal did not resolve the rotated Root bundle key")
+	}
+	if !strings.Contains(source, newID) {
+		t.Fatalf("source %q does not identify current Root %s", source, newID)
+	}
+}
+
+func TestResolveProposeSigningKeyExplicitOverrideWinsAtAppV23(t *testing.T) {
+	key, _ := testAgentKey(t, 0x83)
+	path := filepath.Join(t.TempDir(), "reviewed-admin.key")
+	writeTestAgentKey(t, path, key)
+
+	got, source, err := resolveProposeSigningKey(path, 23, "http://127.0.0.1:1", zerolog.Nop())
+	if err != nil {
+		t.Fatalf("explicit override: %v", err)
+	}
+	if !got.Public().(ed25519.PublicKey).Equal(key.Public()) {
+		t.Fatal("explicit --agent-key did not win")
+	}
+	if source != path {
+		t.Fatalf("source = %q, want %q", source, path)
 	}
 }
 

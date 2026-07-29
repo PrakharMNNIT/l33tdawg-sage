@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 )
@@ -61,9 +62,9 @@ func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}", h.handleGetAgent(agentStore))
 	r.Post("/v1/dashboard/network/agents", h.handleCreateAgent(agentStore))
 	r.Patch("/v1/dashboard/network/agents/{id}", h.handleUpdateAgent(agentStore))
-	r.Delete("/v1/dashboard/network/agents/{id}", handleRemoveAgent(agentStore, h.store))
-	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}/bundle", handleDownloadBundle(agentStore))
-	r.Post("/v1/dashboard/network/agents/{id}/rotate-key", handleRotateAgentKey(agentStore))
+	r.Delete("/v1/dashboard/network/agents/{id}", h.handleRemoveAgent(agentStore))
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}/bundle", h.handleDownloadBundle(agentStore))
+	r.Post("/v1/dashboard/network/agents/{id}/rotate-key", h.handleRotateAgentKey(agentStore))
 	r.Get("/v1/dashboard/network/templates", handleTemplates())
 	r.Get("/v1/dashboard/network/redeploy/status", h.handleRedeployStatusLive)
 	r.Post("/v1/dashboard/network/redeploy", h.handleTriggerRedeploy)
@@ -78,10 +79,21 @@ func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 	// domain's ownership + access on-chain without rewriting authorship.
 	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}/domains", h.handleAgentDomains(agentStore))
 	r.Post("/v1/dashboard/network/reassign-domain-ownership", h.handleReassignDomainOwnership(agentStore))
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/access", h.handleAppV23AccessState(agentStore))
+	r.With(h.cerebrumOperatorGate).Put("/v1/dashboard/network/access/agents/{id}/policy", h.handleAppV23AgentPolicy())
+	r.With(h.cerebrumOperatorGate).Put("/v1/dashboard/network/access/groups/{groupID}", h.handleAppV23AccessGroupPut())
+	r.With(h.cerebrumOperatorGate).Delete("/v1/dashboard/network/access/groups/{groupID}", h.handleAppV23AccessGroupDelete())
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/access/linked-readers", h.handleAppV23LinkedReadersList())
+	r.With(h.cerebrumOperatorGate).Post("/v1/dashboard/network/access/linked-readers/eligibility", h.handleAppV23LinkedReaderEligibility())
+	r.With(h.cerebrumOperatorGate).Post("/v1/dashboard/network/access/linked-readers", h.handleAppV23LinkedReaderMutation())
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/access/linked-messages/candidates", h.handleAppV23RemoteHostedLinkedMessageCandidates())
+	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/access/linked-messages/consent", h.handleAppV23LinkedMessageConsentGet())
+	r.With(h.cerebrumOperatorGate).Put("/v1/dashboard/network/access/linked-messages/consent", h.handleAppV23LinkedMessageConsentPut())
+	r.Post("/v1/dashboard/network/access/root/handover", h.handleAppV23RootCredentialHandover())
 
 	// Pairing code generation (authenticated — admin creates code for an agent)
 	if h.Pairing != nil {
-		registerPairingCreateRoute(r, agentStore, h.Pairing)
+		registerPairingCreateRoute(r, agentStore, h.Pairing, h.appV23IsRootIdentity)
 	}
 }
 
@@ -95,6 +107,14 @@ func (h *DashboardHandler) handleListAgents(agentStore store.AgentStore) http.Ha
 		if agents == nil {
 			agents = []*store.AgentEntry{}
 		}
+		filtered := make([]*store.AgentEntry, 0, len(agents))
+		for _, agent := range agents {
+			if agent == nil || h.appV23IsRootIdentity(agent.AgentID) {
+				continue
+			}
+			filtered = append(filtered, agent)
+		}
+		agents = filtered
 		if h.BadgerStore != nil {
 			for _, agent := range agents {
 				if onChain, getErr := h.BadgerStore.GetRegisteredAgent(agent.AgentID); getErr == nil && onChain != nil {
@@ -109,6 +129,10 @@ func (h *DashboardHandler) handleListAgents(agentStore store.AgentStore) http.Ha
 func (h *DashboardHandler) handleGetAgent(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
+		if h.appV23IsRootIdentity(id) {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
 		agent, err := agentStore.GetAgent(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusNotFound, "agent not found")
@@ -162,16 +186,6 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 			writeError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
-		normalizedDomainAccess, normalizeErr := normalizeDomainAccessBlob(req.DomainAccess)
-		if normalizeErr != nil {
-			writeError(w, http.StatusBadRequest, "invalid domain access policy")
-			return
-		}
-		if err := h.validateDomainAccessBlob(normalizedDomainAccess); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		req.DomainAccess = normalizedDomainAccess
 		if req.Name == "" {
 			writeError(w, http.StatusBadRequest, "name is required")
 			return
@@ -179,8 +193,47 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 		if req.Role == "" {
 			req.Role = "member"
 		}
-		if req.Clearance < 0 || req.Clearance > 4 {
-			req.Clearance = 1
+		requestedRole := strings.ToLower(strings.TrimSpace(req.Role))
+		if requestedRole == "" {
+			requestedRole = store.AppV23RoleMember
+		}
+		appV23PendingApproval := h.appV23IsActive()
+		if appV23PendingApproval {
+			if strings.TrimSpace(h.CometBFTRPC) == "" || h.BadgerStore == nil {
+				writeAppV23AccessError(w, http.StatusServiceUnavailable, "registration_consensus_unavailable",
+					"App-v23 agent creation requires commit-confirmed consensus state.")
+				return
+			}
+			root, rootErr := h.BadgerStore.GetAppV23Root()
+			if rootErr != nil || root == nil {
+				writeAppV23AccessError(w, http.StatusServiceUnavailable, "root_state_unavailable",
+					"Current CEREBRUM Root state is unavailable; no agent was generated.")
+				return
+			}
+			// AgentRegister is discoverability, not elevation. Every new
+			// app-v23 principal enters as a capability-restricted pending
+			// Member; Manager/Admin are applied later by tx-36 approval with
+			// target consent. Do not persist or stage any requested legacy
+			// policy field before that atomic approval.
+			req.Role = store.AppV23RoleMember
+			req.Clearance = 0
+			req.OrgID = ""
+			req.DeptID = ""
+			req.DomainAccess = ""
+		} else {
+			normalizedDomainAccess, normalizeErr := normalizeDomainAccessBlob(req.DomainAccess)
+			if normalizeErr != nil {
+				writeError(w, http.StatusBadRequest, "invalid domain access policy")
+				return
+			}
+			if err := h.validateDomainAccessBlob(normalizedDomainAccess); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			req.DomainAccess = normalizedDomainAccess
+			if req.Clearance < 0 || req.Clearance > 4 {
+				req.Clearance = 1
+			}
 		}
 
 		// Generate Ed25519 keypair server-side
@@ -218,11 +271,12 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 
 		// Broadcast on-chain registration through CometBFT (non-blocking).
 		// The ABCI processor will set on_chain_height in BadgerDB.
-		if h.CometBFTRPC != "" && h.SigningKey != nil {
+		if !appV23PendingApproval && h.CometBFTRPC != "" && h.SigningKey != nil {
 			h.runBackground(func(_ context.Context) {
+				registrationKey := h.SigningKey
 				registerTx := &tx.ParsedTx{
 					Type:      tx.TxTypeAgentRegister,
-					Nonce:     tx.MonotonicNonce(h.SigningKey),
+					Nonce:     tx.MonotonicNonce(registrationKey),
 					Timestamp: time.Now(),
 					AgentRegister: &tx.AgentRegister{
 						AgentID:    agentID,
@@ -233,8 +287,8 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 						P2PAddress: req.P2PAddress,
 					},
 				}
-				embedDashboardAgentProof(registerTx, h.SigningKey)
-				if signErr := tx.SignTx(registerTx, h.SigningKey); signErr != nil {
+				embedDashboardAgentProof(registerTx, registrationKey)
+				if signErr := tx.SignTx(registerTx, registrationKey); signErr != nil {
 					log.Printf("agent-create: on-chain AgentRegister sign failed for %s: %v", agentID, signErr)
 					return
 				}
@@ -309,23 +363,78 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 		claimExpiry := time.Now().Add(24 * time.Hour)
 		agent.ClaimToken = claimToken
 		agent.ClaimExpiresAt = &claimExpiry
-		if err := agentStore.UpdateAgent(r.Context(), agent); err != nil {
+		if updateErr := agentStore.UpdateAgent(r.Context(), agent); updateErr != nil {
 			writeError(w, http.StatusInternalServerError, "failed to save claim token")
 			return
 		}
 
-		writeJSONResp(w, http.StatusCreated, map[string]any{
-			"agent":           agent,
-			"agent_id":        agentID,
-			"claim_token":     claimToken,
-			"install_command": fmt.Sprintf("sage-gui mcp install --token %s", claimToken),
-		})
+		var registrationHash string
+		var registrationHeight int64
+		if appV23PendingApproval {
+			// The target's seed and recovery bundle are durable before its
+			// self-registration can commit. This avoids an irrecoverable
+			// pending principal whose consent key existed only in a goroutine.
+			registerTx := &tx.ParsedTx{
+				Type: tx.TxTypeAgentRegister,
+				AgentRegister: &tx.AgentRegister{
+					AgentID:    agentID,
+					Name:       req.Name,
+					Role:       store.AppV23RoleMember,
+					BootBio:    req.BootBio,
+					Provider:   req.Provider,
+					P2PAddress: req.P2PAddress,
+				},
+			}
+			registrationHash, registrationHeight, _, err = h.signAndBroadcastCommit(registerTx, priv)
+			if err != nil {
+				writeAppV23AccessError(w, http.StatusBadGateway, "agent_registration_rejected",
+					"The agent key is safely stored, but consensus did not register it. No approval or elevated policy was created.")
+				return
+			}
+			registered, readErr := h.BadgerStore.GetRegisteredAgent(agentID)
+			if readErr != nil || registered == nil ||
+				registered.Role != store.AppV23RoleMember ||
+				registered.Capabilities != store.DefaultSelfRegisteredAgentCapabilities {
+				writeAppV23AccessError(w, http.StatusServiceUnavailable, "agent_registration_unconfirmed",
+					"Consensus returned success but the restricted pending-agent state could not be confirmed.")
+				return
+			}
+			agent.Capabilities = store.DefaultSelfRegisteredAgentCapabilities
+			if updateErr := agentStore.UpdateAgent(r.Context(), agent); updateErr != nil {
+				writeAppV23AccessError(w, http.StatusInternalServerError, "agent_projection_failed",
+					"The agent registered with consensus, but its local dashboard projection could not be updated.")
+				return
+			}
+		}
+
+		response := map[string]any{
+			"agent":             agent,
+			"agent_id":          agentID,
+			"claim_token":       claimToken,
+			"install_command":   fmt.Sprintf("sage-gui mcp install --token %s", claimToken),
+			"approval_required": appV23PendingApproval,
+			"requested_role":    requestedRole,
+		}
+		if appV23PendingApproval {
+			response["tx_hash"] = registrationHash
+			response["height"] = registrationHeight
+		}
+		writeJSONResp(w, http.StatusCreated, response)
 	}
 }
 
 func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
+		if h.appV23IsRootIdentity(id) {
+			writeAppV23AccessError(w, http.StatusForbidden, "root_agent_surface_forbidden",
+				"CEREBRUM Root is not an agent and cannot be edited through agent management.")
+			return
+		}
+		if h.appV23IsActive() && !h.isCEREBRUMOperatorRequest(r) {
+			writeCEREBRUMOperatorForbidden(w, "Changing local agent metadata requires current CEREBRUM Admin authority.")
+			return
+		}
 
 		existing, err := agentStore.GetAgent(r.Context(), id)
 		if err != nil {
@@ -375,6 +484,11 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 			req.VisibleAgents != nil ||
 			req.Capabilities != nil ||
 			len(req.AdminOverride) > 0
+		if sensitivePolicyChange && h.appV23IsActive() {
+			writeAppV23AccessError(w, http.StatusGone, "legacy_permission_route_retired",
+				"This legacy agent route cannot change app-v23 access policy. Use the atomic Access Controls policy endpoint.")
+			return
+		}
 		if sensitivePolicyChange && !h.isCEREBRUMOperatorRequest(r) {
 			writeCEREBRUMOperatorForbidden(w, "Changing agent permissions requires operator authority.")
 			return
@@ -519,7 +633,7 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 		if roleChangeRejected {
 			warnings = append(warnings, "role is set at registration and cannot be changed here (unchanged)")
 		}
-		if h.CometBFTRPC != "" && h.SigningKey != nil {
+		if !h.appV23IsActive() && h.CometBFTRPC != "" && h.SigningKey != nil {
 			// Metadata changes (name, boot_bio) go through AgentUpdate.
 			if req.Name != nil || req.BootBio != nil {
 				if err := h.broadcastAgentUpdate(id, existing.Name, existing.BootBio); err != nil {
@@ -597,6 +711,9 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 		if onChainWarning != "" {
 			resp["on_chain_warning"] = onChainWarning
 		}
+		if h.appV23IsActive() && (req.Name != nil || req.Avatar != nil || req.BootBio != nil || req.P2PAddress != nil) {
+			resp["metadata_scope"] = "local"
+		}
 		if len(grantResults) > 0 {
 			resp["grant_results"] = grantResults
 		}
@@ -604,7 +721,108 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 	}
 }
 
-func handleRemoveAgent(agentStore store.AgentStore, _ store.MemoryStore) http.HandlerFunc {
+func (h *DashboardHandler) handleRemoveAgent(agentStore store.AgentStore) http.HandlerFunc {
+	legacy := handleRemoveAgentLegacy(agentStore)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.appV23IsActive() {
+			legacy.ServeHTTP(w, r)
+			return
+		}
+		actor, ok := h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+		id := strings.TrimSpace(chi.URLParam(r, "id"))
+		if _, err := auth.AgentIDToPublicKey(id); err != nil {
+			writeAppV23AccessError(w, http.StatusBadRequest, "invalid_agent_id",
+				"Agent ID must be canonical lowercase Ed25519 hex.")
+			return
+		}
+		if h.appV23IsRootIdentity(id) {
+			writeAppV23AccessError(w, http.StatusForbidden, "root_removal_forbidden",
+				"CEREBRUM Root cannot be removed through agent management.")
+			return
+		}
+		agent, err := agentStore.GetAgent(r.Context(), id)
+		if err != nil {
+			writeAppV23AccessError(w, http.StatusNotFound, "agent_not_found", "Agent not found.")
+			return
+		}
+		if agent.MemoryCount > 0 && r.URL.Query().Get("force") != "true" {
+			writeJSONResp(w, http.StatusConflict, map[string]any{
+				"ok": false, "code": "agent_has_memories", "error": "Agent has memories.",
+				"memory_count": agent.MemoryCount,
+				"message":      "Use ?force=true to deactivate it while preserving original memory attribution.",
+			})
+			return
+		}
+		enrollment, err := h.BadgerStore.GetAppV23Enrollment(id)
+		if err != nil || enrollment == nil {
+			writeAppV23AccessError(w, http.StatusConflict, "enrollment_state_missing",
+				"The agent has no consensus enrollment to deactivate.")
+			return
+		}
+		role, err := h.BadgerStore.GetAppV23Role(id)
+		if err != nil || role == nil {
+			writeAppV23AccessError(w, http.StatusConflict, "role_state_missing",
+				"The agent has no consensus role state to deactivate.")
+			return
+		}
+		var hash string
+		var height int64
+		if enrollment.Active {
+			deactivatedProfile := enrollment.Profile
+			deactivatedCapabilities := uint32(enrollment.Capabilities)
+			if deactivatedProfile == store.AppV23ProfileLegacyRestricted {
+				// Legacy-restricted is migration-only and cannot be retained
+				// by a post-migration mutation. Deactivation is an explicit
+				// operator decision, so retire it into the inert canonical
+				// Member policy instead of trying to mint the hidden profile.
+				deactivatedProfile = store.AppV23ProfileStandard
+				deactivatedCapabilities = 0
+			}
+			ptx := &tx.ParsedTx{
+				Type: tx.TxTypeLocalAgentApprove,
+				LocalAgentApprove: &tx.LocalAgentApprove{
+					AgentID: id, Active: false, Role: store.AppV23RoleMember,
+					Profile: deactivatedProfile, HomeDomain: enrollment.HomeDomain,
+					Clearance: enrollment.Clearance, Capabilities: deactivatedCapabilities,
+					Scope: actor.Root.Scope, ExpectedRevision: enrollment.Revision,
+					ExpectedRoleRevision: role.Revision,
+				},
+			}
+			hash, height, _, err = h.signAndBroadcastAppV23Control(ptx, actor)
+			if err != nil {
+				writeAppV23AccessError(w, http.StatusConflict, "consensus_deactivation_rejected",
+					"The agent was not removed because consensus did not commit its deactivation.")
+				return
+			}
+		}
+		committed, err := h.BadgerStore.GetAppV23Enrollment(id)
+		if err != nil || committed == nil || committed.Active {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "deactivation_state_unconfirmed",
+				"Consensus deactivation could not be confirmed; the local agent record was left unchanged.")
+			return
+		}
+		groups, err := h.BadgerStore.ListAppV23AgentGroups(id)
+		if err != nil || len(groups) != 0 {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "group_cleanup_unconfirmed",
+				"Consensus group cleanup could not be confirmed; the local agent record was left unchanged.")
+			return
+		}
+		if err := agentStore.RemoveAgent(r.Context(), id); err != nil {
+			writeAppV23AccessError(w, http.StatusInternalServerError, "projection_update_failed",
+				"The agent is deactivated on-chain, but its local dashboard projection could not be marked removed.")
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"ok": true, "status": "removed", "consensus_active": false,
+			"tx_hash": hash, "height": height, "redeploy_required": false,
+		})
+	}
+}
+
+func handleRemoveAgentLegacy(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
 
@@ -654,9 +872,13 @@ func handleRemoveAgent(agentStore store.AgentStore, _ store.MemoryStore) http.Ha
 	}
 }
 
-func handleDownloadBundle(agentStore store.AgentStore) http.HandlerFunc {
+func (h *DashboardHandler) handleDownloadBundle(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
+		if h.appV23IsRootIdentity(id) {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
 
 		agent, err := agentStore.GetAgent(r.Context(), id)
 		if err != nil {
@@ -668,27 +890,209 @@ func handleDownloadBundle(agentStore store.AgentStore) http.HandlerFunc {
 			writeError(w, http.StatusNotFound, "no bundle available")
 			return
 		}
-
-		data, err := os.ReadFile(agent.BundlePath) //nolint:gosec // BundlePath is from trusted agent store
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "bundle file not found")
-			return
-		}
-
-		// Sanitize agent name for use in Content-Disposition header
-		safeName := strings.Map(func(r rune) rune {
-			if r == '"' || r == '\\' || r == '\r' || r == '\n' || r < 32 {
-				return '_'
-			}
-			return r
-		}, agent.Name)
-		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="sage-agent-%s.zip"`, safeName))
-		w.Write(data) //nolint:errcheck,gosec // server-generated ZIP archive, not user input
+		writeAgentBundle(w, agent.BundlePath, agent.Name)
 	}
 }
 
-func handleRotateAgentKey(agentStore store.AgentStore) http.HandlerFunc {
+func writeAgentBundle(w http.ResponseWriter, bundlePath, name string) {
+	data, err := os.ReadFile(bundlePath) //nolint:gosec // server-controlled or trusted stored bundle path
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "bundle file not found")
+		return
+	}
+
+	safeName := strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' || r == '\r' || r == '\n' || r < 32 {
+			return '_'
+		}
+		return r
+	}, name)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="sage-agent-%s.zip"`, safeName))
+	w.Write(data) //nolint:errcheck,gosec // server-generated ZIP archive, not user input
+}
+
+func (h *DashboardHandler) handleRotateAgentKey(agentStore store.AgentStore) http.HandlerFunc {
+	legacy := handleRotateAgentKeyLegacy(agentStore)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.appV23IsActive() {
+			writeAppV23AccessError(w, http.StatusConflict, "agent_key_rotation_requires_reenrollment",
+				"App-v23 agent identities are replaced through re-enrollment. Root handover is available only on the separate CEREBRUM Root authority card.")
+			return
+		}
+		legacy.ServeHTTP(w, r)
+	}
+}
+
+const appV23RootHandoverPhrase = "ROTATE CEREBRUM ROOT"
+
+func (h *DashboardHandler) handleAppV23RootCredentialHandover() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// A successful response contains the only network-delivered copy of a
+		// live Root recovery credential. It must never be cached or retrievable
+		// through a generic/current-Root download URL.
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+		if !h.appV23IsActive() {
+			writeAppV23AccessError(w, http.StatusConflict, "app_v23_inactive",
+				"Root credential handover requires app-v23 activation.")
+			return
+		}
+		actor, ok := h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+		if !actor.IsRoot {
+			writeAppV23AccessError(w, http.StatusForbidden, "root_rotation_requires_root",
+				"Only the current CEREBRUM Root can rotate the Root credential.")
+			return
+		}
+		var confirmation struct {
+			ConfirmIrreversible bool   `json:"confirm_irreversible"`
+			ConfirmationPhrase  string `json:"confirmation_phrase"`
+			ExpectedGeneration  uint64 `json:"expected_generation"`
+		}
+		if err := decodeAppV23AccessJSON(w, r, &confirmation); err != nil {
+			writeAppV23AccessError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		if !confirmation.ConfirmIrreversible ||
+			strings.TrimSpace(confirmation.ConfirmationPhrase) != appV23RootHandoverPhrase {
+			writeAppV23AccessError(w, http.StatusBadRequest, "root_handover_confirmation_required",
+				"Root handover requires both the irreversible confirmation and the exact typed phrase.")
+			return
+		}
+		if confirmation.ExpectedGeneration != actor.Root.Generation {
+			writeAppV23AccessError(w, http.StatusConflict, "stale_root_generation",
+				"Root changed after this handover ceremony began. Reload CEREBRUM and begin again.")
+			return
+		}
+		public, newKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			writeAppV23AccessError(w, http.StatusInternalServerError, "credential_generation_failed",
+				"Could not generate a new Root credential.")
+			return
+		}
+		newID := hex.EncodeToString(public)
+		seed := newKey.Seed()
+		bundleDir := filepath.Join(sageHome(), "bundles", newID)
+		if mkdirErr := os.MkdirAll(bundleDir, 0700); mkdirErr != nil {
+			writeAppV23AccessError(w, http.StatusInternalServerError, "credential_storage_failed",
+				"Could not create the new Root credential directory.")
+			return
+		}
+		if writeErr := os.WriteFile(filepath.Join(bundleDir, "agent.key"), seed, 0600); writeErr != nil { //nolint:gosec // server-controlled credential path
+			writeAppV23AccessError(w, http.StatusInternalServerError, "credential_storage_failed",
+				"Could not durably store the new Root credential.")
+			return
+		}
+		bundlePath, err := generateRootRecoveryBundle(bundleDir, seed)
+		if err != nil {
+			writeAppV23AccessError(w, http.StatusInternalServerError, "credential_bundle_failed",
+				"Could not prepare the new Root credential recovery bundle.")
+			return
+		}
+		if h.ResolveAgentKeyFn == nil {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "root_rotation_key_unresolvable",
+				"This machine cannot resolve newly stored Root credentials; no rotation was submitted.")
+			return
+		}
+		resolved, resolvedOK := h.ResolveAgentKeyFn(newID)
+		if !resolvedOK || len(resolved) != ed25519.PrivateKeySize || agentIDForKey(resolved) != newID {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "root_rotation_key_unresolvable",
+				"The new Root recovery key was stored but could not be resolved locally; no rotation was submitted.")
+			return
+		}
+		bundle, err := os.ReadFile(bundlePath) //nolint:gosec // server-created Root recovery archive
+		if err != nil {
+			writeAppV23AccessError(w, http.StatusInternalServerError, "credential_bundle_failed",
+				"Could not prepare the one-time Root credential recovery delivery.")
+			return
+		}
+		rotation := &tx.RootCredentialRotate{
+			ExpectedGeneration: actor.Root.Generation,
+			NewCredentialID:    newID,
+			Scope:              actor.Root.Scope,
+		}
+		rotation.NewCredentialSignature = ed25519.Sign(
+			newKey,
+			tx.RootCredentialRotationSignBytes(actor.Root.PrincipalID, rotation),
+		)
+		ptx := &tx.ParsedTx{Type: tx.TxTypeRootCredentialRotate, RootCredentialRotate: rotation}
+		hash, height, _, err := h.signAndBroadcastAppV23Control(ptx, actor)
+		if err != nil {
+			writeAppV23AccessError(w, http.StatusConflict, "root_rotation_rejected",
+				"The Root credential rotation was not committed. The unactivated recovery bundle remains local.")
+			return
+		}
+		committed, err := h.BadgerStore.GetAppV23Root()
+		if err != nil || committed == nil ||
+			committed.CredentialID != newID ||
+			committed.Generation != actor.Root.Generation+1 {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "root_rotation_unconfirmed",
+				"The rotation response was ambiguous; inspect committed Root state before retrying.")
+			return
+		}
+		resolved, resolvedOK = h.ResolveAgentKeyFn(newID)
+		if !resolvedOK || len(resolved) != ed25519.PrivateKeySize || agentIDForKey(resolved) != newID {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "root_rotation_key_unresolvable",
+				"The new Root committed, but its local recovery key could not be resolved. The old key material was retained.")
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"ok": true, "root_principal_id": committed.PrincipalID,
+			"old_credential_id": actor.Root.CredentialID,
+			"new_agent_id":      newID, "new_credential_id": newID,
+			"generation": committed.Generation, "tx_hash": hash, "height": height,
+			"recovery_bundle":   base64.StdEncoding.EncodeToString(bundle),
+			"bundle_filename":   "sage-cerebrum-root-recovery.zip",
+			"redeploy_required": false,
+			"message":           "Root credential rotated by tx-39. Existing Root domains and memories were not moved or copied; historical authorship is unchanged, and the new credential now controls the stable Root principal. Secure the one-time recovery download now.",
+		})
+	}
+}
+
+func generateRootRecoveryBundle(bundleDir string, seed []byte) (string, error) {
+	if len(seed) != ed25519.SeedSize {
+		return "", errors.New("invalid Root credential seed")
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	keyHeader := &zip.FileHeader{Name: "sage-cerebrum-root-recovery/agent.key", Method: zip.Store}
+	keyHeader.SetMode(0600)
+	keyWriter, err := zw.CreateHeader(keyHeader)
+	if err != nil {
+		return "", err
+	}
+	if _, writeErr := keyWriter.Write(seed); writeErr != nil {
+		return "", writeErr
+	}
+	readmeHeader := &zip.FileHeader{Name: "sage-cerebrum-root-recovery/README.txt", Method: zip.Deflate}
+	readmeHeader.SetMode(0600)
+	readme, err := zw.CreateHeader(readmeHeader)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.WriteString(readme,
+		"CEREBRUM Root recovery credential.\n\n"+
+			"This is not an agent bundle. Keep it offline and private. "+
+			"Anyone holding agent.key can exercise this node's sovereign Root authority.\n\n"+
+			"A Root handover changes only the current operational credential. "+
+			"It does not move or copy domains or memories, and it does not rewrite historical authorship. "+
+			"The stable Root principal keeps its existing domains while this credential exercises current authority.\n"); err != nil {
+		return "", err
+	}
+	if err := zw.Close(); err != nil {
+		return "", err
+	}
+	zipPath := filepath.Join(bundleDir, "sage-cerebrum-root-recovery.zip")
+	if err := os.WriteFile(zipPath, buf.Bytes(), 0600); err != nil { //nolint:gosec // server-controlled credential path
+		return "", err
+	}
+	return zipPath, nil
+}
+
+func handleRotateAgentKeyLegacy(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
 
@@ -787,12 +1191,19 @@ func (h *DashboardHandler) RegisterAgentClaimRoute(r chi.Router) {
 	if !agentsOK || !claimsOK {
 		return
 	}
-	r.Post("/v1/dashboard/network/claim", handleClaimAgent(agentStore, claimStore, &redeemRateLimiter{}))
+	r.Post("/v1/dashboard/network/claim", handleClaimAgent(
+		agentStore, claimStore, &redeemRateLimiter{}, h.appV23IsRootIdentity,
+	))
 }
 
 // handleClaimAgent exchanges a one-time claim token for the agent's key seed
 // and a deliberately credential-free subset of its metadata.
-func handleClaimAgent(agentStore store.AgentStore, claimStore store.AgentClaimStore, rl *redeemRateLimiter) http.HandlerFunc {
+func handleClaimAgent(
+	agentStore store.AgentStore,
+	claimStore store.AgentClaimStore,
+	rl *redeemRateLimiter,
+	isRootIdentity func(string) bool,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// A successful response contains an Ed25519 seed. Explicitly forbid
 		// storage by browsers and intermediaries on every claim outcome.
@@ -844,6 +1255,13 @@ func handleClaimAgent(agentStore store.AgentStore, claimStore store.AgentClaimSt
 		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to redeem claim token")
+			return
+		}
+		// The token was deliberately burned above. A claim issued before
+		// app-v23 activation must never become a post-activation Root-key
+		// exfiltration path.
+		if isRootIdentity != nil && isRootIdentity(agentID) {
+			writeError(w, http.StatusNotFound, "invalid or expired claim token")
 			return
 		}
 
@@ -947,6 +1365,11 @@ func (h *DashboardHandler) handleTriggerRedeploy(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "agent_id is required")
 		return
 	}
+	if h.appV23IsRootIdentity(req.AgentID) {
+		writeAppV23AccessError(w, http.StatusForbidden, "root_agent_surface_forbidden",
+			"CEREBRUM Root is not an agent and cannot be targeted by an agent redeployment operation.")
+		return
+	}
 
 	// Check if already redeploying
 	if h.Redeployer.IsRedeploying() {
@@ -1046,6 +1469,9 @@ func (h *DashboardHandler) handleUnregisteredAgents(agentStore store.AgentStore)
 			if agentID == "" {
 				continue
 			}
+			if h.appV23IsRootIdentity(agentID) {
+				continue
+			}
 			if !knownIDs[agentID] {
 				shortID := agentID
 				if len(shortID) > 16 {
@@ -1068,6 +1494,14 @@ func (h *DashboardHandler) handleUnregisteredAgents(agentStore store.AgentStore)
 // TxTypeMemoryReassign — no raw SQL backdoor.
 func (h *DashboardHandler) handleMergeAgent(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		var appV23Actor *appV23ControlActor
+		if h.appV23IsActive() {
+			var ok bool
+			appV23Actor, ok = h.requireAppV23ControlActor(w, r, true)
+			if !ok {
+				return
+			}
+		}
 		var req struct {
 			SourceAgentID string `json:"source_agent_id"`
 			TargetAgentID string `json:"target_agent_id"`
@@ -1081,10 +1515,46 @@ func (h *DashboardHandler) handleMergeAgent(agentStore store.AgentStore) http.Ha
 			writeError(w, http.StatusBadRequest, "source_agent_id and target_agent_id are required")
 			return
 		}
+		if h.appV23IsRootIdentity(req.SourceAgentID) ||
+			h.appV23IsRootIdentity(req.TargetAgentID) {
+			writeAppV23AccessError(w, http.StatusForbidden, "root_agent_surface_forbidden",
+				"CEREBRUM Root is not an agent and cannot participate in memory reassignment.")
+			return
+		}
 
 		// Verify target agent is registered
 		if _, err := agentStore.GetAgent(r.Context(), req.TargetAgentID); err != nil {
 			writeError(w, http.StatusBadRequest, "target agent not found in registry")
+			return
+		}
+
+		if appV23Actor != nil {
+			memoriesMoved := 0
+			if stats, statsErr := h.cerebrumVisibleStats(r.Context()); statsErr == nil {
+				memoriesMoved = stats.ByAgent[req.SourceAgentID]
+			}
+			reassignTx := &tx.ParsedTx{
+				Type: tx.TxTypeMemoryReassign,
+				MemoryReassign: &tx.MemoryReassign{
+					SourceAgentID: req.SourceAgentID,
+					TargetAgentID: req.TargetAgentID,
+				},
+			}
+			txHash, height, _, broadcastErr := h.signAndBroadcastAppV23Control(reassignTx, appV23Actor)
+			if broadcastErr != nil {
+				writeAppV23AccessError(w, http.StatusBadGateway, "memory_reassign_rejected",
+					"Consensus rejected the memory reassignment; no local memory was changed.")
+				return
+			}
+			writeJSONResp(w, http.StatusOK, map[string]any{
+				"status":         "completed",
+				"message":        fmt.Sprintf("%d memories reassigned from source to target.", memoriesMoved),
+				"memories_moved": memoriesMoved,
+				"source":         req.SourceAgentID,
+				"target":         req.TargetAgentID,
+				"tx_hash":        txHash,
+				"height":         height,
+			})
 			return
 		}
 
@@ -1133,6 +1603,10 @@ func (h *DashboardHandler) handleMergeAgent(agentStore store.AgentStore) http.Ha
 func (h *DashboardHandler) handleAgentTags(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
+		if h.appV23IsRootIdentity(id) {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
 		tags, err := agentStore.ListAgentTags(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list agent tags: "+err.Error())

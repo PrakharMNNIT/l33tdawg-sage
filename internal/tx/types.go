@@ -79,7 +79,27 @@ const (
 	// the whole validator set BEFORE app-v17 activates (same mixed-binary note as
 	// co-commit tx-31/32).
 	TxTypeMemoryReinstate TxType = 35
+	// app-v23: root-attested, node-local RBAC. These transaction types are
+	// deliberately new wire bytes and are dual-gated in CheckTx and FinalizeBlock
+	// until the app-v23 activation boundary.
+	TxTypeLocalAgentApprove    TxType = 36
+	TxTypeAgentRoleChange      TxType = 37
+	TxTypeAccessGroupMutate    TxType = 38
+	TxTypeRootCredentialRotate TxType = 39
 )
+
+// LocalElevationProof is the node-local CEREBRUM countersignature required
+// when a delegated Admin performs a control-plane action. The Admin's normal
+// agent proof remains the action signature; this second proof binds the exact
+// action to the current root credential, root generation and a short consensus
+// height window. Nonce consumption is committed atomically with the action.
+type LocalElevationProof struct {
+	RootGeneration   uint64
+	ValidFromHeight  int64
+	ValidUntilHeight int64
+	Nonce            string
+	Signature        []byte
+}
 
 // GovProposalOp identifies the governance operation being proposed.
 type GovProposalOp uint8
@@ -561,48 +581,108 @@ type AgentSetPermission struct {
 	CapabilitiesPresent bool
 }
 
+// LocalAgentApprove atomically approves or revokes a registered agent's local
+// enrollment and its security profile. Approval is root-only and requires the
+// target key to sign LocalAgentApprovalSignBytes. Scope binds the proof to the
+// root's persisted chain scope. Revocation does not require target consent.
+type LocalAgentApprove struct {
+	AgentID                 string
+	ExpectedRevision        uint64
+	ExpectedRoleRevision    uint64
+	Active                  bool
+	Role                    string
+	Profile                 string
+	HomeDomain              string
+	ExpectedHomeDomainOwner string
+	TransferHomeDomain      bool
+	Clearance               uint8
+	Capabilities            uint32
+	Scope                   string
+	TargetSignature         []byte
+}
+
+// AgentRoleChange changes one approved local agent between member, manager and
+// admin. ExpectedRevision is a compare-and-swap guard; EnrollmentRevision
+// prevents an approval revocation/re-approval race from authorizing a stale
+// elevation.
+type AgentRoleChange struct {
+	AgentID            string
+	ExpectedRevision   uint64
+	EnrollmentRevision uint64
+	Role               string
+	ExpectedProfile    string
+	Profile            string
+	Clearance          uint8
+	Capabilities       uint32
+}
+
+// AccessGroupMutate replaces one local access group's canonical membership or
+// deletes it. Members must be sorted canonical local agent IDs. Agents may
+// belong to multiple groups up to the consensus bound.
+type AccessGroupMutate struct {
+	GroupID          string
+	Name             string
+	ExpectedRevision uint64
+	Delete           bool
+	Members          []string
+}
+
+// RootCredentialRotate changes only the credential authorized to act for the
+// immutable CEREBRUM root principal. The current root signs the outer
+// transaction and the proposed credential signs RootCredentialRotationSignBytes.
+type RootCredentialRotate struct {
+	ExpectedGeneration     uint64
+	NewCredentialID        string
+	Scope                  string
+	NewCredentialSignature []byte
+}
+
 // ParsedTx is the top-level transaction envelope.
 type ParsedTx struct {
-	Type               TxType
-	MemorySubmit       *MemorySubmit
-	MemoryVote         *MemoryVote
-	MemoryChallenge    *MemoryChallenge
-	MemoryCorroborate  *MemoryCorroborate
-	AccessRequest      *AccessRequest
-	AccessGrant        *AccessGrant
-	AccessRevoke       *AccessRevoke
-	AccessQuery        *AccessQuery
-	DomainRegister     *DomainRegister
-	OrgRegister        *OrgRegister
-	OrgAddMember       *OrgAddMember
-	OrgRemoveMember    *OrgRemoveMember
-	OrgSetClearance    *OrgSetClearance
-	FederationPropose  *FederationPropose
-	FederationApprove  *FederationApprove
-	FederationRevoke   *FederationRevoke
-	DeptRegister       *DeptRegister
-	DeptAddMember      *DeptAddMember
-	DeptRemoveMember   *DeptRemoveMember
-	AgentRegister      *AgentRegister
-	AgentUpdateTx      *AgentUpdate // Named AgentUpdateTx to avoid collision with existing method names
-	AgentSetPermission *AgentSetPermission
-	MemoryReassign     *MemoryReassign
-	GovPropose         *GovPropose
-	GovVote            *GovVote
-	GovCancel          *GovCancel
-	UpgradePropose     *UpgradePropose
-	UpgradeCancel      *UpgradeCancel
-	UpgradeRevert      *UpgradeRevert
-	DomainReassign     *DomainReassign
-	CoCommitSubmit     *CoCommitSubmit
-	CoCommitAttest     *CoCommitAttest
-	CrossFedTerms      *CrossFedTerms
-	CrossFedRevoke     *CrossFedRevoke
-	MemoryReinstate    *MemoryReinstate
-	Signature          []byte // Node validator Ed25519 signature (64 bytes)
-	PublicKey          []byte // Node validator Ed25519 public key (32 bytes)
-	Nonce              uint64
-	Timestamp          time.Time
+	Type                 TxType
+	MemorySubmit         *MemorySubmit
+	MemoryVote           *MemoryVote
+	MemoryChallenge      *MemoryChallenge
+	MemoryCorroborate    *MemoryCorroborate
+	AccessRequest        *AccessRequest
+	AccessGrant          *AccessGrant
+	AccessRevoke         *AccessRevoke
+	AccessQuery          *AccessQuery
+	DomainRegister       *DomainRegister
+	OrgRegister          *OrgRegister
+	OrgAddMember         *OrgAddMember
+	OrgRemoveMember      *OrgRemoveMember
+	OrgSetClearance      *OrgSetClearance
+	FederationPropose    *FederationPropose
+	FederationApprove    *FederationApprove
+	FederationRevoke     *FederationRevoke
+	DeptRegister         *DeptRegister
+	DeptAddMember        *DeptAddMember
+	DeptRemoveMember     *DeptRemoveMember
+	AgentRegister        *AgentRegister
+	AgentUpdateTx        *AgentUpdate // Named AgentUpdateTx to avoid collision with existing method names
+	AgentSetPermission   *AgentSetPermission
+	MemoryReassign       *MemoryReassign
+	GovPropose           *GovPropose
+	GovVote              *GovVote
+	GovCancel            *GovCancel
+	UpgradePropose       *UpgradePropose
+	UpgradeCancel        *UpgradeCancel
+	UpgradeRevert        *UpgradeRevert
+	DomainReassign       *DomainReassign
+	CoCommitSubmit       *CoCommitSubmit
+	CoCommitAttest       *CoCommitAttest
+	CrossFedTerms        *CrossFedTerms
+	CrossFedRevoke       *CrossFedRevoke
+	MemoryReinstate      *MemoryReinstate
+	LocalAgentApprove    *LocalAgentApprove
+	AgentRoleChange      *AgentRoleChange
+	AccessGroupMutate    *AccessGroupMutate
+	RootCredentialRotate *RootCredentialRotate
+	Signature            []byte // Node validator Ed25519 signature (64 bytes)
+	PublicKey            []byte // Node validator Ed25519 public key (32 bytes)
+	Nonce                uint64
+	Timestamp            time.Time
 
 	// Agent identity proof — allows ABCI to verify agent identity on-chain.
 	// The agent signed SHA256(METHOD + " " + path[+query] + "\n" + body) +
@@ -620,4 +700,8 @@ type ParsedTx struct {
 	// retains its byte-identical encoding. Post-app-v17 consensus uses it to
 	// bind a delegated identity proof to the exact action being executed.
 	AgentRequest []byte
+	// LocalElevation is an optional app-v23 envelope trailer. It is generic so
+	// every existing control-plane transaction can carry the same local
+	// CEREBRUM countersignature without changing its historical payload codec.
+	LocalElevation *LocalElevationProof
 }

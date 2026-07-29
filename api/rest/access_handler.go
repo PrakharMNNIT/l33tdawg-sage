@@ -79,7 +79,7 @@ func (s *Server) handleAccessRequest(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), accessTx)
 
-	err = tx.SignTx(accessTx, s.signingKey)
+	err = s.signTx(accessTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign access request tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -146,7 +146,7 @@ func (s *Server) handleAccessGrant(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), grantTx)
 
-	err = tx.SignTx(grantTx, s.signingKey)
+	err = s.signTx(grantTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign access grant tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -208,7 +208,7 @@ func (s *Server) handleAccessRevoke(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), revokeTx)
 
-	err = tx.SignTx(revokeTx, s.signingKey)
+	err = s.signTx(revokeTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign access revoke tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -246,6 +246,42 @@ func (s *Server) handleListGrants(w http.ResponseWriter, r *http.Request) {
 	agentID := chi.URLParam(r, "agent_id")
 	if agentID == "" {
 		agentID = middleware.ContextAgentID(r.Context())
+	}
+	if s.isPostV23ForNextTx() {
+		callerID := middleware.ContextAgentID(r.Context())
+		if callerID == "" {
+			writeProblem(w, http.StatusForbidden, "Agent identity required",
+				"An authenticated local identity is required to list access grants.")
+			return
+		}
+		isRoot, rootErr := s.appV23IsRootIdentity(callerID)
+		if rootErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current CEREBRUM Root credential history could not be verified.")
+			return
+		}
+		if isRoot {
+			writeProblem(w, http.StatusForbidden, "Root is not an agent",
+				"CEREBRUM Root credentials cannot use the ordinary-agent grant-list surface.")
+			return
+		}
+		targetIsRoot, targetRootErr := s.appV23IsRootIdentity(agentID)
+		if targetRootErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Target CEREBRUM Root credential history could not be verified.")
+			return
+		}
+		if targetIsRoot {
+			writeProblem(w, http.StatusForbidden, "Root is not an agent",
+				"CEREBRUM Root credentials cannot be targeted through the ordinary-agent grant-list surface.")
+			return
+		}
+		if agentID != callerID &&
+			!s.callerIsOperatorOrAdmin(r.Context(), callerID) {
+			writeProblem(w, http.StatusForbidden, "Access denied",
+				"Members and Managers may list only their own access grants; a current local Admin may inspect another local agent.")
+			return
+		}
 	}
 
 	if s.accessStore == nil {
@@ -306,7 +342,7 @@ func (s *Server) handleDomainRegister(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), domainTx)
 
-	err = tx.SignTx(domainTx, s.signingKey)
+	err = s.signTx(domainTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign domain register tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")

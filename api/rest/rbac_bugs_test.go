@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 // which hides RBAC-filter regressions. These tests need real filter behavior.
 type rbacMockMemoryStore struct {
 	*mockMemoryStore
+	badger *store.BadgerStore
 }
 
 func newRBACMockMemoryStore() *rbacMockMemoryStore {
@@ -43,6 +45,15 @@ func (m *rbacMockMemoryStore) QuerySimilar(_ context.Context, embedding []float3
 				}
 			}
 			if !match {
+				continue
+			}
+		}
+		if opts.CandidateFilter != nil {
+			allowed, err := opts.CandidateFilter(rec)
+			if err != nil {
+				return nil, err
+			}
+			if !allowed {
 				continue
 			}
 		}
@@ -77,7 +88,38 @@ func (m *rbacMockMemoryStore) ListMemories(_ context.Context, opts store.ListOpt
 		}
 		results = append(results, rec)
 	}
-	return results, len(results), nil
+	sort.Slice(results, func(i, j int) bool {
+		switch opts.Sort {
+		case "oldest":
+			if results[i].CreatedAt.Equal(results[j].CreatedAt) {
+				return results[i].MemoryID < results[j].MemoryID
+			}
+			return results[i].CreatedAt.Before(results[j].CreatedAt)
+		case "confidence":
+			if results[i].ConfidenceScore == results[j].ConfidenceScore {
+				return results[i].MemoryID < results[j].MemoryID
+			}
+			return results[i].ConfidenceScore > results[j].ConfidenceScore
+		default:
+			if results[i].CreatedAt.Equal(results[j].CreatedAt) {
+				return results[i].MemoryID < results[j].MemoryID
+			}
+			return results[i].CreatedAt.After(results[j].CreatedAt)
+		}
+	})
+	total := len(results)
+	if opts.Offset >= total {
+		return []*memory.MemoryRecord{}, total, nil
+	}
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	end := opts.Offset + limit
+	if end > total {
+		end = total
+	}
+	return results[opts.Offset:end], total, nil
 }
 
 // newRBACTestServer builds a Server with a real BadgerStore + a filter-honoring
@@ -93,6 +135,7 @@ func newRBACTestServer(t *testing.T) (*Server, *rbacMockMemoryStore, *store.Badg
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = bs.CloseBadger() })
 	srv.badgerStore = bs
+	memStore.badger = bs
 
 	agentSt := newMockAgentStore()
 	srv.agentStore = agentSt
@@ -107,12 +150,21 @@ func seedMemory(t *testing.T, memStore *rbacMockMemoryStore, id, submitter, doma
 		MemoryID:        id,
 		SubmittingAgent: submitter,
 		Content:         content,
-		ContentHash:     []byte(id),
+		ContentHash:     memory.ComputeContentHash(content),
 		MemoryType:      memory.TypeObservation,
 		DomainTag:       domain,
 		ConfidenceScore: 0.85,
 		Status:          memory.StatusCommitted,
 		CreatedAt:       time.Now().Add(-time.Hour),
+	}
+	if memStore.badger != nil {
+		rec := memStore.memories[id]
+		require.NoError(t, memStore.badger.SetMemoryHash(
+			rec.MemoryID, rec.ContentHash, string(rec.Status),
+		))
+		require.NoError(t, memStore.badger.SetMemoryDomain(rec.MemoryID, rec.DomainTag))
+		require.NoError(t, memStore.badger.SetMemoryAuthor(rec.MemoryID, rec.SubmittingAgent))
+		require.NoError(t, memStore.badger.SetMemoryClassification(rec.MemoryID, 1))
 	}
 }
 

@@ -26,8 +26,9 @@ package rest
 //
 // Bearer reuse: at /authorize approval time we mint a fresh bearer via the
 // existing IssueMCPToken path (so the operator gets a normal mcp_tokens row
-// they can revoke from the dashboard), and stash the plaintext into the
-// auth-code row. /token redeems it back out and returns it as access_token.
+// they can revoke from the dashboard). The auth-code row stores only
+// SHA-256(code) plus an AES-GCM bearer-delivery envelope whose key is derived
+// from the unpersisted raw code. /token uses that code to redeem the bearer.
 // Sessions to /v1/mcp/sse continue to use the same Authorization: Bearer
 // scheme as before. Zero changes to the bearer-auth middleware.
 
@@ -43,13 +44,16 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/l33tdawg/sage/api/rest/middleware"
 	"github.com/l33tdawg/sage/internal/store"
 )
 
@@ -61,6 +65,22 @@ const AuthCodeTTL = 5 * time.Minute
 // AuthCodeTTL — anything older is treated as a stale tab.
 const csrfTTL = 5 * time.Minute
 
+// csrfClockSkew permits a small wall-clock correction between render and
+// submit without allowing a materially future-issued signed form to become
+// valid for longer than csrfTTL after a local clock rollback.
+const csrfClockSkew = time.Minute
+
+// OAuthApprovalHandoffTTL bounds the public-authorize → localhost-approval
+// bridge. The token contains no OAuth parameters or CEREBRUM state; it is an
+// opaque, HMAC-authenticated handle to process-local state and is single-use
+// at consent submission.
+const OAuthApprovalHandoffTTL = 5 * time.Minute
+
+// oauthApprovalHandoffMax is a hard process-memory bound. Expiry pruning keeps
+// normal usage far below it; reaching the cap fails new authorization attempts
+// closed instead of evicting a still-valid consent ceremony.
+const oauthApprovalHandoffMax = 2048
+
 // oauthCleanupTimeout bounds revocation/authorization-code cleanup after an
 // issuance failure. It must not inherit a canceled browser request.
 const oauthCleanupTimeout = 8 * time.Second
@@ -70,8 +90,10 @@ const oauthCleanupTimeout = 8 * time.Second
 // clients register once per connector setup; bursty traffic is a sign of
 // abuse.
 const (
-	dcrRegisterPerIPLimit = 10
-	dcrRegisterWindow     = 1 * time.Hour
+	dcrRegisterPerIPLimit   = 10
+	dcrRegisterWindow       = 1 * time.Hour
+	oauthApprovalPerIPLimit = 60
+	oauthApprovalRateWindow = 5 * time.Minute
 )
 
 // OAuthStore is the storage surface OAuthHandler needs. The full
@@ -117,6 +139,24 @@ type OAuthSessionChecker func(r *http.Request) (authenticated bool, loginRedirec
 // sees the agent list.
 type OAuthDashboardSession func(r *http.Request) bool
 
+// OAuthControlActorResolver resolves the exact current local CEREBRUM
+// authority for this request. Production wires the dashboard's app-v23-aware
+// resolver, which accepts only the current committed Root or an active
+// current-generation same-machine Admin. The returned identity is the issuer
+// for a distinct pending-review MCP agent; it never becomes the token actor.
+type OAuthControlActorResolver func(r *http.Request) (agentID string, ok bool)
+
+// OAuthLocalityChecker is the localhost control-plane boundary used by the
+// approval route. It must reject remote peers, non-loopback Host values, and
+// reverse-proxy forwarding metadata that names a non-loopback client.
+type OAuthLocalityChecker func(r *http.Request) bool
+
+type oauthApprovalHandoff struct {
+	Params    authorizeFormParams
+	ExpiresAt time.Time
+	Used      bool
+}
+
 // OAuthHandler bundles the OAuth 2.0 endpoints. Built once at server start,
 // mounted on the chi router at the host root.
 //
@@ -128,14 +168,22 @@ type OAuthDashboardSession func(r *http.Request) bool
 // screen rather than letting the user pick an agent that the bearer will
 // not actually act as.
 type OAuthHandler struct {
-	Store               OAuthStore
-	IsAuthed            OAuthSessionChecker
-	HasDashboardCookie  OAuthDashboardSession
-	IssuerBaseURL       func(r *http.Request) string // e.g. "https://host:8443" — derived per request
-	NodeOperatorAgentID string
+	Store                OAuthStore
+	IsAuthed             OAuthSessionChecker
+	HasDashboardCookie   OAuthDashboardSession
+	ResolveControlActor  OAuthControlActorResolver
+	IsLocalApproval      OAuthLocalityChecker
+	IssuerBaseURL        func(r *http.Request) string // e.g. "https://host:8443" — derived per request
+	LocalApprovalBaseURL string                       // e.g. "http://127.0.0.1:8080"
+	NodeOperatorAgentID  string
 
-	csrfKey   []byte // process-lifetime random for HMAC-signing the consent CSRF nonce
-	dcrLimits *ipRateLimiter
+	csrfKey        []byte // process-lifetime random for HMAC-signing consent + approval handles
+	dcrLimits      *ipRateLimiter
+	approvalLimits *ipRateLimiter
+	approvalMu     sync.Mutex
+	approvals      map[string]*oauthApprovalHandoff
+	now            func() time.Time
+	random         io.Reader
 }
 
 // NewOAuthHandler constructs a handler with sensible defaults.
@@ -152,30 +200,37 @@ func NewOAuthHandler(s OAuthStore, isAuthed OAuthSessionChecker, issuer func(r *
 	}
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
-		// Reading from crypto/rand should never fail; if it does, fall back to
-		// a deterministic-looking key so the handler still functions but logs
-		// the condition. Production binaries will have crypto/rand available.
-		log.Printf("oauth: failed to seed CSRF key from crypto/rand: %v", err)
+		// OAuth approval and CSRF integrity cannot function with a predictable
+		// HMAC key. crypto/rand failure is a startup-fatal platform condition.
+		panic(fmt.Sprintf("oauth: seed approval HMAC key: %v", err))
 	}
 	return &OAuthHandler{
-		Store:         s,
-		IsAuthed:      isAuthed,
-		IssuerBaseURL: issuer,
-		csrfKey:       key,
-		dcrLimits:     newIPRateLimiter(dcrRegisterPerIPLimit, dcrRegisterWindow),
+		Store:                s,
+		IsAuthed:             isAuthed,
+		IsLocalApproval:      isOAuthLoopbackRequest,
+		IssuerBaseURL:        issuer,
+		LocalApprovalBaseURL: "http://127.0.0.1:8080",
+		csrfKey:              key,
+		dcrLimits:            newIPRateLimiter(dcrRegisterPerIPLimit, dcrRegisterWindow),
+		approvalLimits:       newIPRateLimiter(oauthApprovalPerIPLimit, oauthApprovalRateWindow),
+		approvals:            make(map[string]*oauthApprovalHandoff),
+		now:                  time.Now,
+		random:               rand.Reader,
 	}
 }
 
-// hasDashboardCookie returns true if the OAuthHandler has a dashboard-session
-// checker wired up AND the current request carries a valid session cookie.
-// Falls open to false when no checker is set, which means encryption-off
-// nodes that don't pass a checker default to the safer behaviour (no agent
-// roster rendered).
-func (h *OAuthHandler) hasDashboardCookie(r *http.Request) bool {
-	if h == nil || h.HasDashboardCookie == nil {
-		return false
+func (h *OAuthHandler) nowTime() time.Time {
+	if h != nil && h.now != nil {
+		return h.now()
 	}
-	return h.HasDashboardCookie(r)
+	return time.Now()
+}
+
+func (h *OAuthHandler) randomReader() io.Reader {
+	if h != nil && h.random != nil {
+		return h.random
+	}
+	return rand.Reader
 }
 
 // inferIssuer reconstructs `scheme://host` from the request. Honors
@@ -434,6 +489,7 @@ type authorizeFormParams struct {
 	CodeChallengeMethod string
 	ResponseType        string
 	Scope               string
+	ApprovalHandoff     string
 }
 
 // parseAuthorizeParams reads + validates the /authorize parameters from
@@ -521,31 +577,199 @@ func (h *OAuthHandler) resolveClient(ctx context.Context, clientID, redirectURI 
 	return nil, "", "redirect_uri does not match a registered URI for this client_id"
 }
 
-// HandleAuthorize serves the consent screen (GET) and processes consent
-// submission (POST). The user must be authenticated to the dashboard
-// (when encryption is on) — IsAuthed gates that.
+func oauthLoopbackHost(raw string) bool {
+	host := strings.TrimSpace(raw)
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// isOAuthLoopbackRequest is the standalone fail-closed default. sage-gui
+// replaces it with the dashboard's canonical CEREBRUM locality predicate.
+func isOAuthLoopbackRequest(r *http.Request) bool {
+	if r == nil || !oauthLoopbackHost(r.RemoteAddr) || !oauthLoopbackHost(r.Host) {
+		return false
+	}
+	for _, name := range []string{"X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host", "Forwarded"} {
+		for _, value := range r.Header.Values(name) {
+			if strings.TrimSpace(value) != "" {
+				// The default has no trusted-proxy configuration. Production's
+				// dashboard checker understands the exact forwarding grammar;
+				// this generic fallback therefore rejects all forwarded hops.
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (h *OAuthHandler) requestIsLocalApproval(r *http.Request) bool {
+	return h != nil && h.IsLocalApproval != nil && h.IsLocalApproval(r)
+}
+
+func (h *OAuthHandler) resolveControlActor(r *http.Request) (string, bool) {
+	if h.ResolveControlActor != nil {
+		id, ok := h.ResolveControlActor(r)
+		id = strings.TrimSpace(id)
+		return id, ok && len(id) == 64
+	}
+	// Compatibility for embedded/pre-v23 callers. Production sage-gui always
+	// wires ResolveControlActor, so app-v23 never reaches the static operator
+	// fallback after a Root handover.
+	if h.IsAuthed == nil {
+		return "", false
+	}
+	ok, _ := h.IsAuthed(r)
+	if !ok {
+		return "", false
+	}
+	if actorID := strings.TrimSpace(middleware.ContextAgentID(r.Context())); len(actorID) == 64 {
+		return actorID, true
+	}
+	id := strings.TrimSpace(h.NodeOperatorAgentID)
+	return id, len(id) == 64
+}
+
+func (h *OAuthHandler) redirectToLocalLogin(w http.ResponseWriter, r *http.Request) {
+	loginURL := ""
+	if h.IsAuthed != nil {
+		_, loginURL = h.IsAuthed(r)
+	}
+	if loginURL == "" {
+		loginURL = "/ui/?next=" + url.QueryEscape(r.URL.RequestURI())
+	}
+	http.Redirect(w, r, loginURL, http.StatusFound)
+}
+
+func (h *OAuthHandler) approvalMAC(value, issuedAt string) []byte {
+	mac := hmac.New(sha256.New, h.csrfKey)
+	mac.Write([]byte("sage:oauth-local-approval:v1|"))
+	mac.Write([]byte(value))
+	mac.Write([]byte("|"))
+	mac.Write([]byte(issuedAt))
+	return mac.Sum(nil)
+}
+
+func (h *OAuthHandler) issueApprovalHandoff(p authorizeFormParams) (string, error) {
+	nonce := make([]byte, 24)
+	if _, err := io.ReadFull(h.randomReader(), nonce); err != nil {
+		return "", fmt.Errorf("generate approval handoff: %w", err)
+	}
+	value := base64.RawURLEncoding.EncodeToString(nonce)
+	issuedAt := fmt.Sprintf("%d", h.nowTime().Unix())
+	token := value + "." + issuedAt + "." +
+		base64.RawURLEncoding.EncodeToString(h.approvalMAC(value, issuedAt))
+	h.approvalMu.Lock()
+	h.pruneApprovalHandoffsLocked()
+	if len(h.approvals) >= oauthApprovalHandoffMax {
+		h.approvalMu.Unlock()
+		return "", errors.New("too many pending OAuth approval handoffs")
+	}
+	h.approvals[token] = &oauthApprovalHandoff{
+		Params:    p,
+		ExpiresAt: h.nowTime().Add(OAuthApprovalHandoffTTL),
+	}
+	h.approvalMu.Unlock()
+	return token, nil
+}
+
+func (h *OAuthHandler) verifyApprovalHandoffToken(token string) error {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return errors.New("malformed approval handoff")
+	}
+	received, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || subtle.ConstantTimeCompare(received, h.approvalMAC(parts[0], parts[1])) != 1 {
+		return errors.New("invalid approval handoff signature")
+	}
+	var issuedAt int64
+	if _, err := fmt.Sscanf(parts[1], "%d", &issuedAt); err != nil {
+		return errors.New("invalid approval handoff timestamp")
+	}
+	now := h.nowTime()
+	issued := time.Unix(issuedAt, 0)
+	if issued.After(now.Add(time.Minute)) || now.Sub(issued) > OAuthApprovalHandoffTTL {
+		return errors.New("approval handoff expired")
+	}
+	return nil
+}
+
+func (h *OAuthHandler) approvalHandoff(token string, consume bool) (authorizeFormParams, error) {
+	if err := h.verifyApprovalHandoffToken(token); err != nil {
+		return authorizeFormParams{}, err
+	}
+	h.approvalMu.Lock()
+	defer h.approvalMu.Unlock()
+	h.pruneApprovalHandoffsLocked()
+	entry := h.approvals[token]
+	if entry == nil || h.nowTime().After(entry.ExpiresAt) {
+		return authorizeFormParams{}, errors.New("approval handoff expired or unknown")
+	}
+	if entry.Used {
+		return authorizeFormParams{}, errors.New("approval handoff already used")
+	}
+	if consume {
+		entry.Used = true
+	}
+	return entry.Params, nil
+}
+
+func (h *OAuthHandler) pruneApprovalHandoffsLocked() {
+	now := h.nowTime()
+	for token, entry := range h.approvals {
+		if entry == nil || now.After(entry.ExpiresAt.Add(time.Minute)) {
+			delete(h.approvals, token)
+		}
+	}
+}
+
+func (h *OAuthHandler) localApprovalURL(token string) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(h.LocalApprovalBaseURL), "/")
+	parsed, err := url.Parse(base)
+	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" ||
+		parsed.User != nil || parsed.Fragment != "" || parsed.RawFragment != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery ||
+		(parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" ||
+		!oauthLoopbackHost(parsed.Host) ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", errors.New("local OAuth approval URL is not configured as a loopback HTTP(S) origin")
+	}
+	parsed.Path = "/oauth/approve"
+	q := parsed.Query()
+	q.Set("handoff", token)
+	parsed.RawQuery = q.Encode()
+	return parsed.String(), nil
+}
+
+// HandleAuthorize is the public OAuth authorization endpoint. Remote requests
+// never see CEREBRUM, a consent form, or a dashboard cookie: they receive only
+// an absolute loopback redirect carrying a short-lived opaque handoff. A
+// local, already-authorized caller retains the direct path for pre-v23 CLI
+// compatibility; sage-gui's normal Cloudflare flow always uses HandleApprove.
 func (h *OAuthHandler) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// Authenticate BEFORE parsing a POST form. On encryption-off nodes the
-	// production checker verifies an Ed25519 signature over the exact raw body;
-	// ParseForm consumes that body and would otherwise turn the check into a
-	// signature over empty bytes. The checker re-buffers signed bodies.
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
 	}
-	if h.IsAuthed != nil {
-		ok, loginURL := h.IsAuthed(r)
+	localApproval := h.requestIsLocalApproval(r)
+	var localActorID string
+	if localApproval {
+		// Resolve signed Admin/Root authority before ParseForm consumes the
+		// exact body covered by the Ed25519 request signature.
+		var ok bool
+		localActorID, ok = h.resolveControlActor(r)
 		if !ok {
-			if loginURL == "" {
-				// Build "/ui/?next=<full /oauth/authorize URL with query>"
-				next := r.URL.RequestURI()
-				loginURL = "/ui/?next=" + url.QueryEscape(next)
-			}
-			http.Redirect(w, r, loginURL, http.StatusFound)
+			h.redirectToLocalLogin(w, r)
 			return
 		}
 	}
@@ -562,21 +786,92 @@ func (h *OAuthHandler) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !localApproval {
+		if h.approvalLimits != nil && !h.approvalLimits.allow(remoteIP(r)) {
+			w.Header().Set("Retry-After", "300")
+			writeOAuthError(
+				w, http.StatusTooManyRequests, "rate_limited",
+				"too many pending authorization attempts from this address",
+			)
+			return
+		}
+		handoff, err := h.issueApprovalHandoff(params)
+		if err != nil {
+			http.Error(w, "failed to create local approval handoff", http.StatusInternalServerError)
+			return
+		}
+		approvalURL, err := h.localApprovalURL(handoff)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		http.Redirect(w, r, approvalURL, http.StatusFound)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		h.renderConsent(w, r, params, "")
+		h.renderConsent(w, r, params, localActorID, "", "/oauth/authorize")
 	case http.MethodPost:
-		h.processConsent(w, r, params)
+		h.processConsent(w, r, params, localActorID, "")
+	}
+}
+
+// HandleApprove is the localhost-only side of the public authorization
+// bridge. It never appears in discovery or Cloudflare's ingress allowlist.
+func (h *OAuthHandler) HandleApprove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.requestIsLocalApproval(r) {
+		http.NotFound(w, r)
+		return
+	}
+	// Authenticate while a signed POST body is still intact. Browser session
+	// checks are unaffected, and an unencrypted app-v23 same-origin CEREBRUM
+	// request resolves current Root through the same callback.
+	actorID, ok := h.resolveControlActor(r)
+	if !ok {
+		h.redirectToLocalLogin(w, r)
+		return
+	}
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "invalid approval form", http.StatusBadRequest)
+			return
+		}
+	}
+	handoff := strings.TrimSpace(r.FormValue("handoff"))
+	params, err := h.approvalHandoff(handoff, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, _, clientErr := h.resolveClient(r.Context(), params.ClientID, params.RedirectURI); clientErr != "" {
+		http.Error(w, clientErr, http.StatusBadRequest)
+		return
+	}
+	params.ApprovalHandoff = handoff
+	switch r.Method {
+	case http.MethodGet:
+		h.renderConsent(w, r, params, actorID, "", "/oauth/approve")
+	case http.MethodPost:
+		h.processConsent(w, r, params, actorID, handoff)
 	}
 }
 
 // signCSRFNonce returns "value.iat.mac" — a self-contained signed token
 // that processConsent can verify on POST without server-side state.
-func (h *OAuthHandler) signCSRFNonce(p authorizeFormParams) string {
+func (h *OAuthHandler) signCSRFNonce(p authorizeFormParams) (string, error) {
 	nonce := make([]byte, 16)
-	_, _ = rand.Read(nonce)
+	if _, err := io.ReadFull(h.randomReader(), nonce); err != nil {
+		return "", fmt.Errorf("generate csrf nonce: %w", err)
+	}
 	value := base64.RawURLEncoding.EncodeToString(nonce)
-	iat := time.Now().Unix()
+	iat := h.nowTime().Unix()
 	iatStr := fmt.Sprintf("%d", iat)
 	mac := hmac.New(sha256.New, h.csrfKey)
 	mac.Write([]byte(p.ClientID))
@@ -587,10 +882,12 @@ func (h *OAuthHandler) signCSRFNonce(p authorizeFormParams) string {
 	mac.Write([]byte("|"))
 	mac.Write([]byte(p.CodeChallenge))
 	mac.Write([]byte("|"))
+	mac.Write([]byte(p.ApprovalHandoff))
+	mac.Write([]byte("|"))
 	mac.Write([]byte(value))
 	mac.Write([]byte("|"))
 	mac.Write([]byte(iatStr))
-	return value + "." + iatStr + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return value + "." + iatStr + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
 // verifyCSRFNonce confirms the POSTed nonce was signed by THIS handler with
@@ -614,6 +911,8 @@ func (h *OAuthHandler) verifyCSRFNonce(p authorizeFormParams, token string) erro
 	mac.Write([]byte("|"))
 	mac.Write([]byte(p.CodeChallenge))
 	mac.Write([]byte("|"))
+	mac.Write([]byte(p.ApprovalHandoff))
+	mac.Write([]byte("|"))
 	mac.Write([]byte(value))
 	mac.Write([]byte("|"))
 	mac.Write([]byte(iatStr))
@@ -624,7 +923,12 @@ func (h *OAuthHandler) verifyCSRFNonce(p authorizeFormParams, token string) erro
 	if _, perr := fmt.Sscanf(iatStr, "%d", &iat); perr != nil {
 		return errors.New("csrf nonce iat parse")
 	}
-	if time.Since(time.Unix(iat, 0)) > csrfTTL {
+	now := h.nowTime()
+	issued := time.Unix(iat, 0)
+	if issued.After(now.Add(csrfClockSkew)) {
+		return errors.New("csrf nonce issued in the future — refresh the consent page and resubmit")
+	}
+	if now.Sub(issued) > csrfTTL {
 		return errors.New("csrf nonce expired — refresh the consent page and resubmit")
 	}
 	return nil
@@ -668,7 +972,7 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
 
   {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
 
-  <form method="POST" action="/oauth/authorize">
+  <form method="POST" action="{{.Action}}">
     <!-- OAuth params travel as hidden inputs, NOT as a query-string suffix on
          the action URL. html/template treats the action attribute as URL
          context and would double-encode an interpolated raw query string, so
@@ -685,6 +989,7 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
     <input type="hidden" name="state" value="{{.State}}">
     <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
     <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
+    {{if .ApprovalHandoff}}<input type="hidden" name="handoff" value="{{.ApprovalHandoff}}">{{end}}
     <input type="hidden" name="csrf_nonce" value="{{.CSRFNonce}}">
     <h2 style="font-size: 1.1em;">Mint a new bearer for this client</h2>
     <p class="meta">A new <code>mcp_tokens</code> row is created for this connection — you can revoke it at any time from <code>sage-gui mcp-token revoke &lt;id&gt;</code> or the dashboard.</p>
@@ -694,8 +999,8 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
       </label>
     </p>
     <div class="card" style="background:#fff;border-color:#cfd8dc;">
-      <p style="margin:0;"><strong>Operates as:</strong> <code>{{.NodeOperatorAgentLabel}}</code></p>
-      <p class="meta" style="margin:0.5em 0 0;">MCP requests from this connection are attributed to the local SAGE node identity. To run as a different agent, register that agent on a separate node and issue a bearer there.</p>
+      <p style="margin:0;"><strong>Identity:</strong> a distinct pending-review MCP agent</p>
+      <p class="meta" style="margin:0.5em 0 0;">This connection receives its own signing key and starts as a restricted Member pending CEREBRUM review. It never inherits Root or Admin authority from the person approving it.</p>
     </div>
     <p style="margin-top:1em;"><button type="submit">Authorize</button></p>
   </form>
@@ -714,98 +1019,99 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
 // outgoing REST calls with the node's signing key — so the picked agent_id
 // only ever functioned as a label. Removing the picker is the honest
 // representation of what the bearer actually does.
-func (h *OAuthHandler) renderConsent(w http.ResponseWriter, r *http.Request, p authorizeFormParams, errMsg string) {
+func (h *OAuthHandler) renderConsent(
+	w http.ResponseWriter,
+	r *http.Request,
+	p authorizeFormParams,
+	actorID, errMsg, action string,
+) {
+	csrfNonce, err := h.signCSRFNonce(p)
+	if err != nil {
+		log.Printf("oauth: cannot generate consent CSRF nonce: %v", err)
+		http.Error(w, "failed to create secure consent page", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	label := h.consentNodeOperatorLabel(r)
-
 	data := struct {
-		ClientID               string
-		RedirectURI            string
-		Scope                  string
-		State                  string
-		ResponseType           string
-		CodeChallenge          string
-		CodeChallengeMethod    string
-		Error                  string
-		CSRFNonce              string
-		NodeOperatorAgentLabel string
+		ClientID            string
+		RedirectURI         string
+		Scope               string
+		State               string
+		ResponseType        string
+		CodeChallenge       string
+		CodeChallengeMethod string
+		Error               string
+		CSRFNonce           string
+		ApprovalHandoff     string
+		Action              string
 	}{
-		ClientID:               p.ClientID,
-		RedirectURI:            p.RedirectURI,
-		Scope:                  p.Scope,
-		State:                  p.State,
-		ResponseType:           p.ResponseType,
-		CodeChallenge:          p.CodeChallenge,
-		CodeChallengeMethod:    p.CodeChallengeMethod,
-		Error:                  errMsg,
-		CSRFNonce:              h.signCSRFNonce(p),
-		NodeOperatorAgentLabel: label,
+		ClientID:            p.ClientID,
+		RedirectURI:         p.RedirectURI,
+		Scope:               p.Scope,
+		State:               p.State,
+		ResponseType:        p.ResponseType,
+		CodeChallenge:       p.CodeChallenge,
+		CodeChallengeMethod: p.CodeChallengeMethod,
+		Error:               errMsg,
+		CSRFNonce:           csrfNonce,
+		ApprovalHandoff:     p.ApprovalHandoff,
+		Action:              action,
 	}
+	_ = actorID // authority is deliberately not rendered into the consent page
 	if err := consentTemplate.Execute(w, data); err != nil {
 		log.Printf("oauth: consentTemplate.Execute failed: %v (data=%+v)", err, data)
 		http.Error(w, "failed to render consent page", http.StatusInternalServerError)
 	}
 }
 
-// consentNodeOperatorLabel returns a short human-readable label for the
-// operator's agent_id. We render the registered name when authenticated
-// (saves the operator looking up the hex), and an 8-char hex prefix otherwise
-// (avoids rendering the full pubkey to a tunnel-exposed unauthenticated
-// visitor).
-func (h *OAuthHandler) consentNodeOperatorLabel(r *http.Request) string {
-	if h.NodeOperatorAgentID == "" {
-		return "(node identity not configured)"
-	}
-	prefix := h.NodeOperatorAgentID
-	if len(prefix) > 8 {
-		prefix = prefix[:8]
-	}
-	if !h.hasDashboardCookie(r) {
-		return prefix + "…"
-	}
-	if all, err := h.Store.ListAgents(r.Context()); err == nil {
-		for _, a := range all {
-			if a != nil && a.AgentID == h.NodeOperatorAgentID {
-				name := a.Name
-				if name == "" {
-					name = a.RegisteredName
-				}
-				if name != "" {
-					return name + " (" + prefix + "…)"
-				}
-				break
-			}
-		}
-	}
-	return prefix + "…"
-}
-
 // processConsent handles the POST: mint a bearer for the chosen agent, bind
 // it to a fresh authorization code, and 302-redirect the user back to the
 // client's redirect_uri carrying the code (and original state).
-func (h *OAuthHandler) processConsent(w http.ResponseWriter, r *http.Request, p authorizeFormParams) {
+func (h *OAuthHandler) processConsent(
+	w http.ResponseWriter,
+	r *http.Request,
+	p authorizeFormParams,
+	actorID, approvalHandoff string,
+) {
 	// HandleAuthorize already bounded and parsed the form, after authenticating
 	// against the original bytes.
 	if err := h.verifyCSRFNonce(p, r.FormValue("csrf_nonce")); err != nil {
-		h.renderConsent(w, r, p, "Consent request could not be verified — please try again. ("+err.Error()+")")
+		h.renderConsent(
+			w, r, p, actorID,
+			"Consent request could not be verified — please try again. ("+err.Error()+")",
+			r.URL.Path,
+		)
 		return
+	}
+	if approvalHandoff != "" {
+		handedParams, err := h.approvalHandoff(approvalHandoff, true)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		handedParams.ApprovalHandoff = approvalHandoff
+		if handedParams != p {
+			http.Error(w, "approval handoff does not match consent request", http.StatusBadRequest)
+			return
+		}
 	}
 	tokenName := strings.TrimSpace(r.FormValue("token_name"))
 	if tokenName == "" {
 		tokenName = "oauth-" + p.ClientID
 	}
 
-	// The bearer is bound to the node operator's identity — see the comment
-	// on OAuthHandler.NodeOperatorAgentID. We do NOT honour any agent_id the
-	// caller submits; the consent screen no longer offers that choice.
-	agentID := strings.TrimSpace(h.NodeOperatorAgentID)
+	// actorID is resolved from live local CEREBRUM state on this exact POST.
+	// It owns the token record but never becomes the token's acting identity:
+	// IssuePendingMCPToken generates and synchronously registers a distinct
+	// restricted Member key.
+	agentID := strings.TrimSpace(actorID)
 	if len(agentID) != 64 {
-		h.renderConsent(w, r, p, "node operator identity unavailable — bearers cannot be issued")
+		h.renderConsent(w, r, p, actorID, "current CEREBRUM authority unavailable — bearers cannot be issued", r.URL.Path)
 		return
 	}
 	if _, decErr := hex.DecodeString(agentID); decErr != nil {
-		h.renderConsent(w, r, p, "node operator identity is not hex-encoded — server misconfiguration")
+		h.renderConsent(w, r, p, actorID, "current CEREBRUM authority is invalid — server misconfiguration", r.URL.Path)
 		return
 	}
 	// Validate the redirect sink before creating either secret. The normal
@@ -830,7 +1136,8 @@ func (h *OAuthHandler) processConsent(w http.ResponseWriter, r *http.Request, p 
 		return
 	}
 
-	// 2. Mint the auth code and bind it to the bearer plaintext.
+	// 2. Mint the auth code and bind it to an encrypted bearer-delivery
+	// envelope. Neither raw secret is persisted by the store.
 	codeRaw := make([]byte, 32)
 	if _, err = rand.Read(codeRaw); err != nil {
 		h.cleanupOAuthIssue(issued.ID, "")
@@ -1025,6 +1332,10 @@ func MountOAuthRoutes(r interface {
 	r.Get("/oauth/authorize", wrap(h.HandleAuthorize))
 	r.Post("/oauth/authorize", wrap(h.HandleAuthorize))
 	r.Options("/oauth/authorize", wrap(oauthPreflightHandler))
+	// Local approval bridge. Intentionally absent from discovery and from the
+	// Cloudflare ingress allowlist generated by the CEREBRUM wizard.
+	r.Get("/oauth/approve", h.HandleApprove)
+	r.Post("/oauth/approve", h.HandleApprove)
 	r.Post("/oauth/token", wrap(h.HandleToken))
 	r.Options("/oauth/token", wrap(oauthPreflightHandler))
 }

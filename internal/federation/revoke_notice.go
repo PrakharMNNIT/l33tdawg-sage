@@ -17,6 +17,12 @@ const revokeNoticeTimeout = 5 * time.Second
 // best-effort authenticated notification to the exact peer first. Notification
 // failure never weakens or blocks the local operator's right to revoke.
 func (m *Manager) RevokeAgreementNotifying(remoteChainID string) (*RevokeAgreementResult, error) {
+	return m.RevokeAgreementNotifyingAs("", remoteChainID)
+}
+
+func (m *Manager) RevokeAgreementNotifyingAs(
+	controlActorID, remoteChainID string,
+) (*RevokeAgreementResult, error) {
 	result := &RevokeAgreementResult{}
 	unlock := m.LockAgreementMutation()
 	defer unlock()
@@ -49,7 +55,9 @@ func (m *Manager) RevokeAgreementNotifying(remoteChainID string) (*RevokeAgreeme
 	// Commit our irreversible tx-34 first. The peer is never asked to revoke if
 	// local consensus rejects. Keep the exact old CA/seed only long enough to
 	// sign the best-effort notice; ActiveAgreement already denies this edge.
-	hash, err := m.broadcastRevokeAgreementLockedReason(remoteChainID, "operator disconnect")
+	hash, err := m.broadcastRevokeAgreementLockedReasonAs(
+		controlActorID, remoteChainID, "operator disconnect",
+	)
 	if err != nil {
 		return nil, err
 	}

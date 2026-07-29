@@ -39,6 +39,83 @@ def test_propose_memory(client, mock_api, sample_submit_response):
     assert result.memory_id == sample_submit_response["memory_id"]
 
 
+def test_propose_task_omits_domain_and_preserves_derived_receipt(
+    client, mock_api, sample_submit_response
+):
+    import json
+
+    response = {
+        **sample_submit_response,
+        "task_status": "planned",
+        "projection_confirmed": True,
+        "idempotency_key": "mcp-derived-semantic-key",
+    }
+    route = mock_api.post("/v1/memory/submit").mock(
+        return_value=httpx.Response(201, json=response)
+    )
+    result = client.propose(
+        content="Check the HDMI port",
+        memory_type="task",
+        domain_tag=None,
+        confidence=0.9,
+    )
+    body = json.loads(route.calls.last.request.read())
+    assert "domain_tag" not in body
+    assert "idempotency_key" not in body
+    assert result.idempotency_key == "mcp-derived-semantic-key"
+    assert result.projection_confirmed is True
+
+
+def test_propose_task_parses_confirmed_replay(client, mock_api, sample_submit_response):
+    response = {
+        **sample_submit_response,
+        "task_status": "done",
+        "projection_confirmed": True,
+        "idempotency_key": "check-hdmi-2026-08-01",
+        "idempotent_replay": True,
+    }
+    mock_api.post("/v1/memory/submit").mock(
+        return_value=httpx.Response(200, json=response)
+    )
+    result = client.propose(
+        content="Check the HDMI port",
+        memory_type="task",
+        domain_tag="hardware",
+        confidence=0.9,
+        idempotency_key="check-hdmi-2026-08-01",
+    )
+    assert result.task_status == "done"
+    assert result.idempotent_replay is True
+    assert result.projection_confirmed is True
+
+
+def test_propose_task_parses_committed_unconfirmed(
+    client, mock_api, sample_submit_response
+):
+    response = {
+        **sample_submit_response,
+        "status": "committed_unconfirmed",
+        "task_status": "planned",
+        "projection_confirmed": False,
+        "retryable": False,
+        "message": "Reconcile this memory_id; do not resubmit the task.",
+        "idempotency_key": "mcp-derived-semantic-key",
+    }
+    mock_api.post("/v1/memory/submit").mock(
+        return_value=httpx.Response(202, json=response)
+    )
+    result = client.propose(
+        content="Check the HDMI port",
+        memory_type="task",
+        domain_tag="hardware",
+        confidence=0.9,
+    )
+    assert result.committed is True
+    assert result.projection_confirmed is False
+    assert result.retryable is False
+    assert "do not resubmit" in (result.message or "")
+
+
 def test_propose_memory_with_tags(client, mock_api, sample_submit_response):
     import json
     route = mock_api.post("/v1/memory/submit").mock(
@@ -102,6 +179,28 @@ def test_propose_memory_without_classification_omits_field(client, mock_api, sam
     # Omitted classification must not appear on the wire — server defaults to
     # PUBLIC (0), not INTERNAL (the v6.8.6 server-side behavior).
     assert "classification" not in body
+
+
+def test_timeline_preserves_visible_total(client, mock_api):
+    mock_api.get("/v1/memory/timeline").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "buckets": [
+                    {
+                        "period": "2026-07-30T01:00:00Z",
+                        "count": 3,
+                        "domain": "hardware",
+                    }
+                ],
+                "total": 3,
+            },
+        )
+    )
+
+    result = client.timeline(domain="hardware", bucket="hour")
+    assert result.total == 3
+    assert result.buckets[0].domain == "hardware"
 
 
 def test_query_memories(client, mock_api, sample_query_response):
@@ -242,6 +341,39 @@ def test_error_handling(client, mock_api, sample_error_response):
     )
     with pytest.raises(SageNotFoundError):
         client.get_memory("nonexistent")
+
+
+def test_typed_write_denial_preserves_machine_readable_remedy(client, mock_api):
+    from sage_sdk.exceptions import SageAuthError
+
+    mock_api.post("/v1/memory/submit").mock(
+        return_value=httpx.Response(
+            403,
+            json={
+                "type": "https://sage.dev/errors/domain-write-denied",
+                "title": "Memory write denied",
+                "status": 403,
+                "detail": "memory write access denied",
+                "reason_code": "foreign_write_restricted",
+                "remedy": (
+                    "Assign a write-compatible named profile that permits "
+                    "foreign-domain writes, or submit to a domain this agent owns."
+                ),
+                "retryable": False,
+            },
+        )
+    )
+    with pytest.raises(SageAuthError) as exc:
+        client.propose(
+            content="Denied",
+            memory_type="fact",
+            domain_tag="foreign",
+            confidence=0.8,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.reason_code == "foreign_write_restricted"
+    assert exc.value.retryable is False
+    assert "write-compatible" in (exc.value.remedy or "")
 
 
 def test_context_manager(agent_identity, mock_api):

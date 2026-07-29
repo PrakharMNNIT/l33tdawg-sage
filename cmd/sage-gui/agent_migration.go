@@ -22,9 +22,17 @@ func migrateAgentsOnChainAtStartup(
 	signingKey ed25519.PrivateKey,
 	quorumEnabled bool,
 	logger zerolog.Logger,
-) {
+) error {
 	if quorumEnabled {
 		logger.Info().Msg("legacy SQLite-to-consensus agent registration skipped in quorum mode; reconciling projection-only fields")
 	}
-	sageabci.MigrateAgentsOnChain(ctx, agentStore, badgerStore, cometRPC, signingKey, !quorumEnabled, logger)
+	return sageabci.MigrateAgentsOnChain(
+		ctx,
+		agentStore,
+		badgerStore,
+		cometRPC,
+		signingKey,
+		!quorumEnabled,
+		logger,
+	)
 }

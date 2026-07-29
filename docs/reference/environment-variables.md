@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.14.2. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
+<!-- Reconciled through SAGE v11.15.0. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
 
 # SAGE Reference — Environment Variables
 
@@ -23,6 +23,20 @@ notes which.
 | `SAGE_IDENTITY_PATH` | Explicit identity-key path. Takes precedence over `SAGE_AGENT_KEY`. Project-local Codex installs pin their derived provider-specific folder key explicitly; the shared user-level Codex config uses workspace mode so `sage-gui mcp` and provider-neutral workspace hooks derive the same stable per-workspace key without inheriting a shell pin. | (per-project derivation) | sage-gui, MCP | `cmd/sage-gui/mcp.go`, `cmd/sage-gui/hook.go:219`, `cmd/sage-gui/connect.go` (`mcpIdentityPath`) |
 | `SAGE_IDENTITY_MODE` | Codex MCP identity selection. `workspace` ignores inherited `SAGE_IDENTITY_PATH`/`SAGE_AGENT_KEY` and derives from the launch working directory; `pinned` honors the explicit configured key. Written by generated Codex config rather than intended as a general user setting. | `pinned` unless configured | sage-gui MCP | `cmd/sage-gui/mcp.go`, `cmd/sage-gui/codex.go` |
 | `SAGE_AGENT_KEY` | Explicit agent-key path; overrides per-project key derivation. Used if `SAGE_IDENTITY_PATH` is unset. | `$SAGE_HOME/agent.key` | sage-gui, MCP | `cmd/sage-gui/mcp.go:147`, `cmd/sage-gui/mcp_token.go:208` |
+
+### First-party vendored companion bootstrap
+
+These variables are for an application such as Mynah / SAGE Voice Bridge that
+creates and owns a fresh personal SAGE node. Ordinary self-registering agents
+must not set them. Supplying any one makes the complete contract mandatory;
+missing or invalid fields fail startup rather than silently creating a mute or
+partially privileged companion.
+
+| Variable | What it does | Default | Read by | Source |
+|----------|--------------|---------|---------|--------|
+| `SAGE_VENDORED_AGENT_KEY_FILE` | Stable, application-owned Ed25519 key path for a first-party companion that creates a fresh node. Genesis creates/loads it, dual-signs the chain-bound bootstrap with Root and companion, and enrolls that distinct identity directly at app-v23. It is not an upgraded-node repair selector; existing third-party or mask-30 agents require reviewed onboarding. | (unset; generic enrollment) | sage-gui | `cmd/sage-gui/config.go` (`applyEnvOverrides`), `cmd/sage-gui/node.go` (`genesisAppStateForVendoredAgent`) |
+| `SAGE_VENDORED_AGENT_HOME_DOMAIN` | Non-shared domain the companion owns after fresh-genesis bootstrap, for example `voice-interface`. This is ownership, not a synthetic level-2 grant. | (required with vendored key) | sage-gui | `cmd/sage-gui/config.go`, `cmd/sage-gui/node.go`, `cmd/sage-gui/appv23_vendored_readiness.go` |
+| `SAGE_VENDORED_AGENT_CLEARANCE` | Maximum classification the companion may read, integer `0..4`. The app-v23 Companion profile remains fixed at role Member and capability mask `15`; this variable cannot promote it to Manager/Admin or weaken the profile. | `1` when another vendored field creates the config | sage-gui | `cmd/sage-gui/config.go`, `cmd/sage-gui/node.go` |
 
 ---
 
@@ -81,7 +95,7 @@ this exact profile, including an empty WAL directory for the crash oracle.
 
 | Variable | What it does | Default | Read by | Source |
 |----------|--------------|---------|---------|--------|
-| `SAGE_PASSPHRASE` | Vault passphrase for the encrypted store. If empty, the node prompts on a TTY (and stays locked if none is available). | (prompt) | sage-gui | `cmd/sage-gui/node.go:169` |
+| `SAGE_PASSPHRASE` | Vault passphrase for the encrypted store. If empty, the node prompts on a TTY. A provably single-validator personal node may start in isolated local-unlock mode; quorum, state-sync, or multi-validator nodes fail before CometBFT starts until the vault is unlocked. | (prompt) | sage-gui | `cmd/sage-gui/node.go` |
 | `SAGE_QUORUM_PASSPHRASE` | Passphrase supplied non-interactively to quorum init/join. | (prompt) | sage-gui | `cmd/sage-gui/quorum.go:501` |
 
 ---

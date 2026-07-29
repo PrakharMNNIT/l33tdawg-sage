@@ -29,6 +29,7 @@ const (
 	BootStateSyncFailed
 
 	bootStateSyncCheckTxBlockedCode uint32 = 110
+	localTxAdmissionBlockedCode     uint32 = 112
 )
 
 // ErrBootStateSyncPersistencePending means the active application is ahead of
@@ -136,6 +137,11 @@ type BootStateSyncRuntime struct {
 	consensusGateOnce    sync.Once
 	p2pFilterFailed      atomic.Bool
 	p2pFilterSealed      atomic.Bool
+	// localTxAdmissionBlocked is an explicitly process-local mempool latch.
+	// It is used only while a single-validator personal node waits for its
+	// encrypted serving projection to unlock. It never enters AppHash and must
+	// never be used as a substitute for a consensus-path authorization rule.
+	localTxAdmissionBlocked atomic.Bool
 
 	endpointsMu sync.RWMutex
 	serving     *StateSyncServingController
@@ -272,7 +278,31 @@ func (r *BootStateSyncRuntime) CheckTx(ctx context.Context, req *abcitypes.Reque
 		}, nil
 	}
 	defer r.mu.RUnlock()
+	if r.localTxAdmissionBlocked.Load() {
+		return &abcitypes.ResponseCheckTx{
+			Code:      localTxAdmissionBlockedCode,
+			Codespace: "sage-local-admission",
+			Log:       "transaction admission is unavailable until the local encrypted vault is unlocked",
+		}, nil
+	}
 	return r.bundle.application.CheckTx(ctx, req)
+}
+
+// SetLocalTxAdmissionBlocked closes or opens the process-local CheckTx latch.
+// Unlock callers must attach the vault to the serving projection before opening
+// this latch. Sequentially-consistent atomics then guarantee a CheckTx that
+// observes false can also observe the earlier vault publication.
+func (r *BootStateSyncRuntime) SetLocalTxAdmissionBlocked(blocked bool) {
+	if r == nil {
+		return
+	}
+	r.localTxAdmissionBlocked.Store(blocked)
+}
+
+// LocalTxAdmissionBlocked exposes the process-local latch for startup
+// assertions and health wiring. It is not consensus state.
+func (r *BootStateSyncRuntime) LocalTxAdmissionBlocked() bool {
+	return r != nil && r.localTxAdmissionBlocked.Load()
 }
 
 func (r *BootStateSyncRuntime) InitChain(ctx context.Context, req *abcitypes.RequestInitChain) (*abcitypes.ResponseInitChain, error) {
@@ -438,7 +468,7 @@ func (r *BootStateSyncRuntime) activatePreparedBundleAuthorized(
 	}
 	if !statesync.SupportsAppVersion(expectedAppVersion) {
 		r.setBootStateSyncPhaseLocked(BootStateSyncFailed)
-		return errors.New("state sync activation requires supported app version 20, 21, or 22")
+		return errors.New("state sync activation requires supported app version 20, 21, 22, or 23")
 	}
 	if expectedHeight < r.bundle.expectedHeight ||
 		(expectedHeight == r.bundle.expectedHeight && !bytes.Equal(expectedHash, r.bundle.expectedHash)) ||

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -15,6 +16,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -288,6 +291,14 @@ func peerResponseLimit(path string, headers http.Header) int64 {
 	if path == "/fed/v1/pipe/contacts/lookup" {
 		return int64(maxPipeContactLookupBytes)
 	}
+	if path == "/fed/v1/pipe/linked/consent-candidates" {
+		return int64(maxLinkedMessageCandidateResponseBytes)
+	}
+	if path == "/fed/v1/pipe/linked/resolve" ||
+		path == "/fed/v1/pipe/linked/revalidate" ||
+		path == "/fed/v1/pipe/linked/consent-offer" {
+		return int64(maxLinkedMessageResolveBytes)
+	}
 	if path == "/fed/v1/status" && clientRequestsCapability(headers, CapabilityFederatedPipelineContactLookup) {
 		// A compact status has no contact roster. The peer policy/capability
 		// envelope is far smaller than this, while the limit bounds all eight
@@ -333,7 +344,37 @@ func (m *Manager) QueryPeer(ctx context.Context, remoteChainID string, qr *Query
 	if err != nil {
 		return nil, err
 	}
-	body, status, err := m.doPeerRequest(ctx, agreement, http.MethodPost, "/fed/v1/query", qr)
+	if qr == nil {
+		return nil, errors.New("v23 federation query request is required")
+	}
+	expectedDigest := qr.PlanAgreementBindings[remoteChainID]
+	expectedChallenge := qr.PlanChallenges[remoteChainID]
+	if expectedDigest == "" || expectedChallenge == "" {
+		return nil, fmt.Errorf("v23 federation query has no agent-signed plan for %s", remoteChainID)
+	}
+	peerStatus, err := m.fetchPeerStatus(ctx, agreement)
+	if err != nil {
+		return nil, fmt.Errorf("v23 federation negotiation with %s failed: %w", remoteChainID, err)
+	}
+	if validationErr := validatePeerV23Status(peerStatus); validationErr != nil {
+		return nil, fmt.Errorf("peer %s does not support required federation protocol v23: %w", remoteChainID, validationErr)
+	}
+	if peerStatus.QueryAgreementBindingDigest != expectedDigest {
+		return nil, fmt.Errorf("peer %s federation binding changed after the agent signed its recall plan", remoteChainID)
+	}
+	v23req, err := cloneQueryRequest(qr)
+	if err != nil {
+		return nil, err
+	}
+	if v23req.AgentProof == nil {
+		return nil, fmt.Errorf("v23 federation query requires the original agent proof")
+	}
+	v23req.ProtocolVersion = FederationProtocolV23
+	v23req.SourceChainID = m.localChainID
+	v23req.DestinationChainID = remoteChainID
+	v23req.AgreementBindingDigest = expectedDigest
+	v23req.QueryChallenge = expectedChallenge
+	body, status, err := m.doPeerRequest(ctx, agreement, http.MethodPost, "/fed/v1/query", v23req)
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +386,114 @@ func (m *Manager) QueryPeer(ctx context.Context, remoteChainID string, qr *Query
 		return nil, fmt.Errorf("decode peer response: %w", err)
 	}
 	return &out, nil
+}
+
+// PlanRecall expands wildcard targets to an exact finite set and obtains one
+// authenticated, durable destination challenge per peer. The returned maps are
+// designed to be copied verbatim into the original agent-signed recall body.
+func (m *Manager) PlanRecall(ctx context.Context, targets []string, agentID, domain string) (*RecallPlan, error) {
+	if _, err := auth.AgentIDToPublicKey(agentID); err != nil {
+		return nil, fmt.Errorf("valid recall agent id is required: %w", err)
+	}
+	if domain == "" || domain != strings.TrimSpace(domain) {
+		return nil, errors.New("an exact recall domain is required")
+	}
+	var chains []string
+	if len(targets) == 0 || (len(targets) == 1 && targets[0] == "*") {
+		for _, agreement := range m.ActiveAgreements() {
+			chains = append(chains, agreement.RemoteChainID)
+		}
+	} else {
+		seen := make(map[string]struct{}, len(targets))
+		for _, target := range targets {
+			target = strings.TrimSpace(target)
+			if target == "" || target == "*" {
+				return nil, errors.New("wildcard federation target must be used alone")
+			}
+			if _, duplicate := seen[target]; duplicate {
+				continue
+			}
+			seen[target] = struct{}{}
+			chains = append(chains, target)
+			if len(chains) >= maxFanOutTargets {
+				break
+			}
+		}
+	}
+	sort.Strings(chains)
+	plan := &RecallPlan{
+		ProtocolVersion:   FederationProtocolV23,
+		SourceChainID:     m.localChainID,
+		AgreementBindings: make(map[string]string),
+		QueryChallenges:   make(map[string]string),
+		ExpiresAt:         make(map[string]int64),
+		Errors:            make(map[string]string),
+	}
+	for _, chain := range chains {
+		agreement, err := m.ActiveAgreement(chain)
+		if err != nil {
+			plan.Errors[chain] = err.Error()
+			continue
+		}
+		status, err := m.fetchPeerStatus(ctx, agreement)
+		if err != nil {
+			plan.Errors[chain] = err.Error()
+			continue
+		}
+		if validationErr := validatePeerV23Status(status); validationErr != nil {
+			plan.Errors[chain] = validationErr.Error()
+			continue
+		}
+		body, httpStatus, err := m.doPeerRequest(ctx, agreement, http.MethodPost,
+			"/fed/v1/query/plan", &QueryPlanRequest{AgentID: agentID, DomainTag: domain})
+		if err != nil {
+			plan.Errors[chain] = err.Error()
+			continue
+		}
+		if httpStatus != http.StatusOK {
+			plan.Errors[chain] = fmt.Sprintf("peer returned %d: %s", httpStatus, truncate(body, 200))
+			continue
+		}
+		var destination QueryPlanResponse
+		if err := json.Unmarshal(body, &destination); err != nil {
+			plan.Errors[chain] = fmt.Sprintf("decode recall plan: %v", err)
+			continue
+		}
+		if destination.ProtocolVersion != FederationProtocolV23 ||
+			destination.SourceChainID != m.localChainID ||
+			destination.DestinationChainID != chain ||
+			destination.AgreementBindingDigest != status.QueryAgreementBindingDigest ||
+			destination.QueryChallenge == "" || destination.ExpiresAt <= time.Now().Unix() {
+			plan.Errors[chain] = "peer returned a stale or mismatched v23 recall plan"
+			continue
+		}
+		plan.Destinations = append(plan.Destinations, chain)
+		plan.AgreementBindings[chain] = destination.AgreementBindingDigest
+		plan.QueryChallenges[chain] = destination.QueryChallenge
+		plan.ExpiresAt[chain] = destination.ExpiresAt
+	}
+	if len(plan.Errors) == 0 {
+		plan.Errors = nil
+	}
+	return plan, nil
+}
+
+func validatePeerV23Status(status *StatusResponse) error {
+	if status == nil {
+		return errors.New("status is unavailable")
+	}
+	if status.FederationProtocolVersion != FederationProtocolV23 {
+		return fmt.Errorf("protocol version is %d", status.FederationProtocolVersion)
+	}
+	if !slices.Contains(status.Capabilities, CapabilityFederationV23) ||
+		!slices.Contains(status.Capabilities, CapabilityQueryAgentProofV2) {
+		return errors.New("required v23 capabilities are absent")
+	}
+	digest, err := hex.DecodeString(status.QueryAgreementBindingDigest)
+	if err != nil || len(digest) != sha256.Size || status.QueryAgreementBindingDigest != strings.ToLower(status.QueryAgreementBindingDigest) {
+		return errors.New("query agreement binding is absent or invalid")
+	}
+	return nil
 }
 
 // PushReceipt delivers our signed CommitReceipt to one peer.

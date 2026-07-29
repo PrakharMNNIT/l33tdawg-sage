@@ -12,7 +12,7 @@
 # governed upgrade-delay floor is three blocks instead of 200, and the proposer
 # cooldown is one block instead of 50. It also recognizes a test-only dormant
 # pre-publication pause hook used to place the exact crash below. A fresh
-# provider still performs the real signed auto-advance ceremony through app-v22,
+# provider still performs the real signed auto-advance ceremony through app-v23,
 # including app-v20's chain-derived governance domain at a positive activation
 # height.
 # Authorization, quorum, identity, state-sync, P2P, receiver-session,
@@ -762,7 +762,7 @@ write_authorization() {
   "chain_id": "${chain_id}",
   "joining_node_id": "${joining_id}",
   "validator_public_key": "${validator_pubkey}",
-  "app_version": 22,
+  "app_version": 23,
   "expires_at": "${expiry}",
   "snapshot_height_floor": ${floor},
   "validator_node_ids": ["${provider_id}"],
@@ -783,33 +783,103 @@ copy_provider_genesis() {
 seed_memories() {
   local container=$1
   local file=$2
-  docker exec "${container}" ./sage-gui-v119-fixture seed "${file}" --domain v119-state-sync >/dev/null
+  local expected_count=$3
+  local output
+  if ! output=$(docker exec "${container}" ./sage-gui-v119-fixture \
+    seed "${file}" --domain v119-state-sync 2>&1); then
+    echo "ERROR: seed command failed for ${file}" >&2
+    printf '%s\n' "${output}" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "${output}" | python3 -c '
+import sys
+
+expected = int(sys.argv[1])
+lines = sys.stdin.read().splitlines()
+summary = f"Seeded {expected}/{expected} memories successfully."
+matches = [line for line in lines if line.startswith("Seeded ") and line.endswith(" memories successfully.")]
+if len(matches) != 1 or matches[0] != summary or not lines or lines[-1] != summary:
+    raise SystemExit(1)
+' "${expected_count}"; then
+    echo "ERROR: seed command did not report exactly ${expected_count}/${expected_count} successful memories for ${file}" >&2
+    printf '%s\n' "${output}" >&2
+    return 1
+  fi
+}
+
+assert_appv23_root_semantics() {
+  local provider=$1
+  local receiver=$2
+  local provider_state
+  local receiver_state
+  if ! provider_state=$(docker exec "${provider}" ./sage-gui-v119-fixture \
+    v119-state-sync-fixture appv23-root-state); then
+    echo "ERROR: could not query provider app-v23 Root semantic state" >&2
+    return 1
+  fi
+  if ! receiver_state=$(docker exec "${receiver}" ./sage-gui-v119-fixture \
+    v119-state-sync-fixture appv23-root-state); then
+    echo "ERROR: could not query receiver app-v23 Root semantic state" >&2
+    return 1
+  fi
+  python3 - "${provider_state}" "${receiver_state}" <<'PY'
+import re
+import sys
+
+canonical = re.compile(r"^[0-9a-f]{64}$")
+
+def parse(label, raw):
+    fields = raw.strip().split("|")
+    if len(fields) != 5:
+        raise SystemExit(f"ERROR: {label} Root fixture returned {len(fields)} fields, want 5")
+    principal, credential, generation, history_digest, local_agent = fields
+    if not all(canonical.fullmatch(value) for value in (
+        principal, credential, history_digest, local_agent
+    )):
+        raise SystemExit(f"ERROR: {label} Root fixture returned a non-canonical identity or digest")
+    try:
+        generation_number = int(generation)
+    except ValueError as error:
+        raise SystemExit(f"ERROR: {label} Root generation is not an integer") from error
+    if generation_number < 1 or str(generation_number) != generation:
+        raise SystemExit(f"ERROR: {label} Root generation is not canonical and positive")
+    return principal, credential, generation, history_digest, local_agent
+
+provider = parse("provider", sys.argv[1])
+receiver = parse("receiver", sys.argv[2])
+if provider[:4] != receiver[:4]:
+    raise SystemExit(
+        "ERROR: state sync changed app-v23 Root principal, credential, generation, or history digest"
+    )
+if receiver[4] in receiver[:2]:
+    raise SystemExit("ERROR: receiver local agent.key became CEREBRUM Root")
+PY
 }
 
 echo "=== v11.9 integrated authorized state-sync wire gate ==="
 echo "source: ${SOURCE_ID} (both image labels verified before topology start)"
 echo "fixture: one validator provider; observer/receiver/unauthorized peers are distinct non-validator full nodes"
 
-# 1. Drive a fresh real chain through the signed app-v22 ladder. The scoped
+# 1. Drive a fresh real chain through the signed app-v23 ladder. The scoped
 # projection installed below still proves app-v20's governance-domain semantics.
 write_provider_personal_config
-cat >"${PROVIDER_HOME}/post-v22.txt" <<'EOF'
-This committed post-app-v22 fixture record proves the provider snapshot is beyond the positive activation height.
+cat >"${PROVIDER_HOME}/post-v23.txt" <<'EOF'
+This committed post-app-v23 fixture record proves the provider snapshot is beyond the positive activation height.
 EOF
 cat >"${PROVIDER_HOME}/advance.txt" <<'EOF'
 This first state-sync eligibility record advances the provider beyond the exported snapshot height.
 
 This second state-sync eligibility record supplies additional committed blocks for the H plus two light-client window.
 EOF
-chmod 0644 "${PROVIDER_HOME}/post-v22.txt" "${PROVIDER_HOME}/advance.txt"
+chmod 0644 "${PROVIDER_HOME}/post-v23.txt" "${PROVIDER_HOME}/advance.txt"
 
 start_sage "${PROVIDER}" "${PROVIDER_HOME}" provider-rpc
 docker network connect --alias provider-p2p "${P2P_NETWORK}" "${PROVIDER}"
 wait_rpc "${PROVIDER}"
 wait_rest "${PROVIDER}"
-wait_app_version "${PROVIDER}" 22
+wait_app_version "${PROVIDER}" 23
 pre_seed_height=$(rpc_height "${PROVIDER}")
-seed_memories "${PROVIDER}" /sage/post-v22.txt
+seed_memories "${PROVIDER}" /sage/post-v23.txt 1
 wait_height_at_least "${PROVIDER}" "$((pre_seed_height + 1))"
 scoped_memory_id=$(docker exec "${PROVIDER}" ./sage-gui-v119-fixture \
   v119-state-sync-fixture install-scoped-proof)
@@ -861,7 +931,7 @@ wait_convergence "${PROVIDER}" "${OBSERVER}"
 snapshot_height=$(rpc_height "${PROVIDER}")
 snapshot_app_hash=$(rpc_app_hash "${PROVIDER}")
 if [ "${snapshot_height}" -le 1 ]; then
-  echo "ERROR: provider did not reach a positive post-app-v22 snapshot height" >&2
+  echo "ERROR: provider did not reach a positive post-app-v23 snapshot height" >&2
   exit 1
 fi
 if ! is_canonical_hash "${snapshot_app_hash}"; then
@@ -900,7 +970,7 @@ docker start "${PROVIDER}" >/dev/null
 docker start "${OBSERVER}" >/dev/null
 wait_rest "${PROVIDER}"
 wait_rpc "${OBSERVER}"
-seed_memories "${PROVIDER}" /sage/advance.txt
+seed_memories "${PROVIDER}" /sage/advance.txt 2
 wait_height_at_least "${PROVIDER}" "$((snapshot_height + 2))"
 wait_convergence "${PROVIDER}" "${OBSERVER}"
 latest_height=$(rpc_height "${PROVIDER}")
@@ -1102,7 +1172,7 @@ fi
 # `/abci_info` while the runtime write lease is held: it is expected to wait
 # behind the same gate we are proving.
 pre_publish_evidence=$(docker exec "${RECEIVER}" cat "${PRE_PUBLISH_MARKER}")
-python3 - "${snapshot_height}" "${snapshot_app_hash}" 22 "${pre_publish_evidence}" <<'PY'
+python3 - "${snapshot_height}" "${snapshot_app_hash}" 23 "${pre_publish_evidence}" <<'PY'
 import json
 import sys
 
@@ -1201,14 +1271,15 @@ receiver_app_version=$(rpc_app_version "${RECEIVER}" 2>/dev/null || true)
 provider_app_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 receiver_app_hash=$(rpc_app_hash "${RECEIVER}" 2>/dev/null || true)
 provider_app_hash=$(rpc_app_hash "${PROVIDER}" 2>/dev/null || true)
-if [ "${receiver_app_version}" != 22 ] ||
-   [ "${provider_app_version}" != 22 ] ||
+if [ "${receiver_app_version}" != 23 ] ||
+   [ "${provider_app_version}" != 23 ] ||
    ! is_canonical_hash "${receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v22 state" >&2
+  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v23 state" >&2
   exit 1
 fi
+assert_appv23_root_semantics "${PROVIDER}" "${RECEIVER}"
 
 ready_line=$(docker logs "${RECEIVER}" 2>&1 | grep -n 'SAGE Personal ready' | tail -1 | cut -d: -f1)
 if [ -z "${ready_line}" ] || [ "${session_line}" -ge "${ready_line}" ]; then
@@ -1260,14 +1331,15 @@ success_receiver_app_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null
 provider_app_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 success_receiver_app_hash=$(rpc_app_hash "${SUCCESS_RECEIVER}" 2>/dev/null || true)
 provider_app_hash=$(rpc_app_hash "${PROVIDER}" 2>/dev/null || true)
-if [ "${success_receiver_app_version}" != 22 ] ||
-   [ "${provider_app_version}" != 22 ] ||
+if [ "${success_receiver_app_version}" != 23 ] ||
+   [ "${provider_app_version}" != 23 ] ||
    ! is_canonical_hash "${success_receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${success_receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: successful receiver/provider did not publish exact app-v22 state" >&2
+  echo "ERROR: successful receiver/provider did not publish exact app-v23 state" >&2
   exit 1
 fi
+assert_appv23_root_semantics "${PROVIDER}" "${SUCCESS_RECEIVER}"
 
 success_session_line=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep -n 'authorized state-sync session assembled and exact-version candidate verified' | tail -1 | cut -d: -f1)
 success_seal_line=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep -n 'authorized validator state-sync activation sealed before service admission' | tail -1 | cut -d: -f1)
@@ -1298,14 +1370,14 @@ cat >"${PROVIDER_HOME}/restart.txt" <<'EOF'
 This post-restart committed record proves the synchronized non-validator full node resumes ordinary block catch-up.
 EOF
 chmod 0644 "${PROVIDER_HOME}/restart.txt"
-seed_memories "${PROVIDER}" /sage/restart.txt
+seed_memories "${PROVIDER}" /sage/restart.txt 1
 wait_height_at_least "${PROVIDER}" "$((before_restart_seed + 1))"
 wait_convergence "${PROVIDER}" "${SUCCESS_RECEIVER}"
 assert_nonvalidator "${SUCCESS_RECEIVER}"
 post_restart_provider_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 post_restart_receiver_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null || true)
-if [ "${post_restart_provider_version}" != 22 ] || [ "${post_restart_receiver_version}" != 22 ]; then
-  echo "ERROR: provider SIGKILL recovery regressed exact app-v22 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
+if [ "${post_restart_provider_version}" != 23 ] || [ "${post_restart_receiver_version}" != 23 ]; then
+  echo "ERROR: provider SIGKILL recovery regressed exact app-v23 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
   exit 1
 fi
 
@@ -1328,5 +1400,5 @@ for image in "${ABCI_IMAGE}" "${NODE_IMAGE}"; do
 done
 
 echo "=== v11.9 AUTHORIZED STATE-SYNC WIRE GATE PASSED ==="
-echo "PASS: frozen source ${SOURCE_ID}; governed app-v22 provider; real signed app-v20 scope+memory; exact app-v22 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
+echo "PASS: frozen source ${SOURCE_ID}; governed app-v23 provider; real signed app-v20 scope+memory; exact app-v23 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
 echo "ROLE: receiver is intentionally a synchronized NON-VALIDATOR full node; validator-set admission remains a separate signed governance action"

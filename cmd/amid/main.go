@@ -52,6 +52,7 @@ func main() {
 	abciAddr := flag.String("abci-addr", envOrDefault("ABCI_ADDR", ""), "ABCI server listen address (e.g. tcp://0.0.0.0:26658). If set, runs as standalone ABCI server; otherwise embeds CometBFT in-process")
 	cometRPC := flag.String("comet-rpc", envOrDefault("COMET_RPC", "http://127.0.0.1:26657"), "CometBFT RPC endpoint for REST API tx broadcast")
 	validatorKeyFile := flag.String("validator-key-file", os.Getenv("VALIDATOR_KEY_FILE"), "priv_validator_key.json for the memory auto-voter and REST governance gateway in socket mode (in-process mode uses the key under --home). If unset in socket mode, no voter runs and governance mutations return 503")
+	cerebrumRootKeyFile := flag.String("cerebrum-root-key-file", os.Getenv("SAGE_CEREBRUM_ROOT_KEY_FILE"), "raw 32-byte seed or 64-byte Ed25519 CEREBRUM Root key used only to countersign local promoted-Admin actions (empty keeps delegated Admin REST actions disabled)")
 	governanceOperatorID := flag.String("governance-operator-id", os.Getenv("SAGE_GOVERNANCE_OPERATOR_ID"), "hex Ed25519 identity allowed to authorize this validator's REST governance mutations (empty disables them)")
 	requireVoter := flag.Bool("require-voter", envBoolOrDefault("VOTER_REQUIRED", false), "Exit non-zero at startup if the memory auto-voter cannot start (missing/unreadable/invalid validator key) instead of serving without a voter")
 	tlsCert := flag.String("tls-cert", os.Getenv("TLS_CERT"), "TLS certificate file for REST API (PEM)")
@@ -148,13 +149,13 @@ func main() {
 
 	if *abciAddr != "" {
 		// ── Standalone ABCI server mode (Docker: separate CometBFT container) ──
-		runABCIServer(app, *abciAddr, *restAddr, *metricsAddr, *cometRPC, *validatorKeyFile, *governanceOperatorID, *tlsCert, *tlsKey, *tlsCA, *requireVoter, health, logger)
+		runABCIServer(app, *abciAddr, *restAddr, *metricsAddr, *cometRPC, *validatorKeyFile, *cerebrumRootKeyFile, *governanceOperatorID, *tlsCert, *tlsKey, *tlsCA, *requireVoter, health, logger)
 	} else {
 		// ── In-process mode (single binary: ABCI + CometBFT embedded) ──
 		if *cometHome == "" {
 			logger.Fatal().Msg("CometBFT home directory is required in in-process mode (--home or COMETBFT_HOME)")
 		}
-		runInProcess(app, *cometHome, *restAddr, *metricsAddr, *governanceOperatorID, *tlsCert, *tlsKey, *tlsCA, *requireVoter, health, logger)
+		runInProcess(app, *cometHome, *restAddr, *metricsAddr, *cerebrumRootKeyFile, *governanceOperatorID, *tlsCert, *tlsKey, *tlsCA, *requireVoter, health, logger)
 	}
 }
 
@@ -194,6 +195,24 @@ func requireVoterKeyOrExit(keyFile string, logger zerolog.Logger) {
 	}
 }
 
+func loadCEREBRUMRootKey(path string) (ed25519.PrivateKey, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // explicit operator-owned key path
+	if err != nil {
+		return nil, err
+	}
+	switch len(data) {
+	case ed25519.SeedSize:
+		return ed25519.NewKeyFromSeed(data), nil
+	case ed25519.PrivateKeySize:
+		return append(ed25519.PrivateKey(nil), data...), nil
+	default:
+		return nil, fmt.Errorf(
+			"CEREBRUM Root key has length %d, want %d-byte seed or %d-byte private key",
+			len(data), ed25519.SeedSize, ed25519.PrivateKeySize,
+		)
+	}
+}
+
 type governanceDomainBinder interface {
 	SetExpectedGovernanceDelegationDomain(chainID string) error
 }
@@ -203,6 +222,7 @@ type restForkAccessorSetter interface {
 	SetPostV17ForNextTxAccessor(func() bool)
 	SetPostV20ForNextTxAccessor(func() bool)
 	SetPostV22ForNextTxAccessor(func() bool)
+	SetPostV23ForNextTxAccessor(func() bool)
 }
 
 type appForkAccessorSource interface {
@@ -210,6 +230,7 @@ type appForkAccessorSource interface {
 	IsAppV17ActiveForNextTx() bool
 	IsAppV20ActiveForNextTx() bool
 	IsAppV22ActiveForNextTx() bool
+	IsAppV23ActiveForNextTx() bool
 }
 
 // wireRESTForkAccessors keeps amid's REST authorization behavior in lockstep
@@ -221,6 +242,7 @@ func wireRESTForkAccessors(server restForkAccessorSetter, app appForkAccessorSou
 	server.SetPostV17ForNextTxAccessor(app.IsAppV17ActiveForNextTx)
 	server.SetPostV20ForNextTxAccessor(app.IsAppV20ActiveForNextTx)
 	server.SetPostV22ForNextTxAccessor(app.IsAppV22ActiveForNextTx)
+	server.SetPostV23ForNextTxAccessor(app.IsAppV23ActiveForNextTx)
 }
 
 const (
@@ -333,7 +355,7 @@ func bindExpectedGovernanceDomainFromRPCUntilReady(
 }
 
 // runABCIServer starts the ABCI app as a TCP server for an external CometBFT node.
-func runABCIServer(app *sageabci.SageApp, abciAddr, restAddr, metricsAddr, cometRPC, validatorKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, requireVoter bool, health *metrics.HealthChecker, logger zerolog.Logger) {
+func runABCIServer(app *sageabci.SageApp, abciAddr, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, requireVoter bool, health *metrics.HealthChecker, logger zerolog.Logger) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cmtLogger := cmtlog.NewTMLogger(cmtlog.NewSyncWriter(os.Stdout))
@@ -361,7 +383,7 @@ func runABCIServer(app *sageabci.SageApp, abciAddr, restAddr, metricsAddr, comet
 	logger.Info().Str("addr", abciAddr).Msg("ABCI server listening")
 
 	// Start metrics + REST + health in background
-	startServices(ctx, app, restAddr, metricsAddr, cometRPC, validatorKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA, health, logger)
+	startServices(ctx, app, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA, health, logger)
 
 	// Socket mode: the consensus key lives with the separate CometBFT process, so
 	// the voter needs it supplied explicitly (operator mounts priv_validator_key.json
@@ -397,7 +419,7 @@ func runABCIServer(app *sageabci.SageApp, abciAddr, restAddr, metricsAddr, comet
 }
 
 // runInProcess embeds CometBFT in the same process as the ABCI app.
-func runInProcess(app *sageabci.SageApp, cometHome, restAddr, metricsAddr, governanceOperatorID, tlsCert, tlsKey, tlsCA string, requireVoter bool, health *metrics.HealthChecker, logger zerolog.Logger) {
+func runInProcess(app *sageabci.SageApp, cometHome, restAddr, metricsAddr, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, requireVoter bool, health *metrics.HealthChecker, logger zerolog.Logger) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cometCfg, err := loadCometConfig(cometHome)
@@ -462,7 +484,7 @@ func runInProcess(app *sageabci.SageApp, cometHome, restAddr, metricsAddr, gover
 
 	// In-process: CometBFT RPC is localhost
 	cometRPC := fmt.Sprintf("http://127.0.0.1%s", cometCfg.RPC.ListenAddress[len("tcp://0.0.0.0"):])
-	startServices(ctx, app, restAddr, metricsAddr, cometRPC, cometCfg.PrivValidatorKeyFile(), governanceOperatorID, tlsCert, tlsKey, tlsCA, health, logger)
+	startServices(ctx, app, restAddr, metricsAddr, cometRPC, cometCfg.PrivValidatorKeyFile(), cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA, health, logger)
 
 	// In-process: the consensus key is right here under --home; the voter signs
 	// memory votes with it (same key CometBFT validates blocks with).
@@ -482,7 +504,7 @@ func runInProcess(app *sageabci.SageApp, cometHome, restAddr, metricsAddr, gover
 }
 
 // startServices launches the metrics server and REST API.
-func startServices(ctx context.Context, app *sageabci.SageApp, restAddr, metricsAddr, cometRPC, validatorKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, health *metrics.HealthChecker, logger zerolog.Logger) {
+func startServices(ctx context.Context, app *sageabci.SageApp, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, health *metrics.HealthChecker, logger zerolog.Logger) {
 	// Prometheus metrics server
 	metricsServer := metrics.NewMetricsServer(metricsAddr, health)
 	go func() {
@@ -510,6 +532,18 @@ func startServices(ctx context.Context, app *sageabci.SageApp, restAddr, metrics
 		logger.Warn().Msg("REST governance disabled: set --governance-operator-id / SAGE_GOVERNANCE_OPERATOR_ID")
 	} else if operatorErr := restServer.SetGovernanceOperatorID(governanceOperatorID); operatorErr != nil {
 		logger.Error().Err(operatorErr).Msg("REST governance disabled: governance operator identity is invalid")
+	}
+	if cerebrumRootKeyFile == "" {
+		logger.Warn().Msg("promoted-Admin REST actions disabled: set --cerebrum-root-key-file / SAGE_CEREBRUM_ROOT_KEY_FILE")
+	} else {
+		restServer.SetAppV23RootKeyResolver(func(credentialID string) (ed25519.PrivateKey, bool) {
+			key, keyErr := loadCEREBRUMRootKey(cerebrumRootKeyFile)
+			if keyErr != nil {
+				return nil, false
+			}
+			public, ok := key.Public().(ed25519.PublicKey)
+			return key, ok && auth.PublicKeyToAgentID(public) == credentialID
+		})
 	}
 	restServer.StartEmbeddingRepair(ctx)
 	restServer.SetSuppCache(app.SuppCache)

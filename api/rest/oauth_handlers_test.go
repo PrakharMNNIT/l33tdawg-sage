@@ -37,7 +37,18 @@ func newOAuthRouter(t *testing.T, authed bool, redirectURL string) (*OAuthHandle
 	h.NodeOperatorAgentID = strings.Repeat("a", 64)
 	r := chi.NewRouter()
 	MountOAuthRoutes(r, h)
-	return h, r, memStore
+	// httptest.NewRequest defaults to example.com / 192.0.2.1. Most historical
+	// OAuth unit tests exercise the local consent path; preserve that intent
+	// while tests that explicitly set a remote peer/Host continue to exercise
+	// the public opaque-handoff bridge.
+	localDefaults := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.RemoteAddr == "192.0.2.1:1234" && req.Host == "example.com" {
+			req.RemoteAddr = "127.0.0.1:43210"
+			req.Host = "localhost:8080"
+		}
+		r.ServeHTTP(w, req)
+	})
+	return h, localDefaults, memStore
 }
 
 // pkceChallenge returns the S256 base64url-no-pad challenge for the verifier.
@@ -363,9 +374,9 @@ func TestOAuth_Token_GET_405(t *testing.T) {
 	assert.Equal(t, http.StatusMethodNotAllowed, rr.Code)
 }
 
-// TestOAuth_Authorize_RendersOperatorLabel asserts the consent screen makes
-// the node-operator binding explicit instead of presenting an agent picker.
-func TestOAuth_Authorize_RendersOperatorLabel(t *testing.T) {
+// TestOAuth_Authorize_RendersDistinctPendingAgent asserts consent never
+// presents Root/Admin as the bearer identity or offers an arbitrary picker.
+func TestOAuth_Authorize_RendersDistinctPendingAgent(t *testing.T) {
 	_, r, _ := newOAuthRouter(t, true, "")
 	clientID := registerOAuthClient(t, r, "https://x/cb")
 
@@ -378,7 +389,8 @@ func TestOAuth_Authorize_RendersOperatorLabel(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	body := rr.Body.String()
-	assert.Contains(t, body, "Operates as:")
+	assert.Contains(t, body, "distinct pending-review MCP agent")
+	assert.Contains(t, body, "never inherits Root or Admin")
 	assert.NotContains(t, body, `name="agent_id"`)
 	assert.NotContains(t, body, "<select")
 }

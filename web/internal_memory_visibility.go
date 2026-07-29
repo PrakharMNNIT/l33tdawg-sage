@@ -44,10 +44,10 @@ func cerebrumQueryOptions(opts store.QueryOptions) store.QueryOptions {
 	return opts
 }
 
-// cerebrumVisibleStats returns a presentation copy whose headline totals and
+// legacyCerebrumVisibleStats returns a presentation copy whose headline totals and
 // domain catalogue omit protocol-owned namespaces. The underlying StoreStats is
 // never mutated because callers may share/cache it.
-func (h *DashboardHandler) cerebrumVisibleStats(ctx context.Context) (*store.StoreStats, error) {
+func (h *DashboardHandler) legacyCerebrumVisibleStats(ctx context.Context) (*store.StoreStats, error) {
 	if provider, ok := h.store.(interface {
 		GetStatsExcludingDomainPrefixes(context.Context, []string) (*store.StoreStats, error)
 	}); ok {
@@ -82,6 +82,17 @@ func (h *DashboardHandler) cerebrumVisibleStats(ctx context.Context) (*store.Sto
 		visible.TotalMemories = 0
 	}
 	return visible, nil
+}
+
+// cerebrumVisibleStats derives every app-v23 aggregate from records that match
+// the canonical Badger disclosure snapshot. Pre-v23 retains the historical
+// backend aggregate implementation.
+func (h *DashboardHandler) cerebrumVisibleStats(ctx context.Context) (*store.StoreStats, error) {
+	if !h.appV23IsActive() {
+		return h.legacyCerebrumVisibleStats(ctx)
+	}
+	stats, _, err := h.cerebrumVisibleStatsAndActivity(ctx)
+	return stats, err
 }
 
 func (h *DashboardHandler) rejectInternalCerebrumMemory(w http.ResponseWriter, ctx context.Context, memoryID string) bool {

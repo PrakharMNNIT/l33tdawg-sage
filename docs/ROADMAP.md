@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-07):** **v11.14.2 is the current release line.** Governed app-v22 adds consensus-enforced, operator-controlled capabilities for least-privilege co-located companions: clearance-bounded global reads, denied shared/foreign writes, and denied domain claims, while federated agent inbox messaging stays available by default. Every inbox payload is explicitly untrusted `request_only` content rather than instructions, and returned agent content is `data_only`, closing the prompt-injection authority confusion at the MCP surface. Bounded substring lookup makes short recipient names practical. The v11.14.2 emergency patch restores unencrypted loopback CEREBRUM reads, vault setup, and verified in-app updates without weakening remote or mutation boundaries. Direct remote memory Write remains unavailable; cross-network work travels through the authenticated agent pipeline and any memory mutation is performed locally by the receiving agent under its own authorization. The complete CI/security/fault matrix remains a mandatory publication invariant, and the native-shell productization bridge remains targeted at v11.11–v11.14.
+**Status (2026-07):** **v11.15.0 is the current release line.** Governed app-v23 replaces raw capability-bit administration with Member, Manager, and Admin roles plus consensus Access Groups, named security profiles, and classification clearance. CEREBRUM Root is a hidden singleton authority with a dedicated credential-handover ceremony; rotation preserves operational access to Root-owned domains without rewriting historical memory authorship or chain history. Federated agents are linked readers only and can never become local group members or receive remote Write, Copy, Modify, claim, ownership, role, grant, or governance authority. Fresh first-party Mynah / SAGE Voice Bridge nodes atomically receive their reviewed companion profile and owned home domain before readiness, while unrelated self-registrations remain pending review. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 replay and state-sync checks, and the native-shell productization bridge now spans v11.11–v11.15.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -157,7 +157,7 @@ checks.
 
 ---
 
-## v11.11 – v11.14 - planned (the productization bridge to v12)
+## v11.11 – v11.15 - shipped (the productization bridge to v12)
 
 v11.10 completes the federation and federated-agent backend/administrative experience. v12 is the **product**: a standalone native application in which every CEREBRUM function is mapped to a real app experience, with the web dashboard kept only as a still-supported fallback. The releases between them de-risk and stage that transition so v12 is an integration-and-polish capstone, not a from-scratch rewrite. Every step keeps the hard constraints — no chain reset, upgrade-in-place, the SAGE daemon and authenticated local APIs cleanly separated from any shell, and no weakening of the local trust boundary. Order and grouping are indicative; nothing here is dated.
 
@@ -179,7 +179,7 @@ are recorded in [`desktop-shell-decision.md`](desktop-shell-decision.md),
 Tauri foundation remains an opt-in preview until that full matrix passes.
 
 **The native shell is alpha and does not gate releases.** Browser CEREBRUM is
-the product; the shell is a background track through v11.11–v11.13. It is built
+the product; the shell is a background track through v11.11–v11.15. It is built
 and runtime-tested in CI, never staged as a public release asset, and not
 intended for end-user use. Releases continue shipping bug fixes and capabilities
 on their normal cadence — federation, agent-to-agent messaging, and the rest of
@@ -256,11 +256,58 @@ Move the operational surface a desktop product needs out of terminal-and-dashboa
 
 Meet the accessibility bar v12 treats as a release criterion: full keyboard navigation, screen-reader labeling, sufficient contrast, and reduced-motion support across CEREBRUM and the native shell. Hold the v11.11 performance budgets for the embedded experience on large memory stores and the 3D connectome view. Verify fully offline operation end to end — the bundled embedder and reranker, onboarding, recall, and recovery all work with no network — so a sovereign node is genuinely sovereign.
 
+### v11.15 - governed local collaboration and safe federation
+
+App-v23 makes local access control understandable without weakening its
+consensus boundary. Member, Manager, and Admin roles define verbs; Access
+Groups define which local agents share scope; clearance caps readable
+classification; and named security profiles supply hard restrictions that
+override every role or grant. Approval binds enrollment, role, profile,
+clearance, and a non-shared home domain in one commit-confirmed operation.
+
+CEREBRUM Root is separated from the agent roster and retains one immutable
+authority principal across credential handovers. The current credential may
+operate every Root-owned domain immediately, while prior memories keep their
+original author and retired credentials remain permanently ineligible. Across
+independent SAGEs, exact federated agents can be linked as live readers but
+never mixed into local membership or given mutation authority. Fresh
+first-party companion installations are ready to write their first memory
+without a manual repair; generic new keys remain safely pending review.
+
+---
+
+## v11.16 - planned (agent message delivery and read receipts)
+
+Consolidate pipe, inbox, sent results, and status into one agent-only
+**Messages** service model with idempotent send, explicit idempotent receive,
+idempotent receiver-local reply, explicit signed
+`PUT /v1/messages/{receiver_local_message_id}/read`, and exact sender-only
+status—the five canonical operations. Do not disguise claiming inbox work as
+a passive `GET` list or combine it with sent/`all`; defer passive lists until
+their cursor and claim semantics are safe. Retain the old MCP/REST names as
+compatibility wrappers through v12 and at least two feature releases, without
+duplicating rows into a second default `sage_turn` field. Add
+payload-free, sender-only status for one exact sent message:
+durable destination delivery plus an automatic exact-ID acknowledgement signed
+by the addressed recipient when canonical receive, `sage_inbox`, or
+`sage_turn.pipe_inbox` returns the item.
+Federated receipts preserve both principals—the outer JOIN-frozen SAGE operator
+and inner recipient agent—and are negotiated as an additive capability with
+durable retry, replay/equivocation protection, and fail-closed
+pause/revoke/re-pair behavior. “Read” means the authenticated recipient client
+fetched and acknowledged that exact message; it is not presence, comprehension,
+action, or a reply. Status is unavailable to Root/Admin/operators and unrelated
+agents, contains no payload or roster data, remains transient/off-consensus, and
+uses a dedicated metadata-only SQL projection that remains queryable while the
+content vault is locked. It requires no application fork. The complete planned contract and mandatory
+two-node fault/security gates are in
+[`design/agent-message-receipts.md`](design/agent-message-receipts.md).
+
 ---
 
 ## v12 - product roadmap capstone
 
-v12 is the planned completion milestone for the SAGE product roadmap: the fully integrated product rather than another backend-only release. It ships as a standalone desktop application in which every CEREBRUM dashboard function is mapped to a real native app experience — the same capabilities, but presented as a proper application rather than a set of web pages. The web CEREBRUM remains a supported fallback for anyone who wants it; it simply is not the primary product surface. By v12 the v11.11–v11.14 bridge has already chosen the desktop shell, proven consumer onboarding and recovery, moved lifecycle into the app, and established accessibility/performance/offline gates, so v12 is the integration-and-polish capstone that ties it into one coherent product. The app owns installation, node lifecycle, onboarding, permissions, updates, health/recovery, federation, and Sharing & Sync as one coherent native-feeling experience, while the SAGE daemon and authenticated local APIs remain cleanly separated underneath.
+v12 is the planned completion milestone for the SAGE product roadmap: the fully integrated product rather than another backend-only release. It ships as a standalone desktop application in which every CEREBRUM dashboard function is mapped to a real native app experience — the same capabilities, but presented as a proper application rather than a set of web pages. The web CEREBRUM remains a supported fallback for anyone who wants it; it simply is not the primary product surface. By v12 the v11.11–v11.15 bridge has already chosen the desktop shell, proven consumer onboarding and recovery, moved lifecycle into the app, established accessibility/performance/offline gates, and made local/federated collaboration governable, so v12 is the integration-and-polish capstone that ties it into one coherent product. The app owns installation, node lifecycle, onboarding, permissions, updates, health/recovery, federation, and Sharing & Sync as one coherent native-feeling experience, while the SAGE daemon and authenticated local APIs remain cleanly separated underneath.
 
 **Consumer usability is a release criterion, not polish.** A nontechnical person must be able to install SAGE, create or join a node, connect an AI tool, choose what is private or shared, recover from ordinary failures, and keep the app updated without opening a terminal or learning SAGE internals. Every choice uses plain language and safe defaults; destructive or privacy-affecting actions use consistent accessible SAGE dialogs; errors explain what happened, what remains safe, and the next recovery action. The v12 release gate includes clean-machine onboarding and recovery usability tests with people who have not used SAGE before.
 

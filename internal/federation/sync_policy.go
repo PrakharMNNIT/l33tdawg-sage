@@ -473,7 +473,7 @@ func (m *Manager) authorizeSyncPolicyDomains(domains []string) error {
 		return fmt.Errorf("domain authorization store is unavailable")
 	}
 	agentID := hex.EncodeToString(m.agentPub)
-	if rec, err := m.badger.GetRegisteredAgent(agentID); err == nil && rec != nil && rec.Role == "admin" {
+	if m.localOperatorAdminForCurrentRules(agentID) {
 		return nil
 	}
 	for _, domain := range domains {
@@ -511,7 +511,7 @@ func (m *Manager) authorizeOwnerUnilateralDomain(tag string, requireStoredOwner 
 		}
 	}
 	agentID := hex.EncodeToString(m.agentPub)
-	if rec, err := m.badger.GetRegisteredAgent(agentID); err == nil && rec != nil && rec.Role == "admin" {
+	if m.localOperatorAdminForCurrentRules(agentID) {
 		return nil
 	}
 	owns, err := m.badger.IsDomainOwnerOrAncestor(tag, agentID)
@@ -519,6 +519,18 @@ func (m *Manager) authorizeOwnerUnilateralDomain(tag string, requireStoredOwner 
 		return fmt.Errorf("local operator is not admin or owner of domain %q", tag)
 	}
 	return nil
+}
+
+// localOperatorAdminForCurrentRules keeps legacy sync-policy paths behind the
+// same authority-generation boundary as app-v23. A historical role label is
+// sufficient only before activation; after v23, the exact current root
+// credential or an active, generation-bound promoted Admin is required.
+func (m *Manager) localOperatorAdminForCurrentRules(agentID string) bool {
+	if m.postV23ForNextTx != nil && m.postV23ForNextTx() {
+		return m.localAdminSignerActive(agentID)
+	}
+	rec, err := m.badger.GetRegisteredAgent(agentID)
+	return err == nil && rec != nil && rec.Role == store.AppV23RoleAdmin
 }
 
 func (m *Manager) deliverSyncPolicy(ctx context.Context, ss *store.SQLiteStore, remoteChainID string) error {

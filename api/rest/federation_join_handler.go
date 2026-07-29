@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/l33tdawg/sage/api/rest/middleware"
 	"github.com/l33tdawg/sage/internal/federation"
 )
 
@@ -16,12 +17,14 @@ func contextWithJoinConfirmTimeout(r *http.Request) (context.Context, context.Ca
 	return context.WithTimeout(r.Context(), federation.JoinConfirmationOperationTimeout())
 }
 
-// v11 real-TOTP JOIN ceremony - the LOCAL operator half. These endpoints drive
-// the guided guest/host wizards. They are node-operator-only (requireNodeOperator)
-// and off-consensus: the only on-chain writes are the two operators' own tx-33
-// CrossFedSet broadcasts, each fired inside the federation Manager only after its
-// human confirmation. The peer-facing /fed/v1/join/* routes live on the mTLS
-// federation listener; these /v1/federation/join/* routes are the operator's
+// v11 real-TOTP JOIN ceremony - the LOCAL control half. These endpoints drive
+// the guided guest/host wizards. Before app-v23 they are exact-node-operator
+// only; after app-v23 current local Root/Admin drives them. They are
+// off-consensus except for each node's tx-33 CrossFedSet, fired inside the
+// federation Manager only after human confirmation. Post-v23 it preserves the
+// exact local Root/Admin actor; an Admin envelope carries a one-action
+// current-Root elevation. The peer-facing /fed/v1/join/* routes live on the
+// mTLS federation listener; these /v1/federation/join/* routes are the
 // localhost control surface.
 
 // federationEnabled guards every join endpoint: a node with no wired transport
@@ -117,12 +120,31 @@ func (s *Server) handleJoinHostApprove(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Invalid JSON", err.Error())
 		return
 	}
-	err := s.federation.HostApprove(chi.URLParam(r, "session_id"), body.TypedCode, federation.ScopeWire{
+	scope := federation.ScopeWire{
 		MaxClearance:   body.MaxClearance,
 		AllowedDomains: body.AllowedDomains,
 		Mode:           body.Mode,
 		Direction:      body.Direction,
-	})
+	}
+	var err error
+	if s.isPostV23ForNextTx() {
+		driver, ok := s.federation.(interface {
+			HostApproveAs(string, string, string, federation.ScopeWire) error
+		})
+		if !ok {
+			writeProblem(w, http.StatusNotImplemented, "Federation control unavailable",
+				"The federation transport cannot preserve the local Admin authority envelope.")
+			return
+		}
+		err = driver.HostApproveAs(
+			middleware.ContextAgentID(r.Context()),
+			chi.URLParam(r, "session_id"), body.TypedCode, scope,
+		)
+	} else {
+		err = s.federation.HostApprove(
+			chi.URLParam(r, "session_id"), body.TypedCode, scope,
+		)
+	}
 	if err != nil {
 		writeProblem(w, http.StatusUnprocessableEntity, "Not approved", err.Error())
 		return
@@ -235,12 +257,32 @@ func (s *Server) handleJoinGuestConfirm(w http.ResponseWriter, r *http.Request) 
 	}
 	ctx, cancel := contextWithJoinConfirmTimeout(r)
 	defer cancel()
-	txHash, err := s.federation.GuestConfirm(ctx, body.SessionID, body.Endpoint, federation.ScopeWire{
+	scope := federation.ScopeWire{
 		MaxClearance:   body.HostScope.MaxClearance,
 		AllowedDomains: body.HostScope.AllowedDomains,
 		Mode:           body.HostScope.Mode,
 		Direction:      body.HostScope.Direction,
-	})
+	}
+	var txHash string
+	var err error
+	if s.isPostV23ForNextTx() {
+		driver, ok := s.federation.(interface {
+			GuestConfirmAs(context.Context, string, string, string, federation.ScopeWire) (string, error)
+		})
+		if !ok {
+			writeProblem(w, http.StatusNotImplemented, "Federation control unavailable",
+				"The federation transport cannot preserve the local Admin authority envelope.")
+			return
+		}
+		txHash, err = driver.GuestConfirmAs(
+			ctx, middleware.ContextAgentID(r.Context()),
+			body.SessionID, body.Endpoint, scope,
+		)
+	} else {
+		txHash, err = s.federation.GuestConfirm(
+			ctx, body.SessionID, body.Endpoint, scope,
+		)
+	}
 	if err != nil {
 		writeProblem(w, http.StatusBadGateway, "Connection not finished", err.Error())
 		return

@@ -3,6 +3,7 @@ package abci
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 
 	"github.com/rs/zerolog"
 
@@ -16,15 +17,40 @@ import (
 // callers must pass false: registrations there may only arrive through
 // consensus, while projection-only first_seen and on_chain_height repairs are
 // still safe on every node.
-func MigrateAgentsOnChain(ctx context.Context, agentStore store.AgentStore, badgerStore *store.BadgerStore, cometRPC string, signingKey ed25519.PrivateKey, allowRegistration bool, logger zerolog.Logger) {
+func MigrateAgentsOnChain(ctx context.Context, agentStore store.AgentStore, badgerStore *store.BadgerStore, cometRPC string, signingKey ed25519.PrivateKey, allowRegistration bool, logger zerolog.Logger) error {
 	if agentStore == nil || badgerStore == nil {
-		return
+		return nil
+	}
+
+	// App-v23 reverses the legacy repair direction: consensus enrollment is the
+	// authority, and the local agent directory is only its serving projection.
+	// This is required for direct-v23 genesis (whose Root and Companion are
+	// committed before SQLite exists), state sync, and projection-loss recovery.
+	// It also prevents a stale node-local SQL row from being promoted directly
+	// into consensus after app-v23 activation.
+	root, rootErr := badgerStore.GetAppV23Root()
+	if rootErr != nil {
+		logger.Error().Err(rootErr).Msg("app-v23 agent projection: Root state unavailable")
+		return fmt.Errorf("read app-v23 Root for agent projection: %w", rootErr)
+	}
+	if root != nil {
+		projected, projectionErr := store.ReconcileAppV23AgentProjections(
+			ctx, agentStore, badgerStore,
+		)
+		if projectionErr != nil {
+			logger.Error().Err(projectionErr).Msg("app-v23 agent projection reconciliation failed")
+			return fmt.Errorf("reconcile app-v23 agent projection: %w", projectionErr)
+		}
+		logger.Info().
+			Int("active_agents", projected).
+			Msg("app-v23 consensus agent projection reconciled")
+		return nil
 	}
 
 	agents, err := agentStore.ListAgents(ctx)
 	if err != nil {
 		logger.Warn().Err(err).Msg("migrate: failed to list agents")
-		return
+		return nil
 	}
 
 	// Backfill first_seen for any agents that have NULL first_seen
@@ -101,4 +127,5 @@ func MigrateAgentsOnChain(ctx context.Context, agentStore store.AgentStore, badg
 	if migrated > 0 || skipped > 0 {
 		logger.Info().Int("migrated", migrated).Int("skipped", skipped).Int("total", len(agents)).Msg("agent on-chain migration complete")
 	}
+	return nil
 }

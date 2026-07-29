@@ -46,6 +46,10 @@ func shortID(id string) string {
 func (h *DashboardHandler) handleAgentDomains(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
+		if h.appV23IsRootIdentity(id) {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
 		domains, err := agentStore.ListAgentDomains(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list agent domains: "+err.Error())
@@ -295,7 +299,7 @@ func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override
 		return grantResult{Domain: domain, Action: "shared", Level: level, OK: true}
 	}
 
-	owner, ownedDomain, err := h.BadgerStore.ResolveOwningAncestor(domain)
+	owner, ownedDomain, err := h.resolveEffectiveOwningAncestor(domain)
 	if err != nil {
 		return grantResult{Domain: domain, Action: "skip", Level: level, OK: false,
 			Code: "owner_lookup_failed", Error: "could not resolve domain owner: " + err.Error()}
@@ -385,7 +389,7 @@ func (h *DashboardHandler) revokeAs(domain, granteeID string, override *adminOve
 	if h.isSharedDomain(domain) {
 		return grantResult{Domain: domain, Action: "shared", OK: true}
 	}
-	owner, ownedDomain, err := h.BadgerStore.ResolveOwningAncestor(domain)
+	owner, ownedDomain, err := h.resolveEffectiveOwningAncestor(domain)
 	if err != nil || owner == "" {
 		return grantResult{Domain: domain, Action: "skip", OK: false,
 			Code: "owner_missing", Error: "domain has no on-chain owner, so there is nothing to revoke"}
@@ -516,6 +520,16 @@ func (h *DashboardHandler) mirrorDomainAccessSet(ctx context.Context, agentStore
 // Errors are ignored: if execution already cleared gov:active, there is nothing
 // to cancel.
 func (h *DashboardHandler) cancelActiveProposal(proposalID string, proposerKey ed25519.PrivateKey, postAppV20 bool) {
+	h.cancelActiveProposalWithActor(proposalID, proposerKey, h.AdminSigningKey, postAppV20, nil)
+}
+
+func (h *DashboardHandler) cancelActiveProposalWithActor(
+	proposalID string,
+	proposerKey ed25519.PrivateKey,
+	operatorKey ed25519.PrivateKey,
+	postAppV20 bool,
+	actor *appV23ControlActor,
+) {
 	if len(proposerKey) != ed25519.PrivateKeySize {
 		return
 	}
@@ -538,9 +552,12 @@ func (h *DashboardHandler) cancelActiveProposal(proposalID string, proposerKey e
 			ProposalID:       proposalID,
 		})
 		if err != nil ||
-			embedDashboardGovernanceProof(cancelTx, h.AdminSigningKey, http.MethodPost, "/v1/governance/cancel", proofBody) != nil {
+			embedDashboardGovernanceProof(cancelTx, operatorKey, http.MethodPost, "/v1/governance/cancel", proofBody) != nil {
 			return
 		}
+	}
+	if actor != nil && h.appV23AttachElevation(cancelTx, actor) != nil {
+		return
 	}
 	_, _, _, _ = h.signAndBroadcastCommit(cancelTx, proposerKey)
 }
@@ -561,14 +578,21 @@ func (h *DashboardHandler) cancelActiveProposal(proposalID string, proposerKey e
 // commit-confirmed so consensus rejections surface honestly.
 func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !h.requireDashboardGovernanceOperator(w, r) {
+		var appV23Actor *appV23ControlActor
+		if h.appV23IsActive() {
+			var ok bool
+			appV23Actor, ok = h.requireAppV23ControlActor(w, r, true)
+			if !ok {
+				return
+			}
+		} else if !h.requireDashboardGovernanceOperator(w, r) {
 			return
 		}
 		if h.CometBFTRPC == "" {
 			writeError(w, http.StatusServiceUnavailable, "CometBFT consensus not configured")
 			return
 		}
-		if h.AdminSigningKey == nil {
+		if appV23Actor == nil && h.AdminSigningKey == nil {
 			writeError(w, http.StatusServiceUnavailable, "admin signing key not available (operator key ~/.sage/agent.key missing), so a domain reassignment cannot be authorized")
 			return
 		}
@@ -600,6 +624,12 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 		req.Domain = strings.TrimSpace(req.Domain)
 		if req.TargetAgentID == "" || req.Domain == "" {
 			writeError(w, http.StatusBadRequest, "target_agent_id and domain are required")
+			return
+		}
+		if h.appV23IsRootIdentity(req.SourceAgentID) ||
+			h.appV23IsRootIdentity(req.TargetAgentID) {
+			writeAppV23AccessError(w, http.StatusForbidden, "root_agent_surface_forbidden",
+				"CEREBRUM Root is not an agent and cannot be targeted by domain reassignment.")
 			return
 		}
 		if isCerebrumInternalMemoryDomain(req.Domain) {
@@ -640,6 +670,9 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 		}
 
 		adminKey := h.AdminSigningKey
+		if appV23Actor != nil {
+			adminKey = appV23Actor.Key
+		}
 		adminID := agentIDForKey(adminKey)
 		postAppV20 := h.AppV20ActiveFn != nil && h.AppV20ActiveFn()
 
@@ -705,6 +738,12 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 			proposerKey = h.SigningKey
 			proposerID = validatorID
 		}
+		if appV23Actor != nil {
+			if elevationErr := h.appV23AttachElevation(proposeTx, appV23Actor); elevationErr != nil {
+				fail(http.StatusServiceUnavailable, "propose", "bind local authority: "+elevationErr.Error())
+				return
+			}
+		}
 		proposeHash, height, _, pErr := h.signAndBroadcastCommit(proposeTx, proposerKey)
 		if pErr != nil {
 			fail(http.StatusBadGateway, "propose", pErr.Error())
@@ -740,7 +779,9 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 			if vErr != nil {
 				// Clear the dangling active proposal so a retry and other
 				// governance are not blocked until it expires.
-				h.cancelActiveProposal(proposalID, proposerKey, postAppV20)
+				h.cancelActiveProposalWithActor(
+					proposalID, proposerKey, adminKey, postAppV20, appV23Actor,
+				)
 				fail(http.StatusBadGateway, "vote", vErr.Error())
 				return
 			}
@@ -759,11 +800,19 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 				OpenToShared: false,
 			},
 		}
-		reassignHash, _, reassignLog, rErr := h.signAndBroadcastCommit(reassignTx, adminKey)
+		var reassignHash, reassignLog string
+		var rErr error
+		if appV23Actor != nil {
+			reassignHash, _, reassignLog, rErr = h.signAndBroadcastAppV23Control(reassignTx, appV23Actor)
+		} else {
+			reassignHash, _, reassignLog, rErr = h.signAndBroadcastCommit(reassignTx, adminKey)
+		}
 		if rErr != nil {
 			// If the proposal already executed, this is a no-op; otherwise it
 			// clears the dangling active proposal.
-			h.cancelActiveProposal(proposalID, proposerKey, postAppV20)
+			h.cancelActiveProposalWithActor(
+				proposalID, proposerKey, adminKey, postAppV20, appV23Actor,
+			)
 			fail(http.StatusBadGateway, "reassign", rErr.Error())
 			return
 		}

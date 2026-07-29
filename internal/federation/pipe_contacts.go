@@ -88,6 +88,39 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 	if ss == nil || m.badger == nil {
 		return nil, fmt.Errorf("pipe contacts require SQLite and consensus domain state")
 	}
+	rootIdentities := map[string]struct{}{}
+	rootIdentityChecked := make(map[string]bool)
+	postV23 := m.postV23ForNextTx != nil && m.postV23ForNextTx()
+	if postV23 {
+		root, rootErr := m.badger.GetAppV23Root()
+		if rootErr != nil || root == nil {
+			return nil, fmt.Errorf("pipe contacts require current app-v23 Root state")
+		}
+		rootIdentities[root.PrincipalID] = struct{}{}
+		rootIdentities[root.CredentialID] = struct{}{}
+		rootIdentityChecked[root.PrincipalID] = true
+		rootIdentityChecked[root.CredentialID] = true
+	}
+	isRootIdentity := func(agentID string) (bool, error) {
+		if root, checked := rootIdentityChecked[agentID]; checked {
+			return root, nil
+		}
+		if _, root := rootIdentities[agentID]; root {
+			return true, nil
+		}
+		if !postV23 {
+			return false, nil
+		}
+		wasRoot, rootErr := m.badger.IsAppV23RootCredential(agentID)
+		if rootErr != nil {
+			return false, rootErr
+		}
+		rootIdentityChecked[agentID] = wasRoot
+		if wasRoot {
+			rootIdentities[agentID] = struct{}{}
+		}
+		return wasRoot, nil
+	}
 	var err error
 	agentByID := make(map[string]*store.AgentEntry, len(agents))
 	candidateIDSet := make(map[string]struct{}, len(agents)+len(candidateIDs))
@@ -97,6 +130,13 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 			if isCanonicalAgentID(key) {
 				key = strings.ToLower(key)
 			}
+			isRoot, rootErr := isRootIdentity(key)
+			if rootErr != nil {
+				return nil, fmt.Errorf("read app-v23 Root history for pipe contact %q: %w", key, rootErr)
+			}
+			if isRoot {
+				continue
+			}
 			agentByID[key] = agent
 			candidateIDSet[key] = struct{}{}
 		}
@@ -105,7 +145,11 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 		if isCanonicalAgentID(agentID) {
 			agentID = strings.ToLower(agentID)
 		}
-		if agentID != "" {
+		isRoot, rootErr := isRootIdentity(agentID)
+		if rootErr != nil {
+			return nil, fmt.Errorf("read app-v23 Root history for pipe candidate %q: %w", agentID, rootErr)
+		}
+		if agentID != "" && !isRoot {
 			candidateIDSet[agentID] = struct{}{}
 		}
 	}
@@ -117,6 +161,13 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 	postV22Capabilities := m.postV22ForNextTx != nil && m.postV22ForNextTx()
 	capabilityCache := make(map[string]pipeContactCapabilityOverlay, len(agentByID))
 	capabilityFor := func(agentID string) (pipeContactCapabilityOverlay, error) {
+		isRoot, rootErr := isRootIdentity(agentID)
+		if rootErr != nil {
+			return pipeContactCapabilityOverlay{}, rootErr
+		}
+		if isRoot {
+			return pipeContactCapabilityOverlay{denied: true}, nil
+		}
 		if !postV22Capabilities {
 			return pipeContactCapabilityOverlay{}, nil
 		}
@@ -140,7 +191,15 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 		if !permission.Read && !permission.Copy {
 			continue
 		}
-		owner, owningDomain, resolveErr := m.badger.ResolveOwningAncestor(permission.Domain)
+		var owner, owningDomain string
+		var resolveErr error
+		if postV23 {
+			owner, owningDomain, resolveErr =
+				m.badger.ResolveAppV23OwningAncestor(permission.Domain)
+		} else {
+			owner, owningDomain, resolveErr =
+				m.badger.ResolveOwningAncestor(permission.Domain)
+		}
 		if resolveErr != nil {
 			return nil, fmt.Errorf("resolve pipe contact owner for %q: %w", permission.Domain, resolveErr)
 		}

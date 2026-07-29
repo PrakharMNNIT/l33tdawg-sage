@@ -98,10 +98,9 @@ def main() -> None:
     # ================================================================
     # 2. MEMORY OPERATIONS
     # ================================================================
-    # Memories are the core data type in (S)AGE. An agent proposes a
-    # memory, validators vote on it, and if it reaches quorum (2/3
-    # weighted vote), it becomes "committed" -- permanent, replicated
-    # consensus-validated knowledge.
+    # Memories are the core data type in (S)AGE. A successful propose() call
+    # waits for the submission transaction to commit on-chain. The memory's
+    # governed lifecycle remains "proposed" until later validation advances it.
 
     print("=" * 60)
     print("2. MEMORY OPERATIONS")
@@ -111,8 +110,8 @@ def main() -> None:
 
         # ── propose: submit a new memory ──────────────────────────
         # This creates a transaction, signs it with your key, and
-        # broadcasts it to the CometBFT network. The memory starts
-        # with status "proposed" and waits for validator votes.
+        # broadcasts it to the CometBFT network, and waits for the transaction
+        # commit. The memory lifecycle starts at status "proposed".
         #
         # memory_type can be: "fact", "observation", or "inference"
         # confidence is 0.0 to 1.0 (how sure the agent is)

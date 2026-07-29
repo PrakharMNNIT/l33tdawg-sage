@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +33,212 @@ func TestConsensusOwnerCommitWaitsForOwnershipReaders(t *testing.T) {
 	owner, err := base.GetDomainOwner("research")
 	require.NoError(t, err)
 	require.Equal(t, "owner-b", owner)
+}
+
+func TestConsensusPublicationUsesOwnershipThenRuntimeLockOrder(t *testing.T) {
+	base, err := NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, base.CloseBadger()) })
+	require.NoError(t, base.RegisterDomain("research", "owner-a", "", 1))
+	scoped := base.BeginConsensusTransaction(nil)
+	require.NoError(t, scoped.TransferDomain("research", "owner-b", "", 2))
+
+	var runtime sync.RWMutex
+	unlockOwnership := base.LockDomainOwnershipRead()
+	runtimeAcquired := make(chan struct{})
+	committed := make(chan error, 1)
+	go func() {
+		committed <- scoped.CommitConsensusTransactionWithPublication(
+			func() func() {
+				runtime.Lock()
+				close(runtimeAcquired)
+				return runtime.Unlock
+			},
+			nil,
+			func() {},
+		)
+	}()
+
+	// A federated reader already holding the domain lease must still be able to
+	// enter the runtime read view. Commit cannot own runtime while it waits for
+	// that reader's domain lease, or the two sides deadlock permanently.
+	runtime.RLock()
+	select {
+	case <-runtimeAcquired:
+		runtime.RUnlock()
+		t.Fatal("Commit acquired runtime publication before the domain reader released")
+	case <-time.After(100 * time.Millisecond):
+	}
+	runtime.RUnlock()
+
+	unlockOwnership()
+	require.NoError(t, <-committed)
+	select {
+	case <-runtimeAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Commit did not acquire runtime publication after the domain lease released")
+	}
+}
+
+func TestConsensusPublicationLocksRuntimeBeforeDurableKeysBecomeVisible(t *testing.T) {
+	base, err := NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, base.CloseBadger()) })
+	require.NoError(t, base.RegisterDomain("research", "owner-a", "", 1))
+	scoped := base.BeginConsensusTransaction(nil)
+	require.NoError(t, scoped.TransferDomain("research", "owner-b", "", 2))
+
+	var runtime sync.RWMutex
+	runtime.RLock()
+	runtimeAttempted := make(chan struct{})
+	published := make(chan struct{})
+	committed := make(chan error, 1)
+	go func() {
+		committed <- scoped.CommitConsensusTransactionWithPublication(
+			func() func() {
+				close(runtimeAttempted)
+				runtime.Lock()
+				return runtime.Unlock
+			},
+			nil,
+			func() { close(published) },
+		)
+	}()
+
+	select {
+	case <-runtimeAttempted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Commit did not reach the runtime publication gate")
+	}
+	owner, err := base.GetDomainOwner("research")
+	require.NoError(t, err)
+	require.Equal(t, "owner-a", owner,
+		"staged keys became visible before Commit acquired runtime publication")
+	select {
+	case <-published:
+		t.Fatal("runtime view published while its write gate was held by a reader")
+	default:
+	}
+
+	runtime.RUnlock()
+	require.NoError(t, <-committed)
+	select {
+	case <-published:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime publication callback did not run after durable commit")
+	}
+	owner, err = base.GetDomainOwner("research")
+	require.NoError(t, err)
+	require.Equal(t, "owner-b", owner)
+}
+
+func TestOrderedPublicationBarrierLetsDomainReaderFinishBeforeRuntimeWriter(t *testing.T) {
+	base, err := NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, base.CloseBadger()) })
+	require.NoError(t, base.RegisterDomain("legacy-research", "owner-a", "", 1))
+
+	var runtime sync.RWMutex
+	unlockOwnership := base.LockDomainOwnershipRead()
+	runtimeAcquired := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		finished <- base.WithOrderedPublicationBarrier(
+			func() func() {
+				runtime.Lock()
+				close(runtimeAcquired)
+				return runtime.Unlock
+			},
+			func(scoped *BadgerStore) error {
+				return scoped.TransferDomain("legacy-research", "owner-b", "", 2)
+			},
+		)
+	}()
+
+	runtime.RLock()
+	select {
+	case <-runtimeAcquired:
+		runtime.RUnlock()
+		t.Fatal("legacy publication acquired runtime before the domain reader released")
+	case <-time.After(100 * time.Millisecond):
+	}
+	runtime.RUnlock()
+	unlockOwnership()
+	require.NoError(t, <-finished)
+
+	owner, err := base.GetDomainOwner("legacy-research")
+	require.NoError(t, err)
+	require.Equal(t, "owner-b", owner,
+		"nested mutation on the barrier-scoped handle did not publish")
+}
+
+func TestConsensusCloneUsesAuthorizationHookInstalledAfterClone(t *testing.T) {
+	base, err := NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, base.CloseBadger()) })
+	require.NoError(t, base.SetCrossFed(
+		"peer-late-hook", "https://peer.invalid", []byte("peer-key"),
+		4, 0, []string{"*"}, nil, "active",
+	))
+
+	scoped := base.BeginConsensusTransaction(nil)
+	require.NoError(t, scoped.UpdateCrossFedStatus(
+		"peer-late-hook", "revoked",
+	))
+	var acquiredChain string
+	var releases int
+	base.SetAuthorizationMutationHook(func(remoteChainID string) func() {
+		acquiredChain = remoteChainID
+		return func() { releases++ }
+	})
+	require.NoError(t, scoped.CommitConsensusTransaction())
+	require.Equal(t, "peer-late-hook", acquiredChain,
+		"a clone opened before startup wiring must resolve the live hook at commit")
+	require.Equal(t, 1, releases)
+}
+
+func TestAuthorizationHookInstallWaitsForPreHookConsensusCommit(t *testing.T) {
+	base, err := NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, base.CloseBadger()) })
+	require.NoError(t, base.SetCrossFed(
+		"peer-startup", "https://peer.invalid", []byte("peer-key"),
+		4, 0, []string{"*"}, nil, "active",
+	))
+	scoped := base.BeginConsensusTransaction(nil)
+	require.NoError(t, scoped.UpdateCrossFedStatus("peer-startup", "revoked"))
+
+	unlockOwnership := base.LockDomainOwnershipRead()
+	commitDone := make(chan error, 1)
+	go func() { commitDone <- scoped.CommitConsensusTransaction() }()
+	require.Eventually(t, func() bool {
+		if base.authorizationMutationHooks.mu.TryLock() {
+			base.authorizationMutationHooks.mu.Unlock()
+			return false
+		}
+		return true
+	}, 2*time.Second, time.Millisecond,
+		"pre-hook authorization commit did not acquire startup barrier")
+
+	installed := make(chan struct{})
+	go func() {
+		base.SetAuthorizationMutationHook(func(string) func() {
+			return func() {}
+		})
+		close(installed)
+	}()
+	select {
+	case <-installed:
+		t.Fatal("hook installation bypassed a pre-hook authorization commit")
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlockOwnership()
+	require.NoError(t, <-commitDone)
+	select {
+	case <-installed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook installation did not finish after old commit published")
+	}
 }
 
 func TestSetSharedDomainWaitsForOwnershipReaders(t *testing.T) {

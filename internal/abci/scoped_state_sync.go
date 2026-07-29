@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -146,13 +147,20 @@ func InspectStateSyncRecoveryDirectory(ctx context.Context, path string) (uint64
 		_ = readOnly.CloseBadger()
 		return 0, nil, upgradeErr
 	}
+	genesisV23, genesisErr := readOnly.GetAppV23GenesisActivation()
+	if genesisErr != nil {
+		_ = readOnly.CloseBadger()
+		return 0, nil, genesisErr
+	}
 	// A quarantine may legitimately be from any older supported app version.
 	// Pre-app-v12 AppHashes include bookkeeping that SaveState changes after
 	// FinalizeBlock, so they cannot be recomputed from the closed post-Commit DB.
 	// The persisted height/AppHash are still compared exactly with Comet by the
 	// recovery executor. Once app-v20 is active, apply its stronger narrow-hash
 	// and scoped-state checks as well.
-	if appV20 == nil || appV20.TargetAppVersion != 20 || appV20.AppliedHeight <= 0 || state.Height <= appV20.AppliedHeight {
+	if genesisV23 == nil &&
+		(appV20 == nil || appV20.TargetAppVersion != 20 ||
+			appV20.AppliedHeight <= 0 || state.Height <= appV20.AppliedHeight) {
 		closeErr := readOnly.CloseBadger()
 		if closeErr != nil {
 			return 0, nil, closeErr
@@ -276,9 +284,9 @@ func inspectAppV20StateSyncStore(ctx context.Context, badgerStore *store.BadgerS
 	if contextErr := ctx.Err(); contextErr != nil {
 		return 0, nil, contextErr
 	}
-	state, err := LoadState(badgerStore)
-	if err != nil {
-		return 0, nil, fmt.Errorf("load %s app state: %w", label, err)
+	state, stateErr := LoadState(badgerStore)
+	if stateErr != nil {
+		return 0, nil, fmt.Errorf("load %s app state: %w", label, stateErr)
 	}
 	if state.Height <= 0 {
 		return 0, nil, fmt.Errorf("%s app height must be positive", label)
@@ -286,26 +294,96 @@ func inspectAppV20StateSyncStore(ctx context.Context, badgerStore *store.BadgerS
 	if state.EpochNum != poe.EpochNumber(state.Height) {
 		return 0, nil, fmt.Errorf("%s persisted epoch does not match height", label)
 	}
-	applied, err := badgerStore.GetAppliedUpgrade(appV20UpgradeName)
-	if err != nil {
-		return 0, nil, err
+	applied, appliedErr := badgerStore.GetAppliedUpgrade(appV20UpgradeName)
+	if appliedErr != nil {
+		return 0, nil, appliedErr
 	}
-	if applied == nil || applied.TargetAppVersion != 20 || applied.AppliedHeight <= 0 || state.Height <= applied.AppliedHeight {
+	genesisV23, genesisErr := badgerStore.GetAppV23GenesisActivation()
+	if genesisErr != nil {
+		return 0, nil, fmt.Errorf("read %s app-v23 genesis activation: %w", label, genesisErr)
+	}
+	if genesisV23 != nil {
+		if lineageErr := badgerStore.ValidateAppV23GenesisLineage(); lineageErr != nil {
+			return 0, nil, fmt.Errorf("verify %s app-v23 genesis lineage: %w", label, lineageErr)
+		}
+		if policyErr := badgerStore.ValidateAppV23State(); policyErr != nil {
+			return 0, nil, fmt.Errorf("verify %s app-v23 genesis state: %w", label, policyErr)
+		}
+		root, rootErr := badgerStore.GetAppV23Root()
+		if rootErr != nil || root == nil ||
+			root.Scope != genesisV23.Scope ||
+			root.BootstrapDigest != genesisV23.BootstrapDigest {
+			return 0, nil, fmt.Errorf("%s app-v23 genesis Root lineage is invalid", label)
+		}
+		domain, domainErr := badgerStore.GetState(governanceDelegationDomainStateKey)
+		decodedScope, decodeErr := hex.DecodeString(genesisV23.Scope)
+		if domainErr != nil || decodeErr != nil || len(decodedScope) != sha256.Size ||
+			!bytes.Equal(domain, decodedScope) {
+			return 0, nil, fmt.Errorf("%s app-v23 genesis governance domain is invalid", label)
+		}
+	} else if applied == nil || applied.TargetAppVersion != 20 ||
+		applied.AppliedHeight <= 0 || state.Height <= applied.AppliedHeight {
 		return 0, nil, errors.New("state sync state is not from an active post-app-v20 height")
 	}
-	computed, err := badgerStore.ComputeAppHashExcludingBookkeeping()
-	if err != nil {
-		return 0, nil, err
+	computed, hashErr := badgerStore.ComputeAppHashExcludingBookkeeping()
+	if hashErr != nil {
+		return 0, nil, hashErr
 	}
 	if len(state.AppHash) != sha256.Size || !bytes.Equal(state.AppHash, computed) {
 		return 0, nil, fmt.Errorf("%s persisted AppHash does not match Badger state", label)
 	}
 	probe := &SageApp{badgerStore: badgerStore}
-	if _, err := probe.governanceDelegationDomain(); err != nil {
-		return 0, nil, fmt.Errorf("verify %s governance delegation domain: %w", label, err)
+	if _, governanceErr := probe.governanceDelegationDomain(); governanceErr != nil {
+		return 0, nil, fmt.Errorf("verify %s governance delegation domain: %w", label, governanceErr)
 	}
-	if _, err := probe.VerifyScopedCanonicalState(); err != nil {
-		return 0, nil, fmt.Errorf("verify %s scoped state: %w", label, err)
+	if _, scopedErr := probe.VerifyScopedCanonicalState(); scopedErr != nil {
+		return 0, nil, fmt.Errorf("verify %s scoped state: %w", label, scopedErr)
+	}
+	appV23, upgradeErr := badgerStore.GetAppliedUpgrade(appV23UpgradeName)
+	if upgradeErr != nil {
+		return 0, nil, fmt.Errorf("read %s app-v23 activation: %w", label, upgradeErr)
+	}
+	if genesisV23 != nil {
+		if appV23 != nil {
+			return 0, nil, fmt.Errorf(
+				"%s has both app-v23 genesis and governed app-v23 activation records",
+				label,
+			)
+		}
+	} else if appV23 != nil {
+		if appV23.Name != appV23UpgradeName || appV23.TargetAppVersion != 23 ||
+			appV23.AppliedHeight <= 0 || state.Height <= appV23.AppliedHeight {
+			return 0, nil, fmt.Errorf("%s has invalid active app-v23 record", label)
+		}
+		previousHeight := applied.AppliedHeight
+		for _, predecessor := range []struct {
+			version uint64
+			name    string
+		}{
+			{version: 21, name: appV21UpgradeName},
+			{version: 22, name: appV22UpgradeName},
+		} {
+			version, name := predecessor.version, predecessor.name
+			record, readErr := badgerStore.GetAppliedUpgrade(name)
+			if readErr != nil {
+				return 0, nil, fmt.Errorf("read %s %s predecessor: %w", label, name, readErr)
+			}
+			if record == nil || record.Name != name || record.TargetAppVersion != version ||
+				record.AppliedHeight <= previousHeight || record.AppliedHeight >= appV23.AppliedHeight {
+				return 0, nil, fmt.Errorf("%s has invalid app-v23 predecessor %s", label, name)
+			}
+			previousHeight = record.AppliedHeight
+		}
+		if err := badgerStore.ValidateAppV23State(); err != nil {
+			return 0, nil, fmt.Errorf("verify %s app-v23 state: %w", label, err)
+		}
+		migration, err := badgerStore.GetAppV23MigrationState()
+		if err != nil {
+			return 0, nil, fmt.Errorf("read %s app-v23 migration state: %w", label, err)
+		}
+		if migration == nil {
+			return 0, nil, fmt.Errorf("verify %s app-v23 state: migration state is missing", label)
+		}
 	}
 	return uint64(state.Height), computed, nil // #nosec G115 -- positive int64 checked above
 }

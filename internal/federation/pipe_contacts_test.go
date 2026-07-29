@@ -3,6 +3,9 @@ package federation
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -92,6 +95,49 @@ func TestStatusPipeContactsDeriveEffectiveOwnerContacts(t *testing.T) {
 	require.Contains(t, status.Capabilities, CapabilityFederatedPipeline)
 }
 
+func TestAppV23PipeContactsStopAtDynamicSharedOwnershipBarrier(t *testing.T) {
+	ctx := context.Background()
+	m, ss, bs := newDrainTestManager(t)
+	rootID := hex.EncodeToString(m.agentPub)
+	companionPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	companionID := hex.EncodeToString(companionPub)
+	require.NoError(t, bs.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: rootID, Scope: "pipe-shared-barrier",
+		AgentID: companionID, Profile: store.AppV23ProfileStandard,
+		HomeDomain: "team", Clearance: 1, Height: 1,
+		BootstrapDigest: strings.Repeat("24", 32),
+	}))
+	require.NoError(t, bs.SetSharedDomain("team.shared"))
+	require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: companionID, Name: "team-owner", Status: "active",
+	}))
+	peerID := newPeerOperatorID(t)
+	agreement := configurePeerRBACConnection(
+		t, m, ss, bs, "chain-peer", peerID, "host", nil, 4,
+	)
+	_, err = m.ReplacePeerRBACPolicy(
+		ctx, "chain-peer",
+		[]store.PeerRBACDomainPermission{{
+			Domain: "team.shared.secret", Read: true,
+		}},
+	)
+	require.NoError(t, err)
+
+	// Legacy byte behavior knows only the historical reserved-name rule and
+	// therefore resolves the broader owner.
+	m.postV23ForNextTx = func() bool { return false }
+	legacy := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
+	require.Len(t, legacy.Contacts, 1)
+	require.Equal(t, companionID, legacy.Contacts[0].AgentID)
+
+	// App-v23 observes the consensus shared_domain marker at the intermediate
+	// ancestor and must not advertise the broader owner as a recipient.
+	m.postV23ForNextTx = func() bool { return true }
+	current := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
+	require.Empty(t, current.Contacts)
+}
+
 func TestPipeContactsIncludeActiveAgentsWithSharedDomainAccess(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
@@ -179,6 +225,65 @@ func TestPipeContactsIncludeActiveAgentsWithSharedDomainAccess(t *testing.T) {
 	require.NoError(t, bs.DeleteAccessGrant("research", reader))
 	_, err = m.authorizeInboundPipeContact(ctx, peer, event)
 	require.ErrorIs(t, err, ErrFederatedPipeInvalid)
+}
+
+func TestAppV23PipeContactsNeverExposeRootButKeepGrantedAgentsOnRootOwnedDomains(t *testing.T) {
+	ctx := context.Background()
+	m, ss, bs := newDrainTestManager(t)
+	rootID := hex.EncodeToString(m.agentPub)
+	companionPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	currentRootPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	currentRootID := hex.EncodeToString(currentRootPub)
+	finalRootPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	finalRootID := hex.EncodeToString(finalRootPub)
+	require.NoError(t, bs.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: rootID, Scope: "pipe-contact-test",
+		AgentID: hex.EncodeToString(companionPub), Profile: store.AppV23ProfileStandard,
+		HomeDomain: "pipe-contact-companion", Clearance: 1, Height: 1,
+		BootstrapDigest: strings.Repeat("23", 32),
+	}))
+	require.NoError(t, bs.RotateAppV23RootCredential(1, currentRootID, 2))
+	require.NoError(t, bs.RotateAppV23RootCredential(2, finalRootID, 3))
+	m.postV23ForNextTx = func() bool { return true }
+	m.postV8ForAccess = func() bool { return true }
+
+	peerID := newPeerOperatorID(t)
+	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
+	reader := newPeerOperatorID(t)
+	for _, agent := range []*store.AgentEntry{
+		{AgentID: rootID, Name: "root-principal", Status: "active"},
+		{AgentID: currentRootID, Name: "root-retired-generation", Status: "active"},
+		{AgentID: finalRootID, Name: "root-current", Status: "active"},
+		{AgentID: reader, Name: "ordinary-reader", Status: "active"},
+	} {
+		require.NoError(t, ss.CreateAgent(ctx, agent))
+	}
+	require.NoError(t, bs.RegisterDomain("root-owned", rootID, "", 10))
+	require.NoError(t, bs.SetAccessGrant("root-owned", currentRootID, 1, 0, rootID))
+	require.NoError(t, bs.SetAccessGrant("root-owned", finalRootID, 1, 0, rootID))
+	require.NoError(t, bs.SetAccessGrant("root-owned", reader, 1, 0, rootID))
+	_, err = m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{
+		{Domain: "root-owned.work", Read: true},
+	})
+	require.NoError(t, err)
+
+	grant := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
+	require.NotNil(t, grant)
+	contacts := make(map[string]PipeContact, len(grant.Contacts))
+	for _, contact := range grant.Contacts {
+		contacts[contact.AgentID] = contact
+	}
+	require.NotContains(t, contacts, rootID, "the immutable Root principal is authority, never an agent contact")
+	require.NotContains(t, contacts, currentRootID, "a retired Root generation is never an agent contact")
+	require.NotContains(t, contacts, finalRootID, "the live Root credential is never an agent contact")
+	readerContact, ok := contacts[reader]
+	require.True(t, ok, "ordinary agents keep their granted inbox on a Root-owned domain")
+	require.Equal(t, []PipeContactDomain{{
+		Domain: "root-owned.work", OwningDomain: "root-owned", OwnerHeight: 10,
+	}}, readerContact.Domains)
 }
 
 func TestPipeContactCapabilitiesIncludeReadAllAndLinearizeTargetDeny(t *testing.T) {

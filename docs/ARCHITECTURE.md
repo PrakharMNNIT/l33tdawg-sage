@@ -544,7 +544,7 @@ Access to a memory requires passing three checks, evaluated in order:
 
 ## Upgrade Machinery
 
-SAGE includes an in-place chain-upgrade substrate: existing chains move forward across consensus-rule changes without a chain reset and without losing accumulated memory. How much of it is hands-off depends on the fork: the upgrade watchdog auto-proposes only up to its frozen deployment-safe default (app-v6), while every later fork (app-v7 onward) is governance-activated by an operator running `sage-gui upgrade propose --target <next>` one fork at a time (post-app-v8, signed by a chain-admin agent). Personal single-validator nodes also have auto-advance support for later forks, preserving the no-typed-commands experience. The substrate has four moving parts:
+SAGE includes an in-place chain-upgrade substrate: existing chains move forward across consensus-rule changes without a chain reset and without losing accumulated memory. How much of it is hands-off depends on the fork: the upgrade watchdog auto-proposes only up to its frozen deployment-safe default (app-v6), while every later fork (app-v7 onward) is governance-activated by an operator running `sage-gui upgrade propose --target <next>` one fork at a time (post-app-v8, signed by a chain-admin agent). At app-v23 and later, automatic and default CLI signing resolves the current consensus CEREBRUM Root credential from local key material for every transaction, including rotated recovery-bundle keys; it fails closed instead of falling back to a stale genesis `agent.key`. Personal single-validator nodes also have auto-advance support for later forks, preserving the no-typed-commands experience. The substrate has four moving parts:
 
 ### 1. Scheduled snapshots
 
@@ -921,7 +921,7 @@ marker; see `docs/reference/rest-api.md` for the authoritative details.
 | `POST` | `/v1/memory/submit` | Yes | Submit a new memory for consensus validation |
 | `POST` | `/v1/memory/query` | Yes | Semantic similarity search over memories |
 | `GET` | `/v1/memory/{memory_id}` | Yes | Retrieve a single memory by ID |
-| `POST` | `/v1/memory/{memory_id}/vote` | Yes | Cast a validator vote (accept/reject/abstain) |
+| `POST` | `/v1/memory/{memory_id}/vote` | Yes | Local operator override for this node's validator vote (accept/reject/abstain) |
 | `POST` | `/v1/memory/{memory_id}/challenge` | Yes | Challenge a committed memory |
 | `POST` | `/v1/memory/{memory_id}/corroborate` | Yes | Corroborate a memory with evidence |
 | `GET` | `/v1/agent/me` | Yes | Get authenticated agent's profile and PoE weight |
@@ -988,7 +988,9 @@ stateDiagram-v2
 
 1. An agent submits a memory via `/v1/memory/submit` (status: `proposed`)
 2. Each node's memory auto-voter runs the validation checks (dedup, quality, consistency) and signs ONE vote transaction with the node's own consensus key, broadcast through CometBFT
-3. On a multi-node chain every node votes with its own key; agents can also vote via `/v1/memory/{id}/vote`
+3. On a multi-node chain every node votes with its own key; the local operator
+   can deliberately override that node's one validator vote via
+   `/v1/memory/{id}/vote`
 4. When quorum is reached (>= 2/3 weighted vote), status advances to `committed`
 5. Other agents can corroborate (strengthens confidence) or challenge (triggers review)
 6. Challenged memories may be deprecated based on evidence

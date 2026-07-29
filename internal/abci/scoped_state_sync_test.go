@@ -138,6 +138,186 @@ func TestPrepareAppV20StateSyncBackupRejectsMalformedCanonicalScope(t *testing.T
 	require.ErrorContains(t, err, "verify staged scoped state")
 }
 
+func TestPrepareAppV20StateSyncBackupRejectsMalformedAppV23State(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "badger")
+	bs, err := store.NewBadgerStore(path)
+	require.NoError(t, err)
+	require.NoError(t, bs.MarkUpgradeApplied(appV20UpgradeName, 20, 1))
+	require.NoError(t, bs.MarkUpgradeApplied(appV21UpgradeName, 21, 2))
+	require.NoError(t, bs.MarkUpgradeApplied(appV22UpgradeName, 22, 3))
+	require.NoError(t, bs.MarkUpgradeApplied(appV23UpgradeName, 23, 4))
+	seedTestGovernanceDelegationDomain(t, bs)
+	state := &AppState{Height: 5, EpochNum: poe.EpochNumber(5)}
+	hash, err := bs.ComputeAppHashExcludingBookkeeping()
+	require.NoError(t, err)
+	state.AppHash = hash
+	require.NoError(t, SaveState(bs, state))
+	hash, err = bs.ComputeAppHashExcludingBookkeeping()
+	require.NoError(t, err)
+	state.AppHash = hash
+	require.NoError(t, SaveState(bs, state))
+
+	backupPath := filepath.Join(root, "badger.backup")
+	backup, err := os.OpenFile(backupPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, statesync.WriteCanonicalState(context.Background(), bs.DB(), backup))
+	require.NoError(t, backup.Close())
+	require.NoError(t, bs.CloseBadger())
+
+	err = PrepareAppV20StateSyncBackup(
+		context.Background(), backupPath, filepath.Join(root, "prepared"), 5, hash,
+	)
+	require.ErrorContains(t, err, "verify staged app-v23 state")
+}
+
+func TestPrepareAppV20StateSyncBackupRejectsMissingHistoricalRootCredential(t *testing.T) {
+	rootDir := t.TempDir()
+	source, err := store.NewBadgerStore(filepath.Join(rootDir, "badger"))
+	require.NoError(t, err)
+
+	root := deterministicScopedAgent(10)
+	generationTwo := deterministicScopedAgent(42)
+	generationThree := deterministicScopedAgent(74)
+	require.NoError(t, source.RegisterAgentWithCapabilities(
+		root.id, "CEREBRUM", store.AppV23RoleAdmin, "", "", "", 1, 0,
+	))
+	seedTestGovernanceDelegationDomain(t, source)
+	require.NoError(t, source.MarkUpgradeApplied(appV20UpgradeName, 20, 1))
+	require.NoError(t, source.MarkUpgradeApplied(appV21UpgradeName, 21, 2))
+	require.NoError(t, source.MarkUpgradeApplied(appV22UpgradeName, 22, 3))
+	require.NoError(t, source.EnsureAppV23Root("missing-root-history", 4))
+	require.NoError(t, source.MarkUpgradeApplied(appV23UpgradeName, 23, 4))
+	require.NoError(t, source.RotateAppV23RootCredential(1, generationTwo.id, 5))
+	require.NoError(t, source.RotateAppV23RootCredential(2, generationThree.id, 6))
+	require.NoError(t, source.ValidateAppV23State())
+
+	// Model a hash-consistent but semantically incomplete trusted snapshot. The
+	// current generation still says three, so dropping only the middle marker
+	// must not be accepted merely because canonical backup/AppHash agree.
+	require.NoError(t, source.DB().Update(func(txn *badger.Txn) error {
+		return txn.Delete([]byte("appv23:root_credential:" + generationTwo.id))
+	}))
+
+	state := &AppState{Height: 6, EpochNum: poe.EpochNumber(6)}
+	appHash, err := source.ComputeAppHashExcludingBookkeeping()
+	require.NoError(t, err)
+	state.AppHash = append([]byte(nil), appHash...)
+	require.NoError(t, SaveState(source, state))
+	appHash, err = source.ComputeAppHashExcludingBookkeeping()
+	require.NoError(t, err)
+	state.AppHash = append([]byte(nil), appHash...)
+	require.NoError(t, SaveState(source, state))
+
+	backupPath := filepath.Join(rootDir, "app-v23-missing-history.backup")
+	backup, err := os.OpenFile(backupPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, statesync.WriteCanonicalState(context.Background(), source.DB(), backup))
+	require.NoError(t, backup.Close())
+	require.NoError(t, source.CloseBadger())
+
+	err = PrepareAppV20StateSyncBackup(
+		context.Background(), backupPath, filepath.Join(rootDir, "prepared"), 6, appHash,
+	)
+	require.ErrorContains(t, err, "verify staged app-v23 state")
+	require.ErrorContains(t, err, "root credential history count")
+}
+
+func TestPrepareAppV20StateSyncBackupPreservesValidAppV23PolicySemantics(t *testing.T) {
+	rootDir := t.TempDir()
+	sourcePath := filepath.Join(rootDir, "source-badger")
+	source, err := store.NewBadgerStore(sourcePath)
+	require.NoError(t, err)
+
+	root := deterministicScopedAgent(9)
+	member := deterministicScopedAgent(41)
+	manager := deterministicScopedAgent(73)
+	require.NoError(t, source.RegisterAgentWithCapabilities(
+		root.id, "CEREBRUM", store.AppV23RoleAdmin, "", "", "", 1, 0,
+	))
+	require.NoError(t, source.RegisterAgentWithCapabilities(
+		member.id, "member", store.AppV23RoleMember, "", "", "", 2, 0,
+	))
+	require.NoError(t, source.RegisterAgentWithCapabilities(
+		manager.id, "manager", store.AppV23RoleMember, "", "", "", 3, 0,
+	))
+	seedTestGovernanceDelegationDomain(t, source)
+	require.NoError(t, source.MarkUpgradeApplied(appV20UpgradeName, 20, 1))
+	require.NoError(t, source.MarkUpgradeApplied(appV21UpgradeName, 21, 2))
+	require.NoError(t, source.MarkUpgradeApplied(appV22UpgradeName, 22, 3))
+	require.NoError(t, source.EnsureAppV23Root("scope-state-sync-v23", 4))
+	require.NoError(t, source.MarkUpgradeApplied(appV23UpgradeName, 23, 4))
+
+	managerEnrollment, err := source.GetAppV23Enrollment(manager.id)
+	require.NoError(t, err)
+	managerRole, err := source.GetAppV23Role(manager.id)
+	require.NoError(t, err)
+	require.NoError(t, source.SetAppV23Policy(
+		root.id, manager.id, store.AppV23RoleManager,
+		managerEnrollment.Profile, store.AppV23ProfileStandard,
+		3, 0, managerRole.Revision, managerEnrollment.Revision, 5,
+	))
+	groupMembers := []string{member.id, manager.id}
+	sort.Strings(groupMembers)
+	require.NoError(t, source.MutateAppV23AccessGroup(
+		root.id, "state-sync-team", "State Sync Team", groupMembers, 0, false, 5,
+	))
+	rotatedRoot := deterministicScopedAgent(105)
+	require.NoError(t, source.RotateAppV23RootCredential(1, rotatedRoot.id, 5))
+	currentRoot := deterministicScopedAgent(137)
+	require.NoError(t, source.RotateAppV23RootCredential(2, currentRoot.id, 6))
+	require.NoError(t, source.ValidateAppV23State())
+
+	state := &AppState{Height: 6, EpochNum: poe.EpochNumber(6)}
+	appHash, err := source.ComputeAppHashExcludingBookkeeping()
+	require.NoError(t, err)
+	state.AppHash = append([]byte(nil), appHash...)
+	require.NoError(t, SaveState(source, state))
+	appHash, err = source.ComputeAppHashExcludingBookkeeping()
+	require.NoError(t, err)
+	state.AppHash = append([]byte(nil), appHash...)
+	require.NoError(t, SaveState(source, state))
+
+	backupPath := filepath.Join(rootDir, "app-v23.backup")
+	backup, err := os.OpenFile(backupPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, statesync.WriteCanonicalState(context.Background(), source.DB(), backup))
+	require.NoError(t, backup.Close())
+	require.NoError(t, source.CloseBadger())
+
+	target := filepath.Join(rootDir, "prepared")
+	require.NoError(t, PrepareAppV20StateSyncBackup(
+		context.Background(), backupPath, target, 6, appHash,
+	))
+	prepared, err := store.OpenBadgerStoreReadOnly(target)
+	require.NoError(t, err)
+	require.NoError(t, prepared.ValidateAppV23State())
+	rootState, err := prepared.GetAppV23Root()
+	require.NoError(t, err)
+	require.Equal(t, root.id, rootState.PrincipalID)
+	require.Equal(t, currentRoot.id, rootState.CredentialID)
+	require.Equal(t, uint64(3), rootState.Generation)
+	for _, id := range []string{root.id, rotatedRoot.id, currentRoot.id} {
+		wasRoot, markerErr := prepared.IsAppV23RootCredential(id)
+		require.NoError(t, markerErr)
+		require.True(t, wasRoot, "state sync must preserve every Root credential generation")
+	}
+	preparedRole, err := prepared.GetAppV23Role(manager.id)
+	require.NoError(t, err)
+	require.Equal(t, store.AppV23RoleManager, preparedRole.Role)
+	groups, err := prepared.ListAppV23AccessGroups()
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
+	require.Equal(t, "state-sync-team", groups[0].GroupID)
+	require.Equal(t, groupMembers, groups[0].Members)
+	require.NoError(t, prepared.CloseBadger())
+
+	height, inspectedHash, err := InspectAppV20StateSyncDirectory(context.Background(), target)
+	require.NoError(t, err)
+	require.Equal(t, uint64(6), height)
+	require.Equal(t, appHash, inspectedHash)
+}
+
 func seedTestGovernanceDelegationDomain(t *testing.T, badgerStore *store.BadgerStore) {
 	t.Helper()
 	require.NoError(t, badgerStore.SetState(governanceDelegationDomainStateKey, bytes.Repeat([]byte{0x5a}, sha256.Size)))

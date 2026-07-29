@@ -63,6 +63,9 @@ func (s *Server) callerIsGlobalAdmin(r *http.Request) bool {
 		return false
 	}
 	agentID := middleware.ContextAgentID(r.Context())
+	if s.isPostV23ForNextTx() {
+		return s.callerIsOperatorOrAdmin(r.Context(), agentID)
+	}
 	agent, err := s.badgerStore.GetRegisteredAgent(agentID)
 	return err == nil && agent != nil && agent.Role == "admin"
 }
@@ -80,14 +83,23 @@ func (s *Server) handleOrgRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agentID := middleware.ContextAgentID(r.Context())
+	credentialID := middleware.ContextAgentID(r.Context())
 	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
 		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 organization registration requires a global admin.")
 		return
 	}
+	adminID := credentialID
+	if s.isPostV23ForNextTx() {
+		adminID, err = appV23PolicyPrincipal(s.badgerStore, credentialID)
+		if err != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current Root policy state could not be resolved.")
+			return
+		}
+	}
 
 	// Deterministic org ID from agent pubkey + name.
-	orgIDHash := sha256.Sum256([]byte(agentID + req.Name))
+	orgIDHash := sha256.Sum256([]byte(adminID + req.Name))
 	orgID := hex.EncodeToString(orgIDHash[:16])
 
 	orgTx := &tx.ParsedTx{
@@ -98,13 +110,13 @@ func (s *Server) handleOrgRegister(w http.ResponseWriter, r *http.Request) {
 			OrgID:       orgID,
 			Name:        req.Name,
 			Description: req.Description,
-			AdminAgent:  agentID,
+			AdminAgent:  adminID,
 		},
 	}
 
 	s.embedAgentAuth(r.Context(), orgTx)
 
-	err = tx.SignTx(orgTx, s.signingKey)
+	err = s.signTx(orgTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign org register tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -264,6 +276,15 @@ func (s *Server) handleListOrgMembers(w http.ResponseWriter, r *http.Request) {
 	out := make([]*store.OrgMemberEntry, 0, len(chainMembers))
 	for i := range chainMembers {
 		m := chainMembers[i]
+		isRoot, rootErr := s.appV23IsRootIdentity(m.AgentID)
+		if rootErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current CEREBRUM Root state is unavailable.")
+			return
+		}
+		if isRoot {
+			continue
+		}
 		if mm := mirrorByAgent[m.AgentID]; mm != nil {
 			m.CreatedAt = mm.CreatedAt
 			m.RemovedAt = mm.RemovedAt
@@ -290,6 +311,9 @@ func (s *Server) handleOrgAddMember(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AgentID == "" {
 		writeProblem(w, http.StatusBadRequest, "Missing agent ID", "agent_id is required")
+		return
+	}
+	if s.rejectAppV23RootAgentTarget(w, req.AgentID) {
 		return
 	}
 	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
@@ -320,7 +344,7 @@ func (s *Server) handleOrgAddMember(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), addTx)
 
-	err = tx.SignTx(addTx, s.signingKey)
+	err = s.signTx(addTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign org add member tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -354,6 +378,9 @@ func (s *Server) handleOrgRemoveMember(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing parameters", "org_id and agent_id path parameters are required")
 		return
 	}
+	if s.rejectAppV23RootAgentTarget(w, agentToRemove) {
+		return
+	}
 	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
 		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 organization membership changes require a global admin.")
 		return
@@ -371,7 +398,7 @@ func (s *Server) handleOrgRemoveMember(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), removeTx)
 
-	err := tx.SignTx(removeTx, s.signingKey)
+	err := s.signTx(removeTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign org remove member tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -415,6 +442,9 @@ func (s *Server) handleOrgSetClearance(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing agent ID", "agent_id is required")
 		return
 	}
+	if s.rejectAppV23RootAgentTarget(w, req.AgentID) {
+		return
+	}
 	if s.isPostV22ForNextTx() && !s.callerIsGlobalAdmin(r) {
 		writeProblem(w, http.StatusForbidden, "Access denied", "app-v22 organization clearance changes require a global admin.")
 		return
@@ -433,7 +463,7 @@ func (s *Server) handleOrgSetClearance(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), clearanceTx)
 
-	err = tx.SignTx(clearanceTx, s.signingKey)
+	err = s.signTx(clearanceTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign org set clearance tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -490,7 +520,17 @@ func (s *Server) handleFederationPropose(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	agentID := middleware.ContextAgentID(r.Context())
+	credentialID := middleware.ContextAgentID(r.Context())
+	globalAdmin := s.isPostV23ForNextTx() && s.callerIsGlobalAdmin(r)
+	policyID := credentialID
+	if s.isPostV23ForNextTx() {
+		policyID, err = appV23PolicyPrincipal(s.badgerStore, credentialID)
+		if err != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current Root policy state could not be resolved.")
+			return
+		}
+	}
 
 	// Resolve the proposer's org from on-chain state. Multi-org callers may
 	// select an exact membership; omission preserves the legacy primary-org
@@ -502,17 +542,24 @@ func (s *Server) handleFederationPropose(w http.ResponseWriter, r *http.Request)
 	}
 	proposerOrg := req.ProposerOrgID
 	if proposerOrg != "" {
-		member, memberErr := s.badgerStore.IsAgentInOrg(agentID, proposerOrg)
-		if memberErr != nil || !member {
-			writeProblem(w, http.StatusForbidden, "Not in proposer organization",
-				"You must belong to proposer_org_id to propose its federation.")
-			return
+		if !globalAdmin {
+			member, memberErr := s.badgerStore.IsAgentInOrg(policyID, proposerOrg)
+			if memberErr != nil || !member {
+				writeProblem(w, http.StatusForbidden, "Not in proposer organization",
+					"You must belong to proposer_org_id to propose its federation.")
+				return
+			}
 		}
 	} else {
-		proposerOrg, err = s.badgerStore.GetAgentOrg(agentID)
+		proposerOrg, err = s.badgerStore.GetAgentOrg(policyID)
 		if err != nil {
-			writeProblem(w, http.StatusForbidden, "Not in an organization",
-				"You must belong to an organization to propose federations")
+			if globalAdmin {
+				writeProblem(w, http.StatusBadRequest, "Missing proposer organization",
+					"proposer_org_id is required when the global Admin is not a member of an organization.")
+			} else {
+				writeProblem(w, http.StatusForbidden, "Not in an organization",
+					"You must belong to an organization to propose federations")
+			}
 			return
 		}
 	}
@@ -534,7 +581,7 @@ func (s *Server) handleFederationPropose(w http.ResponseWriter, r *http.Request)
 
 	s.embedAgentAuth(r.Context(), proposeTx)
 
-	err = tx.SignTx(proposeTx, s.signingKey)
+	err = s.signTx(proposeTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign federation propose tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -572,7 +619,18 @@ func (s *Server) handleFederationApprove(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	agentID := middleware.ContextAgentID(r.Context())
+	credentialID := middleware.ContextAgentID(r.Context())
+	globalAdmin := s.isPostV23ForNextTx() && s.callerIsGlobalAdmin(r)
+	policyID := credentialID
+	if s.isPostV23ForNextTx() {
+		var policyErr error
+		policyID, policyErr = appV23PolicyPrincipal(s.badgerStore, credentialID)
+		if policyErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current Root policy state could not be resolved.")
+			return
+		}
+	}
 
 	// Resolve the authoritative target from the stored agreement. A legacy
 	// primary-org lookup is insufficient for multi-org agents and can produce a
@@ -587,11 +645,13 @@ func (s *Server) handleFederationApprove(w http.ResponseWriter, r *http.Request)
 		writeProblem(w, http.StatusNotFound, "Federation not found", "The federation agreement does not exist.")
 		return
 	}
-	member, memberErr := s.badgerStore.IsAgentInOrg(agentID, approverOrg)
-	if memberErr != nil || !member {
-		writeProblem(w, http.StatusForbidden, "Not in target organization",
-			"You must belong to the federation's target organization to approve it.")
-		return
+	if !globalAdmin {
+		member, memberErr := s.badgerStore.IsAgentInOrg(policyID, approverOrg)
+		if memberErr != nil || !member {
+			writeProblem(w, http.StatusForbidden, "Not in target organization",
+				"You must belong to the federation's target organization to approve it.")
+			return
+		}
 	}
 
 	approveTx := &tx.ParsedTx{
@@ -606,7 +666,7 @@ func (s *Server) handleFederationApprove(w http.ResponseWriter, r *http.Request)
 
 	s.embedAgentAuth(r.Context(), approveTx)
 
-	err = tx.SignTx(approveTx, s.signingKey)
+	err = s.signTx(approveTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign federation approve tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
@@ -644,7 +704,18 @@ func (s *Server) handleFederationRevoke(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	agentID := middleware.ContextAgentID(r.Context())
+	credentialID := middleware.ContextAgentID(r.Context())
+	globalAdmin := s.isPostV23ForNextTx() && s.callerIsGlobalAdmin(r)
+	policyID := credentialID
+	if s.isPostV23ForNextTx() {
+		var policyErr error
+		policyID, policyErr = appV23PolicyPrincipal(s.badgerStore, credentialID)
+		if policyErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current Root policy state could not be resolved.")
+			return
+		}
+	}
 
 	// Resolve both authoritative sides from the stored agreement and choose a
 	// deterministic exact membership (proposer first). This matches consensus
@@ -660,9 +731,11 @@ func (s *Server) handleFederationRevoke(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	revokerOrg := ""
-	if inProposer, _ := s.badgerStore.IsAgentInOrg(agentID, proposerOrg); inProposer {
+	if globalAdmin {
 		revokerOrg = proposerOrg
-	} else if inTarget, _ := s.badgerStore.IsAgentInOrg(agentID, targetOrg); inTarget {
+	} else if inProposer, _ := s.badgerStore.IsAgentInOrg(policyID, proposerOrg); inProposer {
+		revokerOrg = proposerOrg
+	} else if inTarget, _ := s.badgerStore.IsAgentInOrg(policyID, targetOrg); inTarget {
 		revokerOrg = targetOrg
 	}
 	if revokerOrg == "" {
@@ -688,7 +761,7 @@ func (s *Server) handleFederationRevoke(w http.ResponseWriter, r *http.Request) 
 
 	s.embedAgentAuth(r.Context(), revokeTx)
 
-	err = tx.SignTx(revokeTx, s.signingKey)
+	err = s.signTx(revokeTx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to sign federation revoke tx")
 		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")

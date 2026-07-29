@@ -1,4 +1,4 @@
-<!-- Reference index reconciled for SAGE v11.14.2. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
+<!-- Reference index reconciled for SAGE v11.15.0. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
 
 
 # SAGE Reference — Agent Integration Index
@@ -24,6 +24,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | [`concepts/memory-lifecycle.md`](concepts/memory-lifecycle.md) | submit → proposed → committed/deprecated; node-local vs on-chain data; confidence decay; corroboration. |
 | [`concepts/clearance-classification.md`](concepts/clearance-classification.md) | Per-record classification (0–4), the REST-vs-wire default gotcha, and the per-record query gate. |
 | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) | Orgs, departments, agent clearance, cross-org federation, cross-chain peer Read/Copy RBAC, why peer Write is reserved but unavailable in v11.9, the five-gate query pipeline, and the app-v20 one-chain quorum-scope boundary. |
+| [`app-v23-access-control-design.md`](app-v23-access-control-design.md) | The v11.15.0 contract for Root, Member/Manager/Admin roles, named security profiles, Access Groups, atomic enrollment, linked federated readers, migration, replay, and state sync. |
 | [`concepts/consensus-confidence-decay.md`](concepts/consensus-confidence-decay.md) | CometBFT BFT path, "CometBFT-committed" vs "SAGE-committed", quorum, PoE weights, epochs. |
 | [`concepts/block-production-and-idle.md`](concepts/block-production-and-idle.md) | Why an idle chain mints **no** blocks (SAGE has no heartbeat), when a block *is* minted, and how to tell healthy-idle from actually-stuck. Read this before alarming on a frozen block height. |
 | [`concepts/voter-operations.md`](concepts/voter-operations.md) | How `proposed` memories become `committed` (the per-node auto-voter), how to *guarantee* auto-commit (`--require-voter` / `voter:` config), the stuck-memory alarm + triage, key safety, and the honest REST-vote caveat. |
@@ -49,6 +50,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | Send agent work to a visible shared-domain recipient on another federated SAGE | [`mcp-tools.md`](mcp-tools.md) — `sage_find_agent`, then `sage_pipe`; [`federation-and-brain-api.md`](federation-and-brain-api.md) — `POST /fed/v1/pipe/event` |
 | Discover connected SAGEs and live-read a domain they share | [`mcp-tools.md`](mcp-tools.md) — `sage_federation`, then `sage_recall` with `federated=true` |
 | Distinguish internet federation, app-v20 quorum replication, and local-vs-network snapshot recovery | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) — “v11.9 quorum scopes are not cross-chain federation” |
+| Understand Root handover, local Access Groups, or why a federated agent is read-only | [`app-v23-access-control-design.md`](app-v23-access-control-design.md) + [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) |
 | Configure SAGE via environment variables | [`environment-variables.md`](environment-variables.md) |
 
 ---
@@ -62,8 +64,28 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 
 The server enforces this: it blocks after ~7 non-SAGE tool calls or ~5 minutes without a `sage_turn`. See [`mcp-tools.md`](mcp-tools.md).
 
-### Clearance / classification (single integer, two meanings)
-The same `0–4` integer is overloaded in the codebase:
+### App-v23 access control: role, scope, clearance, and Root are separate
+
+Current app-v23 policy composes four independent questions:
+
+- **Member, Manager, or Admin** determines which verbs a local agent may use.
+- **Access Groups** determine the local-agent/domain scope for derived access.
+- **Clearance 0–4** caps the classification an agent may read.
+- **Named security profiles** add hard restrictions that override roles,
+  groups, and grants.
+
+CEREBRUM Root is not an Admin role or an agent roster entry. It is one immutable
+authority principal whose current credential can be handed over without
+rewriting domains, memories, authorship, or earlier blocks. Federated linked
+readers are a separate node-local principal kind: they can receive exact,
+classification-bounded live Read and untrusted pipeline messages, but never
+local membership or mutation authority. See
+[`app-v23-access-control-design.md`](app-v23-access-control-design.md).
+
+### Clearance / classification (legacy overloaded integer)
+
+Before app-v23's explicit role model, the same `0–4` integer was also described
+with an operational meaning:
 
 | Value | As **data classification** (memory records) | As **operational clearance** (agent capability) |
 |-------|---------------------------------------------|-------------------------------------------------|
@@ -73,7 +95,9 @@ The same `0–4` integer is overloaded in the codebase:
 | 3 | SECRET — own-org agents (clearance ≥3), dept scope; grants/federation additive | Validate |
 | 4 | TOP SECRET — named agents via grant, dual-approval | Admin |
 
-The **memory record** meaning is the data-classification column. See [`concepts/clearance-classification.md`](concepts/clearance-classification.md).
+The **memory record** meaning remains the data-classification column. Under
+app-v23, do not infer Member/Manager/Admin from this number. See
+[`concepts/clearance-classification.md`](concepts/clearance-classification.md).
 
 **Within-org reads are clearance-gated, not grant-gated.** The per-record gate is an **OR** over three additive paths (`HasAccessMultiOrg`): *direct grant* → *same-org clearance ≥ the record's level* → *federation ceiling ≥ level*. So a same-org agent with sufficient clearance reads a CONFIDENTIAL/SECRET record **without** any grant; explicit grants and federation extend access (typically cross-org), they are not a within-org requirement. See [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) for the resolution algorithm.
 
@@ -98,7 +122,7 @@ CometBFT without treating the consensus RPC as proof of application storage.
 
 ---
 
-## Related docs (reconciled through v11.14.2)
+## Related docs (reconciled through v11.15.0)
 
 These were stale earlier in v8 and have now been reconciled against the code. Where any of them still disagrees with this reference, this reference wins.
 

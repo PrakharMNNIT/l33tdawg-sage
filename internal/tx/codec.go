@@ -81,8 +81,11 @@ func EncodeTx(tx *ParsedTx) ([]byte, error) {
 	// omitted entirely when empty to preserve legacy bytes.
 	totalLen := 1 + 4 + len(payload) + ed25519.SignatureSize + ed25519.PublicKeySize + 8 + 8 +
 		ed25519.PublicKeySize + ed25519.SignatureSize + 8 + 32 + 4 + len(agentNonce)
-	if len(agentRequest) > 0 {
+	if len(agentRequest) > 0 || tx.LocalElevation != nil {
 		totalLen += 4 + len(agentRequest)
+	}
+	if tx.LocalElevation != nil {
+		totalLen += len(appendLocalElevationProof(nil, tx.LocalElevation))
 	}
 	buf := make([]byte, 0, totalLen)
 	buf = append(buf, byte(tx.Type))
@@ -100,9 +103,12 @@ func EncodeTx(tx *ParsedTx) ([]byte, error) {
 	// Agent nonce (variable length, length-prefixed)
 	buf = appendUint32(buf, uint32(len(agentNonce))) // #nosec G115 -- nonce length fits in uint32
 	buf = append(buf, agentNonce...)
-	if len(agentRequest) > 0 {
+	if len(agentRequest) > 0 || tx.LocalElevation != nil {
 		buf = appendUint32(buf, uint32(len(agentRequest))) // #nosec G115 -- bounded above
 		buf = append(buf, agentRequest...)
+	}
+	if tx.LocalElevation != nil {
+		buf = appendLocalElevationProof(buf, tx.LocalElevation)
 	}
 
 	return buf, nil
@@ -189,9 +195,19 @@ func DecodeTx(data []byte) (*ParsedTx, error) {
 			if offset+4 <= len(data) {
 				requestLen := binary.BigEndian.Uint32(data[offset : offset+4])
 				offset += 4
-				if requestLen > 0 && requestLen <= MaxAgentRequestSize && offset+int(requestLen) <= len(data) { // #nosec G115 -- requestLen bounded
-					tx.AgentRequest = make([]byte, requestLen)
-					copy(tx.AgentRequest, data[offset:offset+int(requestLen)]) // #nosec G115 -- requestLen bounded
+				requestTailValid := requestLen <= MaxAgentRequestSize && offset+int(requestLen) <= len(data) // #nosec G115 -- bounded by remaining bytes
+				if requestTailValid {
+					if requestLen > 0 {
+						tx.AgentRequest = make([]byte, requestLen)
+						copy(tx.AgentRequest, data[offset:offset+int(requestLen)]) // #nosec G115 -- requestLen bounded
+						offset += int(requestLen)                                  // #nosec G115 -- requestLen bounded
+					}
+					if offset < len(data) {
+						proof, proofOffset, proofErr := readLocalElevationProof(data, offset)
+						if proofErr == nil && proof != nil && proofOffset == len(data) {
+							tx.LocalElevation = proof
+						}
+					}
 				}
 			}
 		}
@@ -438,6 +454,26 @@ func encodePayload(tx *ParsedTx) ([]byte, error) {
 			return nil, fmt.Errorf("MemoryReinstate is nil for memory reinstate tx")
 		}
 		return encodeMemoryReinstate(tx.MemoryReinstate), nil
+	case TxTypeLocalAgentApprove:
+		if tx.LocalAgentApprove == nil {
+			return nil, fmt.Errorf("LocalAgentApprove is nil for local agent approve tx")
+		}
+		return encodeLocalAgentApprove(tx.LocalAgentApprove), nil
+	case TxTypeAgentRoleChange:
+		if tx.AgentRoleChange == nil {
+			return nil, fmt.Errorf("AgentRoleChange is nil for agent role change tx")
+		}
+		return encodeAgentRoleChange(tx.AgentRoleChange), nil
+	case TxTypeAccessGroupMutate:
+		if tx.AccessGroupMutate == nil {
+			return nil, fmt.Errorf("AccessGroupMutate is nil for access group mutate tx")
+		}
+		return encodeAccessGroupMutate(tx.AccessGroupMutate), nil
+	case TxTypeRootCredentialRotate:
+		if tx.RootCredentialRotate == nil {
+			return nil, fmt.Errorf("RootCredentialRotate is nil for root credential rotate tx")
+		}
+		return encodeRootCredentialRotate(tx.RootCredentialRotate), nil
 	default:
 		return nil, ErrUnknownTxType
 	}
@@ -689,6 +725,34 @@ func decodePayload(tx *ParsedTx, data []byte) error {
 			return err
 		}
 		tx.MemoryReinstate = r
+		return nil
+	case TxTypeLocalAgentApprove:
+		a, err := decodeLocalAgentApprove(data)
+		if err != nil {
+			return err
+		}
+		tx.LocalAgentApprove = a
+		return nil
+	case TxTypeAgentRoleChange:
+		r, err := decodeAgentRoleChange(data)
+		if err != nil {
+			return err
+		}
+		tx.AgentRoleChange = r
+		return nil
+	case TxTypeAccessGroupMutate:
+		g, err := decodeAccessGroupMutate(data)
+		if err != nil {
+			return err
+		}
+		tx.AccessGroupMutate = g
+		return nil
+	case TxTypeRootCredentialRotate:
+		r, err := decodeRootCredentialRotate(data)
+		if err != nil {
+			return err
+		}
+		tx.RootCredentialRotate = r
 		return nil
 	default:
 		return ErrUnknownTxType
@@ -2661,4 +2725,327 @@ func decodeDomainReassign(data []byte) (*DomainReassign, error) {
 	d.OpenToShared = byteToBool(data[off])
 
 	return d, nil
+}
+
+// --- app-v23 local RBAC ---
+
+func appendLocalElevationProof(buf []byte, proof *LocalElevationProof) []byte {
+	if proof == nil {
+		return append(buf, 0)
+	}
+	buf = append(buf, 1)
+	buf = appendUint64(buf, proof.RootGeneration)
+	buf = appendInt64(buf, proof.ValidFromHeight)
+	buf = appendInt64(buf, proof.ValidUntilHeight)
+	buf = appendBytes(buf, []byte(proof.Nonce))
+	return appendBytes(buf, proof.Signature)
+}
+
+func readLocalElevationProof(data []byte, off int) (*LocalElevationProof, int, error) {
+	if off >= len(data) || data[off] > 1 {
+		return nil, off, ErrInvalidTxData
+	}
+	present := data[off] == 1
+	off++
+	if !present {
+		return nil, off, nil
+	}
+	proof := &LocalElevationProof{}
+	var err error
+	proof.RootGeneration, off, err = readUint64(data, off)
+	if err != nil {
+		return nil, off, err
+	}
+	proof.ValidFromHeight, off, err = readInt64(data, off)
+	if err != nil {
+		return nil, off, err
+	}
+	proof.ValidUntilHeight, off, err = readInt64(data, off)
+	if err != nil {
+		return nil, off, err
+	}
+	var b []byte
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, off, err
+	}
+	proof.Nonce = string(b)
+	proof.Signature, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, off, err
+	}
+	return proof, off, nil
+}
+
+// AppV23ElevationSignBytes is signed by the current local CEREBRUM root
+// credential. actionBytes must be the type-specific canonical action bytes
+// returned by one of the helpers below and excludes the elevation proof.
+func AppV23ElevationSignBytes(scope, adminID string, txType TxType, actionBytes []byte, proof *LocalElevationProof) []byte {
+	buf := appendBytes(nil, []byte("sage/local-admin-elevation/v23"))
+	buf = appendBytes(buf, []byte(scope))
+	buf = appendBytes(buf, []byte(adminID))
+	buf = append(buf, byte(txType))
+	buf = appendBytes(buf, actionBytes)
+	buf = appendUint64(buf, proof.RootGeneration)
+	buf = appendInt64(buf, proof.ValidFromHeight)
+	buf = appendInt64(buf, proof.ValidUntilHeight)
+	return appendBytes(buf, []byte(proof.Nonce))
+}
+
+func appendLocalAgentApprovalCore(buf []byte, a *LocalAgentApprove) []byte {
+	buf = appendBytes(buf, []byte(a.AgentID))
+	buf = appendUint64(buf, a.ExpectedRevision)
+	buf = appendUint64(buf, a.ExpectedRoleRevision)
+	buf = append(buf, boolToByte(a.Active))
+	buf = appendBytes(buf, []byte(a.Role))
+	buf = appendBytes(buf, []byte(a.Profile))
+	buf = appendBytes(buf, []byte(a.HomeDomain))
+	buf = appendBytes(buf, []byte(a.ExpectedHomeDomainOwner))
+	buf = append(buf, boolToByte(a.TransferHomeDomain))
+	buf = append(buf, a.Clearance)
+	buf = appendUint32(buf, a.Capabilities)
+	buf = appendBytes(buf, []byte(a.Scope))
+	return buf
+}
+
+// LocalAgentApprovalSignBytes is the domain-separated target-consent message
+// signed by the agent being approved. rootID and Scope prevent an approval
+// proof from being transplanted to another root or chain scope.
+func LocalAgentApprovalSignBytes(rootID string, a *LocalAgentApprove) []byte {
+	buf := appendBytes(nil, []byte("sage/local-agent-approval/v23"))
+	buf = appendBytes(buf, []byte(rootID))
+	return appendLocalAgentApprovalCore(buf, a)
+}
+
+func encodeLocalAgentApprove(a *LocalAgentApprove) []byte {
+	buf := appendLocalAgentApprovalCore(nil, a)
+	return appendBytes(buf, a.TargetSignature)
+}
+
+// LocalAgentApproveActionBytes binds every semantic approval field and target
+// consent signature while intentionally excluding the elevation proof itself.
+func LocalAgentApproveActionBytes(a *LocalAgentApprove) []byte {
+	return appendBytes(appendLocalAgentApprovalCore(nil, a), a.TargetSignature)
+}
+
+func decodeLocalAgentApprove(data []byte) (*LocalAgentApprove, error) {
+	a := &LocalAgentApprove{}
+	var b []byte
+	var err error
+	off := 0
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	a.AgentID = string(b)
+	a.ExpectedRevision, off, err = readUint64(data, off)
+	if err != nil || off >= len(data) {
+		return nil, ErrInvalidTxData
+	}
+	a.ExpectedRoleRevision, off, err = readUint64(data, off)
+	if err != nil || off >= len(data) {
+		return nil, ErrInvalidTxData
+	}
+	if data[off] > 1 {
+		return nil, ErrInvalidTxData
+	}
+	a.Active = byteToBool(data[off])
+	off++
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	a.Role = string(b)
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	a.Profile = string(b)
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	a.HomeDomain = string(b)
+	if off >= len(data) {
+		return nil, ErrInvalidTxData
+	}
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	a.ExpectedHomeDomainOwner = string(b)
+	if off >= len(data) || data[off] > 1 {
+		return nil, ErrInvalidTxData
+	}
+	a.TransferHomeDomain = byteToBool(data[off])
+	off++
+	if off >= len(data) {
+		return nil, ErrInvalidTxData
+	}
+	a.Clearance = data[off]
+	off++
+	if off+4 > len(data) {
+		return nil, ErrInvalidTxData
+	}
+	a.Capabilities = binary.BigEndian.Uint32(data[off : off+4])
+	off += 4
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	a.Scope = string(b)
+	a.TargetSignature, off, err = readBytes(data, off)
+	if err != nil || off != len(data) {
+		return nil, ErrInvalidTxData
+	}
+	return a, nil
+}
+
+func appendAgentRoleChangeCore(buf []byte, r *AgentRoleChange) []byte {
+	buf = appendBytes(buf, []byte(r.AgentID))
+	buf = appendUint64(buf, r.ExpectedRevision)
+	buf = appendUint64(buf, r.EnrollmentRevision)
+	buf = appendBytes(buf, []byte(r.Role))
+	buf = appendBytes(buf, []byte(r.ExpectedProfile))
+	buf = appendBytes(buf, []byte(r.Profile))
+	buf = append(buf, r.Clearance)
+	return appendUint32(buf, r.Capabilities)
+}
+
+func AgentRoleChangeActionBytes(r *AgentRoleChange) []byte {
+	return appendAgentRoleChangeCore(nil, r)
+}
+
+func encodeAgentRoleChange(r *AgentRoleChange) []byte {
+	return appendAgentRoleChangeCore(nil, r)
+}
+
+func decodeAgentRoleChange(data []byte) (*AgentRoleChange, error) {
+	r := &AgentRoleChange{}
+	var b []byte
+	var err error
+	off := 0
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	r.AgentID = string(b)
+	r.ExpectedRevision, off, err = readUint64(data, off)
+	if err != nil {
+		return nil, err
+	}
+	r.EnrollmentRevision, off, err = readUint64(data, off)
+	if err != nil {
+		return nil, err
+	}
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, ErrInvalidTxData
+	}
+	r.Role = string(b)
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, ErrInvalidTxData
+	}
+	r.ExpectedProfile = string(b)
+	b, off, err = readBytes(data, off)
+	if err != nil || off+5 != len(data) {
+		return nil, ErrInvalidTxData
+	}
+	r.Profile = string(b)
+	r.Clearance = data[off]
+	off++
+	r.Capabilities = binary.BigEndian.Uint32(data[off : off+4])
+	return r, nil
+}
+
+func appendAccessGroupMutateCore(buf []byte, g *AccessGroupMutate) []byte {
+	buf = appendBytes(buf, []byte(g.GroupID))
+	buf = appendBytes(buf, []byte(g.Name))
+	buf = appendUint64(buf, g.ExpectedRevision)
+	buf = append(buf, boolToByte(g.Delete))
+	return appendStringSlice(buf, g.Members)
+}
+
+func AccessGroupMutateActionBytes(g *AccessGroupMutate) []byte {
+	return appendAccessGroupMutateCore(nil, g)
+}
+
+func encodeAccessGroupMutate(g *AccessGroupMutate) []byte {
+	return appendAccessGroupMutateCore(nil, g)
+}
+
+func decodeAccessGroupMutate(data []byte) (*AccessGroupMutate, error) {
+	g := &AccessGroupMutate{}
+	var b []byte
+	var err error
+	off := 0
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	g.GroupID = string(b)
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, err
+	}
+	g.Name = string(b)
+	g.ExpectedRevision, off, err = readUint64(data, off)
+	if err != nil || off >= len(data) {
+		return nil, ErrInvalidTxData
+	}
+	if data[off] > 1 {
+		return nil, ErrInvalidTxData
+	}
+	g.Delete = byteToBool(data[off])
+	off++
+	g.Members, off, err = readStringSlice(data, off)
+	if err != nil || off != len(data) {
+		return nil, ErrInvalidTxData
+	}
+	return g, nil
+}
+
+func appendRootCredentialRotationCore(buf []byte, r *RootCredentialRotate) []byte {
+	buf = appendUint64(buf, r.ExpectedGeneration)
+	buf = appendBytes(buf, []byte(r.NewCredentialID))
+	return appendBytes(buf, []byte(r.Scope))
+}
+
+// RootCredentialRotationSignBytes is the dual-control proof signed by the new
+// credential before the current root commits the rotation transaction.
+func RootCredentialRotationSignBytes(principalID string, r *RootCredentialRotate) []byte {
+	buf := appendBytes(nil, []byte("sage/root-credential-rotation/v23"))
+	buf = appendBytes(buf, []byte(principalID))
+	return appendRootCredentialRotationCore(buf, r)
+}
+
+func encodeRootCredentialRotate(r *RootCredentialRotate) []byte {
+	return appendBytes(appendRootCredentialRotationCore(nil, r), r.NewCredentialSignature)
+}
+
+func decodeRootCredentialRotate(data []byte) (*RootCredentialRotate, error) {
+	r := &RootCredentialRotate{}
+	off := 0
+	var err error
+	r.ExpectedGeneration, off, err = readUint64(data, off)
+	if err != nil {
+		return nil, ErrInvalidTxData
+	}
+	var b []byte
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, ErrInvalidTxData
+	}
+	r.NewCredentialID = string(b)
+	b, off, err = readBytes(data, off)
+	if err != nil {
+		return nil, ErrInvalidTxData
+	}
+	r.Scope = string(b)
+	r.NewCredentialSignature, off, err = readBytes(data, off)
+	if err != nil || off != len(data) {
+		return nil, ErrInvalidTxData
+	}
+	return r, nil
 }

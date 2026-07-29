@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // Pure Go SQLite driver
@@ -39,14 +40,19 @@ type SQLiteStore struct {
 	conn                  sqlQuerier // either *sql.DB or *sql.Tx
 	db                    *sql.DB    // nil for tx-scoped stores
 	dbPath                string
-	vault                 *vault.Vault  // nil = no encryption
-	vaultExpected         bool          // true = encryption should be active; reject writes if vault nil
-	decryptWarnOnce       sync.Once     // gates the one-time decryption failure warning
-	writeMu               sync.Mutex    // serializes ALL writes to prevent SQLITE_BUSY
-	syncPolicyGate        *sync.RWMutex // shared with tx clones; linearizes consent vs egress
-	syncOriginGate        *sync.RWMutex // shared with tx clones; linearizes copy provenance vs re-forward scans
-	agentContactGate      *sync.RWMutex // shared with tx clones; linearizes advertised agent identity/availability
-	agentContactWriteHeld bool          // true only on a RunInAgentContactTx-scoped clone
+	vault                 atomic.Pointer[vault.Vault] // nil = no encryption; hot-swapped when CEREBRUM unlocks
+	vaultExpected         atomic.Bool                 // true = encryption should be active; reject writes if vault nil
+	decryptWarnOnce       sync.Once                   // gates the one-time decryption failure warning
+	writeMu               sync.Mutex                  // serializes ALL writes to prevent SQLITE_BUSY
+	syncPolicyGate        *sync.RWMutex               // shared with tx clones; linearizes consent vs egress
+	syncOriginGate        *sync.RWMutex               // shared with tx clones; linearizes copy provenance vs re-forward scans
+	agentContactGate      *sync.RWMutex               // shared with tx clones; linearizes advertised agent identity/availability
+	agentContactWriteHeld bool                        // true only on a RunInAgentContactTx-scoped clone
+	// federationAuthorizationMutationHook publishes/cancels the bounded
+	// per-peer linked delivery lease before a local consent, guest-link, or
+	// agent-availability mutation. Empty chain means the mutation can affect
+	// every linked peer.
+	federationAuthorizationMutationHooks *authorizationMutationHookState
 
 	// Optional cross-encoder reranker; nil = skip the rerank pass and return
 	// the RRF-sorted candidates directly. Wired at server startup via
@@ -99,7 +105,7 @@ const ErrTextSearchVaultEncryptedMsg = "text search unavailable: content is vaul
 // SetVault attaches an encryption vault to the store.
 // When set, memory content is encrypted on write and decrypted on read.
 func (s *SQLiteStore) SetVault(v *vault.Vault) {
-	s.vault = v
+	s.vault.Store(v)
 }
 
 // SetReranker attaches an optional cross-encoder reranker used by
@@ -138,33 +144,34 @@ func (s *SQLiteStore) RerankerInfo() (bool, string, string) {
 // REST handlers like /v1/embed/info use this to force semantic mode on for
 // vault-active nodes so MCP clients don't get routed to the broken FTS5 path.
 func (s *SQLiteStore) VaultActive() bool {
-	return s.vault != nil
+	return s.vault.Load() != nil
 }
 
 // VaultExpected marks that encryption should be active. When true and the vault
 // is nil (locked), writes are rejected rather than silently going plaintext.
 func (s *SQLiteStore) SetVaultExpected(expected bool) {
-	s.vaultExpected = expected
+	s.vaultExpected.Store(expected)
 }
 
 // VaultLocked reports whether writes would currently be rejected because
 // encryption is expected but the vault has not been unlocked. Callers that
 // stage work (e.g. sync admission) use this to defer instead of failing.
 func (s *SQLiteStore) VaultLocked() bool {
-	return s.vaultExpected && s.vault == nil
+	return s.vaultExpected.Load() && s.vault.Load() == nil
 }
 
 // encryptContent encrypts a string if the vault is set.
 // Returns the original string if no vault and encryption is not expected.
 // Returns an error if encryption is expected but vault is locked.
 func (s *SQLiteStore) encryptContent(plaintext string) (string, error) {
-	if s.vault == nil {
-		if s.vaultExpected {
+	activeVault := s.vault.Load()
+	if activeVault == nil {
+		if s.vaultExpected.Load() {
 			return "", fmt.Errorf("vault is locked — unlock encryption before storing memories")
 		}
 		return plaintext, nil
 	}
-	encrypted, err := s.vault.EncryptString(plaintext)
+	encrypted, err := activeVault.EncryptString(plaintext)
 	if err != nil {
 		return "", fmt.Errorf("encrypt content: %w", err)
 	}
@@ -182,14 +189,15 @@ func (s *SQLiteStore) decryptContent(stored string) (string, error) {
 	if !strings.HasPrefix(stored, encPrefix) {
 		return stored, nil // not encrypted
 	}
-	if s.vault == nil {
+	activeVault := s.vault.Load()
+	if activeVault == nil {
 		return VaultLockedPlaceholder, nil
 	}
 	data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, encPrefix))
 	if err != nil {
 		return "", fmt.Errorf("decode encrypted content: %w", err)
 	}
-	plaintext, decErr := s.vault.DecryptString(data)
+	plaintext, decErr := activeVault.DecryptString(data)
 	if decErr != nil {
 		// Log once per process lifetime — this typically means the vault key
 		// doesn't match the key used to encrypt these memories (e.g., the vault
@@ -204,23 +212,25 @@ func (s *SQLiteStore) decryptContent(stored string) (string, error) {
 
 // encryptEmbedding encrypts embedding bytes if the vault is set.
 func (s *SQLiteStore) encryptEmbedding(data []byte) ([]byte, error) {
-	if s.vault == nil || data == nil {
-		if s.vaultExpected && data != nil {
+	activeVault := s.vault.Load()
+	if activeVault == nil || data == nil {
+		if s.vaultExpected.Load() && data != nil {
 			return nil, fmt.Errorf("vault is locked — unlock encryption before storing embeddings")
 		}
 		return data, nil
 	}
-	return s.vault.Encrypt(data)
+	return activeVault.Encrypt(data)
 }
 
 // decryptEmbedding decrypts embedding bytes if vault is set and data looks encrypted.
 // Encrypted embeddings are longer than raw ones (nonce + tag overhead).
 func (s *SQLiteStore) decryptEmbedding(data []byte) ([]byte, error) {
-	if s.vault == nil || data == nil {
+	activeVault := s.vault.Load()
+	if activeVault == nil || data == nil {
 		return data, nil
 	}
 	// Try to decrypt — if it fails, it's likely unencrypted legacy data.
-	decrypted, err := s.vault.Decrypt(data)
+	decrypted, err := activeVault.Decrypt(data)
 	if err != nil {
 		return data, nil // return as-is for backward compatibility
 	}
@@ -264,7 +274,12 @@ func NewSQLiteStore(ctx context.Context, dbPath string) (*SQLiteStore, error) {
 		}
 	}
 
-	s := &SQLiteStore{conn: db, db: db, dbPath: dbPath, syncPolicyGate: &sync.RWMutex{}, syncOriginGate: &sync.RWMutex{}, agentContactGate: &sync.RWMutex{}}
+	s := &SQLiteStore{
+		conn: db, db: db, dbPath: dbPath,
+		syncPolicyGate: &sync.RWMutex{}, syncOriginGate: &sync.RWMutex{},
+		agentContactGate:                     &sync.RWMutex{},
+		federationAuthorizationMutationHooks: &authorizationMutationHookState{},
+	}
 	if err := s.initSchema(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -394,6 +409,7 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain_tag);
 	CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+	CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
 
 	CREATE TABLE IF NOT EXISTS knowledge_triples (
 		id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -751,17 +767,26 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	// Migration: add pipeline_messages table.
 	s.migratePipeline(ctx)
 	s.migratePipelineTransport(ctx)
+	if err := s.migratePipelineV23SecurityColumns(ctx); err != nil {
+		return fmt.Errorf("migrate pipeline v23 authorization columns: %w", err)
+	}
 
 	// Migration: add mcp_tokens table for HTTP MCP transport bearer auth.
-	s.migrateMCPTokens(ctx)
+	if err := s.migrateMCPTokens(ctx); err != nil {
+		return fmt.Errorf("migrate MCP tokens: %w", err)
+	}
 
 	// Migration: add mcp_auth_codes table for the OAuth 2.0 + PKCE wrapper
 	// in front of bearer auth (v6.7.2 — ChatGPT MCP connector compat).
-	s.migrateMCPAuthCodes(ctx)
+	if err := s.migrateMCPAuthCodes(ctx); err != nil {
+		return fmt.Errorf("migrate OAuth auth codes: %w", err)
+	}
 
 	// Migration: add oauth_clients table for persisted DCR registrations
 	// (v6.8.0 — required so /oauth/authorize can validate redirect_uri).
-	s.migrateOAuthClients(ctx)
+	if err := s.migrateOAuthClients(ctx); err != nil {
+		return fmt.Errorf("migrate OAuth clients: %w", err)
+	}
 
 	// Migration: add domain-sync tables (v11.5 — sync_domains consent,
 	// sync_outbox store-and-forward queue, sync_origin admission ledger).
@@ -779,6 +804,21 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	// Per-contact inbound work-request consent. This stays local/off-consensus,
 	// but every row is bound to one exact peer-RBAC/JOIN generation.
 	s.migrateFederatedPipeContacts(ctx)
+	if err := s.migrateFederatedLinkedMessageConsent(ctx); err != nil {
+		return fmt.Errorf("migrate federated linked-message consent: %w", err)
+	}
+
+	// app-v23 read-only guest links. These are signed node-local capability
+	// snapshots; local group membership remains owned by the consensus layer.
+	if err := s.migrateFederatedGroupGuests(ctx); err != nil {
+		return fmt.Errorf("migrate federated group guests: %w", err)
+	}
+	if err := s.migrateFederatedQueryChallenges(ctx); err != nil {
+		return fmt.Errorf("migrate federated query challenges: %w", err)
+	}
+	if err := s.FederationV23SchemaReady(ctx); err != nil {
+		return fmt.Errorf("verify federation v23 schema: %w", err)
+	}
 
 	// FTS5 full-text search index on memory content.
 	// Used as a fallback when semantic embeddings are unavailable (hash mode).
@@ -1232,7 +1272,7 @@ func (s *SQLiteStore) InsertMemory(ctx context.Context, record *memory.MemoryRec
 
 	// Sync FTS5 index with plaintext content for full-text search.
 	// Skip when vault is active to avoid storing plaintext in a secondary table.
-	if s.vault == nil {
+	if s.vault.Load() == nil {
 		_, _ = s.writeExecContext(ctx, `DELETE FROM memories_fts WHERE memory_id = ?`, record.MemoryID)
 		_, _ = s.writeExecContext(ctx, `INSERT INTO memories_fts(memory_id, content, domain_tag) VALUES (?, ?, ?)`,
 			record.MemoryID, record.Content, record.DomainTag)
@@ -1409,7 +1449,7 @@ func (s *SQLiteStore) MarkMemoryEmbeddingError(ctx context.Context, memoryID str
 // untouched. Memories the old key can't decrypt are left as-is (try another key).
 // Returns how many were (or would be) recovered. Requires the live vault unlocked.
 func (s *SQLiteStore) RekeyUnreadableMemories(ctx context.Context, oldVault *vault.Vault, dryRun bool) (int, error) {
-	if s.vault == nil {
+	if s.vault.Load() == nil {
 		return 0, fmt.Errorf("live vault is locked — unlock before recovering")
 	}
 	// Snapshot the candidate rows first (don't UPDATE while a query is open on the
@@ -1484,7 +1524,8 @@ func (s *SQLiteStore) DeprecateUnreadableMemories(ctx context.Context) (int, err
 func (s *SQLiteStore) GetMemory(ctx context.Context, memoryID string) (*memory.MemoryRecord, error) {
 	row := s.conn.QueryRowContext(ctx,
 		`SELECT memory_id, submitting_agent, content, content_hash, embedding, embedding_hash,
-			memory_type, domain_tag, provider, confidence_score, status, parent_hash, created_at, committed_at, deprecated_at, COALESCE(task_status, '')
+			memory_type, domain_tag, provider, confidence_score, status, parent_hash, created_at, committed_at, deprecated_at,
+			COALESCE(task_status, ''), COALESCE(assignee, '')
 		FROM memories WHERE memory_id = ?`, memoryID)
 
 	var r memory.MemoryRecord
@@ -1494,7 +1535,7 @@ func (s *SQLiteStore) GetMemory(ctx context.Context, memoryID string) (*memory.M
 
 	err := row.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
 		&embData, &r.EmbeddingHash, &mt, &r.DomainTag, &r.Provider, &r.ConfidenceScore,
-		&st, &parentHash, &createdAt, &committedAt, &deprecatedAt, &taskStatus)
+		&st, &parentHash, &createdAt, &committedAt, &deprecatedAt, &taskStatus, &r.Assignee)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("memory not found: %s", memoryID)
@@ -1604,6 +1645,14 @@ func (s *SQLiteStore) QuerySimilar(ctx context.Context, embedding []float32, opt
 		query += " AND memory_id IN (SELECT memory_id FROM memory_tags WHERE tag IN (" +
 			strings.Join(placeholders, ",") + "))"
 	}
+	if opts.CandidateFilter != nil {
+		// SQLite ranks vectors in Go. Read at most one sentinel beyond the
+		// authorization budget so an authenticated app-v23 recall cannot force a
+		// full-corpus decrypt/cosine/policy scan. Refuse the broad query instead
+		// of returning a misleading ranking over an arbitrary prefix.
+		query += " LIMIT ?"
+		args = append(args, CandidateFilterScanBudget+1)
+	}
 
 	rows, err := s.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -1653,6 +1702,9 @@ func (s *SQLiteStore) QuerySimilar(ctx context.Context, embedding []float32, opt
 		// all matching records are returned regardless of similarity score.
 		sim := cosineSimilarity(embedding, r.Embedding)
 		scored = append(scored, scoredRecord{record: &r, similarity: sim})
+		if opts.CandidateFilter != nil && len(scored) > CandidateFilterScanBudget {
+			return nil, ErrCandidateFilterScanBudgetExceeded
+		}
 	}
 
 	sort.Slice(scored, func(i, j int) bool {
@@ -1675,6 +1727,10 @@ func (s *SQLiteStore) QuerySimilar(ctx context.Context, embedding []float32, opt
 		}
 		ordered = applyDecayFloor(ordered, opts.DecayFloor, opts.DecayNow, counts, opts.IncludeDisputed)
 	}
+	ordered, err = applyCandidateFilter(ordered, opts.CandidateFilter)
+	if err != nil {
+		return nil, err
+	}
 
 	// opts.TopK was capped to [1, 100] at function entry, but make an explicit
 	// local guard so CodeQL sees the bound at the allocation site — defence-in-depth
@@ -1693,7 +1749,7 @@ func (s *SQLiteStore) QuerySimilar(ctx context.Context, embedding []float32, opt
 // SearchByText performs full-text search using FTS5 with BM25 ranking.
 // Falls back gracefully when vault is active (encrypted content can't be FTS-indexed).
 func (s *SQLiteStore) SearchByText(ctx context.Context, query string, opts QueryOptions) ([]*memory.MemoryRecord, error) {
-	if s.vault != nil {
+	if s.vault.Load() != nil {
 		return nil, fmt.Errorf("%s", ErrTextSearchVaultEncryptedMsg)
 	}
 	if query == "" {
@@ -1775,64 +1831,119 @@ func (s *SQLiteStore) SearchByText(ctx context.Context, query string, opts Query
 			strings.Join(placeholders, ",") + "))"
 	}
 
-	sqlStr += " ORDER BY rank LIMIT ?"
-	scanLimit := opts.TopK
-	if opts.DecayFloor > 0 {
-		// Over-fetch: the decayed floor can't be a SQL predicate, so pull a bounded
-		// rank-ordered pool and filter it in Go below, before trimming to top_k.
-		scanLimit = decayFilterScanCap
+	orderBy := " ORDER BY rank"
+	if opts.CandidateFilter != nil {
+		// Stable secondary order is required when the trusted app-v23 path walks
+		// multiple ranked pages. The historical one-page query is unchanged.
+		orderBy += ", m.memory_id ASC"
 	}
-	args = append(args, scanLimit)
+	fetchPage := func(limit, offset int) ([]*memory.MemoryRecord, error) {
+		pageArgs := make([]any, len(args), len(args)+2)
+		copy(pageArgs, args)
+		pageArgs = append(pageArgs, limit, offset)
+		rows, queryErr := s.conn.QueryContext(
+			ctx, sqlStr+orderBy+" LIMIT ? OFFSET ?", pageArgs...,
+		)
+		if queryErr != nil {
+			return nil, fmt.Errorf("search by text: %w", queryErr)
+		}
+		defer func() { _ = rows.Close() }()
 
-	rows, err := s.conn.QueryContext(ctx, sqlStr, args...)
-	if err != nil {
-		return nil, fmt.Errorf("search by text: %w", err)
+		page := make([]*memory.MemoryRecord, 0, limit)
+		for rows.Next() {
+			var r memory.MemoryRecord
+			var mt, st, createdAt, taskStatus string
+			var embData []byte
+			var parentHash, committedAt, deprecatedAt *string
+
+			scanErr := rows.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
+				&embData, &mt, &r.DomainTag, &r.Provider, &r.ConfidenceScore,
+				&st, &parentHash, &createdAt, &committedAt, &deprecatedAt, &taskStatus)
+			if scanErr != nil {
+				return nil, fmt.Errorf("scan row: %w", scanErr)
+			}
+
+			r.MemoryType = memory.MemoryType(mt)
+			r.Status = memory.MemoryStatus(st)
+			r.TaskStatus = memory.TaskStatus(taskStatus)
+
+			// Decrypt content if encrypted (shouldn't be in FTS mode, but defensive).
+			if decContent, decErr := s.decryptContent(r.Content); decErr == nil {
+				r.Content = decContent
+			}
+			decEmb, _ := s.decryptEmbedding(embData)
+			r.Embedding = decodeEmbedding(decEmb)
+
+			r.CreatedAt = parseTime(createdAt)
+			r.CommittedAt = parseTimePtr(committedAt)
+			r.DeprecatedAt = parseTimePtr(deprecatedAt)
+			if parentHash != nil {
+				r.ParentHash = *parentHash
+			}
+			page = append(page, &r)
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			return nil, fmt.Errorf("search by text rows: %w", rowsErr)
+		}
+		return page, nil
 	}
-	defer func() { _ = rows.Close() }()
 
-	results := make([]*memory.MemoryRecord, 0)
-	for rows.Next() {
-		var r memory.MemoryRecord
-		var mt, st, createdAt, taskStatus string
-		var embData []byte
-		var parentHash, committedAt, deprecatedAt *string
-
-		scanErr := rows.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
-			&embData, &mt, &r.DomainTag, &r.Provider, &r.ConfidenceScore,
-			&st, &parentHash, &createdAt, &committedAt, &deprecatedAt, &taskStatus)
-		if scanErr != nil {
-			return nil, fmt.Errorf("scan row: %w", scanErr)
+	filterPage := func(page []*memory.MemoryRecord) ([]*memory.MemoryRecord, error) {
+		if opts.DecayFloor > 0 {
+			counts, cErr := s.GetCorroborationCounts(ctx, recordIDs(page))
+			if cErr != nil {
+				return nil, fmt.Errorf("search by text decay floor: %w", cErr)
+			}
+			page = applyDecayFloor(page, opts.DecayFloor, opts.DecayNow, counts, opts.IncludeDisputed)
 		}
-
-		r.MemoryType = memory.MemoryType(mt)
-		r.Status = memory.MemoryStatus(st)
-		r.TaskStatus = memory.TaskStatus(taskStatus)
-
-		// Decrypt content if encrypted (shouldn't be in FTS mode, but defensive).
-		if decContent, decErr := s.decryptContent(r.Content); decErr == nil {
-			r.Content = decContent
-		}
-		decEmb, _ := s.decryptEmbedding(embData)
-		r.Embedding = decodeEmbedding(decEmb)
-
-		r.CreatedAt = parseTime(createdAt)
-		r.CommittedAt = parseTimePtr(committedAt)
-		r.DeprecatedAt = parseTimePtr(deprecatedAt)
-		if parentHash != nil {
-			r.ParentHash = *parentHash
-		}
-
-		results = append(results, &r)
+		return applyCandidateFilter(page, opts.CandidateFilter)
 	}
-	// Decayed-confidence floor (if any) over the over-fetched pool, before trim.
-	if opts.DecayFloor > 0 {
-		counts, cErr := s.GetCorroborationCounts(ctx, recordIDs(results))
-		if cErr != nil {
-			return nil, fmt.Errorf("search by text decay floor: %w", cErr)
+
+	if opts.CandidateFilter == nil {
+		scanLimit := opts.TopK
+		if opts.DecayFloor > 0 {
+			// Preserve the historical bounded decay-only over-fetch.
+			scanLimit = decayFilterScanCap
 		}
-		results = applyDecayFloor(results, opts.DecayFloor, opts.DecayNow, counts, opts.IncludeDisputed)
+		results, fetchErr := fetchPage(scanLimit, 0)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		results, fetchErr = filterPage(results)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
 		if len(results) > opts.TopK {
 			results = results[:opts.TopK]
+		}
+		return results, nil
+	}
+
+	// Authorization-aware app-v23 path: each SQL page and the whole candidate
+	// walk are bounded. A sparse authorized tail must not let one authenticated
+	// request force unbounded SQL + live-policy work.
+	const candidatePageSize = 128
+	results := make([]*memory.MemoryRecord, 0, opts.TopK)
+	for offset := 0; len(results) < opts.TopK; offset += candidatePageSize {
+		if offset >= CandidateFilterScanBudget {
+			return nil, ErrCandidateFilterScanBudgetExceeded
+		}
+		page, fetchErr := fetchPage(candidatePageSize, offset)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		rawCount := len(page)
+		page, fetchErr = filterPage(page)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		remaining := opts.TopK - len(results)
+		if len(page) > remaining {
+			page = page[:remaining]
+		}
+		results = append(results, page...)
+		if rawCount < candidatePageSize {
+			break
 		}
 	}
 	return results, nil
@@ -1854,6 +1965,13 @@ func (s *SQLiteStore) SearchHybrid(ctx context.Context, query string, embedding 
 	if requestedTopK <= 0 {
 		requestedTopK = 10
 	}
+	// RRFMerge and the REST expansion layer both cap fused output at 1,000.
+	// Clamp before multiplying by operator-controlled oversample factors so a
+	// huge pre-v23 top_k cannot wrap int and silently shrink the candidate pool.
+	const maxHybridTopK = 1000
+	if requestedTopK > maxHybridTopK {
+		requestedTopK = maxHybridTopK
+	}
 
 	// When the reranker is active we ask RRF for more candidates than the
 	// caller wants back, so the cross-encoder has a real pool to choose from.
@@ -1873,36 +1991,49 @@ func (s *SQLiteStore) SearchHybrid(ctx context.Context, query string, embedding 
 		if os <= 0 {
 			os = 2
 		}
-		rerankPool = requestedTopK * os
+		if os > maxHybridTopK/requestedTopK {
+			rerankPool = maxHybridTopK
+		} else {
+			rerankPool = requestedTopK * os
+			if rerankPool > maxHybridTopK {
+				rerankPool = maxHybridTopK
+			}
+		}
 	}
 
 	// Each underlying index oversamples so the fusion has enough overlap to
 	// rank fairly when the two lists diverge near the tail.
 	subOpts := opts
-	subOpts.TopK = rerankPool * params.OversampleMul
-	if subOpts.TopK > 100 {
-		subOpts.TopK = 100
+	const maxHybridLeafTopK = 100
+	if params.OversampleMul > maxHybridLeafTopK/rerankPool {
+		subOpts.TopK = maxHybridLeafTopK
+	} else {
+		subOpts.TopK = rerankPool * params.OversampleMul
 	}
 
 	var bm25Results, vectorResults []*memory.MemoryRecord
-	if query != "" && s.vault == nil {
+	vaultActive := s.vault.Load() != nil
+	if query != "" && !vaultActive {
 		r, err := s.SearchByText(ctx, query, subOpts)
 		if err != nil {
-			// Under a decayed floor a leaf error is fail-closed (e.g. corroboration
-			// counts unavailable) — propagate rather than degrade to a partial,
-			// floor-unenforced recall. Without a floor, BM25 failure is best-effort
-			// and vector results alone still produce a recall.
-			if subOpts.DecayFloor > 0 {
+			// Under a decayed floor or live authorization hook a leaf error is
+			// fail-closed. Swallowing it could turn an exhausted authorization
+			// budget or unavailable policy state into a misleading partial 200.
+			// The same applies when BM25 is the only requested leaf: there is no
+			// successful vector result to degrade to.
+			if subOpts.DecayFloor > 0 || subOpts.CandidateFilter != nil || len(embedding) == 0 {
 				return nil, err
 			}
 		} else {
 			bm25Results = r
 		}
+	} else if query != "" && len(embedding) == 0 {
+		return nil, fmt.Errorf("%s", ErrTextSearchVaultEncryptedMsg)
 	}
 
 	if len(embedding) > 0 {
 		r, err := s.QuerySimilar(ctx, embedding, subOpts)
-		if err != nil && (subOpts.DecayFloor > 0 || len(bm25Results) == 0) {
+		if err != nil && (subOpts.DecayFloor > 0 || subOpts.CandidateFilter != nil || len(bm25Results) == 0) {
 			return nil, err
 		}
 		vectorResults = r
@@ -2051,7 +2182,7 @@ func (s *SQLiteStore) InsertVote(ctx context.Context, vote *ValidationVote) erro
 func (s *SQLiteStore) GetVotes(ctx context.Context, memoryID string) ([]*ValidationVote, error) {
 	rows, err := s.conn.QueryContext(ctx,
 		`SELECT id, memory_id, validator_id, decision, rationale, weight_at_vote, block_height, created_at
-		FROM validation_votes WHERE memory_id = ? ORDER BY created_at`, memoryID)
+		FROM validation_votes WHERE memory_id = ? ORDER BY created_at, id`, memoryID)
 	if err != nil {
 		return nil, fmt.Errorf("get votes: %w", err)
 	}
@@ -2318,6 +2449,51 @@ func (s *SQLiteStore) GetPendingByDomain(ctx context.Context, domainTag string, 
 	return results, nil
 }
 
+// GetPendingByDomainPage is the stable, additive paging form used by app-v23
+// disclosure-aware REST reads. GetPendingByDomain retains its historical SQL
+// and ordering for pre-v23 callers.
+func (s *SQLiteStore) GetPendingByDomainPage(
+	ctx context.Context,
+	domainTag string,
+	limit, offset int,
+) ([]*memory.MemoryRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT memory_id, submitting_agent, content, content_hash,
+			memory_type, domain_tag, confidence_score, status, created_at
+		FROM memories WHERE status = 'proposed' AND domain_tag LIKE ?
+		ORDER BY created_at ASC, memory_id ASC LIMIT ? OFFSET ?`,
+		domainTag, limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get pending page: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	results := make([]*memory.MemoryRecord, 0, limit)
+	for rows.Next() {
+		var r memory.MemoryRecord
+		var mt, st, createdAt string
+		if scanErr := rows.Scan(&r.MemoryID, &r.SubmittingAgent, &r.Content, &r.ContentHash,
+			&mt, &r.DomainTag, &r.ConfidenceScore, &st, &createdAt); scanErr != nil {
+			return nil, fmt.Errorf("scan pending page: %w", scanErr)
+		}
+		r.MemoryType = memory.MemoryType(mt)
+		r.Status = memory.MemoryStatus(st)
+		r.CreatedAt = parseTime(createdAt)
+		results = append(results, &r)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("get pending page rows: %w", rowsErr)
+	}
+	return results, nil
+}
+
 // OldestProposedCreatedAt returns MIN(created_at) over status='proposed'
 // memories — the voter-observability probe behind
 // sage_proposed_oldest_age_seconds. ok=false (zero time) when nothing is
@@ -2442,6 +2618,9 @@ func (s *SQLiteStore) ListMemories(ctx context.Context, opts ListOptions) ([]*me
 		query += " ORDER BY confidence_score DESC"
 	default:
 		query += " ORDER BY created_at DESC"
+	}
+	if opts.StablePaging {
+		query += ", memory_id ASC"
 	}
 
 	query += " LIMIT ? OFFSET ?"
@@ -2596,6 +2775,27 @@ func (s *SQLiteStore) GetTimeline(ctx context.Context, from, to time.Time, domai
 	return s.getTimeline(ctx, from, to, domain, bucket, nil)
 }
 
+func (s *SQLiteStore) FormatTimelinePeriod(at time.Time, bucket string) string {
+	at = at.UTC()
+	switch bucket {
+	case "hour":
+		return at.Truncate(time.Hour).Format("2006-01-02T15:00:00Z")
+	case "week":
+		yearStart := time.Date(at.Year(), time.January, 1, 0, 0, 0, 0, time.UTC)
+		firstMondayOffset := (8 - int(yearStart.Weekday())) % 7
+		yearDay := at.YearDay() - 1
+		week := 0
+		if yearDay >= firstMondayOffset {
+			week = ((yearDay - firstMondayOffset) / 7) + 1
+		}
+		return fmt.Sprintf("%04d-W%02d", at.Year(), week)
+	case "month":
+		return at.Format("2006-01")
+	default:
+		return at.Format("2006-01-02")
+	}
+}
+
 func (s *SQLiteStore) GetTimelineExcludingDomainPrefixes(
 	ctx context.Context,
 	from, to time.Time,
@@ -2691,7 +2891,7 @@ func (s *SQLiteStore) DeleteMemory(ctx context.Context, memoryID string) error {
 // store/update/deprecate path keeps FTS in sync incrementally, so once the initial
 // backfill completes the gate makes subsequent boots a sub-second no-op.
 func (s *SQLiteStore) BackfillFTS(ctx context.Context) error {
-	if s.vault != nil {
+	if s.vault.Load() != nil {
 		return nil // Can't index encrypted content
 	}
 
@@ -3645,25 +3845,36 @@ func (s *SQLiteStore) updateAgent(ctx context.Context, agent *AgentEntry) error 
 }
 
 func (s *SQLiteStore) RemoveAgent(ctx context.Context, agentID string) error {
-	return s.withAgentContactMutation(func() error {
-		_, err := s.writeExecContext(ctx, `
-			UPDATE network_agents SET status='removed', removed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-			WHERE agent_id=?`, agentID)
-		if err != nil {
-			return fmt.Errorf("remove agent: %w", err)
-		}
-		return nil
+	return s.withLinkedAuthorizationInvalidation(func() error {
+		return s.withAgentContactMutation(func() error {
+			_, err := s.writeExecContext(ctx, `
+				UPDATE network_agents SET status='removed', removed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+				WHERE agent_id=?`, agentID)
+			if err != nil {
+				return fmt.Errorf("remove agent: %w", err)
+			}
+			return nil
+		})
 	})
 }
 
 func (s *SQLiteStore) UpdateAgentStatus(ctx context.Context, agentID, status string) error {
-	return s.withAgentContactMutation(func() error {
-		_, err := s.writeExecContext(ctx, `UPDATE network_agents SET status=? WHERE agent_id=?`, status, agentID)
-		if err != nil {
-			return fmt.Errorf("update agent status: %w", err)
-		}
-		return nil
-	})
+	mutate := func() error {
+		return s.withAgentContactMutation(func() error {
+			_, err := s.writeExecContext(ctx, `
+				UPDATE network_agents
+				SET status=?, removed_at=CASE WHEN ?='active' THEN NULL ELSE removed_at END
+				WHERE agent_id=?`, status, status, agentID)
+			if err != nil {
+				return fmt.Errorf("update agent status: %w", err)
+			}
+			return nil
+		})
+	}
+	if status == "active" {
+		return mutate()
+	}
+	return s.withLinkedAuthorizationInvalidation(mutate)
 }
 
 func (s *SQLiteStore) UpdateAgentLastSeen(ctx context.Context, agentID string, lastSeen time.Time) error {
@@ -3689,10 +3900,12 @@ func (s *SQLiteStore) BackfillFirstSeen(ctx context.Context, agentID string, fir
 func (s *SQLiteStore) RotateAgentKey(ctx context.Context, oldAgentID string) (string, []byte, error) {
 	var newAgentID string
 	var seed []byte
-	err := s.withAgentContactMutation(func() error {
-		var rotateErr error
-		newAgentID, seed, rotateErr = s.rotateAgentKey(ctx, oldAgentID)
-		return rotateErr
+	err := s.withLinkedAuthorizationInvalidation(func() error {
+		return s.withAgentContactMutation(func() error {
+			var rotateErr error
+			newAgentID, seed, rotateErr = s.rotateAgentKey(ctx, oldAgentID)
+			return rotateErr
+		})
 	})
 	return newAgentID, seed, err
 }
@@ -4197,6 +4410,39 @@ func (s *SQLiteStore) LockAgentContactRead() func() {
 	return s.agentContactGate.RUnlock
 }
 
+// SetFederationAuthorizationMutationHook configures the process-local linked
+// delivery publication hook during startup.
+func (s *SQLiteStore) SetFederationAuthorizationMutationHook(
+	hook func(remoteChainID string) func(),
+) {
+	if s != nil {
+		if s.federationAuthorizationMutationHooks == nil {
+			s.federationAuthorizationMutationHooks = &authorizationMutationHookState{}
+		}
+		s.federationAuthorizationMutationHooks.mu.Lock()
+		s.federationAuthorizationMutationHooks.hook = hook
+		s.federationAuthorizationMutationHooks.mu.Unlock()
+	}
+}
+
+func (s *SQLiteStore) beginFederationAuthorizationMutation(
+	remoteChainID string,
+) func() {
+	if s == nil {
+		return func() {}
+	}
+	hook, releaseHookState :=
+		s.federationAuthorizationMutationHooks.acquire()
+	if hook == nil {
+		return releaseHookState
+	}
+	releaseAuthorization := hook(remoteChainID)
+	return func() {
+		releaseAuthorization()
+		releaseHookState()
+	}
+}
+
 func (s *SQLiteStore) withAgentContactMutation(fn func() error) error {
 	// A tx-scoped clone is created only by runInTx. The public RunInTx has
 	// no safe way to acquire another process lock after SQLite's writeMu;
@@ -4213,6 +4459,25 @@ func (s *SQLiteStore) withAgentContactMutation(fn func() error) error {
 	}
 	s.agentContactGate.Lock()
 	defer s.agentContactGate.Unlock()
+	return fn()
+}
+
+func (s *SQLiteStore) withLinkedAuthorizationInvalidation(
+	fn func() error,
+) error {
+	// Every tx clone already owns writeMu, and RunInAgentContactTx additionally
+	// owns agentContactGate.Write. Waiting for a linked-delivery drain from
+	// either callback would invert delivery's order (delivery lease -> writeMu
+	// and contact Read) and can deadlock. These lifecycle invalidators cannot
+	// succeed through an ordinary clone anyway; enter through the base store so
+	// the delivery barrier is published before either SQLite/contact lock.
+	if s != nil && s.db == nil {
+		return errors.New(
+			"linked authorization invalidation is not permitted inside SQLite transaction",
+		)
+	}
+	releaseAuthorization := s.beginFederationAuthorizationMutation("")
+	defer releaseAuthorization()
 	return fn()
 }
 
@@ -4260,11 +4525,13 @@ func (s *SQLiteStore) runInTx(ctx context.Context, contactMutation bool, fn func
 
 	txStore := &SQLiteStore{
 		conn: tx, dbPath: s.dbPath,
-		vault: s.vault, vaultExpected: s.vaultExpected,
 		syncPolicyGate: s.syncPolicyGate, syncOriginGate: s.syncOriginGate,
-		agentContactGate:      s.agentContactGate,
-		agentContactWriteHeld: contactMutation,
+		agentContactGate:                     s.agentContactGate,
+		agentContactWriteHeld:                contactMutation,
+		federationAuthorizationMutationHooks: s.federationAuthorizationMutationHooks,
 	}
+	txStore.vault.Store(s.vault.Load())
+	txStore.vaultExpected.Store(s.vaultExpected.Load())
 	if err := fn(txStore); err != nil {
 		return err
 	}
@@ -4642,6 +4909,65 @@ func (s *SQLiteStore) GetOpenTasks(ctx context.Context, domain string, provider 
 		return nil, err
 	}
 	_ = rows.Close() // release the query before hydrating board-only fields
+	if err := s.populateTaskAssignees(ctx, records); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+// GetOpenTasksPage is the stable, additive paging form used by app-v23 REST.
+// It preserves exact-assignee isolation while allowing disclosure filtering to
+// continue beyond a revoked first 500 rows.
+func (s *SQLiteStore) GetOpenTasksPage(
+	ctx context.Context,
+	domain, provider, assignee string,
+	limit, offset int,
+) ([]*memory.MemoryRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	query := `SELECT memory_id, submitting_agent, content, content_hash, embedding, embedding_hash,
+		memory_type, domain_tag, provider, confidence_score, status, parent_hash, created_at, committed_at, deprecated_at, COALESCE(task_status, '')
+		FROM memories
+		WHERE memory_type = 'task'
+		AND task_status IN ('planned', 'in_progress')
+		AND status NOT IN ('deprecated')`
+	var args []any
+	if domain != "" {
+		query += ` AND domain_tag = ?`
+		args = append(args, domain)
+	}
+	if assignee != "" {
+		query += ` AND assignee = ?`
+		args = append(args, assignee)
+	} else if provider != "" {
+		query += ` AND (provider = ? OR provider = '')`
+		args = append(args, provider)
+	}
+	query += ` ORDER BY created_at DESC, memory_id ASC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	rows, err := s.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get open task page: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	records := make([]*memory.MemoryRecord, 0, limit)
+	for rows.Next() {
+		rec, scanErr := s.scanMemoryRow(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		records = append(records, rec)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, rowsErr
+	}
+	_ = rows.Close()
 	if err := s.populateTaskAssignees(ctx, records); err != nil {
 		return nil, err
 	}
@@ -5343,7 +5669,9 @@ func (s *SQLiteStore) migratePipeline(ctx context.Context) {
 		federation_policy_epoch TEXT NOT NULL DEFAULT '',
 		federation_agreement_id TEXT NOT NULL DEFAULT '',
 		federation_contact_id   TEXT NOT NULL DEFAULT '',
-		federation_contact_revision TEXT NOT NULL DEFAULT ''
+		federation_contact_revision TEXT NOT NULL DEFAULT '',
+		federation_authorization_mode TEXT NOT NULL DEFAULT '',
+		federation_linked_relation BLOB NOT NULL DEFAULT x''
 	)`)
 	var hasClaimedBy int
 	_ = s.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('pipeline_messages') WHERE name='claimed_by'`).Scan(&hasClaimedBy)
@@ -5453,14 +5781,20 @@ func (s *SQLiteStore) InsertPipeline(ctx context.Context, msg *PipelineMessage) 
 
 	// Call the underlying connection directly: standalone stores already hold
 	// writeMu above, while tx-scoped stores are already inside the parent lock.
+	linkedRelation := msg.FederationLinkedRelation
+	if linkedRelation == nil {
+		linkedRelation = []byte{}
+	}
 	_, err = s.conn.ExecContext(ctx,
 		`INSERT INTO pipeline_messages (pipe_id, from_agent, from_provider, to_agent, to_provider, intent, payload, status, created_at, expires_at,
-		 source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision,
+		 federation_authorization_mode, federation_linked_relation)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		msg.PipeID, msg.FromAgent, msg.FromProvider, msg.ToAgent, msg.ToProvider,
 		encryptedIntent, encryptedPayload, msg.Status, formatTime(msg.CreatedAt), formatTime(msg.ExpiresAt),
 		msg.SourceChainID, msg.SourcePipeID, msg.DestinationChainID, msg.FederationPolicyEpoch,
-		msg.FederationAgreementID, msg.FederationContactID, msg.FederationContactRevision)
+		msg.FederationAgreementID, msg.FederationContactID, msg.FederationContactRevision,
+		msg.FederationAuthorizationMode, linkedRelation)
 	return err
 }
 
@@ -5468,7 +5802,8 @@ func (s *SQLiteStore) GetPipeline(ctx context.Context, pipeID string) (*Pipeline
 	row := s.conn.QueryRowContext(ctx,
 		`SELECT pipe_id, from_agent, from_provider, to_agent, to_provider, intent, payload,
 		        COALESCE(result, ''), status, created_at, COALESCE(claimed_by, ''), claimed_at, completed_at, expires_at, COALESCE(journal_id, ''),
-		        source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision
+		        source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision,
+		        federation_authorization_mode, federation_linked_relation
 		 FROM pipeline_messages WHERE pipe_id = ?`, pipeID)
 
 	var m PipelineMessage
@@ -5477,7 +5812,8 @@ func (s *SQLiteStore) GetPipeline(ctx context.Context, pipeID string) (*Pipeline
 	if err := row.Scan(&m.PipeID, &m.FromAgent, &m.FromProvider, &m.ToAgent, &m.ToProvider,
 		&m.Intent, &m.Payload, &m.Result, &m.Status, &createdAt, &m.ClaimedBy, &claimedAt, &completedAt,
 		&expiresAt, &m.JournalID, &m.SourceChainID, &m.SourcePipeID, &m.DestinationChainID,
-		&m.FederationPolicyEpoch, &m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision); err != nil {
+		&m.FederationPolicyEpoch, &m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision,
+		&m.FederationAuthorizationMode, &m.FederationLinkedRelation); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("pipeline message not found: %s", pipeID)
 		}
@@ -5496,7 +5832,8 @@ func (s *SQLiteStore) GetPipeline(ctx context.Context, pipeID string) (*Pipeline
 func (s *SQLiteStore) GetInbox(ctx context.Context, agentID, provider string, limit int) ([]*PipelineMessage, error) {
 	rows, err := s.conn.QueryContext(ctx,
 		`SELECT pipe_id, from_agent, from_provider, to_agent, to_provider, intent, payload, status, created_at, expires_at,
-		        source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision
+		        source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision,
+		        federation_authorization_mode, federation_linked_relation
 		 FROM pipeline_messages
 		 WHERE status = 'pending'
 		   AND destination_chain_id = ''
@@ -5516,7 +5853,8 @@ func (s *SQLiteStore) GetInbox(ctx context.Context, agentID, provider string, li
 		if err := rows.Scan(&m.PipeID, &m.FromAgent, &m.FromProvider, &m.ToAgent, &m.ToProvider,
 			&m.Intent, &m.Payload, &m.Status, &createdAt, &expiresAt, &m.SourceChainID,
 			&m.SourcePipeID, &m.DestinationChainID, &m.FederationPolicyEpoch,
-			&m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision); err != nil {
+			&m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision,
+			&m.FederationAuthorizationMode, &m.FederationLinkedRelation); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = parseTime(createdAt)
@@ -5571,7 +5909,8 @@ func (s *SQLiteStore) GetCompletedForSender(ctx context.Context, agentID string,
 	rows, err := s.conn.QueryContext(ctx,
 		`SELECT pipe_id, from_agent, from_provider, to_agent, to_provider, intent,
 		        COALESCE(result, ''), status, created_at, completed_at, expires_at, COALESCE(journal_id, ''),
-		        source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision
+		        source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision,
+		        federation_authorization_mode, federation_linked_relation
 		 FROM pipeline_messages
 		 WHERE from_agent = ? AND source_chain_id = '' AND status = 'completed'
 		 ORDER BY completed_at DESC LIMIT ?`,
@@ -5589,7 +5928,8 @@ func (s *SQLiteStore) GetCompletedForSender(ctx context.Context, agentID string,
 		if err := rows.Scan(&m.PipeID, &m.FromAgent, &m.FromProvider, &m.ToAgent, &m.ToProvider,
 			&m.Intent, &m.Result, &m.Status, &createdAt, &completedAt, &expiresAt, &m.JournalID,
 			&m.SourceChainID, &m.SourcePipeID, &m.DestinationChainID, &m.FederationPolicyEpoch,
-			&m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision); err != nil {
+			&m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision,
+			&m.FederationAuthorizationMode, &m.FederationLinkedRelation); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = parseTime(createdAt)
@@ -5609,7 +5949,8 @@ func (s *SQLiteStore) ListPipelines(ctx context.Context, status string, limit in
 	}
 	query := `SELECT pipe_id, from_agent, from_provider, to_agent, to_provider, intent, payload,
 		                 COALESCE(result, ''), status, created_at, claimed_at, completed_at, expires_at, COALESCE(journal_id, ''),
-		                 source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision
+		                 source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision,
+		                 federation_authorization_mode, federation_linked_relation
 	          FROM pipeline_messages`
 	var args []any
 	if status != "" {
@@ -5633,7 +5974,8 @@ func (s *SQLiteStore) ListPipelines(ctx context.Context, status string, limit in
 		if err := rows.Scan(&m.PipeID, &m.FromAgent, &m.FromProvider, &m.ToAgent, &m.ToProvider,
 			&m.Intent, &m.Payload, &m.Result, &m.Status, &createdAt, &claimedAt, &completedAt,
 			&expiresAt, &m.JournalID, &m.SourceChainID, &m.SourcePipeID, &m.DestinationChainID,
-			&m.FederationPolicyEpoch, &m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision); err != nil {
+			&m.FederationPolicyEpoch, &m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision,
+			&m.FederationAuthorizationMode, &m.FederationLinkedRelation); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = parseTime(createdAt)

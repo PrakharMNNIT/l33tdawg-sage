@@ -29,6 +29,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/l33tdawg/sage/internal/appv23disclosure"
 	"github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/embedding"
 	"github.com/l33tdawg/sage/internal/memory"
@@ -41,6 +42,10 @@ import (
 // for status=deprecated: deprecated rows are deliberately absent from the FTS
 // index, so an FTS MATCH can never serve that filter.
 var errDeprecatedNoFTS = errors.New("deprecated status uses keyword scan, not FTS")
+
+var errAppV23TaskAuthorizationUnavailable = errors.New(
+	"app-v23 task authorization state is unavailable",
+)
 
 // assetVerRe matches the ?v=NNN cache-busting token on served HTML/JS so the
 // content-hash rewrite survives manual version bumps (a fixed literal rots the
@@ -134,6 +139,11 @@ type DashboardHandler struct {
 
 	// SaveEncryptionConfig persists encryption enabled/disabled state to config.yaml.
 	SaveEncryptionConfig func(enabled bool) error
+	// OnVaultUnlocked opens any process-local transaction admission latch after
+	// the serving projection has received the vault. It must remain
+	// process-local: consensus execution never depends on the operator's local
+	// passphrase or this callback.
+	OnVaultUnlocked func(passphrase string)
 
 	// Redeployer — when set, write endpoints return 503 during active redeployment
 	// and the /redeploy endpoint can trigger chain redeployment.
@@ -253,6 +263,10 @@ type DashboardHandler struct {
 	// AppV22ActiveFn reports whether capability-bearing agent permission
 	// transactions can execute in the next block.
 	AppV22ActiveFn func() bool
+	// AppV23ActiveFn reports whether local enrollment, mutable roles, and
+	// consensus Access Groups can execute in the next block. nil is
+	// fail-closed for every app-v23 dashboard mutation.
+	AppV23ActiveFn func() bool
 	// GovernanceDomainFn returns the committed app-v20 chain authorization
 	// domain. Post-v20 dashboard governance fails closed when it is unavailable.
 	GovernanceDomainFn func() string
@@ -333,6 +347,37 @@ func (h *DashboardHandler) resolveAgentRBAC(r *http.Request) ([]string, bool) {
 	if agentID == "" || h.BadgerStore == nil {
 		return nil, true // Human dashboard — no filtering
 	}
+	if h.appV23IsActive() {
+		root, err := h.BadgerStore.GetAppV23Root()
+		if err != nil || root == nil {
+			return []string{agentID}, false
+		}
+		policyID := agentID
+		if agentID == root.CredentialID {
+			policyID = root.PrincipalID
+		} else {
+			wasRoot, markerErr := h.BadgerStore.IsAppV23RootCredential(agentID)
+			if markerErr != nil || wasRoot {
+				return []string{agentID}, false
+			}
+		}
+		enrollment, err := h.BadgerStore.GetAppV23Enrollment(policyID)
+		if err != nil || enrollment == nil || !enrollment.Active {
+			return []string{agentID}, false
+		}
+		role, err := h.BadgerStore.GetAppV23Role(policyID)
+		if err != nil || role == nil ||
+			store.ValidateAppV23Policy(
+				role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+			) != nil ||
+			(policyID != root.PrincipalID && role.Role == store.AppV23RoleAdmin &&
+				enrollment.RootGeneration != root.Generation) {
+			return []string{agentID}, false
+		}
+		// App-v23 visibility is domain-derived. Do not pre-filter by submitter:
+		// every record is still checked by agentDomainReadDecision.
+		return nil, true
+	}
 
 	agent, err := h.BadgerStore.GetRegisteredAgent(agentID)
 	if err == nil && agent != nil {
@@ -396,6 +441,22 @@ func (h *DashboardHandler) startPostUnlockRepairs() {
 		}
 		_, _ = h.StartEmbeddingRepairIfNeeded(ctx)
 	})
+}
+
+// publishUnlockedVault preserves the safety ordering for locked personal-node
+// startup: first publish the vault to the projection store, then open the
+// process-local CheckTx latch, and only then report the dashboard as unlocked.
+func (h *DashboardHandler) publishUnlockedVault(v *vault.Vault, passphrase string) error {
+	vs, ok := h.store.(VaultStore)
+	if !ok {
+		return errors.New("serving projection does not support vault publication")
+	}
+	vs.SetVault(v)
+	if h.OnVaultUnlocked != nil {
+		h.OnVaultUnlocked(passphrase)
+	}
+	h.VaultLocked.Store(false)
+	return nil
 }
 
 // handlePreValidate runs the per-node validation checks (dedup, quality,
@@ -465,20 +526,48 @@ func verifiedDashboardAgentID(ctx context.Context) string {
 	return agentID
 }
 
+// isLoopbackCEREBRUMRequest is the network boundary for the human CEREBRUM
+// control plane. Check both the connected peer and Host: the peer blocks LAN
+// management while Host blocks DNS-rebinding and misleading forwarded hosts.
+func isLoopbackCEREBRUMRequest(r *http.Request) bool {
+	if r == nil || !isLoopbackRemote(r.RemoteAddr) || !hostIsLoopback(r.Host) {
+		return false
+	}
+	// Forwarding metadata is deny-only corroboration. A remote browser reaching
+	// SAGE through a loopback reverse-proxy socket must not become CEREBRUM just
+	// because that proxy rewrote Host to localhost. Conversely, no forwarded
+	// header can ever turn a non-loopback socket/Host into a local request.
+	return forwardedIPListIsLoopback(r.Header.Values("X-Forwarded-For")) &&
+		forwardedIPListIsLoopback(r.Header.Values("X-Real-IP")) &&
+		forwardedHostListIsLoopback(r.Header.Values("X-Forwarded-Host")) &&
+		rfcForwardedIsLoopback(r.Header.Values("Forwarded"))
+}
+
 // isCEREBRUMOperatorRequest distinguishes the dashboard operator from an
 // ordinary signed agent or an unauthenticated local process. Routing headers,
 // loopback source addresses, Origin, and Fetch Metadata are not identity.
 // Authority is either:
 //   - the exact configured node-operator identity on a cryptographically
-//     verified request (usable from any route), or
+//     verified request received through the local CEREBRUM control plane, or
 //   - a real encrypted-dashboard session that also passes the local/browser
 //     CSRF and anti-rebinding checks.
 //
-// Encryption-off nodes have no browser session authority: privileged
-// CEREBRUM controls require the exact node-operator signature. Read-only
-// CEREBRUM views and the vault-enablement bootstrap have narrower compatibility
-// paths below so an upgrade cannot strand an existing local installation.
+// An encryption-off personal node has no password-backed session to present.
+// Its same-machine, same-origin loopback SPA is therefore the local operator
+// surface by product contract. This is deliberately narrower than "localhost":
+// unsigned CLI-style requests, LAN callers, cross-origin tabs, rebinding hosts,
+// and any request carrying an unrelated agent identity remain non-operators.
+// Once encryption is enabled, the browser must instead present a valid vault
+// session. Exact node-operator signatures remain valid in either mode, but
+// copying that key to another machine never makes CEREBRUM network-manageable.
 func (h *DashboardHandler) isCEREBRUMOperatorRequest(r *http.Request) bool {
+	if !isLoopbackCEREBRUMRequest(r) || !isLocalRequest(r) {
+		return false
+	}
+	if h.appV23IsActive() {
+		actor, _, _ := h.appV23ResolveControlActor(r)
+		return actor != nil
+	}
 	operatorID := strings.TrimSpace(h.NodeOperatorAgentID)
 	if verifiedAgentID := verifiedDashboardAgentID(r.Context()); verifiedAgentID != "" {
 		return operatorID != "" && verifiedAgentID == operatorID
@@ -487,15 +576,22 @@ func (h *DashboardHandler) isCEREBRUMOperatorRequest(r *http.Request) bool {
 		return operatorID != "" && headerAgentID == operatorID && h.validAgentSignature(r)
 	}
 
-	if !h.Encrypted.Load() || !isLocalRequest(r) {
-		return false
+	if !h.Encrypted.Load() {
+		return isLoopbackCEREBRUMBrowserRequest(r)
 	}
 	secFetch := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if secFetch == "" && origin == "" {
-		if !isLoopbackRemote(r.RemoteAddr) || !hostIsLoopbackOrIP(r.Host) {
+	switch secFetch {
+	case "same-origin", "none":
+		if origin != "" && !originMatchesRequest(r, origin) {
 			return false
 		}
+	case "":
+		if origin != "" && !originMatchesRequest(r, origin) {
+			return false
+		}
+	default:
+		return false
 	}
 	cookie, err := r.Cookie(sessionCookieName)
 	return err == nil && h.validSession(cookie.Value)
@@ -523,9 +619,9 @@ func isLoopbackCEREBRUMBrowserRequest(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	switch secFetch {
 	case "same-origin", "none":
-		return origin == "" || originIsLocal(origin)
+		return origin == "" || originMatchesRequest(r, origin)
 	case "":
-		return origin != "" && originIsLocal(origin)
+		return origin != "" && originMatchesRequest(r, origin)
 	default:
 		return false
 	}
@@ -547,7 +643,70 @@ func hostIsLoopback(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-const cerebrumOperatorAuthorityHint = "Open CEREBRUM on this machine, unlock its encrypted vault, or use a request signed by the exact node-operator identity."
+func forwardedIPListIsLoopback(values []string) bool {
+	for _, value := range values {
+		for _, entry := range strings.Split(value, ",") {
+			entry = strings.Trim(strings.TrimSpace(entry), `"`)
+			if entry == "" || !forwardedAddressIsLoopback(entry) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func forwardedHostListIsLoopback(values []string) bool {
+	for _, value := range values {
+		for _, entry := range strings.Split(value, ",") {
+			if !hostIsLoopback(strings.Trim(strings.TrimSpace(entry), `"`)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func forwardedAddressIsLoopback(raw string) bool {
+	value := strings.Trim(strings.TrimSpace(raw), `"`)
+	if value == "" || strings.EqualFold(value, "unknown") || strings.HasPrefix(value, "_") {
+		return false
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	value = strings.TrimPrefix(strings.TrimSuffix(value, "]"), "[")
+	if strings.EqualFold(value, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(value)
+	return ip != nil && ip.IsLoopback()
+}
+
+func rfcForwardedIsLoopback(values []string) bool {
+	for _, value := range values {
+		for _, element := range strings.Split(value, ",") {
+			for _, parameter := range strings.Split(element, ";") {
+				name, raw, found := strings.Cut(strings.TrimSpace(parameter), "=")
+				if !found {
+					return false
+				}
+				switch strings.ToLower(strings.TrimSpace(name)) {
+				case "for":
+					if !forwardedAddressIsLoopback(raw) {
+						return false
+					}
+				case "host":
+					if !hostIsLoopback(strings.Trim(strings.TrimSpace(raw), `"`)) {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+const cerebrumOperatorAuthorityHint = "Open CEREBRUM through localhost on this machine, unlock its encrypted vault when configured, or use the exact local node-operator identity."
 
 func writeCEREBRUMOperatorForbidden(w http.ResponseWriter, action string) {
 	writeError(w, http.StatusForbidden, action+" "+cerebrumOperatorAuthorityHint)
@@ -628,6 +787,248 @@ func (h *DashboardHandler) cerebrumOperatorGate(next http.Handler) http.Handler 
 	})
 }
 
+// isRemoteSignedAgentDashboardRoute is the exhaustive compatibility list for
+// signed agent APIs that historically live under the dashboard router. Keep
+// this narrow: adding a human CEREBRUM GET must not silently make it remotely
+// readable by every signed agent.
+func isRemoteSignedAgentDashboardRoute(r *http.Request) bool {
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	switch {
+	case r.Method == http.MethodGet && path == "/v1/dashboard/tasks":
+		return true
+	case r.Method == http.MethodGet && path == "/v1/dashboard/task-notifications":
+		return true
+	case r.Method == http.MethodGet && path == "/v1/dashboard/settings/boot-instructions":
+		return true
+	case r.Method == http.MethodGet && path == "/v1/dashboard/stats":
+		return true
+	case r.Method == http.MethodGet && path == "/v1/dashboard/settings/recall":
+		return true
+	case r.Method == http.MethodGet && path == "/v1/dashboard/settings/memory-mode":
+		return true
+	case r.Method == http.MethodGet && path == "/v1/dashboard/governance/proposals":
+		return true
+	case r.Method == http.MethodGet &&
+		strings.HasPrefix(path, "/v1/dashboard/governance/proposals/") &&
+		strings.TrimPrefix(path, "/v1/dashboard/governance/proposals/") != "":
+		return true
+	case r.Method == http.MethodPost && path == "/v1/memory/pre-validate":
+		return true
+	case r.Method == http.MethodPut:
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		return len(parts) == 5 &&
+			parts[0] == "v1" &&
+			parts[1] == "dashboard" &&
+			parts[2] == "tasks" &&
+			parts[3] != "" &&
+			parts[4] == "status"
+	default:
+		return false
+	}
+}
+
+func (h *DashboardHandler) isActiveRegisteredDashboardAgent(ctx context.Context, agentID string) bool {
+	agentStore, ok := h.store.(store.AgentStore)
+	if !ok || strings.TrimSpace(agentID) == "" {
+		return false
+	}
+	agent, err := agentStore.GetAgent(ctx, agentID)
+	if err != nil || agent == nil || agent.Status != "active" || agent.RemovedAt != nil {
+		return false
+	}
+	if !h.appV23IsActive() {
+		return true
+	}
+	if h.BadgerStore == nil {
+		return false
+	}
+	root, err := h.BadgerStore.GetAppV23Root()
+	if err != nil || root == nil {
+		return false
+	}
+	wasRoot, err := h.BadgerStore.IsAppV23RootCredential(agentID)
+	if err != nil || wasRoot ||
+		agentID == root.PrincipalID || agentID == root.CredentialID {
+		return false
+	}
+	enrollment, err := h.BadgerStore.GetAppV23Enrollment(agentID)
+	if err != nil || enrollment == nil || !enrollment.Active ||
+		enrollment.AgentID != agentID ||
+		enrollment.Profile == store.AppV23ProfileRoot {
+		return false
+	}
+	role, err := h.BadgerStore.GetAppV23Role(agentID)
+	if err != nil || role == nil || role.AgentID != agentID {
+		return false
+	}
+	// Promotion does not erase an agent's ordinary task/notification identity.
+	// A current-generation Admin may therefore use the narrow agent-facing
+	// compatibility routes, while every stale Admin remains suspended. Admin
+	// control-plane mutations still pass the separate localhost/elevation gates.
+	switch role.Role {
+	case store.AppV23RoleMember, store.AppV23RoleManager:
+	case store.AppV23RoleAdmin:
+		if enrollment.RootGeneration != root.Generation {
+			return false
+		}
+	default:
+		return false
+	}
+	return store.ValidateAppV23Policy(
+		role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+	) == nil
+}
+
+// isEligibleRemoteSignedDashboardAgent narrows the legacy dashboard API
+// compatibility surface to ordinary agents. Admin remains a same-machine
+// control-plane role under app-v23; it must never become a network-manageable
+// agent identity merely because an old agent API lives under /v1/dashboard.
+func (h *DashboardHandler) isEligibleRemoteSignedDashboardAgent(
+	ctx context.Context,
+	agentID string,
+) bool {
+	if !h.isActiveRegisteredDashboardAgent(ctx, agentID) {
+		return false
+	}
+	if !h.appV23IsActive() {
+		return true
+	}
+	role, err := h.BadgerStore.GetAppV23Role(agentID)
+	if err != nil || role == nil || role.AgentID != agentID {
+		return false
+	}
+	return role.Role == store.AppV23RoleMember ||
+		role.Role == store.AppV23RoleManager
+}
+
+// isAgentOnlyDashboardRoute identifies compatibility routes whose semantics
+// are exclusively an ordinary agent acting for itself. Even a current local
+// Root must not enter these handlers as an "agent"; a promoted Admin retains
+// its ordinary agent identity only while its approval matches the current Root
+// generation. The mixed task list remains a separate human CEREBRUM view.
+func isAgentOnlyDashboardRoute(r *http.Request) bool {
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	if r.Method == http.MethodGet &&
+		path == "/v1/dashboard/task-notifications" {
+		return true
+	}
+	if r.Method != http.MethodPut {
+		return false
+	}
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	return len(parts) == 5 &&
+		parts[0] == "v1" &&
+		parts[1] == "dashboard" &&
+		parts[2] == "tasks" &&
+		parts[3] != "" &&
+		parts[4] == "status"
+}
+
+// cerebrumBrowserLocalityGate keeps the human/session dashboard control plane
+// on this machine without breaking the exact signed agent endpoints above.
+// Those requests still face their route-specific authorization checks; every
+// other protected route is hidden unless both peer and Host are loopback.
+func (h *DashboardHandler) cerebrumBrowserLocalityGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		agentID := verifiedDashboardAgentID(r.Context())
+		if isLoopbackCEREBRUMRequest(r) {
+			hasBrowserMetadata := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")) != "" ||
+				strings.TrimSpace(r.Header.Get("Origin")) != ""
+			if agentID == "" &&
+				(!h.Encrypted.Load() || hasBrowserMetadata) &&
+				!isLoopbackCEREBRUMBrowserRequest(r) {
+				writeCEREBRUMOperatorForbidden(w,
+					"Browser access to protected CEREBRUM resources requires the same-origin localhost dashboard.")
+				return
+			}
+			// Signed callers on human-only routes remain agents unless they are
+			// the exact local Root/Admin/operator. An arbitrary local signature
+			// must not bypass an encrypted vault session or gain CEREBRUM reads.
+			if agentID != "" {
+				// Task-status is a mixed route: Member/Manager callers act only
+				// for their exact assignment, while current Root/Admin may act
+				// as the localhost CEREBRUM operator. Resolve operator authority
+				// before the ordinary-agent exclusion so Root is never
+				// reinterpreted as an agent and a promoted Admin does not lose
+				// its sudo-equivalent task-board authority.
+				if h.appV23IsActive() &&
+					r.Method == http.MethodPut &&
+					isAgentOwnedDashboardMutation(r) &&
+					h.isCEREBRUMOperatorRequest(r) {
+					next.ServeHTTP(w, r)
+					return
+				}
+				if h.appV23IsActive() && isAgentOnlyDashboardRoute(r) &&
+					!h.isActiveRegisteredDashboardAgent(r.Context(), agentID) {
+					writeError(w, http.StatusForbidden,
+						"active current-generation agent identity required")
+					return
+				}
+				if h.isCEREBRUMOperatorRequest(r) {
+					next.ServeHTTP(w, r)
+					return
+				}
+				if isRemoteSignedAgentDashboardRoute(r) {
+					if !h.isEligibleRemoteSignedDashboardAgent(r.Context(), agentID) {
+						writeError(w, http.StatusForbidden, "active ordinary agent identity required")
+						return
+					}
+					next.ServeHTTP(w, r)
+					return
+				}
+				writeCEREBRUMOperatorForbidden(w, "This CEREBRUM resource requires operator authority.")
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		if agentID != "" && isRemoteSignedAgentDashboardRoute(r) {
+			if !h.isEligibleRemoteSignedDashboardAgent(r.Context(), agentID) {
+				writeError(w, http.StatusForbidden, "active ordinary agent identity required")
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
+}
+
+// cerebrumLoopbackOnly hides human CEREBRUM entry points from the network.
+// Pairing, claim redemption, health, and dedicated agent/federation APIs are
+// registered separately and deliberately do not use this middleware.
+func cerebrumLoopbackOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackCEREBRUMRequest(r) ||
+			!isAllowedCEREBRUMEntryRequest(r) {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isAllowedCEREBRUMEntryRequest keeps the unauthenticated login/recovery and UI
+// entry routes usable by native launchers while rejecting browser requests
+// whose Fetch Metadata says they came from another site. Browser GETs commonly
+// omit Origin, so an absent Origin is accepted only with same-origin/none Fetch
+// Metadata; when Origin is present it must name an exact loopback host.
+func isAllowedCEREBRUMEntryRequest(r *http.Request) bool {
+	secFetch := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if secFetch == "" && origin == "" {
+		return true
+	}
+	switch secFetch {
+	case "same-origin", "none":
+		return origin == "" || originMatchesRequest(r, origin)
+	case "":
+		return originMatchesRequest(r, origin)
+	default:
+		return false
+	}
+}
+
 // bootInstructionsReadGate preserves sage_inception for real agents without
 // exposing the operator's custom boot context to any process that can merely
 // reach localhost or mint an unrelated Ed25519 key. CEREBRUM operator authority
@@ -640,13 +1041,7 @@ func (h *DashboardHandler) bootInstructionsReadGate(next http.Handler) http.Hand
 			return
 		}
 		agentID := verifiedDashboardAgentID(r.Context())
-		agentStore, ok := h.store.(store.AgentStore)
-		if agentID == "" || !ok {
-			writeError(w, http.StatusForbidden, "boot instructions require an active registered agent or CEREBRUM operator")
-			return
-		}
-		agent, err := agentStore.GetAgent(r.Context(), agentID)
-		if err != nil || agent == nil || agent.Status != "active" || agent.RemovedAt != nil {
+		if !h.isActiveRegisteredDashboardAgent(r.Context(), agentID) {
 			writeError(w, http.StatusForbidden, "boot instructions require an active registered agent or CEREBRUM operator")
 			return
 		}
@@ -672,9 +1067,9 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 		r.Use(securityHeaders)
 
 		// Auth endpoints — always available (login page needs to load without auth).
-		r.Post("/v1/dashboard/auth/login", h.handleLogin)
-		r.Post("/v1/dashboard/auth/lock", h.handleLock)
-		r.Get("/v1/dashboard/auth/check", h.handleAuthCheck)
+		r.With(cerebrumLoopbackOnly).Post("/v1/dashboard/auth/login", h.handleLogin)
+		r.With(cerebrumLoopbackOnly).Post("/v1/dashboard/auth/lock", h.handleLock)
+		r.With(cerebrumLoopbackOnly).Get("/v1/dashboard/auth/check", h.handleAuthCheck)
 
 		// Health is public (needed by CLI status command).
 		r.Get("/v1/dashboard/health", h.handleHealth)
@@ -691,11 +1086,12 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 		h.RegisterAgentClaimRoute(r)
 
 		// Recovery — unauthenticated (the recovery key IS the auth).
-		r.Post("/v1/dashboard/settings/ledger/recover", h.handleRecoverLedger)
+		r.With(cerebrumLoopbackOnly).Post("/v1/dashboard/settings/ledger/recover", h.handleRecoverLedger)
 
 		// Protected routes — auth middleware checks dynamically whether encryption is active.
 		r.Group(func(r chi.Router) {
 			r.Use(h.authMiddleware)
+			r.Use(h.cerebrumBrowserLocalityGate)
 			r.Use(h.dashboardOperatorMutationGate)
 			// Redeploy guard — returns 503 for write endpoints during active redeployment.
 			r.Use(redeployGuard(h.Redeployer))
@@ -839,18 +1235,14 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 
 		// Launch endpoint — redirects to CEREBRUM dashboard.
 		// The dock/tray app opens this URL; simple redirect avoids popup-blocker issues on macOS Tahoe+.
-		r.Get("/ui/launch", func(w http.ResponseWriter, r *http.Request) {
+		r.With(cerebrumLoopbackOnly).Get("/ui/launch", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/ui/", http.StatusFound)
 		})
 		// Browser-independent dashboard presence for the native macOS launcher.
 		// Firefox has no useful AppleScript tab API, so the tray checks whether an
 		// authenticated CEREBRUM tab already owns an SSE stream before deciding to
 		// open another URL. This endpoint exposes only an aggregate local UI count.
-		r.Get("/ui/presence", func(w http.ResponseWriter, r *http.Request) {
-			if !isLoopbackRemote(r.RemoteAddr) {
-				http.NotFound(w, r)
-				return
-			}
+		r.With(cerebrumLoopbackOnly).Get("/ui/presence", func(w http.ResponseWriter, r *http.Request) {
 			clients := 0
 			if h.SSE != nil {
 				clients = h.SSE.ClientCount()
@@ -899,7 +1291,7 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			return hex.EncodeToString(h.Sum(nil))[:12]
 		}()
 
-		r.Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
+		r.With(cerebrumLoopbackOnly).Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
 			// Strip /ui prefix
 			path := strings.TrimPrefix(r.URL.Path, "/ui")
 			if path == "" || path == "/" {
@@ -960,7 +1352,7 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			w.Write(f) //nolint:errcheck,gosec // static embedded file, not user input
 		})
 
-		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		r.With(cerebrumLoopbackOnly).Get("/", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/ui/", http.StatusFound)
 		})
 	}) // end securityHeaders group
@@ -971,11 +1363,10 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 // Encryption ON — require either a valid session cookie or a fresh Ed25519
 // signature.
 //
-// Encryption OFF — admit the same-origin/no-Origin SPA and CLI to ordinary
-// routes, or a fresh Ed25519 signature. Privileged mutation handlers add the
-// stricter isCEREBRUMOperatorRequest gate: an unsigned local request can read
-// the dashboard but cannot become the operator merely by forging routing or
-// browser headers.
+// Encryption OFF — admit the same-origin/no-Origin SPA and CLI to the protected
+// group, or a fresh Ed25519 signature. The locality and per-route gates then
+// distinguish the human localhost CEREBRUM surface from signed agent APIs and
+// reject unsigned LAN/dashboard access.
 func (h *DashboardHandler) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// An agent identity is usable only when this exact request verifies. Check
@@ -1047,13 +1438,13 @@ func isLocalRequest(r *http.Request) bool {
 	case "cross-site":
 		return false
 	case "same-origin", "same-site", "none":
-		return true
+		return origin == "" || originMatchesRequest(r, origin)
 	}
 	if origin == "" {
 		// No Origin header: same-origin GET, or non-browser caller.
 		return true
 	}
-	return originIsLocal(origin)
+	return originMatchesRequest(r, origin)
 }
 
 // hostIsLoopbackOrIP reports whether the request Host header is "localhost" or
@@ -1074,16 +1465,68 @@ func hostIsLoopbackOrIP(host string) bool {
 	return net.ParseIP(host) != nil
 }
 
-// originIsLocal parses an Origin header and checks its hostname is EXACTLY a
-// loopback name/address - not a prefix match, so http://localhost.evil.com and
-// http://127.0.0.1.evil.com are correctly rejected.
-func originIsLocal(origin string) bool {
+// originMatchesRequest compares the complete browser origin tuple with the
+// request target. Fetch Metadata is useful when Origin is absent, but it must
+// never override a supplied Origin whose scheme, host, or effective port
+// differs. Host names remain distinct: localhost is not interchangeable with
+// 127.0.0.1, even though both resolve to loopback.
+func originMatchesRequest(r *http.Request, origin string) bool {
 	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
+	if err != nil ||
+		(u.Scheme != "http" && u.Scheme != "https") ||
+		u.Host == "" ||
+		u.User != nil ||
+		u.Opaque != "" ||
+		u.Path != "" ||
+		u.RawQuery != "" ||
+		u.Fragment != "" {
 		return false
 	}
-	host := u.Hostname() // strips port and [] brackets
-	return strings.EqualFold(host, "localhost") || host == "127.0.0.1" || host == "::1"
+	requestScheme := "http"
+	if r.TLS != nil {
+		requestScheme = "https"
+	}
+	if u.Scheme != requestScheme {
+		return false
+	}
+	originHost, originPort, ok := normalizedOriginAuthority(u.Scheme, u.Host)
+	if !ok {
+		return false
+	}
+	requestHost, requestPort, ok := normalizedOriginAuthority(requestScheme, r.Host)
+	return ok && originHost == requestHost && originPort == requestPort
+}
+
+func normalizedOriginAuthority(scheme, authority string) (string, string, bool) {
+	u, err := url.Parse(scheme + "://" + strings.TrimSpace(authority))
+	if err != nil || u.Host == "" || u.User != nil ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", "", false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return "", "", false
+		}
+	}
+	if parsedPort, err := strconv.ParseUint(port, 10, 16); err != nil || parsedPort == 0 {
+		return "", "", false
+	} else {
+		port = strconv.FormatUint(parsedPort, 10)
+	}
+	return host, port, true
 }
 
 // wizardSecurityGate is a defence-in-depth layer specifically for the
@@ -1236,10 +1679,11 @@ func (h *DashboardHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Unlock the vault store so new writes are encrypted.
 	// This handles the case where the server started without a passphrase
 	// (e.g. launched from app icon) and the user unlocks via the web UI.
-	if vs, ok := h.store.(VaultStore); ok {
-		vs.SetVault(v)
+	if err := h.publishUnlockedVault(v, req.Passphrase); err != nil {
+		writeError(w, http.StatusInternalServerError,
+			"the encrypted serving projection could not be unlocked")
+		return
 	}
-	h.VaultLocked.Store(false)
 	// A transient MCP embed failure may have preserved observations without
 	// vectors while the vault was locked. Repair them now that plaintext is
 	// available instead of leaving a manual setup banner behind.
@@ -1450,6 +1894,14 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		if opts.Tag != "" {
 			qopts.Tags = []string{opts.Tag} // honor the tag filter on the FTS path too (the fallback already did)
 		}
+		if h.appV23IsActive() {
+			qopts.CandidateFilter = func(record *memory.MemoryRecord) (bool, error) {
+				if err := h.validateAppV23DashboardRecord(record); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+		}
 		var ftsRecs []*memory.MemoryRecord
 		var ferr error
 		if opts.Status == "deprecated" {
@@ -1462,7 +1914,17 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		} else {
 			ftsRecs, ferr = h.store.SearchByText(r.Context(), qStr, qopts)
 		}
+		if ferr != nil && writeAppV23DashboardProjectionFailure(w, ferr) {
+			return
+		}
 		if ferr == nil {
+			if projectionErr := h.validateAppV23DashboardRecords(ftsRecs); projectionErr != nil {
+				if writeAppV23DashboardProjectionFailure(w, projectionErr) {
+					return
+				}
+				writeError(w, http.StatusInternalServerError, projectionErr.Error())
+				return
+			}
 			records, total = ftsRecs, len(ftsRecs)
 		} else {
 			pool, _, perr := h.store.ListMemories(r.Context(), cerebrumListOptions(store.ListOptions{
@@ -1474,6 +1936,13 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 			}))
 			if perr != nil {
 				writeError(w, http.StatusInternalServerError, perr.Error())
+				return
+			}
+			if projectionErr := h.validateAppV23DashboardRecords(pool); projectionErr != nil {
+				if writeAppV23DashboardProjectionFailure(w, projectionErr) {
+					return
+				}
+				writeError(w, http.StatusInternalServerError, projectionErr.Error())
 				return
 			}
 			needle := strings.ToLower(qStr)
@@ -1489,8 +1958,15 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		}
 	} else {
 		var lerr error
-		records, total, lerr = h.store.ListMemories(r.Context(), opts)
+		if h.appV23IsActive() {
+			records, total, lerr = h.appV23CanonicalDashboardPage(r.Context(), opts)
+		} else {
+			records, total, lerr = h.store.ListMemories(r.Context(), opts)
+		}
 		if lerr != nil {
+			if writeAppV23DashboardProjectionFailure(w, lerr) {
+				return
+			}
 			writeError(w, http.StatusInternalServerError, lerr.Error())
 			return
 		}
@@ -1510,12 +1986,65 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	writeJSONResp(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"memories": records,
 		"total":    total,
 		"limit":    limit,
 		"offset":   offset,
-	})
+	}
+	// Keep immutable signer attribution in every record, but give the local
+	// CEREBRUM UI a non-agent display label for every historical Root
+	// credential generation. The IDs remain ledger truth; they must not be
+	// synthesized into selectable "unknown agent" roster entries.
+	if h.appV23IsActive() && h.BadgerStore != nil && h.isCEREBRUMReadRequest(r) {
+		authorLabels := make(map[string]string)
+		for _, rec := range records {
+			if _, seen := authorLabels[rec.SubmittingAgent]; seen {
+				continue
+			}
+			if wasRoot, markerErr := h.BadgerStore.IsAppV23RootCredential(rec.SubmittingAgent); markerErr == nil && wasRoot {
+				authorLabels[rec.SubmittingAgent] = "CEREBRUM Root"
+			}
+		}
+		if len(authorLabels) > 0 {
+			response["author_labels"] = authorLabels
+		}
+	}
+	writeJSONResp(w, http.StatusOK, response)
+}
+
+func portableDashboardMemoryRecord(rec *memory.MemoryRecord) memory.MemoryRecord {
+	return memory.MemoryRecord{
+		MemoryID:        rec.MemoryID,
+		SubmittingAgent: rec.SubmittingAgent,
+		Content:         rec.Content,
+		MemoryType:      rec.MemoryType,
+		DomainTag:       rec.DomainTag,
+		Provider:        rec.Provider,
+		ConfidenceScore: rec.ConfidenceScore,
+		Status:          rec.Status,
+		ParentHash:      rec.ParentHash,
+		TaskStatus:      rec.TaskStatus,
+		CreatedAt:       rec.CreatedAt,
+		CommittedAt:     rec.CommittedAt,
+		DeprecatedAt:    rec.DeprecatedAt,
+	}
+}
+
+func dashboardExportManifest() map[string]any {
+	return map[string]any{
+		"record_type":         "sage_backup_manifest",
+		"sage_backup_version": 1,
+	}
+}
+
+func setDashboardExportHeaders(w http.ResponseWriter, contentLength int64) {
+	filename := fmt.Sprintf("sage-backup-%s.jsonl", time.Now().Format("2006-01-02"))
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	if contentLength >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	}
 }
 
 // handleExport streams active (non-deprecated) memories as JSONL (one JSON object per line).
@@ -1526,14 +2055,41 @@ func (h *DashboardHandler) handleExport(w http.ResponseWriter, r *http.Request) 
 	// status, provider, submitting_agent, created_at, committed_at, etc.
 	// Embeddings are excluded to keep export portable (re-generated on import).
 
+	exportOpts := cerebrumListOptions(store.ListOptions{
+		Sort:   "oldest",
+		Status: "active",
+	})
+	if h.appV23IsActive() {
+		snapshot, contentLength, err := h.spoolAppV23CanonicalDashboardExport(
+			r.Context(), exportOpts,
+		)
+		if err != nil {
+			if writeAppV23DashboardProjectionFailure(w, err) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer func() {
+			_ = snapshot.Close()
+			_ = os.Remove(snapshot.Name())
+		}()
+
+		// These are deliberately the first response-header accesses. At this
+		// point the canonical snapshot is sealed and its exact byte length is
+		// known; concurrent SQL publication cannot change the response body.
+		setDashboardExportHeaders(w, contentLength)
+		_, _ = io.Copy(w, snapshot) // client disconnects cannot alter the sealed file
+		return
+	}
+
+	// Preserve the pre-v23 streaming behavior exactly. Historical nodes do not
+	// have the canonical disclosure envelope needed to build the v23 snapshot.
+	setDashboardExportHeaders(w, -1)
+
 	// Page through all records to avoid loading everything in memory at once.
 	const pageSize = 500
 	offset := 0
-
-	filename := fmt.Sprintf("sage-backup-%s.jsonl", time.Now().Format("2006-01-02"))
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
-
 	enc := json.NewEncoder(w)
 	exported := 0
 
@@ -1556,22 +2112,7 @@ func (h *DashboardHandler) handleExport(w http.ResponseWriter, r *http.Request) 
 
 		for _, rec := range records {
 			// Export record — strip embeddings (regenerated on import).
-			export := memory.MemoryRecord{
-				MemoryID:        rec.MemoryID,
-				SubmittingAgent: rec.SubmittingAgent,
-				Content:         rec.Content,
-				MemoryType:      rec.MemoryType,
-				DomainTag:       rec.DomainTag,
-				Provider:        rec.Provider,
-				ConfidenceScore: rec.ConfidenceScore,
-				Status:          rec.Status,
-				ParentHash:      rec.ParentHash,
-				TaskStatus:      rec.TaskStatus,
-				CreatedAt:       rec.CreatedAt,
-				CommittedAt:     rec.CommittedAt,
-				DeprecatedAt:    rec.DeprecatedAt,
-			}
-			if err := enc.Encode(export); err != nil {
+			if err := enc.Encode(portableDashboardMemoryRecord(rec)); err != nil {
 				return // client disconnected
 			}
 			exported++
@@ -1583,10 +2124,7 @@ func (h *DashboardHandler) handleExport(w http.ResponseWriter, r *http.Request) 
 	// Keep an empty backup self-identifying. Without a manifest line, Import
 	// cannot distinguish an empty SAGE JSONL file from another empty format.
 	if exported == 0 {
-		_ = enc.Encode(map[string]any{
-			"record_type":         "sage_backup_manifest",
-			"sage_backup_version": 1,
-		})
+		_ = enc.Encode(dashboardExportManifest())
 	}
 }
 
@@ -1618,7 +2156,11 @@ func (h *DashboardHandler) handleTimeline(w http.ResponseWriter, r *http.Request
 	}
 	var buckets []store.TimelineBucket
 	var err error
-	if provider, ok := h.store.(interface {
+	if h.appV23IsActive() {
+		buckets, err = h.appV23CanonicalTimeline(
+			r.Context(), from, to, domain, bucket,
+		)
+	} else if provider, ok := h.store.(interface {
 		GetTimelineExcludingDomainPrefixes(context.Context, time.Time, time.Time, string, string, []string) ([]store.TimelineBucket, error)
 	}); ok {
 		buckets, err = provider.GetTimelineExcludingDomainPrefixes(
@@ -1628,6 +2170,9 @@ func (h *DashboardHandler) handleTimeline(w http.ResponseWriter, r *http.Request
 		buckets, err = h.store.GetTimeline(r.Context(), from, to, domain, bucket)
 	}
 	if err != nil {
+		if writeAppV23DashboardProjectionFailure(w, err) {
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1637,15 +2182,17 @@ func (h *DashboardHandler) handleTimeline(w http.ResponseWriter, r *http.Request
 
 // graphNode is a memory node for the force-directed graph.
 type graphNode struct {
-	ID         string   `json:"id"`
-	Content    string   `json:"content"`
-	Domain     string   `json:"domain"`
-	Confidence float64  `json:"confidence"`
-	Status     string   `json:"status"`
-	MemoryType string   `json:"memory_type"`
-	CreatedAt  string   `json:"created_at"`
-	Agent      string   `json:"agent"`
-	Tags       []string `json:"tags,omitempty"`
+	ID          string   `json:"id"`
+	Content     string   `json:"content"`
+	Domain      string   `json:"domain"`
+	Confidence  float64  `json:"confidence"`
+	Status      string   `json:"status"`
+	MemoryType  string   `json:"memory_type"`
+	CreatedAt   string   `json:"created_at"`
+	Agent       string   `json:"agent"`
+	AgentLabel  string   `json:"agent_label,omitempty"`
+	AgentIsRoot bool     `json:"agent_is_root,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
 	// CorroborationCount drives consolidation visuals in the brain view (a
 	// well-corroborated memory glows/enlarges). Same value the recall paths
 	// surface as corroboration_count.
@@ -1702,7 +2249,11 @@ func (h *DashboardHandler) handleGraph(w http.ResponseWriter, r *http.Request) {
 	// restricted agent is never served an operator (or another agent's) graph.
 	scope := append([]string(nil), allowedAgents...)
 	sort.Strings(scope)
-	cacheKey := fmt.Sprintf("%v|%s|%s|%d|%s", seeAll, statusParam, drillDomain, limit, strings.Join(scope, ","))
+	cacheKey := fmt.Sprintf(
+		"v23=%v|%v|%s|%s|%d|%s",
+		h.appV23IsActive(), seeAll, statusParam, drillDomain, limit,
+		strings.Join(scope, ","),
+	)
 
 	if body := h.serveGraphFromCache(cacheKey, statusParam, drillDomain, limit, seeAll, allowedAgents); body != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1711,6 +2262,9 @@ func (h *DashboardHandler) handleGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := h.computeGraphJSON(r.Context(), statusParam, drillDomain, limit, seeAll, allowedAgents)
 	if err != nil {
+		if writeAppV23DashboardProjectionFailure(w, err) {
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1799,10 +2353,17 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 	// Scale aggregates — operator view only (no RBAC aggregate leak).
 	var grandTotal int
 	var domainCounts map[string]int
+	var domainLast map[string]string
 	if seeAll {
-		if stats, sErr := h.cerebrumVisibleStats(ctx); sErr == nil && stats != nil {
+		stats, activity, sErr := h.cerebrumVisibleStatsAndActivity(ctx)
+		if sErr != nil {
+			if h.appV23IsActive() {
+				return nil, sErr
+			}
+		} else if stats != nil {
 			grandTotal = stats.TotalMemories
 			domainCounts = stats.ByDomain
+			domainLast = activity
 		}
 	}
 
@@ -1820,11 +2381,14 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 		opts.Sort = "confidence"
 		records, _, err = h.store.ListMemories(ctx, opts)
 	case seeAll && grandTotal > limit && len(domainCounts) > 1:
-		records = h.stratifiedSample(ctx, opts, domainCounts, grandTotal, limit)
+		records, err = h.stratifiedSample(ctx, opts, domainCounts, grandTotal, limit)
 	default:
 		records, _, err = h.store.ListMemories(ctx, opts)
 	}
 	if err != nil {
+		return nil, err
+	}
+	if err := h.validateAppV23DashboardRecords(records); err != nil {
 		return nil, err
 	}
 
@@ -1844,7 +2408,22 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 
 	// Build domain groups for edge generation
 	domainMemories := make(map[string][]string)
+	rootAuthors := make(map[string]bool)
 	for _, rec := range records {
+		agentLabel := ""
+		agentIsRoot := false
+		if seeAll && h.appV23IsActive() && h.BadgerStore != nil {
+			var known bool
+			agentIsRoot, known = rootAuthors[rec.SubmittingAgent]
+			if !known {
+				wasRoot, markerErr := h.BadgerStore.IsAppV23RootCredential(rec.SubmittingAgent)
+				agentIsRoot = markerErr == nil && wasRoot
+				rootAuthors[rec.SubmittingAgent] = agentIsRoot
+			}
+			if agentIsRoot {
+				agentLabel = "CEREBRUM Root"
+			}
+		}
 		nodes = append(nodes, graphNode{
 			ID:                 rec.MemoryID,
 			Content:            truncate(rec.Content, 200),
@@ -1854,6 +2433,8 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 			MemoryType:         string(rec.MemoryType),
 			CreatedAt:          rec.CreatedAt.Format(time.RFC3339),
 			Agent:              rec.SubmittingAgent,
+			AgentLabel:         agentLabel,
+			AgentIsRoot:        agentIsRoot,
 			Tags:               tagMap[rec.MemoryID],
 			CorroborationCount: corrCounts[rec.MemoryID],
 		})
@@ -1912,15 +2493,8 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 		// Per-domain recency so the lobe list can order by last activity
 		// (newest first) instead of alphabetically. Optional-interface so
 		// non-SQLite stores simply omit it.
-		if dap, ok := h.store.(domainActivityProvider); ok {
-			if dl, dErr := dap.GetDomainLastActivity(ctx); dErr == nil {
-				for domain := range dl {
-					if isCerebrumInternalMemoryDomain(domain) {
-						delete(dl, domain)
-					}
-				}
-				resp["domain_last"] = dl
-			}
+		if domainLast != nil {
+			resp["domain_last"] = domainLast
 		}
 	}
 	return json.Marshal(resp)
@@ -1937,7 +2511,7 @@ type domainActivityProvider interface {
 // total, filled with that domain's highest-confidence memories. Keeps lobe
 // density faithful to reality and surfaces the most significant memories, while
 // never exceeding the cap. One bounded ListMemories call per domain.
-func (h *DashboardHandler) stratifiedSample(ctx context.Context, base store.ListOptions, domainCounts map[string]int, total, cap int) []*memory.MemoryRecord {
+func (h *DashboardHandler) stratifiedSample(ctx context.Context, base store.ListOptions, domainCounts map[string]int, total, cap int) ([]*memory.MemoryRecord, error) {
 	out := make([]*memory.MemoryRecord, 0, cap)
 	for domain, cnt := range domainCounts {
 		if cnt <= 0 {
@@ -1953,20 +2527,26 @@ func (h *DashboardHandler) stratifiedSample(ctx context.Context, base store.List
 		o.Limit = quota
 		recs, _, err := h.store.ListMemories(ctx, o)
 		if err != nil {
-			continue
+			return nil, err
+		}
+		if err := h.validateAppV23DashboardRecords(recs); err != nil {
+			return nil, err
 		}
 		out = append(out, recs...)
 	}
 	if len(out) > cap {
 		out = out[:cap]
 	}
-	return out
+	return out, nil
 }
 
 // handleStats returns aggregate statistics.
 func (h *DashboardHandler) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := h.cerebrumVisibleStats(r.Context())
 	if err != nil {
+		if writeAppV23DashboardProjectionFailure(w, err) {
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2223,11 +2803,32 @@ func (h *DashboardHandler) handleGetTasks(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusForbidden, "the task backlog is available only to signed agents or an authenticated CEREBRUM session")
 			return
 		}
-		tasks, err = h.store.GetOpenTasks(r.Context(), domain, provider, agentID)
+		if h.appV23IsActive() && agentID != "" {
+			if pager, ok := h.store.(store.OpenTaskPageStore); ok {
+				tasks, err = h.collectAppV23VisibleDashboardTasks(
+					r.Context(), pager, domain, provider, agentID, 500,
+				)
+			} else {
+				// Compatibility fallback for third-party stores. Built-in
+				// SQLite/Postgres stores implement stable task paging.
+				tasks, err = h.store.GetOpenTasks(
+					r.Context(), domain, provider, agentID,
+				)
+			}
+		} else {
+			tasks, err = h.store.GetOpenTasks(r.Context(), domain, provider, agentID)
+		}
 		if err == nil && agentID != "" {
 			filtered := tasks[:0]
 			for _, task := range tasks {
-				if h.agentCanReadTask(r.Context(), agentID, task.MemoryID, task.DomainTag) {
+				allowed, definitive := h.agentTaskRecordReadDecision(
+					r.Context(), agentID, task,
+				)
+				if !allowed && h.appV23IsActive() && !definitive {
+					err = errAppV23TaskAuthorizationUnavailable
+					break
+				}
+				if allowed {
 					filtered = append(filtered, task)
 				}
 			}
@@ -2236,6 +2837,11 @@ func (h *DashboardHandler) handleGetTasks(w http.ResponseWriter, r *http.Request
 	}
 
 	if err != nil {
+		if errors.Is(err, errAppV23TaskAuthorizationUnavailable) {
+			writeError(w, http.StatusServiceUnavailable,
+				"task authorization state is unavailable; retry later")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2344,18 +2950,20 @@ func (h *DashboardHandler) handleUpdateTaskStatusDashboard(w http.ResponseWriter
 		writeError(w, http.StatusBadRequest, "task_status must be one of: planned, in_progress, done, dropped")
 		return
 	}
-	// Agent status changes require an active signature-bound identity and current
-	// task read permission. Starting and terminal completion are store-level CAS
-	// operations; reopening/planning is reserved for the operator task board.
-	if agentID := verifiedDashboardAgentID(r.Context()); agentID != "" {
-		agentStore, ok := h.store.(store.AgentStore)
-		if !ok {
-			writeError(w, http.StatusNotImplemented, "agent registry is not available on this datastore")
-			return
+	// Agent status changes require an active Member/Manager signature and current
+	// task read permission. A current Root/Admin signature received through the
+	// loopback CEREBRUM boundary is an operator request instead; remote/stale
+	// Admins and every retired Root credential are denied, never downgraded into
+	// the ordinary-agent branch.
+	agentID := verifiedDashboardAgentID(r.Context())
+	appV23Operator := h.appV23IsActive() && h.isCEREBRUMOperatorRequest(r)
+	if agentID != "" && !appV23Operator {
+		activeOrdinary := h.isActiveRegisteredDashboardAgent(r.Context(), agentID)
+		if h.appV23IsActive() {
+			activeOrdinary = h.isEligibleRemoteSignedDashboardAgent(r.Context(), agentID)
 		}
-		agent, agentErr := agentStore.GetAgent(r.Context(), agentID)
-		if agentErr != nil || agent == nil || agent.Status != "active" || agent.RemovedAt != nil {
-			writeError(w, http.StatusForbidden, "active registered agent identity required")
+		if !activeOrdinary {
+			writeError(w, http.StatusForbidden, "active current-generation agent identity required")
 			return
 		}
 		task, taskErr := h.store.GetMemory(r.Context(), id)
@@ -2363,7 +2971,20 @@ func (h *DashboardHandler) handleUpdateTaskStatusDashboard(w http.ResponseWriter
 			writeError(w, http.StatusNotFound, taskErr.Error())
 			return
 		}
-		if !h.agentCanReadTask(r.Context(), agentID, id, task.DomainTag) {
+		canRead, definitive := h.agentTaskRecordReadDecision(
+			r.Context(), agentID, task,
+		)
+		if h.appV23IsActive() && !canRead && !definitive {
+			writeError(w, http.StatusServiceUnavailable,
+				"task authorization state is unavailable; retry later")
+			return
+		}
+		canMutate := canRead
+		if h.appV23IsActive() {
+			canMutate = canMutate &&
+				h.agentCanWriteDomainAppV23(agentID, task.DomainTag)
+		}
+		if !canMutate {
 			writeError(w, http.StatusForbidden, "you do not have permission to update this task")
 			return
 		}
@@ -2398,7 +3019,7 @@ func (h *DashboardHandler) handleUpdateTaskStatusDashboard(w http.ResponseWriter
 		writeJSONResp(w, http.StatusOK, map[string]string{"memory_id": id, "task_status": body.TaskStatus})
 		return
 	}
-	if !h.isCEREBRUMOperatorRequest(r) {
+	if !appV23Operator && !h.isCEREBRUMOperatorRequest(r) {
 		writeCEREBRUMOperatorForbidden(w, "Changing another agent's task status requires operator authority.")
 		return
 	}
@@ -2442,6 +3063,11 @@ func (h *DashboardHandler) handleAssignTask(w http.ResponseWriter, r *http.Reque
 	}
 	assignee := strings.TrimSpace(body.Assignee)
 	if assignee != "" {
+		if h.appV23IsRootIdentity(assignee) {
+			writeAppV23AccessError(w, http.StatusForbidden, "root_agent_surface_forbidden",
+				"CEREBRUM Root is not an agent and cannot be assigned a task.")
+			return
+		}
 		agentStore, ok := h.store.(store.AgentStore)
 		if !ok {
 			writeError(w, http.StatusNotImplemented, "task assignment is not available on this datastore")
@@ -2457,7 +3083,15 @@ func (h *DashboardHandler) handleAssignTask(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if !h.agentCanReadTask(r.Context(), assignee, id, task.DomainTag) {
+		allowed, definitive := h.agentTaskRecordReadDecision(
+			r.Context(), assignee, task,
+		)
+		if h.appV23IsActive() && !allowed && !definitive {
+			writeError(w, http.StatusServiceUnavailable,
+				"task authorization state is unavailable; retry later")
+			return
+		}
+		if !allowed {
 			writeError(w, http.StatusForbidden, "that agent does not have permission to read this task")
 			return
 		}
@@ -2486,18 +3120,63 @@ type taskClassificationReader interface {
 	GetMemoryClassificationLocal(ctx context.Context, memoryID string) (int, error)
 }
 
-// agentCanReadTask prevents assignment/backlog from becoming an RBAC side
-// channel. Public tasks are readable; non-public tasks must pass the same
-// multi-org/domain access check as memory reads.
-func (h *DashboardHandler) agentCanReadTask(ctx context.Context, agentID, memoryID, domain string) bool {
-	allowed, _ := h.agentTaskReadDecision(ctx, agentID, memoryID, domain)
-	return allowed
+func (h *DashboardHandler) collectAppV23VisibleDashboardTasks(
+	ctx context.Context,
+	pager store.OpenTaskPageStore,
+	domain, provider, agentID string,
+	visibleLimit int,
+) ([]*memory.MemoryRecord, error) {
+	const rawPageSize = 128
+	if visibleLimit <= 0 {
+		return []*memory.MemoryRecord{}, nil
+	}
+	visible := make([]*memory.MemoryRecord, 0, visibleLimit)
+	for offset := 0; len(visible) < visibleLimit; offset += rawPageSize {
+		batch, err := pager.GetOpenTasksPage(
+			ctx, domain, provider, agentID, rawPageSize, offset,
+		)
+		if err != nil {
+			return nil, err
+		}
+		rawCount := len(batch)
+		for _, task := range batch {
+			allowed, definitive := h.agentTaskRecordReadDecision(
+				ctx, agentID, task,
+			)
+			if !allowed && !definitive {
+				return nil, errAppV23TaskAuthorizationUnavailable
+			}
+			if allowed {
+				visible = append(visible, task)
+				if len(visible) == visibleLimit {
+					break
+				}
+			}
+		}
+		if rawCount < rawPageSize {
+			break
+		}
+	}
+	return visible, nil
 }
 
 // agentTaskReadDecision distinguishes a definitive access denial from a
 // transient/unavailable authorization lookup. Notification delivery keeps a
 // notice unread on transient failures and supersedes only definitive denials.
 func (h *DashboardHandler) agentTaskReadDecision(ctx context.Context, agentID, memoryID, domain string) (allowed, definitive bool) {
+	if h.appV23IsActive() {
+		if memoryID == "" || domain == "" {
+			return false, false
+		}
+		task, err := h.store.GetMemory(ctx, memoryID)
+		if err != nil || task == nil {
+			return false, false
+		}
+		if task.DomainTag != domain {
+			return false, true
+		}
+		return h.agentTaskRecordReadDecision(ctx, agentID, task)
+	}
 	if domainAllowed, domainDefinitive := h.agentDomainReadDecision(ctx, agentID, domain); !domainAllowed {
 		return false, domainDefinitive
 	}
@@ -2527,10 +3206,83 @@ func (h *DashboardHandler) agentTaskReadDecision(ctx context.Context, agentID, m
 	return allowed, true
 }
 
+func (h *DashboardHandler) agentTaskRecordReadDecision(
+	ctx context.Context,
+	agentID string,
+	task *memory.MemoryRecord,
+) (allowed, definitive bool) {
+	if task == nil {
+		return false, false
+	}
+	if !h.appV23IsActive() {
+		return h.agentTaskReadDecision(
+			ctx, agentID, task.MemoryID, task.DomainTag,
+		)
+	}
+	if h.BadgerStore == nil || agentID == "" ||
+		task.MemoryID == "" || task.DomainTag == "" {
+		return false, false
+	}
+	canonical, err := h.BadgerStore.ValidateMemoryProjection(task)
+	if err != nil {
+		return false, false
+	}
+	domain := task.DomainTag
+	if canonical.DomainRecorded {
+		domain = canonical.Domain
+	}
+	author := task.SubmittingAgent
+	if canonical.AuthorRecorded {
+		author = canonical.Author
+	}
+	decision, err := appv23disclosure.Evaluate(
+		h.BadgerStore,
+		agentID,
+		appv23disclosure.Record{
+			SubmittingAgent: author,
+			Domain:          domain,
+			Classification:  canonical.Classification,
+		},
+		time.Now(),
+	)
+	if err != nil {
+		return false, false
+	}
+	return decision.Allowed, true
+}
+
 // agentDomainReadDecision applies the same explicit domain allowlist used by
 // the REST memory APIs. Assignment is workflow ownership, not an implicit RBAC
 // grant, even for a PUBLIC task.
 func (h *DashboardHandler) agentDomainReadDecision(ctx context.Context, agentID, domain string) (allowed, definitive bool) {
+	if h.appV23IsActive() {
+		if h.BadgerStore == nil || agentID == "" || domain == "" {
+			return false, false
+		}
+		shared, err := h.BadgerStore.IsAppV23SharedDomain(domain)
+		if err != nil {
+			return false, false
+		}
+		decision, err := h.BadgerStore.AuthorizeAppV23LocalDomain(
+			agentID, domain, store.AppV23VerbRead, shared,
+		)
+		if err != nil {
+			return false, false
+		}
+		if decision.ExplicitDeny {
+			return false, true
+		}
+		if decision.Allowed {
+			return true, true
+		}
+		hasGrant, err := h.BadgerStore.HasAppV23AccessOrAncestor(
+			domain, agentID, 1, time.Now(), shared,
+		)
+		if err != nil {
+			return false, false
+		}
+		return hasGrant, true
+	}
 	check := func(role, raw string) (bool, bool) {
 		if role == "admin" || strings.TrimSpace(raw) == "" {
 			return true, true
@@ -2578,6 +3330,29 @@ func (h *DashboardHandler) agentDomainReadDecision(ctx context.Context, agentID,
 	return check(agent.Role, agent.DomainAccess)
 }
 
+func (h *DashboardHandler) agentCanWriteDomainAppV23(agentID, domain string) bool {
+	if h.BadgerStore == nil || agentID == "" || domain == "" {
+		return false
+	}
+	shared, err := h.BadgerStore.IsAppV23SharedDomain(domain)
+	if err != nil {
+		return false
+	}
+	decision, err := h.BadgerStore.AuthorizeAppV23LocalDomain(
+		agentID, domain, store.AppV23VerbWrite, shared,
+	)
+	if err != nil || decision.ExplicitDeny {
+		return false
+	}
+	if decision.Allowed {
+		return true
+	}
+	hasGrant, err := h.BadgerStore.HasAppV23AccessOrAncestor(
+		domain, agentID, 2, time.Now(), shared,
+	)
+	return err == nil && hasGrant
+}
+
 // handleTaskNotifications returns one-way assignment notices for the signed
 // agent. Reading atomically acknowledges them; unlike pipeline work, these
 // notices require no claim or result.
@@ -2585,6 +3360,10 @@ func (h *DashboardHandler) handleTaskNotifications(w http.ResponseWriter, r *htt
 	agentID := verifiedDashboardAgentID(r.Context())
 	if agentID == "" {
 		writeError(w, http.StatusUnauthorized, "agent identity required")
+		return
+	}
+	if !h.isActiveRegisteredDashboardAgent(r.Context(), agentID) {
+		writeError(w, http.StatusForbidden, "active current-generation agent identity required")
 		return
 	}
 	agentStore, ok := h.store.(store.AgentStore)
@@ -2652,7 +3431,14 @@ func (h *DashboardHandler) handleTaskNotifications(w http.ResponseWriter, r *htt
 
 // handleCreateTaskDashboard creates a new task from the CEREBRUM dashboard.
 func (h *DashboardHandler) handleCreateTaskDashboard(w http.ResponseWriter, r *http.Request) {
-	if !h.isCEREBRUMOperatorRequest(r) {
+	var appV23Actor *appV23ControlActor
+	if h.appV23IsActive() {
+		var ok bool
+		appV23Actor, ok = h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+	} else if !h.isCEREBRUMOperatorRequest(r) {
 		writeCEREBRUMOperatorForbidden(w, "Creating tasks from CEREBRUM requires operator authority; agents should use sage_task.")
 		return
 	}
@@ -2691,10 +3477,14 @@ func (h *DashboardHandler) handleCreateTaskDashboard(w http.ResponseWriter, r *h
 	}
 
 	contentHash := sha256.Sum256([]byte(taskContent))
+	submittingKey := h.SigningKey
+	if appV23Actor != nil {
+		submittingKey = appV23Actor.Key
+	}
 
 	rec := &memory.MemoryRecord{
 		MemoryID:          memoryID,
-		SubmittingAgent:   agentIDForKey(h.SigningKey),
+		SubmittingAgent:   agentIDForKey(submittingKey),
 		Content:           taskContent,
 		ContentHash:       contentHash[:],
 		MemoryType:        memory.TypeTask,
@@ -2709,7 +3499,7 @@ func (h *DashboardHandler) handleCreateTaskDashboard(w http.ResponseWriter, r *h
 
 	// Broadcast on-chain through CometBFT consensus
 	if h.CometBFTRPC != "" {
-		if len(h.SigningKey) != ed25519.PrivateKeySize {
+		if len(submittingKey) != ed25519.PrivateKeySize {
 			writeError(w, http.StatusServiceUnavailable, "this node cannot sign a task submission; restart it and try again")
 			return
 		}
@@ -2728,9 +3518,23 @@ func (h *DashboardHandler) handleCreateTaskDashboard(w http.ResponseWriter, r *h
 				Classification:  tx.ClearanceLevel(1), // INTERNAL
 			},
 		}
-		if _, _, _, err := h.signAndBroadcastCommit(submitTx, h.SigningKey); err != nil {
+		var err error
+		if appV23Actor != nil {
+			_, _, _, err = h.signAndBroadcastAppV23Control(submitTx, appV23Actor)
+		} else {
+			_, _, _, err = h.signAndBroadcastCommit(submitTx, submittingKey)
+		}
+		if err != nil {
 			writeError(w, http.StatusBadGateway, "the network did not confirm this task; nothing was added: "+err.Error())
 			return
+		}
+		if appV23Actor != nil {
+			author, authorErr := h.BadgerStore.GetMemoryAuthor(memoryID)
+			if authorErr != nil || author != appV23Actor.ID {
+				writeAppV23AccessError(w, http.StatusServiceUnavailable, "task_author_unconfirmed",
+					"The task commit response was ambiguous; CEREBRUM could not verify the current credential as author.")
+				return
+			}
 		}
 		// The dashboard broadcasts directly instead of going through api/rest's
 		// supplementary-data cache. Consensus has inserted the task by the time

@@ -13,9 +13,10 @@ type EmbedRequest struct {
 
 // EmbedResponse is the response body for POST /v1/embed.
 type EmbedResponse struct {
-	Embedding []float32 `json:"embedding"`
-	Model     string    `json:"model"`
-	Dimension int       `json:"dimension"`
+	Embedding         []float32 `json:"embedding"`
+	Model             string    `json:"model"`
+	EmbeddingProvider string    `json:"embedding_provider"`
+	Dimension         int       `json:"dimension"`
 }
 
 // EmbedInfoResponse describes the active embedding provider.
@@ -117,9 +118,10 @@ func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, EmbedResponse{
-		Embedding: emb,
-		Model:     model,
-		Dimension: len(emb),
+		Embedding:         emb,
+		Model:             model,
+		EmbeddingProvider: s.activeEmbeddingProvider(),
+		Dimension:         len(emb),
 	})
 }
 

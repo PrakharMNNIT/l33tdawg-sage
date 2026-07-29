@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -13,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/l33tdawg/sage/internal/store"
+	"github.com/l33tdawg/sage/internal/taskidempotency"
 )
 
 func stateSyncFixture(t *testing.T) (Metadata, []byte, []byte, [][]byte, []byte) {
@@ -30,6 +33,88 @@ func stateSyncFixture(t *testing.T) (Metadata, []byte, []byte, [][]byte, []byte)
 	metadata, encoded, snapshotHash, err := BuildMetadata(42, appHash[:], MinChunkSize, chunks)
 	require.NoError(t, err)
 	return metadata, encoded, snapshotHash, chunks, payload
+}
+
+func TestCanonicalStatePromotesAppV23StageOnlyAfterActivation(t *testing.T) {
+	source, err := store.NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, source.CloseBadger()) })
+	var memberID string
+	for i := 0; i < 513; i++ {
+		id := fmt.Sprintf("%064x", i+1)
+		role := store.AppV23RoleMember
+		if i == 0 {
+			role = store.AppV23RoleAdmin
+		}
+		if i == 1 {
+			memberID = id
+		}
+		require.NoError(t, source.RegisterAgentWithCapabilities(
+			id, fmt.Sprintf("legacy-%d", i), role, "", "", "",
+			int64(i+1), 0,
+		))
+	}
+	require.NoError(t, source.PrepareAppV23Migration("canonical-stage", 100))
+
+	stagePrefix := []byte{0xff, 's', 'a', 'g', 'e', ':', 'a', 'p', 'p', 'v', '2', '3', ':', 's', 't', 'a', 'g', 'e', ':'}
+	var preActivation bytes.Buffer
+	require.NoError(t, WriteCanonicalState(context.Background(), source.DB(), &preActivation))
+	require.False(t, bytes.Contains(preActivation.Bytes(), stagePrefix),
+		"unpromoted preparation rows are local and must not enter state sync")
+
+	require.NoError(t, source.EnsureAppV23Root("canonical-stage", 100))
+	idempotencyKey := "state-sync-task-v1"
+	memoryID, err := taskidempotency.MemoryID(memberID, idempotencyKey)
+	require.NoError(t, err)
+	keyDigest, err := taskidempotency.BindingKeyDigest(memberID, idempotencyKey)
+	require.NoError(t, err)
+	contentHash := sha256.Sum256([]byte("[TASK] survive state sync"))
+	require.NoError(t, source.SetMemoryHash(memoryID, contentHash[:], "proposed"))
+	require.NoError(t, source.SetMemoryDomain(memoryID, "legacy-1"))
+	require.NoError(t, source.SetMemoryClassification(memoryID, 0))
+	require.NoError(t, source.SetMemoryAuthorPrincipal(memoryID, memberID))
+	binding := &store.AppV23TaskIdempotencyBinding{
+		Version: 1, PrincipalID: memberID,
+		BindingKeyDigest: taskidempotency.Hex(keyDigest),
+		PayloadDigest:    strings.Repeat("ab", 32),
+		MemoryID:         memoryID, AssigneeID: memberID,
+		CommittedHeight: 101, TxHash: strings.Repeat("CD", 32),
+	}
+	require.NoError(t, source.SetAppV23TaskIdempotencyBinding(
+		memberID, idempotencyKey, binding,
+	))
+	require.NoError(t, source.ValidateAppV23State())
+	sourceHash, err := source.ComputeAppHashExcludingBookkeeping()
+	require.NoError(t, err)
+	var activated bytes.Buffer
+	require.NoError(t, WriteCanonicalState(context.Background(), source.DB(), &activated))
+	require.True(t, bytes.Contains(activated.Bytes(), stagePrefix))
+
+	restorePath := filepath.Join(t.TempDir(), "restored")
+	opts := badger.DefaultOptions(restorePath).WithLogger(nil)
+	raw, err := badger.Open(opts)
+	require.NoError(t, err)
+	require.NoError(t, RestoreCanonicalState(
+		context.Background(), bytes.NewReader(activated.Bytes()), raw,
+	))
+	require.NoError(t, raw.Close())
+	restored, err := store.NewBadgerStore(restorePath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, restored.CloseBadger()) })
+	require.NoError(t, restored.ValidateAppV23State())
+	restoredBinding, err := restored.GetAppV23TaskIdempotencyBinding(
+		memberID, idempotencyKey,
+	)
+	require.NoError(t, err)
+	require.Equal(t, binding, restoredBinding,
+		"canonical state sync must preserve the authoritative retry receipt")
+	restoredHash, err := restored.ComputeAppHashExcludingBookkeeping()
+	require.NoError(t, err)
+	require.Equal(t, sourceHash, restoredHash)
+	enrollment, err := restored.GetAppV23Enrollment(memberID)
+	require.NoError(t, err)
+	require.NotNil(t, enrollment)
+	require.True(t, enrollment.Active)
 }
 
 func TestMetadataCanonicalRoundTripAndTrustedOffer(t *testing.T) {

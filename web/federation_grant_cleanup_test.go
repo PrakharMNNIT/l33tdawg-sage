@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -81,6 +82,39 @@ func TestFederationManagedGrantCleanupUsesOwnerBoundAdminAfterTransfer(t *testin
 	assert.Equal(t, peerID, captured.AccessRevoke.GranteeID)
 	assert.Equal(t, currentOwner, captured.AccessRevoke.ExpectedOwnerID)
 	assert.Equal(t, "tii", captured.AccessRevoke.ExpectedOwnedDomain)
+}
+
+func TestAppV23FederationCleanupUsesCurrentRootForStableRootPrincipal(t *testing.T) {
+	fixture := newAppV23AccessFixture(t)
+	require.NoError(t, fixture.badger.RegisterDomain(
+		"root-owned", fixture.rootID, "", 1,
+	))
+	_, rotatedKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	rotatedID := agentIDForKey(rotatedKey)
+	require.NoError(t, fixture.badger.RotateAppV23RootCredential(1, rotatedID, 2))
+
+	var captured *tx.ParsedTx
+	var calls atomic.Int32
+	rpc := newGrantRPC(t, &captured, &calls)
+	defer rpc.Close()
+	h := appV23AccessTestHandler(
+		fixture, rpc.URL, map[string]ed25519.PrivateKey{rotatedID: rotatedKey},
+	)
+	h.AdminSigningKey = fixture.rootKey // deliberately retired
+	h.AppV18ActiveFn = func() bool { return true }
+
+	result := h.revokeFederationManagedGrant(
+		"root-owned", strings.Repeat("ab", 32),
+	)
+	require.True(t, result.OK, result.Error)
+	assert.Equal(t, int32(1), calls.Load())
+	require.NotNil(t, captured)
+	require.NotNil(t, captured.AccessRevoke)
+	assert.Equal(t, rotatedID, captured.AccessRevoke.RevokerID)
+	assert.Equal(t, fixture.rootID, captured.AccessRevoke.ExpectedOwnerID)
+	assert.Equal(t, "root-owned", captured.AccessRevoke.ExpectedOwnedDomain)
+	assert.Equal(t, rotatedID, hex.EncodeToString(captured.PublicKey))
 }
 
 func TestFederationManagedGrantCleanupRetainsUntilAdminOverrideActive(t *testing.T) {

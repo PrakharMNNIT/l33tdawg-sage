@@ -242,6 +242,7 @@ func TestInsertVoteAndGetVotes(t *testing.T) {
 	rec := testMemory("m1", "agent1", "content", "general")
 	require.NoError(t, s.InsertMemory(ctx, rec))
 
+	createdAt := time.Now().UTC()
 	vote := &ValidationVote{
 		MemoryID:     "m1",
 		ValidatorID:  "val1",
@@ -249,7 +250,7 @@ func TestInsertVoteAndGetVotes(t *testing.T) {
 		Rationale:    "looks good",
 		WeightAtVote: 0.5,
 		BlockHeight:  100,
-		CreatedAt:    time.Now().UTC(),
+		CreatedAt:    createdAt,
 	}
 	require.NoError(t, s.InsertVote(ctx, vote))
 
@@ -260,7 +261,7 @@ func TestInsertVoteAndGetVotes(t *testing.T) {
 		Rationale:    "not sure",
 		WeightAtVote: 0.3,
 		BlockHeight:  100,
-		CreatedAt:    time.Now().UTC(),
+		CreatedAt:    createdAt,
 	}
 	require.NoError(t, s.InsertVote(ctx, vote2))
 
@@ -1177,12 +1178,15 @@ func TestRunInAgentContactTxWaitsForReadersWithoutBlockingOrdinaryTransactions(t
 	require.NoError(t, <-ordinary, "an unrelated transaction must not wait behind a contact snapshot reader")
 	require.ErrorContains(t, s.RunInTx(ctx, func(tx OffchainStore) error {
 		return tx.UpdateAgentStatus(ctx, "contact-agent", "inactive")
-	}), "requires RunInAgentContactTx")
+	}), "linked authorization invalidation is not permitted")
 
 	updated := make(chan error, 1)
 	go func() {
 		updated <- s.RunInAgentContactTx(ctx, func(tx OffchainStore) error {
-			return tx.UpdateAgentStatus(ctx, "contact-agent", "inactive")
+			return tx.UpdateAgent(ctx, &AgentEntry{
+				AgentID: "contact-agent", Name: "updated-owner",
+				Status: "active",
+			})
 		})
 	}()
 	select {
@@ -1194,7 +1198,7 @@ func TestRunInAgentContactTxWaitsForReadersWithoutBlockingOrdinaryTransactions(t
 	require.NoError(t, <-updated)
 	agent, err := s.GetAgent(ctx, "contact-agent")
 	require.NoError(t, err)
-	require.Equal(t, "inactive", agent.Status)
+	require.Equal(t, "updated-owner", agent.Name)
 }
 
 func TestAcquireRedeployLock(t *testing.T) {

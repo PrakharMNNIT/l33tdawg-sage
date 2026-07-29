@@ -5,9 +5,10 @@ package rest
 // These endpoints sit under /v1/mcp/tokens and use ed25519 admin auth (NOT
 // the bearer-token auth that gates the actual MCP transport). The flow is:
 //
-//   1. Operator (a Claude Code agent or human via dashboard) calls
-//      POST /v1/mcp/tokens with name + the local node-operator agent_id. Server returns a one-shot
-//      token string + token ID. Show ONCE — never readable again.
+//  1. Current Root/Admin (or the pre-v23 node operator during upgrade) calls
+//     POST /v1/mcp/tokens. Under app-v23 the authorizer is only the issuer:
+//     the bearer receives a distinct restricted Member identity.
+//     The server returns a one-shot token string + token ID.
 //   2. External MCP client (ChatGPT, Cursor, etc.) sends that token in
 //      Authorization: Bearer <token> on every /v1/mcp/sse or
 //      /v1/mcp/streamable request.
@@ -105,25 +106,41 @@ func (s *Server) handleMCPTokenIssue(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "agent_id must be hex-encoded")
 		return
 	}
-	if s.nodeOperatorID == "" {
-		writeJSONError(w, http.StatusServiceUnavailable, "node operator identity unavailable — MCP tokens cannot be issued")
-		return
-	}
-
-	// Token issuance is exact-node-operator-only. Allowing an arbitrary
-	// self-signed, not-yet-registered caller to mint creates an unlimited Sybil
-	// issuance oracle and bypasses the identity-keyed rate limiter.
 	callerID := middleware.ContextAgentID(r.Context())
-	if callerID == "" || callerID != s.nodeOperatorID {
-		writeJSONError(w, http.StatusForbidden, "MCP token issuance requires the exact node operator identity")
-		return
-	}
-	if req.AgentID != s.nodeOperatorID {
-		writeJSONError(w, http.StatusBadRequest, "HTTP MCP tokens run as the local node operator; agent_id must match the node operator identity")
-		return
+	legacyAgentID := s.nodeOperatorID
+	if s.isPostV23ForNextTx() {
+		// Root handover retires the historical cfg.AgentKey from CEREBRUM
+		// authority without rotating its separate federation transport role.
+		// Token issuance must therefore follow live consensus authority, never
+		// the startup-time nodeOperatorID. The outer locality middleware has
+		// already confined Root/Admin callers to this machine.
+		if !s.callerIsOperatorOrAdmin(r.Context(), callerID) {
+			writeJSONError(w, http.StatusForbidden, "MCP token issuance requires the current CEREBRUM Root or a current local Admin")
+			return
+		}
+		if req.AgentID != callerID {
+			writeJSONError(w, http.StatusBadRequest, "agent_id must match the authorizing Root or Admin")
+			return
+		}
+		legacyAgentID = callerID
+	} else {
+		if s.nodeOperatorID == "" {
+			writeJSONError(w, http.StatusServiceUnavailable, "node operator identity unavailable — MCP tokens cannot be issued")
+			return
+		}
+		// Pre-v23 token issuance remains exact-node-operator-only. Allowing an
+		// arbitrary self-signed caller to mint creates an unlimited Sybil oracle.
+		if callerID == "" || callerID != s.nodeOperatorID {
+			writeJSONError(w, http.StatusForbidden, "MCP token issuance requires the exact node operator identity")
+			return
+		}
+		if req.AgentID != s.nodeOperatorID {
+			writeJSONError(w, http.StatusBadRequest, "HTTP MCP tokens run as the local node operator; agent_id must match the node operator identity")
+			return
+		}
 	}
 
-	issued, err := ts.IssueMCPToken(r.Context(), req.Name, callerID, s.nodeOperatorID, "mcp-token")
+	issued, err := ts.IssueMCPToken(r.Context(), req.Name, callerID, legacyAgentID, "mcp-token")
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to persist token: "+err.Error())
 		return

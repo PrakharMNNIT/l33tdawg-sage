@@ -205,9 +205,17 @@ func generatePairingCode() (string, error) {
 
 // handleCreatePairingCode generates a pairing code for an existing agent.
 // POST /v1/dashboard/network/agents/{id}/pair
-func handleCreatePairingCode(agentStore store.AgentStore, ps *PairingStore) http.HandlerFunc {
+func handleCreatePairingCode(
+	agentStore store.AgentStore,
+	ps *PairingStore,
+	isRootIdentity func(string) bool,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
+		if isRootIdentity != nil && isRootIdentity(id) {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
 
 		// Verify agent exists
 		_, err := agentStore.GetAgent(r.Context(), id)
@@ -236,7 +244,12 @@ func handleCreatePairingCode(agentStore store.AgentStore, ps *PairingStore) http
 // handleRedeemPairingCode redeems a pairing code and returns the agent bundle.
 // GET /v1/dashboard/network/pair/{code}
 // UNAUTHENTICATED — the code IS the authentication.
-func handleRedeemPairingCode(agentStore store.AgentStore, ps *PairingStore, rl *redeemRateLimiter) http.HandlerFunc {
+func handleRedeemPairingCode(
+	agentStore store.AgentStore,
+	ps *PairingStore,
+	rl *redeemRateLimiter,
+	isRootIdentity func(string) bool,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// A successful response contains the Ed25519 agent key. Never let a
 		// browser or intermediary retain either success or error responses.
@@ -256,6 +269,12 @@ func handleRedeemPairingCode(agentStore store.AgentStore, ps *PairingStore, rl *
 
 		agentID, ok := ps.Consume(code)
 		if !ok {
+			writeError(w, http.StatusNotFound, "invalid, expired, or already used pairing code")
+			return
+		}
+		// Consume/burn first, then reject. This kills a pairing code issued
+		// before app-v23 activation without ever disclosing the Root seed.
+		if isRootIdentity != nil && isRootIdentity(agentID) {
 			writeError(w, http.StatusNotFound, "invalid, expired, or already used pairing code")
 			return
 		}
@@ -302,11 +321,20 @@ func (h *DashboardHandler) RegisterPairingRoutes(r chi.Router) {
 	if !ok {
 		return
 	}
-	r.Get("/v1/dashboard/network/pair/{code}", handleRedeemPairingCode(agentStore, h.Pairing, &redeemRateLimiter{}))
+	r.Get("/v1/dashboard/network/pair/{code}", handleRedeemPairingCode(
+		agentStore, h.Pairing, &redeemRateLimiter{}, h.appV23IsRootIdentity,
+	))
 }
 
 // registerPairingCreateRoute registers the authenticated pairing code creation route.
 // Called from RegisterNetworkRoutes (inside the auth middleware group).
-func registerPairingCreateRoute(r chi.Router, agentStore store.AgentStore, ps *PairingStore) {
-	r.Post("/v1/dashboard/network/agents/{id}/pair", handleCreatePairingCode(agentStore, ps))
+func registerPairingCreateRoute(
+	r chi.Router,
+	agentStore store.AgentStore,
+	ps *PairingStore,
+	isRootIdentity func(string) bool,
+) {
+	r.Post("/v1/dashboard/network/agents/{id}/pair", handleCreatePairingCode(
+		agentStore, ps, isRootIdentity,
+	))
 }
