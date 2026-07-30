@@ -127,6 +127,12 @@ const (
 	// GovPropose.Payload is the canonical versioned scope record template and
 	// TargetID must equal its ScopeID.
 	GovOpScopeAction GovProposalOp = 8
+	// GovOpMemoryHashReanchor (app-v24) repairs the canonical content hash of
+	// narrowly eligible terminal app-v23 memories whose historical lifecycle
+	// transition erased memory:<id>'s hash. The proposal Payload is the strict
+	// versioned binary MemoryHashReanchorPayload and TargetID is its
+	// domain-separated digest.
+	GovOpMemoryHashReanchor GovProposalOp = 9
 )
 
 // VoteDecision represents a validator's vote on a proposed memory.
@@ -396,6 +402,28 @@ type DomainReassign struct {
 type MemoryDomainRepairEntry struct {
 	MemoryID string `json:"memory_id"`
 	Domain   string `json:"domain"`
+}
+
+// MemoryHashReanchorPayload is the canonical app-v24 governance body for one
+// bounded, atomic memory-hash repair chunk. RootCredentialID and
+// RootGeneration bind the proposal to the exact current CEREBRUM Root
+// generation; consensus revalidates that authority when the operation is
+// wired into ABCI.
+type MemoryHashReanchorPayload struct {
+	Version          uint8
+	RootCredentialID string
+	RootGeneration   uint64
+	Entries          []MemoryHashReanchorEntry
+}
+
+// MemoryHashReanchorEntry repairs one terminal ordinary memory. ExpectedStatus
+// is part of the attested evidence, so a lifecycle change between proposal and
+// execution fails the complete chunk instead of silently repairing a different
+// state.
+type MemoryHashReanchorEntry struct {
+	MemoryID       string
+	ExpectedStatus string
+	ContentHash    []byte
 }
 
 // CoCommitCoauthor is one foreign counter-signer of a co-committed envelope.
