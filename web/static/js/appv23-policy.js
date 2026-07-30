@@ -47,15 +47,23 @@ export function appV23PolicyDraft(agent) {
     const role = profile === 'companion' || profile === 'read_only'
         ? 'member'
         : (agent.role === 'admin' || agent.role === 'manager' ? agent.role : 'member');
-    const federatedPipeRestriction = appV23FederatedPipeRestriction(agent.capabilities);
+    const baseCapabilities = profile === 'companion' ? 15 :
+        (profile === 'read_only' || role === 'admin') ? 1 : 0;
+    const recordedCapabilities = Number.isFinite(Number(agent.capabilities))
+        ? Math.max(0, Math.trunc(Number(agent.capabilities)))
+        : baseCapabilities;
+    // Preserve the independent pipe restriction only from an otherwise
+    // canonical named policy. Pending mask 30 and contradictory legacy mixes
+    // are review inputs, not permission overlays on a freshly chosen preset.
+    const federatedPipeRestriction =
+        (recordedCapabilities & ~APPV23_DENY_FEDERATED_PIPE) === baseCapabilities
+            ? appV23FederatedPipeRestriction(recordedCapabilities)
+            : 0;
     return {
         role,
         profile,
         clearance: role === 'admin' ? 4 : Math.max(0, Math.min(4, Number(agent.clearance ?? 1))),
-        capabilities: (
-            profile === 'companion' ? 15 :
-                (profile === 'read_only' || role === 'admin') ? 1 : 0
-        ) | federatedPipeRestriction,
+        capabilities: baseCapabilities | federatedPipeRestriction,
         home_domain: profile === 'read_only'
             ? (agent.home_domain || '')
             : (agent.home_domain || `agent-${String(agent.agent_id || '').slice(0, 12)}`),

@@ -55,11 +55,7 @@ test('Read-only is the explicit reviewed read-all profile without write authorit
         agent_id: 'abcdef',
         profile: 'read_only', role: 'member', capabilities: 30, clearance: 2,
     });
-    assert.equal(
-        draft.capabilities,
-        17,
-        'the independent federated-pipe restriction must survive profile normalization',
-    );
+    assert.equal(draft.capabilities, 1);
     assert.equal(draft.home_domain, '', 'Read-only must not invent a home domain');
 });
 
@@ -105,11 +101,7 @@ test('raw capability indicators are derived and read-only from named policy', ()
     const standard = appV23CapabilityIndicators({
         profile: 'standard', role: 'member', capabilities: 31, clearance: 2,
     });
-    assert.deepEqual(
-        standard.filter(item => item.enabled).map(item => item.bit),
-        [16],
-        'named policy removes contradictory bits but preserves the independent pipe restriction',
-    );
+    assert.equal(standard.every(item => item.enabled === false), true);
 
     const companion = appV23CapabilityIndicators({
         profile: 'companion', role: 'member', capabilities: 0, clearance: 2,
@@ -169,6 +161,17 @@ test('named policy editing preserves the independent federated-pipe hard restric
     assert.equal(
         appV23ProfileDefaults('read_only', 'member', companion.capabilities).capabilities,
         17,
+    );
+    assert.equal(
+        appV23PolicyDraft({
+            agent_id: 'pending-agent',
+            profile: '',
+            role: 'member',
+            clearance: 1,
+            capabilities: 30,
+        }).capabilities,
+        0,
+        'pending mask 30 must not turn the explicitly selected Companion preset into mask 31',
     );
 });
 
