@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/l33tdawg/sage/internal/store"
+	"github.com/l33tdawg/sage/internal/tx"
 )
 
 type testAppV23RootReader struct {
@@ -177,6 +178,12 @@ func TestCurrentUpgradeSigningKeyTracksRotatedRootBundle(t *testing.T) {
 	before, err := buildUpgradeProposeTx(cfg, 23)
 	require.NoError(t, err)
 	require.Equal(t, oldID, before.UpgradePropose.ProposerID)
+	beforeHeartbeatRaw, err := buildOperatorRegisterTx(cfg)
+	require.NoError(t, err)
+	beforeHeartbeat, err := tx.DecodeTx(beforeHeartbeatRaw)
+	require.NoError(t, err)
+	require.Equal(t, ed25519.PublicKey(oldKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(beforeHeartbeat.AgentPubKey))
+	require.Equal(t, ed25519.PublicKey(oldKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(beforeHeartbeat.PublicKey))
 
 	state.root = &store.AppV23RootState{
 		PrincipalID: oldID, CredentialID: newID, Generation: 2,
@@ -185,6 +192,12 @@ func TestCurrentUpgradeSigningKeyTracksRotatedRootBundle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, newID, after.UpgradePropose.ProposerID)
 	require.Equal(t, ed25519.PublicKey(newKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(after.AgentPubKey))
+	afterHeartbeatRaw, err := buildOperatorRegisterTx(cfg)
+	require.NoError(t, err)
+	afterHeartbeat, err := tx.DecodeTx(afterHeartbeatRaw)
+	require.NoError(t, err)
+	require.Equal(t, ed25519.PublicKey(newKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(afterHeartbeat.AgentPubKey))
+	require.Equal(t, ed25519.PublicKey(newKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(afterHeartbeat.PublicKey))
 }
 
 func TestCurrentUpgradeSigningKeyFailsClosedAfterRootRotation(t *testing.T) {

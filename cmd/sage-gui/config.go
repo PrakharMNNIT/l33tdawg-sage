@@ -341,6 +341,12 @@ func (cfg *Config) validate() error {
 	if bootstrap := cfg.VendoredAgentBootstrap; bootstrap != nil {
 		bootstrap.AgentKeyFile = strings.TrimSpace(bootstrap.AgentKeyFile)
 		bootstrap.HomeDomain = strings.TrimSpace(bootstrap.HomeDomain)
+		if cfg.Quorum.Enabled {
+			return errors.New("invalid config: vendored_agent_bootstrap requires personal mode (quorum.enabled must be false)")
+		}
+		if !cfg.Voter.Enabled {
+			return errors.New("invalid config: vendored_agent_bootstrap requires voter.enabled=true so the single validator can approve governed app-v24 activation")
+		}
 		if bootstrap.AgentKeyFile == "" {
 			return errors.New("invalid config: vendored_agent_bootstrap.agent_key_file is required")
 		}

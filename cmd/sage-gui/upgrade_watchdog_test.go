@@ -51,7 +51,8 @@ func newFakeCometRPC(t *testing.T) *fakeCometRPC {
 	})
 	mux.HandleFunc("/broadcast_tx_sync", func(w http.ResponseWriter, r *http.Request) {
 		f.broadcasts.Add(1)
-		if f.mintOnBroadcast.Load() {
+		code := f.broadcastCode.Load()
+		if f.mintOnBroadcast.Load() && code == 0 {
 			f.currentHeight.Add(1)
 		}
 		txHex := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
@@ -62,7 +63,7 @@ func newFakeCometRPC(t *testing.T) *fakeCometRPC {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"result": map[string]any{
-				"code": int(f.broadcastCode.Load()),
+				"code": int(code),
 				"hash": "DEADBEEF",
 				"log":  logStr,
 			},

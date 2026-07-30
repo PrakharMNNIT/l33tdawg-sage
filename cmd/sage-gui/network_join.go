@@ -24,6 +24,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -238,6 +239,18 @@ func doWipeAndAdopt(b NodeJoinBundle, genesisBytes []byte) error {
 	configDir := filepath.Join(cometHome, "config")
 	badgerPath := filepath.Join(home, "data", "badger")
 
+	// A direct-app-v23 first-party node is permanently personal-mode. Refuse
+	// before initCometBFTConfig or any genesis/state/projection write: discovering
+	// the contradiction after adoption would leave a deliberately unbootable
+	// config on top of already-wiped local chain state.
+	cfg, err := LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config before network join: %w", err)
+	}
+	if transitionErr := rejectVendoredQuorumTransition(cfg); transitionErr != nil {
+		return transitionErr
+	}
+
 	// Ensure this node has its own CometBFT identity (node key + validator key).
 	// A brand-new joiner has none; initCometBFTConfig creates them and seeds a
 	// throwaway local genesis we immediately overwrite below.
@@ -277,10 +290,6 @@ func doWipeAndAdopt(b NodeJoinBundle, genesisBytes []byte) error {
 
 	// Point config at the host: quorum mode (p2p peers + 0.0.0.0 binds), the
 	// host as our sole persistent peer, and the adopted chain_id.
-	cfg, err := LoadConfig()
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
 	cfg.Quorum.Enabled = true
 	cfg.Quorum.Peers = []string{b.HostPeer}
 	cfg.ChainID = b.ChainID
@@ -365,6 +374,13 @@ func pendingJoinPath() string {
 // WritePendingJoin persists a decrypted bundle for apply-on-next-restart.
 // Exported so the web guest-ceremony driver can call it via a callback.
 func WritePendingJoin(bundleJSON []byte) error {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config before staging network join: %w", err)
+	}
+	if transitionErr := rejectVendoredQuorumTransition(cfg); transitionErr != nil {
+		return transitionErr
+	}
 	// Validate before persisting so we never stage a bundle that would fail at
 	// startup (and brick boot).
 	b, err := parseNodeJoinBundleJSON(bundleJSON)
@@ -426,6 +442,14 @@ func applyPendingJoinAtStartup(logger zerolog.Logger) (bool, error) {
 		return false, nil
 	}
 	if adoptErr := doWipeAndAdopt(b, genesisBytes); adoptErr != nil {
+		if errors.Is(adoptErr, errVendoredQuorumTransition) {
+			logger.Warn().Err(adoptErr).
+				Msg("pending network join is permanently incompatible with this first-party companion — discarding")
+			if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+				return false, fmt.Errorf("discard incompatible pending join: %w", removeErr)
+			}
+			return false, nil
+		}
 		// Leave the pending file in place so a transient failure retries next boot.
 		return false, fmt.Errorf("apply pending join: %w", adoptErr)
 	}

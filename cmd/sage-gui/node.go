@@ -754,6 +754,11 @@ func runServe(startupProof string) (rerr error) {
 	if badgerStore == nil {
 		return errors.New("normal-serving SAGE app has no Badger store")
 	}
+	// One authoritative inventory for every current-Root operation. In
+	// particular, the exact app-owned vendored key path may live outside the
+	// conventional ~/.sage key directories; readiness and the upgrade watchdog
+	// must agree on whether that credential is locally held.
+	resolveLocalAgentKey := localAgentKeyResolverForConfig(cfg)
 	// Fresh direct-v23 Init has now completed, and a state-sync receiver has been
 	// sealed. Verify immutable vendored provenance before sidecars, migrations,
 	// watchdogs, voters, or serving workers start. The companion remains
@@ -764,7 +769,7 @@ func runServe(startupProof string) (rerr error) {
 		verifyVendoredEnrollment := func() error {
 			return verifyAppV23VendoredAgentReadiness(
 				cfg.VendoredAgentBootstrap,
-				localAgentKeyResolverWithOperator(cfg.AgentKey),
+				resolveLocalAgentKey,
 				badgerStore,
 			)
 		}
@@ -1024,23 +1029,6 @@ func runServe(startupProof string) (rerr error) {
 			"reconcile consensus agent serving projection: %w",
 			migrationErr,
 		)
-	}
-
-	// Resolve every local agent credential this machine actually holds. This is
-	// constructed before the upgrade watchdog because app-v23 Root rotation must
-	// take effect for unattended governance immediately, without a process
-	// restart or a fallback to the historical genesis agent.key.
-	baseAgentKeyResolver := localAgentKeyResolverWithOperator(cfg.AgentKey)
-	resolveLocalAgentKey := func(agentID string) (ed25519.PrivateKey, bool) {
-		if bootstrap := cfg.VendoredAgentBootstrap; bootstrap != nil {
-			if key, ok := parseKeyFile(bootstrap.AgentKeyFile); ok {
-				if public, publicOK := key.Public().(ed25519.PublicKey); publicOK &&
-					hex.EncodeToString(public) == agentID {
-					return key, true
-				}
-			}
-		}
-		return baseAgentKeyResolver(agentID)
 	}
 
 	// v7.5 upgrade watchdog: auto-propose an UpgradePlan when the
@@ -1354,8 +1342,7 @@ func runServe(startupProof string) (rerr error) {
 		return SaveConfig(cfg)
 	}
 	dashboard.SetNetworkMode = func(enabled bool) error {
-		cfg.Quorum.Enabled = enabled
-		return SaveConfig(cfg)
+		return setNetworkMode(cfg, enabled)
 	}
 	// Federation on/off, surfaced in Settings (the toggle re-execs to start/stop
 	// the inbound mTLS listener). Outbound recall/receipt delivery is unaffected.

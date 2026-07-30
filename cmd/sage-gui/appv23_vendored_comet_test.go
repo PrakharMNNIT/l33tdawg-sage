@@ -279,23 +279,32 @@ func runVendoredAgentRealCometHandshake(t *testing.T, encrypted bool) {
 		exactVendoredKeyResolver(rootKeyPath),
 		badgerStore,
 	))
-	// Model the already-governed single-validator app-v24 plan. The first
-	// Companion submit deliberately lands at activation height H: it must be
-	// rejected under app-v23 semantics while advancing the consensus protocol.
-	// Replaying the unchanged transaction at H+1 is the first safe write.
+	rootKey, ok := parseKeyFile(rootKeyPath)
+	require.True(t, ok)
+	// Model the already-governed single-validator app-v24 plan. A
+	// production-built current-Root heartbeat enters the mempool at activation
+	// height H, fails execution because Root is never an ordinary agent, and
+	// still advances the protocol to app-v24. The Companion transaction at H+1
+	// is then the first safe write.
 	require.NoError(t, badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
 		Name: tx.CanonicalUpgradeName(24), TargetAppVersion: 24,
 		ActivationHeight: 1, ProposedAt: 0,
 	}))
 	rawMemory := vendoredFirstMemoryRaw(t, bootstrap)
+	heartbeatRaw, err := buildOperatorRegisterTx(upgradeWatchdogConfig{
+		ResolveSigningKey: func() (ed25519.PrivateKey, error) {
+			return rootKey, nil
+		},
+	})
+	require.NoError(t, err)
 	activation, err := rpcEnvironment.BroadcastTxCommit(
 		&rpctypes.Context{},
-		cmttypes.Tx(rawMemory),
+		cmttypes.Tx(heartbeatRaw),
 	)
 	require.NoError(t, err)
 	require.Zero(t, activation.CheckTx.Code, activation.CheckTx.Log)
-	require.Equal(t, uint32(11), activation.TxResult.Code)
-	require.Contains(t, activation.TxResult.Log, "require governed app-v24 activation")
+	require.Equal(t, uint32(110), activation.TxResult.Code)
+	require.Equal(t, "access denied", activation.TxResult.Log)
 	status, err = rpcEnvironment.Status(nil)
 	require.NoError(t, err)
 	require.Equal(t, sageabci.AppV23GenesisAppVersion, status.NodeInfo.ProtocolVersion.App,
@@ -318,8 +327,6 @@ func runVendoredAgentRealCometHandshake(t *testing.T, encrypted bool) {
 	require.Equal(t, bootstrap.HomeDomain, projected.DomainTag)
 	_, _, err = badgerStore.GetMemoryHash(memoryID)
 	require.NoError(t, err)
-	rootKey, ok := parseKeyFile(rootKeyPath)
-	require.True(t, ok)
 	originalTransportBytes, err := os.ReadFile(rootKeyPath)
 	require.NoError(t, err)
 	rootState, err := badgerStore.GetAppV23Root()

@@ -109,6 +109,119 @@ func TestPendingPlanPump_PumpsQuiescentChainToActivation(t *testing.T) {
 	}
 }
 
+func TestPendingPlanPump_CheckTxRejectionDoesNotAdvanceFakeChain(t *testing.T) {
+	rpc := newFakeCometRPC(t)
+	rpc.currentVersion.Store(23)
+	rpc.currentHeight.Store(100)
+	rpc.mintOnBroadcast.Store(true)
+	rpc.broadcastCode.Store(60)
+	rpc.setLog("access denied before mempool admission")
+
+	cfg := pumpTestConfig(t, rpc, func() (*store.UpgradePlanRecord, error) {
+		return &store.UpgradePlanRecord{
+			Name: "app-v24", TargetAppVersion: 24, ActivationHeight: 103,
+		}, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !startPendingPlanPump(ctx, cfg) {
+		t.Fatal("startPendingPlanPump refused valid test configuration")
+	}
+	if !waitForCondition(time.Second, func() bool { return rpc.broadcasts.Load() >= 3 }) {
+		t.Fatalf("pump did not attempt rejected heartbeats; broadcasts=%d", rpc.broadcasts.Load())
+	}
+	if got := rpc.currentHeight.Load(); got != 100 {
+		t.Fatalf("fake chain advanced on CheckTx rejection: height=%d, want 100", got)
+	}
+}
+
+// TestPendingPlanPump_UsesDynamicRootResolver pins the runServe/app-v23 wiring:
+// the pump has no static AgentKey after Root-aware governance is configured, so
+// every heartbeat must resolve and sign with the current Root credential.
+func TestPendingPlanPump_UsesDynamicRootResolver(t *testing.T) {
+	rpc := newFakeCometRPC(t)
+	rpc.currentVersion.Store(23)
+	rpc.currentHeight.Store(100)
+	rpc.mintOnBroadcast.Store(true)
+
+	_, rootKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen Root key: %v", err)
+	}
+	pendingPlan := func() (*store.UpgradePlanRecord, error) {
+		if rpc.currentHeight.Load() >= 103 {
+			return nil, store.ErrNoUpgradePlan
+		}
+		return &store.UpgradePlanRecord{
+			Name: "app-v24", TargetAppVersion: 24, ActivationHeight: 103,
+		}, nil
+	}
+	cfg := pumpTestConfig(t, rpc, pendingPlan)
+	cfg.AgentKey = nil
+	cfg.ResolveSigningKey = func() (ed25519.PrivateKey, error) {
+		return rootKey, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !startPendingPlanPump(ctx, cfg) {
+		t.Fatal("startPendingPlanPump refused resolver-only current-Root signing")
+	}
+	if !waitForCondition(5*time.Second, func() bool { return rpc.currentHeight.Load() >= 103 }) {
+		t.Fatalf("resolver-only pump did not reach activation; height=%d broadcasts=%d",
+			rpc.currentHeight.Load(), rpc.broadcasts.Load())
+	}
+
+	txHexPtr := rpc.lastTxHex.Load()
+	if txHexPtr == nil {
+		t.Fatal("resolver-only pump did not broadcast a heartbeat")
+	}
+	raw, err := hex.DecodeString(*txHexPtr)
+	if err != nil {
+		t.Fatalf("decode tx hex: %v", err)
+	}
+	parsed, err := tx.DecodeTx(raw)
+	if err != nil {
+		t.Fatalf("decode heartbeat: %v", err)
+	}
+	rootPublic := rootKey.Public().(ed25519.PublicKey)
+	if got := ed25519.PublicKey(parsed.AgentPubKey); !got.Equal(rootPublic) {
+		t.Errorf("agent-proof signer = %x, want current Root %x", got, rootPublic)
+	}
+	if got := ed25519.PublicKey(parsed.PublicKey); !got.Equal(rootPublic) {
+		t.Errorf("outer signer = %x, want current Root %x", got, rootPublic)
+	}
+}
+
+// TestPendingPlanPump_ResolverFailureNeverFallsBackToStaticKey prevents a
+// rotated/missing current Root from silently reviving a stale agent.key. The
+// dynamic resolver is authoritative whenever configured.
+func TestPendingPlanPump_ResolverFailureNeverFallsBackToStaticKey(t *testing.T) {
+	rpc := newFakeCometRPC(t)
+	rpc.currentVersion.Store(23)
+	rpc.currentHeight.Store(100)
+	rpc.mintOnBroadcast.Store(true)
+
+	cfg := pumpTestConfig(t, rpc, func() (*store.UpgradePlanRecord, error) {
+		return &store.UpgradePlanRecord{
+			Name: "app-v24", TargetAppVersion: 24, ActivationHeight: 103,
+		}, nil
+	})
+	cfg.ResolveSigningKey = func() (ed25519.PrivateKey, error) {
+		return nil, errors.New("current Root key is not held on this machine")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !startPendingPlanPump(ctx, cfg) {
+		t.Fatal("pump should arm when a dynamic signing source is configured")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := rpc.broadcasts.Load(); got != 0 {
+		t.Fatalf("resolver failure fell back to stale AgentKey and broadcast %d heartbeats", got)
+	}
+}
+
 // TestPendingPlanPump_IdleWithoutPlan asserts the pump never heartbeats a
 // chain with no pending plan, quiescent or not.
 func TestPendingPlanPump_IdleWithoutPlan(t *testing.T) {
@@ -146,10 +259,10 @@ func TestPendingPlanPump_StalePlanIsNotPumped(t *testing.T) {
 	}
 }
 
-// TestStartPendingPlanPump_RequiresKeyAndAccessor asserts the pump refuses to
-// start without a signing key (heartbeats are signed txs) or without the
-// in-process pending-plan accessor (CLI contexts).
-func TestStartPendingPlanPump_RequiresKeyAndAccessor(t *testing.T) {
+// TestStartPendingPlanPump_RequiresSigningSourceAndAccessor asserts the pump
+// refuses to start without either signing source or without the in-process
+// pending-plan accessor (CLI contexts).
+func TestStartPendingPlanPump_RequiresSigningSourceAndAccessor(t *testing.T) {
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -159,6 +272,14 @@ func TestStartPendingPlanPump_RequiresKeyAndAccessor(t *testing.T) {
 	}
 	if startPendingPlanPump(ctx, upgradeWatchdogConfig{Logger: zerolog.Nop(), AgentKey: priv}) {
 		t.Error("pump started without a pending-plan accessor")
+	}
+	if startPendingPlanPump(ctx, upgradeWatchdogConfig{
+		Logger: zerolog.Nop(),
+		ResolveSigningKey: func() (ed25519.PrivateKey, error) {
+			return priv, nil
+		},
+	}) {
+		t.Error("resolver-only pump started without a pending-plan accessor")
 	}
 }
 

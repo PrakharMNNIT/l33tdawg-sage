@@ -82,6 +82,14 @@ func runQuorumInit() error {
 	cometHome := filepath.Join(home, "data", "cometbft")
 	configDir := filepath.Join(cometHome, "config")
 
+	cfg, err := LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config before quorum init: %w", err)
+	}
+	if transitionErr := rejectVendoredQuorumTransition(cfg); transitionErr != nil {
+		return transitionErr
+	}
+
 	// Parse args
 	name := "node0"
 	address := ""
@@ -226,6 +234,17 @@ func runQuorumJoin() error {
 	home := SageHome()
 	cometHome := filepath.Join(home, "data", "cometbft")
 	configDir := filepath.Join(cometHome, "config")
+
+	// Vendored direct-app-v23 nodes use federation, never quorum adoption.
+	// This gate must precede key generation, genesis replacement, state wipes,
+	// and TLS/config writes.
+	cfg, err := LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config before quorum join: %w", err)
+	}
+	if transitionErr := rejectVendoredQuorumTransition(cfg); transitionErr != nil {
+		return transitionErr
+	}
 
 	// Parse args
 	manifestPath := ""
@@ -444,10 +463,6 @@ func runQuorumJoin() error {
 	}
 
 	// Update config.yaml with quorum settings
-	cfg, err := LoadConfig()
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
 	cfg.Quorum.Enabled = true
 	cfg.Quorum.Peers = peers
 	cfg.ChainID = peerManifest.ChainID // record the adopted federated chain_id

@@ -93,6 +93,33 @@ func localAgentKeyResolverWithOperator(operatorKeyPath string) func(agentID stri
 	return localAgentKeyResolverWithOperatorCache(operatorKeyPath, time.Second, time.Now)
 }
 
+// localAgentKeyResolverForConfig extends the ordinary local-key inventory with
+// the exact first-party application-owned key path. The path is intentionally
+// unconstrained: a bundled application may keep its credential outside
+// ~/.sage/{agents,identities,bundles}. Readiness and unattended governance must
+// use this same resolver so a legitimate Root handover cannot work live and
+// then fail on restart.
+func localAgentKeyResolverForConfig(cfg *Config) func(agentID string) (ed25519.PrivateKey, bool) {
+	operatorKeyPath := ""
+	if cfg != nil {
+		operatorKeyPath = cfg.AgentKey
+	}
+	base := localAgentKeyResolverWithOperator(operatorKeyPath)
+	return func(agentID string) (ed25519.PrivateKey, bool) {
+		if cfg != nil {
+			if bootstrap := cfg.VendoredAgentBootstrap; bootstrap != nil {
+				if key, ok := parseKeyFile(bootstrap.AgentKeyFile); ok {
+					if public, publicOK := key.Public().(ed25519.PublicKey); publicOK &&
+						hex.EncodeToString(public) == agentID {
+						return key, true
+					}
+				}
+			}
+		}
+		return base(agentID)
+	}
+}
+
 type localAgentKeyCacheEntry struct {
 	key       ed25519.PrivateKey
 	found     bool
