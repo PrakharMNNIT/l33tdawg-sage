@@ -807,6 +807,94 @@ test('the real-Comet firewall proof allows one symmetric endpoint to count the r
   }
 });
 
+test('the real-Comet fixture proves full mesh recovery before the 2+2 split', () => {
+  const helperStart = v119Chaos.indexOf('wait_full_peer_mesh() {');
+  const helperEnd = v119Chaos.indexOf('\n}\n\ninstall_partition_firewall()', helperStart);
+  const helper = v119Chaos.slice(helperStart, helperEnd);
+  const healedAppHash = v119Chaos.indexOf(
+    'assert_matched_apphash "post-one-validator partition" 180',
+  );
+  const healedAppVersion = v119Chaos.indexOf('wait_all_app_version 23 180', healedAppHash);
+  const recoveryCall = v119Chaos.indexOf('wait_full_peer_mesh 90 2', healedAppVersion);
+  const recoveredMesh = v119Chaos.indexOf(
+    'proved the full peer mesh recovered before the next partition',
+    healedAppVersion,
+  );
+  const faultTwo = v119Chaos.indexOf(
+    '--- fault 2: post-removal stable-IP 2+2 split',
+    recoveredMesh,
+  );
+  const firstFirewallAfterHeal = v119Chaos.indexOf('\ninstall_partition_firewall ', healedAppVersion);
+  const exactFirstFaultTwoFirewall = v119Chaos.indexOf(
+    '\ninstall_partition_firewall cometbft0 "${COMET_IPS[2]}" "${COMET_IPS[3]}"',
+    healedAppVersion,
+  );
+
+  assert.ok(
+    helperStart >= 0 &&
+      helperEnd > helperStart &&
+      healedAppHash >= 0 &&
+      healedAppVersion > healedAppHash &&
+      recoveryCall > healedAppVersion &&
+      recoveredMesh > recoveryCall &&
+      faultTwo > recoveredMesh &&
+      firstFirewallAfterHeal > faultTwo,
+  );
+  assert.equal(
+    firstFirewallAfterHeal,
+    exactFirstFaultTwoFirewall,
+    'the first firewall after healing must be the exact opening mutation of fault 2',
+  );
+  const recoveryWindow = v119Chaos.slice(healedAppVersion, recoveredMesh);
+  assert.equal(
+    (recoveryWindow.match(/wait_full_peer_mesh 90 2/g) || []).length,
+    1,
+    'fault 2 must have one bounded two-round full-mesh precondition',
+  );
+  assert.ok(
+    v119Chaos.slice(recoveredMesh, firstFirewallAfterHeal).includes(
+      '--- fault 2: post-removal stable-IP 2+2 split',
+    ),
+    'the full-mesh proof must precede the first actual fault-2 firewall mutation',
+  );
+
+  for (const exactLine of [
+    'expected0=$(expected_peer_ids "${NODE_IDS[1]}" "${NODE_IDS[2]}" "${NODE_IDS[3]}")',
+    'expected1=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[2]}" "${NODE_IDS[3]}")',
+    'expected2=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[1]}" "${NODE_IDS[3]}")',
+    'expected3=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[1]}" "${NODE_IDS[2]}")',
+    'actual0=$(rpc_peer_ids "${RPC_PORTS[0]}" 2>/dev/null || echo ERROR)',
+    'actual1=$(rpc_peer_ids "${RPC_PORTS[1]}" 2>/dev/null || echo ERROR)',
+    'actual2=$(rpc_peer_ids "${RPC_PORTS[2]}" 2>/dev/null || echo ERROR)',
+    'actual3=$(rpc_peer_ids "${RPC_PORTS[3]}" 2>/dev/null || echo ERROR)',
+  ]) {
+    assert.equal(
+      (helper.match(new RegExp(exactLine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || [])
+        .length,
+      1,
+      `full-mesh helper must retain exactly one ${exactLine}`,
+    );
+  }
+  const exactSamplingBlock = `while [ "\${SECONDS}" -lt "\${deadline}" ]; do
+    actual0=$(rpc_peer_ids "\${RPC_PORTS[0]}" 2>/dev/null || echo ERROR)
+    actual1=$(rpc_peer_ids "\${RPC_PORTS[1]}" 2>/dev/null || echo ERROR)
+    actual2=$(rpc_peer_ids "\${RPC_PORTS[2]}" 2>/dev/null || echo ERROR)
+    actual3=$(rpc_peer_ids "\${RPC_PORTS[3]}" 2>/dev/null || echo ERROR)
+    if [ "\${actual0}" = "\${expected0}" ] &&
+       [ "\${actual1}" = "\${expected1}" ] &&
+       [ "\${actual2}" = "\${expected2}" ] &&
+       [ "\${actual3}" = "\${expected3}" ]; then`;
+  assert.ok(
+    helper.includes(exactSamplingBlock),
+    'every fresh RPC snapshot must be sampled inside the bounded loop immediately before comparison',
+  );
+  assert.match(
+    helper,
+    /consecutive=\$\(\(consecutive \+ 1\)\)[\s\S]*?\[ "\$\{consecutive\}" -ge "\$\{required_rounds\}" \][\s\S]*?else[\s\S]*?consecutive=0/,
+    'one bounded sampling loop must observe every exact peer set in two consecutive rounds',
+  );
+});
+
 test('all private artifacts converge at one publication gate', () => {
   assert.match(job('goreleaser-prepare'), /release --clean --skip=publish/);
   assert.doesNotMatch(job('docker-image'), /push:\s+true/);

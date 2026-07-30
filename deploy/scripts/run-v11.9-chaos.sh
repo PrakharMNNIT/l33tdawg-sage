@@ -1047,6 +1047,43 @@ wait_exact_peer_set() {
   return 1
 }
 
+wait_full_peer_mesh() {
+  local timeout=${1:-90}
+  local required_rounds=${2:-2}
+  local deadline=$((SECONDS + timeout))
+  local consecutive=0
+  local expected0 expected1 expected2 expected3
+  local actual0=ERROR actual1=ERROR actual2=ERROR actual3=ERROR
+  expected0=$(expected_peer_ids "${NODE_IDS[1]}" "${NODE_IDS[2]}" "${NODE_IDS[3]}")
+  expected1=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[2]}" "${NODE_IDS[3]}")
+  expected2=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[1]}" "${NODE_IDS[3]}")
+  expected3=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[1]}" "${NODE_IDS[2]}")
+
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    actual0=$(rpc_peer_ids "${RPC_PORTS[0]}" 2>/dev/null || echo ERROR)
+    actual1=$(rpc_peer_ids "${RPC_PORTS[1]}" 2>/dev/null || echo ERROR)
+    actual2=$(rpc_peer_ids "${RPC_PORTS[2]}" 2>/dev/null || echo ERROR)
+    actual3=$(rpc_peer_ids "${RPC_PORTS[3]}" 2>/dev/null || echo ERROR)
+    if [ "${actual0}" = "${expected0}" ] &&
+       [ "${actual1}" = "${expected1}" ] &&
+       [ "${actual2}" = "${expected2}" ] &&
+       [ "${actual3}" = "${expected3}" ]; then
+      consecutive=$((consecutive + 1))
+      if [ "${consecutive}" -ge "${required_rounds}" ]; then
+        echo "all four RPCs reported the exact full peer mesh for ${consecutive} consecutive rounds"
+        return 0
+      fi
+    else
+      consecutive=0
+    fi
+    sleep 1
+  done
+
+  echo "ERROR: full peer mesh did not remain exact for ${required_rounds} consecutive rounds within ${timeout}s" >&2
+  echo "ERROR: RPC peer snapshots: 0=${actual0} 1=${actual1} 2=${actual2} 3=${actual3}" >&2
+  return 1
+}
+
 install_partition_firewall() {
   local service=$1
   shift
@@ -1705,6 +1742,8 @@ for service in cometbft0 cometbft1 cometbft2 cometbft3; do
 done
 assert_matched_apphash "post-one-validator partition" 180
 wait_all_app_version 23 180
+wait_full_peer_mesh 90 2
+echo "proved the full peer mesh recovered before the next partition"
 
 echo "--- fault 2: post-removal stable-IP 2+2 split must halt both live halves ---"
 install_partition_firewall cometbft0 "${COMET_IPS[2]}" "${COMET_IPS[3]}"
