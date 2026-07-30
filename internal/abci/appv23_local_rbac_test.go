@@ -754,6 +754,53 @@ func TestAppV23LocalApprovalCannotStealActiveHomeThroughProcessTx(t *testing.T) 
 	require.NoError(t, app.badgerStore.ValidateAppV23State())
 }
 
+func TestAppV23LocalApprovalAcceptsCompanionWithFederatedMessagingDisabled(t *testing.T) {
+	app := setupTestApp(t)
+	rootKey := newAgentKey(t)
+	companionKey := newAgentKey(t)
+	registerAppV23Agent(t, app, rootKey, store.AppV23RoleAdmin, 1, 0)
+	registerAppV23Agent(
+		t, app, companionKey, store.AppV23RoleMember, 2,
+		store.DefaultSelfRegisteredAgentCapabilities,
+	)
+	require.NoError(t, app.badgerStore.EnsureAppV23Root("companion-approval-scope", 10))
+	app.appV23AppliedHeight = 10
+
+	enrollment, err := app.badgerStore.GetAppV23Enrollment(companionKey.id)
+	require.NoError(t, err)
+	role, err := app.badgerStore.GetAppV23Role(companionKey.id)
+	require.NoError(t, err)
+	approval := &tx.LocalAgentApprove{
+		AgentID: companionKey.id, Active: true, Role: store.AppV23RoleMember,
+		Profile: store.AppV23ProfileCompanion, HomeDomain: "voice-interface",
+		Clearance: 1, Capabilities: uint32(
+			store.AgentCapabilities(15) | store.AgentCapabilityDenyFederatedPipe,
+		),
+		ExpectedRevision: enrollment.Revision, ExpectedRoleRevision: role.Revision,
+		Scope: "companion-approval-scope",
+	}
+	approval.TargetSignature = ed25519.Sign(
+		companionKey.priv, tx.LocalAgentApprovalSignBytes(rootKey.id, approval),
+	)
+	pub, sig, bodyHash, ts := signAgentProof(t, rootKey, []byte("approve-companion-no-pipe"))
+	parsed := &tx.ParsedTx{
+		Type: tx.TxTypeLocalAgentApprove, LocalAgentApprove: approval,
+		AgentPubKey: pub, AgentSig: sig, AgentBodyHash: bodyHash, AgentTimestamp: ts,
+	}
+	signAppV23Outer(t, parsed, rootKey, 1)
+
+	result := app.processTx(parsed, 11, appV23BlockTime())
+	require.Zero(t, result.Code, result.Log)
+	approved, err := app.badgerStore.GetAppV23Enrollment(companionKey.id)
+	require.NoError(t, err)
+	require.Equal(
+		t,
+		store.AgentCapabilities(15)|store.AgentCapabilityDenyFederatedPipe,
+		approved.Capabilities,
+	)
+	require.NoError(t, app.badgerStore.ValidateAppV23State())
+}
+
 func TestAppV23RoleChangeCannotExitReadOnlyWithoutHomeThroughProcessTx(t *testing.T) {
 	app := setupTestApp(t)
 	rootKey := newAgentKey(t)
