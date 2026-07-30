@@ -37,6 +37,9 @@ func writeFakeChild(t *testing.T, dir string) string {
 	}
 	path := filepath.Join(dir, "fake-sage-gui")
 	script := `#!/bin/sh
+if [ -n "$SPAWN_MARKER" ]; then
+  echo spawned > "$SPAWN_MARKER"
+fi
 case "$FAKE_CHILD_MODE" in
   exit0)
     exit 0
@@ -445,11 +448,11 @@ exit 1
 	}
 }
 
-func TestSupervisor_HaltTriggersRollback(t *testing.T) {
+func TestSupervisor_HaltRefusesAutomaticRollback(t *testing.T) {
 	cfg, _ := newTestSupervisor(t)
 
-	// Pre-populate the snapshots dir with an anchor for v7.1.0.
-	snapDir := makeSnapshot(t, cfg.SnapshotsDir, "100", "v7.1.0", 100)
+	// Even a valid rollback anchor cannot authorize automatic mutation.
+	_ = makeSnapshot(t, cfg.SnapshotsDir, "100", "v7.1.0", 100)
 
 	t.Setenv("FAKE_CHILD_MODE", "halt")
 	t.Setenv("HALT_PATH", filepath.Join(cfg.DataDir, "HALT"))
@@ -463,28 +466,93 @@ func TestSupervisor_HaltTriggersRollback(t *testing.T) {
 	defer cancel()
 	code := cfg.Run(ctx)
 
-	if code != 0 {
-		t.Fatalf("expected exit 0 (rollback dispatched), got %d", code)
+	if code == 0 {
+		t.Fatalf("expected non-zero refusal, got %d", code)
 	}
-	if !rest.wasCalled() {
-		t.Fatal("restorer was not called")
+	if rest.wasCalled() {
+		t.Fatal("restorer must not be called automatically")
 	}
-	if rest.snapshotDir != snapDir {
-		t.Fatalf("restorer wrong snapshot: got %s want %s", rest.snapshotDir, snapDir)
+	if exe.wasCalled() {
+		t.Fatal("old binary must not be executed automatically")
 	}
-	if rest.dataDir != cfg.DataDir {
-		t.Fatalf("restorer wrong dataDir: got %s want %s", rest.dataDir, cfg.DataDir)
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "HALT")); err != nil {
+		t.Fatalf("HALT evidence must remain for operator diagnosis: %v", err)
 	}
-	if !exe.wasCalled() {
-		t.Fatal("execer was not called")
+}
+
+func TestSupervisor_PreexistingHaltRefusesBeforeSpawn(t *testing.T) {
+	cfg, _ := newTestSupervisor(t)
+	spawnMarker := filepath.Join(cfg.SageHome, "spawned")
+	t.Setenv("SPAWN_MARKER", spawnMarker)
+	t.Setenv("FAKE_CHILD_MODE", "exit0")
+	haltPath := filepath.Join(cfg.DataDir, "HALT")
+	if err := os.WriteFile(haltPath, []byte(`{"failed_version":"v11.16.0"}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	binName := "sage-gui-v7.1.0"
+
+	rest := &recordingRestorer{}
+	exe := &stubExecer{}
+	cfg.Restorer = rest
+	cfg.Execer = exe
+
+	if code := cfg.Run(context.Background()); code == 0 {
+		t.Fatalf("expected non-zero refusal, got %d", code)
+	}
+	if rest.wasCalled() || exe.wasCalled() {
+		t.Fatal("pre-existing HALT must not restore state or execute an old binary")
+	}
+	if _, err := os.Stat(spawnMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("child must not spawn while HALT exists: %v", err)
+	}
+	if _, err := os.Stat(haltPath); err != nil {
+		t.Fatalf("HALT evidence must be preserved: %v", err)
+	}
+}
+
+func TestSupervisor_PreexistingHaltWrongKindOrDanglingRefusesBeforeSpawn(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		binName += ".exe"
+		t.Skip("dangling symlink setup requires Unix-like symlink semantics")
 	}
-	want := filepath.Join(snapDir, "binary", binName)
-	if exe.argv0 != want {
-		t.Fatalf("execer argv0: got %s want %s", exe.argv0, want)
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, path string)
+	}{
+		{
+			name: "directory",
+			make: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "dangling-symlink",
+			make: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Symlink(filepath.Join(filepath.Dir(path), "missing-target"), path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, _ := newTestSupervisor(t)
+			spawnMarker := filepath.Join(cfg.SageHome, "spawned")
+			t.Setenv("SPAWN_MARKER", spawnMarker)
+			t.Setenv("FAKE_CHILD_MODE", "exit0")
+			tc.make(t, cfg.haltPath())
+
+			if code := cfg.Run(context.Background()); code == 0 {
+				t.Fatalf("expected non-zero refusal, got %d", code)
+			}
+			if _, err := os.Stat(spawnMarker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("child must not spawn for %s HALT evidence: %v", tc.name, err)
+			}
+			if _, err := os.Lstat(cfg.haltPath()); err != nil {
+				t.Fatalf("HALT evidence must be preserved: %v", err)
+			}
+		})
 	}
 }
 

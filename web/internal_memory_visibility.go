@@ -91,7 +91,7 @@ func (h *DashboardHandler) cerebrumVisibleStats(ctx context.Context) (*store.Sto
 	if !h.appV23IsActive() {
 		return h.legacyCerebrumVisibleStats(ctx)
 	}
-	stats, _, err := h.cerebrumVisibleStatsAndActivity(ctx)
+	stats, _, _, err := h.cerebrumVisibleStatsAndActivity(ctx)
 	return stats, err
 }
 

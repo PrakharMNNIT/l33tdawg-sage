@@ -68,7 +68,7 @@ func main() {
 				err = web.RestartProcess(execPath)
 			}
 		}
-		if err != nil && lock != nil {
+		if shouldAttemptUpdateRollback(err) && lock != nil {
 			if execPath, pathErr := os.Executable(); pathErr == nil {
 				if resolved, resolveErr := filepath.EvalSymlinks(execPath); resolveErr == nil {
 					execPath = resolved
@@ -150,6 +150,14 @@ func main() {
 	}
 }
 
+// Automatic executable rollback is disabled at the v11.16.1 safety boundary.
+// Any prior binary may still contain the retired destructive migration/remint
+// startup paths, so a later unrelated startup error must never restart it.
+func shouldAttemptUpdateRollback(err error) bool {
+	_ = err
+	return false
+}
+
 func serveExitCode(err error) int {
 	if errors.Is(err, errInstanceLockHeld) {
 		return nativeShellAlreadyRunningExitCode
@@ -216,7 +224,7 @@ Commands:
   snapshot  List or prune on-disk chain snapshots (list | prune [--keep N])
   upgrade   Activate app-version consensus forks (status | propose --target N)
   recover   Reset vault passphrase using your recovery key
-  repair-chain  Recover a personal chain stranded at the upgrade admin-gate (issue #52); rebuilds consensus state, preserves memories
+  repair-chain  Disabled: SQLite cannot reconstruct canonical chain history; restore a complete stopped-node backup
   quorum-init   Initialize a quorum network (generates shared genesis)
   quorum-join   Join a quorum network (imports genesis from another node)
   pair          Join a SAGE network on your LAN as a non-validator peer (sage-gui pair <token>)

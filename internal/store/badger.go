@@ -49,6 +49,12 @@ var ErrAccessGrantNotFound = errors.New("access grant not found")
 // canonical memory:<id> record does not exist.
 var ErrMemoryNotFound = errors.New("memory not found")
 
+// ErrMemoryDisclosureNotFound identifies the narrow case where a serving row
+// has no canonical memory:<id> disclosure envelope at all. Broad readers may
+// omit that row only while explicitly reporting degraded projection state;
+// exact reads and every other projection error must still fail.
+var ErrMemoryDisclosureNotFound = errors.New("memory disclosure state not found")
+
 // ErrMemoryHashUnavailable marks a structurally valid legacy memory:<id> entry
 // whose content hash was erased. It is distinct from ErrMemoryHashMalformed. A
 // caller must re-anchor that memory before attempting a hash-preserving status
@@ -1042,7 +1048,7 @@ func (s *BadgerStore) GetMemoryDisclosureState(memoryID string) (*MemoryDisclosu
 		return nil
 	})
 	if errors.Is(err, badger.ErrKeyNotFound) {
-		return nil, fmt.Errorf("memory disclosure state not found: %s", memoryID)
+		return nil, fmt.Errorf("%w: %s", ErrMemoryDisclosureNotFound, memoryID)
 	}
 	if err != nil {
 		return nil, err

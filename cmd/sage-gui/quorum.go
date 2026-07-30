@@ -298,9 +298,9 @@ func runQuorumJoin() error {
 	// this node's own. quorum-join's semantics are "adopt the peer's chain and
 	// re-sync" — so an equal id means we are (re-)joining the SAME quorum we
 	// already belong to, which is the legitimate recovery/re-sync path (it wipes
-	// and rebuilds local state from the shared genesis + peers; and repair-chain
-	// refuses quorum nodes, so this is the ONLY local rebuild mechanism for a
-	// quorum member). The same-id REFUSAL belongs to the v11 CROSS-NETWORK
+	// and rebuilds local state from the shared genesis + peers; this is the ONLY
+	// local rebuild mechanism for a quorum member). The same-id REFUSAL belongs
+	// to the v11 CROSS-NETWORK
 	// federation-join ceremony (two independent chains that must stay distinct),
 	// not here — placing it in quorum-join would brick recovery while never
 	// catching the "joining your own personal manifest" case (a personal id never

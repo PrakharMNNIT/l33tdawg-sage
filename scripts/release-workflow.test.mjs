@@ -5,6 +5,13 @@ import test from 'node:test';
 const workflowPath = new URL('../.github/workflows/release.yml', import.meta.url);
 const workflow = readFileSync(workflowPath, 'utf8');
 const ciWorkflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+const codeqlWorkflow = readFileSync(
+  new URL('../.github/workflows/codeql.yml', import.meta.url),
+  'utf8',
+);
+const codeqlBaseline = JSON.parse(
+  readFileSync(new URL('./codeql-cometbft-baseline.json', import.meta.url), 'utf8'),
+);
 const faultWorkflow = readFileSync(
   new URL('../.github/workflows/v11.9-fault-gates.yml', import.meta.url),
   'utf8',
@@ -92,6 +99,24 @@ test('release actions stay pinned to immutable commits', () => {
     if (action.startsWith('./')) continue;
     assert.match(action, /@[0-9a-f]{40}(?:\s+#\s+v[^\s]+)?$/, `unpinned release action: ${action}`);
   }
+});
+
+test('CodeQL uses the exact bundle audited by the CometBFT baseline', () => {
+  const expected = `https://github.com/github/codeql-action/releases/download/codeql-bundle-v${codeqlBaseline.codeql.semanticVersion}/codeql-bundle-linux64.tar.gz`;
+  const initMarkers = [...codeqlWorkflow.matchAll(/^      - name: Initialize CodeQL$/gm)];
+  assert.equal(initMarkers.length, 1);
+  const initStart = initMarkers[0].index;
+  const followingStep = codeqlWorkflow.indexOf('\n      - name:', initStart + 1);
+  const initStep = codeqlWorkflow.slice(
+    initStart,
+    followingStep === -1 ? codeqlWorkflow.length : followingStep,
+  );
+  assert.match(codeqlWorkflow, /^    runs-on: ubuntu-latest$/m);
+  assert.equal([...codeqlWorkflow.matchAll(/^          tools:/gm)].length, 1);
+  assert.match(
+    initStep,
+    new RegExp(`^          tools: '${expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'$`, 'm'),
+  );
 });
 
 test('Docker preparation retries the BuildKit pull before creating Buildx', () => {
@@ -438,6 +463,7 @@ test('the cold gate freezes its serving provider before advertising the old snap
 test('the cold gate secures pristine data roots for the signed app-v24 projection baseline', () => {
   const initCometHome = shellFunction(v119StateSync, 'init_pristine_comet_home');
   const copyGenesis = shellFunction(v119StateSync, 'copy_provider_genesis');
+  const copyLineageMarkers = shellFunction(v119StateSync, 'copy_provider_lineage_markers');
   const secureDataDir = shellFunction(v119StateSync, 'secure_fixture_data_dir');
 
   assert.match(
@@ -455,8 +481,44 @@ test('the cold gate secures pristine data roots for the signed app-v24 projectio
   assert.match(initCometHome, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
   assert.match(copyGenesis, /chown "\$1:\$2" \/target\/genesis\.json/);
   assert.match(copyGenesis, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
+  assert.match(
+    copyLineageMarkers,
+    /"\$\{OBSERVER_HOME\}"\|"\$\{RECEIVER_HOME\}"\|"\$\{SUCCESS_RECEIVER_HOME\}"\|"\$\{ATTACKER_HOME\}"/,
+  );
+  assert.match(copyLineageMarkers, /\[ ! -d "\$\{PROVIDER_HOME\}" \] \|\| \[ -L "\$\{PROVIDER_HOME\}" \]/);
+  assert.match(copyLineageMarkers, /\[ ! -d "\$\{target_home\}" \] \|\| \[ -L "\$\{target_home\}" \]/);
+  assert.match(copyLineageMarkers, /docker run --rm --pull never --network none/);
+  assert.match(copyLineageMarkers, /-v "\$\{PROVIDER_HOME\}:\/provider:ro"/);
+  assert.match(copyLineageMarkers, /-v "\$\{target_home\}:\/target"/);
+  assert.match(copyLineageMarkers, /"\$\{NODE_IMAGE\}" sh -ec/);
+  assert.match(copyLineageMarkers, /set -eu/);
+  assert.match(copyLineageMarkers, /test -f \/provider\/version\.txt/);
+  assert.match(copyLineageMarkers, /test ! -L \/provider\/version\.txt/);
+  assert.match(copyLineageMarkers, /test -f \/provider\/fork-version\.txt/);
+  assert.match(copyLineageMarkers, /test ! -L \/provider\/fork-version\.txt/);
+  assert.match(
+    copyLineageMarkers,
+    /test "\$\(cat \/provider\/version\.txt\)" = "v11\.9\.0-state-sync-fixture"/,
+  );
+  assert.match(copyLineageMarkers, /test "\$\(cat \/provider\/fork-version\.txt\)" = "1"/);
+  assert.match(
+    copyLineageMarkers,
+    /for marker in version\.txt fork-version\.txt; do\s+test ! -e "\/target\/\$\{marker\}"\s+test ! -L "\/target\/\$\{marker\}"\s+done\s+for marker in version\.txt fork-version\.txt; do\s+cp "\/provider\/\$\{marker\}" "\/target\/\$\{marker\}"/,
+  );
+  assert.match(copyLineageMarkers, /cmp "\/provider\/\$\{marker\}" "\/target\/\$\{marker\}"/);
+  assert.match(copyLineageMarkers, /chown "\$1:\$2" "\/target\/\$\{marker\}"/);
+  assert.match(copyLineageMarkers, /chmod 0600 "\/target\/\$\{marker\}"/);
+  assert.match(
+    copyLineageMarkers,
+    /test "\$\(stat -c "%u:%g:%a" "\/target\/\$\{marker\}"\)" = "\$1:\$2:600"/,
+  );
+  assert.match(
+    copyLineageMarkers,
+    /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/,
+  );
   assert.doesNotMatch(initCometHome, /100:101/);
   assert.doesNotMatch(copyGenesis, /100:101/);
+  assert.doesNotMatch(copyLineageMarkers, /100:101/);
   assert.doesNotMatch(secureDataDir, /100:101/);
   assert.match(secureDataDir, /stat -c '%u:%g:%a' \/fixture-data/);
   assert.match(
@@ -465,7 +527,7 @@ test('the cold gate secures pristine data roots for the signed app-v24 projectio
   );
   assert.match(
     v119StateSync,
-    /copy_provider_genesis "\$\{home\}"\n  secure_fixture_data_dir "\$\{home\}"/,
+    /copy_provider_genesis "\$\{home\}"\n  copy_provider_lineage_markers "\$\{home\}"\n  secure_fixture_data_dir "\$\{home\}"/,
   );
 });
 
@@ -743,6 +805,94 @@ test('the real-Comet firewall proof allows one symmetric endpoint to count the r
       `${marker} must still prove the exact peer set on every node`,
     );
   }
+});
+
+test('the real-Comet fixture proves full mesh recovery before the 2+2 split', () => {
+  const helperStart = v119Chaos.indexOf('wait_full_peer_mesh() {');
+  const helperEnd = v119Chaos.indexOf('\n}\n\ninstall_partition_firewall()', helperStart);
+  const helper = v119Chaos.slice(helperStart, helperEnd);
+  const healedAppHash = v119Chaos.indexOf(
+    'assert_matched_apphash "post-one-validator partition" 180',
+  );
+  const healedAppVersion = v119Chaos.indexOf('wait_all_app_version 23 180', healedAppHash);
+  const recoveryCall = v119Chaos.indexOf('wait_full_peer_mesh 90 2', healedAppVersion);
+  const recoveredMesh = v119Chaos.indexOf(
+    'proved the full peer mesh recovered before the next partition',
+    healedAppVersion,
+  );
+  const faultTwo = v119Chaos.indexOf(
+    '--- fault 2: post-removal stable-IP 2+2 split',
+    recoveredMesh,
+  );
+  const firstFirewallAfterHeal = v119Chaos.indexOf('\ninstall_partition_firewall ', healedAppVersion);
+  const exactFirstFaultTwoFirewall = v119Chaos.indexOf(
+    '\ninstall_partition_firewall cometbft0 "${COMET_IPS[2]}" "${COMET_IPS[3]}"',
+    healedAppVersion,
+  );
+
+  assert.ok(
+    helperStart >= 0 &&
+      helperEnd > helperStart &&
+      healedAppHash >= 0 &&
+      healedAppVersion > healedAppHash &&
+      recoveryCall > healedAppVersion &&
+      recoveredMesh > recoveryCall &&
+      faultTwo > recoveredMesh &&
+      firstFirewallAfterHeal > faultTwo,
+  );
+  assert.equal(
+    firstFirewallAfterHeal,
+    exactFirstFaultTwoFirewall,
+    'the first firewall after healing must be the exact opening mutation of fault 2',
+  );
+  const recoveryWindow = v119Chaos.slice(healedAppVersion, recoveredMesh);
+  assert.equal(
+    (recoveryWindow.match(/wait_full_peer_mesh 90 2/g) || []).length,
+    1,
+    'fault 2 must have one bounded two-round full-mesh precondition',
+  );
+  assert.ok(
+    v119Chaos.slice(recoveredMesh, firstFirewallAfterHeal).includes(
+      '--- fault 2: post-removal stable-IP 2+2 split',
+    ),
+    'the full-mesh proof must precede the first actual fault-2 firewall mutation',
+  );
+
+  for (const exactLine of [
+    'expected0=$(expected_peer_ids "${NODE_IDS[1]}" "${NODE_IDS[2]}" "${NODE_IDS[3]}")',
+    'expected1=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[2]}" "${NODE_IDS[3]}")',
+    'expected2=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[1]}" "${NODE_IDS[3]}")',
+    'expected3=$(expected_peer_ids "${NODE_IDS[0]}" "${NODE_IDS[1]}" "${NODE_IDS[2]}")',
+    'actual0=$(rpc_peer_ids "${RPC_PORTS[0]}" 2>/dev/null || echo ERROR)',
+    'actual1=$(rpc_peer_ids "${RPC_PORTS[1]}" 2>/dev/null || echo ERROR)',
+    'actual2=$(rpc_peer_ids "${RPC_PORTS[2]}" 2>/dev/null || echo ERROR)',
+    'actual3=$(rpc_peer_ids "${RPC_PORTS[3]}" 2>/dev/null || echo ERROR)',
+  ]) {
+    assert.equal(
+      (helper.match(new RegExp(exactLine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || [])
+        .length,
+      1,
+      `full-mesh helper must retain exactly one ${exactLine}`,
+    );
+  }
+  const exactSamplingBlock = `while [ "\${SECONDS}" -lt "\${deadline}" ]; do
+    actual0=$(rpc_peer_ids "\${RPC_PORTS[0]}" 2>/dev/null || echo ERROR)
+    actual1=$(rpc_peer_ids "\${RPC_PORTS[1]}" 2>/dev/null || echo ERROR)
+    actual2=$(rpc_peer_ids "\${RPC_PORTS[2]}" 2>/dev/null || echo ERROR)
+    actual3=$(rpc_peer_ids "\${RPC_PORTS[3]}" 2>/dev/null || echo ERROR)
+    if [ "\${actual0}" = "\${expected0}" ] &&
+       [ "\${actual1}" = "\${expected1}" ] &&
+       [ "\${actual2}" = "\${expected2}" ] &&
+       [ "\${actual3}" = "\${expected3}" ]; then`;
+  assert.ok(
+    helper.includes(exactSamplingBlock),
+    'every fresh RPC snapshot must be sampled inside the bounded loop immediately before comparison',
+  );
+  assert.match(
+    helper,
+    /consecutive=\$\(\(consecutive \+ 1\)\)[\s\S]*?\[ "\$\{consecutive\}" -ge "\$\{required_rounds\}" \][\s\S]*?else[\s\S]*?consecutive=0/,
+    'one bounded sampling loop must observe every exact peer set in two consecutive rounds',
+  );
 });
 
 test('all private artifacts converge at one publication gate', () => {

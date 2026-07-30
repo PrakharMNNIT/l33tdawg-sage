@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.16.0. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.16.1. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -868,10 +868,34 @@ App-v23 also treats canonical memory publication as a CEREBRUM read boundary.
 `/v1/dashboard/memory/graph`, `/v1/dashboard/memory/{id}/related`,
 `/v1/dashboard/stats`, and `/v1/dashboard/memory/timeline` validate every
 candidate against its exact canonical hash/status/domain/author/classification
-projection before exposing content or aggregates. A SQL-only row, a tampered
-serving projection, or temporarily unavailable canonical state fails closed
-with a sanitized HTTP `503`; it is never silently skipped or exposed.
-Pre-app-v23 nodes retain their legacy projection behavior.
+projection before exposing content or aggregates. A tampered or malformed
+serving projection, canonical record missing from SQL, or temporarily
+unavailable canonical store fails closed with a sanitized HTTP `503`.
+
+v11.16.1 adds one narrow degraded CEREBRUM lane for historical SQL rows whose
+entire canonical `memory:<id>` envelope is absent. Broad list/search, graph,
+timeline, stats, and dashboard-health reads omit only that unanchored row before
+content, paging, or aggregate processing and return the remaining individually
+verified records. List/search, graph, timeline, and stats responses include:
+
+```json
+{
+  "projection": {
+    "complete": false,
+    "partial": true,
+    "verified_only": true,
+    "state": "quarantined",
+    "message": "Some memories are temporarily hidden because their canonical state could not be verified. Your stored data was not changed."
+  }
+}
+```
+
+Dashboard health exposes the same object as `memory_projection`. The marker
+never includes a skipped count, identity, domain, author, status, or reason.
+Exact/detail, related, tags, task-derived views, and export remain fail-closed,
+and `/ready` remains HTTP `503`; a partial CEREBRUM view is never a complete
+backup or readiness claim. Pre-app-v23 nodes retain their legacy projection
+behavior.
 
 | Method + path | Purpose |
 |---|---|

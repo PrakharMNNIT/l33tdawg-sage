@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
@@ -140,9 +139,8 @@ func runServe(startupProof string) (rerr error) {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// v7.5: catch panics, write HALT sentinel so the launcher's
-	// --supervise mode can roll back. Re-panics so the original
-	// stack still reaches stderr and the process exits non-zero.
+	// Preserve the original panic and stack while deliberately declining
+	// to authorize automatic state/binary rollback (v11.16.1 safety rule).
 	defer haltOnPanic(cfg.DataDir)
 
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
@@ -167,6 +165,20 @@ func runServe(startupProof string) (rerr error) {
 			return fmt.Errorf("preflight first-party app-v23 genesis: %w", preflightErr)
 		}
 		vendoredChainIDRecovered = configuredChainIDWasEmpty && cfg.ChainID != ""
+	}
+
+	freshNodeOrigin, originErr := genuinelyFreshNodeOrigin(cfg.DataDir)
+	if originErr != nil {
+		return fmt.Errorf("classify node origin before startup: %w", originErr)
+	}
+	if genesisErr := preflightGenesisOrigin(cometHome, freshNodeOrigin); genesisErr != nil {
+		return genesisErr
+	}
+	// Validate persisted lineage before startup creates sockets, directories,
+	// keys, repairs activation state, applies a pending network join, or opens
+	// any store.
+	if _, migrateErr := migrateOnUpgrade(cfg.DataDir); migrateErr != nil {
+		return fmt.Errorf("upgrade migration: %w", migrateErr)
 	}
 
 	// The native shell is additive: failure to create its per-user control
@@ -287,26 +299,13 @@ func runServe(startupProof string) (rerr error) {
 		}
 	}
 
-	// Auto-migrate on version upgrade: backup SQLite, reset chain state
-	if migrated, migrateErr := migrateOnUpgrade(cfg.DataDir); migrateErr != nil {
-		return fmt.Errorf("upgrade migration: %w", migrateErr)
-	} else if migrated {
-		logger.Info().
-			Str("version", version).
-			Msg("upgrade migration completed — chain state reset, memories preserved")
-	}
-
-	// Federation fix: pre-v11 personal nodes were all born with the identical
+	// Pre-v11 personal nodes were all born with the identical
 	// "sage-personal" chain_id, which the federation self-federation guard treats
-	// as the same network — so two distinct users could never connect. Re-mint a
-	// globally-unique id (memories backed up + preserved; quorum/joined nodes and
-	// already-unique ids are skipped). Runs AFTER migrateOnUpgrade (whose reset
-	// keeps the legacy genesis) and BEFORE ensureGenesisSeed + the chain_id
-	// reconcile below, so the new id flows into cfg.ChainID for this same boot.
-	if remolded, remintErr := remintLegacyChainID(cfg.DataDir, cfg, logger); remintErr != nil {
+	// as the same network. Detect it, but never re-mint automatically: changing the
+	// id by resetting Badger/CometBFT would discard canonical history. A governed,
+	// history-preserving migration is required before federation can be enabled.
+	if _, remintErr := remintLegacyChainID(cfg.DataDir, cfg, logger); remintErr != nil {
 		return fmt.Errorf("re-mint legacy chain_id: %w", remintErr)
-	} else if remolded {
-		logger.Info().Msg("legacy shared chain_id re-minted — cross-node federation is now unblocked")
 	}
 
 	// Initialize CometBFT config (seeds a brand-new chain's genesis with the operator
@@ -992,13 +991,10 @@ func runServe(startupProof string) (rerr error) {
 		Str("node_id", string(cometNode.NodeInfo().ID())).
 		Msg("CometBFT node started (single-validator personal mode)")
 
-	// Resolve any stale "challenged" memories → deprecated (upgrade from < v4.5.0
-	// where challenges stayed in limbo instead of being auto-deprecated).
-	if n, resolveErr := sqliteStore.ResolveChallengedMemories(ctx); resolveErr != nil {
-		logger.Warn().Err(resolveErr).Msg("failed to resolve challenged memories")
-	} else if n > 0 {
-		logger.Info().Int("resolved", n).Msg("upgraded challenged memories to deprecated")
-	}
+	// Legacy challenged-memory cleanup is intentionally not run at startup.
+	// Its historical implementation rewrote only the SQLite serving projection,
+	// which can diverge from canonical Badger status. Any future repair must be a
+	// governed/canonical transition rather than an automatic boot sweep.
 
 	// Auto-seed network_agents from existing chain state (v3 upgrade path)
 	seedNetworkAgents(ctx, sqliteStore, cometHome, cometNode, logger)
@@ -1949,30 +1945,10 @@ func runServe(startupProof string) (rerr error) {
 	// identity, so the node's votes count toward the same 2/3 quorum the chain tallies.
 	selfKey := loadNodeSigningKey(cometCfg.PrivValidatorKeyFile(), logger)
 
-	// Legacy single-node chain repairs run whenever the consensus key is available —
-	// INDEPENDENT of voter.enabled. They fix validator-set / dedup damage from retired
-	// code paths, not voting cadence, so disabling the voter must not disable them.
-	if selfKey != nil {
-		selfID := hex.EncodeToString(selfKey.Public().(ed25519.PublicKey))
-		// Repair a legacy single-node chain that previously ran the retired
-		// 4-archetype RegisterAppValidators path — whether the persisted set lacks this
-		// node's consensus key (votes rejected) or carries it alongside the 4 phantom
-		// archetypes (governance quorum unreachable, issue #37). Guarded off on quorum.
-		if changed, rErr := app.ReconcileSelfValidator(selfID, deriveArchetypeIDs(selfKey), !cfg.Quorum.Enabled); rErr != nil {
-			logger.Warn().Err(rErr).Msg("legacy validator reconcile skipped")
-		} else if changed {
-			logger.Warn().Str("self", selfID[:16]).Msg("legacy app-validators replaced by node consensus key (single-node repair)")
-		}
-		// Resurrect memories the pre-v10.4.2 voter wrongly deprecated as "duplicates"
-		// of their own proposed row (dedup self-match). Runs AFTER ReconcileSelfValidator
-		// so a just-collapsed legacy set passes the repair's set-is-exactly-{selfID}
-		// guard; the voter (if enabled) re-votes the resurrected memories into committed.
-		if repaired, rErr := app.RepairSelfDupRejectedMemories(ctx, selfID, !cfg.Quorum.Enabled); rErr != nil {
-			logger.Warn().Err(rErr).Msg("self-dup-reject memory repair incomplete — will retry next startup")
-		} else if repaired > 0 {
-			logger.Warn().Int("memories", repaired).Msg("memories wrongly deprecated by the dedup self-match bug restored to proposed (single-node repair)")
-		}
-	}
+	// Retired direct-state startup repairs are intentionally disabled. They changed
+	// AppHash-covered validator/memory/vote keys outside a committed transaction and
+	// could also rewrite SQLite status. Historical anomalies now remain unchanged
+	// until a governed, replay-safe repair is available.
 
 	switch {
 	case !cfg.Voter.Enabled:
@@ -2323,12 +2299,6 @@ func cmtP2PAddr(def string) string {
 	return def
 }
 
-// genesisInitialAdminAppState returns the genesis app_state JSON that seeds the node
-// operator's agent key as the chain-admin, or nil if the operator key is unavailable.
-func genesisInitialAdminAppState() json.RawMessage {
-	return genesisInitialAdminAppStateForKey(filepath.Join(SageHome(), "agent.key"))
-}
-
 func genesisInitialAdminAppStateForKey(keyPath string) json.RawMessage {
 	admin := ensureOperatorAdminIDForKey(keyPath)
 	if admin == "" {
@@ -2440,15 +2410,9 @@ func ensureOperatorAdminIDForKey(keyPath string) string {
 	return hex.EncodeToString(pub)
 }
 
-// ensureGenesisSeed performs the two issue-#52 genesis steps the serve path needs
-// after migrateOnUpgrade: initCometBFTConfig (which creates a freshly-seeded genesis
-// for a brand-new chain) and healGenesisAdminIfReset (which re-injects the seed if a
-// prior admin-less genesis survived a reset — initCometBFTConfig short-circuits on an
-// existing genesis, so without the heal an upgraded+reset chain re-deadlocks).
-//
-// The two steps live in ONE named helper, called from runServe and exercised directly
-// by TestIssue52_HealThenInitChain_EndToEnd, so the heal step cannot be silently
-// dropped from the serve path without a test going red.
+// ensureGenesisSeed creates a seeded genesis only for a caller-proven fresh
+// origin. Existing genesis is never rewritten here; legacy automatic healing
+// could change authority outside a committed governance transition.
 func ensureGenesisSeed(cometHome string, logger zerolog.Logger) error {
 	return ensureGenesisSeedWithKey(cometHome, filepath.Join(SageHome(), "agent.key"), logger)
 }
@@ -2478,9 +2442,23 @@ func ensureGenesisSeedWithBootstrap(
 		// rewrite it into an issue-#52 lookalike.
 		return nil
 	}
-	// Strictly gated on height-0 (block store wiped) so a live chain's genesis hash is
-	// never disturbed. Runs AFTER migrateOnUpgrade's reset.
-	healGenesisAdminIfResetWithKey(cometHome, keyPath, logger)
+	_ = logger
+	return nil
+}
+
+func preflightGenesisOrigin(cometHome string, freshNodeOrigin bool) error {
+	if freshNodeOrigin {
+		return nil
+	}
+	genesisPath := filepath.Join(cometHome, "config", "genesis.json")
+	if _, err := cmttypes.GenesisDocFromFile(genesisPath); err != nil {
+		return fmt.Errorf(
+			"initialized node genesis is missing or invalid; refusing to mint or rewrite "+
+				"a replacement identity at %s: %w",
+			genesisPath,
+			err,
+		)
+	}
 	return nil
 }
 
@@ -3271,24 +3249,6 @@ func createEmbeddingProvider(cfg *Config, logger zerolog.Logger) embedding.Provi
 		logger.Info().Int("dimension", dim).Msg("using hash-based pseudo-embeddings")
 		return embedding.NewHashProvider(dim)
 	}
-}
-
-// deriveArchetypeIDs reproduces the 4 seed-derived validator IDs that the retired
-// startAppValidators path persisted, so ReconcileSelfValidator can fingerprint a
-// legacy single-node chain and repair it. The derivation MUST match the old one
-// exactly: sha256(node-seed) -> sha256(seed + "sage-validator-"+name) -> ed25519 key.
-func deriveArchetypeIDs(selfKey ed25519.PrivateKey) []string {
-	var seed [32]byte
-	h := sha256.Sum256(selfKey.Seed())
-	copy(seed[:], h[:])
-	names := []string{"sentinel", "dedup", "quality", "consistency"}
-	ids := make([]string, 0, len(names))
-	for _, name := range names {
-		keySeed := sha256.Sum256(append(seed[:], []byte("sage-validator-"+name)...))
-		key := ed25519.NewKeyFromSeed(keySeed[:])
-		ids = append(ids, hex.EncodeToString(key.Public().(ed25519.PublicKey)))
-	}
-	return ids
 }
 
 // autoImport checks for pending-import.json from the setup wizard and seeds memories.

@@ -25,9 +25,9 @@ const (
 )
 
 func main() {
-	// v7.5 supervisor mode: foreground, watches HALT sentinel,
-	// triggers rollback. Opt-in via --supervise so the historical
-	// "double-click the .app -> open browser" flow keeps working.
+	// Supervisor mode: foreground bounded restart. HALT evidence stops
+	// the supervisor for governed recovery; it never triggers automatic
+	// restore or old-binary execution.
 	for _, a := range os.Args[1:] {
 		if a == "--supervise" || a == "-supervise" {
 			os.Exit(runSuperviseMode(os.Args[2:]))

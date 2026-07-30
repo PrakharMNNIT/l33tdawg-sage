@@ -24,6 +24,12 @@ func TestValidateMemoryProjectionRequiresExactCanonicalEnvelope(t *testing.T) {
 	}
 	_, err = badger.ValidateMemoryProjection(record)
 	require.ErrorIs(t, err, ErrMemoryProjectionUnpublished)
+	require.ErrorIs(t, err, ErrMemoryDisclosureNotFound)
+
+	_, disposition, err := badger.ClassifyMemoryProjection(record)
+	require.ErrorIs(t, err, ErrMemoryProjectionUnpublished)
+	require.ErrorIs(t, err, ErrMemoryDisclosureNotFound)
+	require.Equal(t, MemoryProjectionLegacyUnanchored, disposition)
 
 	require.NoError(t, badger.SetMemoryHash(
 		record.MemoryID, record.ContentHash, string(record.Status),

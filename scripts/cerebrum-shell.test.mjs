@@ -87,6 +87,31 @@ test('global health bar surfaces projection unavailability instead of disappeari
     assert.doesNotMatch(healthBar, /if \(!health\) return null/);
 });
 
+test('CEREBRUM labels a partial canonical projection and never calls it an empty brain', () => {
+    const inventory = appSource.slice(
+        appSource.indexOf('function BrainDomainInventory('),
+        appSource.indexOf('// MriView'),
+    );
+    const mri = appSource.slice(
+        appSource.indexOf('function MriView('),
+        appSource.indexOf('// Global tooltips state'),
+    );
+    const healthBar = appSource.slice(
+        appSource.indexOf('function HealthBar()'),
+        appSource.indexOf('// ============================================================================', appSource.indexOf('function HealthBar()')),
+    );
+
+    assert.match(inventory, /stats\.projection\?\.partial === true/);
+    assert.match(inventory, /Verified memories shown/);
+    assert.match(inventory, /Your stored data was not changed/);
+    assert.match(mri, /No verified memories can be shown yet/);
+    assert.match(mri, /noLocalMemories && !partialProjection/);
+    assert.match(healthBar, /health\.memory_projection\?\.partial === true/);
+    assert.match(healthBar, /verified memories/);
+    assert.match(healthBar, /Canonically verified memories currently visible/);
+    assert.match(healthBar, /Verified view/);
+});
+
 test('Search page renders projection failures as errors, never empty search results', () => {
     const searchPage = appSource.slice(
         appSource.indexOf('function SearchPage()'),

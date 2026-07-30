@@ -455,15 +455,11 @@ This means your personal SAGE instance uses the exact same consensus protocol as
 
 ### Upgrading from v3.x
 
-On first launch after upgrading, SAGE automatically:
-- **Backs up** your SQLite database to `~/.sage/backups/`
-- **Resets** chain state (BadgerDB + CometBFT) for the new validator architecture
-- **Cleans up** noisy memories accumulated before quality gates existed:
-  - Duplicate boot safeguards (keeps newest)
-  - Greeting/session observations ("user said hi", "brain online", etc.)
-  - Very short observations (< 20 characters)
-  - Duplicate content hashes (keeps newest)
-- All your substantive memories are preserved. The chain rebuilds automatically.
+Current SAGE releases do not reset or rebuild an existing chain during an
+ordinary upgrade, and they do not rewrite memory statuses as startup cleanup.
+SQLite is a serving projection, not a substitute for canonical Badger and
+CometBFT history. Very old or unknown lineages fail closed and require a
+history-preserving migration or restoration of a complete stopped-node backup.
 
 ---
 

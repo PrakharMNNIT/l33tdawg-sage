@@ -66,6 +66,16 @@ func TestRollbackPendingUpdateInvalidatesBeforeExecutableSwap(t *testing.T) {
 	})
 }
 
+func TestAutomaticRollbackIsSuppressedForLineageSafetyRefusal(t *testing.T) {
+	assert.False(t, shouldAttemptUpdateRollback(errAutomaticChainResetRefused))
+	assert.False(t, shouldAttemptUpdateRollback(
+		errors.Join(errors.New("startup failed"), errAutomaticChainResetRefused),
+	))
+	assert.False(t, shouldAttemptUpdateRollback(errors.New("ordinary post-migration startup failure")),
+		"an unrelated failure must not restart a pre-safety-floor binary")
+	assert.False(t, shouldAttemptUpdateRollback(nil))
+}
+
 func TestAutomaticBinaryRollbackInvalidatesConfiguredBadgerIndexProgress(t *testing.T) {
 	home := t.TempDir()
 	dataDir := filepath.Join(t.TempDir(), "custom data 状態")

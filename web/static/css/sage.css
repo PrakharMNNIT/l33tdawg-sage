@@ -372,10 +372,18 @@ body {
 }
 .health-dot.ok { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
 .health-dot.err { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+.health-dot.warning { background: #f5bd55; box-shadow: 0 0 6px rgba(245, 189, 85, 0.45); }
 .health-dot.muted { background: var(--text-muted); box-shadow: none; }
 .health-dot.configured { background: var(--primary); box-shadow: none; }
 .health-num { font-weight: 700; color: var(--primary); }
 .health-sep { width: 1px; height: 12px; background: var(--border-light); }
+.health-projection-warning {
+    margin-left: auto;
+    color: #f5bd55;
+}
+.health-projection-warning span {
+    color: var(--text-dim);
+}
 
 /* Brain canvas */
 .brain-container {
@@ -5535,6 +5543,22 @@ input[type="range"]::-moz-range-thumb {
     min-height: 0;
     height: auto !important;
     resize: horizontal;
+}
+.brain-projection-warning {
+    display: grid;
+    gap: 3px;
+    padding: 9px 13px;
+    border-bottom: 1px solid rgba(245, 189, 85, 0.28);
+    background: rgba(245, 189, 85, 0.09);
+}
+.brain-projection-warning strong {
+    color: #f5bd55;
+    font-size: 11px;
+}
+.brain-projection-warning span {
+    color: #b9c7db;
+    font-size: 10px;
+    line-height: 1.4;
 }
 .brain-domain-head {
     display: flex;

@@ -51,6 +51,39 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.16.1
+
+**CEREBRUM recovers verified memories on upgraded personal nodes without
+guessing or rewriting history.** A small class of long-lived nodes can contain
+an old SQL serving row whose canonical `memory:<id>` envelope was never carried
+across a historical pre-v11 chain reset. v11.16.0 correctly quarantined that
+row, but its all-or-nothing dashboard gate also hid every healthy memory behind
+a `503` and made the brain appear unavailable. v11.16.1 gives only broad
+CEREBRUM views a narrow verified-only mode: every canonically verified memory
+is shown and counted, the unanchored row is omitted before content or aggregate
+processing, and the UI persistently says that some historical records are
+temporarily hidden and stored data was not changed.
+
+The release also disables two inherited automatic reset paths. An incompatible
+fork marker or legacy shared network id now fails closed or remains unchanged
+instead of deleting Badger/CometBFT history and trying to reconstruct authority
+from SQLite. The unsafe `repair-chain` command is disabled entirely; recovery
+requires a complete stopped-node backup until a history-preserving migration exists.
+Normal same-fork upgrades remain automatic and preserve the chain in place.
+Automatic executable rollback is also disabled at this safety boundary so a
+later startup error cannot restart an older binary containing the retired reset.
+
+The exception applies only when the entire canonical envelope is absent.
+Status, domain, author, content, hash, classification, malformed-state, storage,
+and paging errors still fail closed. Exact memory reads, related-memory views,
+tags, task-derived views, portable export, and `/ready` remain unavailable
+while the projection is quarantined, so a partial view can never be mislabeled
+as a complete backup or a healthy node. This patch changes no consensus rule,
+transaction, AppHash input, application version, memory, domain, key, or chain
+history.
+
+Container: `ghcr.io/l33tdawg/sage:11.16.1`. SDK 11.16.1.
+
 ## What's New in v11.16.0
 
 **App-v24 closes the canonical terminal-hash lifecycle defect without rewriting
@@ -868,11 +901,19 @@ SDK 11.2.0.
 <details>
 <summary>v11.1.0 — cross-node federation fix + health/observability polish</summary>
 
-**Federation actually works between separate nodes now, plus health/observability polish.** v11.1.0 changes **no consensus rule, AppHash, transaction, or key-encoding**; `app-v15` remains the active v11 consensus fork. The one upgrade-time behavior change is a one-time local **network-identity re-mint** on legacy nodes (details below) — your memories are backed up first and preserved.
+**Historical v11.1 release note.** v11.1.0 introduced a startup
+**network-identity re-mint** for legacy nodes. That mechanism is retired and
+disabled in v11.16.1 because it reset canonical history.
 
-- **Cross-node federation is fixed.** Every pre-v11 personal node was born with the *identical* network id `sage-personal`, so SAGE's self-federation guard treated any two nodes as the same network and refused every join. On its next boot a legacy node now re-mints a **globally-unique** network id, so two independent nodes can finally connect.
-  - **What you'll see on upgrade (legacy nodes only):** a new network id; block height resets to 0 and the chain rebuilds itself (your memories in SQLite are backed up first and never wiped); the dashboard's self-signed HTTPS certificate is regenerated (**a one-time browser certificate warning** — accept it once); if you had already connected to another network, **re-join once**.
-  - **Known limitation:** if you ran a **LAN network as host** on v11.0.x and turned Network Mode *off* before upgrading, your node is indistinguishable from a standalone node on disk and will be re-minted — your guests keep all their memories and simply **re-join once**. Guests are never wrongly re-minted.
+> **Safety update (v11.16.1):** the automatic legacy re-mint described in this
+> historical release note is disabled. It deleted canonical Badger/CometBFT
+> history and SQLite cannot reconstruct that authority. Legacy ids now remain
+> unchanged until a history-preserving governed migration exists.
+
+- **Historical v11.1 behavior (retired in v11.16.1).** v11.1 attempted to replace
+  the shared pre-v11 `sage-personal` network id during startup. That mechanism
+  reset canonical history and is now disabled. Affected legacy ids remain
+  unchanged until a governed, history-preserving migration exists.
 - **Turning on encryption is discoverable.** The System Status "Synaptic Ledger Encryption" row now has an inline **Enable →** button (opens Settings → Security), instead of a dead-end "Off".
 - **Idle chains are explained.** A new operator doc (`concepts/block-production-and-idle.md`) makes clear that a SAGE chain has no heartbeat — an idle chain mints no blocks, and a frozen height with an empty mempool is **healthy, not stuck**. `/v1/dashboard/health` now exposes `chain.idle` / `chain.stuck` / `last_block_age_seconds` so monitors alert on *stuck*, not a still height.
 - **Embedding health is visible.** `GET /ready` now reflects the embedding provider: a down semantic embedder reports `degraded` (HTTP 200; `?strict=1` → 503) instead of a misleading `ready`, refreshed by a background watchdog. And `sage_recall` / `sage_turn` results carry `recall_mode` / `semantic_degraded` / `degraded_reason` so an agent knows when recall silently fell back to keyword-only.
@@ -972,7 +1013,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.16.0`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.16.1`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

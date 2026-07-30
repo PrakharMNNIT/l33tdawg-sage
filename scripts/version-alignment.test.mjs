@@ -34,6 +34,7 @@ test('release-facing version metadata stays aligned', () => {
     ['README.md', 'App-v24 closes the canonical terminal-hash lifecycle defect'],
     ['README.md', `SDK ${version}.`],
     ['README.md', `ghcr.io/l33tdawg/sage:${version}`],
+    ['README.md', `Pin a specific version with \`ghcr.io/l33tdawg/sage:${version}\`.`],
     ['sdk/python/README.md', `SAGE v${version} SDK`],
     ['docs/reference/INDEX.md', `reconciled for SAGE v${version}`],
     ['docs/reference/INDEX.md', `reconciled through v${version}`],

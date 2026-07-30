@@ -1,15 +1,14 @@
-// Package main — v7.5 HALT sentinel writer.
+// Package main — legacy HALT sentinel wire format.
 //
-// When the chain binary determines it cannot continue (consensus
-// handler panic, post-upgrade migration failure, etc.), it writes a
-// JSON sentinel to <DataDir>/HALT and exits non-zero. The launcher
-// running in --supervise mode reads the sentinel, scans available
-// anchor snapshots, and re-execs into the rollback binary.
+// v11.16.1 retires automatic rollback authorization from sage-gui:
+// a prior executable may contain startup migrations that are unsafe
+// for the current on-disk lineage. Panics therefore propagate without
+// writing HALT and the supervisor applies its bounded crash-loop
+// circuit breaker instead of restoring or executing an older version.
 //
-// Wire-format contract: this file is the producer side. The
-// consumer side lives in cmd/sage-launcher/halt_sentinel.go.
-// Field names are stable; do not rename without coordinating both
-// sides.
+// The legacy writer and wire-format types remain so launchers and
+// offline recovery tooling can still parse explicitly supplied
+// sentinels. They are not called by the live startup path.
 package main
 
 import (
@@ -96,27 +95,15 @@ func writeHaltSentinel(dataDir, failedVersion, rollbackTo, failureMsg string) er
 	return nil
 }
 
-// haltOnPanic recovers a panic at the top of runServe, writes a
-// HALT sentinel, then re-panics so the binary still exits non-zero.
-// Deferred from runServe; the deferred close+exit chain runs normally
-// before main() picks up the non-zero err.
-//
-// Captures the panic message into FailureMessage so the launcher's
-// rollback log records what actually broke. RollbackTo is left
-// empty — the launcher will pick the latest non-failed anchor.
-func haltOnPanic(dataDir string) {
+// haltOnPanic recovers a panic at the top of runServe and immediately
+// re-panics so the original stack still reaches stderr. It deliberately
+// does not write HALT: doing so would authorize the supervisor to restore
+// state and execute an older binary whose startup path may destructively
+// rewrite current data.
+func haltOnPanic(_ string) {
 	r := recover()
 	if r == nil {
 		return
 	}
-	failureMsg := fmt.Sprintf("panic: %v", r)
-	if err := writeHaltSentinel(dataDir, version, "", failureMsg); err != nil {
-		// We're already mid-panic; the best we can do is print and
-		// re-panic so the original stack reaches stderr.
-		fmt.Fprintf(os.Stderr, "halt_writer: failed to write HALT sentinel: %v\n", err)
-	}
-	// Re-panic so the original stack trace surfaces in launcher.log
-	// and the process exits non-zero. The deferred close calls in
-	// runServe still run on the panic unwind.
 	panic(r)
 }

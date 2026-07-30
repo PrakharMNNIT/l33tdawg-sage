@@ -57,6 +57,10 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
+          # The inherited CometBFT suppression manifest is bound to this exact
+          # audited CLI/query bundle. A silent default-bundle upgrade must fail
+          # source review, not bypass or invalidate the baseline gate.
+          tools: 'https://github.com/github/codeql-action/releases/download/codeql-bundle-v2.26.1/codeql-bundle-linux64.tar.gz'
           # security-extended adds queries beyond the default 'security-and-quality'
           # baseline — worth it for consensus-critical code where false-positive
           # noise is acceptable in exchange for catching subtler taint flows.

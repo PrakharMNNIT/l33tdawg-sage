@@ -74,29 +74,20 @@ func TestWriteHaltSentinel_RejectsEmptyFailedVersion(t *testing.T) {
 	}
 }
 
-func TestHaltOnPanic_WritesSentinelAndRepanics(t *testing.T) {
+func TestHaltOnPanicV11161DoesNotAuthorizeRollback(t *testing.T) {
 	dataDir := t.TempDir()
 	defer func() {
 		r := recover()
 		if r == nil {
 			t.Fatal("expected panic to propagate")
 		}
-
-		// Sentinel should be on disk
-		raw, err := os.ReadFile(filepath.Join(dataDir, "HALT"))
-		if err != nil {
-			t.Fatalf("HALT missing after recover: %v", err)
+		if r != "simulated boom" {
+			t.Fatalf("panic = %v, want simulated boom", r)
 		}
-		var sig haltSignal
-		if err := json.Unmarshal(raw, &sig); err != nil {
-			t.Fatalf("parse HALT: %v", err)
-		}
-		// FailedVersion is whatever main.version is at test time ("dev")
-		if sig.FailedVersion == "" {
-			t.Errorf("FailedVersion empty; expected ldflag-injected value")
-		}
-		if sig.FailureMessage != "panic: simulated boom" {
-			t.Errorf("FailureMessage = %q", sig.FailureMessage)
+		for _, name := range []string{"HALT", ".HALT.tmp"} {
+			if _, err := os.Stat(filepath.Join(dataDir, name)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s must not be written by live panic path: %v", name, err)
+			}
 		}
 	}()
 

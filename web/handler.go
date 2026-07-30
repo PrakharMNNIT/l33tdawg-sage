@@ -1077,13 +1077,33 @@ func securityHeaders(next http.Handler) http.Handler {
 type appV23ProjectionAuditContextKey struct{}
 
 type appV23ProjectionAuditSnapshot struct {
-	stats    *store.StoreStats
-	activity map[string]string
+	stats      *store.StoreStats
+	activity   map[string]string
+	projection *appV23ProjectionResponse
+}
+
+func (h *DashboardHandler) appV23ProjectionResponseForContext(
+	ctx context.Context,
+) *appV23ProjectionResponse {
+	if audited, ok := ctx.Value(appV23ProjectionAuditContextKey{}).(appV23ProjectionAuditSnapshot); ok {
+		// Never let a request-local exact snapshot hide a quarantine observed
+		// by the handler's subsequent SQL walk. A consensus Commit can land
+		// between the gate audit and response serialization; classification of
+		// its unanchored serving row updates the process-local health marker.
+		if audited.projection != nil && !audited.projection.Partial {
+			if latest := h.appV23ProjectionResponse(); latest != nil && latest.Partial {
+				return latest
+			}
+		}
+		return audited.projection
+	}
+	return h.appV23ProjectionResponse()
 }
 
 func (h *DashboardHandler) appV23ProjectionReadGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		stats, activity, err := h.requireAppV23DashboardProjectionAvailable(r.Context())
+		stats, activity, projection, err :=
+			h.requireAppV23DashboardProjectionAvailable(r.Context())
 		if err != nil {
 			if writeAppV23DashboardProjectionFailure(w, err) {
 				return
@@ -1095,7 +1115,38 @@ func (h *DashboardHandler) appV23ProjectionReadGate(next http.Handler) http.Hand
 			r = r.WithContext(context.WithValue(
 				r.Context(),
 				appV23ProjectionAuditContextKey{},
-				appV23ProjectionAuditSnapshot{stats: stats, activity: activity},
+				appV23ProjectionAuditSnapshot{
+					stats: stats, activity: activity,
+					projection: projection,
+				},
+			))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// appV23ProjectionBroadReadGate performs the same complete audit as the strict
+// gate, but allows individually verified broad routes to serve while one or
+// more unsafe historical rows remain quarantined. The route handler must omit
+// every unsafe record and must not provide an exact/export response.
+func (h *DashboardHandler) appV23ProjectionBroadReadGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stats, activity, projection, err := h.requireAppV23DashboardProjectionAudited(r.Context())
+		if err != nil {
+			if writeAppV23DashboardProjectionFailure(w, err) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if h.appV23IsActive() {
+			r = r.WithContext(context.WithValue(
+				r.Context(),
+				appV23ProjectionAuditContextKey{},
+				appV23ProjectionAuditSnapshot{
+					stats: stats, activity: activity,
+					projection: projection,
+				},
 			))
 		}
 		next.ServeHTTP(w, r)
@@ -1138,12 +1189,12 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			// Redeploy guard — returns 503 for write endpoints during active redeployment.
 			r.Use(redeployGuard(h.Redeployer))
 
-			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
 				Get("/v1/dashboard/memory/list", h.handleListMemories)
 			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/export", h.handleExport)
-			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
 				Get("/v1/dashboard/memory/timeline", h.handleTimeline)
-			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
 				Get("/v1/dashboard/memory/graph", h.handleGraph)
 			r.Get("/v1/dashboard/stats", h.handleStats)
 
@@ -1954,7 +2005,11 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		}
 		if h.appV23IsActive() {
 			qopts.CandidateFilter = func(record *memory.MemoryRecord) (bool, error) {
-				if err := h.validateAppV23DashboardRecord(record); err != nil {
+				disposition, err := h.classifyAppV23DashboardRecord(record)
+				if err != nil {
+					if isAppV23LegacyUnanchoredDashboardRecord(disposition, err) {
+						return false, nil
+					}
 					return false, err
 				}
 				return true, nil
@@ -2051,6 +2106,9 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		"total":    total,
 		"limit":    limit,
 		"offset":   offset,
+	}
+	if projection := h.appV23ProjectionResponseForContext(r.Context()); projection != nil {
+		response["projection"] = projection
 	}
 	// Keep immutable signer attribution in every record, but give the local
 	// CEREBRUM UI a non-agent display label for every historical Root
@@ -2220,7 +2278,11 @@ func (h *DashboardHandler) handleTimeline(w http.ResponseWriter, r *http.Request
 	}
 
 	if isCerebrumInternalMemoryDomain(domain) {
-		writeJSONResp(w, http.StatusOK, map[string]any{"buckets": []store.TimelineBucket{}})
+		response := map[string]any{"buckets": []store.TimelineBucket{}}
+		if projection := h.appV23ProjectionResponseForContext(r.Context()); projection != nil {
+			response["projection"] = projection
+		}
+		writeJSONResp(w, http.StatusOK, response)
 		return
 	}
 	var buckets []store.TimelineBucket
@@ -2246,7 +2308,11 @@ func (h *DashboardHandler) handleTimeline(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSONResp(w, http.StatusOK, map[string]any{"buckets": buckets})
+	response := map[string]any{"buckets": buckets}
+	if projection := h.appV23ProjectionResponseForContext(r.Context()); projection != nil {
+		response["projection"] = projection
+	}
+	writeJSONResp(w, http.StatusOK, response)
 }
 
 // graphNode is a memory node for the force-directed graph.
@@ -2318,16 +2384,28 @@ func (h *DashboardHandler) handleGraph(w http.ResponseWriter, r *http.Request) {
 	// restricted agent is never served an operator (or another agent's) graph.
 	scope := append([]string(nil), allowedAgents...)
 	sort.Strings(scope)
+	projection := h.appV23ProjectionResponseForContext(r.Context())
+	projectionState := ""
+	partialProjection := false
+	if projection != nil {
+		projectionState = projection.State
+		partialProjection = projection.Partial
+	}
 	cacheKey := fmt.Sprintf(
-		"v23=%v|%v|%s|%s|%d|%s",
+		"v23=%v|%v|%s|%s|%d|%s|projection=%s",
 		h.appV23IsActive(), seeAll, statusParam, drillDomain, limit,
-		strings.Join(scope, ","),
+		strings.Join(scope, ","), projectionState,
 	)
 
-	if body := h.serveGraphFromCache(cacheKey, statusParam, drillDomain, limit, seeAll, allowedAgents); body != nil {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body) //nolint:gosec // G705: body is server-built JSON sent as application/json, not HTML — no XSS sink
-		return
+	if !partialProjection {
+		if body := h.serveGraphFromCache(
+			cacheKey, statusParam, drillDomain, limit, seeAll, allowedAgents,
+			!h.appV23IsActive(),
+		); body != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body) //nolint:gosec // G705: body is server-built JSON sent as application/json, not HTML — no XSS sink
+			return
+		}
 	}
 	body, err := h.computeGraphJSON(r.Context(), statusParam, drillDomain, limit, seeAll, allowedAgents)
 	if err != nil {
@@ -2337,7 +2415,13 @@ func (h *DashboardHandler) handleGraph(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.putGraphCache(cacheKey, body)
+	finalProjection := h.appV23ProjectionResponseForContext(r.Context())
+	if finalProjection != nil && finalProjection.Partial {
+		partialProjection = true
+	}
+	if !partialProjection {
+		h.putGraphCache(cacheKey, body)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(body) //nolint:gosec // G705: body is server-built JSON sent as application/json, not HTML — no XSS sink
 }
@@ -2345,12 +2429,21 @@ func (h *DashboardHandler) handleGraph(w http.ResponseWriter, r *http.Request) {
 // serveGraphFromCache returns a cached graph body when one is fresh enough to
 // use, triggering a single background refresh once an entry is past its fresh
 // window. Returns nil on a miss (the caller then computes synchronously).
-func (h *DashboardHandler) serveGraphFromCache(key, statusParam, drillDomain string, limit int, seeAll bool, allowedAgents []string) []byte {
+func (h *DashboardHandler) serveGraphFromCache(
+	key, statusParam, drillDomain string,
+	limit int,
+	seeAll bool,
+	allowedAgents []string,
+	allowStaleRefresh bool,
+) []byte {
 	now := time.Now()
 	h.graphCacheMu.Lock()
 	defer h.graphCacheMu.Unlock()
 	ent := h.graphCache[key]
 	if ent == nil || now.Sub(ent.at) >= graphCacheTTL {
+		return nil
+	}
+	if now.Sub(ent.at) >= graphCacheFresh && !allowStaleRefresh {
 		return nil
 	}
 	if now.Sub(ent.at) >= graphCacheFresh && !ent.refreshing {
@@ -2430,7 +2523,7 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 		if audited, ok := ctx.Value(appV23ProjectionAuditContextKey{}).(appV23ProjectionAuditSnapshot); ok {
 			stats, activity = audited.stats, audited.activity
 		} else {
-			stats, activity, sErr = h.cerebrumVisibleStatsAndActivity(ctx)
+			stats, activity, _, sErr = h.cerebrumVisibleStatsAndActivity(ctx)
 		}
 		if sErr != nil {
 			if h.appV23IsActive() {
@@ -2560,6 +2653,9 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 		"nodes": nodes,
 		"edges": edges,
 	}
+	if projection := h.appV23ProjectionResponseForContext(ctx); projection != nil {
+		resp["projection"] = projection
+	}
 	// Scale signal for the MRI view: the true memory total + per-domain counts so
 	// the brain can convey "showing N of M" and weight each lobe by its real size
 	// even when only a bounded sample of nodes is rendered. Operator view only —
@@ -2618,9 +2714,14 @@ func (h *DashboardHandler) stratifiedSample(ctx context.Context, base store.List
 	return out, nil
 }
 
+type appV23DashboardStatsResponse struct {
+	*store.StoreStats
+	Projection *appV23ProjectionResponse `json:"projection,omitempty"`
+}
+
 // handleStats returns aggregate statistics.
 func (h *DashboardHandler) handleStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := h.cerebrumVisibleStats(r.Context())
+	stats, _, projection, err := h.cerebrumVisibleStatsAndActivity(r.Context())
 	if err != nil {
 		if writeAppV23DashboardProjectionFailure(w, err) {
 			return
@@ -2628,7 +2729,10 @@ func (h *DashboardHandler) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSONResp(w, http.StatusOK, stats)
+	writeJSONResp(w, http.StatusOK, appV23DashboardStatsResponse{
+		StoreStats: stats,
+		Projection: projection,
+	})
 }
 
 // handleDeleteMemory deprecates a memory.
@@ -3827,13 +3931,16 @@ func (h *DashboardHandler) handleHealth(w http.ResponseWriter, r *http.Request) 
 	health["embedder"] = embedderInfo
 
 	// Get memory stats
-	stats, err := h.cerebrumVisibleStats(r.Context())
+	stats, _, projection, err := h.cerebrumVisibleStatsAndActivity(r.Context())
 	if err != nil {
 		if writeAppV23DashboardProjectionFailure(w, err) {
 			return
 		}
 	} else {
 		health["memories"] = stats
+		if projection != nil {
+			health["memory_projection"] = projection
+		}
 	}
 
 	// CometBFT chain stats — dial the configured RPC endpoint (honors

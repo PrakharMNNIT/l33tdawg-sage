@@ -1,11 +1,9 @@
-// Package main — rollback flow for the v7.5 supervisor mode.
+// Package main — legacy explicit/offline rollback primitives.
 //
-// When the supervised sage-gui binary writes a HALT sentinel and
-// exits non-zero, the launcher walks ~/.sage/snapshots/ newest-first
-// to find an anchor snapshot pinned to the requested rollback
-// version, asks the injected Restorer to restore that snapshot
-// into the data dir, and finally re-execs into the previous-version
-// binary that travels inside the snapshot under binary/.
+// Since v11.16.1 the production supervisor never calls HandleHalt:
+// HALT is preserved as diagnostic evidence and startup fails closed.
+// These primitives remain for compatibility tests and future
+// separately authorized offline recovery ceremonies.
 //
 // The Restorer is an interface (not a direct dependency on
 // internal/snapshot) so this package can be built and tested in
@@ -26,7 +24,7 @@ import (
 )
 
 // Restorer applies a snapshot directory's contents into a SAGE
-// data directory. The supervisor calls it with the absolute path to
+// data directory. Explicit offline recovery calls it with the absolute path to
 // the snapshot dir (e.g. ~/.sage/snapshots/12345) and the absolute
 // path to the data dir (e.g. ~/.sage/data).
 //
@@ -51,7 +49,7 @@ func (n *nopRestorer) Restore(snapshotDir, dataDir string) error {
 	return nil
 }
 
-// Execer replaces the running launcher process with the rollback
+// Execer replaces the running recovery process with the rollback
 // binary. The default implementation calls syscall.Exec (see
 // exec_unix.go / exec_windows.go). Tests inject a stub so they can
 // assert the call happened without actually replacing the test
