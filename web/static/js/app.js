@@ -8250,11 +8250,11 @@ function AppV23AccessControl() {
     const mutateDraft = (patch) => setDraft(current => ({ ...(current || {}), ...patch }));
     const chooseRole = (role) => {
         if (!draft) return;
-        mutateDraft(appV23RoleDefaults(role));
+        mutateDraft(appV23RoleDefaults(role, draft.capabilities));
     };
     const chooseProfile = (profile) => {
         if (!draft || !appV23ProfileIsSelectable(profile)) return;
-        mutateDraft(appV23ProfileDefaults(profile, draft.role));
+        mutateDraft(appV23ProfileDefaults(profile, draft.role, draft.capabilities));
     };
 
     const savePolicy = async () => {

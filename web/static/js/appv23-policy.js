@@ -9,6 +9,15 @@ export const APPV23_SELECTABLE_PROFILES = Object.freeze([
     'companion',
     'read_only',
 ]);
+const APPV23_DENY_FEDERATED_PIPE = 16;
+
+function appV23FederatedPipeRestriction(capabilities) {
+    const recorded = Number(capabilities ?? 0);
+    return Number.isFinite(recorded) &&
+        (Math.max(0, Math.trunc(recorded)) & APPV23_DENY_FEDERATED_PIPE) !== 0
+        ? APPV23_DENY_FEDERATED_PIPE
+        : 0;
+}
 
 export function appV23ProfileIsSelectable(profile) {
     return APPV23_SELECTABLE_PROFILES.includes(profile);
@@ -38,44 +47,84 @@ export function appV23PolicyDraft(agent) {
     const role = profile === 'companion' || profile === 'read_only'
         ? 'member'
         : (agent.role === 'admin' || agent.role === 'manager' ? agent.role : 'member');
+    const federatedPipeRestriction = appV23FederatedPipeRestriction(agent.capabilities);
     return {
         role,
         profile,
         clearance: role === 'admin' ? 4 : Math.max(0, Math.min(4, Number(agent.clearance ?? 1))),
-        capabilities: profile === 'companion' ? 15 : (profile === 'read_only' || role === 'admin') ? 1 : 0,
+        capabilities: (
+            profile === 'companion' ? 15 :
+                (profile === 'read_only' || role === 'admin') ? 1 : 0
+        ) | federatedPipeRestriction,
         home_domain: profile === 'read_only'
             ? (agent.home_domain || '')
             : (agent.home_domain || `agent-${String(agent.agent_id || '').slice(0, 12)}`),
     };
 }
 
-export function appV23ProfileDefaults(profile, role) {
+export function appV23ProfileDefaults(profile, role, currentCapabilities = 0) {
     if (!appV23ProfileIsSelectable(profile)) {
         throw new TypeError(`Profile "${profile}" is not selectable`);
     }
+    const federatedPipeRestriction = appV23FederatedPipeRestriction(currentCapabilities);
     if (profile === 'companion') {
-        return { profile, role: 'member', capabilities: 15 };
+        return {
+            profile,
+            role: 'member',
+            capabilities: 15 | federatedPipeRestriction,
+        };
     }
     if (profile === 'read_only') {
-        return { profile, role: 'member', capabilities: 1 };
+        return {
+            profile,
+            role: 'member',
+            capabilities: 1 | federatedPipeRestriction,
+        };
     }
     if (role === 'admin') {
-        return { profile: 'standard', role, clearance: 4, capabilities: 1 };
+        return {
+            profile: 'standard',
+            role,
+            clearance: 4,
+            capabilities: 1 | federatedPipeRestriction,
+        };
     }
     if (role === 'manager') {
-        return { profile: 'standard', role, capabilities: 0 };
+        return {
+            profile: 'standard',
+            role,
+            capabilities: federatedPipeRestriction,
+        };
     }
-    return { profile: 'standard', role: 'member', capabilities: 0 };
+    return {
+        profile: 'standard',
+        role: 'member',
+        capabilities: federatedPipeRestriction,
+    };
 }
 
-export function appV23RoleDefaults(role) {
+export function appV23RoleDefaults(role, currentCapabilities = 0) {
+    const federatedPipeRestriction = appV23FederatedPipeRestriction(currentCapabilities);
     if (role === 'admin') {
-        return { role, profile: 'standard', clearance: 4, capabilities: 1 };
+        return {
+            role,
+            profile: 'standard',
+            clearance: 4,
+            capabilities: 1 | federatedPipeRestriction,
+        };
     }
     if (role === 'manager') {
-        return { role, profile: 'standard', capabilities: 0 };
+        return {
+            role,
+            profile: 'standard',
+            capabilities: federatedPipeRestriction,
+        };
     }
-    return { role: 'member', profile: 'standard', capabilities: 0 };
+    return {
+        role: 'member',
+        profile: 'standard',
+        capabilities: federatedPipeRestriction,
+    };
 }
 
 export const APPV23_CAPABILITY_INDICATORS = Object.freeze([

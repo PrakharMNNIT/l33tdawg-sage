@@ -55,7 +55,11 @@ test('Read-only is the explicit reviewed read-all profile without write authorit
         agent_id: 'abcdef',
         profile: 'read_only', role: 'member', capabilities: 30, clearance: 2,
     });
-    assert.equal(draft.capabilities, 1);
+    assert.equal(
+        draft.capabilities,
+        17,
+        'the independent federated-pipe restriction must survive profile normalization',
+    );
     assert.equal(draft.home_domain, '', 'Read-only must not invent a home domain');
 });
 
@@ -101,7 +105,11 @@ test('raw capability indicators are derived and read-only from named policy', ()
     const standard = appV23CapabilityIndicators({
         profile: 'standard', role: 'member', capabilities: 31, clearance: 2,
     });
-    assert.equal(standard.every(item => item.enabled === false), true);
+    assert.deepEqual(
+        standard.filter(item => item.enabled).map(item => item.bit),
+        [16],
+        'named policy removes contradictory bits but preserves the independent pipe restriction',
+    );
 
     const companion = appV23CapabilityIndicators({
         profile: 'companion', role: 'member', capabilities: 0, clearance: 2,
@@ -118,6 +126,50 @@ test('raw capability indicators are derived and read-only from named policy', ()
     assert.equal(companion[0].enabledLabel, 'All local domains');
     assert.equal(companion[1].enabledLabel, 'Blocked');
     assert.equal(standard[1].disabledLabel, 'Policy-controlled');
+});
+
+test('named policy editing preserves the independent federated-pipe hard restriction', () => {
+    const standard = {
+        agent_id: 'standard-agent',
+        profile: 'standard',
+        role: 'member',
+        clearance: 1,
+        capabilities: 16,
+        home_domain: 'standard-home',
+    };
+    const companion = {
+        agent_id: 'companion-agent',
+        profile: 'companion',
+        role: 'member',
+        clearance: 1,
+        capabilities: 31,
+        home_domain: 'companion-home',
+    };
+    const readOnly = {
+        agent_id: 'read-only-agent',
+        profile: 'read_only',
+        role: 'member',
+        clearance: 1,
+        capabilities: 17,
+        home_domain: '',
+    };
+
+    assert.equal(appV23PolicyDraft(standard).capabilities, 16);
+    assert.equal(appV23PolicyDraft(companion).capabilities, 31);
+    assert.equal(appV23PolicyDraft(readOnly).capabilities, 17);
+    assert.equal(appV23PolicyChanged(companion, appV23PolicyDraft(companion)), false);
+    assert.equal(
+        appV23CapabilityIndicators(companion).find(item => item.bit === 16).enabled,
+        true,
+    );
+    assert.equal(
+        appV23RoleDefaults('manager', companion.capabilities).capabilities,
+        16,
+    );
+    assert.equal(
+        appV23ProfileDefaults('read_only', 'member', companion.capabilities).capabilities,
+        17,
+    );
 });
 
 test('policy change detection avoids meaningless consensus saves', () => {
