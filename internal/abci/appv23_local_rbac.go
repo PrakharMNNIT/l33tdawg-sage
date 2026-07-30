@@ -694,9 +694,6 @@ func (app *SageApp) processLocalAgentApprove(parsedTx *tx.ParsedTx, height int64
 		store.ValidateAppV23Policy(approval.Role, approval.Profile, capabilities, approval.Clearance) != nil {
 		return appV23ControlDenied()
 	}
-	if approval.Profile == store.AppV23ProfileCompanion && approval.Capabilities != 15 {
-		return appV23ControlDenied()
-	}
 	if (!approval.Active || approval.Profile == store.AppV23ProfileReadOnly) &&
 		(approval.TransferHomeDomain || approval.ExpectedHomeDomainOwner != "") {
 		return appV23ControlDenied()

@@ -270,7 +270,7 @@ func TestAppV23RootHandoverPreservesDomainAuthorityAndRecallsOldAndNewAuthorship
 	require.Equal(t, newRootID, authors["after-handover"])
 }
 
-func TestAppV23RecallFailsClosedOnUnreadableClassificationAcrossAllModes(t *testing.T) {
+func TestAppV23RecallOmitsUnreadableClassificationAcrossAllBroadModes(t *testing.T) {
 	srv, badger, memberID, ownerID, _ := setupAppV23RESTAccess(t)
 	memStore := srv.store.(*rbacMockMemoryStore)
 	seedMemory(t, memStore, "corrupt-classification", ownerID, "owner.home", "needle classified memory")
@@ -303,8 +303,8 @@ func TestAppV23RecallFailsClosedOnUnreadableClassificationAcrossAllModes(t *test
 			req = req.WithContext(middleware.WithAgentID(req.Context(), memberID))
 			recorder := httptest.NewRecorder()
 			tc.handler.ServeHTTP(recorder, req)
-			require.Equal(t, http.StatusServiceUnavailable, recorder.Code, recorder.Body.String())
-			require.Contains(t, recorder.Body.String(), "Memory classification state is unavailable")
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			require.Contains(t, recorder.Body.String(), `"results":[]`)
 			require.NotContains(t, recorder.Body.String(), "needle classified memory")
 		})
 	}

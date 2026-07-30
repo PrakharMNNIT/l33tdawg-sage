@@ -369,7 +369,7 @@ func TestRecoverPendingStateSyncActivationRunsBeforeLiveDirectoryCreation(t *tes
 		context.Background(), dataDir, cometHome, badgerPath,
 		func(*config.Config) (uint64, []byte, error) { return 40, oldHash[:], nil },
 		inspectBootRecoveryTestState,
-		func() error { return errors.New("rollback must not complete the receiver role") },
+		func(uint64, []byte) error { return errors.New("rollback must not complete the receiver role") },
 	)
 	require.NoError(t, err)
 	assert.True(t, found)
@@ -411,7 +411,7 @@ func TestRecoverPendingStateSyncActivationRejectsReceiverInPersistedCometRoster(
 	completed := false
 	action, found, err := recoverPendingStateSyncActivation(
 		context.Background(), dataDir, cometHome, badgerPath,
-		func() error {
+		func(uint64, []byte) error {
 			completed = true
 			return nil
 		},
@@ -437,7 +437,7 @@ func TestRecoverPendingStateSyncActivationNoJournalAndCanonicalTarget(t *testing
 			return 0, nil, nil
 		},
 		inspectBootRecoveryTestState,
-		func() error { return errors.New("missing journal must not complete the receiver role") },
+		func(uint64, []byte) error { return errors.New("missing journal must not complete the receiver role") },
 	)
 	require.NoError(t, err)
 	assert.False(t, found)
@@ -454,10 +454,12 @@ func TestCompleteStateSyncReceivingRolePersistsOneShotDisarm(t *testing.T) {
 
 	require.NoError(t, completeStateSyncReceivingRole(config))
 	assert.False(t, config.Quorum.StateSync.Receiving)
+	assert.True(t, config.Quorum.StateSync.Received)
 	require.NoError(t, completeStateSyncReceivingRole(config), "completed role is idempotent")
 	written, err := os.ReadFile(filepath.Join(home, "config.yaml"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(written), "receiving: true")
+	assert.Contains(t, string(written), "received: true")
 	assert.ErrorContains(t, completeStateSyncReceivingRole(nil), "required")
 }
 

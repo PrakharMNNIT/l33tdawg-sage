@@ -54,8 +54,8 @@ func seedAgentWithSecrets(id string) *store.AgentEntry {
 	}
 }
 
-// TestListRegisteredAgents_StripsCredentials: the unauthenticated /v1/agents
-// must not leak claim_token or per-agent ACL topology.
+// TestListRegisteredAgents_StripsCredentials exercises the handler projection
+// directly; the production route also requires a valid Ed25519 caller.
 func TestListRegisteredAgents_StripsCredentials(t *testing.T) {
 	agentID := "00000000000000000000000000000000000000000000000000000000000000a1"
 	mock := &mockAgentStore{agents: map[string]*store.AgentEntry{agentID: seedAgentWithSecrets(agentID)}}

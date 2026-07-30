@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -14,6 +15,34 @@ import (
 // become visible only after consensus replay completes the matching Commit.
 var ErrMemoryProjectionUnpublished = errors.New("memory projection is not canonically published")
 
+// ErrMemoryProjectionQuarantined identifies a canonical memory entry that
+// exists, but whose content cannot be safely disclosed. In particular, legacy
+// ordinary lifecycle transitions stored a zero-length canonical content hash.
+// A narrowly eligible pre-app-v23 terminal record may use the compatibility
+// disposition below; every other zero-hash record remains quarantined.
+//
+// This sentinel is always wrapped together with ErrMemoryProjectionUnpublished
+// so exact/detail callers continue to fail closed while broad collection
+// callers may omit the single unsafe row without disclosing it or consuming a
+// visible result/count.
+var ErrMemoryProjectionQuarantined = errors.New("memory projection is quarantined")
+
+// MemoryProjectionDisposition describes why a serving-layer row is publishable.
+// Only Exact and LegacyTerminalHashless are returned without an error.
+type MemoryProjectionDisposition string
+
+const (
+	MemoryProjectionExact MemoryProjectionDisposition = "exact"
+	// MemoryProjectionLegacyTerminalHashless is the replay-neutral compatibility
+	// path for a pre-app-v23 ordinary terminal memory whose historical lifecycle
+	// transition erased its canonical hash. It verifies the surviving SQL
+	// content/hash pair and every canonical envelope field still present, but it
+	// must not be represented as a chain-retained content commitment.
+	MemoryProjectionLegacyTerminalHashless MemoryProjectionDisposition = "legacy_terminal_hashless"
+	MemoryProjectionQuarantined            MemoryProjectionDisposition = "quarantined"
+	MemoryProjectionUnpublished            MemoryProjectionDisposition = "unpublished"
+)
+
 // ValidateMemoryProjection verifies that a serving-layer record is the exact
 // projection of one committed on-chain memory snapshot. It also returns the
 // classification from that same Badger read transaction so disclosure policy
@@ -21,37 +50,91 @@ var ErrMemoryProjectionUnpublished = errors.New("memory projection is not canoni
 func (s *BadgerStore) ValidateMemoryProjection(
 	record *memory.MemoryRecord,
 ) (*MemoryDisclosureState, error) {
+	state, _, err := s.ClassifyMemoryProjection(record)
+	return state, err
+}
+
+// ClassifyMemoryProjection performs the same fail-closed validation as
+// ValidateMemoryProjection and additionally reports the narrow compatibility
+// disposition used for pre-app-v23 terminal zero-hash records.
+func (s *BadgerStore) ClassifyMemoryProjection(
+	record *memory.MemoryRecord,
+) (projection *MemoryDisclosureState, disposition MemoryProjectionDisposition, resultErr error) {
+	defer func() {
+		s.observeMemoryProjectionDisposition(disposition)
+	}()
 	if s == nil || record == nil || record.MemoryID == "" {
-		return nil, fmt.Errorf("%w: missing store or record identity", ErrMemoryProjectionUnpublished)
+		return nil, MemoryProjectionUnpublished, fmt.Errorf(
+			"%w: missing store or record identity", ErrMemoryProjectionUnpublished,
+		)
 	}
 	state, err := s.GetMemoryDisclosureState(record.MemoryID)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMemoryProjectionUnpublished, err)
+		return nil, MemoryProjectionUnpublished, fmt.Errorf(
+			"%w: %v", ErrMemoryProjectionUnpublished, err,
+		)
 	}
-	if len(record.ContentHash) == 0 || !bytes.Equal(record.ContentHash, state.ContentHash) {
-		return nil, fmt.Errorf("%w: content hash mismatch for %s",
-			ErrMemoryProjectionUnpublished, record.MemoryID)
+	if string(record.Status) != state.Status {
+		return nil, MemoryProjectionUnpublished, fmt.Errorf(
+			"%w: status mismatch for %s", ErrMemoryProjectionUnpublished, record.MemoryID,
+		)
+	}
+	if state.DomainRecorded && record.DomainTag != state.Domain {
+		return nil, MemoryProjectionUnpublished, fmt.Errorf(
+			"%w: domain mismatch for %s", ErrMemoryProjectionUnpublished, record.MemoryID,
+		)
+	}
+	if state.AuthorRecorded && record.SubmittingAgent != state.Author {
+		return nil, MemoryProjectionUnpublished, fmt.Errorf(
+			"%w: author mismatch for %s", ErrMemoryProjectionUnpublished, record.MemoryID,
+		)
+	}
+
+	if len(state.ContentHash) == 0 {
+		if legacyTerminalHashlessProjectionEligible(record, state) {
+			return state, MemoryProjectionLegacyTerminalHashless, nil
+		}
+		return nil, MemoryProjectionQuarantined, fmt.Errorf(
+			"%w: %w: canonical content hash is unavailable for %s",
+			ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, record.MemoryID,
+		)
+	}
+	if len(state.ContentHash) != sha256.Size ||
+		len(record.ContentHash) != sha256.Size ||
+		!bytes.Equal(record.ContentHash, state.ContentHash) {
+		return nil, MemoryProjectionUnpublished, fmt.Errorf(
+			"%w: content hash mismatch for %s", ErrMemoryProjectionUnpublished, record.MemoryID,
+		)
 	}
 	if record.Content == "" {
 		if !state.CoCommitRecorded {
-			return nil, fmt.Errorf("%w: empty content is not a canonical hash-only co-commit for %s",
-				ErrMemoryProjectionUnpublished, record.MemoryID)
+			return nil, MemoryProjectionUnpublished, fmt.Errorf(
+				"%w: empty content is not a canonical hash-only co-commit for %s",
+				ErrMemoryProjectionUnpublished, record.MemoryID,
+			)
 		}
 	} else if computed := memory.ComputeContentHash(record.Content); !bytes.Equal(computed, state.ContentHash) {
-		return nil, fmt.Errorf("%w: content does not match canonical hash for %s",
-			ErrMemoryProjectionUnpublished, record.MemoryID)
+		return nil, MemoryProjectionUnpublished, fmt.Errorf(
+			"%w: content does not match canonical hash for %s",
+			ErrMemoryProjectionUnpublished, record.MemoryID,
+		)
 	}
-	if string(record.Status) != state.Status {
-		return nil, fmt.Errorf("%w: status mismatch for %s",
-			ErrMemoryProjectionUnpublished, record.MemoryID)
+	return state, MemoryProjectionExact, nil
+}
+
+func legacyTerminalHashlessProjectionEligible(
+	record *memory.MemoryRecord,
+	state *MemoryDisclosureState,
+) bool {
+	if record == nil || state == nil ||
+		state.AuthorPrincipalRecorded || state.CoCommitRecorded ||
+		len(record.ContentHash) != sha256.Size || record.Content == "" {
+		return false
 	}
-	if state.DomainRecorded && record.DomainTag != state.Domain {
-		return nil, fmt.Errorf("%w: domain mismatch for %s",
-			ErrMemoryProjectionUnpublished, record.MemoryID)
+	switch record.Status {
+	case memory.StatusCommitted, memory.StatusDeprecated:
+	default:
+		return false
 	}
-	if state.AuthorRecorded && record.SubmittingAgent != state.Author {
-		return nil, fmt.Errorf("%w: author mismatch for %s",
-			ErrMemoryProjectionUnpublished, record.MemoryID)
-	}
-	return state, nil
+	return bytes.Equal(record.ContentHash, memory.ComputeContentHash(record.Content))
 }

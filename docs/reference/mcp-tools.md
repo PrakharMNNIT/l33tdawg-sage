@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.15.1.
+Reconciled against internal/mcp for SAGE v11.16.0.
 
 # SAGE MCP Tools Reference
 
@@ -167,6 +167,17 @@ most important operational tool.
   complete canonical problem type + known code + explicit `retryable:false`
   contract and derives remedy text locally; unknown codes and server-provided
   remedy text are not trusted.
+
+**Permanent-denial remedy rule:** A level-2 grant is never a remedy for a hard
+capability or profile denial. It cannot override
+`foreign_write_restricted`, `shared_write_restricted`,
+`domain_claim_restricted`, `principal_pending_review`,
+`no_owned_home_domain`, or `manager_scope_denied`. Even
+`missing_write_grant` is not an instruction to invent a direct grant in
+CEREBRUM: v11.16.0 exposes the narrower owned-domain path or, when shared
+management is intended, Root/Admin approval as a Manager in an Access Group
+covering that domain. Clients must surface the exact typed remedy and must not
+replace it with the obsolete blanket advice to “grant level 2.”
 
 **Recall path:** Uses hybrid BM25+vector (RRF) by default; falls back to FTS5
 full-text search if `/v1/memory/hybrid` is unavailable; falls back to semantic
@@ -804,7 +815,7 @@ bytes can leave the node
   handle deliberately cannot resolve from cached display metadata.
 
 Sender-queryable successful-delivery and receiver claim/read receipts are
-explicitly deferred to v11.16. In v11.15, a local queue status, a clean inbox,
+explicitly deferred beyond v11.16. In v11.16, a local queue status, a clean inbox,
 or the absence of a terminal failure must never be described as proof that the
 recipient received or read the work.
 
@@ -837,6 +848,20 @@ their registered casing. Thus `mynah` can resolve
 `MYNAH (SAGE Voice Bridge Agent)`. Only when no local match exists does it
 inspect caller-authorized federated contacts; it is not a global agent
 directory.
+
+After app-v23, local discovery uses the same active-ordinary-agent boundary as
+local pipeline resolve/send/inbox for both caller and result: Root and every
+historical Root credential, pending/inactive principals, and inconsistent
+enrollments are excluded even if a stale SQLite row still says `active`. Local
+pipeline discovery is not a memory read, so clearance and Access Group memory
+scope do not hide an otherwise active local recipient; a message delegates no
+memory authority. The signed REST projection owns match and eligibility
+decisions, and MCP consumes its `match_kind` instead of independently dropping
+rows through a second status oracle.
+
+`GET /v1/agents` is also signed and active-ordinary scoped as of v11.16, but it
+is a roster operation and must never be substituted for this caller-scoped projection;
+`sage_find_agent` additionally owns bounded name resolution.
 
 This is discovery metadata, not presence or a reachability probe. Zero matches
 does not mean that a previously known recipient is offline or undeliverable.

@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/l33tdawg/sage/internal/store"
+	"github.com/l33tdawg/sage/internal/tx"
 )
 
 type testAppV23RootReader struct {
@@ -96,6 +97,41 @@ func TestLocalAgentKeyResolverFindsCEREBRUMBundleKey(t *testing.T) {
 	require.Equal(t, bundleKey, resolved)
 }
 
+func TestLocalAgentKeyResolverFindsSDKManagedIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	operatorKey, _ := testAgentKey(t, 0x53)
+	writeTestAgentKey(t, filepath.Join(home, "agent.key"), operatorKey)
+	identityKey, identityID := testAgentKey(t, 0x54)
+	writeTestAgentKey(
+		t,
+		filepath.Join(home, "identities", "agent-01.key"),
+		identityKey,
+	)
+
+	resolver := localAgentKeyResolverWithOperator(filepath.Join(home, "agent.key"))
+	resolved, ok := resolver(identityID)
+	require.True(t, ok)
+	require.Equal(t, identityKey, resolved)
+}
+
+func TestLocalAgentKeyResolverDoesNotFollowSDKIdentitySymlinks(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	externalKey, externalID := testAgentKey(t, 0x55)
+	externalPath := filepath.Join(t.TempDir(), "external.key")
+	writeTestAgentKey(t, externalPath, externalKey)
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "identities"), 0o700))
+	require.NoError(t, os.Symlink(
+		externalPath,
+		filepath.Join(home, "identities", "linked.key"),
+	))
+
+	resolver := localAgentKeyResolverWithOperator(filepath.Join(home, "agent.key"))
+	_, ok := resolver(externalID)
+	require.False(t, ok)
+}
+
 func TestLocalAgentKeyResolverExpiresRotatedPositive(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SAGE_HOME", home)
@@ -142,6 +178,12 @@ func TestCurrentUpgradeSigningKeyTracksRotatedRootBundle(t *testing.T) {
 	before, err := buildUpgradeProposeTx(cfg, 23)
 	require.NoError(t, err)
 	require.Equal(t, oldID, before.UpgradePropose.ProposerID)
+	beforeHeartbeatRaw, err := buildOperatorRegisterTx(cfg)
+	require.NoError(t, err)
+	beforeHeartbeat, err := tx.DecodeTx(beforeHeartbeatRaw)
+	require.NoError(t, err)
+	require.Equal(t, ed25519.PublicKey(oldKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(beforeHeartbeat.AgentPubKey))
+	require.Equal(t, ed25519.PublicKey(oldKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(beforeHeartbeat.PublicKey))
 
 	state.root = &store.AppV23RootState{
 		PrincipalID: oldID, CredentialID: newID, Generation: 2,
@@ -150,6 +192,12 @@ func TestCurrentUpgradeSigningKeyTracksRotatedRootBundle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, newID, after.UpgradePropose.ProposerID)
 	require.Equal(t, ed25519.PublicKey(newKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(after.AgentPubKey))
+	afterHeartbeatRaw, err := buildOperatorRegisterTx(cfg)
+	require.NoError(t, err)
+	afterHeartbeat, err := tx.DecodeTx(afterHeartbeatRaw)
+	require.NoError(t, err)
+	require.Equal(t, ed25519.PublicKey(newKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(afterHeartbeat.AgentPubKey))
+	require.Equal(t, ed25519.PublicKey(newKey.Public().(ed25519.PublicKey)), ed25519.PublicKey(afterHeartbeat.PublicKey))
 }
 
 func TestCurrentUpgradeSigningKeyFailsClosedAfterRootRotation(t *testing.T) {

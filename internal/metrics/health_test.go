@@ -218,3 +218,61 @@ func TestReadiness_VendoredAgentEnrollmentFailsClosedUntilExactPolicyIsReady(t *
 		t.Fatalf("confirmed vendored enrollment must recover readiness, got %d %v", code, body["status"])
 	}
 }
+
+func TestReadiness_CanonicalMemoryProjectionFailsClosedUntilCompleteAudit(t *testing.T) {
+	h := NewHealthChecker()
+	h.SetPostgresHealth(true)
+	h.SetCometBFTHealth(true)
+
+	status := CanonicalMemoryProjectionStatus{
+		Required: true,
+		State:    "unchecked",
+	}
+	h.SetCanonicalMemoryProjectionProvider(func() CanonicalMemoryProjectionStatus {
+		return status
+	})
+
+	code, body := readiness(t, h, "")
+	if code != http.StatusServiceUnavailable || body["status"] != "not_ready" {
+		t.Fatalf("unchecked canonical projection must be 503, got %d %v", code, body["status"])
+	}
+	projected, _ := body["memory_projection"].(map[string]any)
+	if projected["state"] != "unchecked" {
+		t.Fatalf("canonical projection status missing or wrong: %v", body["memory_projection"])
+	}
+
+	status = CanonicalMemoryProjectionStatus{
+		Checked:          true,
+		Required:         true,
+		OK:               true,
+		State:            "legacy_compatible",
+		LegacyCompatible: true,
+	}
+	code, body = readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "ready" {
+		t.Fatalf("verified legacy-compatible projection must be ready, got %d %v", code, body["status"])
+	}
+
+	status = CanonicalMemoryProjectionStatus{
+		Checked:  true,
+		Required: true,
+		OK:       true,
+		State:    "canonical_subset",
+	}
+	code, body = readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "ready" {
+		t.Fatalf("verified state-sync subset projection must be ready, got %d %v", code, body["status"])
+	}
+
+	status = CanonicalMemoryProjectionStatus{
+		Checked:     true,
+		Required:    true,
+		OK:          false,
+		State:       "quarantined",
+		Quarantined: true,
+	}
+	code, body = readiness(t, h, "")
+	if code != http.StatusServiceUnavailable || body["status"] != "not_ready" {
+		t.Fatalf("quarantined canonical projection must be 503, got %d %v", code, body["status"])
+	}
+}

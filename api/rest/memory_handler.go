@@ -1502,6 +1502,9 @@ func (s *Server) appV23RecallCandidateFilter(
 	return func(rec *memory.MemoryRecord) (bool, error) {
 		disclosure, err := s.evaluateAppV23RecordDisclosure(agentID, rec, at)
 		if err != nil {
+			if isUnsafeAppV23Projection(err) {
+				return false, nil
+			}
 			return false, appV23RecordDisclosureError(err)
 		}
 		return disclosure.Allowed, nil
@@ -1793,6 +1796,9 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 				queryAgentID, rec, now,
 			)
 			if disclosureErr != nil {
+				if isUnsafeAppV23Projection(disclosureErr) {
+					continue
+				}
 				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
 					"Memory classification state is unavailable; retry later.")
 				return
@@ -2487,6 +2493,9 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 				queryAgentID, rec, now,
 			)
 			if disclosureErr != nil {
+				if isUnsafeAppV23Projection(disclosureErr) {
+					continue
+				}
 				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
 					"Memory classification state is unavailable; retry later.")
 				return
@@ -2804,6 +2813,9 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 				queryAgentID, rec, now,
 			)
 			if disclosureErr != nil {
+				if isUnsafeAppV23Projection(disclosureErr) {
+					continue
+				}
 				writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
 					"Memory classification state is unavailable; retry later.")
 				return
@@ -3645,6 +3657,9 @@ func (s *Server) handleGetOpenTasks(w http.ResponseWriter, r *http.Request) {
 					agentID, rec, now,
 				)
 				if disclosureErr != nil {
+					if isUnsafeAppV23Projection(disclosureErr) {
+						continue
+					}
 					writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
 						"Task authorization state is unavailable; retry later.")
 					return
@@ -3779,6 +3794,9 @@ func (s *Server) listAppV23VisibleMemories(
 		for _, rec := range batch {
 			disclosure, err := s.evaluateAppV23RecordDisclosure(agentID, rec, now)
 			if err != nil {
+				if isUnsafeAppV23Projection(err) {
+					continue
+				}
 				return nil, 0, false, false, appV23RecordDisclosureError(err)
 			}
 			if disclosure.Allowed {
@@ -4110,6 +4128,9 @@ func (s *Server) getAppV23VisibleTimeline(
 				agentID, rec, now,
 			)
 			if disclosureErr != nil {
+				if isUnsafeAppV23Projection(disclosureErr) {
+					continue
+				}
 				return nil, appV23RecordDisclosureError(disclosureErr)
 			}
 			if disclosure.Allowed {

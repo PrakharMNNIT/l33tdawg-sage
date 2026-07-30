@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/l33tdawg/sage/internal/governance"
 	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 )
@@ -811,6 +812,15 @@ func TestAppV23DashboardGovernanceProofUsesRotatedRootCredential(t *testing.T) {
 	h.AdminSigningKey = fixture.rootKey // stale after rotation; must not authorize
 	h.AppV20ActiveFn = func() bool { return true }
 	h.GovernanceDomainFn = func() string { return strings.Repeat("ab", 32) }
+	proposal, err := json.Marshal(governance.ProposalState{
+		ProposalID: "proposal-1",
+		Operation:  governance.OpAddValidator,
+		TargetID:   rotatedID,
+		ProposerID: rotatedID,
+		Status:     governance.StatusVoting,
+	})
+	require.NoError(t, err)
+	require.NoError(t, fixture.badger.SetGovProposal("proposal-1", proposal))
 	req := httptest.NewRequest(
 		http.MethodPost, "/v1/dashboard/governance/vote",
 		strings.NewReader(`{"proposal_id":"proposal-1","decision":"accept"}`),

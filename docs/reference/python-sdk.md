@@ -1,8 +1,8 @@
-Verified against SDK source for SAGE v11.15.1. Package: sage-agent-sdk.
+Verified against SDK source for SAGE v11.16.0. Package: sage-agent-sdk.
 
 # SAGE Python SDK Reference
 
-**Package:** `sage-agent-sdk` **Version:** 11.15.1
+**Package:** `sage-agent-sdk` **Version:** 11.16.0
 **Requires:** Python 3.10+ | httpx ≥ 0.25 | pydantic ≥ 2.0 | PyNaCl ≥ 1.5
 
 ```bash
@@ -580,10 +580,14 @@ Returns `AgentInfo` — all fields optional except `agent_id`. Key fields: `name
 #### `list_agents()`
 
 ```python
-list_agents() -> list[dict]
+list_agents() -> dict
 ```
 
 `GET /v1/agents`
+
+The SDK signs this request. Since v11.16/app-v24, the server returns only the
+active ordinary local roster visible through the pipeline identity boundary;
+the endpoint is no longer an unsigned full-directory read.
 
 ---
 
@@ -735,7 +739,8 @@ pipe_status(pipe_id: str) -> PipeMessage
 
 This inspects the current node's local pipeline workflow row. It is not proof
 that a remote recipient received or read the message. Sender-queryable
-successful-delivery and claim/read receipts are explicitly deferred to v11.16.
+successful-delivery and claim/read receipts are explicitly deferred beyond
+v11.16.
 
 `PipeMessage` includes additive `source_chain_id`, `source_pipe_id`,
 `destination_chain_id`, `reply_source_chain_id`, policy/agreement/contact
@@ -1508,7 +1513,7 @@ Canonical app-v23 memory-write denials have
 `error_type="https://sage.dev/errors/domain-write-denied"`, one of the seven
 stable `reason_code` values, an exact `remedy`, and `retryable=False`. Branch on
 those fields, never on human-readable `detail`. For `missing_write_grant`,
-v11.15.0 directs the agent to its owned domain or, when broader shared
+v11.16.0 directs the agent to its owned domain or, when broader shared
 management is intended, to a Root/Admin-approved Manager Access Group; it does
 not claim that CEREBRUM has a direct level-2 grant editor.
 

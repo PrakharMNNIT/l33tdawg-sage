@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +37,7 @@ func (h *DashboardHandler) RegisterGovernanceRoutes(r chi.Router) {
 	// Read-only query endpoints
 	r.Get("/v1/dashboard/governance/proposals", handleListProposals(govStore))
 	r.Get("/v1/dashboard/governance/proposals/{id}", h.handleGetProposal(govStore))
+	r.Get("/v1/dashboard/memory-reanchor/plan", h.handleMemoryHashReanchorPlan)
 
 	// Write endpoints — broadcast governance transactions through CometBFT
 	r.Post("/v1/dashboard/governance/propose", h.handleDashboardGovPropose)
@@ -173,7 +175,7 @@ func (h *DashboardHandler) handleDashboardGovPropose(w http.ResponseWriter, r *h
 	}
 
 	if req.Operation == "" {
-		writeError(w, http.StatusBadRequest, "operation is required (add_validator, remove_validator, update_power, sync_group_action, scope_action)")
+		writeError(w, http.StatusBadRequest, "operation is required (add_validator, remove_validator, update_power, sync_group_action, scope_action, memory_hash_reanchor)")
 		return
 	}
 	if req.Reason == "" {
@@ -191,6 +193,17 @@ func (h *DashboardHandler) handleDashboardGovPropose(w http.ResponseWriter, r *h
 		writeError(w, http.StatusConflict, "scope_action requires app-v20 activation")
 		return
 	}
+	if op == tx.GovOpMemoryHashReanchor {
+		if h.AppV24ActiveFn == nil || !h.AppV24ActiveFn() {
+			writeError(w, http.StatusConflict, "memory_hash_reanchor requires app-v24 activation")
+			return
+		}
+		if appV23Actor == nil || !appV23Actor.IsRoot {
+			writeAppV23AccessError(w, http.StatusForbidden, "current_root_required",
+				"Only the current local CEREBRUM Root may propose memory commitment repair.")
+			return
+		}
+	}
 
 	var pubKeyBytes []byte
 	if req.TargetPubkey != "" {
@@ -205,6 +218,17 @@ func (h *DashboardHandler) handleDashboardGovPropose(w http.ResponseWriter, r *h
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if op == tx.GovOpMemoryHashReanchor {
+		targetID, targetErr := tx.MemoryHashReanchorTargetID(payloadBytes)
+		if targetErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid memory_hash_reanchor payload: "+targetErr.Error())
+			return
+		}
+		if req.TargetID != targetID {
+			writeError(w, http.StatusBadRequest, "target_id does not bind the exact memory_hash_reanchor payload")
+			return
+		}
 	}
 
 	outerKey := h.AdminSigningKey
@@ -393,6 +417,23 @@ func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if decision == tx.VoteDecisionAccept {
+		proposal, proposalErr := h.dashboardGovernanceProposal(req.ProposalID)
+		if proposalErr != nil {
+			writeError(w, http.StatusConflict, "cannot attest governance proposal: "+proposalErr.Error())
+			return
+		}
+		if proposal.Operation == governance.OpMemoryHashReanchor {
+			if h.AppV24ActiveFn == nil || !h.AppV24ActiveFn() {
+				writeError(w, http.StatusConflict, "memory_hash_reanchor requires app-v24 activation")
+				return
+			}
+			if attestErr := h.attestMemoryHashReanchorProposal(r.Context(), proposal); attestErr != nil {
+				writeError(w, http.StatusConflict, "memory repair vote blocked: "+attestErr.Error())
+				return
+			}
+		}
+	}
 
 	voteTx := &tx.ParsedTx{
 		Type:      tx.TxTypeGovVote,
@@ -506,21 +547,32 @@ func (h *DashboardHandler) dashboardCommittedGovernanceStatus(proposalID string)
 	if h.BadgerStore == nil {
 		return "unknown", nil
 	}
+	proposal, err := h.dashboardGovernanceProposal(proposalID)
+	if err != nil {
+		return "", err
+	}
+	return string(proposal.Status), nil
+}
+
+func (h *DashboardHandler) dashboardGovernanceProposal(proposalID string) (*governance.ProposalState, error) {
+	if h.BadgerStore == nil {
+		return nil, errors.New("canonical governance store is unavailable")
+	}
 	data, err := h.BadgerStore.GetGovProposal(proposalID)
 	if err != nil {
-		return "", fmt.Errorf("load proposal: %w", err)
+		return nil, fmt.Errorf("load proposal: %w", err)
 	}
 	if len(data) == 0 {
-		return "", fmt.Errorf("proposal is absent after successful commit")
+		return nil, fmt.Errorf("proposal is absent")
 	}
 	var proposal governance.ProposalState
 	if err = json.Unmarshal(data, &proposal); err != nil {
-		return "", fmt.Errorf("decode proposal: %w", err)
+		return nil, fmt.Errorf("decode proposal: %w", err)
 	}
 	if proposal.ProposalID != proposalID {
-		return "", fmt.Errorf("proposal id mismatch: got %q", proposal.ProposalID)
+		return nil, fmt.Errorf("proposal id mismatch: got %q", proposal.ProposalID)
 	}
-	return string(proposal.Status), nil
+	return &proposal, nil
 }
 
 func readDashboardGovernanceBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
@@ -573,8 +625,10 @@ func parseDashboardGovOp(s string) (tx.GovProposalOp, error) {
 		return tx.GovOpSyncGroupAction, nil
 	case "scope_action":
 		return tx.GovOpScopeAction, nil
+	case "memory_hash_reanchor":
+		return tx.GovOpMemoryHashReanchor, nil
 	default:
-		return 0, fmt.Errorf("operation must be one of: add_validator, remove_validator, update_power, sync_group_action, scope_action")
+		return 0, fmt.Errorf("operation must be one of: add_validator, remove_validator, update_power, sync_group_action, scope_action, memory_hash_reanchor")
 	}
 }
 

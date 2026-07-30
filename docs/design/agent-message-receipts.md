@@ -1,14 +1,14 @@
 # Agent Message Delivery and Read Receipts
 
-**Status:** planned design contract for SAGE v11.16.0; not implemented.
+**Status:** planned post-v11.16 design contract; not implemented.
 
 **Consensus:** off-consensus and off both chains. This feature requires no new
 application fork and does not change app-v23, AppHash, replay, or state-sync
 rules.
 
-**Release boundary:** this is deliberately not part of v11.15.0. The current
-release must finish its app-v23 security and upgrade gates without adding a new
-federation protocol. Implementation belongs to the next feature release and
+**Release boundary:** this is deliberately not part of v11.16.0. The current
+release finishes its app-v24 memory-integrity, RBAC, and recovery gates without
+adding a new federation protocol. Implementation belongs to a later feature release and
 must pass the gates in this document before any REST, MCP, SDK, or product copy
 describes receipts as available.
 
@@ -27,7 +27,7 @@ messages use the same sender-facing query.
 ## One public Messages model
 
 “Pipe”, “inbox”, “results”, and “outbox” are implementation states, not four
-product concepts an agent should have to reconcile. v11.16 therefore starts
+product concepts an agent should have to reconcile. The future service therefore starts
 one agent-only **Messages** model, but receiving work remains an explicitly
 destructive operation: selecting pending rows also claims them. The minimal
 safe surface has five operations:
@@ -49,7 +49,7 @@ acknowledging cannot be confused or rebound. Incoming receive may return
 request payload only to the exact authorized recipient. Status is always
 payload-free.
 
-The canonical v11.16 surfaces are:
+The planned post-v11.16 surfaces are:
 
 - `POST /v1/messages`;
 - `POST /v1/messages/receive`;

@@ -25,7 +25,7 @@ func TestPostgresFindAgentsByNameUsesBoundedEscapedActiveLookup(t *testing.T) {
 		AddRow("partial", "MYNAH (MYNAH-Ü%_\\ bridge)", "registered-bridge", "mynah-app", "active", nil)
 
 	mock.ExpectQuery(regexp.QuoteMeta(postgresFindAgentsByNameSQL)).
-		WithArgs(pattern, exact, maxAgentNameLookupResults).
+		WithArgs(pattern, exact, maxAgentNameLookupResults, 0).
 		WillReturnRows(rows)
 
 	agents, err := s.FindAgentsByName(context.Background(), "  MYNAH-Ü%_\\  ", 200)
@@ -35,6 +35,26 @@ func TestPostgresFindAgentsByNameUsesBoundedEscapedActiveLookup(t *testing.T) {
 	assert.Equal(t, "MYNAH-Ü%_\\", agents[0].RegisteredName, "legacy empty registered name must backfill")
 	assert.Equal(t, "partial", agents[1].AgentID)
 	assert.Equal(t, "active", agents[1].Status)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresFindAgentsByNamePageUsesBoundedOffset(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	require.NoError(t, err)
+	t.Cleanup(mock.Close)
+	s := &PostgresStore{db: mock}
+
+	rows := pgxmock.NewRows([]string{
+		"agent_id", "name", "registered_name", "provider", "status", "removed_at",
+	}).AddRow("canonical", "claude-code/sage", "", "claude-code", "active", nil)
+	mock.ExpectQuery(regexp.QuoteMeta(postgresFindAgentsByNameSQL)).
+		WithArgs("%claude%", "claude", maxAgentNameLookupResults, 40).
+		WillReturnRows(rows)
+
+	agents, err := s.FindAgentsByNamePage(context.Background(), "claude", 200, 40)
+	require.NoError(t, err)
+	require.Len(t, agents, 1)
+	assert.Equal(t, "canonical", agents[0].AgentID)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

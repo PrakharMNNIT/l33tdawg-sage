@@ -88,6 +88,7 @@ func TestPersistStateSyncReceivingPreservesRawPaths(t *testing.T) {
 	assert.Contains(t, string(written), "agent_key_file: ./operator.key")
 	assert.Contains(t, string(written), "authorization_file: ./join.json")
 	assert.NotContains(t, string(written), "receiving: true")
+	assert.Contains(t, string(written), "received: true")
 	require.NoError(t, persistStateSyncReceiving(false), "completion must be idempotent")
 }
 
@@ -112,6 +113,7 @@ func TestPersistStateSyncReceivingPreservesAbsentDefaults(t *testing.T) {
 	loaded, err := LoadConfig()
 	require.NoError(t, err)
 	assert.False(t, loaded.Quorum.StateSync.Receiving)
+	assert.True(t, loaded.Quorum.StateSync.Received)
 	assert.Equal(t, filepath.Join(home, "data"), loaded.DataDir)
 	assert.Equal(t, filepath.Join(home, "agent.key"), loaded.AgentKey)
 	assert.Equal(t, "127.0.0.1:8080", loaded.RESTAddr)

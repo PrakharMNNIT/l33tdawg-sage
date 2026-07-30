@@ -1098,6 +1098,33 @@ func TestFindAgentsByNameSupportsBoundedLocalSubstringLookup(t *testing.T) {
 	assert.Empty(t, unicodeDifferentCase, "non-ASCII code points require registered casing")
 }
 
+func TestFindAgentsByNamePageUsesStableBoundedOffset(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for i := 0; i < 25; i++ {
+		agent := testAgent(
+			fmt.Sprintf("agent-page-%02d", i),
+			fmt.Sprintf("claude %02d pending", i),
+			"member",
+		)
+		agent.Status = "active"
+		agent.Provider = "claude-code"
+		require.NoError(t, s.CreateAgent(ctx, agent))
+	}
+
+	first, err := s.FindAgentsByNamePage(ctx, "claude", 200, 0)
+	require.NoError(t, err)
+	require.Len(t, first, maxAgentNameLookupResults)
+	assert.Equal(t, "agent-page-00", first[0].AgentID)
+	assert.Equal(t, "agent-page-19", first[19].AgentID)
+
+	second, err := s.FindAgentsByNamePage(ctx, "claude", 200, maxAgentNameLookupResults)
+	require.NoError(t, err)
+	require.Len(t, second, 5)
+	assert.Equal(t, "agent-page-20", second[0].AgentID)
+	assert.Equal(t, "agent-page-24", second[4].AgentID)
+}
+
 func TestUpdateAgent(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

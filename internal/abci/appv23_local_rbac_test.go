@@ -290,6 +290,68 @@ func TestAppV23RootRotationMapsNewCredentialAndDeniesOld(t *testing.T) {
 	require.NoError(t, app.enforceAppV23ControlElevation(adminTx, 13))
 }
 
+// TestAppV23RootHeartbeatAdmittedByCheckTxAndRejectedAtExecution pins the
+// pending-upgrade pump's intentional ABCI split. A current Root-signed
+// AgentRegister must enter the mempool so an idle chain produces a block, but
+// execution must still reject it so CEREBRUM Root never becomes a roster agent.
+func TestAppV23RootHeartbeatAdmittedByCheckTxAndRejectedAtExecution(t *testing.T) {
+	app := setupTestApp(t)
+	genesisRoot := newAgentKey(t)
+	currentRoot := newAgentKey(t)
+	registerAppV23Agent(t, app, genesisRoot, "admin", 1, 0)
+	require.NoError(t, app.badgerStore.EnsureAppV23Root("heartbeat-scope", 10))
+	require.NoError(t, app.badgerStore.RotateAppV23RootCredential(1, currentRoot.id, 11))
+	app.appV23AppliedHeight = 10
+	registeredBefore := app.badgerStore.IsAgentRegistered(currentRoot.id)
+	require.False(t, registeredBefore,
+		"rotated Root credential must begin outside the ordinary agent roster")
+	rootBefore, err := app.badgerStore.GetAppV23Root()
+	require.NoError(t, err)
+	require.Equal(t, currentRoot.id, rootBefore.CredentialID)
+	nonceBefore, err := app.badgerStore.GetNonce(currentRoot.id)
+	require.NoError(t, err)
+
+	heartbeat := makeAgentRegisterTx(t, currentRoot, "operator-admin", "admin", "node operator key", "", "")
+	signAppV23Outer(t, heartbeat, currentRoot, 1)
+	raw, err := tx.EncodeTx(heartbeat)
+	require.NoError(t, err)
+
+	admission, err := app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: raw})
+	require.NoError(t, err)
+	require.Zero(t, admission.Code, admission.Log)
+
+	finalized, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+		Height: 12,
+		Time:   appV23BlockTime(),
+		Txs:    [][]byte{raw},
+	})
+	require.NoError(t, err)
+	require.Len(t, finalized.TxResults, 1)
+	require.Equal(t, appV23ControlDenied(), finalized.TxResults[0])
+	_, err = app.Commit(context.Background(), &abcitypes.RequestCommit{})
+	require.NoError(t, err)
+	require.Equal(t, int64(12), app.state.Height)
+
+	nonceAfter, err := app.badgerStore.GetNonce(currentRoot.id)
+	require.NoError(t, err)
+	require.Equal(t, nonceBefore, nonceAfter,
+		"execution-denied heartbeat must not burn the Root nonce")
+	rootAfter, err := app.badgerStore.GetAppV23Root()
+	require.NoError(t, err)
+	require.Equal(t, rootBefore, rootAfter)
+	require.Equal(t, registeredBefore, app.badgerStore.IsAgentRegistered(currentRoot.id),
+		"Root heartbeat must not materialize a rotated Root credential as an ordinary agent")
+
+	nextHeartbeat := makeAgentRegisterTx(t, currentRoot, "operator-admin", "admin", "node operator key", "", "")
+	signAppV23Outer(t, nextHeartbeat, currentRoot, 2)
+	nextRaw, err := tx.EncodeTx(nextHeartbeat)
+	require.NoError(t, err)
+	nextAdmission, err := app.CheckTx(context.Background(), &abcitypes.RequestCheckTx{Tx: nextRaw})
+	require.NoError(t, err)
+	require.Zero(t, nextAdmission.Code, nextAdmission.Log,
+		"a freshly nonced Root heartbeat must remain admissible after denied execution")
+}
+
 func TestAppV23RootTaskProjectionNeverPersistsRootAsAssignee(t *testing.T) {
 	app := setupTestApp(t)
 	initialRoot := newAgentKey(t)
@@ -751,6 +813,53 @@ func TestAppV23LocalApprovalCannotStealActiveHomeThroughProcessTx(t *testing.T) 
 	owner, err := app.badgerStore.GetDomainOwner(sourceEnrollment.HomeDomain)
 	require.NoError(t, err)
 	require.Equal(t, sourceKey.id, owner)
+	require.NoError(t, app.badgerStore.ValidateAppV23State())
+}
+
+func TestAppV23LocalApprovalAcceptsCompanionWithFederatedMessagingDisabled(t *testing.T) {
+	app := setupTestApp(t)
+	rootKey := newAgentKey(t)
+	companionKey := newAgentKey(t)
+	registerAppV23Agent(t, app, rootKey, store.AppV23RoleAdmin, 1, 0)
+	registerAppV23Agent(
+		t, app, companionKey, store.AppV23RoleMember, 2,
+		store.DefaultSelfRegisteredAgentCapabilities,
+	)
+	require.NoError(t, app.badgerStore.EnsureAppV23Root("companion-approval-scope", 10))
+	app.appV23AppliedHeight = 10
+
+	enrollment, err := app.badgerStore.GetAppV23Enrollment(companionKey.id)
+	require.NoError(t, err)
+	role, err := app.badgerStore.GetAppV23Role(companionKey.id)
+	require.NoError(t, err)
+	approval := &tx.LocalAgentApprove{
+		AgentID: companionKey.id, Active: true, Role: store.AppV23RoleMember,
+		Profile: store.AppV23ProfileCompanion, HomeDomain: "voice-interface",
+		Clearance: 1, Capabilities: uint32(
+			store.AgentCapabilities(15) | store.AgentCapabilityDenyFederatedPipe,
+		),
+		ExpectedRevision: enrollment.Revision, ExpectedRoleRevision: role.Revision,
+		Scope: "companion-approval-scope",
+	}
+	approval.TargetSignature = ed25519.Sign(
+		companionKey.priv, tx.LocalAgentApprovalSignBytes(rootKey.id, approval),
+	)
+	pub, sig, bodyHash, ts := signAgentProof(t, rootKey, []byte("approve-companion-no-pipe"))
+	parsed := &tx.ParsedTx{
+		Type: tx.TxTypeLocalAgentApprove, LocalAgentApprove: approval,
+		AgentPubKey: pub, AgentSig: sig, AgentBodyHash: bodyHash, AgentTimestamp: ts,
+	}
+	signAppV23Outer(t, parsed, rootKey, 1)
+
+	result := app.processTx(parsed, 11, appV23BlockTime())
+	require.Zero(t, result.Code, result.Log)
+	approved, err := app.badgerStore.GetAppV23Enrollment(companionKey.id)
+	require.NoError(t, err)
+	require.Equal(
+		t,
+		store.AgentCapabilities(15)|store.AgentCapabilityDenyFederatedPipe,
+		approved.Capabilities,
+	)
 	require.NoError(t, app.badgerStore.ValidateAppV23State())
 }
 

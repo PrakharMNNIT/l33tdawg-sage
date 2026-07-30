@@ -46,8 +46,17 @@ test('CEREBRUM has a dependency-free bootstrap shell and sanitized failure state
             indexSource.indexOf('/ui/js/vendor/preact.umd.js'),
         'the bootstrap guard must run before any vendor or application dependency',
     );
+    assert.match(indexSource, /const shell = document\.getElementById\("sage-bootstrap-shell"\)/);
+    assert.match(indexSource, /if \(shell\) shell\.remove\(\)/,
+        'successful render must remove the dependency-free shell instead of covering the app forever');
     assert.match(appSource, /window\.__sageBootstrap\?\.ready\?\.\(\)/);
     assert.match(appSource, /window\.__sageBootstrap\?\.fail\?\.\('render', error\)/);
+    assert.match(apiSource, /if \(!res\.ok\) throw new Error\('memory statistics are temporarily unavailable'\)/,
+        'a projection 503 must reject instead of becoming a plausible zero-memory payload');
+    assert.match(appSource, /CEREBRUM refused to display an unverified or incomplete projection instead of pretending the brain is empty/);
+    assert.match(appSource, /\.catch\(\(\) => setAuthState\('error'\)\)/,
+        'authentication preflight failures must not be treated as an unencrypted ready session');
+    assert.doesNotMatch(appSource, /if auth check fails, assume no auth/);
 });
 
 test('static JavaScript gate rejects the v11.15 nested-template failure under module grammar', () => {
@@ -64,6 +73,28 @@ test('static JavaScript gate rejects the v11.15 nested-template failure under mo
         `${result.stdout}\n${result.stderr}`,
         /SyntaxError|ES module syntax check failed/,
     );
+});
+
+test('global health bar surfaces projection unavailability instead of disappearing', () => {
+    const healthBar = appSource.slice(
+        appSource.indexOf('function HealthBar()'),
+        appSource.indexOf('// ============================================================================', appSource.indexOf('function HealthBar()')),
+    );
+    assert.match(healthBar, /setHealthUnavailable\(true\)/);
+    assert.match(healthBar, /health-bar health-bar-unavailable/);
+    assert.match(healthBar, /role="alert"/);
+    assert.match(healthBar, /Your memories are unchanged\. CEREBRUM could not verify the local memory projection/);
+    assert.doesNotMatch(healthBar, /if \(!health\) return null/);
+});
+
+test('Search page renders projection failures as errors, never empty search results', () => {
+    const searchPage = appSource.slice(
+        appSource.indexOf('function SearchPage()'),
+        appSource.indexOf('function SynapticLedger()'),
+    );
+    assert.match(searchPage, /const data = await fetchMemories\(params\)/);
+    assert.match(searchPage, /setError\(err && err\.message \? err\.message : 'Failed to load memories'\)/);
+    assert.match(searchPage, /results\.length === 0 && !loading && !error/);
 });
 
 test('Access Controls is a first-class sidebar route', () => {
@@ -411,8 +442,25 @@ test('governance wizard builds structured canonical quorum scopes', () => {
     assert.match(networkPage, /Number\.isSafeInteger\(weight\)/,
         'the browser must not round canonical uint64 weights before submission');
     assert.match(networkPage, /above two-thirds of this pinned integer weight/);
-    assert.doesNotMatch(networkPage, /btoa\(|payload.*scope_action/s,
+    const scopeSubmitBranch = networkPage.slice(
+        networkPage.indexOf("if (govNewOp === 'scope_action')"),
+        networkPage.indexOf('const res = await submitGovProposal(proposal);')
+    );
+    assert.doesNotMatch(scopeSubmitBranch, /btoa\(|proposal\.payload/,
         'the dashboard must submit structured scope JSON, not recreate the binary codec');
+});
+
+test('app-v24 memory repair stays Root-planned and requires an explicit vote', () => {
+    const networkPage = appSource.slice(appSource.indexOf('function NetworkPage('), appSource.indexOf('function AddAgentWizard('));
+    assert.match(networkPage, /fetchMemoryReanchorPlan\(\)/,
+        'the browser must request a locally attested plan rather than inventorying memory rows itself');
+    assert.match(networkPage, /operation: memoryRepairPlan\.operation/);
+    assert.match(networkPage, /payload: memoryRepairPlan\.payload/);
+    assert.match(networkPage, /No memory content, author, domain, status, or chain history will be rewritten/);
+    assert.match(networkPage, /It does not execute automatically/);
+    assert.match(networkPage, /cast this validator’s explicit vote/);
+    assert.doesNotMatch(networkPage, /submitGovVote\(result\.proposal_id/,
+        'repair proposal creation must never cast a synthetic browser vote');
 });
 
 test('chain activity exposes committed RBAC changes and remains usable while empty', () => {
@@ -426,9 +474,9 @@ test('chain activity exposes committed RBAC changes and remains usable while emp
     assert.match(activity, /aria-label="Resize Chain Activity"/);
 });
 
-test('chain health recognizes app-v23 as the current consensus protocol', () => {
-    assert.match(appSource, /const appVerTone = appVer === '23'/);
-    assert.match(appSource, /Green when current \(23\)\./);
+test('chain health recognizes app-v24 as the current consensus protocol', () => {
+    assert.match(appSource, /const appVerTone = appVer === '24'/);
+    assert.match(appSource, /Green when current \(24\)\./);
     assert.doesNotMatch(appSource, /appVer === '22'/);
     assert.doesNotMatch(appSource, /appVer === '15'/);
 });

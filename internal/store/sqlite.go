@@ -3550,6 +3550,17 @@ func (s *SQLiteStore) ListAgents(ctx context.Context) ([]*AgentEntry, error) {
 // weakening exact target/address resolution. LIKE metacharacters are escaped;
 // SQLite's LOWER/NOCASE behavior folds ASCII only.
 func (s *SQLiteStore) FindPipeContactLookupCandidates(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	return s.findPipeContactLookupCandidatePage(ctx, query, limit, 0)
+}
+
+func (s *SQLiteStore) findPipeContactLookupCandidatePage(
+	ctx context.Context,
+	query string,
+	limit, offset int,
+) ([]*AgentEntry, error) {
+	if offset < 0 {
+		return nil, nil
+	}
 	exact, pattern, limit, ok := normalizeAgentNameLookup(query, limit, 0)
 	if !ok {
 		return nil, nil
@@ -3563,16 +3574,16 @@ func (s *SQLiteStore) FindPipeContactLookupCandidates(ctx context.Context, query
 		    OR LOWER(COALESCE(registered_name,'')) LIKE ? ESCAPE '\'
 		    OR LOWER(COALESCE(provider,'')) LIKE ? ESCAPE '\'
 		  )
-		ORDER BY CASE
-		  WHEN LOWER(name) LIKE ? ESCAPE '\'
-		    OR LOWER(COALESCE(registered_name,'')) LIKE ? ESCAPE '\'
-		    OR LOWER(COALESCE(provider,'')) LIKE ? ESCAPE '\' THEN 0
-		  ELSE 1
-		END, LOWER(name), agent_id
-		LIMIT ?`,
+			ORDER BY CASE
+			  WHEN LOWER(name) LIKE ? ESCAPE '\'
+			    OR LOWER(COALESCE(registered_name,'')) LIKE ? ESCAPE '\'
+			    OR LOWER(COALESCE(provider,'')) LIKE ? ESCAPE '\' THEN 0
+			  ELSE 1
+			END, LOWER(name), agent_id
+			LIMIT ? OFFSET ?`,
 		pattern, pattern, pattern,
 		exact, exact, exact,
-		limit,
+		limit, offset,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("find pipe contact lookup candidates: %w", err)
@@ -3587,10 +3598,22 @@ func (s *SQLiteStore) FindPipeContactLookupCandidates(ctx context.Context, query
 // metadata-only and capped; it never invokes ListAgents' roster-wide derived
 // memory-count query.
 func (s *SQLiteStore) FindAgentsByName(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	return s.FindAgentsByNamePage(ctx, query, limit, 0)
+}
+
+// FindAgentsByNamePage exposes one stable, bounded SQL candidate page. The
+// signed REST lookup walks these pages while applying canonical Badger
+// enrollment checks, so SQL-active but consensus-pending registrations cannot
+// consume the public result limit and hide a later active recipient.
+func (s *SQLiteStore) FindAgentsByNamePage(
+	ctx context.Context,
+	query string,
+	limit, offset int,
+) ([]*AgentEntry, error) {
 	if limit > maxAgentNameLookupResults {
 		limit = maxAgentNameLookupResults
 	}
-	return s.FindPipeContactLookupCandidates(ctx, query, limit)
+	return s.findPipeContactLookupCandidatePage(ctx, query, limit, offset)
 }
 
 // FindPipeContactAgentsByIDPrefix resolves a friendly handle suffix without

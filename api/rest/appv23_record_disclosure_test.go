@@ -241,6 +241,156 @@ func TestAppV23HashOnlyCoCommitRemainsVisibleAcrossCentralRoutes(t *testing.T) {
 	require.Contains(t, timeline.Body.String(), `"total":1`)
 }
 
+func TestAppV23PrincipalHashlessProjectionIsOmittedFromBroadRoutesAndExactDetailFailsClosed(
+	t *testing.T,
+) {
+	srv, memStore, badger, _, readerID, ownerID, _ := appV23DisclosureFixture(t)
+	secret := "principal hashless content"
+	seedMemory(t, memStore, "principal-hashless", ownerID, "owner.home", secret)
+	record := memStore.memories["principal-hashless"]
+	record.MemoryType = memory.TypeTask
+	record.TaskStatus = memory.TaskStatusPlanned
+	record.Assignee = readerID
+	memStore.pendingRecords = []*memory.MemoryRecord{record}
+	require.NoError(t, badger.SetMemoryHash(
+		record.MemoryID, nil, string(record.Status),
+	))
+	require.NoError(t, badger.SetMemoryAuthorPrincipal(
+		record.MemoryID, record.SubmittingAgent,
+	))
+
+	routes := []struct {
+		name string
+		run  func() *httptest.ResponseRecorder
+	}{
+		{
+			name: "query",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleQueryMemory(out, appV23DisclosureRequest(
+					readerID, http.MethodPost, "/v1/memory/query",
+					[]byte(`{"embedding":[0.1,0.2,0.3],"top_k":10}`),
+				))
+				return out
+			},
+		},
+		{
+			name: "search",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleSearchMemory(out, appV23DisclosureRequest(
+					readerID, http.MethodPost, "/v1/memory/search",
+					[]byte(`{"query":"hashless","top_k":10}`),
+				))
+				return out
+			},
+		},
+		{
+			name: "hybrid",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleHybridSearchMemory(out, appV23DisclosureRequest(
+					readerID, http.MethodPost, "/v1/memory/hybrid",
+					[]byte(`{"query":"hashless","embedding":[0.1,0.2,0.3],"top_k":10}`),
+				))
+				return out
+			},
+		},
+		{
+			name: "list",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleListMemoriesAuth(out, appV23DisclosureRequest(
+					readerID, http.MethodGet, "/v1/memory/list", nil,
+				))
+				return out
+			},
+		},
+		{
+			name: "tasks",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleGetOpenTasks(out, appV23DisclosureRequest(
+					readerID, http.MethodGet, "/v1/memory/tasks", nil,
+				))
+				return out
+			},
+		},
+		{
+			name: "pending",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleGetPending(out, appV23DisclosureRequest(
+					readerID, http.MethodGet, "/v1/validator/pending", nil,
+				))
+				return out
+			},
+		},
+		{
+			name: "timeline",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleTimelineAuth(out, appV23DisclosureRequest(
+					readerID, http.MethodGet, "/v1/memory/timeline", nil,
+				))
+				return out
+			},
+		},
+	}
+	for _, route := range routes {
+		t.Run(route.name, func(t *testing.T) {
+			out := route.run()
+			require.Equal(t, http.StatusOK, out.Code, out.Body.String())
+			require.NotContains(t, out.Body.String(), secret)
+			require.NotContains(t, out.Body.String(), record.MemoryID)
+		})
+	}
+
+	detailReq := appV23DisclosureRequest(
+		readerID, http.MethodGet, "/v1/memory/"+record.MemoryID, nil,
+	)
+	route := chi.NewRouteContext()
+	route.URLParams.Add("memory_id", record.MemoryID)
+	detailReq = detailReq.WithContext(context.WithValue(
+		detailReq.Context(), chi.RouteCtxKey, route,
+	))
+	detail := httptest.NewRecorder()
+	srv.handleGetMemory(detail, detailReq)
+	require.Equal(t, http.StatusServiceUnavailable, detail.Code, detail.Body.String())
+	require.NotContains(t, detail.Body.String(), secret)
+}
+
+func TestAppV23LegacyTerminalHashlessProjectionRemainsReadable(t *testing.T) {
+	srv, memStore, badger, _, readerID, ownerID, _ := appV23DisclosureFixture(t)
+	content := "eligible legacy terminal content"
+	seedMemory(t, memStore, "legacy-terminal-hashless", ownerID, "owner.home", content)
+	record := memStore.memories["legacy-terminal-hashless"]
+	require.NoError(t, badger.SetMemoryHash(
+		record.MemoryID, nil, string(record.Status),
+	))
+
+	list := httptest.NewRecorder()
+	srv.handleListMemoriesAuth(list, appV23DisclosureRequest(
+		readerID, http.MethodGet, "/v1/memory/list", nil,
+	))
+	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+	require.Contains(t, list.Body.String(), record.MemoryID)
+	require.Contains(t, list.Body.String(), content)
+
+	detailReq := appV23DisclosureRequest(
+		readerID, http.MethodGet, "/v1/memory/"+record.MemoryID, nil,
+	)
+	route := chi.NewRouteContext()
+	route.URLParams.Add("memory_id", record.MemoryID)
+	detailReq = detailReq.WithContext(context.WithValue(
+		detailReq.Context(), chi.RouteCtxKey, route,
+	))
+	detail := httptest.NewRecorder()
+	srv.handleGetMemory(detail, detailReq)
+	require.Equal(t, http.StatusOK, detail.Code, detail.Body.String())
+	require.Contains(t, detail.Body.String(), content)
+}
+
 func TestAppV23RecordDisclosureReevaluatesAllLiveAuthority(t *testing.T) {
 	tests := []struct {
 		name        string

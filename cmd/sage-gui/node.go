@@ -201,9 +201,19 @@ func runServe(startupProof string) (rerr error) {
 	recoveredReceiverCompleted := false
 	recoveryAction, recoveryFound, recoveryErr := recoverPendingStateSyncActivation(
 		context.Background(), cfg.DataDir, cometHome, badgerPath,
-		func() error {
+		func(height uint64, appHash []byte) error {
 			wasReceiving := cfg.Quorum.StateSync.Receiving
-			if completeErr := completeStateSyncReceivingRole(cfg); completeErr != nil {
+			projectionNodeKey, validatorPublicKey, identityErr := stateSyncProjectionLocalIdentity(cometHome)
+			if identityErr != nil {
+				return identityErr
+			}
+			if completeErr := validateStateSyncProjectionBaselinePendingAndComplete(
+				cfg,
+				projectionNodeKey,
+				validatorPublicKey,
+				height,
+				appHash,
+			); completeErr != nil {
 				return completeErr
 			}
 			recoveredReceiverCompleted = recoveredReceiverCompleted || wasReceiving
@@ -686,6 +696,12 @@ func runServe(startupProof string) (rerr error) {
 			return errors.New("state-sync activation seal has a non-positive height")
 		}
 		sealedHeight := uint64(height) // #nosec G115 -- positive height checked above
+		journal, journalErr := statesync.LoadActivationJournal(
+			filepath.Join(cfg.DataDir, stateSyncActivationJournalName),
+		)
+		if journalErr != nil {
+			return fmt.Errorf("load state-sync activation journal before projection completion: %w", journalErr)
+		}
 		return statesync.SealActivatedDirectory(
 			cfg.DataDir,
 			filepath.Join(cfg.DataDir, stateSyncActivationJournalName),
@@ -693,7 +709,15 @@ func runServe(startupProof string) (rerr error) {
 			appHash,
 			sealedHeight,
 			appHash,
-			func() error { return completeStateSyncReceivingRole(cfg) },
+			func() error {
+				return validateStateSyncProjectionBaselinePendingAndComplete(
+					cfg,
+					nodeKey,
+					receiverValidatorPublicKey,
+					journal.Height,
+					journal.AppHash,
+				)
+			},
 		)
 	}
 	sealCtx, cancelSeal := context.WithTimeout(ctx, stateSyncStartupTimeout)
@@ -730,29 +754,71 @@ func runServe(startupProof string) (rerr error) {
 	if badgerStore == nil {
 		return errors.New("normal-serving SAGE app has no Badger store")
 	}
+	// One authoritative inventory for every current-Root operation. In
+	// particular, the exact app-owned vendored key path may live outside the
+	// conventional ~/.sage key directories; readiness and the upgrade watchdog
+	// must agree on whether that credential is locally held.
+	resolveLocalAgentKey := localAgentKeyResolverForConfig(cfg)
 	// Fresh direct-v23 Init has now completed, and a state-sync receiver has been
-	// sealed. Verify immutable vendored provenance and current write readiness
-	// before sidecars, migrations, watchdogs, voters, or serving workers start.
+	// sealed. Verify immutable vendored provenance before sidecars, migrations,
+	// watchdogs, voters, or serving workers start. The companion remains
+	// fail-closed in /ready until governed app-v24 activation reaches its strict
+	// H+1 boundary: app-v23's terminal lifecycle bug can otherwise make the
+	// first-party app write memories that it cannot subsequently read.
 	if cfg.VendoredAgentBootstrap != nil {
-		if readinessErr := verifyAppV23VendoredAgentReadiness(
-			cfg.VendoredAgentBootstrap,
-			localAgentKeyResolverWithOperator(cfg.AgentKey),
-			badgerStore,
-		); readinessErr != nil {
+		verifyVendoredEnrollment := func() error {
+			return verifyAppV23VendoredAgentReadiness(
+				cfg.VendoredAgentBootstrap,
+				resolveLocalAgentKey,
+				badgerStore,
+			)
+		}
+		if readinessErr := verifyVendoredEnrollment(); readinessErr != nil {
 			health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
 				Required: true,
 				State:    "blocked",
 			})
 			return fmt.Errorf("first-party app-v23 companion is not ready: %w", readinessErr)
 		}
-		health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
-			Required: true,
-			OK:       true,
-			State:    "ready",
-		})
-		logger.Info().
-			Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
-			Msg("first-party app-v23 companion enrollment is ready")
+		if app.IsAppV24ActiveForNextTx() {
+			health.SetVendoredAgentEnrollmentStatus(vendoredAgentProtocolStatus(true))
+			logger.Info().
+				Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
+				Msg("first-party companion enrollment and app-v24 lifecycle are ready")
+		} else {
+			health.SetVendoredAgentEnrollmentStatus(vendoredAgentProtocolStatus(false))
+			logger.Info().
+				Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
+				Msg("first-party companion is waiting for governed app-v24 activation")
+			startWorker(func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						if !app.IsAppV24ActiveForNextTx() {
+							continue
+						}
+						if readinessErr := verifyVendoredEnrollment(); readinessErr != nil {
+							health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
+								Required: true,
+								State:    "blocked",
+							})
+							logger.Error().Err(readinessErr).
+								Msg("first-party companion enrollment changed before app-v24 readiness")
+							return
+						}
+						health.SetVendoredAgentEnrollmentStatus(vendoredAgentProtocolStatus(true))
+						logger.Info().
+							Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
+							Msg("first-party companion admitted after app-v24 activation")
+						return
+					}
+				}
+			})
+		}
 	}
 
 	// Everything below may capture concrete app/store references because the
@@ -818,6 +884,47 @@ func runServe(startupProof string) (rerr error) {
 		logger.Warn().Err(rebuildErr).Msg("scoped serving projection is not ready")
 	} else if rebuilt > 0 {
 		logger.Info().Int("records", rebuilt).Msg("scoped serving projection verified from canonical state")
+	}
+
+	var projectionBaselineMu sync.RWMutex
+	var projectionBaselineAllowed map[string]struct{}
+	projectionBaselineRequired := cfg.Quorum.StateSync.Received
+	ensureProjectionBaseline := func(baselineCtx context.Context) error {
+		if !projectionBaselineRequired {
+			return nil
+		}
+		info, baselineInfoErr := app.Info(baselineCtx, nil)
+		if baselineInfoErr != nil || info == nil {
+			if baselineInfoErr == nil {
+				baselineInfoErr = errors.New("nil application info")
+			}
+			return fmt.Errorf("read canonical state for projection baseline: %w", baselineInfoErr)
+		}
+		projectionNodeKey, validatorPublicKey, identityErr := stateSyncProjectionLocalIdentity(cometHome)
+		if identityErr != nil {
+			return identityErr
+		}
+		baseline, baselineErr := ensureStateSyncProjectionBaseline(
+			cfg.DataDir,
+			cfg.ChainID,
+			projectionNodeKey,
+			validatorPublicKey,
+			info.LastBlockHeight,
+			info.LastBlockAppHash,
+			badgerStore,
+		)
+		if baselineErr != nil {
+			return baselineErr
+		}
+		allowed := baselineAllowedMissingIDs(baseline)
+		projectionBaselineMu.Lock()
+		projectionBaselineAllowed = allowed
+		projectionBaselineMu.Unlock()
+		return nil
+	}
+	if baselineErr := ensureProjectionBaseline(ctx); baselineErr != nil {
+		logger.Error().Err(baselineErr).
+			Msg("state-sync ordinary-memory projection baseline unavailable; using strict readiness")
 	}
 
 	if warn := app.ContentValidationEnforcementWarning(); warn != "" {
@@ -924,23 +1031,6 @@ func runServe(startupProof string) (rerr error) {
 		)
 	}
 
-	// Resolve every local agent credential this machine actually holds. This is
-	// constructed before the upgrade watchdog because app-v23 Root rotation must
-	// take effect for unattended governance immediately, without a process
-	// restart or a fallback to the historical genesis agent.key.
-	baseAgentKeyResolver := localAgentKeyResolverWithOperator(cfg.AgentKey)
-	resolveLocalAgentKey := func(agentID string) (ed25519.PrivateKey, bool) {
-		if bootstrap := cfg.VendoredAgentBootstrap; bootstrap != nil {
-			if key, ok := parseKeyFile(bootstrap.AgentKeyFile); ok {
-				if public, publicOK := key.Public().(ed25519.PublicKey); publicOK &&
-					hex.EncodeToString(public) == agentID {
-					return key, true
-				}
-			}
-		}
-		return baseAgentKeyResolver(agentID)
-	}
-
 	// v7.5 upgrade watchdog: auto-propose an UpgradePlan when the
 	// running binary's embedded TargetAppVersion exceeds the chain's
 	// current app version. No-op when target == current (the steady
@@ -962,12 +1052,13 @@ func runServe(startupProof string) (rerr error) {
 		// v10.5.1 auto-advance: personal nodes walk the fork ladder to the
 		// binary ceiling automatically (issue #40 follow-up — updating the
 		// binary now brings the chain up to date too). Quorum clusters keep
-		// the legacy target-6 watchdog. v11.15.0 makes app-v23 the minimum
-		// personal-node security floor; disable_auto_upgrade can stop later
-		// optional movement but cannot strand this release on app-v22.
+		// the legacy target-6 watchdog. v11.16.0 makes app-v24 the minimum
+		// personal-node security floor because app-v23 terminal transitions can
+		// erase the canonical content hash; disable_auto_upgrade must not strand
+		// an updated personal node on that broken lifecycle.
 		PersonalMode:       !cfg.Quorum.Enabled,
 		AutoAdvance:        !cfg.DisableAutoUpgrade,
-		RequiredAppVersion: 23,
+		RequiredAppVersion: 24,
 		// v10.5.2 (issue #41): in-process pending-plan accessor for the
 		// always-on pump and the auto-advance pre-check. GetUpgradePlan's
 		// ErrNoUpgradePlan is flattened to nil by readPendingPlan.
@@ -1103,6 +1194,13 @@ func runServe(startupProof string) (rerr error) {
 		} else if rebuilt > 0 {
 			logger.Info().Int("records", rebuilt).Msg("scoped serving projection ready after vault unlock")
 		}
+		if rebuildErr == nil {
+			if baselineErr := ensureProjectionBaseline(rebuildCtx); baselineErr != nil {
+				logger.Error().Err(baselineErr).
+					Msg("state-sync ordinary-memory projection baseline unavailable after vault unlock")
+				rebuildErr = baselineErr
+			}
+		}
 		return rebuilt, rebuildErr
 	}
 
@@ -1127,6 +1225,9 @@ func runServe(startupProof string) (rerr error) {
 		// callback, so no CheckTx can observe admission open with a locked
 		// projection.
 		bootRuntime.SetLocalTxAdmissionBlocked(false)
+		if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
+			logger.Warn().Err(projectionErr).Msg("canonical ordinary-memory projection audit incomplete after vault unlock")
+		}
 	}
 	// The health watchdog signals every healthy probe, not only startup. This
 	// makes vector repair eventual after a late Ollama start or transient provider
@@ -1193,6 +1294,37 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.AppV20ActiveFn = app.IsAppV20ActiveForNextTx
 	dashboard.AppV22ActiveFn = app.IsAppV22ActiveForNextTx
 	dashboard.AppV23ActiveFn = app.IsAppV23ActiveForNextTx
+	dashboard.AppV24ActiveFn = app.IsAppV24ActiveForNextTx
+	if projectionBaselineRequired {
+		dashboard.CanonicalProjectionMissingAllowedFn = func(memoryID string) bool {
+			projectionBaselineMu.RLock()
+			allowed := projectionBaselineAllowed
+			projectionBaselineMu.RUnlock()
+			return stateSyncProjectionMissingAllowed(allowed, badgerStore, memoryID)
+		}
+	}
+	app.SetCanonicalProjectionAuditNotifier(func() {
+		startWorker(func() {
+			if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
+				logger.Warn().Err(projectionErr).
+					Msg("canonical ordinary-memory projection audit incomplete after memory reanchor")
+			}
+		})
+	})
+	health.SetCanonicalMemoryProjectionProvider(func() metrics.CanonicalMemoryProjectionStatus {
+		status := badgerStore.CanonicalMemoryProjectionHealth()
+		return metrics.CanonicalMemoryProjectionStatus{
+			Checked:          status.Checked,
+			Required:         app.IsAppV23ActiveForNextTx(),
+			OK:               status.OK,
+			State:            status.State,
+			LegacyCompatible: status.LegacyCompatible,
+			Quarantined:      status.Quarantined,
+		}
+	})
+	if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
+		logger.Warn().Err(projectionErr).Msg("canonical ordinary-memory projection audit incomplete")
+	}
 	dashboard.GovernanceDomainFn = app.GovernanceDelegationDomain
 	dashboard.StrictRBAC = cfg.RBAC.Strict // opt-out of the app-v19 default-read flip
 	// Embeddings setup: flip the config to the bundled Ollama + nomic-embed-text
@@ -1210,8 +1342,7 @@ func runServe(startupProof string) (rerr error) {
 		return SaveConfig(cfg)
 	}
 	dashboard.SetNetworkMode = func(enabled bool) error {
-		cfg.Quorum.Enabled = enabled
-		return SaveConfig(cfg)
+		return setNetworkMode(cfg, enabled)
 	}
 	// Federation on/off, surfaced in Settings (the toggle re-execs to start/stop
 	// the inbound mTLS listener). Outbound recall/receipt delivery is unaffected.

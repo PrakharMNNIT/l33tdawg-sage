@@ -120,6 +120,61 @@ test('raw capability indicators are derived and read-only from named policy', ()
     assert.equal(standard[1].disabledLabel, 'Policy-controlled');
 });
 
+test('named policy editing preserves the independent federated-pipe hard restriction', () => {
+    const standard = {
+        agent_id: 'standard-agent',
+        profile: 'standard',
+        role: 'member',
+        clearance: 1,
+        capabilities: 16,
+        home_domain: 'standard-home',
+    };
+    const companion = {
+        agent_id: 'companion-agent',
+        profile: 'companion',
+        role: 'member',
+        clearance: 1,
+        capabilities: 31,
+        home_domain: 'companion-home',
+    };
+    const readOnly = {
+        agent_id: 'read-only-agent',
+        profile: 'read_only',
+        role: 'member',
+        clearance: 1,
+        capabilities: 17,
+        home_domain: '',
+    };
+
+    assert.equal(appV23PolicyDraft(standard).capabilities, 16);
+    assert.equal(appV23PolicyDraft(companion).capabilities, 31);
+    assert.equal(appV23PolicyDraft(readOnly).capabilities, 17);
+    assert.equal(appV23PolicyChanged(companion, appV23PolicyDraft(companion)), false);
+    assert.equal(
+        appV23CapabilityIndicators(companion).find(item => item.bit === 16).enabled,
+        true,
+    );
+    assert.equal(
+        appV23RoleDefaults('manager', companion.capabilities).capabilities,
+        16,
+    );
+    assert.equal(
+        appV23ProfileDefaults('read_only', 'member', companion.capabilities).capabilities,
+        17,
+    );
+    assert.equal(
+        appV23PolicyDraft({
+            agent_id: 'pending-agent',
+            profile: '',
+            role: 'member',
+            clearance: 1,
+            capabilities: 30,
+        }).capabilities,
+        0,
+        'pending mask 30 must not turn the explicitly selected Companion preset into mask 31',
+    );
+});
+
 test('policy change detection avoids meaningless consensus saves', () => {
     const current = {
         agent_id: 'abcdef',

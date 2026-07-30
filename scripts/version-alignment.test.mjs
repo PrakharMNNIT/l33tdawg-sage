@@ -31,6 +31,7 @@ test('release-facing version metadata stays aligned', () => {
     ['web/static/js/app.js', `const SAGE_VERSION = 'v${version}';`],
     ['README.md', `## What's New in v${version}`],
     ['README.md', 'App-v23 replaces capability-bit administration'],
+    ['README.md', 'App-v24 closes the canonical terminal-hash lifecycle defect'],
     ['README.md', `SDK ${version}.`],
     ['README.md', `ghcr.io/l33tdawg/sage:${version}`],
     ['sdk/python/README.md', `SAGE v${version} SDK`],
@@ -43,7 +44,10 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/reference/rest-api.md', `Reconciled through SAGE v${version}`],
     ['docs/reference/concepts/rbac-orgs-federation.md', `reconciled through SAGE v${version}`],
     ['docs/reference/app-v23-access-control-design.md', `SAGE v${version}`],
-    ['internal/abci/app.go', 'const maxSupportedAppVersion uint64 = 23'],
+    ['docs/reference/app-v23-access-control-design.md', '## App-v24 readiness and memory-write barrier'],
+    ['docs/reference/mcp-tools.md', 'A level-2 grant is never a remedy for a hard'],
+    ['docs/reference/mcp-tools.md', 'never be substituted for this caller-scoped projection'],
+    ['internal/abci/app.go', 'const maxSupportedAppVersion uint64 = 24'],
     [
       'docs/ROADMAP.md',
       version.includes('-')
@@ -56,7 +60,7 @@ test('release-facing version metadata stays aligned', () => {
   }
 });
 
-test('v11.15 app-v23 public contract markers stay release-visible', () => {
+test('v11.16 app-v23/app-v24 public contract markers stay release-visible', () => {
   const openapi = read('api/openapi.yaml');
   for (const marker of [
     'committed_unconfirmed',
@@ -65,7 +69,7 @@ test('v11.15 app-v23 public contract markers stay release-visible', () => {
     'DomainWriteDeniedProblem:',
     'has_more:',
     'total_exact:',
-    'receipts are explicitly deferred to v11.16.',
+    'receipts are explicitly deferred beyond v11.16.',
   ]) {
     assert.ok(openapi.includes(marker), `OpenAPI is missing app-v23 contract marker: ${marker}`);
   }
@@ -73,6 +77,7 @@ test('v11.15 app-v23 public contract markers stay release-visible', () => {
   const readme = read('README.md');
   const environment = read('docs/reference/environment-variables.md');
   assert.match(readme, /Mynah has no released legacy population/);
+  assert.match(readme, /waiting_for_app_v24/);
   assert.doesNotMatch(readme, /Existing installations stranded by app-v22/);
   assert.doesNotMatch(environment, /appv23_vendored_repair\.go/);
   assert.match(environment, /not an upgraded-node repair selector/);

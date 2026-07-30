@@ -18,6 +18,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	sageabci "github.com/l33tdawg/sage/internal/abci"
+	"github.com/l33tdawg/sage/internal/store"
+	"github.com/l33tdawg/sage/internal/tx"
 	"github.com/l33tdawg/sage/internal/vault"
 )
 
@@ -244,6 +246,22 @@ func TestLockedPersonalRawLocalRPCRejectsUntilVaultPublication(t *testing.T) {
 	projection.SetVault(unlocked)
 	runtime.SetLocalTxAdmissionBlocked(false)
 	wg.Wait()
+
+	// The vault publication gate and the app-v24 first-party write gate are
+	// independent. Install the already-governed activation plan, prove H still
+	// rejects the Companion write under app-v23 rules, then accept it at H+1.
+	require.NoError(t, badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
+		Name: tx.CanonicalUpgradeName(24), TargetAppVersion: 24,
+		ActivationHeight: 1, ProposedAt: 0,
+	}))
+	activation, err := rpcEnvironment.BroadcastTxCommit(
+		&rpctypes.Context{},
+		cmttypes.Tx(raw),
+	)
+	require.NoError(t, err)
+	require.Zero(t, activation.CheckTx.Code, activation.CheckTx.Log)
+	require.Equal(t, uint32(11), activation.TxResult.Code)
+	require.Contains(t, activation.TxResult.Log, "require governed app-v24 activation")
 
 	accepted, err := rpcEnvironment.BroadcastTxCommit(
 		&rpctypes.Context{},

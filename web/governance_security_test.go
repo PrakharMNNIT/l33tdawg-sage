@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/governance"
+	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,6 +68,23 @@ func dashboardGovernanceHandler(t *testing.T, rpc string) (*DashboardHandler, ed
 		NodeOperatorAgentID: auth.PublicKeyToAgentID(operatorKey.Public().(ed25519.PublicKey)),
 	}
 	return h, validatorKey, operatorKey
+}
+
+func seedDashboardGovernanceProposal(t *testing.T, h *DashboardHandler, proposalID string) {
+	t.Helper()
+	badgerStore, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, badgerStore.CloseBadger()) })
+	proposal, err := json.Marshal(governance.ProposalState{
+		ProposalID: proposalID,
+		Operation:  governance.OpAddValidator,
+		TargetID:   "validator-a",
+		ProposerID: h.NodeOperatorAgentID,
+		Status:     governance.StatusVoting,
+	})
+	require.NoError(t, err)
+	require.NoError(t, badgerStore.SetGovProposal(proposalID, proposal))
+	h.BadgerStore = badgerStore
 }
 
 func requireDashboardGovernanceProofBody(t *testing.T, parsed *tx.ParsedTx, method, path string) map[string]any {
@@ -187,6 +206,7 @@ func TestDashboardVoteUsesValidatorOuterAndOperatorProofPostV20(t *testing.T) {
 	comet, _, captured := governanceCaptureServer(t)
 	defer comet.Close()
 	h, validatorKey, operatorKey := dashboardGovernanceHandler(t, comet.URL)
+	seedDashboardGovernanceProposal(t, h, "proposal-a")
 
 	body := []byte(`{"proposal_id":"proposal-a","decision":"accept"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/governance/vote", bytes.NewReader(body))
@@ -256,6 +276,9 @@ func TestDashboardGovernanceCommitFailuresReturnBadGatewayWithoutGhostEvent(t *t
 			comet, broadcasts, _ := governanceCaptureServerResult(t, tc.checkCode, tc.finalizeCode)
 			defer comet.Close()
 			h, _, _ := dashboardGovernanceHandler(t, comet.URL)
+			if tc.path == "/v1/dashboard/governance/vote" {
+				seedDashboardGovernanceProposal(t, h, "proposal-a")
+			}
 			h.SSE = NewSSEBroadcaster()
 			events := h.SSE.Subscribe()
 			require.NotNil(t, events)

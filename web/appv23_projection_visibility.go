@@ -25,7 +25,7 @@ func appV23DashboardProjectionError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w: %v", errAppV23DashboardProjectionUnavailable, err)
+	return fmt.Errorf("%w: %w", errAppV23DashboardProjectionUnavailable, err)
 }
 
 func writeAppV23DashboardProjectionFailure(w http.ResponseWriter, err error) bool {
@@ -47,27 +47,115 @@ func writeAppV23DashboardProjectionFailure(w http.ResponseWriter, err error) boo
 func (h *DashboardHandler) validateAppV23DashboardRecord(
 	record *memory.MemoryRecord,
 ) error {
+	_, err := h.classifyAppV23DashboardRecord(record)
+	return err
+}
+
+func (h *DashboardHandler) classifyAppV23DashboardRecord(
+	record *memory.MemoryRecord,
+) (store.MemoryProjectionDisposition, error) {
 	if !h.appV23IsActive() {
+		return store.MemoryProjectionExact, nil
+	}
+	if h.BadgerStore == nil {
+		return store.MemoryProjectionUnpublished,
+			appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
+	}
+	_, disposition, err := h.BadgerStore.ClassifyMemoryProjection(record)
+	if err != nil {
+		return disposition, appV23DashboardProjectionError(err)
+	}
+	return disposition, nil
+}
+
+func isAppV23UnsafeDashboardRecord(err error) bool {
+	return errors.Is(err, store.ErrMemoryProjectionUnpublished)
+}
+
+// filterAppV23BroadDashboardRecords validates every row before it consumes a
+// visible result/count. A broad collection must fail closed when it encounters
+// an unsafe row: silently omitting it would turn an unavailable projection into
+// a plausible empty or partial CEREBRUM response.
+func (h *DashboardHandler) filterAppV23BroadDashboardRecords(
+	records []*memory.MemoryRecord,
+) ([]*memory.MemoryRecord, error) {
+	if !h.appV23IsActive() {
+		return records, nil
+	}
+	kept := make([]*memory.MemoryRecord, 0, len(records))
+	for _, record := range records {
+		if _, err := h.classifyAppV23DashboardRecord(record); err != nil {
+			return nil, err
+		}
+		kept = append(kept, record)
+	}
+	return kept, nil
+}
+
+type appV23ProjectionWalkAudit struct {
+	legacyCompatible bool
+	quarantined      bool
+	seenMemoryIDs    map[string]struct{}
+}
+
+func rejectAppV23QuarantinedAudit(audit appV23ProjectionWalkAudit) error {
+	if !audit.quarantined {
 		return nil
 	}
+	return appV23DashboardProjectionError(
+		errors.New("serving projection contains unsafe canonical memory records"),
+	)
+}
+
+// requireAppV23DashboardProjectionAvailable performs a complete canonical
+// inventory audit before every memory-derived CEREBRUM read. A missing or
+// filter-hidden canonical memory has no row for a route-local query to validate,
+// and a previously healthy audit cannot detect later SQL tamper. Re-auditing
+// here also prevents a cached graph or tag aggregate from bypassing validation.
+// Emergency correctness intentionally takes priority over read performance.
+// Older app versions retain their historical behavior.
+func (h *DashboardHandler) requireAppV23DashboardProjectionAvailable(
+	ctx context.Context,
+) (*store.StoreStats, map[string]string, error) {
+	if !h.appV23IsActive() {
+		return nil, nil, nil
+	}
+	if h.BadgerStore == nil {
+		return nil, nil,
+			appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
+	}
+	stats, activity, err := h.cerebrumVisibleStatsAndActivity(ctx)
+	if err != nil {
+		// The audit can fail with a backend/paging error that is not yet wrapped
+		// as a projection failure. Every failure on this guard is an availability
+		// failure to callers, never a 500/fallback-to-empty opportunity.
+		return nil, nil, appV23DashboardProjectionError(err)
+	}
+	health := h.BadgerStore.CanonicalMemoryProjectionHealth()
+	if !health.Checked || !health.Required || !health.OK || health.Quarantined {
+		return nil, nil, appV23DashboardProjectionError(
+			errors.New("canonical memory projection audit is unavailable"),
+		)
+	}
+	return stats, activity, nil
+}
+
+// AuditAppV23CanonicalMemoryProjection performs the complete, deterministic
+// ordinary-memory inventory walk used by readiness. It publishes only the
+// safe finite-state result through BadgerStore; no memory identifiers or raw
+// counts enter the public health surface.
+func (h *DashboardHandler) AuditAppV23CanonicalMemoryProjection(
+	ctx context.Context,
+) error {
 	if h.BadgerStore == nil {
 		return appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
 	}
-	if _, err := h.BadgerStore.ValidateMemoryProjection(record); err != nil {
-		return appV23DashboardProjectionError(err)
+	if !h.appV23IsActive() {
+		h.BadgerStore.PublishCanonicalMemoryProjectionAudit(false, false, false)
+		return nil
 	}
-	return nil
-}
-
-func (h *DashboardHandler) validateAppV23DashboardRecords(
-	records []*memory.MemoryRecord,
-) error {
-	for _, record := range records {
-		if err := h.validateAppV23DashboardRecord(record); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, _, err := h.cerebrumVisibleStatsAndActivity(ctx)
+	return err
 }
 
 // walkAppV23CanonicalDashboardRecords pages deterministically through one SQL
@@ -110,6 +198,59 @@ func (h *DashboardHandler) walkAppV23CanonicalDashboardRecords(
 	}
 }
 
+// walkAppV23BroadDashboardRecords is the collection-safe companion to the exact
+// walker above. Unsafe rows fail the entire walk before a plausible empty or
+// partial response can be emitted; the returned audit contains booleans and an
+// internal inventory only and never exposes raw hidden counts or identities.
+func (h *DashboardHandler) walkAppV23BroadDashboardRecords(
+	ctx context.Context,
+	opts store.ListOptions,
+	visit func(*memory.MemoryRecord) error,
+) (appV23ProjectionWalkAudit, error) {
+	audit := appV23ProjectionWalkAudit{
+		seenMemoryIDs: make(map[string]struct{}),
+	}
+	if !h.appV23IsActive() {
+		return audit, errors.New("app-v23 broad dashboard walk requested before activation")
+	}
+	if h.BadgerStore == nil {
+		return audit, appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
+	}
+	opts.Limit = appV23DashboardProjectionPageSize
+	opts.Offset = 0
+	opts.StablePaging = true
+	for offset := 0; ; offset += appV23DashboardProjectionPageSize {
+		opts.Offset = offset
+		records, _, err := h.store.ListMemories(ctx, opts)
+		if err != nil {
+			return audit, err
+		}
+		for _, record := range records {
+			if record != nil {
+				audit.seenMemoryIDs[record.MemoryID] = struct{}{}
+			}
+			disposition, projectionErr := h.classifyAppV23DashboardRecord(record)
+			if projectionErr != nil {
+				if isAppV23UnsafeDashboardRecord(projectionErr) {
+					audit.quarantined = true
+				}
+				return audit, projectionErr
+			}
+			if disposition == store.MemoryProjectionLegacyTerminalHashless {
+				audit.legacyCompatible = true
+			}
+			if visit != nil {
+				if visitErr := visit(record); visitErr != nil {
+					return audit, visitErr
+				}
+			}
+		}
+		if len(records) < appV23DashboardProjectionPageSize {
+			return audit, nil
+		}
+	}
+}
+
 // spoolAppV23CanonicalDashboardExport builds the entire portable backup in a
 // private temporary file before the HTTP response is committed. App-v23 must
 // never validate one live SQL walk and serialize a second: a projection ghost
@@ -136,10 +277,23 @@ func (h *DashboardHandler) spoolAppV23CanonicalDashboardExport(
 
 	encoder := json.NewEncoder(snapshot)
 	exported := 0
+	seenMemoryIDs := make(map[string]struct{})
+	// The sealed walk must inventory every SQL memory, including deprecated and
+	// internal rows that are not portable export content. Comparing a separate
+	// preflight walk with this file would create a deletion/commit race that
+	// could still label a partial file as a complete backup.
+	inventoryOpts := opts
+	inventoryOpts.Status = ""
+	inventoryOpts.ExcludeDomainPrefixes = nil
 	if walkErr := h.walkAppV23CanonicalDashboardRecords(
 		ctx,
-		opts,
+		inventoryOpts,
 		func(record *memory.MemoryRecord) error {
+			seenMemoryIDs[record.MemoryID] = struct{}{}
+			if record.Status == memory.StatusDeprecated ||
+				isCerebrumInternalMemoryDomain(record.DomainTag) {
+				return nil
+			}
 			if encodeErr := encoder.Encode(portableDashboardMemoryRecord(record)); encodeErr != nil {
 				return fmt.Errorf("encode app-v23 export snapshot: %w", encodeErr)
 			}
@@ -148,6 +302,17 @@ func (h *DashboardHandler) spoolAppV23CanonicalDashboardExport(
 		},
 	); walkErr != nil {
 		return nil, 0, walkErr
+	}
+	canonicalMemoryIDs, inventoryErr := store.CanonicalMemoryIDs(h.BadgerStore)
+	if inventoryErr != nil {
+		return nil, 0, appV23DashboardProjectionError(inventoryErr)
+	}
+	for _, memoryID := range canonicalMemoryIDs {
+		if _, ok := seenMemoryIDs[memoryID]; !ok {
+			return nil, 0, appV23DashboardProjectionError(
+				errors.New("serving projection is missing canonical memory records"),
+			)
+		}
 	}
 	if exported == 0 {
 		if encodeErr := encoder.Encode(dashboardExportManifest()); encodeErr != nil {
@@ -183,7 +348,7 @@ func (h *DashboardHandler) appV23CanonicalDashboardPage(
 	}
 	page := make([]*memory.MemoryRecord, 0, limit)
 	total := 0
-	if err := h.walkAppV23CanonicalDashboardRecords(
+	audit, err := h.walkAppV23BroadDashboardRecords(
 		ctx, opts,
 		func(record *memory.MemoryRecord) error {
 			if total >= offset && len(page) < limit {
@@ -192,7 +357,11 @@ func (h *DashboardHandler) appV23CanonicalDashboardPage(
 			total++
 			return nil
 		},
-	); err != nil {
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := rejectAppV23QuarantinedAudit(audit); err != nil {
 		return nil, 0, err
 	}
 	if offset >= total {
@@ -235,10 +404,13 @@ func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 		stats.DBSizeBytes = rawStats.DBSizeBytes
 	}
 	latestByDomain := make(map[string]time.Time)
-	err = h.walkAppV23CanonicalDashboardRecords(
+	audit, err := h.walkAppV23BroadDashboardRecords(
 		ctx,
-		cerebrumListOptions(store.ListOptions{Sort: "oldest"}),
+		store.ListOptions{Sort: "oldest"},
 		func(record *memory.MemoryRecord) error {
+			if isCerebrumInternalMemoryDomain(record.DomainTag) {
+				return nil
+			}
 			status := string(record.Status)
 			stats.ByStatus[status]++
 			stats.ByAgent[record.SubmittingAgent]++
@@ -259,6 +431,44 @@ func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := rejectAppV23QuarantinedAudit(audit); err != nil {
+		return nil, nil, err
+	}
+	subsetAllowed := h.CanonicalProjectionMissingAllowedFn != nil
+	canonicalMemoryIDs, inventoryErr := store.CanonicalMemoryIDs(h.BadgerStore)
+	if inventoryErr != nil {
+		return nil, nil, appV23DashboardProjectionError(inventoryErr)
+	}
+	for _, memoryID := range canonicalMemoryIDs {
+		if _, ok := audit.seenMemoryIDs[memoryID]; ok {
+			continue
+		}
+		if subsetAllowed && h.CanonicalProjectionMissingAllowedFn(memoryID) {
+			continue
+		}
+		audit.quarantined = true
+		if subsetAllowed {
+			h.BadgerStore.PublishCanonicalMemoryProjectionSubsetAudit(
+				audit.legacyCompatible, true,
+			)
+		} else {
+			h.BadgerStore.PublishCanonicalMemoryProjectionAudit(
+				true, audit.legacyCompatible, true,
+			)
+		}
+		return nil, nil, appV23DashboardProjectionError(
+			errors.New("serving projection is missing canonical memory records"),
+		)
+	}
+	if subsetAllowed {
+		h.BadgerStore.PublishCanonicalMemoryProjectionSubsetAudit(
+			audit.legacyCompatible, audit.quarantined,
+		)
+	} else {
+		h.BadgerStore.PublishCanonicalMemoryProjectionAudit(
+			true, audit.legacyCompatible, audit.quarantined,
+		)
+	}
 	activity := make(map[string]string, len(latestByDomain))
 	for domain, at := range latestByDomain {
 		activity[domain] = at.UTC().Format(time.RFC3339Nano)
@@ -273,7 +483,7 @@ func (h *DashboardHandler) appV23CanonicalTimeline(
 ) ([]store.TimelineBucket, error) {
 	counts := make(map[string]int)
 	formatter, _ := h.store.(store.TimelinePeriodFormatter)
-	err := h.walkAppV23CanonicalDashboardRecords(
+	audit, err := h.walkAppV23BroadDashboardRecords(
 		ctx,
 		cerebrumListOptions(store.ListOptions{
 			DomainTag:   domain,
@@ -296,6 +506,9 @@ func (h *DashboardHandler) appV23CanonicalTimeline(
 		},
 	)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectAppV23QuarantinedAudit(audit); err != nil {
 		return nil, err
 	}
 	periods := make([]string, 0, len(counts))

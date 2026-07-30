@@ -12,7 +12,7 @@
 # governed upgrade-delay floor is three blocks instead of 200, and the proposer
 # cooldown is one block instead of 50. It also recognizes a test-only dormant
 # pre-publication pause hook used to place the exact crash below. A fresh
-# provider still performs the real signed auto-advance ceremony through app-v23,
+# provider still performs the real signed auto-advance ceremony through app-v24,
 # including app-v20's chain-derived governance domain at a positive activation
 # height.
 # Authorization, quorum, identity, state-sync, P2P, receiver-session,
@@ -27,6 +27,7 @@ NODE_IMAGE=${V119_STATE_SYNC_NODE_IMAGE:-sage-v119-chaos-node:local}
 REBUILD=${V119_STATE_SYNC_REBUILD:-${V119_CHAOS_REBUILD:-1}}
 KEEP=${V119_STATE_SYNC_KEEP:-0}
 TIMEOUT=${V119_STATE_SYNC_TIMEOUT:-240}
+TARGET_APP_VERSION=24
 
 for setting in "REBUILD=${REBUILD}" "KEEP=${KEEP}"; do
   case "${setting#*=}" in
@@ -163,6 +164,22 @@ if ! docker run --rm --pull never --network none --entrypoint sh "${ABCI_IMAGE}"
   echo "ERROR: ${ABCI_IMAGE} is not the v119-state-sync-fixture target; rebuild with V119_STATE_SYNC_REBUILD=1" >&2
   exit 1
 fi
+ABCI_RUNTIME_IDENTITY=$(docker run --rm --pull never --network none \
+  --entrypoint sh "${ABCI_IMAGE}" -ec 'printf "%s:%s\n" "$(id -u)" "$(id -g)"')
+ABCI_RUNTIME_UID=${ABCI_RUNTIME_IDENTITY%%:*}
+ABCI_RUNTIME_GID=${ABCI_RUNTIME_IDENTITY#*:}
+case "${ABCI_RUNTIME_UID}" in
+  ''|*[!0-9]*)
+    echo "ERROR: ${ABCI_IMAGE} returned invalid runtime identity ${ABCI_RUNTIME_IDENTITY}" >&2
+    exit 1
+    ;;
+esac
+case "${ABCI_RUNTIME_GID}" in
+  ''|*[!0-9]*)
+    echo "ERROR: ${ABCI_IMAGE} returned invalid runtime identity ${ABCI_RUNTIME_IDENTITY}" >&2
+    exit 1
+    ;;
+esac
 
 docker network create --internal "${RPC_NETWORK}" >/dev/null
 docker network create --internal "${P2P_NETWORK}" >/dev/null
@@ -323,7 +340,7 @@ federation:
   p2p_enabled: false
   p2p_force_private: false
 voter:
-  enabled: true
+  enabled: false
   poll_interval: 500ms
 data_dir: /sage/data
 rest_addr: 0.0.0.0:8080
@@ -341,6 +358,8 @@ write_receiving_config() {
   local trust_height=$4
   local trust_hash=$5
   local startup_timeout=$6
+  local provider_rpc_url=$7
+  local observer_rpc_url=$8
   local staged
   staged=$(new_config_file "${home}")
   cat >"${staged}" <<YAML
@@ -362,8 +381,8 @@ quorum:
       - "${provider_id}"
       - "${local_id}"
     rpc_servers:
-      - http://provider-rpc:26657
-      - http://observer-rpc:26657
+      - "${provider_rpc_url}"
+      - "${observer_rpc_url}"
     trust_height: ${trust_height}
     trust_hash: "${trust_hash}"
     trust_period: 1h
@@ -430,6 +449,80 @@ rpc_json_request() {
     --header='Content-Type: application/json' \
     --post-data="${request}" \
     http://127.0.0.1:26657/
+}
+
+rpc_network_ipv4() {
+  local container=$1
+  docker inspect "${container}" | python3 -c '
+import ipaddress
+import json
+import sys
+
+network = sys.argv[1]
+try:
+    raw = json.load(sys.stdin)[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
+    address = ipaddress.ip_address(raw)
+except (IndexError, KeyError, TypeError, ValueError) as error:
+    raise SystemExit(f"invalid {network} address: {error}") from error
+if address.version != 4 or address.is_unspecified:
+    raise SystemExit(f"{network} address is not a usable IPv4 address: {address}")
+print(address)
+' "${RPC_NETWORK}"
+}
+
+remote_rpc_commit_hash() {
+  local container=$1
+  local rpc_url=$2
+  local height=$3
+  docker exec "${container}" wget -qO- -T 5 \
+    --header='Content-Type: application/json' \
+    --post-data="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"commit\",\"params\":{\"height\":\"${height}\"}}" \
+    "${rpc_url}/" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["signed_header"]["commit"]["block_id"]["hash"].lower())'
+}
+
+remote_rpc_validator_count() {
+  local container=$1
+  local rpc_url=$2
+  local height=$3
+  docker exec "${container}" wget -qO- -T 5 \
+    --header='Content-Type: application/json' \
+    --post-data="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"validators\",\"params\":{\"height\":\"${height}\"}}" \
+    "${rpc_url}/" |
+    python3 -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["validators"]))'
+}
+
+wait_remote_rpc_light_height() {
+  local container=$1
+  local origin=$2
+  local rpc_url=$3
+  local height=$4
+  local want=$5
+  local deadline=$((SECONDS + 20))
+  local got=
+  local validators=0
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    got=$(remote_rpc_commit_hash "${container}" "${rpc_url}" "${height}" 2>/dev/null || true)
+    validators=$(remote_rpc_validator_count "${container}" "${rpc_url}" "${height}" 2>/dev/null || printf 0)
+    if [ "${got}" = "${want}" ] && [ "${validators}" -gt 0 ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: ${container} could not verify ${origin} light RPC ${rpc_url} at height ${height} (commit ${got:-<unavailable>}, want ${want}; validators ${validators})" >&2
+  return 1
+}
+
+assert_remote_rpc_origins() {
+  local container=$1
+  local snapshot=$2
+  local height
+  local want
+  for height in "${snapshot}" "$((snapshot + 1))" "$((snapshot + 2))"; do
+    want=$(rpc_block_hash "${PROVIDER}" "${height}")
+    wait_remote_rpc_light_height "${container}" provider "${provider_rpc_url}" "${height}" "${want}"
+    wait_remote_rpc_light_height "${container}" observer "${observer_rpc_url}" "${height}" "${want}"
+  done
 }
 
 rest_ready() {
@@ -671,6 +764,31 @@ wait_height_at_least() {
   return 1
 }
 
+wait_height_quiescent() {
+  local container=$1
+  local stable_seconds=$2
+  local deadline=$((SECONDS + TIMEOUT))
+  local stable_since=${SECONDS}
+  local previous=
+  local current=
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    current=$(rpc_height "${container}" 2>/dev/null || true)
+    if [ -z "${current}" ]; then
+      previous=
+      stable_since=${SECONDS}
+    elif [ "${current}" != "${previous}" ]; then
+      previous=${current}
+      stable_since=${SECONDS}
+    elif [ $((SECONDS - stable_since)) -ge "${stable_seconds}" ]; then
+      printf '%s\n' "${current}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: ${container} height did not remain quiescent for ${stable_seconds}s (last ${current:-<unavailable>})" >&2
+  return 1
+}
+
 wait_convergence() {
   local left=$1
   local right=$2
@@ -716,7 +834,39 @@ init_pristine_comet_home() {
   # test home; the authorization trust root is created separately as 0644.
   docker run --rm --pull never --network none \
     -v "${home}/data/cometbft:/cometbft" "${NODE_IMAGE}" sh -ec \
-    'chown -R 100:101 /cometbft; find /cometbft -type d -exec chmod 0700 {} +; chmod 0600 /cometbft/config/*.json /cometbft/data/priv_validator_state.json' >/dev/null
+    'chown -R "$1:$2" /cometbft; find /cometbft -type d -exec chmod 0700 {} +; chmod 0600 /cometbft/config/*.json /cometbft/data/priv_validator_state.json' sh \
+    "${ABCI_RUNTIME_UID}" "${ABCI_RUNTIME_GID}" >/dev/null
+}
+
+secure_fixture_data_dir() {
+  local home=$1
+  local state
+  case "${home}" in
+    "${OBSERVER_HOME}"|"${RECEIVER_HOME}"|"${SUCCESS_RECEIVER_HOME}"|"${ATTACKER_HOME}") ;;
+    *)
+      echo "ERROR: refusing to secure unexpected fixture data directory ${home}" >&2
+      return 1
+      ;;
+  esac
+  if [ ! -d "${home}/data" ] || [ -L "${home}/data" ]; then
+    echo "ERROR: fixture data directory is absent or a symlink: ${home}/data" >&2
+    return 1
+  fi
+  # The app-v24 signed projection baseline deliberately refuses a writable
+  # group/world data root. Match the actual uid/gid from the exact source-bound
+  # ABCI image instead of coupling this harness to Alpine's account allocator
+  # or weakening the production check for this disposable fixture.
+  docker run --rm --pull never --network none \
+    -v "${home}/data:/fixture-data" "${NODE_IMAGE}" sh -ec \
+    'chown "$1:$2" /fixture-data; chmod 0700 /fixture-data' sh \
+    "${ABCI_RUNTIME_UID}" "${ABCI_RUNTIME_GID}" >/dev/null
+  state=$(docker run --rm --pull never --network none \
+    -v "${home}/data:/fixture-data:ro" "${NODE_IMAGE}" \
+    stat -c '%u:%g:%a' /fixture-data)
+  if [ "${state}" != "${ABCI_RUNTIME_UID}:${ABCI_RUNTIME_GID}:700" ]; then
+    echo "ERROR: fixture data directory has insecure ownership/mode ${state}, want ${ABCI_RUNTIME_UID}:${ABCI_RUNTIME_GID}:700" >&2
+    return 1
+  fi
 }
 
 node_id_from_home() {
@@ -762,7 +912,7 @@ write_authorization() {
   "chain_id": "${chain_id}",
   "joining_node_id": "${joining_id}",
   "validator_public_key": "${validator_pubkey}",
-  "app_version": 23,
+  "app_version": ${TARGET_APP_VERSION},
   "expires_at": "${expiry}",
   "snapshot_height_floor": ${floor},
   "validator_node_ids": ["${provider_id}"],
@@ -777,7 +927,8 @@ copy_provider_genesis() {
   docker run --rm --pull never --network none \
     -v "${PROVIDER_HOME}/data/cometbft/config/genesis.json:/source/genesis.json:ro" \
     -v "${target_home}/data/cometbft/config:/target" "${NODE_IMAGE}" sh -ec \
-    'cp /source/genesis.json /target/genesis.json; chown 100:101 /target/genesis.json; chmod 0600 /target/genesis.json' >/dev/null
+    'cp /source/genesis.json /target/genesis.json; chown "$1:$2" /target/genesis.json; chmod 0600 /target/genesis.json' sh \
+    "${ABCI_RUNTIME_UID}" "${ABCI_RUNTIME_GID}" >/dev/null
 }
 
 seed_memories() {
@@ -807,19 +958,19 @@ if len(matches) != 1 or matches[0] != summary or not lines or lines[-1] != summa
   fi
 }
 
-assert_appv23_root_semantics() {
+assert_root_semantics() {
   local provider=$1
   local receiver=$2
   local provider_state
   local receiver_state
   if ! provider_state=$(docker exec "${provider}" ./sage-gui-v119-fixture \
     v119-state-sync-fixture appv23-root-state); then
-    echo "ERROR: could not query provider app-v23 Root semantic state" >&2
+    echo "ERROR: could not query provider Root semantic state" >&2
     return 1
   fi
   if ! receiver_state=$(docker exec "${receiver}" ./sage-gui-v119-fixture \
     v119-state-sync-fixture appv23-root-state); then
-    echo "ERROR: could not query receiver app-v23 Root semantic state" >&2
+    echo "ERROR: could not query receiver Root semantic state" >&2
     return 1
   fi
   python3 - "${provider_state}" "${receiver_state}" <<'PY'
@@ -849,7 +1000,7 @@ provider = parse("provider", sys.argv[1])
 receiver = parse("receiver", sys.argv[2])
 if provider[:4] != receiver[:4]:
     raise SystemExit(
-        "ERROR: state sync changed app-v23 Root principal, credential, generation, or history digest"
+        "ERROR: state sync changed Root principal, credential, generation, or history digest"
     )
 if receiver[4] in receiver[:2]:
     raise SystemExit("ERROR: receiver local agent.key became CEREBRUM Root")
@@ -860,26 +1011,26 @@ echo "=== v11.9 integrated authorized state-sync wire gate ==="
 echo "source: ${SOURCE_ID} (both image labels verified before topology start)"
 echo "fixture: one validator provider; observer/receiver/unauthorized peers are distinct non-validator full nodes"
 
-# 1. Drive a fresh real chain through the signed app-v23 ladder. The scoped
+# 1. Drive a fresh real chain through the signed app-v24 ladder. The scoped
 # projection installed below still proves app-v20's governance-domain semantics.
 write_provider_personal_config
-cat >"${PROVIDER_HOME}/post-v23.txt" <<'EOF'
-This committed post-app-v23 fixture record proves the provider snapshot is beyond the positive activation height.
+cat >"${PROVIDER_HOME}/post-v24.txt" <<'EOF'
+This committed post-app-v24 fixture record proves the provider snapshot is beyond the positive activation height.
 EOF
 cat >"${PROVIDER_HOME}/advance.txt" <<'EOF'
 This first state-sync eligibility record advances the provider beyond the exported snapshot height.
 
 This second state-sync eligibility record supplies additional committed blocks for the H plus two light-client window.
 EOF
-chmod 0644 "${PROVIDER_HOME}/post-v23.txt" "${PROVIDER_HOME}/advance.txt"
+chmod 0644 "${PROVIDER_HOME}/post-v24.txt" "${PROVIDER_HOME}/advance.txt"
 
 start_sage "${PROVIDER}" "${PROVIDER_HOME}" provider-rpc
 docker network connect --alias provider-p2p "${P2P_NETWORK}" "${PROVIDER}"
 wait_rpc "${PROVIDER}"
 wait_rest "${PROVIDER}"
-wait_app_version "${PROVIDER}" 23
+wait_app_version "${PROVIDER}" "${TARGET_APP_VERSION}"
 pre_seed_height=$(rpc_height "${PROVIDER}")
-seed_memories "${PROVIDER}" /sage/post-v23.txt 1
+seed_memories "${PROVIDER}" /sage/post-v24.txt 1
 wait_height_at_least "${PROVIDER}" "$((pre_seed_height + 1))"
 scoped_memory_id=$(docker exec "${PROVIDER}" ./sage-gui-v119-fixture \
   v119-state-sync-fixture install-scoped-proof)
@@ -899,6 +1050,7 @@ provider_id=$(node_id_from_home "${PROVIDER_HOME}")
 for home in "${OBSERVER_HOME}" "${RECEIVER_HOME}" "${SUCCESS_RECEIVER_HOME}" "${ATTACKER_HOME}"; do
   init_pristine_comet_home "${home}"
   copy_provider_genesis "${home}"
+  secure_fixture_data_dir "${home}"
 done
 observer_id=$(node_id_from_home "${OBSERVER_HOME}")
 receiver_id=$(node_id_from_home "${RECEIVER_HOME}")
@@ -931,7 +1083,7 @@ wait_convergence "${PROVIDER}" "${OBSERVER}"
 snapshot_height=$(rpc_height "${PROVIDER}")
 snapshot_app_hash=$(rpc_app_hash "${PROVIDER}")
 if [ "${snapshot_height}" -le 1 ]; then
-  echo "ERROR: provider did not reach a positive post-app-v23 snapshot height" >&2
+  echo "ERROR: provider did not reach a positive post-app-v24 snapshot height" >&2
   exit 1
 fi
 if ! is_canonical_hash "${snapshot_app_hash}"; then
@@ -973,7 +1125,8 @@ wait_rpc "${OBSERVER}"
 seed_memories "${PROVIDER}" /sage/advance.txt 2
 wait_height_at_least "${PROVIDER}" "$((snapshot_height + 2))"
 wait_convergence "${PROVIDER}" "${OBSERVER}"
-latest_height=$(rpc_height "${PROVIDER}")
+latest_height=$(wait_height_quiescent "${PROVIDER}" 12)
+wait_convergence "${PROVIDER}" "${OBSERVER}"
 if [ "${latest_height}" -lt "$((snapshot_height + 2))" ]; then
   echo "ERROR: provider snapshot H=${snapshot_height} is not H+2 eligible at ${latest_height}" >&2
   exit 1
@@ -990,6 +1143,13 @@ wait_rpc "${PROVIDER}"
 wait_rest "${PROVIDER}"
 wait_rpc "${OBSERVER}"
 
+provider_serving_height=$(rpc_height "${PROVIDER}")
+observer_serving_height=$(rpc_height "${OBSERVER}")
+if [ "${provider_serving_height}" != "${latest_height}" ] ||
+   [ "${observer_serving_height}" != "${latest_height}" ]; then
+  echo "ERROR: serving provider/observer moved outside the frozen light window (${provider_serving_height}/${observer_serving_height}, want ${latest_height})" >&2
+  exit 1
+fi
 if [ "$(rpc_node_id "${PROVIDER}")" != "${provider_id}" ] ||
    [ "$(rpc_node_id "${OBSERVER}")" != "${observer_id}" ]; then
   echo "ERROR: light-client RPC origins do not belong to the independent expected nodes" >&2
@@ -1004,15 +1164,27 @@ for height in "${snapshot_height}" "$((snapshot_height + 1))" "$((snapshot_heigh
   fi
 done
 trust_hash=$(rpc_block_hash "${PROVIDER}" "${snapshot_height}")
+provider_rpc_ip=$(rpc_network_ipv4 "${PROVIDER}")
+observer_rpc_ip=$(rpc_network_ipv4 "${OBSERVER}")
+if [ "${provider_rpc_ip}" = "${observer_rpc_ip}" ]; then
+  echo "ERROR: independent RPC origins share ${provider_rpc_ip}" >&2
+  exit 1
+fi
+provider_rpc_url="http://${provider_rpc_ip}:26657"
+observer_rpc_url="http://${observer_rpc_ip}:26657"
 
-# 5. Both receiver attempts can reach the two independent RPC origins. Give
+# 5. Pin both independent RPC origins to their exact isolated-network addresses,
+# then require each receiver attempt to POST the real light-client commit and
+# validator requests for H/H+1/H+2 to both origins and verify the expected
+# hashes. Docker's embedded DNS is not part
+# of the state-sync trust proof. Give
 # provider-p2p a real DNS answer backed by a deliberately closed port first:
 # peer-profile validation succeeds and Comet RPC comes up, while normal REST
 # remains unbound behind the seal. Then swap that placeholder for the provider.
 write_receiving_config "${RECEIVER_HOME}" "${receiver_id}" "${provider_id}" \
-  "${snapshot_height}" "${trust_hash}" 3m
+  "${snapshot_height}" "${trust_hash}" 3m "${provider_rpc_url}" "${observer_rpc_url}"
 write_receiving_config "${ATTACKER_HOME}" "${attacker_id}" "${provider_id}" \
-  "${snapshot_height}" "${trust_hash}" 45s
+  "${snapshot_height}" "${trust_hash}" 45s "${provider_rpc_url}" "${observer_rpc_url}"
 docker network disconnect "${P2P_NETWORK}" "${PROVIDER}" >/dev/null
 docker run -d --pull never --name "${P2P_PLACEHOLDER}" \
   --network "${P2P_NETWORK}" --network-alias provider-p2p \
@@ -1037,6 +1209,7 @@ wait_rpc "${RECEIVER}"
 wait_rpc "${ATTACKER}"
 start_readiness_probe
 for candidate in "${RECEIVER}" "${ATTACKER}"; do
+  assert_remote_rpc_origins "${candidate}" "${snapshot_height}"
   wait_closed_provider_placeholder "${candidate}" "${placeholder_ip}"
 done
 if rest_ready "${RECEIVER}" || rest_ready "${ATTACKER}"; then
@@ -1148,6 +1321,13 @@ while :; do
 done
 stop_sage "${ATTACKER}"
 
+provider_serving_height=$(rpc_height "${PROVIDER}")
+observer_serving_height=$(rpc_height "${OBSERVER}")
+if [ "${provider_serving_height}" != "${latest_height}" ] ||
+   [ "${observer_serving_height}" != "${latest_height}" ]; then
+  echo "ERROR: provider/observer light window drifted during the unauthorized-peer proof (${provider_serving_height}/${observer_serving_height}, want ${latest_height})" >&2
+  exit 1
+fi
 docker network connect --alias receiver-p2p "${P2P_NETWORK}" "${RECEIVER}"
 wait_pre_publish_marker
 if rest_ready "${RECEIVER}"; then
@@ -1172,7 +1352,7 @@ fi
 # `/abci_info` while the runtime write lease is held: it is expected to wait
 # behind the same gate we are proving.
 pre_publish_evidence=$(docker exec "${RECEIVER}" cat "${PRE_PUBLISH_MARKER}")
-python3 - "${snapshot_height}" "${snapshot_app_hash}" 23 "${pre_publish_evidence}" <<'PY'
+python3 - "${snapshot_height}" "${snapshot_app_hash}" "${TARGET_APP_VERSION}" "${pre_publish_evidence}" <<'PY'
 import json
 import sys
 
@@ -1271,15 +1451,15 @@ receiver_app_version=$(rpc_app_version "${RECEIVER}" 2>/dev/null || true)
 provider_app_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 receiver_app_hash=$(rpc_app_hash "${RECEIVER}" 2>/dev/null || true)
 provider_app_hash=$(rpc_app_hash "${PROVIDER}" 2>/dev/null || true)
-if [ "${receiver_app_version}" != 23 ] ||
-   [ "${provider_app_version}" != 23 ] ||
+if [ "${receiver_app_version}" != "${TARGET_APP_VERSION}" ] ||
+   [ "${provider_app_version}" != "${TARGET_APP_VERSION}" ] ||
    ! is_canonical_hash "${receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v23 state" >&2
+  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v24 state" >&2
   exit 1
 fi
-assert_appv23_root_semantics "${PROVIDER}" "${RECEIVER}"
+assert_root_semantics "${PROVIDER}" "${RECEIVER}"
 
 ready_line=$(docker logs "${RECEIVER}" 2>&1 | grep -n 'SAGE Personal ready' | tail -1 | cut -d: -f1)
 if [ -z "${ready_line}" ] || [ "${session_line}" -ge "${ready_line}" ]; then
@@ -1303,7 +1483,7 @@ write_authorization "${SUCCESS_RECEIVER_HOME}/state-sync-authorization.json" "${
   "${success_receiver_id}" "${success_receiver_pubkey}" "${provider_id}" "${snapshot_height}"
 write_provider_serving_config "${provider_id}" "${success_receiver_id}"
 write_receiving_config "${SUCCESS_RECEIVER_HOME}" "${success_receiver_id}" "${provider_id}" \
-  "${snapshot_height}" "${trust_hash}" 3m
+  "${snapshot_height}" "${trust_hash}" 3m "${provider_rpc_url}" "${observer_rpc_url}"
 docker start "${PROVIDER}" >/dev/null
 wait_rpc "${PROVIDER}"
 wait_rest "${PROVIDER}"
@@ -1311,6 +1491,7 @@ create_sage "${SUCCESS_RECEIVER}" "${SUCCESS_RECEIVER_HOME}" success-receiver-rp
 docker network connect --alias success-receiver-p2p "${P2P_NETWORK}" "${SUCCESS_RECEIVER}"
 docker start "${SUCCESS_RECEIVER}" >/dev/null
 wait_rpc "${SUCCESS_RECEIVER}"
+assert_remote_rpc_origins "${SUCCESS_RECEIVER}" "${snapshot_height}"
 wait_rest "${SUCCESS_RECEIVER}"
 wait_convergence "${PROVIDER}" "${SUCCESS_RECEIVER}"
 assert_nonvalidator "${SUCCESS_RECEIVER}"
@@ -1331,15 +1512,15 @@ success_receiver_app_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null
 provider_app_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 success_receiver_app_hash=$(rpc_app_hash "${SUCCESS_RECEIVER}" 2>/dev/null || true)
 provider_app_hash=$(rpc_app_hash "${PROVIDER}" 2>/dev/null || true)
-if [ "${success_receiver_app_version}" != 23 ] ||
-   [ "${provider_app_version}" != 23 ] ||
+if [ "${success_receiver_app_version}" != "${TARGET_APP_VERSION}" ] ||
+   [ "${provider_app_version}" != "${TARGET_APP_VERSION}" ] ||
    ! is_canonical_hash "${success_receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${success_receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: successful receiver/provider did not publish exact app-v23 state" >&2
+  echo "ERROR: successful receiver/provider did not publish exact app-v24 state" >&2
   exit 1
 fi
-assert_appv23_root_semantics "${PROVIDER}" "${SUCCESS_RECEIVER}"
+assert_root_semantics "${PROVIDER}" "${SUCCESS_RECEIVER}"
 
 success_session_line=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep -n 'authorized state-sync session assembled and exact-version candidate verified' | tail -1 | cut -d: -f1)
 success_seal_line=$(docker logs "${SUCCESS_RECEIVER}" 2>&1 | grep -n 'authorized validator state-sync activation sealed before service admission' | tail -1 | cut -d: -f1)
@@ -1376,8 +1557,9 @@ wait_convergence "${PROVIDER}" "${SUCCESS_RECEIVER}"
 assert_nonvalidator "${SUCCESS_RECEIVER}"
 post_restart_provider_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || true)
 post_restart_receiver_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null || true)
-if [ "${post_restart_provider_version}" != 23 ] || [ "${post_restart_receiver_version}" != 23 ]; then
-  echo "ERROR: provider SIGKILL recovery regressed exact app-v23 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
+if [ "${post_restart_provider_version}" != "${TARGET_APP_VERSION}" ] ||
+   [ "${post_restart_receiver_version}" != "${TARGET_APP_VERSION}" ]; then
+  echo "ERROR: provider SIGKILL recovery regressed exact app-v24 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
   exit 1
 fi
 
@@ -1400,5 +1582,5 @@ for image in "${ABCI_IMAGE}" "${NODE_IMAGE}"; do
 done
 
 echo "=== v11.9 AUTHORIZED STATE-SYNC WIRE GATE PASSED ==="
-echo "PASS: frozen source ${SOURCE_ID}; governed app-v23 provider; real signed app-v20 scope+memory; exact app-v23 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
+echo "PASS: frozen source ${SOURCE_ID}; governed app-v24 provider; real signed app-v20 scope+memory; exact app-v24 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
 echo "ROLE: receiver is intentionally a synchronized NON-VALIDATOR full node; validator-set admission remains a separate signed governance action"

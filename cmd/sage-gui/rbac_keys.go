@@ -84,13 +84,40 @@ func adminSigningKeyAt(path string) ed25519.PrivateKey {
 
 // localAgentKeyResolverWithOperator builds a resolver mapping agentID
 // (hex(pubkey)) -> the local private key that produces it, scanning the
-// operator key path plus ~/.sage/agent.key, installed-agent keys, and
-// CEREBRUM-created bundle keys.
+// operator key path plus ~/.sage/agent.key, installed-agent keys,
+// SDK-managed identities, and CEREBRUM-created bundle keys.
 // The resolver only ever returns keys already held locally and never derives or
 // exposes key material; it reports (nil, false) for any agent whose key is not
 // on this node (e.g. a remote federated agent).
 func localAgentKeyResolverWithOperator(operatorKeyPath string) func(agentID string) (ed25519.PrivateKey, bool) {
 	return localAgentKeyResolverWithOperatorCache(operatorKeyPath, time.Second, time.Now)
+}
+
+// localAgentKeyResolverForConfig extends the ordinary local-key inventory with
+// the exact first-party application-owned key path. The path is intentionally
+// unconstrained: a bundled application may keep its credential outside
+// ~/.sage/{agents,identities,bundles}. Readiness and unattended governance must
+// use this same resolver so a legitimate Root handover cannot work live and
+// then fail on restart.
+func localAgentKeyResolverForConfig(cfg *Config) func(agentID string) (ed25519.PrivateKey, bool) {
+	operatorKeyPath := ""
+	if cfg != nil {
+		operatorKeyPath = cfg.AgentKey
+	}
+	base := localAgentKeyResolverWithOperator(operatorKeyPath)
+	return func(agentID string) (ed25519.PrivateKey, bool) {
+		if cfg != nil {
+			if bootstrap := cfg.VendoredAgentBootstrap; bootstrap != nil {
+				if key, ok := parseKeyFile(bootstrap.AgentKeyFile); ok {
+					if public, publicOK := key.Public().(ed25519.PublicKey); publicOK &&
+						hex.EncodeToString(public) == agentID {
+						return key, true
+					}
+				}
+			}
+		}
+		return base(agentID)
+	}
 }
 
 type localAgentKeyCacheEntry struct {
@@ -140,6 +167,25 @@ func localAgentKeyResolverWithOperatorCache(
 					continue
 				}
 				add(filepath.Join(agentsDir, e.Name(), "agent.key"))
+			}
+		}
+		// The Python SDK documents ~/.sage/identities/<name>.key as the
+		// conventional multi-agent location. Those keys are just as local as
+		// CEREBRUM-created agent bundles, and app-v23 approval deliberately
+		// requires the target's exact local key for its consent signature.
+		// Omitting this directory made a locally managed agent appear remote:
+		// CEREBRUM reported target_key_unavailable and could not repair its
+		// restricted self-registration mask. Scan only direct, regular *.key
+		// children; never follow symlinks or recursively walk caller-controlled
+		// paths.
+		identitiesDir := filepath.Join(home, "identities")
+		if entries, err := os.ReadDir(identitiesDir); err == nil {
+			for _, e := range entries {
+				if !e.Type().IsRegular() ||
+					!strings.EqualFold(filepath.Ext(e.Name()), ".key") {
+					continue
+				}
+				add(filepath.Join(identitiesDir, e.Name()))
 			}
 		}
 		bundlesDir := filepath.Join(home, "bundles")

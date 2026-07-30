@@ -1231,6 +1231,7 @@ type findAgentLocalResult struct {
 	RegisteredName string `json:"registered_name"`
 	Provider       string `json:"provider"`
 	Status         string `json:"status"`
+	MatchKind      string `json:"match_kind"`
 }
 
 type findAgentFederatedContact struct {
@@ -1639,14 +1640,28 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 	localExact := make([]findAgentLocalResult, 0)
 	localPartial := make([]findAgentLocalResult, 0)
 	for _, agent := range localResponse.Agents {
-		if agent.AgentID == "" || !strings.EqualFold(agent.Status, "active") {
+		if agent.AgentID == "" {
 			continue
 		}
-		exact, partial := matchesAgentName(query, agent.Name, agent.RegisteredName, agent.Provider)
-		if exact {
+		// The signed, bounded REST projection owns active-enrollment and name
+		// matching decisions. Do not silently erase a valid result because an
+		// MCP-side status/name copy drifted from that contract. The fallback is
+		// retained only for an older server that predates match_kind; that
+		// endpoint already returned active SQL rows exclusively.
+		switch agent.MatchKind {
+		case "exact":
 			localExact = append(localExact, agent)
-		} else if partial {
+		case "substring":
 			localPartial = append(localPartial, agent)
+		case "":
+			exact, partial := matchesAgentName(
+				query, agent.Name, agent.RegisteredName, agent.Provider,
+			)
+			if exact {
+				localExact = append(localExact, agent)
+			} else if partial {
+				localPartial = append(localPartial, agent)
+			}
 		}
 	}
 	localMatches := localExact
@@ -2007,37 +2022,28 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 	}
 
 	if semantic {
-		// Semantic path: embed topic → cosine similarity search.
-		embedReq, _ := json.Marshal(map[string]string{"text": topic})
-		var embedResp struct {
-			Embedding []float32 `json:"embedding"`
-		}
-		if err := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); err != nil {
+		// Keep turn recall on the same request builder as sage_recall. In
+		// particular, app-v23 binds vector requests to the embedder's exact
+		// embedding_provider; hand-rolling this request previously dropped that
+		// field and also opted every local turn into federation without an
+		// authorized recall plan.
+		if err := s.recallSemantic(
+			ctx,
+			topic,
+			domain,
+			recallTopK,
+			recallMinConf,
+			recallFederationOptions{},
+			&turnRecall,
+		); err != nil {
 			result["recall_error"] = err.Error()
 			result["semantic_degraded"] = true
-			result["degraded_reason"] = "embed_failed: " + err.Error()
-			// Embedder just failed — re-probe next turn instead of trusting a
-			// stale "semantic" verdict for the rest of the session.
-			s.invalidateSemanticMode()
-		} else {
-			queryReq, _ := json.Marshal(map[string]any{
-				"query":          topic,
-				"embedding":      embedResp.Embedding,
-				"domain_tag":     domain,
-				"provider":       s.provider,
-				"status_filter":  "committed",
-				"top_k":          recallTopK,
-				"min_confidence": recallMinConf,
-				"federated":      true,
-			})
-			if err := s.doSignedJSON(ctx, "POST", "/v1/memory/query", queryReq, &turnRecall); err != nil {
-				result["recall_error"] = err.Error()
-				result["semantic_degraded"] = true
-				result["degraded_reason"] = "query_failed: " + err.Error()
-			}
+			result["degraded_reason"] = "semantic_recall_failed: " + err.Error()
 		}
 	} else {
-		// FTS5 path: full-text search when embeddings aren't semantic.
+		// FTS5 path: full-text search when embeddings aren't semantic. A turn is
+		// local by contract; explicit cross-node recall goes through sage_recall,
+		// whose federation planner binds the signed destination proofs.
 		searchReq, _ := json.Marshal(map[string]any{
 			"query":          topic,
 			"domain_tag":     domain,
@@ -2045,7 +2051,6 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 			"status_filter":  "committed",
 			"top_k":          recallTopK,
 			"min_confidence": recallMinConf,
-			"federated":      true,
 		})
 		if err := s.doSignedJSON(ctx, "POST", "/v1/memory/search", searchReq, &turnRecall); err != nil {
 			result["recall_error"] = err.Error()

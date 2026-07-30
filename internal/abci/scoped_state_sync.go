@@ -385,5 +385,24 @@ func inspectAppV20StateSyncStore(ctx context.Context, badgerStore *store.BadgerS
 			return 0, nil, fmt.Errorf("verify %s app-v23 state: migration state is missing", label)
 		}
 	}
+	appV24, upgradeErr := badgerStore.GetAppliedUpgrade(appV24UpgradeName)
+	if upgradeErr != nil {
+		return 0, nil, fmt.Errorf("read %s app-v24 activation: %w", label, upgradeErr)
+	}
+	if appV24 != nil {
+		if appV24.Name != appV24UpgradeName || appV24.TargetAppVersion != 24 ||
+			appV24.AppliedHeight <= 0 || state.Height <= appV24.AppliedHeight {
+			return 0, nil, fmt.Errorf("%s has invalid active app-v24 record", label)
+		}
+		switch {
+		case genesisV23 != nil:
+			// A direct-v23 genesis marker is the authenticated immediate
+			// predecessor; there is intentionally no applied app-v23 record.
+		case appV23 == nil:
+			return 0, nil, fmt.Errorf("%s app-v24 activation is missing app-v23 predecessor", label)
+		case appV24.AppliedHeight <= appV23.AppliedHeight:
+			return 0, nil, fmt.Errorf("%s app-v24 activation does not follow app-v23", label)
+		}
+	}
 	return uint64(state.Height), computed, nil // #nosec G115 -- positive int64 checked above
 }

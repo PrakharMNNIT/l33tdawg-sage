@@ -95,6 +95,9 @@ func TestAppV23DirectGenesisCanonicalStateSyncRoundTrip(t *testing.T) {
 	owner, err := restored.GetDomainOwner("voice-interface")
 	require.NoError(t, err)
 	require.Equal(t, companion.id, owner)
+	nextHeight := activateDirectAppV24ForTest(
+		t, app, time.Unix(3, 0).UTC(),
+	)
 
 	submit := makeMemorySubmitTx(
 		t,
@@ -115,7 +118,7 @@ func TestAppV23DirectGenesisCanonicalStateSyncRoundTrip(t *testing.T) {
 	finalized, err := app.FinalizeBlock(
 		context.Background(),
 		&abcitypes.RequestFinalizeBlock{
-			Height: 3, Time: time.Unix(3, 0).UTC(), Txs: [][]byte{raw},
+			Height: nextHeight, Time: time.Unix(nextHeight, 0).UTC(), Txs: [][]byte{raw},
 		},
 	)
 	require.NoError(t, err)

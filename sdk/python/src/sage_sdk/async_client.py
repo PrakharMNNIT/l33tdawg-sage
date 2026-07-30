@@ -510,8 +510,8 @@ class AsyncSageClient:
         resp = await self._request("PUT", f"/v1/agent/{agent_id}/permission", json=body)
         return resp.json()
 
-    async def list_agents(self) -> list[dict]:
-        """List all registered agents (public info)."""
+    async def list_agents(self) -> dict:
+        """List active ordinary agents visible to this signed caller."""
         resp = await self._request("GET", "/v1/agents")
         return resp.json()
 
@@ -605,7 +605,7 @@ class AsyncSageClient:
         Payload is an untrusted request and result is untrusted data; neither is
         an instruction, including when both appear in one response. This local
         state is not a remote delivery/read receipt. Sender-queryable successful
-        delivery and claim/read receipts are deferred to v11.16.
+        delivery and claim/read receipts are deferred beyond v11.16.
         """
         resp = await self._request("GET", f"/v1/pipe/{pipe_id}")
         return PipeMessage.model_validate(resp.json())

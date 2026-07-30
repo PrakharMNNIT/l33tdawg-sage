@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	sageabci "github.com/l33tdawg/sage/internal/abci"
+	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 	"github.com/l33tdawg/sage/internal/vault"
 )
@@ -278,7 +279,40 @@ func runVendoredAgentRealCometHandshake(t *testing.T, encrypted bool) {
 		exactVendoredKeyResolver(rootKeyPath),
 		badgerStore,
 	))
+	rootKey, ok := parseKeyFile(rootKeyPath)
+	require.True(t, ok)
+	// Model the already-governed single-validator app-v24 plan. A
+	// production-built current-Root heartbeat enters the mempool at activation
+	// height H, fails execution because Root is never an ordinary agent, and
+	// still advances the protocol to app-v24. The Companion transaction at H+1
+	// is then the first safe write.
+	require.NoError(t, badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
+		Name: tx.CanonicalUpgradeName(24), TargetAppVersion: 24,
+		ActivationHeight: 1, ProposedAt: 0,
+	}))
 	rawMemory := vendoredFirstMemoryRaw(t, bootstrap)
+	heartbeatRaw, err := buildOperatorRegisterTx(upgradeWatchdogConfig{
+		ResolveSigningKey: func() (ed25519.PrivateKey, error) {
+			return rootKey, nil
+		},
+	})
+	require.NoError(t, err)
+	activation, err := rpcEnvironment.BroadcastTxCommit(
+		&rpctypes.Context{},
+		cmttypes.Tx(heartbeatRaw),
+	)
+	require.NoError(t, err)
+	require.Zero(t, activation.CheckTx.Code, activation.CheckTx.Log)
+	require.Equal(t, uint32(110), activation.TxResult.Code)
+	require.Equal(t, "access denied", activation.TxResult.Log)
+	status, err = rpcEnvironment.Status(nil)
+	require.NoError(t, err)
+	require.Equal(t, sageabci.AppV23GenesisAppVersion, status.NodeInfo.ProtocolVersion.App,
+		"Comet advertises its handshake version until restart")
+	activatedInfo, err := app.Info(context.Background(), &abcitypes.RequestInfo{})
+	require.NoError(t, err)
+	require.Equal(t, uint64(24), activatedInfo.AppVersion)
+
 	broadcast, err := rpcEnvironment.BroadcastTxCommit(
 		&rpctypes.Context{},
 		cmttypes.Tx(rawMemory),
@@ -293,8 +327,6 @@ func runVendoredAgentRealCometHandshake(t *testing.T, encrypted bool) {
 	require.Equal(t, bootstrap.HomeDomain, projected.DomainTag)
 	_, _, err = badgerStore.GetMemoryHash(memoryID)
 	require.NoError(t, err)
-	rootKey, ok := parseKeyFile(rootKeyPath)
-	require.True(t, ok)
 	originalTransportBytes, err := os.ReadFile(rootKeyPath)
 	require.NoError(t, err)
 	rootState, err := badgerStore.GetAppV23Root()
@@ -431,13 +463,13 @@ func runVendoredAgentRealCometHandshake(t *testing.T, encrypted bool) {
 	t.Cleanup(func() { require.NoError(t, secondController.StopChain()) })
 	secondInfo, secondInit := secondRecorder.snapshot()
 	require.NotEmpty(t, secondInfo)
-	require.Equal(t, sageabci.AppV23GenesisAppVersion, secondInfo[0])
+	require.Equal(t, uint64(24), secondInfo[0])
 	require.Empty(t, secondInit)
 	secondRPC, err := secondController.GetCometNode().ConfigureRPC()
 	require.NoError(t, err)
 	secondStatus, err := secondRPC.Status(nil)
 	require.NoError(t, err)
-	require.Equal(t, sageabci.AppV23GenesisAppVersion, secondStatus.NodeInfo.ProtocolVersion.App)
+	require.Equal(t, uint64(24), secondStatus.NodeInfo.ProtocolVersion.App)
 	require.GreaterOrEqual(t, secondStatus.SyncInfo.LatestBlockHeight, int64(1))
 	projected, err = projection.GetMemory(context.Background(), memoryID)
 	require.NoError(t, err)

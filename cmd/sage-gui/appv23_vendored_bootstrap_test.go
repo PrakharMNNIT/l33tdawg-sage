@@ -80,6 +80,37 @@ func TestVendoredAgentBootstrapConfigNormalizesAndRejectsSharedHomeDomain(t *tes
 	require.ErrorContains(t, cfg.validate(), "must be a non-shared domain")
 }
 
+func TestVendoredAgentBootstrapRequiresPersonalModeAndVoter(t *testing.T) {
+	validBootstrap := func() *VendoredAgentBootstrapConfig {
+		return &VendoredAgentBootstrapConfig{
+			AgentKeyFile: "agents/mynah/agent.key",
+			HomeDomain:   "voice-interface",
+			Clearance:    1,
+		}
+	}
+
+	t.Run("quorum mode rejected", func(t *testing.T) {
+		cfg := DefaultConfig(t.TempDir())
+		cfg.VendoredAgentBootstrap = validBootstrap()
+		cfg.Quorum.Enabled = true
+		require.ErrorContains(t, cfg.validate(), "requires personal mode")
+	})
+
+	t.Run("disabled voter rejected", func(t *testing.T) {
+		cfg := DefaultConfig(t.TempDir())
+		cfg.VendoredAgentBootstrap = validBootstrap()
+		cfg.Voter.Enabled = false
+		require.ErrorContains(t, cfg.validate(), "requires voter.enabled=true")
+	})
+
+	t.Run("generic config remains operator controlled", func(t *testing.T) {
+		cfg := DefaultConfig(t.TempDir())
+		cfg.Quorum.Enabled = true
+		cfg.Voter.Enabled = false
+		require.NoError(t, cfg.validate())
+	})
+}
+
 func vendoredGenesisFixture(
 	t *testing.T,
 ) (*cmttypes.GenesisDoc, *VendoredAgentBootstrapConfig, string) {
@@ -936,7 +967,7 @@ func vendoredInitRequest(
 	}
 }
 
-func TestVendoredAgentBootstrapGenesisToFirstMemoryWrite(t *testing.T) {
+func TestVendoredAgentBootstrapWaitsForAppV24BeforeFirstMemoryWrite(t *testing.T) {
 	genesis, bootstrap, rootKeyPath := vendoredGenesisFixture(t)
 	var appState struct {
 		Sage struct {
@@ -1032,12 +1063,27 @@ func TestVendoredAgentBootstrapGenesisToFirstMemoryWrite(t *testing.T) {
 	require.NoError(t, tx.SignTx(parsed, agentKey))
 	raw, err := tx.EncodeTx(parsed)
 	require.NoError(t, err)
+	require.NoError(t, badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
+		Name: "app-v24", TargetAppVersion: 24, ActivationHeight: 1,
+	}))
 	finalized, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
 		Height: 1, Time: time.Now(), Txs: [][]byte{raw},
 	})
 	require.NoError(t, err)
 	require.Len(t, finalized.TxResults, 1)
-	require.Zero(t, finalized.TxResults[0].Code, finalized.TxResults[0].Log)
+	require.Equal(t, uint32(11), finalized.TxResults[0].Code)
+	require.Contains(t, finalized.TxResults[0].Log, "require governed app-v24 activation")
+	require.NotNil(t, finalized.ConsensusParamUpdates)
+	require.Equal(t, uint64(24), finalized.ConsensusParamUpdates.Version.App)
+	_, err = app.Commit(context.Background(), &abcitypes.RequestCommit{})
+	require.NoError(t, err)
+
+	firstSafe, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+		Height: 2, Time: time.Now().Add(time.Second), Txs: [][]byte{raw},
+	})
+	require.NoError(t, err)
+	require.Len(t, firstSafe.TxResults, 1)
+	require.Zero(t, firstSafe.TxResults[0].Code, firstSafe.TxResults[0].Log)
 }
 
 func TestVendoredAgentBootstrapRejectsMultiValidatorGenesisWithoutDirtyRetry(t *testing.T) {
@@ -1201,6 +1247,8 @@ func TestVendoredAgentReadinessRejectsMismatchedInitialRootKey(t *testing.T) {
 }
 
 func TestVendoredAgentReadinessSurvivesLegitimateRootHandover(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
 	genesis, bootstrap, initialRootPath := vendoredGenesisFixture(t)
 	badgerPath := filepath.Join(t.TempDir(), "badger")
 	projectionPath := filepath.Join(t.TempDir(), "offchain.db")
@@ -1238,21 +1286,66 @@ func TestVendoredAgentReadinessSurvivesLegitimateRootHandover(t *testing.T) {
 		require.NoError(t, projection.Close())
 		require.NoError(t, badgerStore.CloseBadger())
 	})
-	replacementPath := filepath.Join(t.TempDir(), "replacement-root.key")
+	replacementPath := filepath.Join(home, "bundles", appV23AgentIDForKey(replacementKey), "agent.key")
+	require.NoError(t, os.MkdirAll(filepath.Dir(replacementPath), 0o700))
 	require.NoError(t, os.WriteFile(replacementPath, replacementSeed[:], 0o600))
 	require.ErrorContains(t, verifyAppV23VendoredAgentReadiness(
 		bootstrap,
 		exactVendoredKeyResolver(initialRootPath),
 		badgerStore,
 	), "current committed CEREBRUM Root credential")
+	cfg := DefaultConfig(home)
+	cfg.AgentKey = initialRootPath
+	cfg.VendoredAgentBootstrap = bootstrap
 	require.NoError(t, verifyAppV23VendoredAgentReadiness(
 		bootstrap,
-		exactVendoredKeyResolver(replacementPath),
+		localAgentKeyResolverForConfig(cfg),
 		badgerStore,
 	))
 	root, err := badgerStore.GetAppV23Root()
 	require.NoError(t, err)
 	require.NotEqual(t, root.PrincipalID, root.CredentialID)
+}
+
+func TestVendoredAgentReadinessUsesConfiguredExternalKeyResolver(t *testing.T) {
+	// Keep SAGE_HOME disjoint from every fixture key. The companion credential
+	// is available only through the exact application-owned path in
+	// VendoredAgentBootstrap, not any conventional ~/.sage key directory. The
+	// same resolver must also retain the current Root path for readiness.
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	genesis, bootstrap, initialRootPath := vendoredGenesisFixture(t)
+	app, badgerStore, projection := openVendoredTestApp(
+		t,
+		filepath.Join(t.TempDir(), "badger"),
+		filepath.Join(t.TempDir(), "offchain.db"),
+	)
+	t.Cleanup(func() {
+		require.NoError(t, projection.Close())
+		require.NoError(t, badgerStore.CloseBadger())
+	})
+	_, err := app.InitChain(
+		context.Background(),
+		vendoredInitRequest(genesis, genesis.Validators[0].PubKey.Bytes()),
+	)
+	require.NoError(t, err)
+
+	companionKey, ok := parseKeyFile(bootstrap.AgentKeyFile)
+	require.True(t, ok)
+	companionID := appV23AgentIDForKey(companionKey)
+
+	cfg := DefaultConfig(home)
+	cfg.AgentKey = initialRootPath
+	cfg.VendoredAgentBootstrap = bootstrap
+	resolver := localAgentKeyResolverForConfig(cfg)
+	resolvedCompanion, found := resolver(companionID)
+	require.True(t, found)
+	require.Equal(t, companionKey, resolvedCompanion)
+	require.NoError(t, verifyAppV23VendoredAgentReadiness(
+		bootstrap,
+		resolver,
+		badgerStore,
+	))
 }
 
 func TestVendoredAgentReadinessAllowsWriteCapablePromotionAndRejectsReadOnly(t *testing.T) {

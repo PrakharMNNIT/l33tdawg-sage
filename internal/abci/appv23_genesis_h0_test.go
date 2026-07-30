@@ -59,6 +59,35 @@ func directAppV23GenesisTestApp(t *testing.T) (*SageApp, agentKey, agentKey) {
 	return app, root, companion
 }
 
+// activateDirectAppV24ForTest installs the already-governed plan at the next
+// height and commits the activation block. Tests whose subject is Companion
+// behavior after first-run readiness use the returned H+1 height; the separate
+// replay tests cover proposal/vote/watchdog authorization and crash recovery.
+func activateDirectAppV24ForTest(
+	t *testing.T,
+	app *SageApp,
+	blockTime time.Time,
+) int64 {
+	t.Helper()
+	activationHeight := app.state.Height + 1
+	require.NoError(t, app.badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
+		Name: appV24UpgradeName, TargetAppVersion: 24,
+		ActivationHeight: activationHeight, ProposedAt: app.state.Height,
+	}))
+	finalized, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+		Height: activationHeight,
+		Time:   blockTime,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, finalized.ConsensusParamUpdates)
+	require.NotNil(t, finalized.ConsensusParamUpdates.Version)
+	require.Equal(t, uint64(24), finalized.ConsensusParamUpdates.Version.App)
+	_, err = app.Commit(context.Background(), &abcitypes.RequestCommit{})
+	require.NoError(t, err)
+	require.True(t, app.IsAppV24ActiveForNextTx())
+	return activationHeight + 1
+}
+
 func encodeDirectH0Tx(t *testing.T, parsed *tx.ParsedTx, signer agentKey, nonce uint64) []byte {
 	t.Helper()
 	parsed.Nonce = nonce

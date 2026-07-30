@@ -1,4 +1,4 @@
-<!-- Reference index reconciled for SAGE v11.15.1. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
+<!-- Reference index reconciled for SAGE v11.16.0. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
 
 
 # SAGE Reference — Agent Integration Index
@@ -24,7 +24,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | [`concepts/memory-lifecycle.md`](concepts/memory-lifecycle.md) | submit → proposed → committed/deprecated; node-local vs on-chain data; confidence decay; corroboration. |
 | [`concepts/clearance-classification.md`](concepts/clearance-classification.md) | Per-record classification (0–4), the REST-vs-wire default gotcha, and the per-record query gate. |
 | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) | Orgs, departments, agent clearance, cross-org federation, cross-chain peer Read/Copy RBAC, why peer Write is reserved but unavailable in v11.9, the five-gate query pipeline, and the app-v20 one-chain quorum-scope boundary. |
-| [`app-v23-access-control-design.md`](app-v23-access-control-design.md) | The v11.15.0 contract for Root, Member/Manager/Admin roles, named security profiles, Access Groups, atomic enrollment, linked federated readers, migration, replay, and state sync. |
+| [`app-v23-access-control-design.md`](app-v23-access-control-design.md) | The v11.16.0 contract for Root, Member/Manager/Admin roles, named security profiles, Access Groups, atomic enrollment, linked federated readers, app-v24 readiness and memory integrity, migration, replay, and state sync. |
 | [`concepts/consensus-confidence-decay.md`](concepts/consensus-confidence-decay.md) | CometBFT BFT path, "CometBFT-committed" vs "SAGE-committed", quorum, PoE weights, epochs. |
 | [`concepts/block-production-and-idle.md`](concepts/block-production-and-idle.md) | Why an idle chain mints **no** blocks (SAGE has no heartbeat), when a block *is* minted, and how to tell healthy-idle from actually-stuck. Read this before alarming on a frozen block height. |
 | [`concepts/voter-operations.md`](concepts/voter-operations.md) | How `proposed` memories become `committed` (the per-node auto-voter), how to *guarantee* auto-commit (`--require-voter` / `voter:` config), the stuck-memory alarm + triage, key safety, and the honest REST-vote caveat. |
@@ -82,6 +82,22 @@ classification-bounded live Read and untrusted pipeline messages, but never
 local membership or mutation authority. See
 [`app-v23-access-control-design.md`](app-v23-access-control-design.md).
 
+### App-v24 memory integrity and first-party readiness
+
+App-v24 is the strict H+1 successor to app-v23. It binds every new memory's
+canonical content hash to the exact submitted content and preserves that hash
+through terminal lifecycle transitions. A governed re-anchor can repair
+eligible historical terminal rows without changing content, authorship,
+domains, or prior blocks.
+
+A fresh direct-v23 Mynah node remains `waiting_for_app_v24` until its next
+admitted transaction will execute under app-v24. Consensus independently blocks
+that exact Companion enrollment's pre-v24 memory/co-commit writes. The barrier
+does not apply to ordinary upgraded agents, which retain app-v23 write behavior
+while activation completes. See
+[`app-v23-access-control-design.md`](app-v23-access-control-design.md) — “App-v24
+readiness and memory-write barrier.”
+
 ### Clearance / classification (legacy overloaded integer)
 
 Before app-v23's explicit role model, the same `0–4` integer was also described
@@ -122,7 +138,7 @@ CometBFT without treating the consensus RPC as proof of application storage.
 
 ---
 
-## Related docs (reconciled through v11.15.1)
+## Related docs (reconciled through v11.16.0)
 
 These were stale earlier in v8 and have now been reconciled against the code. Where any of them still disagrees with this reference, this reference wins.
 

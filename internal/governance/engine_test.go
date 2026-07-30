@@ -209,6 +209,35 @@ func TestProcessBlockValidatedLeavesFailedExecutionRecoverable(t *testing.T) {
 	assert.Equal(t, proposalID, active.ProposalID)
 }
 
+func TestProcessBlockValidatedWithInvalidationRejectsClassifiedDrift(t *testing.T) {
+	eng, _, _ := makeEngine(map[string]int64{"val-a": 10})
+	proposalID, err := eng.Propose(
+		"val-a", OpAddValidator, "new-val", []byte("key"), 3,
+		0, "stale execution", 100, nil,
+	)
+	require.NoError(t, err)
+
+	drift := fmt.Errorf("deterministic target state changed")
+	executed, invalidated, err := eng.ProcessBlockValidatedWithInvalidation(
+		100,
+		func(*ProposalState) error { return drift },
+		func(proposal *ProposalState, validationErr error) bool {
+			return proposal.Operation == OpAddValidator && validationErr == drift
+		},
+	)
+	require.NoError(t, err)
+	assert.Nil(t, executed)
+	require.NotNil(t, invalidated)
+	assert.Equal(t, proposalID, invalidated.ProposalID)
+
+	proposal, err := eng.LoadProposal(proposalID)
+	require.NoError(t, err)
+	assert.Equal(t, StatusRejected, proposal.Status)
+	active, err := eng.GetActiveProposal()
+	require.NoError(t, err)
+	assert.Nil(t, active)
+}
+
 func TestSingleNodeAutoApprove(t *testing.T) {
 	eng, _, _ := makeEngine(map[string]int64{
 		"sole-val": 10,
@@ -224,6 +253,32 @@ func TestSingleNodeAutoApprove(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, executed)
 	assert.Equal(t, StatusExecuted, executed.Status)
+}
+
+func TestSingleNodeExplicitVoteProposalDoesNotAutoApprove(t *testing.T) {
+	eng, _, _ := makeEngine(map[string]int64{
+		"sole-val": 10,
+	})
+
+	proposalID, err := eng.ProposeWithoutAutoVote(
+		"sole-val", ProposalOp(9), "payload-digest", nil, 0, 0,
+		"repair app-v23 memory commitments", 50, []byte("opaque payload"),
+	)
+	require.NoError(t, err)
+
+	votes, err := eng.GetProposalVotes(proposalID)
+	require.NoError(t, err)
+	require.Empty(t, votes, "the explicit-vote proposal path must not synthesize an accept vote")
+
+	executed, err := eng.ProcessBlock(50)
+	require.NoError(t, err)
+	require.Nil(t, executed, "a single validator must explicitly attest before execution")
+
+	require.NoError(t, eng.Vote(proposalID, "sole-val", "accept", 51))
+	executed, err = eng.ProcessBlock(51)
+	require.NoError(t, err)
+	require.NotNil(t, executed)
+	require.Equal(t, StatusExecuted, executed.Status)
 }
 
 func TestProposalExpiry(t *testing.T) {

@@ -332,7 +332,7 @@ func waitForBootStateSyncSealWithInterval(
 func recoverPendingStateSyncActivation(
 	ctx context.Context,
 	dataDir, cometHome, badgerPath string,
-	complete func() error,
+	complete func(height uint64, appHash []byte) error,
 ) (statesync.RecoveryAction, bool, error) {
 	return recoverPendingStateSyncActivationWith(
 		ctx,
@@ -358,7 +358,7 @@ func recoverPendingStateSyncActivationWith(
 	dataDir, cometHome, badgerPath string,
 	readComet persistedCometStateReader,
 	inspect statesync.ActivationDirectoryInspector,
-	complete func() error,
+	complete func(height uint64, appHash []byte) error,
 ) (statesync.RecoveryAction, bool, error) {
 	if dataDir == "" || cometHome == "" || badgerPath == "" || readComet == nil || inspect == nil || complete == nil {
 		return 0, false, errors.New("state sync recovery paths, Comet reader, directory inspector, and completion are required")
@@ -385,7 +385,16 @@ func recoverPendingStateSyncActivationWith(
 	if err != nil {
 		return 0, true, err
 	}
-	action, err := statesync.RecoverActivationDirectories(dataDir, journalPath, cometHeight, cometAppHash, inspect, complete)
+	action, err := statesync.RecoverActivationDirectories(
+		dataDir,
+		journalPath,
+		cometHeight,
+		cometAppHash,
+		inspect,
+		func() error {
+			return complete(journal.Height, append([]byte(nil), journal.AppHash...))
+		},
+	)
 	if err != nil {
 		return 0, true, err
 	}
@@ -395,6 +404,8 @@ func recoverPendingStateSyncActivationWith(
 // completeStateSyncReceivingRole atomically disarms the one-shot receiver on
 // disk and in memory. The activation journal remains durable until this
 // idempotent completion succeeds, so every crash boundary can retry safely.
+// Normal service admission later seals the separate chain-bound projection
+// baseline; Received alone never authorizes a missing SQL row.
 func completeStateSyncReceivingRole(cfg *Config) error {
 	if cfg == nil {
 		return errors.New("state-sync receiver config is required")
@@ -403,6 +414,7 @@ func completeStateSyncReceivingRole(cfg *Config) error {
 		return fmt.Errorf("persist completed state-sync receiver role: %w", err)
 	}
 	cfg.Quorum.StateSync.Receiving = false
+	cfg.Quorum.StateSync.Received = true
 	return nil
 }
 

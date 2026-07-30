@@ -37,10 +37,14 @@ import (
 const defaultPumpInterval = 5 * time.Second
 
 // startPendingPlanPump launches the pump goroutine. Returns false when the
-// pump can't run: no signing key (heartbeats are signed txs) or no in-process
-// pending-plan accessor (CLI contexts). Cancelled via ctx.
+// pump can't run: no signing-key source (heartbeats are signed txs) or no
+// in-process pending-plan accessor (CLI contexts). ResolveSigningKey is the
+// app-v23 path: it resolves the exact current Root on every heartbeat and fails
+// closed if that credential is not held locally. AgentKey remains the legacy
+// pre-v23 path; never require it when the dynamic resolver is present.
+// Cancelled via ctx.
 func startPendingPlanPump(ctx context.Context, cfg upgradeWatchdogConfig) bool {
-	if cfg.AgentKey == nil || cfg.PendingPlan == nil {
+	if (cfg.AgentKey == nil && cfg.ResolveSigningKey == nil) || cfg.PendingPlan == nil {
 		return false
 	}
 	every := cfg.PumpInterval

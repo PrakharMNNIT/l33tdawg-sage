@@ -1,7 +1,7 @@
 // CEREBRUM — Your SAGE Brain
 import { SSEClient } from './sse.js';
 import { fetchStats, fetchGraph, fetchMemories, deleteMemory, updateMemory, fetchHealth, fetchValidators, fetchScopes, fetchMcpConfig, checkAuth, login, recoverVault, lockSession, importMemories, importPreview, importConfirm, fetchCleanupSettings, saveCleanupSettings, runCleanup, fetchAgents, fetchAppV23Access, updateAppV23AgentPolicy, putAppV23AccessGroup, deleteAppV23AccessGroup, fetchAppV23LinkedReaders, fetchAppV23LinkedReaderIdentities, checkAppV23LinkedReaderEligibility, mutateAppV23LinkedReader, fetchAppV23LinkedMessageConsent, fetchAppV23RemoteHostedMessageCandidates, putAppV23LinkedMessageConsent, fetchAgent, createAgent, updateAgent, removeAgent, downloadBundle, fetchTemplates, fetchRedeployStatus, startRedeploy, createPairingCode, rotateAgentKey, handoverRootCredential, fetchBootInstructions, saveBootInstructions, fetchLedgerStatus, enableLedger, changeLedgerPassphrase, disableLedger, fetchTags, fetchMemoryTags, setMemoryTags, fetchAutostart, setAutostart, checkForUpdate, applyUpdate, restartServer, fetchReranker, saveReranker, testReranker, detectReranker, fetchOnboarding, saveOnboarding,
-rerankerSetupStatus, rerankerSetupDownload, rerankerSetupStart, rerankerSetupStop, rerankerSetupInstallEngine, fetchTasks, updateTaskStatus, reorderTasks, createTask, assignTask, fetchUnregisteredAgents, mergeAgent, fetchRecallSettings, saveRecallSettings, fetchAgentDomains, reassignDomainOwnership, bulkUpdateMemories, fetchMemoryMode, saveMemoryMode, fetchPipeline, fetchPipelineStats, sendPipelineNote, fetchGovProposals, fetchGovProposalDetail, submitGovProposal, submitGovVote, wizardCheckCloudflared, wizardInstallCloudflared, wizardStartLogin, wizardLoginStatus, wizardCreateTunnel, wizardMintToken, connectProvider, connectRemoteUrl, fetchUpdateStatus, selectEmbeddingProvider,
+rerankerSetupStatus, rerankerSetupDownload, rerankerSetupStart, rerankerSetupStop, rerankerSetupInstallEngine, fetchTasks, updateTaskStatus, reorderTasks, createTask, assignTask, fetchUnregisteredAgents, mergeAgent, fetchRecallSettings, saveRecallSettings, fetchAgentDomains, reassignDomainOwnership, bulkUpdateMemories, fetchMemoryMode, saveMemoryMode, fetchPipeline, fetchPipelineStats, sendPipelineNote, fetchGovProposals, fetchGovProposalDetail, submitGovProposal, submitGovVote, fetchMemoryReanchorPlan, wizardCheckCloudflared, wizardInstallCloudflared, wizardStartLogin, wizardLoginStatus, wizardCreateTunnel, wizardMintToken, connectProvider, connectRemoteUrl, fetchUpdateStatus, selectEmbeddingProvider,
 embeddingsStatus, checkOllamaEmbed, installOllamaRuntime, startOllamaRuntime, pullEmbedModel, reembedMemories, reembedProgress, enableSemanticEmbeddings,
 deprecateUnreadable, getRecoveryKey, confirmRecoveryKeyBackup, recoverOrphansPreview, recoverOrphans,
 joinHostInterfaces, enableNetworkMode, joinHostStart, joinHostStatus, joinHostApprove, joinHostAbort,
@@ -51,7 +51,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.15.1';
+const SAGE_VERSION = 'v11.16.0';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -278,8 +278,9 @@ function useModalDialog(onRequestClose, active = true) {
     return dialogRef;
 }
 
-function BrainDomainInventory({ onInventory, selectedDomain, onSelectDomain }) {
+function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onSelectDomain }) {
     const [inventory, setInventory] = useState(null);
+    const [localProjectionError, setLocalProjectionError] = useState(false);
     const [loadingRemote, setLoadingRemote] = useState(false);
     const [federationError, setFederationError] = useState('');
     const [domainFilter, setDomainFilter] = useState('');
@@ -308,6 +309,18 @@ function BrainDomainInventory({ onInventory, selectedDomain, onSelectDomain }) {
             const stats = statsResult.status === 'fulfilled' ? statsResult.value : null;
             const localCatalogue = catalogueResult.status === 'fulfilled' ? catalogueResult.value : null;
             const connectionsPayload = connectionsResult.status === 'fulfilled' ? connectionsResult.value : null;
+            if (!stats || typeof stats.total_memories !== 'number' ||
+                !stats.by_domain || typeof stats.by_domain !== 'object') {
+                setInventory(null);
+                setLocalProjectionError(true);
+                setLoadingRemote(false);
+                if (onInventory) onInventory(null);
+                if (onAvailability) onAvailability('unavailable');
+                inFlight = false;
+                return;
+            }
+            setLocalProjectionError(false);
+            if (onAvailability) onAvailability('ready');
             const connections = connectionsPayload && Array.isArray(connectionsPayload.connections)
                 ? connectionsPayload.connections
                 : [];
@@ -486,6 +499,15 @@ function BrainDomainInventory({ onInventory, selectedDomain, onSelectDomain }) {
     const resetLayout = () => {
         if (panelRef.current) panelRef.current.dispatchEvent(new CustomEvent('sage:domain-panel-reset'));
     };
+    if (localProjectionError) {
+        return html`<aside ref=${panelRef} class="brain-domain-inventory loading" aria-label="Domain sources" role="alert">
+            <strong>Memory view temporarily unavailable</strong>
+            <span class="brain-domain-loading">Your memories are unchanged. CEREBRUM could not verify the local memory projection and will retry automatically.</span>
+            <button type="button" class="brain-domain-manage" onClick=${() => window.location.reload()}>
+                Reload CEREBRUM
+            </button>
+        </aside>`;
+    }
     if (!inventory) {
         return html`<aside ref=${panelRef} class="brain-domain-inventory loading" aria-label="Domain sources">
             <span class="brain-domain-loading">Loading domain sources…</span>
@@ -628,6 +650,7 @@ function BrainDomainInventory({ onInventory, selectedDomain, onSelectDomain }) {
 function MriView({ sse }) {
     const ref = useRef(null);
     const [inventory, setInventory] = useState(null);
+    const [projectionAvailability, setProjectionAvailability] = useState('loading');
     const [selectedDomain, setSelectedDomain] = useState('');
     useEffect(() => {
         if (!ref.current) return;
@@ -651,8 +674,15 @@ function MriView({ sse }) {
     const hasSharedDomains = inventory && inventory.sharedDomains.length > 0;
     return html`<div class="mri-wrap">
         <div class="mri-stage" ref=${ref}></div>
-        <${BrainDomainInventory} onInventory=${setInventory}
+        <${BrainDomainInventory} onInventory=${setInventory} onAvailability=${setProjectionAvailability}
             selectedDomain=${selectedDomain} onSelectDomain=${selectDomain} />
+        ${projectionAvailability === 'unavailable' && html`<div class="brain-empty-overlay" role="alert">
+            <${EmptyState} icon="brain"
+                headline="Memory view temporarily unavailable"
+                hint="Your memories are still stored and unchanged. CEREBRUM refused to display an unverified or incomplete projection instead of pretending the brain is empty."
+                actionLabel="Reload CEREBRUM"
+                onAction=${() => window.location.reload()} />
+        </div>`}
         ${noLocalMemories && html`<div class="brain-empty-overlay">
             <${EmptyState} icon="brain"
                 headline=${hasSharedDomains ? 'No memories stored locally' : 'Your brain is empty'}
@@ -7129,6 +7159,7 @@ function formatUptime(totalSec) {
 
 function HealthBar() {
     const [health, setHealth] = useState(null);
+    const [healthUnavailable, setHealthUnavailable] = useState(false);
     const [uptimeSec, setUptimeSec] = useState(0);
     const uptimeBaseRef = useRef(0);
     const uptimeTickRef = useRef(null);
@@ -7151,21 +7182,38 @@ function HealthBar() {
         try {
             const data = await fetchHealth();
             setHealth(data);
+            setHealthUnavailable(false);
             const parsed = parseUptimeSec(data.uptime);
             uptimeBaseRef.current = parsed;
             setUptimeSec(parsed);
         } catch (e) {
             setHealth(null);
+            setHealthUnavailable(true);
         }
     }
 
-    if (!health) return null;
+    if (!health) {
+        if (!healthUnavailable) return null;
+        return html`
+            <div class="health-bar health-bar-unavailable" role="alert">
+                <div class="health-item">
+                    <div class="health-dot err"></div>
+                    <strong>Memory view temporarily unavailable</strong>
+                    <span>Your memories are unchanged. CEREBRUM could not verify the local memory projection and will retry automatically.</span>
+                </div>
+            </div>
+        `;
+    }
 
     const embedderStatus = describeEmbedder(health);
     const reranker = health?.embedder?.reranker;
     const rerankerOn = !!reranker?.enabled;
-    const totalMem = health.memories?.total_memories || 0;
-    const domains = health.memories?.by_domain ? Object.keys(health.memories.by_domain).length : 0;
+    const totalMem = typeof health.memories?.total_memories === 'number'
+        ? health.memories.total_memories
+        : null;
+    const domains = health.memories?.by_domain && typeof health.memories.by_domain === 'object'
+        ? Object.keys(health.memories.by_domain).length
+        : null;
 
     return html`
         <div class="health-bar">
@@ -7180,11 +7228,11 @@ function HealthBar() {
             </div>
             <div class="health-sep"></div>
             <div class="health-item">
-                <span class="health-num">${totalMem}</span> memories <${HelpTip} text="Total committed memories across all domains and agents." />
+                <span class="health-num">${totalMem === null ? '—' : totalMem}</span> memories <${HelpTip} text="Total committed memories across all domains and agents." />
             </div>
             <div class="health-sep"></div>
             <div class="health-item">
-                <span class="health-num">${domains}</span> domains
+                <span class="health-num">${domains === null ? '—' : domains}</span> domains
             </div>
             <div class="health-sep"></div>
             <div class="health-item">
@@ -8250,11 +8298,11 @@ function AppV23AccessControl() {
     const mutateDraft = (patch) => setDraft(current => ({ ...(current || {}), ...patch }));
     const chooseRole = (role) => {
         if (!draft) return;
-        mutateDraft(appV23RoleDefaults(role));
+        mutateDraft(appV23RoleDefaults(role, draft.capabilities));
     };
     const chooseProfile = (profile) => {
         if (!draft || !appV23ProfileIsSelectable(profile)) return;
-        mutateDraft(appV23ProfileDefaults(profile, draft.role));
+        mutateDraft(appV23ProfileDefaults(profile, draft.role, draft.capabilities));
     };
 
     const savePolicy = async () => {
@@ -9448,6 +9496,9 @@ function NetworkPage({ sse, accessMode = false }) {
 	const [govScopes, setGovScopes] = useState([]);
     const [currentHeight, setCurrentHeight] = useState(0);
     const govPollRef = useRef(null);
+    const [memoryRepairPlan, setMemoryRepairPlan] = useState(null);
+    const [memoryRepairError, setMemoryRepairError] = useState('');
+    const [memoryRepairSubmitting, setMemoryRepairSubmitting] = useState(false);
 
     const loadAgents = useCallback(async () => {
         try {
@@ -9492,12 +9543,32 @@ function NetworkPage({ sse, accessMode = false }) {
         } catch (e) { /* governance endpoint may not exist yet */ }
     }, []);
 
+    const loadMemoryRepairPlan = useCallback(async () => {
+        try {
+            const plan = await fetchMemoryReanchorPlan();
+            setMemoryRepairPlan(plan);
+            setMemoryRepairError('');
+        } catch (e) {
+            // Non-Root operators and pre-app-v24 nodes must not see a control
+            // they cannot authorize. Root-visible attestation failures remain
+            // explicit instead of pretending the projection is healthy.
+            if (e?.status === 401 || e?.status === 403 || e?.status === 409) {
+                setMemoryRepairPlan(null);
+                setMemoryRepairError('');
+                return;
+            }
+            setMemoryRepairPlan(null);
+            setMemoryRepairError(e?.message || 'Local memory attestation is unavailable.');
+        }
+    }, []);
+
     useEffect(() => {
         loadAgents();
 		loadScopeValidators();
 		loadGovScopes();
         loadUnregistered();
         loadGovProposals();
+        loadMemoryRepairPlan();
         fetchStats().then(data => {
             if (data?.by_domain) setAllDomains(Object.keys(data.by_domain).sort());
         }).catch(() => {});
@@ -9543,13 +9614,14 @@ function NetworkPage({ sse, accessMode = false }) {
                         loadGovProposals();
 						loadScopeValidators();
 						loadGovScopes();
+                        loadMemoryRepairPlan();
                     }
                 }
                 if (health?.chain?.block_height) setCurrentHeight(Number(health.chain.block_height));
             } catch (e) { /* ignore polling errors */ }
         }, 3000);
         return () => { if (govPollRef.current) { clearInterval(govPollRef.current); govPollRef.current = null; } };
-	}, [activeProposal?.proposal_id, loadGovProposals, loadScopeValidators, loadGovScopes]);
+	}, [activeProposal?.proposal_id, loadGovProposals, loadScopeValidators, loadGovScopes, loadMemoryRepairPlan]);
 
     // SSE governance events — auto-refresh on governance activity
     useEffect(() => {
@@ -9558,12 +9630,13 @@ function NetworkPage({ sse, accessMode = false }) {
             loadGovProposals();
 			loadScopeValidators();
 			loadGovScopes();
+            loadMemoryRepairPlan();
             fetchHealth().then(h => {
                 if (h?.chain?.block_height) setCurrentHeight(Number(h.chain.block_height));
             }).catch(() => {});
         });
         return unsub;
-	}, [sse, loadGovProposals, loadScopeValidators, loadGovScopes]);
+	}, [sse, loadGovProposals, loadScopeValidators, loadGovScopes, loadMemoryRepairPlan]);
 
     // Redeploy polling
     const startRedeployPoll = useCallback(() => {
@@ -9810,6 +9883,48 @@ function NetworkPage({ sse, accessMode = false }) {
         setGovVoting(false);
     }, [loadGovProposals]);
 
+    const handleMemoryRepairProposal = useCallback(async () => {
+        if (!memoryRepairPlan?.required || activeProposal || memoryRepairSubmitting) return;
+        const reviewed = await showConfirmation(
+            `CEREBRUM locally verified ${memoryRepairPlan.entries} historical memory commitment${memoryRepairPlan.entries === 1 ? '' : 's'} for this bounded repair batch. No memory content, author, domain, status, or chain history will be rewritten.`,
+            {
+                title: 'Prepare memory access repair?',
+                confirmLabel: 'Review final authorization',
+            }
+        );
+        if (!reviewed) return;
+        const authorized = await showConfirmation(
+            'This creates a Root-authorized governance proposal. It does not execute automatically: every validator must independently verify its local projection before accepting.',
+            {
+                title: 'Authorize repair proposal',
+                confirmLabel: 'Create proposal',
+            }
+        );
+        if (!authorized) return;
+        setMemoryRepairSubmitting(true);
+        try {
+            const result = await submitGovProposal({
+                operation: memoryRepairPlan.operation,
+                target_id: memoryRepairPlan.target_id,
+                payload: memoryRepairPlan.payload,
+                expiry_blocks: memoryRepairPlan.expiry_blocks,
+                reason: 'Restore canonical SHA-256 commitments for app-v23 terminal memories after local attestation.',
+            });
+            if (result.error) {
+                showToast(result.error, 'error');
+            } else {
+                showToast('Repair proposal created. Review it below, then cast this validator’s explicit vote.', 'success', 10000);
+                setMemoryRepairPlan(current => current ? { ...current, state: 'proposal_created' } : current);
+                await loadGovProposals();
+            }
+        } catch (e) {
+            showToast('Repair proposal failed: ' + e.message, 'error', 10000);
+            await loadMemoryRepairPlan();
+        } finally {
+            setMemoryRepairSubmitting(false);
+        }
+    }, [memoryRepairPlan, activeProposal, memoryRepairSubmitting, loadGovProposals, loadMemoryRepairPlan]);
+
     const handleGovSubmit = useCallback(async () => {
         setGovSubmitting(true);
         try {
@@ -9876,11 +9991,11 @@ function NetworkPage({ sse, accessMode = false }) {
 
     // Governance helpers
     const govOpLabel = (op) => {
-        const labels = { add_validator: 'Add Validator', remove_validator: 'Remove Validator', update_power: 'Update Power', scope_action: 'Quorum Scope' };
+        const labels = { add_validator: 'Add Validator', remove_validator: 'Remove Validator', update_power: 'Update Power', scope_action: 'Quorum Scope', memory_hash_reanchor: 'Memory Access Repair' };
         return labels[op] || op;
     };
     const govOpIcon = (op) => {
-        const icons = { add_validator: '+', remove_validator: '-', update_power: '~', scope_action: 'Q' };
+        const icons = { add_validator: '+', remove_validator: '-', update_power: '~', scope_action: 'Q', memory_hash_reanchor: '↻' };
         return icons[op] || '?';
     };
     const resolveAgentName = (agentId) => {
@@ -9962,6 +10077,30 @@ function NetworkPage({ sse, accessMode = false }) {
             </div>
 
             ${accessMode && html`<${AppV23AccessControl} />`}
+
+            ${(memoryRepairPlan?.required || memoryRepairError) && html`
+                <section class="memory-repair-card ${memoryRepairError ? 'blocked' : ''}" aria-live="polite">
+                    <div class="memory-repair-copy">
+                        <div class="memory-repair-eyebrow">LOCAL RECOVERY · APP-v24</div>
+                        <h3>${memoryRepairError ? 'Memory access repair needs attention' : 'Historical memories need a safe access repair'}</h3>
+                        <p>${memoryRepairError
+                            ? memoryRepairError
+                            : `CEREBRUM verified ${memoryRepairPlan.entries} terminal memory commitment${memoryRepairPlan.entries === 1 ? '' : 's'} in the next bounded batch against this machine’s encrypted projection. Content and chain history stay unchanged.`}</p>
+                        ${memoryRepairPlan?.remaining && html`
+                            <div class="memory-repair-note">More verified batches remain. CEREBRUM will offer the next batch only after this one commits.</div>
+                        `}
+                    </div>
+                    ${memoryRepairPlan?.required && html`
+                        <button
+                            class="memory-repair-btn"
+                            onClick=${handleMemoryRepairProposal}
+                            disabled=${memoryRepairSubmitting || !!activeProposal}
+                        >
+                            ${memoryRepairSubmitting ? 'Creating proposal…' : activeProposal ? 'Finish active proposal first' : 'Prepare repair proposal'}
+                        </button>
+                    `}
+                </section>
+            `}
 
 			<div class="gov-section">
                 <div class="gov-section-header">
@@ -12989,8 +13128,8 @@ function OverviewPage({ sse }) {
     // report a consensus app version yet, so do not cry "behind" (amber) on it.
     // Only a real version below the v11 baseline is genuinely behind. During a
     // rolling activation the intermediate fork rungs remain neutral; the
-    // current protocol turns green only once the app-v23 gate is active.
-    const appVerTone = appVer === '23' ? 'healthy' : (appVerNum > 0 && appVerNum < 15 ? 'degraded' : 'neutral');
+    // current protocol turns green only once the app-v24 gate is active.
+    const appVerTone = appVer === '24' ? 'healthy' : (appVerNum > 0 && appVerNum < 15 ? 'degraded' : 'neutral');
     const appVerShown = (appVer && appVer !== '0') ? ('v' + appVer) : '--';
     const mempoolTxs = (chain && chain.mempool_txs != null) ? Number(chain.mempool_txs) : null;
     const mempoolHot = mempoolTxs != null && !isNaN(mempoolTxs) && mempoolTxs > 50;
@@ -13015,7 +13154,7 @@ function OverviewPage({ sse }) {
         tile(chain ? Number(chain.block_height || 0).toLocaleString() : '--', 'Block height', { color: '#10b981', title: 'Total blocks committed to the chain.' }),
         tile(fmtAge(blockElapsed), 'Last block age', { title: 'Time since the last committed block.', sub: chainIdle ? 'idle - not a stall' : '' }),
         tile(chain ? (chain.catching_up ? 'Catching up' : 'In sync') : '--', 'Sync state', { small: true, color: chain ? (chain.catching_up ? '#f59e0b' : '#10b981') : undefined }),
-        tile(appVerShown, 'App version', { small: true, color: appVerTone === 'healthy' ? '#10b981' : (appVerTone === 'degraded' ? '#f59e0b' : undefined), title: 'CometBFT app protocol version. Green when current (23).' }),
+        tile(appVerShown, 'App version', { small: true, color: appVerTone === 'healthy' ? '#10b981' : (appVerTone === 'degraded' ? '#f59e0b' : undefined), title: 'CometBFT app protocol version. Green when current (24).' }),
         tile(chainIdle ? 'Idle' : (blockRate ? blockRate.toFixed(1) + 's' : '--'), 'Block rate', { small: chainIdle, title: 'Seconds per block, derived client-side from height deltas.' }),
         tile(uptimeDisplay, 'Node uptime', { small: true, title: 'Time since this node process started.' }),
         tile(chain && chain.mempool_txs != null ? chain.mempool_txs : '--', 'Pending transactions', { color: mempoolHot ? '#f59e0b' : undefined, title: 'Unconfirmed transactions waiting in the mempool. Amber above 50 signals a backlog.' }),
@@ -13405,7 +13544,7 @@ function App() {
             } else {
                 setAuthState('login');
             }
-        }).catch(() => setAuthState('ready')); // if auth check fails, assume no auth
+        }).catch(() => setAuthState('error'));
     }, []);
 
     // First-run onboarding. A FRESH node (empty brain, onboarding not marked
@@ -13506,6 +13645,14 @@ function App() {
     // Show loading spinner
     if (authState === 'loading') {
         return html`<div class="login-screen"><div class="login-card" style="text-align:center;"><p style="color:var(--text-muted, #6b7280);">Loading...</p></div></div>`;
+    }
+
+    if (authState === 'error') {
+        return html`<div class="login-screen"><div class="login-card" role="alert">
+            <h2>CEREBRUM could not verify this session</h2>
+            <p>Your SAGE node and memories were not changed. Reload once; if this continues, install the latest SAGE update.</p>
+            <button class="btn btn-primary" onClick=${() => window.location.reload()}>Reload CEREBRUM</button>
+        </div></div>`;
     }
 
     // Show login screen. If ?next=<path> is set in the URL, redirect to that

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -48,6 +49,34 @@ def write_fixture_tree(root):
 
 
 class SourceIdentityTests(unittest.TestCase):
+    def test_state_sync_target_tracks_compiled_app_ceiling(self):
+        gate = (REPOSITORY_ROOT / "deploy/scripts/run-v11.9-state-sync.sh").read_text(
+            encoding="utf-8"
+        )
+        app = (REPOSITORY_ROOT / "internal/abci/app.go").read_text(encoding="utf-8")
+        state_sync = (
+            REPOSITORY_ROOT / "internal/statesync/authorization.go"
+        ).read_text(encoding="utf-8")
+        gate_target = re.search(r"^TARGET_APP_VERSION=(\d+)$", gate, re.MULTILINE)
+        app_ceiling = re.search(
+            r"^const maxSupportedAppVersion uint64 = (\d+)$", app, re.MULTILINE
+        )
+        state_sync_ceiling = re.search(
+            r"^\s*LatestSupportedAppVersion uint64 = (\d+)$",
+            state_sync,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(gate_target, "state-sync gate target is not canonical")
+        self.assertIsNotNone(app_ceiling, "compiled app ceiling is not canonical")
+        self.assertIsNotNone(
+            state_sync_ceiling, "state-sync authorization ceiling is not canonical"
+        )
+        self.assertEqual(
+            {gate_target.group(1), app_ceiling.group(1), state_sync_ceiling.group(1)},
+            {gate_target.group(1)},
+            "state-sync gate, app ceiling, and authorization ceiling must advance together",
+        )
+
     def test_file_bytes_cannot_manufacture_another_tree_record(self):
         with (
             tempfile.TemporaryDirectory() as single_root,

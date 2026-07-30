@@ -70,9 +70,10 @@ func rawAppV23TaskTx(
 
 func TestAppV23RawOrdinaryTaskRequiresDurableAssignmentIntent(t *testing.T) {
 	app, _, companion := directAppV23GenesisTestApp(t)
+	height := activateDirectAppV24ForTest(t, app, time.Now().UTC().Add(-time.Minute))
 	parsed := rawAppV23TaskTx(t, companion, companion.id, "", false)
 
-	result := app.processTx(parsed, 1, time.Unix(parsed.AgentTimestamp, 0))
+	result := app.processTx(parsed, height, time.Unix(parsed.AgentTimestamp, 0))
 	require.Equal(t, uint32(17), result.Code, result.Log)
 	require.Contains(t, result.Log, "idempotency assignment intent")
 	_, _, err := app.badgerStore.GetMemoryHash(parsed.MemorySubmit.MemoryID)
@@ -82,9 +83,10 @@ func TestAppV23RawOrdinaryTaskRequiresDurableAssignmentIntent(t *testing.T) {
 
 func TestAppV23SignedOrdinaryTaskDerivesDurableAssignmentIntent(t *testing.T) {
 	app, _, companion := directAppV23GenesisTestApp(t)
+	height := activateDirectAppV24ForTest(t, app, time.Now().UTC().Add(-time.Minute))
 	parsed := rawAppV23TaskTx(t, companion, companion.id, "", true)
 
-	result := app.processTx(parsed, 1, time.Unix(parsed.AgentTimestamp, 0))
+	result := app.processTx(parsed, height, time.Unix(parsed.AgentTimestamp, 0))
 	require.Zero(t, result.Code, result.Log)
 	key, err := taskidempotency.SemanticKey(
 		companion.id,
@@ -103,10 +105,11 @@ func TestAppV23SignedOrdinaryTaskDerivesDurableAssignmentIntent(t *testing.T) {
 
 func TestAppV23RawOrdinaryKeyedTaskBindsExactAssignee(t *testing.T) {
 	app, _, companion := directAppV23GenesisTestApp(t)
+	height := activateDirectAppV24ForTest(t, app, time.Now().UTC().Add(-time.Minute))
 	const key = "raw-companion-task-v1"
 	parsed := rawAppV23TaskTx(t, companion, companion.id, key, true)
 
-	result := app.processTx(parsed, 1, time.Unix(parsed.AgentTimestamp, 0))
+	result := app.processTx(parsed, height, time.Unix(parsed.AgentTimestamp, 0))
 	require.Zero(t, result.Code, result.Log)
 	binding, err := app.badgerStore.GetAppV23TaskIdempotencyBinding(companion.id, key)
 	require.NoError(t, err)

@@ -203,6 +203,9 @@ func armConfiguredStateSync(
 	if err != nil {
 		return fmt.Errorf("authorize state sync receiver: %w", err)
 	}
+	if nodeKey == nil || authorization.JoiningNodeID() != string(nodeKey.ID()) {
+		return errors.New("state sync authorization does not match the local node identity")
+	}
 	base := resolveStateSyncPath(cfg.DataDir, stateSyncCfg.SnapshotDir, defaultStateSyncReceivingDir)
 	if rootErr := prepareStateSyncRoot(base, filepath.Join(cfg.DataDir, "badger")); rootErr != nil {
 		return rootErr
@@ -227,6 +230,8 @@ func armConfiguredStateSync(
 			cfg.DataDir,
 			filepath.Join(cfg.DataDir, "badger"),
 			offchain,
+			authorization.ChainID(),
+			nodeKey,
 			authorization.ValidatorPublicKey(),
 			authorization.AppVersion(),
 			logger,
@@ -798,6 +803,8 @@ func newStateSyncReceivePreparer(
 	dataDir string,
 	liveBadgerPath string,
 	offchain *store.SQLiteStore,
+	chainID string,
+	nodeKey *p2p.NodeKey,
 	receiverValidatorPublicKey []byte,
 	expectedAppVersion uint64,
 	logger zerolog.Logger,
@@ -836,6 +843,18 @@ func newStateSyncReceivePreparer(
 		if rosterErr := requireStateSyncReceiverNonValidatorDirectory(ctx, preparedPath, receiverValidatorPublicKey); rosterErr != nil {
 			_ = os.RemoveAll(preparedPath)
 			return nil, fmt.Errorf("prepare received app-v20 state: %w", rosterErr)
+		}
+		if baselineErr := captureStateSyncProjectionBaselinePending(
+			preparedPath,
+			dataDir,
+			chainID,
+			nodeKey,
+			receiverValidatorPublicKey,
+			metadata.Height,
+			metadata.AppHash,
+		); baselineErr != nil {
+			_ = os.RemoveAll(preparedPath)
+			return nil, fmt.Errorf("prepare received app-v20 projection baseline: %w", baselineErr)
 		}
 		journal := statesync.ActivationJournal{
 			Phase:          statesync.ActivationPrepared,
@@ -907,6 +926,16 @@ func newStateSyncReceivePreparer(
 				}
 				if err := os.RemoveAll(preparedPath); err != nil {
 					return fmt.Errorf("discard prepared state sync candidate: %w", err)
+				}
+				if err := removeMatchingStateSyncProjectionBaselinePending(
+					dataDir,
+					chainID,
+					nodeKey,
+					receiverValidatorPublicKey,
+					metadata.Height,
+					metadata.AppHash,
+				); err != nil {
+					return fmt.Errorf("discard prepared state sync projection baseline: %w", err)
 				}
 				return syncStateSyncDirectory(dataDir)
 			},

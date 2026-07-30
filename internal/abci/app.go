@@ -395,6 +395,14 @@ type SageApp struct {
 	// Buffered writes — only flushed to PostgreSQL in Commit
 	pendingWrites []pendingWrite
 
+	// canonicalProjectionAuditNeeded is set only on the speculative app when
+	// an app-v24 memory-hash reanchor executes successfully. Commit consumes
+	// it after the SQL projection and Badger consensus transaction are both
+	// durable, then nudges the process-local projection audit below. It is
+	// deliberately excluded from AppHash/state persistence: readiness is a
+	// local serving concern and SQL must never become consensus input.
+	canonicalProjectionAuditNeeded bool
+
 	// flushMaxRetries bounds the SQLITE_BUSY retry loop in Commit. Exposed
 	// as a field (not a const) so tests can shrink it to keep the panic
 	// path fast.
@@ -423,6 +431,13 @@ type SageApp struct {
 	// races Commit's read. The atomic makes that publish/read data-race-free;
 	// nil load = disabled, a no-op.
 	syncNotifier atomic.Pointer[func([]string)]
+
+	// canonicalProjectionAuditNotifier schedules a complete process-local
+	// canonical-memory projection audit after a successfully committed app-v24
+	// memory-hash reanchor. The callback must only enqueue off-consensus work:
+	// it runs after SQL + Badger durability, receives no consensus data, and
+	// its failure can never change the already-committed ABCI result.
+	canonicalProjectionAuditNotifier atomic.Pointer[func()]
 
 	// v8AppliedHeight is the block at which the v8.0 access-control fork
 	// activated. Zero means not yet activated — handlers must take the
@@ -641,6 +656,10 @@ type SageApp struct {
 	// and consensus-backed local access groups. The activation block remains
 	// under app-v22 rules and v23 semantics start strictly at H+1.
 	appV23AppliedHeight int64 // 0 => fork dormant
+	// appV24AppliedHeight gates hash-preserving terminal memory lifecycle
+	// transitions and strict content-hash binding. The activation block remains
+	// under app-v23 rules and v24 semantics start strictly at H+1.
+	appV24AppliedHeight int64 // 0 => fork dormant
 	// appV23GenesisActive is loaded only from the dedicated, AppHash-covered
 	// dual-signed genesis activation marker. It is separate from applied-height
 	// upgrades because a v23-born chain has no historical activation block.
@@ -819,6 +838,7 @@ const appV21UpgradeName = "app-v21"
 
 const appV22UpgradeName = "app-v22"
 const appV23UpgradeName = "app-v23"
+const appV24UpgradeName = "app-v24"
 
 // governanceDelegationDomainStateKey holds the stable, consensus-derived
 // domain that post-app-v20 governance authorizations must sign. It is approved
@@ -2342,6 +2362,16 @@ func NewSageApp(badgerPath string, postgresURL string, logger zerolog.Logger) (*
 		_ = bs.CloseBadger()
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV24Fork(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV24Prerequisite(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	// Reload persisted validators from BadgerDB (survives restart)
@@ -2426,6 +2456,12 @@ func NewSageAppWithStores(bs *store.BadgerStore, offchain store.OffchainStore, l
 	if invariantErr := app.validateAppV23Prerequisite(); invariantErr != nil {
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV24Fork(); invariantErr != nil {
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV24Prerequisite(); invariantErr != nil {
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	persistedVals, err := bs.LoadValidators()
@@ -2504,6 +2540,8 @@ func restoredValidatorInfo(id string, power int64) *validator.ValidatorInfo {
 // 6 <= 7, so the watchdog stops without re-proposing.
 func (app *SageApp) currentAppVersion() uint64 {
 	switch {
+	case app.appV24AppliedHeight > 0:
+		return 24 // app-v24 (hash-preserving terminal memory lifecycle) — highest gate
 	case app.appV23GenesisActive:
 		return 23 // dual-signed first-party chains are born at app-v23
 	case app.appV23AppliedHeight > 0:
@@ -2556,13 +2594,13 @@ func (app *SageApp) currentAppVersion() uint64 {
 }
 
 // maxSupportedAppVersion is the highest app version this binary has a compiled
-// fork gate for (currently app-v23). It is the readiness ceiling for upgrade
+// fork gate for (currently app-v24). It is the readiness ceiling for upgrade
 // auto-voting: a validator must never vote to activate an upgrade it cannot
 // execute — doing so would commit consensus version.app=N while the binary
 // still runs at N-1, halting the chain on the next CometBFT handshake (the
 // maxSupportedAppVersion footgun). Bump this in lockstep with every new
 // appV<N>UpgradeName fork gate added above.
-const maxSupportedAppVersion uint64 = 23
+const maxSupportedAppVersion uint64 = 24
 
 // MaxSupportedAppVersion returns the highest app version this binary has a
 // compiled fork gate for. Operator tooling (cmd/sage-gui `upgrade propose`)
@@ -2803,6 +2841,19 @@ func (app *SageApp) ActiveUpgradeVote() (proposalID string, targetVersion uint64
 		} else if _, ladderErr := app.validatePersistedAppV23PredecessorLadder(); ladderErr != nil {
 			app.logger.Warn().Err(ladderErr).Str("proposal_id", prop.ProposalID).
 				Msg("app-v23 predecessor ladder is invalid; skipping auto-vote")
+			supported = false
+		}
+	}
+	if payload.Name == appV24UpgradeName && payload.TargetAppVersion == 24 {
+		if app.currentAppVersion() != 23 {
+			app.logger.Warn().
+				Str("proposal_id", prop.ProposalID).
+				Uint64("current_app_version", app.currentAppVersion()).
+				Msg("app-v24 upgrade requires app-v23 as its immediate predecessor; skipping auto-vote")
+			supported = false
+		} else if _, predecessorErr := app.validateAppV24Predecessor(); predecessorErr != nil {
+			app.logger.Warn().Err(predecessorErr).Str("proposal_id", prop.ProposalID).
+				Msg("app-v24 predecessor is invalid; skipping auto-vote")
 			supported = false
 		}
 	}
@@ -3443,6 +3494,7 @@ func (app *SageApp) cloneForAppV20Finalize(scopedStore *store.BadgerStore) *Sage
 		appV21AppliedHeight:      app.appV21AppliedHeight,
 		appV22AppliedHeight:      app.appV22AppliedHeight,
 		appV23AppliedHeight:      app.appV23AppliedHeight,
+		appV24AppliedHeight:      app.appV24AppliedHeight,
 		appV23GenesisActive:      app.appV23GenesisActive,
 		retainBlocks:             app.retainBlocks,
 		expectedGovernanceDomain: app.expectedGovernanceDelegationDomain(),
@@ -3486,6 +3538,7 @@ func (app *SageApp) publishAppV20FinalizeLocked(clone *SageApp) {
 	app.appV21AppliedHeight = clone.appV21AppliedHeight
 	app.appV22AppliedHeight = clone.appV22AppliedHeight
 	app.appV23AppliedHeight = clone.appV23AppliedHeight
+	app.appV24AppliedHeight = clone.appV24AppliedHeight
 	app.appV23GenesisActive = clone.appV23GenesisActive
 }
 
@@ -3752,6 +3805,7 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 	// This handles single-block auto-approve (proposal created + quorum in same block).
 	var valUpdates []abcitypes.ValidatorUpdate
 	var executedProposal *governance.ProposalState
+	var invalidatedProposal *governance.ProposalState
 	var govErr error
 	postAppV20Governance := app.postAppV20Fork(req.Height)
 	freezeValidatorReconfiguration := app.appV20PendingPlanFreezesValidatorReconfiguration()
@@ -3776,20 +3830,33 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		// Governance evaluation begins in the following block, disabling the old
 		// single-block auto-approve edge for target-20.
 	} else if postAppV20Governance || freezeValidatorReconfiguration {
-		executedProposal, govErr = app.govEngine.ProcessBlockValidated(req.Height, func(proposal *governance.ProposalState) error {
-			if !isValidatorSetGovernanceOperation(proposal.Operation) {
-				return nil
-			}
-			if freezeValidatorReconfiguration && !postAppV20Governance {
-				return errors.New("validator reconfiguration is frozen while the app-v20 activation plan is pending")
-			}
-			return app.validateAppV20ValidatorOperation(
-				proposal.Operation,
-				proposal.TargetID,
-				proposal.TargetPubKey,
-				proposal.TargetPower,
-			)
-		})
+		executedProposal, invalidatedProposal, govErr = app.govEngine.ProcessBlockValidatedWithInvalidation(
+			req.Height,
+			func(proposal *governance.ProposalState) error {
+				if proposal.Operation == governance.OpMemoryHashReanchor {
+					_, err := app.validateAppV24MemoryHashReanchorProposal(
+						proposal, req.Height, true,
+					)
+					return err
+				}
+				if !isValidatorSetGovernanceOperation(proposal.Operation) {
+					return nil
+				}
+				if freezeValidatorReconfiguration && !postAppV20Governance {
+					return errors.New("validator reconfiguration is frozen while the app-v20 activation plan is pending")
+				}
+				return app.validateAppV20ValidatorOperation(
+					proposal.Operation,
+					proposal.TargetID,
+					proposal.TargetPubKey,
+					proposal.TargetPower,
+				)
+			},
+			func(proposal *governance.ProposalState, validationErr error) bool {
+				return proposal.Operation == governance.OpMemoryHashReanchor &&
+					appV24MemoryHashReanchorBusinessStateDrift(validationErr)
+			},
+		)
 	} else {
 		executedProposal, govErr = app.govEngine.ProcessBlock(req.Height)
 	}
@@ -3830,8 +3897,13 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				panic(fmt.Sprintf("sage: validated app-v20 governance proposal %s failed to apply: %v", executedProposal.ProposalID, applyErr))
 			}
 			app.logger.Error().Err(applyErr).Msg("failed to apply governance proposal")
-		} else if update != nil {
-			valUpdates = append(valUpdates, *update)
+		} else {
+			if executedProposal.Operation == governance.OpMemoryHashReanchor {
+				app.canonicalProjectionAuditNeeded = true
+			}
+			if update != nil {
+				valUpdates = append(valUpdates, *update)
+			}
 		}
 
 		// Buffer offchain status update for Commit
@@ -3841,6 +3913,20 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				ProposalID:     executedProposal.ProposalID,
 				Status:         string(governance.StatusExecuted),
 				ExecutedHeight: req.Height,
+			},
+		})
+	}
+	if invalidatedProposal != nil {
+		app.logger.Info().
+			Str("proposal_id", invalidatedProposal.ProposalID).
+			Uint8("operation", uint8(invalidatedProposal.Operation)).
+			Str("target", invalidatedProposal.TargetID).
+			Msg("governance proposal rejected after deterministic execution-state drift")
+		app.pendingWrites = append(app.pendingWrites, pendingWrite{
+			writeType: "gov_status_update",
+			data: govStatusUpdateData{
+				ProposalID: invalidatedProposal.ProposalID,
+				Status:     string(governance.StatusRejected),
 			},
 		})
 	}
@@ -3957,6 +4043,26 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				return nil, fmt.Errorf("sage: refuse app-v23 activation with invalid root state: %w", stateErr)
 			}
 		}
+		if plan.Name == appV24UpgradeName {
+			if plan.TargetAppVersion != 24 {
+				return nil, fmt.Errorf(
+					"sage: refuse malformed app-v24 activation at height %d: target_app_version=%d",
+					req.Height, plan.TargetAppVersion,
+				)
+			}
+			if current := app.currentAppVersion(); current != 23 {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v24 activation at height %d: current committed app version is %d, want 23",
+					req.Height, current,
+				)
+			}
+			if _, predecessorErr := app.validateAppV24Predecessor(); predecessorErr != nil {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v24 activation at height %d: invalid predecessor: %w",
+					req.Height, predecessorErr,
+				)
+			}
+		}
 		// Version-non-regression floor (deterministic on every replica): never
 		// commit a consensus version.app lower than the chain's current app
 		// version. app-v7 (content-validation) is an INDEPENDENT gate that can be
@@ -4050,6 +4156,9 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		}
 		if plan.Name == appV23UpgradeName {
 			app.appV23AppliedHeight = req.Height
+		}
+		if plan.Name == appV24UpgradeName {
+			app.appV24AppliedHeight = req.Height
 		}
 		if plan.Name == appV12UpgradeName {
 			app.appV12AppliedHeight = req.Height
@@ -4494,6 +4603,11 @@ func (app *SageApp) processMemorySubmit(parsedTx *tx.ParsedTx, height int64, blo
 			return &abcitypes.ExecTxResult{Code: 11, Log: "invalid memory domain: " + err.Error()}
 		}
 	}
+	if app.postAppV24Rules(height) {
+		if err := validateAppV24MemorySubmitHash(submit); err != nil {
+			return &abcitypes.ExecTxResult{Code: 11, Log: "memory submit rejected: " + err.Error()}
+		}
+	}
 	if app.postAppV20Fork(height) {
 		if err := memorytags.ValidateCanonical(submit.Tags); err != nil {
 			return &abcitypes.ExecTxResult{Code: 19, Log: "memory tags are not canonical: " + err.Error()}
@@ -4515,6 +4629,9 @@ func (app *SageApp) processMemorySubmit(parsedTx *tx.ParsedTx, height int64, blo
 		if actorErr != nil || enrollment == nil ||
 			uint8(submit.Classification) > enrollment.Clearance {
 			return appV23ControlDenied()
+		}
+		if readinessErr := app.requireAppV24ForDirectGenesisCompanion(enrollment, height); readinessErr != nil {
+			return &abcitypes.ExecTxResult{Code: 11, Log: "memory submit rejected: " + readinessErr.Error()}
 		}
 		appV23Root = root
 		appV23Role = role
@@ -5086,6 +5203,9 @@ func (app *SageApp) processCoCommitSubmit(parsedTx *tx.ParsedTx, height int64, b
 		}
 		if actorErr != nil || enrollment == nil || uint8(env.Classification) > enrollment.Clearance {
 			return appV23ControlDenied()
+		}
+		if readinessErr := app.requireAppV24ForDirectGenesisCompanion(enrollment, height); readinessErr != nil {
+			return &abcitypes.ExecTxResult{Code: 95, Log: "co-commit rejected: " + readinessErr.Error()}
 		}
 		allowed, denialCode, decisionErr := app.appV23DomainDecision(
 			parsedTx, localCredentialID, env.Domain, store.AppV23VerbWrite, height, blockTime,
@@ -5955,7 +6075,7 @@ func (app *SageApp) checkAndApplyQuorum(memoryID string, height int64, blockTime
 		// swallowed SetMemoryHash error must NOT leave us crediting a verdict (or
 		// mirroring a committed status to Postgres) for a memory whose on-chain
 		// status never actually changed. poe-drift audit finding.
-		if err := app.badgerStore.SetMemoryHash(memoryID, nil, string(memory.StatusCommitted)); err == nil {
+		if err := app.setTerminalMemoryStatus(memoryID, string(memory.StatusCommitted), height); err == nil {
 			app.logger.Info().
 				Str("memory_id", memoryID).
 				Int64("height", height).
@@ -5982,7 +6102,7 @@ func (app *SageApp) checkAndApplyQuorum(memoryID string, height int64, blockTime
 		// Without this, the memory stays "proposed" forever and the validator
 		// ticker resubmits votes every 2 seconds, flooding the chain. Same
 		// write-success gating as the committed branch above.
-		if err := app.badgerStore.SetMemoryHash(memoryID, nil, string(memory.StatusDeprecated)); err == nil {
+		if err := app.setTerminalMemoryStatus(memoryID, string(memory.StatusDeprecated), height); err == nil {
 			app.logger.Info().
 				Str("memory_id", memoryID).
 				Int64("height", height).
@@ -6312,6 +6432,10 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 			} else if scopedHash != nil {
 				resolvedHash = scopedHash
 			}
+			resolvedHash, err = app.terminalResolutionHash(challenge.MemoryID, resolvedHash, height)
+			if err != nil {
+				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + err.Error()}
+			}
 			outcome, endorseErr := app.badgerStore.EndorseChallengeV21(store.EndorseChallengeV21Input{
 				MemoryID:         challenge.MemoryID,
 				ChallengerID:     challengerID,
@@ -6484,6 +6608,10 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 			} else if scopedHash != nil {
 				resolvedHash = scopedHash
 			}
+			resolvedHash, err = app.terminalResolutionHash(challenge.MemoryID, resolvedHash, height)
+			if err != nil {
+				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + err.Error()}
+			}
 			outcome, openErr := app.badgerStore.OpenChallengeV21(store.OpenChallengeV21Input{
 				MemoryID: challenge.MemoryID, OpenerID: challengerID, Domain: domain,
 				ExecutionHeight: height, ExpectedPriorStatus: string(memory.StatusCommitted),
@@ -6576,6 +6704,10 @@ legacyChallengePolicy:
 				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + scopedErr.Error()}
 			} else if scopedHash != nil {
 				resolvedHash = scopedHash
+			}
+			resolvedHash, err = app.terminalResolutionHash(challenge.MemoryID, resolvedHash, height)
+			if err != nil {
+				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + err.Error()}
 			}
 			if err := app.badgerStore.ResolveChallenge(challenge.MemoryID, resolvedHash, string(memory.StatusDeprecated)); err != nil {
 				return &abcitypes.ExecTxResult{Code: 16, Log: err.Error()}
@@ -6722,7 +6854,7 @@ legacyChallengePolicy:
 		if err := app.badgerStore.SetMemoryHash(challenge.MemoryID, scopedHash, string(memory.StatusDeprecated)); err != nil {
 			return &abcitypes.ExecTxResult{Code: 16, Log: err.Error()}
 		}
-	} else if err := app.badgerStore.SetMemoryHash(challenge.MemoryID, nil, string(memory.StatusDeprecated)); err != nil {
+	} else if err := app.setTerminalMemoryStatus(challenge.MemoryID, string(memory.StatusDeprecated), height); err != nil {
 		return &abcitypes.ExecTxResult{Code: 16, Log: err.Error()}
 	}
 
@@ -9340,6 +9472,28 @@ func (app *SageApp) Commit(_ context.Context, req *abcitypes.RequestCommit) (*ab
 		app.snapshotScheduler.Tick(app.state.Height, app.state.AppHash)
 	}
 
+	// An app-v24 memory-hash reanchor may turn a previously quarantined SQL row
+	// canonical. Refresh the process-local serving audit only after both
+	// durability domains have committed. The callback is intentionally just a
+	// scheduler nudge; SQL inventory remains entirely off the consensus path.
+	// Recover here because a faulty local integration must never turn an
+	// already-durable governance vote into an ABCI/HTTP error.
+	if working.canonicalProjectionAuditNeeded {
+		working.canonicalProjectionAuditNeeded = false
+		if notify := app.canonicalProjectionAuditNotifier.Load(); notify != nil {
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						app.logger.Error().
+							Interface("panic", recovered).
+							Msg("canonical memory projection audit notifier panicked after commit")
+					}
+				}()
+				(*notify)()
+			}()
+		}
+	}
+
 	// v11.5 domain-sync watcher: report this block's committed memory IDs,
 	// post-flush and post-SaveState. status_update -> committed is the single
 	// choke point for every commit transition (quorum path + co-commit
@@ -9410,6 +9564,18 @@ func (app *SageApp) SetSyncNotifier(fn func([]string)) {
 		return
 	}
 	app.syncNotifier.Store(&fn)
+}
+
+// SetCanonicalProjectionAuditNotifier installs the app-v24 reanchor Commit-tail
+// hook (see the field doc). nil disables the best-effort refresh. Safe to call
+// concurrently with Commit; the notifier must enqueue process-local work and
+// must never feed SQL-derived data back into consensus.
+func (app *SageApp) SetCanonicalProjectionAuditNotifier(fn func()) {
+	if fn == nil {
+		app.canonicalProjectionAuditNotifier.Store(nil)
+		return
+	}
+	app.canonicalProjectionAuditNotifier.Store(&fn)
 }
 
 // flushPendingWrites executes all buffered writes against the given store (which
@@ -10148,6 +10314,7 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 	// voting power, cooldown, and deterministic ID remain attached to the outer
 	// signer. Direct/no-proof proposals retain the historical outer-admin rule.
 	delegated := app.postAppV20Fork(height) && isDelegatedGovernanceProof(parsedTx)
+	var delegatedAuthorizerID string
 	if delegated {
 		outerValidator, active := app.validators.GetValidator(proposerID)
 		if !active || outerValidator.Power <= 0 {
@@ -10157,6 +10324,7 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 		if proofErr != nil {
 			return &abcitypes.ExecTxResult{Code: 72, Log: "delegated governance authorizer is invalid: " + proofErr.Error()}
 		}
+		delegatedAuthorizerID = authorizerID
 		if !app.isGlobalAdminAgent(authorizerID, height) {
 			return &abcitypes.ExecTxResult{Code: 72, Log: "only admin agents can authorize governance proposals"}
 		}
@@ -10167,6 +10335,35 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 	}
 	// Keep the two branches separate: an outer validator that also happens to be
 	// admin must never bypass validation of its distinct embedded operator.
+
+	// app-v24: op 9 is a Root-authorized, explicitly voted repair of the exact
+	// app-v23 terminal-hash regression population. It is unknown before H+1,
+	// requires key separation between the current Root credential and an active
+	// validator outer signer, binds TargetID to the canonical payload, and checks
+	// present eligibility now as well as immediately before quorum execution.
+	if op == governance.OpMemoryHashReanchor {
+		if !app.postAppV24Rules(height) {
+			return &abcitypes.ExecTxResult{Code: 72, Log: fmt.Sprintf("governance propose: unknown operation %d", op)}
+		}
+		if !delegated {
+			return &abcitypes.ExecTxResult{Code: 72, Log: "governance propose: OpMemoryHashReanchor requires the current Root credential delegated through an active validator"}
+		}
+		if authorizerErr := app.requireCurrentRootMemoryHashReanchorAuthorizer(
+			delegatedAuthorizerID,
+		); authorizerErr != nil {
+			return &abcitypes.ExecTxResult{Code: 72, Log: "governance propose: " + authorizerErr.Error()}
+		}
+		if _, reanchorErr := app.validateAppV24MemoryHashReanchorFields(
+			gp.TargetID,
+			gp.TargetPubKey,
+			gp.TargetPower,
+			gp.Payload,
+			height,
+			true,
+		); reanchorErr != nil {
+			return &abcitypes.ExecTxResult{Code: 72, Log: "governance propose: invalid OpMemoryHashReanchor: " + reanchorErr.Error()}
+		}
+	}
 
 	// app-v8: OpUpgrade proposals must NOT be creatable on the generic gov path —
 	// they would bypass processUpgradePropose's canonical-name + regression +
@@ -10216,7 +10413,8 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 			case governance.OpDomainReassign,
 				governance.OpMemoryDomainRepair,
 				governance.OpSyncGroupAction,
-				governance.OpScopeAction:
+				governance.OpScopeAction,
+				governance.OpMemoryHashReanchor:
 				// Each known non-validator operation has its own validation and/or
 				// intentionally inert attestation semantics.
 			case governance.OpUpgrade:
@@ -10227,11 +10425,22 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 		}
 	}
 
-	proposalID, propErr := app.govEngine.Propose(
-		proposerID, op, gp.TargetID, gp.TargetPubKey,
-		gp.TargetPower, gp.ExpiryBlocks, gp.Reason, height,
-		gp.Payload,
-	)
+	autoVote := op != governance.OpMemoryHashReanchor
+	var proposalID string
+	var propErr error
+	if autoVote {
+		proposalID, propErr = app.govEngine.Propose(
+			proposerID, op, gp.TargetID, gp.TargetPubKey,
+			gp.TargetPower, gp.ExpiryBlocks, gp.Reason, height,
+			gp.Payload,
+		)
+	} else {
+		proposalID, propErr = app.govEngine.ProposeWithoutAutoVote(
+			proposerID, op, gp.TargetID, gp.TargetPubKey,
+			gp.TargetPower, gp.ExpiryBlocks, gp.Reason, height,
+			gp.Payload,
+		)
+	}
 	if propErr != nil {
 		return &abcitypes.ExecTxResult{Code: 73, Log: "governance propose failed: " + propErr.Error()}
 	}
@@ -10263,16 +10472,20 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 		},
 	})
 
-	// Buffer the auto-vote for Commit.
-	app.pendingWrites = append(app.pendingWrites, pendingWrite{
-		writeType: "gov_vote",
-		data: govVoteData{
-			ProposalID:  proposalID,
-			ValidatorID: proposerID,
-			Decision:    "accept",
-			Height:      height,
-		},
-	})
+	if autoVote {
+		// Historical operations retain their proposal-time auto-vote and
+		// matching off-chain projection. OpMemoryHashReanchor deliberately
+		// records neither until a validator submits an explicit GovVote.
+		app.pendingWrites = append(app.pendingWrites, pendingWrite{
+			writeType: "gov_vote",
+			data: govVoteData{
+				ProposalID:  proposalID,
+				ValidatorID: proposerID,
+				Decision:    "accept",
+				Height:      height,
+			},
+		})
+	}
 
 	return &abcitypes.ExecTxResult{Code: 0, Log: "proposal created: " + proposalID}
 }
@@ -10515,6 +10728,17 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 			return fmt.Errorf("app-v23 upgrade has invalid predecessor ladder: %w", ladderErr)
 		}
 	}
+	if p.Name == appV24UpgradeName {
+		if p.TargetAppVersion != 24 {
+			return fmt.Errorf("app-v24 upgrade has target version %d, want 24", p.TargetAppVersion)
+		}
+		if current := app.currentAppVersion(); current != 23 {
+			return fmt.Errorf("app-v24 upgrade requires current app version 23, got %d", current)
+		}
+		if _, predecessorErr := app.validateAppV24Predecessor(); predecessorErr != nil {
+			return fmt.Errorf("app-v24 upgrade has invalid predecessor: %w", predecessorErr)
+		}
+	}
 
 	// Execution-height regression re-guard: the chain's committed app version
 	// may have advanced (another upgrade activated) between propose and quorum.
@@ -10657,6 +10881,20 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 		if _, ladderErr := app.validatePersistedAppV23PredecessorLadder(); ladderErr != nil {
 			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
 				"upgrade propose: app-v23 predecessor ladder is invalid: %v", ladderErr)}
+		}
+	}
+	if prop.Name == appV24UpgradeName {
+		if prop.TargetAppVersion != 24 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v24 requires target_app_version 24 (got %d)", prop.TargetAppVersion)}
+		}
+		if current := app.currentAppVersion(); current != 23 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v24 requires current committed app version 23 (got %d)", current)}
+		}
+		if _, predecessorErr := app.validateAppV24Predecessor(); predecessorErr != nil {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v24 predecessor is invalid: %v", predecessorErr)}
 		}
 	}
 
@@ -11269,6 +11507,13 @@ func (app *SageApp) applyGovernanceProposal(proposal *governance.ProposalState, 
 		return nil, app.applyMemoryDomainRepair(proposal, height)
 	}
 
+	// app-v24: the repair target is a domain-separated payload digest, not a
+	// validator key. Dispatch before target-pubkey derivation and retain op 9's
+	// historical unknown-operation behavior before the strict H+1 boundary.
+	if proposal.Operation == governance.OpMemoryHashReanchor && app.postAppV24Rules(height) {
+		return nil, app.applyMemoryHashReanchor(proposal, height)
+	}
+
 	// app-v20: quorum execution directly installs the exact scope record voted
 	// on by validators. Dispatch before validator pubkey derivation because the
 	// TargetID is a scope ID, not an Ed25519 key. Before the fork op==8 retains
@@ -11501,6 +11746,8 @@ func opToString(op governance.ProposalOp) string {
 		return "memory_domain_repair"
 	case governance.OpScopeAction:
 		return "scope_action"
+	case governance.OpMemoryHashReanchor:
+		return appV24MemoryHashReanchorOperationName
 	default:
 		return fmt.Sprintf("unknown_%d", op)
 	}
@@ -11511,6 +11758,9 @@ func opToString(op governance.ProposalOp) string {
 // though the upgraded binary knows the future operation name.
 func (app *SageApp) governanceOperationName(op governance.ProposalOp, height int64) string {
 	if op == governance.OpScopeAction && !app.postAppV20Fork(height) {
+		return fmt.Sprintf("unknown_%d", op)
+	}
+	if op == governance.OpMemoryHashReanchor && !app.postAppV24Rules(height) {
 		return fmt.Sprintf("unknown_%d", op)
 	}
 	return opToString(op)

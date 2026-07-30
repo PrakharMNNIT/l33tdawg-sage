@@ -741,6 +741,9 @@ func (s *Server) handleGetPending(w http.ResponseWriter, r *http.Request) {
 					agentID, rec, now,
 				)
 				if disclosureErr != nil {
+					if isUnsafeAppV23Projection(disclosureErr) {
+						continue
+					}
 					writeProblem(w, http.StatusServiceUnavailable, "Authorization unavailable",
 						"Pending-memory authorization state is unavailable; retry later.")
 					return

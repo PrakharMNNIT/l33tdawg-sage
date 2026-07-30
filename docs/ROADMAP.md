@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-07):** **v11.15.1 is the current release line.** Governed app-v23 replaces raw capability-bit administration with Member, Manager, and Admin roles plus consensus Access Groups, named security profiles, and classification clearance. CEREBRUM Root is a hidden singleton authority with a dedicated credential-handover ceremony; rotation preserves operational access to Root-owned domains without rewriting historical memory authorship or chain history. Federated agents are linked readers only and can never become local group members or receive remote Write, Copy, Modify, claim, ownership, role, grant, or governance authority. Fresh first-party Mynah / SAGE Voice Bridge nodes atomically receive their reviewed companion profile and owned home domain before readiness, while unrelated self-registrations remain pending review. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 replay and state-sync checks, and the native-shell productization bridge now spans v11.11–v11.15.
+**Status (2026-07):** **v11.16.0 is the current release line.** Governed app-v23 replaces raw capability-bit administration with Member, Manager, and Admin roles plus consensus Access Groups, named security profiles, and classification clearance. App-v24 adds exact memory content-hash binding, hash-preserving terminal transitions, and a governed historical re-anchor without rewriting content or chain history. CEREBRUM Root is a hidden singleton authority with a dedicated credential-handover ceremony; rotation preserves operational access to Root-owned domains without rewriting historical memory authorship or chain history. Federated agents are linked readers only and can never become local group members or receive remote Write, Copy, Modify, claim, ownership, role, grant, or governance authority. Fresh first-party Mynah / SAGE Voice Bridge nodes atomically receive their reviewed companion profile and owned home domain, then remain fail-closed until app-v24 is active for their next write; unrelated self-registrations remain pending review. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23/app-v24 replay and state-sync checks, and the native-shell productization bridge now spans v11.11–v11.16.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -276,7 +276,7 @@ without a manual repair; generic new keys remain safely pending review.
 
 ---
 
-## v11.16 - planned (agent message delivery and read receipts)
+## Post-v11.16 - planned (agent message delivery and read receipts)
 
 Consolidate pipe, inbox, sent results, and status into one agent-only
 **Messages** service model with idempotent send, explicit idempotent receive,

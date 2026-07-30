@@ -1,10 +1,10 @@
-<!-- Reconciled through SAGE v11.15.1. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.16.0. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
 ## Authentication
 
-Most core `/v1/*` REST endpoints require Ed25519 request signing (`api/rest/middleware/auth.go:81-213`). Public and alternate-auth exceptions include `GET /v1/agents`, health/readiness routes, OAuth discovery/flows, and the HTTP MCP transports (`/v1/mcp/sse`, `/v1/mcp/messages`, `/v1/mcp/streamable`), which use MCP bearer-token/OAuth authentication.
+Most core `/v1/*` REST endpoints require Ed25519 request signing (`api/rest/middleware/auth.go:81-213`). Public and alternate-auth exceptions include health/readiness routes, OAuth discovery/flows, and the HTTP MCP transports (`/v1/mcp/sse`, `/v1/mcp/messages`, `/v1/mcp/streamable`), which use MCP bearer-token/OAuth authentication.
 
 | Header | Format | Purpose |
 |---|---|---|
@@ -152,7 +152,7 @@ new request valid.
 
 | `reason_code` | Effective cause | Exact `remedy` |
 |---|---|---|
-| `missing_write_grant` | No effective level-2 write grant | Submit to a domain this agent owns. If shared management is intended, a local Root/Admin can approve the agent as a Manager and place it in an Access Group covering the target domain. v11.15.0 has no direct level-2 grant editor. |
+| `missing_write_grant` | No effective level-2 write grant | Submit to a domain this agent owns. If shared management is intended, a local Root/Admin can approve the agent as a Manager and place it in an Access Group covering the target domain. v11.16.0 has no direct level-2 grant editor. |
 | `foreign_write_restricted` | The effective named profile includes the deny-foreign-write restriction (app-v22 bit 8) | Assign a write-compatible named profile that permits foreign-domain writes, or submit to a domain this agent owns. |
 | `shared_write_restricted` | The effective named profile includes the deny-shared-write restriction (app-v22 bit 2) | Submit to the agent's owned non-shared home domain, or assign a named profile that permits shared-domain writes. |
 | `domain_claim_restricted` | The effective named profile includes the deny-domain-claim restriction (app-v22 bit 4) | Submit to a domain this agent already owns, or ask a local administrator to assign or reassign a non-shared domain; this profile cannot claim an unowned domain. |
@@ -692,7 +692,13 @@ Returns 503 if not configured on this node.
 
 ### `GET /v1/agents`
 
-List all registered agents. **No auth required.**
+Signed local roster. After app-v23 the caller must be an active ordinary local
+agent and the response contains only active ordinary canonical enrollments.
+Root, historical Root credentials, pending/inactive agents, and inconsistent
+SQL-only rows are excluded. The old unsigned full-roster endpoint was removed
+in v11.16 because it exposed local RBAC/network topology and bypassed
+caller-scoped recipient discovery. MCP clients should normally use the more
+efficient signed `GET /v1/agents/lookup` route.
 
 **Response** (HTTP 200): `{"agents": [...AgentEntry], "total": N}`
 
@@ -700,7 +706,10 @@ List all registered agents. **No auth required.**
 
 ### `GET /v1/agents/lookup`
 
-Signed, bounded human-name lookup for MCP recipient discovery. `name` is
+Signed, bounded human-name lookup for MCP recipient discovery. After app-v23
+the signed caller must be an active ordinary local agent; Root, historical Root
+credentials, pending/inactive agents, and inconsistent enrollments are
+rejected by the same boundary as pipeline resolve/send/inbox. `name` is
 required (1–512 bytes) and performs a literal substring match over active,
 non-removed agents' display name, immutable registered name, and provider.
 ASCII matching is case-insensitive; non-ASCII code points require their
@@ -708,10 +717,16 @@ registered casing. Exact field matches rank before partial matches, so `mynah`
 can resolve `MYNAH (SAGE Voice Bridge Agent)` without making `%` or `_` act as
 wildcards. `limit` defaults to 20 and is 1–20. It returns the same sanitized
 agent fields as the public roster, but uses a capped metadata projection rather
-than enumerating the roster or deriving memory counts. SQLite and PostgreSQL
-implement the same lookup contract.
+than enumerating the roster or deriving memory counts. Each row also carries
+`match_kind` (`exact` or `substring`), which is the server-owned match decision
+consumed by MCP. SQLite status alone is not enough after app-v23: each target
+must still be an active, internally consistent ordinary consensus enrollment.
+Local pipeline discovery is intentionally independent of memory clearance;
+finding or messaging an agent delegates no memory authority. SQLite and
+PostgreSQL implement the same bounded candidate contract.
 
-**Response** (HTTP 200): `{"agents": [...AgentEntry], "total": N}`
+**Response** (HTTP 200):
+`{"agents": [{...AgentEntry, "match_kind":"exact|substring"}], "total": N}`
 
 ---
 
@@ -1027,10 +1042,10 @@ Grant domain access. Caller must own the domain or be admin. Broadcasts `TxTypeA
 **Historical CEREBRUM access matrix (v11.3–v11.14):** Saving the
 per-agent Domain Access matrix issued real `AccessGrant`/`AccessRevoke`
 transactions through this consensus path. App-v23 retires that matrix from the
-live Access Controls page in v11.15.0, so documentation and typed denials must
+live Access Controls page in v11.15+, so documentation and typed denials must
 not direct an operator to a nonexistent level-2 editor. The low-level consensus
 grant/revoke routes remain documented here for compatible clients; the shipped
-v11.15 CEREBRUM actions are owned-home-domain policy and, where shared
+v11.16 CEREBRUM actions are owned-home-domain policy and, where shared
 management is intended, Root/Admin-approved Manager Access Groups.
 
 ---
@@ -2142,7 +2157,8 @@ authorization to take a recovery action.
 `sage_turn` polls this route and returns actionable `pipe_delivery_updates`.
 
 Successful delivery and receiver claim/read receipts are deliberately not
-exposed in v11.15.0; that sender-queryable receipt state is deferred to v11.16.
+exposed in v11.16.0; that sender-queryable receipt state is deferred beyond
+v11.16.
 The local `/v1/pipe/{pipe_id}` workflow row and a clean inbox must not be
 presented as evidence that a remote recipient received or read a message.
 
@@ -2188,6 +2204,14 @@ provider, and any required v11.9 scoped serving projection. No auth.
     "rebuilt": 42,
     "detail": ""
   },
+  "memory_projection": {
+    "checked": true,
+    "required": true,
+    "ok": true,
+    "state": "exact",
+    "legacy_compatible": false,
+    "quarantined": false
+  },
   "embedder": {
     "checked": true,          // false until the watchdog's first probe
     "ok": true,
@@ -2202,8 +2226,11 @@ provider, and any required v11.9 scoped serving projection. No auth.
 Status semantics:
 - `not_ready` → **HTTP 503**: core infrastructure (store or CometBFT) is down,
   or canonical scoped envelopes exist but the local SQL serving projection is
-  locked, incomplete, or failed verification. A locked SQLite vault retries the
-  scoped rebuild after unlock.
+  locked, incomplete, or failed verification. The app-v23
+  `memory_projection` independently verifies the full ordinary-memory
+  Badger inventory against SQL; a missing, rolled-back, SQL-only, or tampered
+  row is quarantined instead of being reported as an empty brain. A locked
+  SQLite vault retries projection verification after unlock.
 - `degraded` → **HTTP 200** by default: core is up but a *semantic* embedder has been
   probed and is unreachable, so hybrid/semantic recall has dropped to keyword-only.
   The node still serves. Pass `?strict=1` to make this a **503** for gates that
@@ -2211,6 +2238,20 @@ Status semantics:
 - `ready` → **HTTP 200**: everything healthy. A hash (non-semantic) provider is
   `ready` — non-semantic is a capability, not a fault. An embedder not yet probed is
   also `ready`.
+
+`memory_projection.state` is `exact` for a complete projection,
+`legacy_compatible` for a complete projection containing only the explicitly
+supported historical terminal hashless shape, and `canonical_subset` for a
+verified state-sync receiver. The subset baseline is bound to that receiver's
+chain, node key, validator key, and canonical height/AppHash; its exact omission
+set is signed by the receiver node key before normal serving begins. The file
+must remain in the receiver's non-group/world-writable data directory. It permits
+only the exact historical IDs whose ordinary plaintext was absent at the sealed
+snapshot. Later memories are still mandatory. A subset node cannot use the portable full-brain dashboard
+export because labeling a partial local projection as a complete backup would
+be unsafe. A receiver completed before v11.16 without this exact baseline
+remains fail-closed until the operator explicitly repairs or repeats state sync;
+startup never infers an allowlist from the receiver's current SQL contents.
 
 The embedder status is refreshed by a ~30s background watchdog (see the node's
 `startEmbedderWatchdog`).

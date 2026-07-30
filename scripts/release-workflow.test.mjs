@@ -175,8 +175,8 @@ test('native shell evidence is version-locked, private, and cannot promote an un
   assert.match(evidence, /SAGE_DAEMON_VERSION/);
   assert.match(
     daemonStager,
-    /SEMVER_PATTERN='\^11\\\.\(10\|11\|12\|13\|14\|15\)\\\./,
-    'the tagged daemon stager must accept the current v11.15 release series',
+    /SEMVER_PATTERN='\^11\\\.\(10\|11\|12\|13\|14\|15\|16\)\\\./,
+    'the tagged daemon stager must accept the current v11.16 release series',
   );
   assert.match(evidence, /Repair v11\.12\.0 native staging helper for immutable-tag recovery/);
   assert.match(evidence, /github\.event_name == 'workflow_dispatch'.*RELEASE_TAG == 'v11\.12\.0'/);
@@ -344,29 +344,128 @@ test('the Linux cold gate proves the closed placeholder through the real Comet d
   assert.doesNotMatch(v119StateSync, /busybox nslookup provider-p2p/);
 });
 
-test('the mandatory cold gate transfers one exact app-v23 session', () => {
+test('the mandatory cold gate transfers one exact app-v24 session', () => {
   assert.match(
     faultWorkflow,
-    /name: App-v23 real Comet\/ABCI crash, partition, and state-sync gate/,
+    /name: App-v24 real Comet\/ABCI crash, partition, and state-sync gate/,
   );
-  assert.match(v119StateSync, /"app_version": 23/);
-  assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21|22)/);
-  assert.match(v119StateSync, /wait_app_version "\$\{PROVIDER\}" 23/);
+  assert.match(v119StateSync, /^TARGET_APP_VERSION=24$/m);
+  assert.match(v119StateSync, /"app_version": \$\{TARGET_APP_VERSION\}/);
+  assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21|22|23)/);
   assert.match(
     v119StateSync,
-    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" 23 "\$\{pre_publish_evidence\}"/,
+    /wait_app_version "\$\{PROVIDER\}" "\$\{TARGET_APP_VERSION\}"/,
   );
-  assert.match(v119StateSync, /\[ "\$\{receiver_app_version\}" != 23 \]/);
-  assert.match(v119StateSync, /\[ "\$\{success_receiver_app_version\}" != 23 \]/);
+  assert.match(
+    v119StateSync,
+    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" "\$\{TARGET_APP_VERSION\}" "\$\{pre_publish_evidence\}"/,
+  );
+  assert.match(
+    v119StateSync,
+    /\[ "\$\{receiver_app_version\}" != "\$\{TARGET_APP_VERSION\}" \]/,
+  );
+  assert.match(
+    v119StateSync,
+    /\[ "\$\{success_receiver_app_version\}" != "\$\{TARGET_APP_VERSION\}" \]/,
+  );
   assert.equal(
-    (v119StateSync.match(/\[ "\$\{provider_app_version\}" != 23 \]/g) || []).length,
+    (
+      v119StateSync.match(
+        /\[ "\$\{provider_app_version\}" != "\$\{TARGET_APP_VERSION\}" \]/g,
+      ) || []
+    ).length,
     2,
   );
-  assert.match(v119StateSync, /\[ "\$\{post_restart_provider_version\}" != 23 \]/);
-  assert.match(v119StateSync, /\[ "\$\{post_restart_receiver_version\}" != 23 \]/);
+  assert.match(
+    v119StateSync,
+    /\[ "\$\{post_restart_provider_version\}" != "\$\{TARGET_APP_VERSION\}" \]/,
+  );
+  assert.match(
+    v119StateSync,
+    /\[ "\$\{post_restart_receiver_version\}" != "\$\{TARGET_APP_VERSION\}" \]/,
+  );
   assert.match(
     stateSyncRuntime,
     /Uint64\("app_version", expectedAppVersion\)[\s\S]*?Msg\("authorized state-sync session assembled and exact-version candidate verified"\)/,
+  );
+});
+
+test('the cold gate pins and exercises two independent RPC origins without trusting Docker DNS', () => {
+  const writeReceivingConfig = shellFunction(v119StateSync, 'write_receiving_config');
+  const networkAddress = shellFunction(v119StateSync, 'rpc_network_ipv4');
+  const remoteCommit = shellFunction(v119StateSync, 'remote_rpc_commit_hash');
+  const remoteValidators = shellFunction(v119StateSync, 'remote_rpc_validator_count');
+  const originProof = shellFunction(v119StateSync, 'assert_remote_rpc_origins');
+
+  assert.match(writeReceivingConfig, /local provider_rpc_url=\$7/);
+  assert.match(writeReceivingConfig, /local observer_rpc_url=\$8/);
+  assert.match(writeReceivingConfig, /- "\$\{provider_rpc_url\}"/);
+  assert.match(writeReceivingConfig, /- "\$\{observer_rpc_url\}"/);
+  assert.doesNotMatch(writeReceivingConfig, /provider-rpc:26657|observer-rpc:26657/);
+  assert.match(networkAddress, /ipaddress\.ip_address\(raw\)/);
+  assert.match(networkAddress, /address\.version != 4 or address\.is_unspecified/);
+  assert.match(v119StateSync, /\[ "\$\{provider_rpc_ip\}" = "\$\{observer_rpc_ip\}" \]/);
+  assert.match(remoteCommit, /--post-data=/);
+  assert.match(remoteCommit, /\\"method\\":\\"commit\\"/);
+  assert.match(remoteCommit, /"\$\{rpc_url\}\/"/);
+  assert.match(remoteValidators, /\\"method\\":\\"validators\\"/);
+  assert.match(originProof, /"\$\{snapshot\}" "\$\(\(snapshot \+ 1\)\)" "\$\(\(snapshot \+ 2\)\)"/);
+  assert.match(originProof, /wait_remote_rpc_light_height "\$\{container\}" provider/);
+  assert.match(originProof, /wait_remote_rpc_light_height "\$\{container\}" observer/);
+  assert.equal(
+    (v119StateSync.match(/assert_remote_rpc_origins "\$\{[^}]+\}"/g) || []).length,
+    2,
+  );
+});
+
+test('the cold gate freezes its serving provider before advertising the old snapshot', () => {
+  const servingConfig = shellFunction(v119StateSync, 'write_provider_serving_config');
+  const quiescence = shellFunction(v119StateSync, 'wait_height_quiescent');
+
+  assert.match(servingConfig, /voter:\n  enabled: false/);
+  assert.match(quiescence, /SECONDS - stable_since/);
+  assert.match(v119StateSync, /latest_height=\$\(wait_height_quiescent "\$\{PROVIDER\}" 12\)/);
+  assert.equal(
+    (v119StateSync.match(/"\$\{provider_serving_height\}" != "\$\{latest_height\}"/g) || []).length,
+    2,
+  );
+  assert.equal(
+    (v119StateSync.match(/"\$\{observer_serving_height\}" != "\$\{latest_height\}"/g) || []).length,
+    2,
+  );
+});
+
+test('the cold gate secures pristine data roots for the signed app-v24 projection baseline', () => {
+  const initCometHome = shellFunction(v119StateSync, 'init_pristine_comet_home');
+  const copyGenesis = shellFunction(v119StateSync, 'copy_provider_genesis');
+  const secureDataDir = shellFunction(v119StateSync, 'secure_fixture_data_dir');
+
+  assert.match(
+    v119StateSync,
+    /ABCI_RUNTIME_IDENTITY=\$\(docker run --rm --pull never --network none[\s\S]*?"\$\(id -u\)" "\$\(id -g\)"/,
+  );
+  assert.match(
+    secureDataDir,
+    /"\$\{OBSERVER_HOME\}"\|"\$\{RECEIVER_HOME\}"\|"\$\{SUCCESS_RECEIVER_HOME\}"\|"\$\{ATTACKER_HOME\}"/,
+  );
+  assert.match(secureDataDir, /\[ ! -d "\$\{home\}\/data" \] \|\| \[ -L "\$\{home\}\/data" \]/);
+  assert.match(secureDataDir, /chown "\$1:\$2" \/fixture-data; chmod 0700 \/fixture-data/);
+  assert.match(secureDataDir, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
+  assert.match(initCometHome, /chown -R "\$1:\$2" \/cometbft/);
+  assert.match(initCometHome, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
+  assert.match(copyGenesis, /chown "\$1:\$2" \/target\/genesis\.json/);
+  assert.match(copyGenesis, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
+  assert.doesNotMatch(initCometHome, /100:101/);
+  assert.doesNotMatch(copyGenesis, /100:101/);
+  assert.doesNotMatch(secureDataDir, /100:101/);
+  assert.match(secureDataDir, /stat -c '%u:%g:%a' \/fixture-data/);
+  assert.match(
+    secureDataDir,
+    /"\$\{state\}" != "\$\{ABCI_RUNTIME_UID\}:\$\{ABCI_RUNTIME_GID\}:700"/,
+  );
+  assert.match(
+    v119StateSync,
+    /copy_provider_genesis "\$\{home\}"\n  secure_fixture_data_dir "\$\{home\}"/,
   );
 });
 
@@ -377,12 +476,12 @@ test('the mandatory cold gate fails closed unless every seed reports its exact s
   assert.match(seedMemories, /lines\[-1\] != summary/);
   assert.match(seedMemories, /matches\[0\] != summary/);
   assert.doesNotMatch(seedMemories, />\/dev\/null/);
-  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v23\.txt 1/);
+  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v24\.txt 1/);
   assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/advance\.txt 2/);
   assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/restart\.txt 1/);
   assert.match(
     v119StateSync,
-    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v23\.txt 1\nwait_height_at_least/,
+    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v24\.txt 1\nwait_height_at_least/,
   );
   assert.match(
     v119StateSync,
@@ -395,16 +494,16 @@ test('the mandatory cold gate fails closed unless every seed reports its exact s
 });
 
 test('the real-process state-sync gate preserves Root semantics without promoting receiver keys', () => {
-  const rootAssertion = shellFunction(v119StateSync, 'assert_appv23_root_semantics');
+  const rootAssertion = shellFunction(v119StateSync, 'assert_root_semantics');
   assert.match(rootAssertion, /provider\[:4\] != receiver\[:4\]/);
   assert.match(rootAssertion, /receiver\[4\] in receiver\[:2\]/);
   assert.match(
     v119StateSync,
-    /assert_appv23_root_semantics "\$\{PROVIDER\}" "\$\{RECEIVER\}"/,
+    /assert_root_semantics "\$\{PROVIDER\}" "\$\{RECEIVER\}"/,
   );
   assert.match(
     v119StateSync,
-    /assert_appv23_root_semantics "\$\{PROVIDER\}" "\$\{SUCCESS_RECEIVER\}"/,
+    /assert_root_semantics "\$\{PROVIDER\}" "\$\{SUCCESS_RECEIVER\}"/,
   );
   assert.match(v119StateSyncFixture, /case "appv23-root-state":/);
   assert.match(v119StateSyncFixture, /state\.PrincipalID/);
