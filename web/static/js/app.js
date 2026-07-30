@@ -1,7 +1,7 @@
 // CEREBRUM — Your SAGE Brain
 import { SSEClient } from './sse.js';
 import { fetchStats, fetchGraph, fetchMemories, deleteMemory, updateMemory, fetchHealth, fetchValidators, fetchScopes, fetchMcpConfig, checkAuth, login, recoverVault, lockSession, importMemories, importPreview, importConfirm, fetchCleanupSettings, saveCleanupSettings, runCleanup, fetchAgents, fetchAppV23Access, updateAppV23AgentPolicy, putAppV23AccessGroup, deleteAppV23AccessGroup, fetchAppV23LinkedReaders, fetchAppV23LinkedReaderIdentities, checkAppV23LinkedReaderEligibility, mutateAppV23LinkedReader, fetchAppV23LinkedMessageConsent, fetchAppV23RemoteHostedMessageCandidates, putAppV23LinkedMessageConsent, fetchAgent, createAgent, updateAgent, removeAgent, downloadBundle, fetchTemplates, fetchRedeployStatus, startRedeploy, createPairingCode, rotateAgentKey, handoverRootCredential, fetchBootInstructions, saveBootInstructions, fetchLedgerStatus, enableLedger, changeLedgerPassphrase, disableLedger, fetchTags, fetchMemoryTags, setMemoryTags, fetchAutostart, setAutostart, checkForUpdate, applyUpdate, restartServer, fetchReranker, saveReranker, testReranker, detectReranker, fetchOnboarding, saveOnboarding,
-rerankerSetupStatus, rerankerSetupDownload, rerankerSetupStart, rerankerSetupStop, rerankerSetupInstallEngine, fetchTasks, updateTaskStatus, reorderTasks, createTask, assignTask, fetchUnregisteredAgents, mergeAgent, fetchRecallSettings, saveRecallSettings, fetchAgentDomains, reassignDomainOwnership, bulkUpdateMemories, fetchMemoryMode, saveMemoryMode, fetchPipeline, fetchPipelineStats, sendPipelineNote, fetchGovProposals, fetchGovProposalDetail, submitGovProposal, submitGovVote, wizardCheckCloudflared, wizardInstallCloudflared, wizardStartLogin, wizardLoginStatus, wizardCreateTunnel, wizardMintToken, connectProvider, connectRemoteUrl, fetchUpdateStatus, selectEmbeddingProvider,
+rerankerSetupStatus, rerankerSetupDownload, rerankerSetupStart, rerankerSetupStop, rerankerSetupInstallEngine, fetchTasks, updateTaskStatus, reorderTasks, createTask, assignTask, fetchUnregisteredAgents, mergeAgent, fetchRecallSettings, saveRecallSettings, fetchAgentDomains, reassignDomainOwnership, bulkUpdateMemories, fetchMemoryMode, saveMemoryMode, fetchPipeline, fetchPipelineStats, sendPipelineNote, fetchGovProposals, fetchGovProposalDetail, submitGovProposal, submitGovVote, fetchMemoryReanchorPlan, wizardCheckCloudflared, wizardInstallCloudflared, wizardStartLogin, wizardLoginStatus, wizardCreateTunnel, wizardMintToken, connectProvider, connectRemoteUrl, fetchUpdateStatus, selectEmbeddingProvider,
 embeddingsStatus, checkOllamaEmbed, installOllamaRuntime, startOllamaRuntime, pullEmbedModel, reembedMemories, reembedProgress, enableSemanticEmbeddings,
 deprecateUnreadable, getRecoveryKey, confirmRecoveryKeyBackup, recoverOrphansPreview, recoverOrphans,
 joinHostInterfaces, enableNetworkMode, joinHostStart, joinHostStatus, joinHostApprove, joinHostAbort,
@@ -9448,6 +9448,9 @@ function NetworkPage({ sse, accessMode = false }) {
 	const [govScopes, setGovScopes] = useState([]);
     const [currentHeight, setCurrentHeight] = useState(0);
     const govPollRef = useRef(null);
+    const [memoryRepairPlan, setMemoryRepairPlan] = useState(null);
+    const [memoryRepairError, setMemoryRepairError] = useState('');
+    const [memoryRepairSubmitting, setMemoryRepairSubmitting] = useState(false);
 
     const loadAgents = useCallback(async () => {
         try {
@@ -9492,12 +9495,32 @@ function NetworkPage({ sse, accessMode = false }) {
         } catch (e) { /* governance endpoint may not exist yet */ }
     }, []);
 
+    const loadMemoryRepairPlan = useCallback(async () => {
+        try {
+            const plan = await fetchMemoryReanchorPlan();
+            setMemoryRepairPlan(plan);
+            setMemoryRepairError('');
+        } catch (e) {
+            // Non-Root operators and pre-app-v24 nodes must not see a control
+            // they cannot authorize. Root-visible attestation failures remain
+            // explicit instead of pretending the projection is healthy.
+            if (e?.status === 401 || e?.status === 403 || e?.status === 409) {
+                setMemoryRepairPlan(null);
+                setMemoryRepairError('');
+                return;
+            }
+            setMemoryRepairPlan(null);
+            setMemoryRepairError(e?.message || 'Local memory attestation is unavailable.');
+        }
+    }, []);
+
     useEffect(() => {
         loadAgents();
 		loadScopeValidators();
 		loadGovScopes();
         loadUnregistered();
         loadGovProposals();
+        loadMemoryRepairPlan();
         fetchStats().then(data => {
             if (data?.by_domain) setAllDomains(Object.keys(data.by_domain).sort());
         }).catch(() => {});
@@ -9543,13 +9566,14 @@ function NetworkPage({ sse, accessMode = false }) {
                         loadGovProposals();
 						loadScopeValidators();
 						loadGovScopes();
+                        loadMemoryRepairPlan();
                     }
                 }
                 if (health?.chain?.block_height) setCurrentHeight(Number(health.chain.block_height));
             } catch (e) { /* ignore polling errors */ }
         }, 3000);
         return () => { if (govPollRef.current) { clearInterval(govPollRef.current); govPollRef.current = null; } };
-	}, [activeProposal?.proposal_id, loadGovProposals, loadScopeValidators, loadGovScopes]);
+	}, [activeProposal?.proposal_id, loadGovProposals, loadScopeValidators, loadGovScopes, loadMemoryRepairPlan]);
 
     // SSE governance events — auto-refresh on governance activity
     useEffect(() => {
@@ -9558,12 +9582,13 @@ function NetworkPage({ sse, accessMode = false }) {
             loadGovProposals();
 			loadScopeValidators();
 			loadGovScopes();
+            loadMemoryRepairPlan();
             fetchHealth().then(h => {
                 if (h?.chain?.block_height) setCurrentHeight(Number(h.chain.block_height));
             }).catch(() => {});
         });
         return unsub;
-	}, [sse, loadGovProposals, loadScopeValidators, loadGovScopes]);
+	}, [sse, loadGovProposals, loadScopeValidators, loadGovScopes, loadMemoryRepairPlan]);
 
     // Redeploy polling
     const startRedeployPoll = useCallback(() => {
@@ -9810,6 +9835,48 @@ function NetworkPage({ sse, accessMode = false }) {
         setGovVoting(false);
     }, [loadGovProposals]);
 
+    const handleMemoryRepairProposal = useCallback(async () => {
+        if (!memoryRepairPlan?.required || activeProposal || memoryRepairSubmitting) return;
+        const reviewed = await showConfirmation(
+            `CEREBRUM locally verified ${memoryRepairPlan.entries} historical memory commitment${memoryRepairPlan.entries === 1 ? '' : 's'} for this bounded repair batch. No memory content, author, domain, status, or chain history will be rewritten.`,
+            {
+                title: 'Prepare memory access repair?',
+                confirmLabel: 'Review final authorization',
+            }
+        );
+        if (!reviewed) return;
+        const authorized = await showConfirmation(
+            'This creates a Root-authorized governance proposal. It does not execute automatically: every validator must independently verify its local projection before accepting.',
+            {
+                title: 'Authorize repair proposal',
+                confirmLabel: 'Create proposal',
+            }
+        );
+        if (!authorized) return;
+        setMemoryRepairSubmitting(true);
+        try {
+            const result = await submitGovProposal({
+                operation: memoryRepairPlan.operation,
+                target_id: memoryRepairPlan.target_id,
+                payload: memoryRepairPlan.payload,
+                expiry_blocks: memoryRepairPlan.expiry_blocks,
+                reason: 'Restore canonical SHA-256 commitments for app-v23 terminal memories after local attestation.',
+            });
+            if (result.error) {
+                showToast(result.error, 'error');
+            } else {
+                showToast('Repair proposal created. Review it below, then cast this validator’s explicit vote.', 'success', 10000);
+                setMemoryRepairPlan(current => current ? { ...current, state: 'proposal_created' } : current);
+                await loadGovProposals();
+            }
+        } catch (e) {
+            showToast('Repair proposal failed: ' + e.message, 'error', 10000);
+            await loadMemoryRepairPlan();
+        } finally {
+            setMemoryRepairSubmitting(false);
+        }
+    }, [memoryRepairPlan, activeProposal, memoryRepairSubmitting, loadGovProposals, loadMemoryRepairPlan]);
+
     const handleGovSubmit = useCallback(async () => {
         setGovSubmitting(true);
         try {
@@ -9876,11 +9943,11 @@ function NetworkPage({ sse, accessMode = false }) {
 
     // Governance helpers
     const govOpLabel = (op) => {
-        const labels = { add_validator: 'Add Validator', remove_validator: 'Remove Validator', update_power: 'Update Power', scope_action: 'Quorum Scope' };
+        const labels = { add_validator: 'Add Validator', remove_validator: 'Remove Validator', update_power: 'Update Power', scope_action: 'Quorum Scope', memory_hash_reanchor: 'Memory Access Repair' };
         return labels[op] || op;
     };
     const govOpIcon = (op) => {
-        const icons = { add_validator: '+', remove_validator: '-', update_power: '~', scope_action: 'Q' };
+        const icons = { add_validator: '+', remove_validator: '-', update_power: '~', scope_action: 'Q', memory_hash_reanchor: '↻' };
         return icons[op] || '?';
     };
     const resolveAgentName = (agentId) => {
@@ -9962,6 +10029,30 @@ function NetworkPage({ sse, accessMode = false }) {
             </div>
 
             ${accessMode && html`<${AppV23AccessControl} />`}
+
+            ${(memoryRepairPlan?.required || memoryRepairError) && html`
+                <section class="memory-repair-card ${memoryRepairError ? 'blocked' : ''}" aria-live="polite">
+                    <div class="memory-repair-copy">
+                        <div class="memory-repair-eyebrow">LOCAL RECOVERY · APP-v24</div>
+                        <h3>${memoryRepairError ? 'Memory access repair needs attention' : 'Historical memories need a safe access repair'}</h3>
+                        <p>${memoryRepairError
+                            ? memoryRepairError
+                            : `CEREBRUM verified ${memoryRepairPlan.entries} terminal memory commitment${memoryRepairPlan.entries === 1 ? '' : 's'} in the next bounded batch against this machine’s encrypted projection. Content and chain history stay unchanged.`}</p>
+                        ${memoryRepairPlan?.remaining && html`
+                            <div class="memory-repair-note">More verified batches remain. CEREBRUM will offer the next batch only after this one commits.</div>
+                        `}
+                    </div>
+                    ${memoryRepairPlan?.required && html`
+                        <button
+                            class="memory-repair-btn"
+                            onClick=${handleMemoryRepairProposal}
+                            disabled=${memoryRepairSubmitting || !!activeProposal}
+                        >
+                            ${memoryRepairSubmitting ? 'Creating proposal…' : activeProposal ? 'Finish active proposal first' : 'Prepare repair proposal'}
+                        </button>
+                    `}
+                </section>
+            `}
 
 			<div class="gov-section">
                 <div class="gov-section-header">

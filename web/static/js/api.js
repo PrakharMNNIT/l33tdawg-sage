@@ -715,6 +715,17 @@ export async function submitGovVote(proposalId, decision) {
     return res.json();
 }
 
+export async function fetchMemoryReanchorPlan() {
+    const res = await fetch(`${API_BASE}/v1/dashboard/memory-reanchor/plan`);
+    if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        const err = new Error(body.error || res.statusText);
+        err.status = res.status;
+        throw err;
+    }
+    return res.json();
+}
+
 // ─── Legacy remote tunnel API (v6.7.3) ───
 // Kept for existing local installs that already use the old remote-URL wizard.
 // ChatGPT setup now uses OpenAI Secure MCP Tunnel from the dashboard runbook.

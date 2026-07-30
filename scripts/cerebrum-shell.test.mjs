@@ -411,8 +411,25 @@ test('governance wizard builds structured canonical quorum scopes', () => {
     assert.match(networkPage, /Number\.isSafeInteger\(weight\)/,
         'the browser must not round canonical uint64 weights before submission');
     assert.match(networkPage, /above two-thirds of this pinned integer weight/);
-    assert.doesNotMatch(networkPage, /btoa\(|payload.*scope_action/s,
+    const scopeSubmitBranch = networkPage.slice(
+        networkPage.indexOf("if (govNewOp === 'scope_action')"),
+        networkPage.indexOf('const res = await submitGovProposal(proposal);')
+    );
+    assert.doesNotMatch(scopeSubmitBranch, /btoa\(|proposal\.payload/,
         'the dashboard must submit structured scope JSON, not recreate the binary codec');
+});
+
+test('app-v24 memory repair stays Root-planned and requires an explicit vote', () => {
+    const networkPage = appSource.slice(appSource.indexOf('function NetworkPage('), appSource.indexOf('function AddAgentWizard('));
+    assert.match(networkPage, /fetchMemoryReanchorPlan\(\)/,
+        'the browser must request a locally attested plan rather than inventorying memory rows itself');
+    assert.match(networkPage, /operation: memoryRepairPlan\.operation/);
+    assert.match(networkPage, /payload: memoryRepairPlan\.payload/);
+    assert.match(networkPage, /No memory content, author, domain, status, or chain history will be rewritten/);
+    assert.match(networkPage, /It does not execute automatically/);
+    assert.match(networkPage, /cast this validator’s explicit vote/);
+    assert.doesNotMatch(networkPage, /submitGovVote\(result\.proposal_id/,
+        'repair proposal creation must never cast a synthetic browser vote');
 });
 
 test('chain activity exposes committed RBAC changes and remains usable while empty', () => {
