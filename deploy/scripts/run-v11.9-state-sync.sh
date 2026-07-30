@@ -931,6 +931,42 @@ copy_provider_genesis() {
     "${ABCI_RUNTIME_UID}" "${ABCI_RUNTIME_GID}" >/dev/null
 }
 
+copy_provider_lineage_markers() {
+  local target_home=$1
+  case "${target_home}" in
+    "${OBSERVER_HOME}"|"${RECEIVER_HOME}"|"${SUCCESS_RECEIVER_HOME}"|"${ATTACKER_HOME}") ;;
+    *)
+      echo "ERROR: refusing to copy lineage markers into unexpected fixture home ${target_home}" >&2
+      return 1
+      ;;
+  esac
+
+  # These pristine full nodes adopt the provider's exact genesis, so they must
+  # also adopt its already-established diagnostic lineage markers. Copying the
+  # provider's source-bound values keeps the production markerless-origin guard
+  # fail-closed; the wire fixture never needs a runtime bypass.
+  docker run --rm --pull never --network none \
+    -v "${PROVIDER_HOME}:/provider:ro" \
+    -v "${target_home}:/target" "${NODE_IMAGE}" sh -ec '
+      set -eu
+      test -f /provider/version.txt
+      test ! -L /provider/version.txt
+      test -f /provider/fork-version.txt
+      test ! -L /provider/fork-version.txt
+      test "$(cat /provider/version.txt)" = "v11.9.0-state-sync-fixture"
+      test "$(cat /provider/fork-version.txt)" = "1"
+      for marker in version.txt fork-version.txt; do
+        test ! -e "/target/${marker}"
+        test ! -L "/target/${marker}"
+        cp "/provider/${marker}" "/target/${marker}"
+        chown "$1:$2" "/target/${marker}"
+        chmod 0600 "/target/${marker}"
+        cmp "/provider/${marker}" "/target/${marker}"
+        test "$(stat -c "%u:%g:%a" "/target/${marker}")" = "$1:$2:600"
+      done
+    ' sh "${ABCI_RUNTIME_UID}" "${ABCI_RUNTIME_GID}" >/dev/null
+}
+
 seed_memories() {
   local container=$1
   local file=$2
@@ -1050,6 +1086,7 @@ provider_id=$(node_id_from_home "${PROVIDER_HOME}")
 for home in "${OBSERVER_HOME}" "${RECEIVER_HOME}" "${SUCCESS_RECEIVER_HOME}" "${ATTACKER_HOME}"; do
   init_pristine_comet_home "${home}"
   copy_provider_genesis "${home}"
+  copy_provider_lineage_markers "${home}"
   secure_fixture_data_dir "${home}"
 done
 observer_id=$(node_id_from_home "${OBSERVER_HOME}")

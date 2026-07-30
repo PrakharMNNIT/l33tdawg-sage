@@ -463,6 +463,7 @@ test('the cold gate freezes its serving provider before advertising the old snap
 test('the cold gate secures pristine data roots for the signed app-v24 projection baseline', () => {
   const initCometHome = shellFunction(v119StateSync, 'init_pristine_comet_home');
   const copyGenesis = shellFunction(v119StateSync, 'copy_provider_genesis');
+  const copyLineageMarkers = shellFunction(v119StateSync, 'copy_provider_lineage_markers');
   const secureDataDir = shellFunction(v119StateSync, 'secure_fixture_data_dir');
 
   assert.match(
@@ -480,8 +481,38 @@ test('the cold gate secures pristine data roots for the signed app-v24 projectio
   assert.match(initCometHome, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
   assert.match(copyGenesis, /chown "\$1:\$2" \/target\/genesis\.json/);
   assert.match(copyGenesis, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
+  assert.match(
+    copyLineageMarkers,
+    /"\$\{OBSERVER_HOME\}"\|"\$\{RECEIVER_HOME\}"\|"\$\{SUCCESS_RECEIVER_HOME\}"\|"\$\{ATTACKER_HOME\}"/,
+  );
+  assert.match(copyLineageMarkers, /-v "\$\{PROVIDER_HOME\}:\/provider:ro"/);
+  assert.match(copyLineageMarkers, /-v "\$\{target_home\}:\/target"/);
+  assert.match(copyLineageMarkers, /test -f \/provider\/version\.txt/);
+  assert.match(copyLineageMarkers, /test ! -L \/provider\/version\.txt/);
+  assert.match(copyLineageMarkers, /test -f \/provider\/fork-version\.txt/);
+  assert.match(copyLineageMarkers, /test ! -L \/provider\/fork-version\.txt/);
+  assert.match(
+    copyLineageMarkers,
+    /test "\$\(cat \/provider\/version\.txt\)" = "v11\.9\.0-state-sync-fixture"/,
+  );
+  assert.match(copyLineageMarkers, /test "\$\(cat \/provider\/fork-version\.txt\)" = "1"/);
+  assert.match(copyLineageMarkers, /test ! -e "\/target\/\$\{marker\}"/);
+  assert.match(copyLineageMarkers, /test ! -L "\/target\/\$\{marker\}"/);
+  assert.match(copyLineageMarkers, /for marker in version\.txt fork-version\.txt/);
+  assert.match(copyLineageMarkers, /cmp "\/provider\/\$\{marker\}" "\/target\/\$\{marker\}"/);
+  assert.match(copyLineageMarkers, /chown "\$1:\$2" "\/target\/\$\{marker\}"/);
+  assert.match(copyLineageMarkers, /chmod 0600 "\/target\/\$\{marker\}"/);
+  assert.match(
+    copyLineageMarkers,
+    /stat -c "%u:%g:%a" "\/target\/\$\{marker\}"/,
+  );
+  assert.match(
+    copyLineageMarkers,
+    /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/,
+  );
   assert.doesNotMatch(initCometHome, /100:101/);
   assert.doesNotMatch(copyGenesis, /100:101/);
+  assert.doesNotMatch(copyLineageMarkers, /100:101/);
   assert.doesNotMatch(secureDataDir, /100:101/);
   assert.match(secureDataDir, /stat -c '%u:%g:%a' \/fixture-data/);
   assert.match(
@@ -490,7 +521,7 @@ test('the cold gate secures pristine data roots for the signed app-v24 projectio
   );
   assert.match(
     v119StateSync,
-    /copy_provider_genesis "\$\{home\}"\n  secure_fixture_data_dir "\$\{home\}"/,
+    /copy_provider_genesis "\$\{home\}"\n  copy_provider_lineage_markers "\$\{home\}"\n  secure_fixture_data_dir "\$\{home\}"/,
   );
 });
 
