@@ -238,6 +238,45 @@ func TestCEREBRUMUIIsLoopbackOnly(t *testing.T) {
 	}
 }
 
+func TestCEREBRUMMissingStaticAssetsReturnTrue404(t *testing.T) {
+	h, _ := newTestHandler(t)
+	router := testRouter(h)
+
+	for _, requestPath := range []string{
+		"/ui/js/missing.js",
+		"/ui/js/missing.mjs",
+		"/ui/js/vendor/missing.js",
+		"/ui/css/missing.css",
+		"/ui/js/missing.js.map",
+		"/ui/assets/missing.wasm",
+	} {
+		t.Run(requestPath, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, requestPath, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+			assert.NotContains(t, strings.ToLower(rec.Header().Get("Content-Type")), "text/html")
+			assert.NotContains(t, strings.ToLower(rec.Body.String()), "<!doctype html")
+			assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+		})
+	}
+}
+
+func TestCEREBRUMExtensionlessRouteUsesBootstrapShell(t *testing.T) {
+	h, _ := newTestHandler(t)
+	router := testRouter(h)
+	req := httptest.NewRequest(http.MethodGet, "/ui/future-client-route", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Header().Get("Content-Type"), "text/html")
+	assert.Contains(t, rec.Body.String(), `data-sage-bootstrap-state="pending"`)
+	assert.NotContains(t, rec.Body.String(), "?v=774",
+		"SPA fallback must receive the same content-hash rewrite as /ui/")
+}
+
 func TestCEREBRUMHumanControlEntryPointsAreLoopbackOnly(t *testing.T) {
 	h, _ := newTestHandler(t)
 	router := testRouter(h)

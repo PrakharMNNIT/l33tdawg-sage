@@ -51,7 +51,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.15.0';
+const SAGE_VERSION = 'v11.15.1';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -9193,7 +9193,7 @@ function AppV23AccessControl() {
                             ${selectedRemote && linkedLinks.length === 0 && html`
                                 <div class="v23-empty">This remote agent has no local group links.</div>
                             `}
-                            {!selectedRemote && html`
+                            ${!selectedRemote && html`
                                 <div class="v23-empty">No federated agents are currently advertised. Refresh the connection under Federation.</div>
                             `}
                         </div>
@@ -16281,4 +16281,11 @@ function EmptyState({ icon, headline, hint, actionLabel, onAction, compact }) {
     </div>`;
 }
 
-render(html`<${App} />`, document.getElementById('app'));
+const appRoot = document.getElementById('app');
+try {
+    render(html`<${App} />`, appRoot);
+    window.__sageBootstrap?.ready?.();
+} catch (error) {
+    window.__sageBootstrap?.fail?.('render', error);
+    throw error;
+}

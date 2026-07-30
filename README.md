@@ -51,6 +51,25 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.15.1
+
+**Emergency CEREBRUM rendering recovery.** v11.15.0 shipped one malformed
+nested-template expression in the Access Control view. Because CEREBRUM is a
+browser-module application, that single parser error prevented the entry module
+from executing and left the otherwise healthy local node behind a blank page.
+v11.15.1 corrects the expression and changes the static JavaScript release gate
+to parse every first-party file with browser-equivalent ES-module grammar, so
+this class of packaging failure is rejected before publication. A
+dependency-free Loading shell now turns future bootstrap failures into a
+sanitized recovery panel, and missing module assets return a true `404` instead
+of a misleading HTML `200`.
+
+This patch does not migrate, delete, rewrite, reassign, or re-encrypt memories.
+It changes no consensus rule, transaction, key encoding, AppHash input, fork
+height, or application version; app-v23 and every historical block remain
+byte-identical. Existing nodes upgrade in place. Container:
+`ghcr.io/l33tdawg/sage:11.15.1`. SDK 11.15.1.
+
 ## What's New in v11.15.0
 
 **App-v23 replaces capability-bit administration with roles, security profiles,

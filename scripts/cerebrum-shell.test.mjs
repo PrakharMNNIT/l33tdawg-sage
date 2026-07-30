@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const appSource = await readFile(new URL('../web/static/js/app.js', import.meta.url), 'utf8');
 const apiSource = await readFile(new URL('../web/static/js/api.js', import.meta.url), 'utf8');
 const cssSource = await readFile(new URL('../web/static/css/sage.css', import.meta.url), 'utf8');
+const indexSource = await readFile(new URL('../web/static/index.html', import.meta.url), 'utf8');
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 const mriPageSource = await readFile(new URL('../web/static/mri.html', import.meta.url), 'utf8');
 const federationRouteSource = await readFile(new URL('../web/static/js/federation-route-state.js', import.meta.url), 'utf8');
@@ -17,6 +20,51 @@ const fedPipeHelperSource = appSource.slice(
 const { normalizeFedPipeContactGrant, mergeFedPipeContactGrant } = new Function(
     `${fedPipeHelperSource}; return { normalizeFedPipeContactGrant, mergeFedPipeContactGrant };`
 )();
+
+test('CEREBRUM has a dependency-free bootstrap shell and sanitized failure state', () => {
+    const inlineScripts = [...indexSource.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)]
+        .map((match) => match[1])
+        .filter((source) => source.trim() !== '');
+    assert.ok(inlineScripts.length >= 3, 'theme, bootstrap, and HTM inline scripts must be present');
+    for (const source of inlineScripts) {
+        assert.doesNotThrow(() => new Function(source), 'inline bootstrap script must parse');
+    }
+    assert.match(indexSource, /data-sage-bootstrap-state="pending"/);
+    assert.match(indexSource, /Opening your SAGE brain/);
+    assert.match(indexSource, /ui-bootstrap\/module-load/);
+    assert.match(indexSource, /Diagnostic code: " \+ pendingCode/);
+    assert.match(indexSource, /pendingCode = diagnosticCodes\[code\] \|\| diagnosticCodes\.unknown/);
+    assert.doesNotMatch(
+        indexSource,
+        /diagnostic\.textContent\s*=.*(?:detail|event|error|message)/,
+        'raw exceptions, rejected values, and messages must never reach the visible diagnostic',
+    );
+    assert.match(indexSource, /textContent = "CEREBRUM could not start"/);
+    assert.match(indexSource, /window\.setTimeout\(\(\) => fail\("timeout"\), 10000\)/);
+    assert.ok(
+        indexSource.indexOf('window.__sageBootstrap') <
+            indexSource.indexOf('/ui/js/vendor/preact.umd.js'),
+        'the bootstrap guard must run before any vendor or application dependency',
+    );
+    assert.match(appSource, /window\.__sageBootstrap\?\.ready\?\.\(\)/);
+    assert.match(appSource, /window\.__sageBootstrap\?\.fail\?\.\('render', error\)/);
+});
+
+test('static JavaScript gate rejects the v11.15 nested-template failure under module grammar', () => {
+    const checker = fileURLToPath(new URL('./check-static-js.mjs', import.meta.url));
+    const fixture = fileURLToPath(
+        new URL('./fixtures/cerebrum-malformed-module.txt', import.meta.url),
+    );
+    const result = spawnSync(process.execPath, [checker, fixture], {
+        encoding: 'utf8',
+    });
+
+    assert.notEqual(result.status, 0, 'malformed browser module must fail the static gate');
+    assert.match(
+        `${result.stdout}\n${result.stderr}`,
+        /SyntaxError|ES module syntax check failed/,
+    );
+});
 
 test('Access Controls is a first-class sidebar route', () => {
     assert.match(appSource, /hash === '\/access'\) setPage\('access'\)/);

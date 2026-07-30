@@ -1,0 +1,10 @@
+const html = (strings) => strings;
+const selectedRemote = false;
+const view = html`${selectedRemote && html`
+  <div>remote</div>
+`}
+{!selectedRemote && html`
+  <div>local</div>
+`}
+`;
+export { view };

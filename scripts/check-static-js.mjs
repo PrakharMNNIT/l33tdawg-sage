@@ -20,11 +20,37 @@ function walk(dir) {
   }
 }
 
-walk('web/static/js');
+const explicitTargets = process.argv.slice(2);
+if (explicitTargets.length > 0) {
+  for (const target of explicitTargets) {
+    const stat = statSync(target);
+    if (stat.isDirectory()) {
+      walk(target);
+    } else {
+      files.push(target);
+    }
+  }
+} else {
+  walk('web/static/js');
+}
 
 for (const file of files) {
-  const result = spawnSync(process.execPath, ['--check', file], { stdio: 'inherit' });
+  // CEREBRUM loads these files as browser ES modules. `node --check file.js`
+  // parses a .js file according to the package's default source type, which can
+  // accept malformed nested-template syntax that browser module parsing
+  // rejects. Force module grammar through stdin so the release gate matches
+  // the production loader.
+  const source = readFileSync(file, 'utf8');
+  const result = spawnSync(
+    process.execPath,
+    ['--input-type=module', '--check'],
+    {
+      input: source,
+      stdio: ['pipe', 'inherit', 'inherit'],
+    },
+  );
   if (result.status !== 0) {
+    console.error(`ES module syntax check failed: ${file}`);
     process.exit(result.status ?? 1);
   }
 }

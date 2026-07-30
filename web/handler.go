@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1265,8 +1266,6 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			sub, _ := fs.Sub(StaticFS, "static")
 			staticFS = sub
 		}
-		fileServer := http.FileServer(http.FS(staticFS))
-
 		// Content-hash asset version for cache-busting. index.html's ?v token was
 		// hardcoded (never bumped across releases) and app.js imports mri-brain.js
 		// with NO version — so browsers/CDNs served stale JS after a deploy (the
@@ -1293,35 +1292,46 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 
 		r.With(cerebrumLoopbackOnly).Get("/ui/*", func(w http.ResponseWriter, r *http.Request) {
 			// Strip /ui prefix
-			path := strings.TrimPrefix(r.URL.Path, "/ui")
-			if path == "" || path == "/" {
-				path = "/index.html"
+			assetPath := strings.TrimPrefix(r.URL.Path, "/ui")
+			if assetPath == "" || assetPath == "/" {
+				assetPath = "/index.html"
 			}
 
 			// Try to serve the file directly
-			f, err := staticFS.(fs.ReadFileFS).ReadFile(strings.TrimPrefix(path, "/")) //nolint:errcheck
+			f, err := staticFS.(fs.ReadFileFS).ReadFile(strings.TrimPrefix(assetPath, "/")) //nolint:errcheck
 			if err != nil {
-				// Fallback to index.html for SPA routing
-				r.URL.Path = "/index.html"
-				fileServer.ServeHTTP(w, r)
-				return
+				// Only extensionless paths are client-side SPA routes. Returning
+				// index.html with HTTP 200 for a missing JavaScript module makes
+				// asset probes look healthy while the browser rejects the HTML MIME
+				// and leaves CEREBRUM blank.
+				if pathpkg.Ext(assetPath) != "" {
+					w.Header().Set("Cache-Control", "no-store")
+					http.NotFound(w, r)
+					return
+				}
+				assetPath = "/index.html"
+				f, err = staticFS.(fs.ReadFileFS).ReadFile("index.html")
+				if err != nil {
+					http.Error(w, "CEREBRUM UI is unavailable", http.StatusInternalServerError)
+					return
+				}
 			}
 
 			// Set content type
 			switch {
-			case strings.HasSuffix(path, ".html"):
+			case strings.HasSuffix(assetPath, ".html"):
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			case strings.HasSuffix(path, ".css"):
+			case strings.HasSuffix(assetPath, ".css"):
 				w.Header().Set("Content-Type", "text/css; charset=utf-8")
-			case strings.HasSuffix(path, ".js"):
+			case strings.HasSuffix(assetPath, ".js"):
 				w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-			case strings.HasSuffix(path, ".json"):
+			case strings.HasSuffix(assetPath, ".json"):
 				w.Header().Set("Content-Type", "application/json")
-			case strings.HasSuffix(path, ".svg"):
+			case strings.HasSuffix(assetPath, ".svg"):
 				w.Header().Set("Content-Type", "image/svg+xml")
-			case strings.HasSuffix(path, ".png"):
+			case strings.HasSuffix(assetPath, ".png"):
 				w.Header().Set("Content-Type", "image/png")
-			case strings.HasSuffix(path, ".ico"):
+			case strings.HasSuffix(assetPath, ".ico"):
 				w.Header().Set("Content-Type", "image/x-icon")
 			}
 
@@ -1338,9 +1348,9 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			// the hash into app.js's/mri-brain.js's version-less imports - so a new
 			// build always serves fresh JS through any cache/CDN. The regex runs
 			// FIRST so it only ever touches source tokens, never an injected hash.
-			if strings.HasSuffix(path, ".html") {
+			if strings.HasSuffix(assetPath, ".html") {
 				f = assetVerRe.ReplaceAll(f, []byte("?v="+assetVer))
-			} else if strings.HasSuffix(path, ".js") {
+			} else if strings.HasSuffix(assetPath, ".js") {
 				f = assetVerRe.ReplaceAll(f, []byte("?v="+assetVer))
 				f = bytes.ReplaceAll(f, []byte("from './mri-brain.js'"), []byte("from './mri-brain.js?v="+assetVer+"'"))
 				f = bytes.ReplaceAll(f, []byte("from './api.js'"), []byte("from './api.js?v="+assetVer+"'"))
