@@ -731,28 +731,65 @@ func runServe(startupProof string) (rerr error) {
 		return errors.New("normal-serving SAGE app has no Badger store")
 	}
 	// Fresh direct-v23 Init has now completed, and a state-sync receiver has been
-	// sealed. Verify immutable vendored provenance and current write readiness
-	// before sidecars, migrations, watchdogs, voters, or serving workers start.
+	// sealed. Verify immutable vendored provenance before sidecars, migrations,
+	// watchdogs, voters, or serving workers start. The companion remains
+	// fail-closed in /ready until governed app-v24 activation reaches its strict
+	// H+1 boundary: app-v23's terminal lifecycle bug can otherwise make the
+	// first-party app write memories that it cannot subsequently read.
 	if cfg.VendoredAgentBootstrap != nil {
-		if readinessErr := verifyAppV23VendoredAgentReadiness(
-			cfg.VendoredAgentBootstrap,
-			localAgentKeyResolverWithOperator(cfg.AgentKey),
-			badgerStore,
-		); readinessErr != nil {
+		verifyVendoredEnrollment := func() error {
+			return verifyAppV23VendoredAgentReadiness(
+				cfg.VendoredAgentBootstrap,
+				localAgentKeyResolverWithOperator(cfg.AgentKey),
+				badgerStore,
+			)
+		}
+		if readinessErr := verifyVendoredEnrollment(); readinessErr != nil {
 			health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
 				Required: true,
 				State:    "blocked",
 			})
 			return fmt.Errorf("first-party app-v23 companion is not ready: %w", readinessErr)
 		}
-		health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
-			Required: true,
-			OK:       true,
-			State:    "ready",
-		})
-		logger.Info().
-			Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
-			Msg("first-party app-v23 companion enrollment is ready")
+		if app.IsAppV24ActiveForNextTx() {
+			health.SetVendoredAgentEnrollmentStatus(vendoredAgentProtocolStatus(true))
+			logger.Info().
+				Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
+				Msg("first-party companion enrollment and app-v24 lifecycle are ready")
+		} else {
+			health.SetVendoredAgentEnrollmentStatus(vendoredAgentProtocolStatus(false))
+			logger.Info().
+				Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
+				Msg("first-party companion is waiting for governed app-v24 activation")
+			startWorker(func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						if !app.IsAppV24ActiveForNextTx() {
+							continue
+						}
+						if readinessErr := verifyVendoredEnrollment(); readinessErr != nil {
+							health.SetVendoredAgentEnrollmentStatus(metrics.VendoredAgentEnrollmentStatus{
+								Required: true,
+								State:    "blocked",
+							})
+							logger.Error().Err(readinessErr).
+								Msg("first-party companion enrollment changed before app-v24 readiness")
+							return
+						}
+						health.SetVendoredAgentEnrollmentStatus(vendoredAgentProtocolStatus(true))
+						logger.Info().
+							Str("home_domain", cfg.VendoredAgentBootstrap.HomeDomain).
+							Msg("first-party companion admitted after app-v24 activation")
+						return
+					}
+				}
+			})
+		}
 	}
 
 	// Everything below may capture concrete app/store references because the
