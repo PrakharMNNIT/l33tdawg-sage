@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/governance"
+	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,10 +59,23 @@ func dashboardGovernanceHandler(t *testing.T, rpc string) (*DashboardHandler, ed
 	require.NoError(t, err)
 	_, operatorKey, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
+	badgerStore, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, badgerStore.CloseBadger()) })
+	proposal, err := json.Marshal(governance.ProposalState{
+		ProposalID: "proposal-a",
+		Operation:  governance.OpAddValidator,
+		TargetID:   "validator-a",
+		ProposerID: auth.PublicKeyToAgentID(validatorKey.Public().(ed25519.PublicKey)),
+		Status:     governance.StatusVoting,
+	})
+	require.NoError(t, err)
+	require.NoError(t, badgerStore.SetGovProposal("proposal-a", proposal))
 	h := &DashboardHandler{
 		CometBFTRPC:         rpc,
 		SigningKey:          validatorKey,
 		AdminSigningKey:     operatorKey,
+		BadgerStore:         badgerStore,
 		AppV20ActiveFn:      func() bool { return true },
 		GovernanceDomainFn:  func() string { return dashboardTestGovernanceDomain },
 		NodeOperatorAgentID: auth.PublicKeyToAgentID(operatorKey.Public().(ed25519.PublicKey)),
