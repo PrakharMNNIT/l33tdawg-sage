@@ -56,9 +56,11 @@ const (
 	// revision, pause/resume, and permanent retirement all use this exact-record
 	// operation; there is no controller-only mutation path.
 	OpScopeAction ProposalOp = 8
-	// OpMemoryHashReanchor (app-v24) repairs the canonical SHA-256 commitment
-	// of narrowly eligible app-v23 terminal memories through a Root-authorized,
-	// explicit-validator-vote, all-or-nothing operation.
+	// OpMemoryHashReanchor (app-v24) repairs the canonical content hash of a
+	// bounded, narrowly eligible set of ordinary app-v23 terminal memories.
+	// Payload and TargetID use the canonical tx.MemoryHashReanchorPayload
+	// encoding/digest. Admission is restricted to the current Root credential
+	// acting through an active validator, and validators must vote explicitly.
 	OpMemoryHashReanchor ProposalOp = 9
 )
 

@@ -38,6 +38,29 @@ type validatedMemoryHashReanchor struct {
 	needsRepair bool
 }
 
+// ValidateMemoryHashReanchors performs the same complete-snapshot eligibility
+// check as ReanchorMemoryHashes without writing. ABCI uses it immediately
+// before governance execution is marked successful, then calls
+// ReanchorMemoryHashes from the apply phase in the same outer consensus
+// transaction.
+func (s *BadgerStore) ValidateMemoryHashReanchors(entries []MemoryHashReanchorEntry) error {
+	if s == nil {
+		return errors.New("memory hash reanchor requires a store")
+	}
+	ownedEntries, err := ownMemoryHashReanchorEntries(entries)
+	if err != nil {
+		return err
+	}
+	return s.view(func(txn *badger.Txn) error {
+		for _, entry := range ownedEntries {
+			if _, err := validateMemoryHashReanchorState(txn, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // ReanchorMemoryHashes validates and applies one bounded repair chunk in one
 // Badger transaction. The first pass validates every entry and stages no
 // mutation. Only after the complete chunk is proven eligible does the second
@@ -51,15 +74,8 @@ func (s *BadgerStore) ReanchorMemoryHashes(entries []MemoryHashReanchorEntry) er
 	if s == nil {
 		return errors.New("memory hash reanchor requires a store")
 	}
-	// Own the exact evidence bytes used by both passes. Consensus callers are
-	// synchronous, but a defensive copy keeps this typed primitive immune to a
-	// caller mutating a reused hash buffer between validation and persistence.
-	ownedEntries := make([]MemoryHashReanchorEntry, len(entries))
-	for i, entry := range entries {
-		ownedEntries[i] = entry
-		ownedEntries[i].ContentHash = append([]byte(nil), entry.ContentHash...)
-	}
-	if err := validateMemoryHashReanchorEntries(ownedEntries); err != nil {
+	ownedEntries, err := ownMemoryHashReanchorEntries(entries)
+	if err != nil {
 		return err
 	}
 
@@ -96,6 +112,21 @@ func (s *BadgerStore) ReanchorMemoryHashes(entries []MemoryHashReanchorEntry) er
 		}
 		return nil
 	})
+}
+
+func ownMemoryHashReanchorEntries(entries []MemoryHashReanchorEntry) ([]MemoryHashReanchorEntry, error) {
+	// Own the exact evidence bytes used by validation and persistence.
+	// Consensus callers are synchronous, but a defensive copy keeps these
+	// primitives immune to a caller mutating a reused hash buffer.
+	ownedEntries := make([]MemoryHashReanchorEntry, len(entries))
+	for i, entry := range entries {
+		ownedEntries[i] = entry
+		ownedEntries[i].ContentHash = append([]byte(nil), entry.ContentHash...)
+	}
+	if err := validateMemoryHashReanchorEntries(ownedEntries); err != nil {
+		return nil, err
+	}
+	return ownedEntries, nil
 }
 
 func validateMemoryHashReanchorEntries(entries []MemoryHashReanchorEntry) error {

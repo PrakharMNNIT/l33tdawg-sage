@@ -3815,6 +3815,12 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		// single-block auto-approve edge for target-20.
 	} else if postAppV20Governance || freezeValidatorReconfiguration {
 		executedProposal, govErr = app.govEngine.ProcessBlockValidated(req.Height, func(proposal *governance.ProposalState) error {
+			if proposal.Operation == governance.OpMemoryHashReanchor {
+				_, err := app.validateAppV24MemoryHashReanchorProposal(
+					proposal, req.Height, true,
+				)
+				return err
+			}
 			if !isValidatorSetGovernanceOperation(proposal.Operation) {
 				return nil
 			}
@@ -10232,6 +10238,7 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 	// voting power, cooldown, and deterministic ID remain attached to the outer
 	// signer. Direct/no-proof proposals retain the historical outer-admin rule.
 	delegated := app.postAppV20Fork(height) && isDelegatedGovernanceProof(parsedTx)
+	var delegatedAuthorizerID string
 	if delegated {
 		outerValidator, active := app.validators.GetValidator(proposerID)
 		if !active || outerValidator.Power <= 0 {
@@ -10241,6 +10248,7 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 		if proofErr != nil {
 			return &abcitypes.ExecTxResult{Code: 72, Log: "delegated governance authorizer is invalid: " + proofErr.Error()}
 		}
+		delegatedAuthorizerID = authorizerID
 		if !app.isGlobalAdminAgent(authorizerID, height) {
 			return &abcitypes.ExecTxResult{Code: 72, Log: "only admin agents can authorize governance proposals"}
 		}
@@ -10251,6 +10259,35 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 	}
 	// Keep the two branches separate: an outer validator that also happens to be
 	// admin must never bypass validation of its distinct embedded operator.
+
+	// app-v24: op 9 is a Root-authorized, explicitly voted repair of the exact
+	// app-v23 terminal-hash regression population. It is unknown before H+1,
+	// requires key separation between the current Root credential and an active
+	// validator outer signer, binds TargetID to the canonical payload, and checks
+	// present eligibility now as well as immediately before quorum execution.
+	if op == governance.OpMemoryHashReanchor {
+		if !app.postAppV24Rules(height) {
+			return &abcitypes.ExecTxResult{Code: 72, Log: fmt.Sprintf("governance propose: unknown operation %d", op)}
+		}
+		if !delegated {
+			return &abcitypes.ExecTxResult{Code: 72, Log: "governance propose: OpMemoryHashReanchor requires the current Root credential delegated through an active validator"}
+		}
+		if authorizerErr := app.requireCurrentRootMemoryHashReanchorAuthorizer(
+			delegatedAuthorizerID,
+		); authorizerErr != nil {
+			return &abcitypes.ExecTxResult{Code: 72, Log: "governance propose: " + authorizerErr.Error()}
+		}
+		if _, reanchorErr := app.validateAppV24MemoryHashReanchorFields(
+			gp.TargetID,
+			gp.TargetPubKey,
+			gp.TargetPower,
+			gp.Payload,
+			height,
+			true,
+		); reanchorErr != nil {
+			return &abcitypes.ExecTxResult{Code: 72, Log: "governance propose: invalid OpMemoryHashReanchor: " + reanchorErr.Error()}
+		}
+	}
 
 	// app-v8: OpUpgrade proposals must NOT be creatable on the generic gov path —
 	// they would bypass processUpgradePropose's canonical-name + regression +
@@ -10300,7 +10337,8 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 			case governance.OpDomainReassign,
 				governance.OpMemoryDomainRepair,
 				governance.OpSyncGroupAction,
-				governance.OpScopeAction:
+				governance.OpScopeAction,
+				governance.OpMemoryHashReanchor:
 				// Each known non-validator operation has its own validation and/or
 				// intentionally inert attestation semantics.
 			case governance.OpUpgrade:
@@ -10311,11 +10349,22 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 		}
 	}
 
-	proposalID, propErr := app.govEngine.Propose(
-		proposerID, op, gp.TargetID, gp.TargetPubKey,
-		gp.TargetPower, gp.ExpiryBlocks, gp.Reason, height,
-		gp.Payload,
-	)
+	autoVote := op != governance.OpMemoryHashReanchor
+	var proposalID string
+	var propErr error
+	if autoVote {
+		proposalID, propErr = app.govEngine.Propose(
+			proposerID, op, gp.TargetID, gp.TargetPubKey,
+			gp.TargetPower, gp.ExpiryBlocks, gp.Reason, height,
+			gp.Payload,
+		)
+	} else {
+		proposalID, propErr = app.govEngine.ProposeWithoutAutoVote(
+			proposerID, op, gp.TargetID, gp.TargetPubKey,
+			gp.TargetPower, gp.ExpiryBlocks, gp.Reason, height,
+			gp.Payload,
+		)
+	}
 	if propErr != nil {
 		return &abcitypes.ExecTxResult{Code: 73, Log: "governance propose failed: " + propErr.Error()}
 	}
@@ -10347,16 +10396,20 @@ func (app *SageApp) processGovPropose(parsedTx *tx.ParsedTx, height int64, _ tim
 		},
 	})
 
-	// Buffer the auto-vote for Commit.
-	app.pendingWrites = append(app.pendingWrites, pendingWrite{
-		writeType: "gov_vote",
-		data: govVoteData{
-			ProposalID:  proposalID,
-			ValidatorID: proposerID,
-			Decision:    "accept",
-			Height:      height,
-		},
-	})
+	if autoVote {
+		// Historical operations retain their proposal-time auto-vote and
+		// matching off-chain projection. OpMemoryHashReanchor deliberately
+		// records neither until a validator submits an explicit GovVote.
+		app.pendingWrites = append(app.pendingWrites, pendingWrite{
+			writeType: "gov_vote",
+			data: govVoteData{
+				ProposalID:  proposalID,
+				ValidatorID: proposerID,
+				Decision:    "accept",
+				Height:      height,
+			},
+		})
+	}
 
 	return &abcitypes.ExecTxResult{Code: 0, Log: "proposal created: " + proposalID}
 }
@@ -11378,6 +11431,13 @@ func (app *SageApp) applyGovernanceProposal(proposal *governance.ProposalState, 
 		return nil, app.applyMemoryDomainRepair(proposal, height)
 	}
 
+	// app-v24: the repair target is a domain-separated payload digest, not a
+	// validator key. Dispatch before target-pubkey derivation and retain op 9's
+	// historical unknown-operation behavior before the strict H+1 boundary.
+	if proposal.Operation == governance.OpMemoryHashReanchor && app.postAppV24Rules(height) {
+		return nil, app.applyMemoryHashReanchor(proposal, height)
+	}
+
 	// app-v20: quorum execution directly installs the exact scope record voted
 	// on by validators. Dispatch before validator pubkey derivation because the
 	// TargetID is a scope ID, not an Ed25519 key. Before the fork op==8 retains
@@ -11610,6 +11670,8 @@ func opToString(op governance.ProposalOp) string {
 		return "memory_domain_repair"
 	case governance.OpScopeAction:
 		return "scope_action"
+	case governance.OpMemoryHashReanchor:
+		return appV24MemoryHashReanchorOperationName
 	default:
 		return fmt.Sprintf("unknown_%d", op)
 	}
@@ -11620,6 +11682,9 @@ func opToString(op governance.ProposalOp) string {
 // though the upgraded binary knows the future operation name.
 func (app *SageApp) governanceOperationName(op governance.ProposalOp, height int64) string {
 	if op == governance.OpScopeAction && !app.postAppV20Fork(height) {
+		return fmt.Sprintf("unknown_%d", op)
+	}
+	if op == governance.OpMemoryHashReanchor && !app.postAppV24Rules(height) {
 		return fmt.Sprintf("unknown_%d", op)
 	}
 	return opToString(op)

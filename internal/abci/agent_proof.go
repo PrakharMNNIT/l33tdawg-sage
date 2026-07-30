@@ -374,6 +374,8 @@ func governanceProposalOpFromRequest(value string, dashboard bool) (tx.GovPropos
 		return tx.GovOpSyncGroupAction, nil
 	case "scope_action":
 		return tx.GovOpScopeAction, nil
+	case appV24MemoryHashReanchorOperationName:
+		return tx.GovOpMemoryHashReanchor, nil
 	}
 	return 0, fmt.Errorf("operation %q is not supported by this governance route", value)
 }
