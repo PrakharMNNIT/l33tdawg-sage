@@ -1,4 +1,4 @@
-// Package main — v7.5 supervisor mode.
+// Package main — bounded-restart supervisor mode.
 //
 // The supervisor runs the sage-gui binary in the foreground (not
 // detached), pipes stdout/stderr through, forwards SIGINT/SIGTERM,
@@ -7,9 +7,8 @@
 //   - exit 0, no HALT  -> propagate exit 0, stop.
 //   - non-zero, no HALT -> crash. Restart with backoff up to N=3 in
 //     a 60s window. Beyond that, log fatal and exit.
-//   - HALT sentinel present (any exit code) -> read sentinel, run
-//     rollback flow (see rollback.go). HandleHalt should not return
-//     on success; if it does (test stub or error) we propagate.
+//   - HALT sentinel present (any exit code) -> refuse automatic
+//     rollback and stop for operator-led recovery.
 //
 // The supervisor is opt-in via the `--supervise` flag. The existing
 // "fire and forget + open browser" behavior remains the default so
@@ -72,14 +71,12 @@ type SupervisorConfig struct {
 	// Defaults to 1 second; tests set it to 0 for speed.
 	RestartDelay time.Duration
 
-	// Restorer is the dependency-injected snapshot applier.
-	// Defaults to a stub that only logs. The real implementation
-	// lives in internal/snapshot and is wired in by a separate
-	// integration commit.
+	// Restorer and Execer are inactive legacy test seams. Run must never
+	// consult them; explicit offline recovery constructs RollbackContext
+	// directly.
 	Restorer Restorer
 
-	// Execer replaces the launcher process with the rollback
-	// binary. Defaults to syscall.Exec; tests inject a stub.
+	// Execer is the matching inactive test seam for old-binary exec.
 	Execer Execer
 
 	// Stdout / Stderr are where the child's piped output goes.
@@ -135,6 +132,21 @@ func (c *SupervisorConfig) pidFile() string {
 	return filepath.Join(c.SageHome, "sage.pid")
 }
 
+// haltEvidencePresent uses Lstat so a wrong-kind or dangling symlink at
+// HALT is still treated as evidence and fails closed. Only a definite
+// not-exist result authorizes child startup/restart.
+func (c *SupervisorConfig) haltEvidencePresent() (bool, error) {
+	_, err := os.Lstat(c.haltPath())
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, fmt.Errorf("inspect HALT evidence %s: %w", c.haltPath(), err)
+	}
+}
+
 // Run is the supervisor's main loop. It returns the exit code the
 // launcher itself should propagate.
 //
@@ -161,33 +173,12 @@ func (c *SupervisorConfig) Run(ctx context.Context) int {
 			return 1
 		}
 
-		// Halt path takes precedence over exit code: the binary
-		// may exit cleanly after writing the sentinel.
+		// Since v11.16.1 a HALT sentinel is evidence requiring
+		// operator-led recovery, not authorization to restore state or
+		// execute an older binary. Preserve the sentinel for diagnosis.
 		if haltDetected {
-			sig, readErr := ReadHaltSignal(c.haltPath())
-			if readErr != nil {
-				// Malformed sentinel — refuse to act, surface
-				// for operator intervention.
-				c.Logf("HALT sentinel present but unreadable: %v", readErr)
-				return 1
-			}
-			rbCtx := RollbackContext{
-				SnapshotsDir: c.SnapshotsDir,
-				DataDir:      c.DataDir,
-				HaltPath:     c.haltPath(),
-				LauncherLog:  c.LauncherLog,
-				Restorer:     c.Restorer,
-				Execer:       c.Execer,
-				Logf:         c.Logf,
-				Now:          c.Now,
-			}
-			if err := HandleHalt(rbCtx, sig); err != nil {
-				c.Logf("rollback failed: %v", err)
-				return 1
-			}
-			// HandleHalt only returns when Execer is a test stub.
-			// In production it has already replaced our process.
-			return 0
+			c.Logf("HALT sentinel present at %s; automatic rollback is disabled — preserve a stopped-node backup and use governed recovery", c.haltPath())
+			return 1
 		}
 
 		if exitCode == 0 {
@@ -223,22 +214,21 @@ func (c *SupervisorConfig) Run(ctx context.Context) int {
 }
 
 // runOnce spawns a single child, waits for it, and returns its
-// exit code and whether a HALT sentinel was found on exit.
+// exit code and whether a HALT sentinel was found.
 //
 // The boolean is checked AFTER the child has exited (not during
 // run) so we don't act on a half-written sentinel. The writer is
 // expected to fsync before exiting; the supervisor relies on this.
 func (c *SupervisorConfig) runOnce(ctx context.Context) (exitCode int, haltDetected bool, err error) {
-	// Clear any stale HALT from a previous boot before launching
-	// the child. The chain binary writes a fresh sentinel on
-	// failure; stale ones from a prior successful rollback would
-	// cause a spurious rollback loop.
-	if _, statErr := os.Stat(c.haltPath()); statErr == nil {
-		// On supervisor start we treat an existing sentinel as
-		// authoritative — caller should have already drained it.
-		// We do NOT delete it here; instead, surface to the
-		// caller by short-circuiting through the halt path.
-		c.Logf("found pre-existing HALT sentinel at %s — handling without spawn", c.haltPath())
+	// Refuse a pre-existing HALT before spawning. It may have been
+	// written by an older executable; consuming it would authorize an
+	// automatic state restore and old-binary exec.
+	haltDetected, haltErr := c.haltEvidencePresent()
+	if haltErr != nil {
+		return 0, false, haltErr
+	}
+	if haltDetected {
+		c.Logf("found pre-existing HALT sentinel at %s — refusing automatic rollback and child spawn", c.haltPath())
 		return 0, true, nil
 	}
 
@@ -287,12 +277,11 @@ func (c *SupervisorConfig) runOnce(ctx context.Context) (exitCode int, haltDetec
 	waitErr := cmd.Wait()
 	close(stopCh)
 
-	// Inspect HALT sentinel AFTER the child exited. The child
-	// writes-and-fsyncs before exit, so by the time Wait()
-	// returns the sentinel is durably on disk if it was going
-	// to be there at all.
-	if _, statErr := os.Stat(c.haltPath()); statErr == nil {
-		haltDetected = true
+	// Inspect HALT after child exit so an older child cannot silently
+	// hand automatic rollback authority to the current supervisor.
+	haltDetected, haltErr = c.haltEvidencePresent()
+	if haltErr != nil {
+		return 0, false, haltErr
 	}
 
 	if waitErr == nil {
@@ -341,11 +330,6 @@ func runSuperviseMode(args []string) int {
 		LauncherLog:  filepath.Join(home, "launcher.log"),
 		MaxCrashes:   *maxCrashes,
 		CrashWindow:  *crashWindow,
-		Restorer: &snapshotRestorer{
-			logf: func(format string, args ...interface{}) {
-				fmt.Fprintf(os.Stderr, "[supervise] "+format+"\n", args...)
-			},
-		},
 	}
 
 	ctx, cancel := signalContext(context.Background())

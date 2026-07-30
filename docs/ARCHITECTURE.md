@@ -580,21 +580,13 @@ At-most-one pending plan is enforced: a propose arriving while another is pendin
 
 ### 3. Halt detection
 
-If the chain binary panics (e.g. an upgrade handler failure), `cmd/sage-gui/halt_writer.go::haltOnPanic` runs in `runServe`'s deferred recover. It writes `~/.sage/data/HALT` atomically with the failed version, an optional rollback target (empty by default — the launcher picks the latest non-failed anchor), and the panic message. The deferred handler re-panics so the original stack still reaches stderr and the process exits non-zero.
+If the chain binary panics (e.g. an upgrade handler failure), `cmd/sage-gui/halt_writer.go::haltOnPanic` runs in `runServe`'s deferred recover and re-panics so the original stack reaches stderr and the process exits non-zero. Since v11.16.1 this live path deliberately does **not** write `~/.sage/data/HALT`: a HALT sentinel authorizes the supervisor to restore state and execute an older binary, and an older startup path may not be safe for the current on-disk lineage.
 
-### 4. Supervised rollback
+### 4. Supervised failure policy
 
-`cmd/sage-launcher` runs in `--supervise` mode as the parent process of the chain binary. On child exit it:
+Since v11.16.1 `cmd/sage-launcher --supervise` treats any pre-existing or child-produced `~/.sage/data/HALT` as diagnostic evidence only. It preserves the sentinel, refuses to spawn/restore/exec, and exits non-zero with stopped-node backup and governed-recovery guidance. The historical `ReadHaltSignal` and `HandleHalt` primitives remain for explicit offline recovery tooling and compatibility tests, but the production supervisor never calls them.
 
-1. Reads `~/.sage/data/HALT`. Absent → propagate exit code (healthy path); present → enter rollback.
-2. Resolves the rollback anchor: `findLatestRollbackAnchor` scans `~/.sage/data/snapshots/` newest-first by mtime, picks the first directory whose `manifest.BinaryVersion != HALT.FailedVersion`.
-3. Locates the rollback binary at `<anchor>/binary/sage-gui-<version>`.
-4. Calls the injected `Restorer` (production: `internal/snapshot.Restore`) which Verify-gates the anchor (chunk hashes + SQLite integrity check + badger backup replayed into a tmpdir with `ComputeAppHash` comparison) before atomically swapping in BadgerDB, SQLite, and CometBFT data.
-5. Writes a `ROLLBACK_TRIGGERED` event to `~/.sage/launcher.log`.
-6. Clears the HALT sentinel.
-7. `syscall.Exec`s the rollback binary, replacing the launcher process. PID continuity preserved so outer supervisors (launchd / systemd) keep the same PID through the swap.
-
-Crash-loop circuit breaker: 3 non-HALT crashes within a 60s sliding window halts the supervisor with a clear error — better to surface "this binary cannot start" than to thrash in a restart loop.
+Without HALT, the crash-loop circuit breaker allows 3 crashes within a 60s sliding window and then halts the supervisor with a clear error. No automatic failure path restores chain state or executes an older binary.
 
 ### Operator behaviour
 
@@ -608,7 +600,7 @@ For federated multi-validator deployments, the chain-computed activation height 
 
 ### Wire format contracts
 
-The HALT sentinel field names (`failed_version`, `rollback_to`, `failure_message`, `timestamp`) are stable wire format between the chain binary's `cmd/sage-gui/halt_writer.go::haltSignal` and the launcher's `cmd/sage-launcher/halt_sentinel.go::HaltSignal`. The manifest's `taken_at` is an RFC3339 string (Go's default JSON encoding of `time.Time`), NOT a unix-epoch int64.
+The legacy HALT sentinel field names (`failed_version`, `rollback_to`, `failure_message`, `timestamp`) remain a stable wire format for offline/explicit recovery tools and the launcher's `cmd/sage-launcher/halt_sentinel.go::HaltSignal`. The manifest's `taken_at` is an RFC3339 string (Go's default JSON encoding of `time.Time`), NOT a unix-epoch int64.
 
 ---
 

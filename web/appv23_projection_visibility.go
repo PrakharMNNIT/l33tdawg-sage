@@ -17,9 +17,63 @@ import (
 
 const appV23DashboardProjectionPageSize = 256
 
+const appV23PartialProjectionMessage = "Some memories are temporarily hidden because their canonical state could not be verified. Your stored data was not changed."
+
 var errAppV23DashboardProjectionUnavailable = errors.New(
 	"app-v23 dashboard memory projection is unavailable",
 )
+
+// appV23ProjectionResponse is safe to expose to CEREBRUM. It deliberately
+// contains no skipped count, memory identity, domain, author, status, or reason.
+type appV23ProjectionResponse struct {
+	Complete     bool   `json:"complete"`
+	Partial      bool   `json:"partial"`
+	VerifiedOnly bool   `json:"verified_only"`
+	State        string `json:"state"`
+	Message      string `json:"message,omitempty"`
+}
+
+func (h *DashboardHandler) appV23ProjectionResponse() *appV23ProjectionResponse {
+	if !h.appV23IsActive() || h.BadgerStore == nil {
+		return nil
+	}
+	health := h.BadgerStore.CanonicalMemoryProjectionHealth()
+	complete := health.Checked && health.Required && health.OK && !health.Quarantined
+	response := &appV23ProjectionResponse{
+		Complete:     complete,
+		Partial:      !complete,
+		VerifiedOnly: true,
+		State:        health.State,
+	}
+	if !complete {
+		response.Message = appV23PartialProjectionMessage
+	}
+	return response
+}
+
+func appV23ProjectionResponseFromAudit(
+	legacyCompatible, quarantined, subset bool,
+) *appV23ProjectionResponse {
+	state := store.CanonicalMemoryProjectionExact
+	switch {
+	case quarantined:
+		state = store.CanonicalMemoryProjectionQuarantined
+	case subset:
+		state = store.CanonicalMemoryProjectionSubset
+	case legacyCompatible:
+		state = store.CanonicalMemoryProjectionLegacyCompatible
+	}
+	response := &appV23ProjectionResponse{
+		Complete:     !quarantined,
+		Partial:      quarantined,
+		VerifiedOnly: true,
+		State:        state,
+	}
+	if quarantined {
+		response.Message = appV23PartialProjectionMessage
+	}
+	return response
+}
 
 func appV23DashboardProjectionError(err error) error {
 	if err == nil {
@@ -68,14 +122,20 @@ func (h *DashboardHandler) classifyAppV23DashboardRecord(
 	return disposition, nil
 }
 
-func isAppV23UnsafeDashboardRecord(err error) bool {
-	return errors.Is(err, store.ErrMemoryProjectionUnpublished)
+func isAppV23LegacyUnanchoredDashboardRecord(
+	disposition store.MemoryProjectionDisposition,
+	err error,
+) bool {
+	return disposition == store.MemoryProjectionLegacyUnanchored &&
+		errors.Is(err, store.ErrMemoryProjectionUnpublished) &&
+		errors.Is(err, store.ErrMemoryDisclosureNotFound)
 }
 
-// filterAppV23BroadDashboardRecords validates every row before it consumes a
-// visible result/count. A broad collection must fail closed when it encounters
-// an unsafe row: silently omitting it would turn an unavailable projection into
-// a plausible empty or partial CEREBRUM response.
+// filterAppV23BroadDashboardRecords omits unsafe rows before they consume a
+// visible result/count. Exact/detail and export paths intentionally do not use
+// this helper: they retain fail-closed behavior. Broad callers must surface the
+// aggregate projection health alongside their verified result so an all-hidden
+// projection can never be mistaken for a genuinely empty brain.
 func (h *DashboardHandler) filterAppV23BroadDashboardRecords(
 	records []*memory.MemoryRecord,
 ) ([]*memory.MemoryRecord, error) {
@@ -84,7 +144,11 @@ func (h *DashboardHandler) filterAppV23BroadDashboardRecords(
 	}
 	kept := make([]*memory.MemoryRecord, 0, len(records))
 	for _, record := range records {
-		if _, err := h.classifyAppV23DashboardRecord(record); err != nil {
+		disposition, err := h.classifyAppV23DashboardRecord(record)
+		if err != nil {
+			if isAppV23LegacyUnanchoredDashboardRecord(disposition, err) {
+				continue
+			}
 			return nil, err
 		}
 		kept = append(kept, record)
@@ -98,13 +162,32 @@ type appV23ProjectionWalkAudit struct {
 	seenMemoryIDs    map[string]struct{}
 }
 
-func rejectAppV23QuarantinedAudit(audit appV23ProjectionWalkAudit) error {
-	if !audit.quarantined {
-		return nil
+// requireAppV23DashboardProjectionAudited performs a complete canonical
+// inventory audit and returns only the verified rows' aggregates. A quarantined
+// row is deliberately not an error here: broad routes omit it and surface the
+// aggregate health explicitly. Backend failures and an incomplete audit still
+// fail closed.
+func (h *DashboardHandler) requireAppV23DashboardProjectionAudited(
+	ctx context.Context,
+) (*store.StoreStats, map[string]string, *appV23ProjectionResponse, error) {
+	if !h.appV23IsActive() {
+		return nil, nil, nil, nil
 	}
-	return appV23DashboardProjectionError(
-		errors.New("serving projection contains unsafe canonical memory records"),
-	)
+	if h.BadgerStore == nil {
+		return nil, nil, nil,
+			appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
+	}
+	stats, activity, projection, err := h.cerebrumVisibleStatsAndActivity(ctx)
+	if err != nil {
+		return nil, nil, nil, appV23DashboardProjectionError(err)
+	}
+	health := h.BadgerStore.CanonicalMemoryProjectionHealth()
+	if !health.Checked || !health.Required {
+		return nil, nil, nil, appV23DashboardProjectionError(
+			errors.New("canonical memory projection audit is unavailable"),
+		)
+	}
+	return stats, activity, projection, nil
 }
 
 // requireAppV23DashboardProjectionAvailable performs a complete canonical
@@ -116,28 +199,20 @@ func rejectAppV23QuarantinedAudit(audit appV23ProjectionWalkAudit) error {
 // Older app versions retain their historical behavior.
 func (h *DashboardHandler) requireAppV23DashboardProjectionAvailable(
 	ctx context.Context,
-) (*store.StoreStats, map[string]string, error) {
-	if !h.appV23IsActive() {
-		return nil, nil, nil
-	}
-	if h.BadgerStore == nil {
-		return nil, nil,
-			appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
-	}
-	stats, activity, err := h.cerebrumVisibleStatsAndActivity(ctx)
+) (*store.StoreStats, map[string]string, *appV23ProjectionResponse, error) {
+	stats, activity, projection, err := h.requireAppV23DashboardProjectionAudited(ctx)
 	if err != nil {
-		// The audit can fail with a backend/paging error that is not yet wrapped
-		// as a projection failure. Every failure on this guard is an availability
-		// failure to callers, never a 500/fallback-to-empty opportunity.
-		return nil, nil, appV23DashboardProjectionError(err)
+		return nil, nil, nil, err
 	}
-	health := h.BadgerStore.CanonicalMemoryProjectionHealth()
-	if !health.Checked || !health.Required || !health.OK || health.Quarantined {
-		return nil, nil, appV23DashboardProjectionError(
+	if !h.appV23IsActive() {
+		return stats, activity, projection, nil
+	}
+	if projection == nil || projection.Partial {
+		return nil, nil, nil, appV23DashboardProjectionError(
 			errors.New("canonical memory projection audit is unavailable"),
 		)
 	}
-	return stats, activity, nil
+	return stats, activity, projection, nil
 }
 
 // AuditAppV23CanonicalMemoryProjection performs the complete, deterministic
@@ -154,7 +229,7 @@ func (h *DashboardHandler) AuditAppV23CanonicalMemoryProjection(
 		h.BadgerStore.PublishCanonicalMemoryProjectionAudit(false, false, false)
 		return nil
 	}
-	_, _, err := h.cerebrumVisibleStatsAndActivity(ctx)
+	_, _, _, err := h.requireAppV23DashboardProjectionAvailable(ctx)
 	return err
 }
 
@@ -199,9 +274,9 @@ func (h *DashboardHandler) walkAppV23CanonicalDashboardRecords(
 }
 
 // walkAppV23BroadDashboardRecords is the collection-safe companion to the exact
-// walker above. Unsafe rows fail the entire walk before a plausible empty or
-// partial response can be emitted; the returned audit contains booleans and an
-// internal inventory only and never exposes raw hidden counts or identities.
+// walker above. Unsafe rows are omitted before visit, pagination, and aggregate
+// counts. The audit retains only health booleans and an internal inventory; no
+// hidden identity or count enters a response.
 func (h *DashboardHandler) walkAppV23BroadDashboardRecords(
 	ctx context.Context,
 	opts store.ListOptions,
@@ -231,8 +306,9 @@ func (h *DashboardHandler) walkAppV23BroadDashboardRecords(
 			}
 			disposition, projectionErr := h.classifyAppV23DashboardRecord(record)
 			if projectionErr != nil {
-				if isAppV23UnsafeDashboardRecord(projectionErr) {
+				if isAppV23LegacyUnanchoredDashboardRecord(disposition, projectionErr) {
 					audit.quarantined = true
+					continue
 				}
 				return audit, projectionErr
 			}
@@ -348,7 +424,7 @@ func (h *DashboardHandler) appV23CanonicalDashboardPage(
 	}
 	page := make([]*memory.MemoryRecord, 0, limit)
 	total := 0
-	audit, err := h.walkAppV23BroadDashboardRecords(
+	_, err := h.walkAppV23BroadDashboardRecords(
 		ctx, opts,
 		func(record *memory.MemoryRecord) error {
 			if total >= offset && len(page) < limit {
@@ -361,9 +437,6 @@ func (h *DashboardHandler) appV23CanonicalDashboardPage(
 	if err != nil {
 		return nil, 0, err
 	}
-	if err := rejectAppV23QuarantinedAudit(audit); err != nil {
-		return nil, 0, err
-	}
 	if offset >= total {
 		return []*memory.MemoryRecord{}, total, nil
 	}
@@ -372,11 +445,11 @@ func (h *DashboardHandler) appV23CanonicalDashboardPage(
 
 func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 	ctx context.Context,
-) (*store.StoreStats, map[string]string, error) {
+) (*store.StoreStats, map[string]string, *appV23ProjectionResponse, error) {
 	if !h.appV23IsActive() {
 		stats, err := h.legacyCerebrumVisibleStats(ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		var activity map[string]string
 		if provider, ok := h.store.(domainActivityProvider); ok {
@@ -387,13 +460,13 @@ func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 				}
 			}
 		}
-		return stats, activity, nil
+		return stats, activity, nil, nil
 	}
 
 	// Preserve backend-local size metadata, but never any SQL-derived counts.
 	rawStats, err := h.store.GetStats(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	stats := &store.StoreStats{
 		ByDomain: make(map[string]int),
@@ -429,15 +502,12 @@ func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 		},
 	)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := rejectAppV23QuarantinedAudit(audit); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	subsetAllowed := h.CanonicalProjectionMissingAllowedFn != nil
 	canonicalMemoryIDs, inventoryErr := store.CanonicalMemoryIDs(h.BadgerStore)
 	if inventoryErr != nil {
-		return nil, nil, appV23DashboardProjectionError(inventoryErr)
+		return nil, nil, nil, appV23DashboardProjectionError(inventoryErr)
 	}
 	for _, memoryID := range canonicalMemoryIDs {
 		if _, ok := audit.seenMemoryIDs[memoryID]; ok {
@@ -456,7 +526,7 @@ func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 				true, audit.legacyCompatible, true,
 			)
 		}
-		return nil, nil, appV23DashboardProjectionError(
+		return nil, nil, nil, appV23DashboardProjectionError(
 			errors.New("serving projection is missing canonical memory records"),
 		)
 	}
@@ -473,7 +543,9 @@ func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 	for domain, at := range latestByDomain {
 		activity[domain] = at.UTC().Format(time.RFC3339Nano)
 	}
-	return stats, activity, nil
+	return stats, activity, appV23ProjectionResponseFromAudit(
+		audit.legacyCompatible, audit.quarantined, subsetAllowed,
+	), nil
 }
 
 func (h *DashboardHandler) appV23CanonicalTimeline(
@@ -483,7 +555,7 @@ func (h *DashboardHandler) appV23CanonicalTimeline(
 ) ([]store.TimelineBucket, error) {
 	counts := make(map[string]int)
 	formatter, _ := h.store.(store.TimelinePeriodFormatter)
-	audit, err := h.walkAppV23BroadDashboardRecords(
+	_, err := h.walkAppV23BroadDashboardRecords(
 		ctx,
 		cerebrumListOptions(store.ListOptions{
 			DomainTag:   domain,
@@ -506,9 +578,6 @@ func (h *DashboardHandler) appV23CanonicalTimeline(
 		},
 	)
 	if err != nil {
-		return nil, err
-	}
-	if err := rejectAppV23QuarantinedAudit(audit); err != nil {
 		return nil, err
 	}
 	periods := make([]string, 0, len(counts))

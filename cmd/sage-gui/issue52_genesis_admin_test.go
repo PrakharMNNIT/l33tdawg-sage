@@ -170,14 +170,52 @@ func TestIssue52_HealGenesisAdminIfReset(t *testing.T) {
 	})
 }
 
-// TestIssue52_HealThenInitChain_EndToEnd exercises the REAL runServe ordering on a
+func TestIssue52_ExistingAdminlessGenesisIsNotHealedAtStartup(t *testing.T) {
+	cometHome := t.TempDir()
+	sageHome := t.TempDir()
+	t.Setenv("SAGE_HOME", sageHome)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(sageHome, "agent.key"), priv.Seed(), 0o600))
+
+	i52WriteGenesis(t, cometHome, 1, nil)
+	genesisPath := filepath.Join(cometHome, "config", "genesis.json")
+	before, err := os.ReadFile(genesisPath)
+	require.NoError(t, err)
+
+	require.NoError(t, ensureGenesisSeed(cometHome, zerolog.Nop()))
+	after, err := os.ReadFile(genesisPath)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "startup must not rewrite existing genesis authority")
+	require.False(t, genesisAppStateHasInitialAdmin(i52ReadGenesisAppState(t, cometHome)))
+	require.NoFileExists(t, genesisPath+".bak")
+}
+
+func TestInitializedOriginMissingGenesisRefusesWithoutMutation(t *testing.T) {
+	cometHome := t.TempDir()
+	statePath := filepath.Join(cometHome, "data", "state.db", "sentinel")
+	require.NoError(t, os.MkdirAll(filepath.Dir(statePath), 0o700))
+	require.NoError(t, os.WriteFile(statePath, []byte("preserve"), 0o600))
+
+	err := preflightGenesisOrigin(cometHome, false)
+	require.Error(t, err)
+	data, readErr := os.ReadFile(statePath)
+	require.NoError(t, readErr)
+	require.Equal(t, "preserve", string(data))
+	require.NoFileExists(t, filepath.Join(cometHome, "config", "genesis.json"))
+}
+
+// legacyIssue52HealThenInitChainEndToEnd documented the retired automatic heal.
+// It is deliberately no longer a Test.
+//
+// It exercised the REAL runServe ordering on a
 // reset, admin-less personal chain: initCometBFTConfig (must NOT seed an existing
 // genesis) -> healGenesisAdminIfReset (must inject the seed) -> a fresh abci.SageApp
 // InitChain consuming that healed genesis (must register the operator as admin). This
 // ties the node-layer heal to the consensus-layer seed end-to-end, rather than testing
 // each half in isolation. (migrateOnUpgrade is a no-op without a version change, so the
 // meaningful ordering is initCometBFTConfig -> heal -> InitChain.)
-func TestIssue52_HealThenInitChain_EndToEnd(t *testing.T) {
+func legacyIssue52HealThenInitChainEndToEnd(t *testing.T) {
 	cometHome := t.TempDir()
 	sageHome := t.TempDir()
 	t.Setenv("SAGE_HOME", sageHome)
@@ -247,11 +285,37 @@ func TestIssue52_HealThenInitChain_EndToEnd(t *testing.T) {
 	require.Equal(t, "admin", ag.Role, "healed operator must hold the admin role end-to-end")
 }
 
-// TestIssue52_RepairChainState covers the `sage-gui repair-chain` recovery core: a
+func TestIssue52_RepairChainStateIsDisabledAndPreservesHistory(t *testing.T) {
+	dataDir := t.TempDir()
+	sageHome := t.TempDir()
+	t.Setenv("SAGE_HOME", sageHome)
+
+	cometHome := filepath.Join(dataDir, "cometbft")
+	i52WriteGenesis(t, cometHome, 1, nil)
+	cometData := filepath.Join(cometHome, "data")
+	require.NoError(t, os.MkdirAll(filepath.Join(cometData, "blockstore.db"), 0o700))
+	require.NoError(t, os.MkdirAll(filepath.Join(cometData, "state.db"), 0o700))
+	badgerPath := filepath.Join(dataDir, "badger")
+	require.NoError(t, os.MkdirAll(badgerPath, 0o700))
+	sentinel := filepath.Join(badgerPath, "canonical.sentinel")
+	require.NoError(t, os.WriteFile(sentinel, []byte("preserve"), 0o600))
+
+	err := repairChainState(dataDir, zerolog.Nop())
+	require.ErrorIs(t, err, errDestructiveChainRepairDisabled)
+	require.DirExists(t, filepath.Join(cometData, "blockstore.db"))
+	require.DirExists(t, filepath.Join(cometData, "state.db"))
+	require.FileExists(t, sentinel)
+	require.False(t, genesisAppStateHasInitialAdmin(i52ReadGenesisAppState(t, cometHome)))
+}
+
+// legacyIssue52RepairChainStateBehavior documents the retired destructive
+// behavior. It is deliberately no longer a Test: v11.16.1 disables this path.
+//
+// It previously covered a `sage-gui repair-chain` core that reset and healed a
 // single-validator chain stranded past app-v9 (admin-less genesis, live block/state)
 // is reset and healed so the next boot re-seeds the operator as admin; a multi-validator
 // chain is refused untouched; an uninitialised data dir errors.
-func TestIssue52_RepairChainState(t *testing.T) {
+func legacyIssue52RepairChainStateBehavior(t *testing.T) {
 	t.Run("single-validator deadlocked chain -> reset + heal", func(t *testing.T) {
 		dataDir := t.TempDir()
 		sageHome := t.TempDir()

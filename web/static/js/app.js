@@ -51,7 +51,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.16.0';
+const SAGE_VERSION = 'v11.16.1';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -281,6 +281,7 @@ function useModalDialog(onRequestClose, active = true) {
 function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onSelectDomain }) {
     const [inventory, setInventory] = useState(null);
     const [localProjectionError, setLocalProjectionError] = useState(false);
+    const [projectionNotice, setProjectionNotice] = useState(null);
     const [loadingRemote, setLoadingRemote] = useState(false);
     const [federationError, setFederationError] = useState('');
     const [domainFilter, setDomainFilter] = useState('');
@@ -320,7 +321,9 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
                 return;
             }
             setLocalProjectionError(false);
-            if (onAvailability) onAvailability('ready');
+            const partialProjection = stats.projection?.partial === true;
+            setProjectionNotice(partialProjection ? stats.projection : null);
+            if (onAvailability) onAvailability(partialProjection ? 'partial' : 'ready');
             const connections = connectionsPayload && Array.isArray(connectionsPayload.connections)
                 ? connectionsPayload.connections
                 : [];
@@ -537,6 +540,12 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
                 </button>
             </div>
         </div>
+        ${projectionNotice && html`
+            <div class="brain-projection-warning" role="alert">
+                <strong>Verified memories shown</strong>
+                <span>${projectionNotice.message || 'Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed.'}</span>
+            </div>
+        `}
         ${!collapsed && html`<div class="brain-domain-body">
             ${showGuide && html`<section class="brain-domain-guide" aria-label="How to read the memory brain">
                 <p>SAGE captures episodic memories; corroboration and decay shape what consolidates.</p>
@@ -672,6 +681,7 @@ function MriView({ sse }) {
     };
     const noLocalMemories = inventory && inventory.localMemoryTotal === 0;
     const hasSharedDomains = inventory && inventory.sharedDomains.length > 0;
+    const partialProjection = projectionAvailability === 'partial';
     return html`<div class="mri-wrap">
         <div class="mri-stage" ref=${ref}></div>
         <${BrainDomainInventory} onInventory=${setInventory} onAvailability=${setProjectionAvailability}
@@ -683,7 +693,12 @@ function MriView({ sse }) {
                 actionLabel="Reload CEREBRUM"
                 onAction=${() => window.location.reload()} />
         </div>`}
-        ${noLocalMemories && html`<div class="brain-empty-overlay">
+        ${noLocalMemories && partialProjection && html`<div class="brain-empty-overlay" role="alert">
+            <${EmptyState} icon="brain"
+                headline="No verified memories can be shown yet"
+                hint="Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed." />
+        </div>`}
+        ${noLocalMemories && !partialProjection && html`<div class="brain-empty-overlay">
             <${EmptyState} icon="brain"
                 headline=${hasSharedDomains ? 'No memories stored locally' : 'Your brain is empty'}
                 hint=${hasSharedDomains
@@ -7214,9 +7229,10 @@ function HealthBar() {
     const domains = health.memories?.by_domain && typeof health.memories.by_domain === 'object'
         ? Object.keys(health.memories.by_domain).length
         : null;
+    const partialProjection = health.memory_projection?.partial === true;
 
     return html`
-        <div class="health-bar">
+        <div class="health-bar ${partialProjection ? 'health-bar-partial' : ''}">
             <div class="health-item" title="${embedderStatus.detail || ''}">
                 <div class="health-dot ${embedderStatus.online ? 'ok' : 'err'}"></div>
                 <span>${embedderStatus.label}</span>
@@ -7228,7 +7244,11 @@ function HealthBar() {
             </div>
             <div class="health-sep"></div>
             <div class="health-item">
-                <span class="health-num">${totalMem === null ? '—' : totalMem}</span> memories <${HelpTip} text="Total committed memories across all domains and agents." />
+                <span class="health-num">${totalMem === null ? '—' : totalMem}</span>
+                ${partialProjection ? 'verified memories' : 'memories'}
+                <${HelpTip} text=${partialProjection
+                    ? 'Canonically verified memories currently visible. Some historical records are temporarily hidden.'
+                    : 'Total committed memories across all domains and agents.'} />
             </div>
             <div class="health-sep"></div>
             <div class="health-item">
@@ -7238,6 +7258,13 @@ function HealthBar() {
             <div class="health-item">
                 <span style="color: var(--text-muted)">uptime</span> ${formatUptime(uptimeSec)} <${PageHelp} section="cerebrum-view" label="Cerebrum guide" />
             </div>
+            ${partialProjection && html`
+                <div class="health-item health-projection-warning" role="alert">
+                    <div class="health-dot warning"></div>
+                    <strong>Verified view</strong>
+                    <span>Some historical records are hidden; stored data is unchanged.</span>
+                </div>
+            `}
         </div>
     `;
 }

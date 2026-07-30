@@ -122,7 +122,7 @@ func (s *BadgerStore) observeMemoryProjectionDisposition(
 		if !status.Quarantined {
 			status.State = CanonicalMemoryProjectionLegacyCompatible
 		}
-	case MemoryProjectionQuarantined, MemoryProjectionUnpublished:
+	case MemoryProjectionLegacyUnanchored, MemoryProjectionQuarantined, MemoryProjectionUnpublished:
 		status.Checked = true
 		status.OK = false
 		status.Quarantined = true

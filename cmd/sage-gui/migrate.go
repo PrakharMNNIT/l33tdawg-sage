@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,27 +17,28 @@ import (
 
 const versionFile = "version.txt"
 
+var errAutomaticChainResetRefused = errors.New(
+	"automatic chain reset refused to preserve canonical history",
+)
+
 // migrateOnUpgrade reconciles persisted chain state with the running binary.
-// It performs the destructive reset (back up SQLite, wipe BadgerDB + CometBFT
-// blocks/state) ONLY when the on-disk consensus fork tag differs from the
-// binary's ConsensusForkVersion — i.e. the new release made existing chain
-// state incompatible at the encoding/protocol level.
+// Same-fork upgrades are stamped in place. A legacy or mismatched fork is
+// refused without changing any state: rebuilding from SQLite cannot reconstruct
+// canonical memory envelopes, RBAC, governance, or historical blocks, and is
+// therefore not an upgrade migration.
 //
 // Pre-v7.5.5 behaviour was to reset on ANY version-string change, which
 // silently destroyed operator state — domain registry, access grants, org
 // memberships, validator set — on every patch and minor bump. See the
 // ConsensusForkVersion docstring for why this gate exists.
 //
-// Returns migrated=true ONLY when the reset actually ran. Same-fork upgrades
-// (patches, minor bumps, RC tags) return false even when the version string
-// changed: state is preserved and only version.txt is re-stamped for
-// operator diagnostics.
+// migrated is retained for call-site compatibility and is always false: safe
+// same-fork reconciliation stamps diagnostics, while incompatible state returns
+// errAutomaticChainResetRefused without changing anything.
 func migrateOnUpgrade(dataDir string) (migrated bool, err error) {
+	_ = dataDir
 	versionPath := filepath.Join(SageHome(), versionFile)
 	forkPath := filepath.Join(SageHome(), forkVersionFile)
-	cometHome := filepath.Join(dataDir, "cometbft")
-	badgerPath := filepath.Join(dataDir, "badger")
-	sqlitePath := filepath.Join(dataDir, "sage.db")
 
 	// Dev builds: never touch state.
 	if version == "dev" {
@@ -47,10 +49,49 @@ func migrateOnUpgrade(dataDir string) (migrated bool, err error) {
 	if data, readErr := os.ReadFile(versionPath); readErr == nil {
 		lastVersion = strings.TrimSpace(string(data))
 	}
-	onDiskFork := readForkVersion(forkPath)
+	onDiskFork, forkMarkerPresent, forkReadErr := inspectForkVersion(forkPath)
+	if forkReadErr != nil {
+		return false, fmt.Errorf(
+			"%w: cannot verify persisted fork marker: %v; no files were changed",
+			errAutomaticChainResetRefused,
+			forkReadErr,
+		)
+	}
 
 	// Fresh install — no prior state. Stamp both files and return.
-	if lastVersion == "" && onDiskFork == 0 {
+	if lastVersion == "" && !forkMarkerPresent {
+		cometHome := filepath.Join(dataDir, "cometbft")
+		if evidence, evidenceErr := persistedNodeIdentityEvidence(
+			SageHome(),
+			dataDir,
+			cometHome,
+		); evidenceErr != nil {
+			return false, fmt.Errorf(
+				"%w: cannot verify whether this marker-less data directory is fresh: %v; no files were changed",
+				errAutomaticChainResetRefused,
+				evidenceErr,
+			)
+		} else if evidence != "" {
+			return false, fmt.Errorf(
+				"%w: version/fork markers are missing but persisted chain evidence exists (%s); "+
+					"no files were changed",
+				errAutomaticChainResetRefused,
+				evidence,
+			)
+		}
+		if _, statErr := os.Lstat(filepath.Join(dataDir, "badger")); statErr == nil {
+			return false, fmt.Errorf(
+				"%w: version/fork markers are missing but a Badger path already exists; "+
+					"no files were changed",
+				errAutomaticChainResetRefused,
+			)
+		} else if !os.IsNotExist(statErr) {
+			return false, fmt.Errorf(
+				"%w: cannot inspect marker-less Badger path: %v; no files were changed",
+				errAutomaticChainResetRefused,
+				statErr,
+			)
+		}
 		if stampErr := stampForkVersion(forkPath, ConsensusForkVersion); stampErr != nil {
 			return false, stampErr
 		}
@@ -66,10 +107,9 @@ func migrateOnUpgrade(dataDir string) (migrated bool, err error) {
 	//       not produce a spurious reset.
 	//
 	//   (b) lastVersion is older (v6.x, v7.0..v7.4). Different fork lineage —
-	//       chain state encoding is incompatible with the current binary.
-	//       Run the destructive reset before stamping fork=1, otherwise the
-	//       new binary tries to read incompatible Badger/CometBFT state.
-	if onDiskFork == 0 {
+	//       refuse without stamping or modifying state. A history-preserving
+	//       migration is required.
+	if !forkMarkerPresent {
 		if isLegacyForkOneVersion(lastVersion) {
 			if stampErr := stampForkVersion(forkPath, ConsensusForkVersion); stampErr != nil {
 				return false, stampErr
@@ -80,18 +120,11 @@ func migrateOnUpgrade(dataDir string) (migrated bool, err error) {
 			return false, stampVersion(versionPath)
 		}
 
-		fmt.Fprintf(os.Stderr, "\n  SAGE %s → %s · one-time chain-index rebuild for an older install. Your memories are safe — they'll be backed up first, then the chain rebuilds itself from them.\n", lastVersion, version)
-		if resetErr := resetChainState(dataDir, badgerPath, cometHome, sqlitePath, lastVersion); resetErr != nil {
-			return false, resetErr
-		}
-		if stampErr := stampForkVersion(forkPath, ConsensusForkVersion); stampErr != nil {
-			return false, stampErr
-		}
-		if stampErr := stampVersion(versionPath); stampErr != nil {
-			return false, stampErr
-		}
-		fmt.Fprintf(os.Stderr, "  Upgrade complete · your memories are intact at %s · chain will rebuild on first run\n\n", sqlitePath)
-		return true, nil
+		return false, fmt.Errorf(
+			"%w: SAGE %s cannot be upgraded automatically to %s because its persisted "+
+				"fork marker predates safe in-place migration; no files were changed",
+			errAutomaticChainResetRefused, lastVersion, version,
+		)
 	}
 
 	// Same fork — patch/minor upgrade that doesn't touch consensus state.
@@ -102,28 +135,51 @@ func migrateOnUpgrade(dataDir string) (migrated bool, err error) {
 		return false, stampVersion(versionPath)
 	}
 
-	// Fork transition — chain state is incompatible. Run the reset.
-	fmt.Fprintf(os.Stderr, "\n  SAGE %s → %s · this release introduces a new chain format. Your memories are safe — they'll be backed up first, then the chain rebuilds itself from them.\n", lastVersion, version)
-	if resetErr := resetChainState(dataDir, badgerPath, cometHome, sqlitePath, lastVersion); resetErr != nil {
-		return false, resetErr
-	}
+	// A fork transition must be implemented as an in-place deterministic
+	// migration or governed application upgrade. Never erase the old canonical
+	// state and synthesize a new chain from the SQLite serving projection.
+	return false, fmt.Errorf(
+		"%w: SAGE %s uses persisted fork %d but %s expects fork %d; "+
+			"no files were changed",
+		errAutomaticChainResetRefused,
+		lastVersion, onDiskFork, version, ConsensusForkVersion,
+	)
+}
 
-	if stampErr := stampForkVersion(forkPath, ConsensusForkVersion); stampErr != nil {
-		return false, stampErr
+// genuinelyFreshNodeOrigin is evaluated before startup creates directories,
+// keys, sockets, or migration stamps. Marker presence or any durable node
+// identity evidence makes the origin initialized/ambiguous, never fresh.
+func genuinelyFreshNodeOrigin(dataDir string) (bool, error) {
+	for _, marker := range []string{versionFile, forkVersionFile} {
+		path := filepath.Join(SageHome(), marker)
+		if _, err := os.Lstat(path); err == nil {
+			return false, nil
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("inspect %s: %w", marker, err)
+		}
 	}
-	if stampErr := stampVersion(versionPath); stampErr != nil {
-		return false, stampErr
+	cometHome := filepath.Join(dataDir, "cometbft")
+	evidence, err := persistedNodeIdentityEvidence(SageHome(), dataDir, cometHome)
+	if err != nil {
+		return false, err
 	}
-
-	fmt.Fprintf(os.Stderr, "  Upgrade complete · your memories are intact at %s · chain will rebuild on first run\n\n", sqlitePath)
+	if evidence != "" {
+		return false, nil
+	}
+	// An empty Badger path can be the remnant of an interrupted first launch.
+	// At this pre-mutation point it is ambiguous, so fail closed.
+	if _, err := os.Lstat(filepath.Join(dataDir, "badger")); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("inspect Badger path: %w", err)
+	}
 	return true, nil
 }
 
-// resetChainState performs the destructive part of a fork-transition upgrade:
+// resetChainState performs an explicit destructive chain reset:
 // back up the vault key + SQLite, wipe BadgerDB, wipe CometBFT block/state DBs,
-// and run the noisy-memory cleanup. Extracted from migrateOnUpgrade so the
-// fork-version gate can call it conditionally rather than on every version
-// string change.
+// and retain config/genesis. SQLite cannot reconstruct the deleted canonical
+// history; automatic migration and chain-id re-mint paths must never call this.
 func resetChainState(dataDir, badgerPath, cometHome, sqlitePath, lastVersion string) error {
 	// Step -1: Refuse to run while another SAGE instance is live on this home.
 	// A serving node holds BadgerDB's directory lock; if we proceeded we would delete
@@ -138,8 +194,7 @@ func resetChainState(dataDir, badgerPath, cometHome, sqlitePath, lastVersion str
 		// BadgerDB has no typed open error. A SERVING node fails the open with the
 		// directory-lock message — the only case that means "stop, the node is running".
 		// Any OTHER failure (corrupt/unreadable index, or a fresh/empty dir) is not a
-		// liveness signal: reset rebuilds badger from the SQLite memories without
-		// needing a readable index, so fall through.
+		// liveness signal for this explicitly destructive command, so fall through.
 		if strings.Contains(openErr.Error(), "Another process is using this Badger database") {
 			return fmt.Errorf("your memories are intact — another SAGE instance is running on this home; stop it and retry before any chain rebuild: %w", openErr)
 		}
@@ -214,8 +269,7 @@ func resetChainState(dataDir, badgerPath, cometHome, sqlitePath, lastVersion str
 		}
 	}
 
-	// Step 2: Rebuild BadgerDB chain index (memories live in SQLite and
-	// are untouched here — Badger only stores derived on-chain registries).
+	// Step 2: Delete canonical Badger state. SQLite cannot reconstruct it.
 	if _, statErr := os.Stat(badgerPath); statErr == nil {
 		if removeErr := os.RemoveAll(badgerPath); removeErr != nil {
 			return fmt.Errorf("remove badger: %w", removeErr)
@@ -223,18 +277,17 @@ func resetChainState(dataDir, badgerPath, cometHome, sqlitePath, lastVersion str
 		if mkErr := os.MkdirAll(badgerPath, 0700); mkErr != nil {
 			return fmt.Errorf("recreate badger dir: %w", mkErr)
 		}
-		fmt.Fprintf(os.Stderr, "  Rebuilding chain index\n")
+		fmt.Fprintf(os.Stderr, "  Deleted canonical chain index\n")
 	}
 
-	// Step 3: Rebuild CometBFT consensus log (blocks/votes — memories
-	// live in SQLite and are untouched here). Keep config (genesis, keys);
-	// remove block/state databases and consensus WAL.
+	// Step 3: Delete CometBFT blocks, votes, state, and WAL. Keep
+	// config/genesis, but do not claim this can be rebuilt from SQLite.
 	cometDataDir := filepath.Join(cometHome, "data")
 	if _, statErr := os.Stat(cometDataDir); statErr == nil {
 		for _, dbName := range []string{"blockstore.db", "state.db", "tx_index.db", "evidence.db", "cs.wal"} {
 			dbPath := filepath.Join(cometDataDir, dbName)
 			if removeErr := os.RemoveAll(dbPath); removeErr != nil {
-				fmt.Fprintf(os.Stderr, "  Note: could not clear %s: %v (the chain will rebuild from your memories regardless)\n", dbName, removeErr)
+				fmt.Fprintf(os.Stderr, "  Note: could not clear %s: %v\n", dbName, removeErr)
 			}
 		}
 		pvStatePath := filepath.Join(cometDataDir, "priv_validator_state.json")
@@ -242,122 +295,10 @@ func resetChainState(dataDir, badgerPath, cometHome, sqlitePath, lastVersion str
 		if writeErr := os.WriteFile(pvStatePath, pvState, 0600); writeErr != nil {
 			fmt.Fprintf(os.Stderr, "  Note: could not reset validator state: %v\n", writeErr)
 		}
-		fmt.Fprintf(os.Stderr, "  Rebuilding consensus log\n")
-	}
-
-	// Step 4: Tidy noise + duplicate memories in SQLite (status-only
-	// flag — no rows deleted, reversible).
-	if _, statErr := os.Stat(sqlitePath); statErr == nil {
-		cleaned := cleanupNoisyMemories(sqlitePath)
-		if cleaned > 0 {
-			fmt.Fprintf(os.Stderr, "  Tidied %d duplicate/low-quality memories (marked deprecated, not deleted)\n", cleaned)
-		}
+		fmt.Fprintf(os.Stderr, "  Deleted consensus log\n")
 	}
 
 	return nil
-}
-
-// cleanupNoisyMemories deprecates duplicate boot safeguards, noise observations,
-// and empty reflections that accumulated before v4.0.0's quality validators.
-// Returns the number of memories deprecated.
-func cleanupNoisyMemories(sqlitePath string) int {
-	dsn := sqlitePath + "?_journal_mode=WAL&_busy_timeout=15000"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return 0
-	}
-	defer func() { _ = db.Close() }()
-
-	// Use a 60-second timeout for the entire cleanup operation
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	deprecated := 0
-
-	// 1. Deduplicate boot safeguard memories — keep only the newest one per agent
-	rows, err := db.QueryContext(ctx, `
-		SELECT memory_id FROM memories
-		WHERE domain_tag = 'meta'
-		  AND status = 'committed'
-		  AND (content LIKE '%sage_inception%' OR content LIKE '%boot sequence%' OR content LIKE '%BOOT SAFEGUARD%')
-		ORDER BY created_at DESC`)
-	if err == nil {
-		var ids []string
-		for rows.Next() {
-			var id string
-			if scanErr := rows.Scan(&id); scanErr == nil {
-				ids = append(ids, id)
-			}
-		}
-		_ = rows.Close()
-		// Keep the first (newest), deprecate the rest
-		if len(ids) > 1 {
-			for _, id := range ids[1:] {
-				if _, execErr := db.ExecContext(ctx, `UPDATE memories SET status = 'deprecated' WHERE memory_id = ?`, id); execErr == nil {
-					deprecated++
-				}
-			}
-		}
-	}
-
-	// 2. Deprecate noise observations (short/low-value content)
-	noisePatterns := []string{
-		"%user said hi%", "%user greeted%", "%session started%",
-		"%brain online%", "%brain is awake%", "%no action taken%",
-		"%user said morning%", "%new session started%",
-		"%user said hello%", "%greeted the user%",
-	}
-	for _, pattern := range noisePatterns {
-		res, execErr := db.ExecContext(ctx, `UPDATE memories SET status = 'deprecated'
-			WHERE status = 'committed' AND LOWER(content) LIKE ?`, pattern)
-		if execErr == nil {
-			if n, _ := res.RowsAffected(); n > 0 {
-				deprecated += int(n)
-			}
-		}
-	}
-
-	// 3. Deprecate very short observations (< 20 chars content)
-	res, err := db.ExecContext(ctx, `UPDATE memories SET status = 'deprecated'
-		WHERE status = 'committed' AND memory_type = 'observation' AND LENGTH(content) < 20`)
-	if err == nil {
-		if n, _ := res.RowsAffected(); n > 0 {
-			deprecated += int(n)
-		}
-	}
-
-	// 4. Deduplicate — deprecate memories with identical content_hash, keep newest
-	dupRows, err := db.QueryContext(ctx, `
-		SELECT content_hash FROM memories
-		WHERE status = 'committed' AND content_hash IS NOT NULL
-		GROUP BY content_hash HAVING COUNT(*) > 1`)
-	if err == nil {
-		var hashes [][]byte
-		for dupRows.Next() {
-			var h []byte
-			if scanErr := dupRows.Scan(&h); scanErr == nil {
-				hashes = append(hashes, h)
-			}
-		}
-		_ = dupRows.Close()
-		for _, h := range hashes {
-			// Keep the newest, deprecate the rest
-			res, execErr := db.ExecContext(ctx, `UPDATE memories SET status = 'deprecated'
-				WHERE content_hash = ? AND status = 'committed'
-				AND memory_id NOT IN (
-					SELECT memory_id FROM memories
-					WHERE content_hash = ? AND status = 'committed'
-					ORDER BY created_at DESC LIMIT 1
-				)`, h, h)
-			if execErr == nil {
-				if n, _ := res.RowsAffected(); n > 0 {
-					deprecated += int(n)
-				}
-			}
-		}
-	}
-
-	return deprecated
 }
 
 // checkpointWAL forces a WAL checkpoint on the database, merging any

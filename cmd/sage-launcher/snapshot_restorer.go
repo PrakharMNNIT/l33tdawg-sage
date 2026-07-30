@@ -1,10 +1,9 @@
-// Package main — adapter wiring internal/snapshot.Restore behind the
-// supervisor's Restorer interface.
+// Package main — legacy explicit/offline adapter wiring
+// internal/snapshot.Restore behind the Restorer interface.
 //
-// The supervisor in rollback.go declares the Restorer interface so it can
-// be unit-tested without dragging the BadgerDB / SQLite / CometBFT
-// dependencies into every test. In production we want the real restore;
-// this file is the thin adapter that fulfils the interface.
+// The v11.16.1+ supervisor never instantiates this adapter automatically.
+// It remains for compatibility tests and a future separately authorized
+// recovery ceremony.
 package main
 
 import (

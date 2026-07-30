@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	cmtcryptoed "github.com/cometbft/cometbft/crypto/ed25519"
@@ -276,8 +275,10 @@ func TestHasNetworkedPeers(t *testing.T) {
 	require.True(t, hasNetworkedPeers(cometHome), "addrbook with a peer => networked")
 }
 
-// TestRemint_LegacyPersonal_ReMintsAndPreservesMemories is the happy path.
-func TestRemint_LegacyPersonal_ReMintsAndPreservesMemories(t *testing.T) {
+// TestRemint_LegacyPersonal_AutomaticRemintIsDisabledAndPreservesCanonicalState
+// locks the v11.16.1 safety fence: changing chain_id cannot be implemented by
+// deleting canonical history and rebuilding from SQLite.
+func TestRemint_LegacyPersonal_AutomaticRemintIsDisabledAndPreservesCanonicalState(t *testing.T) {
 	withVersion(t, "v11.1.0")
 	withNoOtherInstance(t)
 	home := t.TempDir()
@@ -291,11 +292,9 @@ func TestRemint_LegacyPersonal_ReMintsAndPreservesMemories(t *testing.T) {
 
 	migrated, err := remintLegacyChainID(dataDir, &Config{Quorum: QuorumConfig{Enabled: false}}, zerolog.Nop())
 	require.NoError(t, err)
-	require.True(t, migrated, "legacy single-validator personal node must be re-minted")
+	require.False(t, migrated, "automatic re-mint must be detection-only")
 
-	newID := chainIDOf(t, cometHome)
-	require.NotEqual(t, legacySharedChainID, newID, "chain_id must change")
-	require.True(t, strings.HasPrefix(newID, legacySharedChainID+"-"), "new id keeps the sage-personal prefix, got %q", newID)
+	require.Equal(t, legacySharedChainID, chainIDOf(t, cometHome), "chain_id must remain unchanged")
 
 	// Validator identity preserved.
 	genDoc, err := cmttypes.GenesisDocFromFile(filepath.Join(cometHome, "config", "genesis.json"))
@@ -307,23 +306,19 @@ func TestRemint_LegacyPersonal_ReMintsAndPreservesMemories(t *testing.T) {
 	require.FileExists(t, dbPath)
 	require.Equal(t, 2, committedCount(t, dbPath), "committed memories must survive the re-mint")
 
-	// Chain stores wiped (exercises the wipe + the split-brain confirm for real).
-	require.NoFileExists(t, filepath.Join(cometHome, "data", "state.db"))
-	require.NoFileExists(t, filepath.Join(cometHome, "data", "blockstore.db"))
+	// Canonical history remains intact.
+	require.FileExists(t, filepath.Join(cometHome, "data", "state.db"))
+	require.FileExists(t, filepath.Join(cometHome, "data", "blockstore.db"))
 
-	// Safety artifacts.
-	require.FileExists(t, filepath.Join(cometHome, "config", "genesis.json.pre-remint.bak"))
+	// Detection-only behavior writes no reset/re-mint artifacts.
+	require.NoFileExists(t, filepath.Join(cometHome, "config", "genesis.json.pre-remint.bak"))
 	backups, _ := filepath.Glob(filepath.Join(home, "backups", "sage-pre-upgrade-*.db"))
-	require.NotEmpty(t, backups, "a verified SQLite backup must be written before the wipe")
-
-	// TLS CA CN self-heal is covered by TestReconcileCACommonName; the re-mint itself
-	// no longer touches certs (the boot-time reconcile does).
+	require.Empty(t, backups, "automatic detection must not create reset backups")
 }
 
-// TestRemint_ResetFailure_NonFatal pins the headline availability promise: when the
-// chain backup/reset can't complete, the re-mint is skipped and NOTHING is wiped —
-// it never returns an error that would abort boot.
-func TestRemint_ResetFailure_NonFatal(t *testing.T) {
+// TestRemint_DoesNotInspectOrRewriteSQLite pins that the detection-only path
+// leaves even an unreadable serving projection untouched.
+func TestRemint_DoesNotInspectOrRewriteSQLite(t *testing.T) {
 	withVersion(t, "v11.1.0")
 	withNoOtherInstance(t)
 	home := t.TempDir()
@@ -332,24 +327,22 @@ func TestRemint_ResetFailure_NonFatal(t *testing.T) {
 	cometHome := filepath.Join(dataDir, "cometbft")
 	writeTestGenesis(t, cometHome, legacySharedChainID, 1)
 
-	// A garbage (non-sqlite) sage.db makes VACUUM fail -> raw copy -> verifyBackup's
-	// quick_check rejects -> resetChainState errors, all BEFORE any wipe.
+	// A garbage (non-sqlite) sage.db would have failed the old reset path.
 	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "sage.db"), []byte("not a database at all"), 0600))
 
 	migrated, err := remintLegacyChainID(dataDir, &Config{}, zerolog.Nop())
-	require.NoError(t, err, "reset failure must be non-fatal — never an error that aborts boot")
-	require.False(t, migrated, "re-mint must be skipped when the backup can't be verified")
+	require.NoError(t, err)
+	require.False(t, migrated)
 	require.Equal(t, legacySharedChainID, chainIDOf(t, cometHome), "chain_id must be untouched")
 
-	// Abort happened before destruction: chain state and the live DB are intact.
+	// Canonical state and the live DB are intact.
 	require.FileExists(t, filepath.Join(cometHome, "data", "state.db"))
 	require.FileExists(t, filepath.Join(cometHome, "data", "blockstore.db"))
 	got, _ := os.ReadFile(filepath.Join(dataDir, "sage.db"))
 	require.Equal(t, "not a database at all", string(got), "live sage.db must be untouched")
 }
 
-// TestRemint_Idempotent: a second boot after re-mint is a no-op.
-func TestRemint_Idempotent(t *testing.T) {
+func TestRemint_DetectionOnlyIsIdempotent(t *testing.T) {
 	withVersion(t, "v11.1.0")
 	withNoOtherInstance(t)
 	home := t.TempDir()
@@ -361,13 +354,14 @@ func TestRemint_Idempotent(t *testing.T) {
 
 	migrated, err := remintLegacyChainID(dataDir, &Config{}, zerolog.Nop())
 	require.NoError(t, err)
-	require.True(t, migrated)
+	require.False(t, migrated)
 	firstID := chainIDOf(t, cometHome)
+	require.Equal(t, legacySharedChainID, firstID)
 
 	migrated2, err := remintLegacyChainID(dataDir, &Config{}, zerolog.Nop())
 	require.NoError(t, err)
-	require.False(t, migrated2, "second run must be a no-op")
-	require.Equal(t, firstID, chainIDOf(t, cometHome), "chain_id must not churn on re-run")
+	require.False(t, migrated2, "every run must remain detection-only")
+	require.Equal(t, firstID, chainIDOf(t, cometHome), "chain_id must never churn")
 }
 
 // TestRemint_Guards covers every case that must be left untouched.

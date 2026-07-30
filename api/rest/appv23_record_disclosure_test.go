@@ -241,6 +241,132 @@ func TestAppV23HashOnlyCoCommitRemainsVisibleAcrossCentralRoutes(t *testing.T) {
 	require.Contains(t, timeline.Body.String(), `"total":1`)
 }
 
+func TestAppV23LegacyUnanchoredProjectionIsOmittedFromBroadRoutesAndExactDetailFailsClosed(
+	t *testing.T,
+) {
+	srv, memStore, _, _, readerID, ownerID, _ := appV23DisclosureFixture(t)
+	const (
+		memoryID = "legacy-unanchored"
+		secret   = "legacy unanchored content"
+	)
+	memStore.memories[memoryID] = &memory.MemoryRecord{
+		MemoryID:        memoryID,
+		SubmittingAgent: ownerID,
+		Content:         secret,
+		ContentHash:     memory.ComputeContentHash(secret),
+		MemoryType:      memory.TypeObservation,
+		DomainTag:       "owner.home",
+		ConfidenceScore: 0.85,
+		Status:          memory.StatusCommitted,
+		CreatedAt:       time.Now().Add(-time.Hour),
+	}
+	record := memStore.memories[memoryID]
+	record.MemoryType = memory.TypeTask
+	record.TaskStatus = memory.TaskStatusPlanned
+	record.Assignee = readerID
+	memStore.pendingRecords = []*memory.MemoryRecord{record}
+
+	routes := []struct {
+		name string
+		run  func() *httptest.ResponseRecorder
+	}{
+		{
+			name: "query",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleQueryMemory(out, appV23DisclosureRequest(
+					readerID, http.MethodPost, "/v1/memory/query",
+					[]byte(`{"embedding":[0.1,0.2,0.3],"top_k":10}`),
+				))
+				return out
+			},
+		},
+		{
+			name: "search",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleSearchMemory(out, appV23DisclosureRequest(
+					readerID, http.MethodPost, "/v1/memory/search",
+					[]byte(`{"query":"unanchored","top_k":10}`),
+				))
+				return out
+			},
+		},
+		{
+			name: "hybrid",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleHybridSearchMemory(out, appV23DisclosureRequest(
+					readerID, http.MethodPost, "/v1/memory/hybrid",
+					[]byte(`{"query":"unanchored","embedding":[0.1,0.2,0.3],"top_k":10}`),
+				))
+				return out
+			},
+		},
+		{
+			name: "list",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleListMemoriesAuth(out, appV23DisclosureRequest(
+					readerID, http.MethodGet, "/v1/memory/list", nil,
+				))
+				return out
+			},
+		},
+		{
+			name: "tasks",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleGetOpenTasks(out, appV23DisclosureRequest(
+					readerID, http.MethodGet, "/v1/memory/tasks", nil,
+				))
+				return out
+			},
+		},
+		{
+			name: "pending",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleGetPending(out, appV23DisclosureRequest(
+					readerID, http.MethodGet, "/v1/validator/pending", nil,
+				))
+				return out
+			},
+		},
+		{
+			name: "timeline",
+			run: func() *httptest.ResponseRecorder {
+				out := httptest.NewRecorder()
+				srv.handleTimelineAuth(out, appV23DisclosureRequest(
+					readerID, http.MethodGet, "/v1/memory/timeline", nil,
+				))
+				return out
+			},
+		},
+	}
+	for _, route := range routes {
+		t.Run(route.name, func(t *testing.T) {
+			out := route.run()
+			require.Equal(t, http.StatusOK, out.Code, out.Body.String())
+			require.NotContains(t, out.Body.String(), secret)
+			require.NotContains(t, out.Body.String(), memoryID)
+		})
+	}
+
+	detailReq := appV23DisclosureRequest(
+		readerID, http.MethodGet, "/v1/memory/"+memoryID, nil,
+	)
+	route := chi.NewRouteContext()
+	route.URLParams.Add("memory_id", memoryID)
+	detailReq = detailReq.WithContext(context.WithValue(
+		detailReq.Context(), chi.RouteCtxKey, route,
+	))
+	detail := httptest.NewRecorder()
+	srv.handleGetMemory(detail, detailReq)
+	require.Equal(t, http.StatusServiceUnavailable, detail.Code, detail.Body.String())
+	require.NotContains(t, detail.Body.String(), secret)
+}
+
 func TestAppV23PrincipalHashlessProjectionIsOmittedFromBroadRoutesAndExactDetailFailsClosed(
 	t *testing.T,
 ) {

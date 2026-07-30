@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -150,13 +152,201 @@ func TestMigrateOnUpgrade_VersionChangedSameFork_PreservesState(t *testing.T) {
 	}
 }
 
-// TestMigrateOnUpgrade_PreV75_LegacyInstall_RunsReset: a v6.x / v7.0–v7.4
-// install jumping straight to v7.5.6+ has chain state from an incompatible
-// fork lineage. The legacy branch must run the destructive reset before
-// stamping fork=1, otherwise the new binary tries to read old-schema
-// Badger/CometBFT data. Regression guard for the v7.5.5 → v7.5.6 fix where
-// the original legacy adoption was version-blind and unsafe for pre-v7.5.
-func TestMigrateOnUpgrade_PreV75_LegacyInstall_RunsReset(t *testing.T) {
+func TestMigrateOnUpgrade_11_16_0To11_16_1_IsStampOnly(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("SAGE_HOME", tmpDir)
+
+	dataDir := filepath.Join(tmpDir, "data")
+	badgerDir := filepath.Join(dataDir, "badger")
+	cometDir := filepath.Join(dataDir, "cometbft", "data")
+	sqlitePath := filepath.Join(dataDir, "sage.db")
+	requireNoErr := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireNoErr(os.MkdirAll(badgerDir, 0o700))
+	requireNoErr(os.MkdirAll(cometDir, 0o700))
+	makeMemoriesDB(t, sqlitePath, 10)
+	requireNoErr(os.WriteFile(filepath.Join(badgerDir, "canonical.sentinel"), []byte("badger"), 0o600))
+	requireNoErr(os.MkdirAll(filepath.Join(cometDir, "blockstore.db"), 0o700))
+	requireNoErr(os.MkdirAll(filepath.Join(cometDir, "state.db"), 0o700))
+	requireNoErr(os.WriteFile(filepath.Join(cometDir, "priv_validator_state.json"), []byte(`{"height":"22271"}`), 0o600))
+	requireNoErr(os.WriteFile(filepath.Join(tmpDir, versionFile), []byte("11.16.0\n"), 0o600))
+	requireNoErr(stampForkVersion(filepath.Join(tmpDir, forkVersionFile), 1))
+
+	oldVersion, oldFork := version, ConsensusForkVersion
+	version, ConsensusForkVersion = "11.16.1", 1
+	defer func() {
+		version, ConsensusForkVersion = oldVersion, oldFork
+	}()
+
+	migrated, err := migrateOnUpgrade(dataDir)
+	if err != nil {
+		t.Fatalf("live same-fork patch upgrade must succeed: %v", err)
+	}
+	if migrated {
+		t.Fatal("same-fork patch upgrade must not report a migration")
+	}
+	if data, _ := os.ReadFile(filepath.Join(badgerDir, "canonical.sentinel")); string(data) != "badger" {
+		t.Fatal("Badger canonical state changed")
+	}
+	if _, err := os.Stat(filepath.Join(cometDir, "blockstore.db")); err != nil {
+		t.Fatalf("CometBFT blockstore changed: %v", err)
+	}
+	if state, _ := os.ReadFile(filepath.Join(cometDir, "priv_validator_state.json")); string(state) != `{"height":"22271"}` {
+		t.Fatalf("validator state changed: %s", state)
+	}
+	if n, present, err := memoriesRowCount(context.Background(), sqlitePath); err != nil || !present || n != 10 {
+		t.Fatalf("SQLite changed: rows=%d present=%v err=%v", n, present, err)
+	}
+	if stamp, _ := os.ReadFile(filepath.Join(tmpDir, versionFile)); string(stamp) != "11.16.1\n" {
+		t.Fatalf("version diagnostic stamp = %q, want 11.16.1", stamp)
+	}
+}
+
+func TestMigrateOnUpgrade_MarkerlessPersistedNodeRefusesWithoutMutation(t *testing.T) {
+	cases := map[string]func(home, dataDir, cometHome string) string{
+		"genesis": func(_, _, cometHome string) string {
+			path := filepath.Join(cometHome, "config", "genesis.json")
+			_ = os.MkdirAll(filepath.Dir(path), 0o700)
+			_ = os.WriteFile(path, []byte(`{"chain_id":"survived"}`), 0o600)
+			return path
+		},
+		"badger": func(_, dataDir, _ string) string {
+			path := filepath.Join(dataDir, "badger", "MANIFEST")
+			_ = os.MkdirAll(filepath.Dir(path), 0o700)
+			_ = os.WriteFile(path, []byte("survived"), 0o600)
+			return path
+		},
+		"sqlite-wal": func(_, dataDir, _ string) string {
+			path := filepath.Join(dataDir, "sage.db-wal")
+			_ = os.MkdirAll(filepath.Dir(path), 0o700)
+			_ = os.WriteFile(path, []byte("survived"), 0o600)
+			return path
+		},
+		"backup": func(home, _, _ string) string {
+			path := filepath.Join(home, "backups", "node.backup")
+			_ = os.MkdirAll(filepath.Dir(path), 0o700)
+			_ = os.WriteFile(path, []byte("survived"), 0o600)
+			return path
+		},
+	}
+	for name, seed := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("SAGE_HOME", home)
+			dataDir := filepath.Join(home, "data")
+			cometHome := filepath.Join(dataDir, "cometbft")
+			sentinel := seed(home, dataDir, cometHome)
+			before, readErr := os.ReadFile(sentinel)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+
+			oldVersion := version
+			version = "11.16.1"
+			defer func() { version = oldVersion }()
+
+			migrated, err := migrateOnUpgrade(dataDir)
+			if !errors.Is(err, errAutomaticChainResetRefused) || migrated {
+				t.Fatalf("markerless persisted node must refuse, migrated=%v err=%v", migrated, err)
+			}
+			if data, readErr := os.ReadFile(sentinel); readErr != nil || string(data) != string(before) {
+				t.Fatalf("persisted evidence changed: before=%q after=%q err=%v", before, data, readErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(home, versionFile)); !os.IsNotExist(statErr) {
+				t.Fatalf("version marker must not be created, stat err=%v", statErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(home, forkVersionFile)); !os.IsNotExist(statErr) {
+				t.Fatalf("fork marker must not be created, stat err=%v", statErr)
+			}
+		})
+	}
+
+	t.Run("empty-badger-path", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("SAGE_HOME", home)
+		dataDir := filepath.Join(home, "data")
+		badgerPath := filepath.Join(dataDir, "badger")
+		if err := os.MkdirAll(badgerPath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		oldVersion := version
+		version = "11.16.1"
+		defer func() { version = oldVersion }()
+
+		migrated, err := migrateOnUpgrade(dataDir)
+		if !errors.Is(err, errAutomaticChainResetRefused) || migrated {
+			t.Fatalf("empty pre-existing Badger path must refuse, migrated=%v err=%v", migrated, err)
+		}
+		if _, statErr := os.Stat(filepath.Join(home, versionFile)); !os.IsNotExist(statErr) {
+			t.Fatalf("version marker must not be created, stat err=%v", statErr)
+		}
+		if _, statErr := os.Stat(filepath.Join(home, forkVersionFile)); !os.IsNotExist(statErr) {
+			t.Fatalf("fork marker must not be created, stat err=%v", statErr)
+		}
+	})
+}
+
+func TestMigrateOnUpgrade_InvalidForkMarkerRefusesWithoutMutation(t *testing.T) {
+	for _, raw := range []string{"garbage", "0", "-1", ""} {
+		t.Run(fmt.Sprintf("marker_%q", raw), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("SAGE_HOME", home)
+			dataDir := filepath.Join(home, "data")
+			if err := os.MkdirAll(dataDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(home, versionFile), []byte("11.16.0\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			forkPath := filepath.Join(home, forkVersionFile)
+			if err := os.WriteFile(forkPath, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			oldVersion := version
+			version = "11.16.1"
+			defer func() { version = oldVersion }()
+
+			migrated, err := migrateOnUpgrade(dataDir)
+			if !errors.Is(err, errAutomaticChainResetRefused) || migrated {
+				t.Fatalf("invalid fork marker must refuse, migrated=%v err=%v", migrated, err)
+			}
+			if data, _ := os.ReadFile(forkPath); string(data) != raw {
+				t.Fatalf("invalid fork marker changed: %q", data)
+			}
+			if data, _ := os.ReadFile(filepath.Join(home, versionFile)); string(data) != "11.16.0\n" {
+				t.Fatalf("version marker changed: %q", data)
+			}
+		})
+	}
+
+	t.Run("unreadable-kind", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("SAGE_HOME", home)
+		if err := os.WriteFile(filepath.Join(home, versionFile), []byte("11.16.0\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(home, forkVersionFile), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		oldVersion := version
+		version = "11.16.1"
+		defer func() { version = oldVersion }()
+		if _, err := migrateOnUpgrade(filepath.Join(home, "data")); !errors.Is(err, errAutomaticChainResetRefused) {
+			t.Fatalf("wrong-kind marker must refuse, got %v", err)
+		}
+	})
+}
+
+// TestMigrateOnUpgrade_PreV75_LegacyInstall_RefusesWithoutMutation locks the
+// v11.16.1 safety contract: SQLite is a serving projection, not a replacement
+// for canonical Badger/CometBFT history. An incompatible automatic upgrade must
+// stop with every byte and diagnostic stamp unchanged.
+func TestMigrateOnUpgrade_PreV75_LegacyInstall_RefusesWithoutMutation(t *testing.T) {
 	for _, fromVersion := range []string{"v6.8.0", "v7.1.2", "v7.4.5", "7.3.0"} {
 		fromVersion := fromVersion
 		t.Run(fromVersion, func(t *testing.T) {
@@ -183,26 +373,38 @@ func TestMigrateOnUpgrade_PreV75_LegacyInstall_RunsReset(t *testing.T) {
 			defer func() { version = oldVersion }()
 
 			migrated, err := migrateOnUpgrade(dataDir)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			if !errors.Is(err, errAutomaticChainResetRefused) {
+				t.Fatalf("pre-v7.5 install (%s) must refuse automatic reset, got: %v", fromVersion, err)
 			}
-			if !migrated {
-				t.Fatalf("pre-v7.5 install (%s) must trigger reset — chain state encoding is incompatible", fromVersion)
+			if migrated {
+				t.Fatalf("pre-v7.5 install (%s) must not report a migration", fromVersion)
 			}
 
-			if entries, _ := os.ReadDir(badgerDir); len(entries) != 0 {
-				t.Errorf("badger dir must be empty after reset, has %d entries", len(entries))
+			if data, _ := os.ReadFile(filepath.Join(badgerDir, "000001.vlog")); string(data) != "badger" {
+				t.Error("Badger canonical state must be preserved after refusal")
 			}
-			if _, err := os.Stat(filepath.Join(cometDir, "blockstore.db")); !os.IsNotExist(err) {
-				t.Error("blockstore.db must be removed")
+			if _, statErr := os.Stat(filepath.Join(cometDir, "blockstore.db")); statErr != nil {
+				t.Errorf("CometBFT blockstore must be preserved after refusal: %v", statErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(cometDir, "state.db")); statErr != nil {
+				t.Errorf("CometBFT state store must be preserved after refusal: %v", statErr)
+			}
+			if pvState, _ := os.ReadFile(filepath.Join(cometDir, "priv_validator_state.json")); string(pvState) != `{"height":"100"}` {
+				t.Errorf("validator state must be preserved after refusal: %s", pvState)
 			}
 
 			if n, present, err := memoriesRowCount(context.Background(), sqlitePath); err != nil || !present || n != 10 {
-				t.Errorf("SQLite must survive the reset with all rows (only Badger + CometBFT wipe); got %d present=%v", n, present)
+				t.Errorf("SQLite must remain unchanged after refusal; got %d present=%v err=%v", n, present, err)
 			}
 
-			if got := readForkVersion(filepath.Join(tmpDir, forkVersionFile)); got != ConsensusForkVersion {
-				t.Errorf("fork-version = %d, want %d after reset", got, ConsensusForkVersion)
+			if got := readForkVersion(filepath.Join(tmpDir, forkVersionFile)); got != 0 {
+				t.Errorf("fork-version = %d, want no new stamp after refusal", got)
+			}
+			if vData, _ := os.ReadFile(filepath.Join(tmpDir, versionFile)); strings.TrimSpace(string(vData)) != fromVersion {
+				t.Errorf("version stamp changed after refusal: %q", vData)
+			}
+			if _, statErr := os.Stat(filepath.Join(tmpDir, "backups")); !os.IsNotExist(statErr) {
+				t.Errorf("automatic refusal must not create reset backups, stat err=%v", statErr)
 			}
 		})
 	}
@@ -271,10 +473,10 @@ func TestMigrateOnUpgrade_LegacyInstall_AdoptsCurrentFork(t *testing.T) {
 	}
 }
 
-// TestMigrateOnUpgrade_ForkBump_RunsReset: when the on-disk fork is older
-// than the binary's ConsensusForkVersion, the destructive reset must run —
-// chain state is incompatible by definition.
-func TestMigrateOnUpgrade_ForkBump_RunsReset(t *testing.T) {
+// TestMigrateOnUpgrade_ForkBump_RefusesWithoutMutation ensures a future fork
+// cannot silently destroy canonical state. A real fork transition must ship a
+// deterministic in-place/governed migration.
+func TestMigrateOnUpgrade_ForkBump_RefusesWithoutMutation(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("SAGE_HOME", tmpDir)
 
@@ -303,48 +505,44 @@ func TestMigrateOnUpgrade_ForkBump_RunsReset(t *testing.T) {
 	defer func() { ConsensusForkVersion = oldFork }()
 
 	migrated, err := migrateOnUpgrade(dataDir)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, errAutomaticChainResetRefused) {
+		t.Fatalf("fork bump must refuse automatic reset, got: %v", err)
 	}
-	if !migrated {
-		t.Fatal("fork bump must trigger reset")
+	if migrated {
+		t.Fatal("fork bump refusal must not report migration")
 	}
 
-	if entries, _ := os.ReadDir(badgerDir); len(entries) != 0 {
-		t.Errorf("badger dir must be empty after fork-bump reset, has %d entries", len(entries))
+	if data, _ := os.ReadFile(filepath.Join(badgerDir, "000001.vlog")); string(data) != "badger" {
+		t.Error("Badger canonical state must be preserved after fork refusal")
 	}
-	if _, err := os.Stat(filepath.Join(cometDir, "blockstore.db")); !os.IsNotExist(err) {
-		t.Error("blockstore.db must be removed after fork-bump reset")
+	if _, statErr := os.Stat(filepath.Join(cometDir, "blockstore.db")); statErr != nil {
+		t.Errorf("blockstore.db must be preserved after fork refusal: %v", statErr)
 	}
-	if pvState, _ := os.ReadFile(filepath.Join(cometDir, "priv_validator_state.json")); string(pvState) != `{"height":"0","round":0,"step":0}` {
-		t.Errorf("validator state not reset: %s", pvState)
+	if _, statErr := os.Stat(filepath.Join(cometDir, "state.db")); statErr != nil {
+		t.Errorf("state.db must be preserved after fork refusal: %v", statErr)
+	}
+	if pvState, _ := os.ReadFile(filepath.Join(cometDir, "priv_validator_state.json")); string(pvState) != `{"height":"100"}` {
+		t.Errorf("validator state changed after fork refusal: %s", pvState)
 	}
 
 	if n, present, err := memoriesRowCount(context.Background(), sqlitePath); err != nil || !present || n != 10 {
-		t.Errorf("SQLite must survive a fork-bump reset with all rows (only Badger + CometBFT wipe); got %d present=%v", n, present)
+		t.Errorf("SQLite must remain unchanged after fork refusal; got %d present=%v err=%v", n, present, err)
 	}
 
-	backupDir := filepath.Join(tmpDir, "backups")
-	if entries, _ := os.ReadDir(backupDir); len(entries) == 0 {
-		t.Error("fork-bump reset must create SQLite backup")
+	if _, statErr := os.Stat(filepath.Join(tmpDir, "backups")); !os.IsNotExist(statErr) {
+		t.Errorf("automatic refusal must not create reset backups, stat err=%v", statErr)
 	}
 
-	if got := readForkVersion(filepath.Join(tmpDir, forkVersionFile)); got != 2 {
-		t.Errorf("fork-version file = %d, want 2 after successful reset", got)
+	if got := readForkVersion(filepath.Join(tmpDir, forkVersionFile)); got != 1 {
+		t.Errorf("fork-version file = %d, want old stamp 1 after refusal", got)
 	}
 	vData, _ := os.ReadFile(filepath.Join(tmpDir, versionFile))
-	if strings.TrimSpace(string(vData)) != "v8.0.0" {
-		t.Errorf("version file = %q, want v8.0.0", vData)
+	if strings.TrimSpace(string(vData)) != "v7.5.5" {
+		t.Errorf("version file changed after refusal: %q", vData)
 	}
 }
 
-// TestMigrateOnUpgrade_ForkBump_StampsOnlyAfterReset verifies that a crash
-// between the reset and the stamp leaves the OLD fork version on disk so
-// the next boot retries the migration. Tested by checking that the fork
-// stamp is written AFTER the reset wipes state — if we stamped first and
-// then crashed, the next boot would see "current fork" and skip the
-// (incomplete) reset, leaving the operator with mixed-fork state.
-func TestMigrateOnUpgrade_ForkBump_StampsOnlyAfterReset(t *testing.T) {
+func TestMigrateOnUpgrade_ForkBump_RefusalLeavesOldForkStamp(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("SAGE_HOME", tmpDir)
 
@@ -362,13 +560,13 @@ func TestMigrateOnUpgrade_ForkBump_StampsOnlyAfterReset(t *testing.T) {
 	defer func() { ConsensusForkVersion = oldFork }()
 
 	_, err := migrateOnUpgrade(dataDir)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, errAutomaticChainResetRefused) {
+		t.Fatalf("fork mismatch must return typed refusal, got: %v", err)
 	}
 
 	got := readForkVersion(filepath.Join(tmpDir, forkVersionFile))
-	if got != 2 {
-		t.Errorf("post-migration fork = %d, want 2", got)
+	if got != 1 {
+		t.Errorf("fork stamp after refusal = %d, want original 1", got)
 	}
 }
 

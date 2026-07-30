@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 
 	cmttypes "github.com/cometbft/cometbft/types"
-	cmttime "github.com/cometbft/cometbft/types/time"
 	"github.com/rs/zerolog"
 
 	"github.com/l33tdawg/sage/internal/tlsca"
@@ -36,35 +35,18 @@ const legacySharedChainID = "sage-personal"
 // in the test environment.
 var instanceIsServing = serveIsRunning
 
-// remintLegacyChainID migrates a personal node off the shared legacy
-// "sage-personal" chain_id onto a globally-unique minted id, so cross-node
-// federation stops being blocked by the self-federation guard. Returns
-// migrated=true only when the re-mint actually ran.
+// remintLegacyChainID detects a personal node still using the shared legacy
+// "sage-personal" chain_id. It is intentionally detection-only and always
+// returns migrated=false.
 //
-// MEMORY-SAFE: it reuses resetChainState — the same hardened fork-transition path
-// (vault-key backup, VACUUM-INTO SQLite backup with a content-verified
-// abort-before-destruct gate — structural quick_check + memories row-count parity)
-// that every past upgrade already ran. SQLite, where
-// ALL memories live, is backed up and never wiped; only the derived Badger +
-// CometBFT chain state is rebuilt. The memories table has no chain_id column and
-// recall reads purely by status, so changing the chain_id cannot orphan a memory.
+// v11.16.1 SAFETY FENCE: a chain_id cannot be changed without replacing the
+// canonical CometBFT/Badger history. Rebuilding from SQLite loses canonical
+// memory envelopes and RBAC/governance state, so this automatic migration is now
+// detection-only. A matching legacy node keeps running unchanged and federation
+// remains unavailable until a governed, history-preserving migration exists.
 //
-// AVAILABILITY-SAFE: the destructive phase is NON-FATAL. If the chain reset or the
-// genesis rewrite cannot complete (e.g. the backup integrity check aborts on a
-// damaged DB, or a state store survives the wipe), the re-mint is skipped with a
-// loud log and the node boots normally — federation stays broken (the pre-fix
-// status quo) but memories and availability are untouched. It never propagates an
-// error that would abort boot.
-//
-// GUARDED — only a genuine single-validator, non-networked personal node on the
-// EXACT legacy literal, whose genesis validator is THIS node's own signing key, is
-// migrated. Quorum/LAN-networked nodes and guests that adopted a host's genesis
-// intentionally run a shared chain_id they don't solely own; re-minting them would
-// fork them away from their network. And we never wipe chain state out from under
-// another live instance.
-//
-// IDEMPOTENT — after the re-mint the id is no longer "sage-personal", so every
-// subsequent boot is a no-op.
+// The legacy eligibility guards remain so warnings are limited to the exact
+// standalone-node case. Quorum/LAN-networked nodes and guests are left alone.
 func remintLegacyChainID(dataDir string, cfg *Config, logger zerolog.Logger) (migrated bool, err error) {
 	// Dev builds never touch persisted state (mirrors migrateOnUpgrade).
 	if version == "dev" {
@@ -85,16 +67,7 @@ func remintLegacyChainID(dataDir string, cfg *Config, logger zerolog.Logger) (mi
 	// recorded peer means the node joined/participated in a P2P network — skip it,
 	// even if its current config flags have been cleared.
 	//
-	// KNOWN RESIDUAL — this does NOT catch a Flow-3 *host*: SAGE runs quorum P2P with
-	// PEX disabled (node.go), and a host only ever ACCEPTS dials (guests dial in), so
-	// a host's address book stays empty. A pre-v11 host that hosted a LAN network and
-	// then toggled Network Mode off is therefore indistinguishable on disk from a
-	// standalone node and WILL be re-minted. This is accepted: (a) the window is tiny
-	// (LAN hosting shipped in v11.0.0, days before this release, and requires an
-	// explicit toggle-off before upgrading); (b) only the host re-mints — its guests
-	// carry the host's validator key in genesis, so Guard 3b skips them and their
-	// memories (own SQLite) are untouched; recovery is a one-time re-join. Flagged in
-	// the release notes. There is no earlier-version disk trace to detect it by.
+	// Detection remains conservative even though it performs no mutation.
 	if hasNetworkedPeers(cometHome) {
 		logger.Warn().Msg("legacy chain_id re-mint skipped — address book shows dialed peers (this node participated in a P2P network)")
 		return false, nil
@@ -128,7 +101,6 @@ func remintLegacyChainID(dataDir string, cfg *Config, logger zerolog.Logger) (mi
 		return false, nil
 	}
 	validator := genDoc.Validators[0]
-	fallbackAppState := genDoc.AppState // preserve the existing chain-admin seed if we can't re-derive one
 
 	// Guard 3b: the sole genesis validator must be OUR OWN signing key. A Flow-3
 	// guest adopts the host's genesis verbatim, so its single validator is the HOST's
@@ -147,153 +119,30 @@ func remintLegacyChainID(dataDir string, cfg *Config, logger zerolog.Logger) (mi
 		return false, nil
 	}
 
-	// Guard 4: never wipe chain state out from under a live instance. If another
-	// sage-gui is already serving on this SAGE_HOME (a common upgrade footgun:
-	// starting the new binary before stopping the old), skip and let the normal
-	// Badger directory lock surface the "already running" error cleanly, rather than
-	// deleting the running node's databases mid-flight. serveIsRunning() probes this
-	// node's own CometBFT RPC port, which is not yet up in this process.
+	// Avoid emitting a startup migration warning from a second process pointed at
+	// an already-serving home. The normal database lock still owns enforcement.
 	if instanceIsServing() {
 		logger.Warn().Msg("legacy chain_id re-mint skipped — another SAGE instance appears to be running on this home")
 		return false, nil
 	}
 
-	logger.Info().Str("old_chain_id", curID).
-		Msg("legacy shared chain_id detected — re-minting a unique network identity so federation works (memories are backed up and preserved)")
-	fmt.Fprintf(os.Stderr, "\n  SAGE: your node used the shared legacy network id %q, which blocks connecting to other people's networks.\n  Re-minting a unique id now — your memories are backed up first and preserved.\n  (If you had already connected to another network, you'll need to reconnect once.)\n\n", curID)
-
-	badgerPath := filepath.Join(dataDir, "badger")
-	sqlitePath := filepath.Join(dataDir, "sage.db")
-
-	// Back up (vault + SQLite, verified) and wipe ONLY derived chain state.
-	// NON-FATAL: the backup integrity check aborts BEFORE any wipe, so a failure here
-	// leaves everything intact — skip the re-mint and let the node boot rather than
-	// abort into a boot loop.
-	if resetErr := resetChainState(dataDir, badgerPath, cometHome, sqlitePath, version); resetErr != nil {
-		logger.Error().Err(resetErr).
-			Msg("legacy chain_id re-mint skipped — chain backup/reset did not complete; node boots normally, federation stays disabled until resolved")
-		fmt.Fprintf(os.Stderr, "  SAGE: could not safely re-mint the network id (%v). Your memories are untouched; the node is starting normally.\n\n", resetErr)
-		return false, nil
-	}
-
-	// The genesis rewrite is only honored if CometBFT has NO cached genesis doc in
-	// state.db (it prefers that cache over genesis.json). resetChainState removes the
-	// block/state stores but is non-fatal on individual removal errors, so confirm
-	// they are actually gone before rewriting — otherwise we'd advertise a new
-	// chain_id while CometBFT silently keeps running the old chain (split-brain).
-	// Skip and self-heal next boot if either survived.
-	cometDataDir := filepath.Join(cometHome, "data")
-	for _, dbName := range []string{"state.db", "blockstore.db"} {
-		if _, statErr := os.Stat(filepath.Join(cometDataDir, dbName)); statErr == nil {
-			logger.Error().Str("db", dbName).
-				Msg("legacy chain_id re-mint skipped — chain state store survived the reset; retrying next boot to avoid a chain_id split-brain")
-			return false, nil
-		}
-	}
-
-	// Rewrite genesis.json with a fresh unique chain_id bound to the existing
-	// validator key. NON-FATAL: on failure the node boots on the rebuilt legacy
-	// chain and retries the re-mint next boot.
-	newID, regenErr := regenGenesisUniqueID(cometHome, validator, fallbackAppState)
-	if regenErr != nil {
-		logger.Error().Err(regenErr).
-			Msg("legacy chain_id re-mint: genesis rewrite failed after reset; node boots on the rebuilt legacy chain and will retry next boot")
-		return false, nil
-	}
-
-	// TLS certs: the boot sequence's reconcileCACommonName (called from runServe's
-	// cert block, after the chain_id reconcile and before cert auto-gen) detects that
-	// the on-disk CA's CommonName "sage-ca-sage-personal" no longer matches the new
-	// chain_id and regenerates all four cert files with the correct CN. It runs every
-	// boot and handles partial-rotation states, so the re-mint itself needs to do
-	// nothing here — a stale CN can never permanently block federation.
-
-	logger.Info().Str("new_chain_id", newID).
-		Msg("re-minted unique chain_id — federation self-federation guard will no longer misfire; chain rebuilds on first run, memories intact")
-	fmt.Fprintf(os.Stderr, "  New network id: %s · memories intact · chain rebuilds on first run\n\n", newID)
-	return true, nil
-}
-
-// regenGenesisUniqueID rewrites genesis.json with a freshly-minted globally-unique
-// chain_id, reusing the passed-in validator (its pubkey, verified by the caller to
-// be this node's own signing key, seeds both the genesis validator entry and the
-// chain_id digest) so the node's consensus identity stays stable and continues to
-// match priv_validator_key.json. fallbackAppState carries the existing genesis
-// app_state forward when a fresh admin seed can't be derived (a corrupt agent.key),
-// so the re-genesised chain never strands at the fork-ladder admin gate. The caller
-// MUST have wiped the block/state store first (resetChainState) and confirmed
-// state.db is gone. Returns the new chain_id.
-func regenGenesisUniqueID(cometHome string, validator cmttypes.GenesisValidator, fallbackAppState json.RawMessage) (string, error) {
-	configDir := filepath.Join(cometHome, "config")
-	genesisPath := filepath.Join(configDir, "genesis.json")
-
-	genesisTime := cmttime.Now()
-	chainID, mintErr := mintChainID(legacySharedChainID, [][]byte{validator.PubKey.Bytes()}, genesisTime)
-	if mintErr != nil {
-		return "", fmt.Errorf("mint chain_id: %w", mintErr)
-	}
-
-	genDoc := cmttypes.GenesisDoc{
-		ChainID:         chainID,
-		GenesisTime:     genesisTime,
-		ConsensusParams: cmttypes.DefaultConsensusParams(),
-		Validators: []cmttypes.GenesisValidator{
-			{
-				Address: validator.PubKey.Address(),
-				PubKey:  validator.PubKey,
-				Power:   10,
-				Name:    "personal",
-			},
-		},
-	}
-	// Re-seed the operator's agent key as genesis chain-admin (issue #52) so the
-	// re-genesised chain can climb the fork ladder without stranding at the propose
-	// admin-gate. If the key can't be re-derived, carry the OLD genesis app_state
-	// forward rather than emit an admin-less genesis.
-	appState := genesisInitialAdminAppState()
-	if len(appState) == 0 {
-		appState = fallbackAppState
-	}
-	if len(appState) > 0 {
-		genDoc.AppState = appState
-	}
-	if vErr := genDoc.ValidateAndComplete(); vErr != nil {
-		return "", fmt.Errorf("validate genesis: %w", vErr)
-	}
-
-	// Back up the old genesis (best-effort; we are intentionally discarding it), then
-	// write atomically (temp + rename) so a crash mid-write can never leave a
-	// half-written genesis.json.
-	if bkErr := copyFile(genesisPath, genesisPath+".pre-remint.bak"); bkErr != nil {
-		// Non-fatal: the legacy genesis is being replaced on purpose. Log only.
-		fmt.Fprintf(os.Stderr, "  Note: could not back up the pre-remint genesis: %v\n", bkErr)
-	}
-	tmpPath := genesisPath + ".tmp"
-	if saveErr := genDoc.SaveAs(tmpPath); saveErr != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("stage genesis: %w", saveErr)
-	}
-	// fsync the temp file before the rename so a power loss can't leave a torn or
-	// zero-length genesis.json (chain state is already wiped by this point, so a
-	// corrupt genesis would fail every boot until manual restore of .pre-remint.bak).
-	if syncErr := fsyncPath(tmpPath); syncErr != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("sync genesis: %w", syncErr)
-	}
-	if renErr := os.Rename(tmpPath, genesisPath); renErr != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("commit genesis: %w", renErr)
-	}
-	// fsync the directory so the rename itself is durable across power loss.
-	_ = fsyncPath(configDir)
-	return chainID, nil
+	logger.Warn().Str("chain_id", curID).
+		Msg("legacy shared chain_id detected — automatic re-mint is disabled because it would discard canonical history")
+	fmt.Fprintf(
+		os.Stderr,
+		"\n  SAGE: this node still uses the legacy shared network id %q.\n"+
+			"  Federation remains unavailable, but the node will keep running unchanged.\n"+
+			"  SAGE will not reset canonical history to change this id.\n\n",
+		curID,
+	)
+	return false, nil
 }
 
 // localValidatorPubKey returns the raw ed25519 public key bytes from this node's
 // priv_validator_key.json — the identity CometBFT actually signs blocks with. Used
-// to confirm a to-be-re-minted genesis validator is really this node's own key (and
-// not a host's key inherited via an adopted/guest genesis) before any destructive
-// action. Parses the JSON directly (rather than privval.LoadFilePV, which exits the
+// to distinguish a standalone legacy node from an adopted/guest genesis before
+// reporting the migration warning. Parses the JSON directly (rather than
+// privval.LoadFilePV, which exits the
 // process on a malformed file) so an unreadable key is a safe skip, not a crash.
 func localValidatorPubKey(cometHome string) ([]byte, error) {
 	path := filepath.Join(cometHome, "config", "priv_validator_key.json")
@@ -368,18 +217,6 @@ func removeOwnCerts(certsDir string) {
 	for _, f := range []string{tlsca.CACertFile, tlsca.CAKeyFile, tlsca.NodeCertFile, tlsca.NodeKeyFile} {
 		_ = os.Remove(filepath.Join(certsDir, f))
 	}
-}
-
-// fsyncPath flushes a file (or directory) to stable storage. Used to make the
-// genesis temp-write + rename durable against power loss during the fleet-wide
-// re-mint boot. A directory fsync makes the rename entry itself durable.
-func fsyncPath(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	return f.Sync()
 }
 
 // hasNetworkedPeers reports whether the CometBFT address book records any DIALED

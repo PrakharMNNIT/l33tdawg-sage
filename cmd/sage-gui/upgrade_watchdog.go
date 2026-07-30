@@ -329,10 +329,9 @@ func runAutoAdvance(ctx context.Context, cfg upgradeWatchdogConfig, interval tim
 				case autoAdvanceAdminRejected:
 					cfg.Logger.Error().Uint64("target", target).
 						Msg("auto-advance halted: this node's agent.key is not the on-chain chain-admin, and past app-v9 it can " +
-							"no longer self-grant that role (issue #52). Recover with `sage-gui repair-chain` — it rebuilds the local " +
-							"consensus state so the chain re-initialises from genesis with your operator key seeded as chain-admin " +
-							"(memories are backed up and preserved); auto-advance resumes automatically afterwards. " +
-							"See docs/ISSUE_52_RECOVERY.md.")
+							"no longer self-grant that role (issue #52). Automatic reset is disabled because rebuilding from SQLite " +
+							"would discard canonical memory, RBAC, governance, and block history. repair-chain is disabled; restore a " +
+							"complete stopped-node backup or use a governed history-preserving recovery.")
 					return
 				case autoAdvanceTransient:
 					// fall through to the next tick

@@ -39,8 +39,12 @@ const (
 	// content/hash pair and every canonical envelope field still present, but it
 	// must not be represented as a chain-retained content commitment.
 	MemoryProjectionLegacyTerminalHashless MemoryProjectionDisposition = "legacy_terminal_hashless"
-	MemoryProjectionQuarantined            MemoryProjectionDisposition = "quarantined"
-	MemoryProjectionUnpublished            MemoryProjectionDisposition = "unpublished"
+	// MemoryProjectionLegacyUnanchored identifies a completely absent canonical
+	// memory envelope. It remains unpublished and exact reads fail; a broad
+	// reader may omit it only while reporting degraded projection state.
+	MemoryProjectionLegacyUnanchored MemoryProjectionDisposition = "legacy_unanchored"
+	MemoryProjectionQuarantined      MemoryProjectionDisposition = "quarantined"
+	MemoryProjectionUnpublished      MemoryProjectionDisposition = "unpublished"
 )
 
 // ValidateMemoryProjection verifies that a serving-layer record is the exact
@@ -70,8 +74,12 @@ func (s *BadgerStore) ClassifyMemoryProjection(
 	}
 	state, err := s.GetMemoryDisclosureState(record.MemoryID)
 	if err != nil {
-		return nil, MemoryProjectionUnpublished, fmt.Errorf(
-			"%w: %v", ErrMemoryProjectionUnpublished, err,
+		disposition := MemoryProjectionUnpublished
+		if errors.Is(err, ErrMemoryDisclosureNotFound) {
+			disposition = MemoryProjectionLegacyUnanchored
+		}
+		return nil, disposition, fmt.Errorf(
+			"%w: %w", ErrMemoryProjectionUnpublished, err,
 		)
 	}
 	if string(record.Status) != state.Status {
