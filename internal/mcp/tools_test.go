@@ -1343,19 +1343,24 @@ func TestSageTurn(t *testing.T) {
 
 func TestSageTurnScopesSemanticRecallToExactDomain(t *testing.T) {
 	var requestedDomain string
+	var requestedEmbeddingProvider string
+	var requestedFederated bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": true, "ready": true})
 	})
 	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1, 0.2}})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"embedding":          []float32{0.1, 0.2},
+			"embedding_provider": "ollama:nomic-embed-text:768",
+		})
 	})
 	mux.HandleFunc("/v1/memory/query", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			DomainTag string `json:"domain_tag"`
-		}
+		var req map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-		requestedDomain = req.DomainTag
+		requestedDomain, _ = req["domain_tag"].(string)
+		requestedEmbeddingProvider, _ = req["embedding_provider"].(string)
+		_, requestedFederated = req["federated"]
 		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{
 			{"memory_id": "right", "content": "tii context", "domain_tag": "tii-sage", "confidence_score": 0.9, "memory_type": "fact"},
 			{"memory_id": "wrong", "content": "upstream context", "domain_tag": "sage-release", "confidence_score": 0.99, "memory_type": "fact"},
@@ -1369,6 +1374,8 @@ func TestSageTurnScopesSemanticRecallToExactDomain(t *testing.T) {
 	result, err := s.toolTurn(context.Background(), map[string]any{"topic": "current work", "domain": "tii-sage"})
 	require.NoError(t, err)
 	require.Equal(t, "tii-sage", requestedDomain)
+	require.Equal(t, "ollama:nomic-embed-text:768", requestedEmbeddingProvider)
+	require.False(t, requestedFederated, "sage_turn must not opt local recall into federation")
 	recalled := result.(map[string]any)["recalled"].([]map[string]any)
 	require.Len(t, recalled, 1)
 	require.Equal(t, "tii-sage", recalled[0]["domain"])
@@ -1376,16 +1383,16 @@ func TestSageTurnScopesSemanticRecallToExactDomain(t *testing.T) {
 
 func TestSageTurnScopesKeywordRecallToExactDomain(t *testing.T) {
 	var requestedDomain string
+	var requestedFederated bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": false, "ready": true})
 	})
 	mux.HandleFunc("/v1/memory/search", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			DomainTag string `json:"domain_tag"`
-		}
+		var req map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-		requestedDomain = req.DomainTag
+		requestedDomain, _ = req["domain_tag"].(string)
+		_, requestedFederated = req["federated"]
 		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{
 			{"memory_id": "right", "content": "tii context", "domain_tag": "tii-sage", "confidence_score": 0.9, "memory_type": "fact"},
 			{"memory_id": "wrong", "content": "upstream context", "domain_tag": "sage-release", "confidence_score": 0.99, "memory_type": "fact"},
@@ -1400,6 +1407,7 @@ func TestSageTurnScopesKeywordRecallToExactDomain(t *testing.T) {
 	result, err := s.toolTurn(context.Background(), map[string]any{"topic": "current work", "domain": "tii-sage"})
 	require.NoError(t, err)
 	require.Equal(t, "tii-sage", requestedDomain)
+	require.False(t, requestedFederated, "sage_turn must not opt local recall into federation")
 	recalled := result.(map[string]any)["recalled"].([]map[string]any)
 	require.Len(t, recalled, 1)
 	require.Equal(t, "tii-sage", recalled[0]["domain"])
