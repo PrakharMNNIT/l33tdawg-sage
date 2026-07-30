@@ -344,26 +344,46 @@ test('the Linux cold gate proves the closed placeholder through the real Comet d
   assert.doesNotMatch(v119StateSync, /busybox nslookup provider-p2p/);
 });
 
-test('the mandatory cold gate transfers one exact app-v23 session', () => {
+test('the mandatory cold gate transfers one exact app-v24 session', () => {
   assert.match(
     faultWorkflow,
-    /name: App-v23 real Comet\/ABCI crash, partition, and state-sync gate/,
+    /name: App-v24 real Comet\/ABCI crash, partition, and state-sync gate/,
   );
-  assert.match(v119StateSync, /"app_version": 23/);
-  assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21|22)/);
-  assert.match(v119StateSync, /wait_app_version "\$\{PROVIDER\}" 23/);
+  assert.match(v119StateSync, /^TARGET_APP_VERSION=24$/m);
+  assert.match(v119StateSync, /"app_version": \$\{TARGET_APP_VERSION\}/);
+  assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21|22|23)/);
   assert.match(
     v119StateSync,
-    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" 23 "\$\{pre_publish_evidence\}"/,
+    /wait_app_version "\$\{PROVIDER\}" "\$\{TARGET_APP_VERSION\}"/,
   );
-  assert.match(v119StateSync, /\[ "\$\{receiver_app_version\}" != 23 \]/);
-  assert.match(v119StateSync, /\[ "\$\{success_receiver_app_version\}" != 23 \]/);
+  assert.match(
+    v119StateSync,
+    /python3 - "\$\{snapshot_height\}" "\$\{snapshot_app_hash\}" "\$\{TARGET_APP_VERSION\}" "\$\{pre_publish_evidence\}"/,
+  );
+  assert.match(
+    v119StateSync,
+    /\[ "\$\{receiver_app_version\}" != "\$\{TARGET_APP_VERSION\}" \]/,
+  );
+  assert.match(
+    v119StateSync,
+    /\[ "\$\{success_receiver_app_version\}" != "\$\{TARGET_APP_VERSION\}" \]/,
+  );
   assert.equal(
-    (v119StateSync.match(/\[ "\$\{provider_app_version\}" != 23 \]/g) || []).length,
+    (
+      v119StateSync.match(
+        /\[ "\$\{provider_app_version\}" != "\$\{TARGET_APP_VERSION\}" \]/g,
+      ) || []
+    ).length,
     2,
   );
-  assert.match(v119StateSync, /\[ "\$\{post_restart_provider_version\}" != 23 \]/);
-  assert.match(v119StateSync, /\[ "\$\{post_restart_receiver_version\}" != 23 \]/);
+  assert.match(
+    v119StateSync,
+    /\[ "\$\{post_restart_provider_version\}" != "\$\{TARGET_APP_VERSION\}" \]/,
+  );
+  assert.match(
+    v119StateSync,
+    /\[ "\$\{post_restart_receiver_version\}" != "\$\{TARGET_APP_VERSION\}" \]/,
+  );
   assert.match(
     stateSyncRuntime,
     /Uint64\("app_version", expectedAppVersion\)[\s\S]*?Msg\("authorized state-sync session assembled and exact-version candidate verified"\)/,
@@ -377,12 +397,12 @@ test('the mandatory cold gate fails closed unless every seed reports its exact s
   assert.match(seedMemories, /lines\[-1\] != summary/);
   assert.match(seedMemories, /matches\[0\] != summary/);
   assert.doesNotMatch(seedMemories, />\/dev\/null/);
-  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v23\.txt 1/);
+  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v24\.txt 1/);
   assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/advance\.txt 2/);
   assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/restart\.txt 1/);
   assert.match(
     v119StateSync,
-    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v23\.txt 1\nwait_height_at_least/,
+    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v24\.txt 1\nwait_height_at_least/,
   );
   assert.match(
     v119StateSync,
@@ -395,16 +415,16 @@ test('the mandatory cold gate fails closed unless every seed reports its exact s
 });
 
 test('the real-process state-sync gate preserves Root semantics without promoting receiver keys', () => {
-  const rootAssertion = shellFunction(v119StateSync, 'assert_appv23_root_semantics');
+  const rootAssertion = shellFunction(v119StateSync, 'assert_root_semantics');
   assert.match(rootAssertion, /provider\[:4\] != receiver\[:4\]/);
   assert.match(rootAssertion, /receiver\[4\] in receiver\[:2\]/);
   assert.match(
     v119StateSync,
-    /assert_appv23_root_semantics "\$\{PROVIDER\}" "\$\{RECEIVER\}"/,
+    /assert_root_semantics "\$\{PROVIDER\}" "\$\{RECEIVER\}"/,
   );
   assert.match(
     v119StateSync,
-    /assert_appv23_root_semantics "\$\{PROVIDER\}" "\$\{SUCCESS_RECEIVER\}"/,
+    /assert_root_semantics "\$\{PROVIDER\}" "\$\{SUCCESS_RECEIVER\}"/,
   );
   assert.match(v119StateSyncFixture, /case "appv23-root-state":/);
   assert.match(v119StateSyncFixture, /state\.PrincipalID/);
