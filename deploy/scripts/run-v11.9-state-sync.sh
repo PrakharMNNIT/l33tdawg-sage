@@ -940,6 +940,14 @@ copy_provider_lineage_markers() {
       return 1
       ;;
   esac
+  if [ ! -d "${PROVIDER_HOME}" ] || [ -L "${PROVIDER_HOME}" ]; then
+    echo "ERROR: refusing non-directory or symlinked provider fixture home ${PROVIDER_HOME}" >&2
+    return 1
+  fi
+  if [ ! -d "${target_home}" ] || [ -L "${target_home}" ]; then
+    echo "ERROR: refusing non-directory or symlinked target fixture home ${target_home}" >&2
+    return 1
+  fi
 
   # These pristine full nodes adopt the provider's exact genesis, so they must
   # also adopt its already-established diagnostic lineage markers. Copying the
@@ -958,6 +966,8 @@ copy_provider_lineage_markers() {
       for marker in version.txt fork-version.txt; do
         test ! -e "/target/${marker}"
         test ! -L "/target/${marker}"
+      done
+      for marker in version.txt fork-version.txt; do
         cp "/provider/${marker}" "/target/${marker}"
         chown "$1:$2" "/target/${marker}"
         chmod 0600 "/target/${marker}"
@@ -1081,8 +1091,9 @@ chain_id=$(read_private_comet_json "${PROVIDER_HOME}" config/genesis.json |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["chain_id"])')
 provider_id=$(node_id_from_home "${PROVIDER_HOME}")
 
-# 2. Create three truly pristine, independently keyed full-node homes and copy
-# only the provider's configured genesis. Their validator keys are not in it.
+# 2. Create four truly pristine, independently keyed full-node homes and copy
+# the provider's configured genesis and diagnostic lineage markers. Their
+# validator keys are not in either.
 for home in "${OBSERVER_HOME}" "${RECEIVER_HOME}" "${SUCCESS_RECEIVER_HOME}" "${ATTACKER_HOME}"; do
   init_pristine_comet_home "${home}"
   copy_provider_genesis "${home}"

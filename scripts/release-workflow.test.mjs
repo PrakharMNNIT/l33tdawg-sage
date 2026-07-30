@@ -485,8 +485,13 @@ test('the cold gate secures pristine data roots for the signed app-v24 projectio
     copyLineageMarkers,
     /"\$\{OBSERVER_HOME\}"\|"\$\{RECEIVER_HOME\}"\|"\$\{SUCCESS_RECEIVER_HOME\}"\|"\$\{ATTACKER_HOME\}"/,
   );
+  assert.match(copyLineageMarkers, /\[ ! -d "\$\{PROVIDER_HOME\}" \] \|\| \[ -L "\$\{PROVIDER_HOME\}" \]/);
+  assert.match(copyLineageMarkers, /\[ ! -d "\$\{target_home\}" \] \|\| \[ -L "\$\{target_home\}" \]/);
+  assert.match(copyLineageMarkers, /docker run --rm --pull never --network none/);
   assert.match(copyLineageMarkers, /-v "\$\{PROVIDER_HOME\}:\/provider:ro"/);
   assert.match(copyLineageMarkers, /-v "\$\{target_home\}:\/target"/);
+  assert.match(copyLineageMarkers, /"\$\{NODE_IMAGE\}" sh -ec/);
+  assert.match(copyLineageMarkers, /set -eu/);
   assert.match(copyLineageMarkers, /test -f \/provider\/version\.txt/);
   assert.match(copyLineageMarkers, /test ! -L \/provider\/version\.txt/);
   assert.match(copyLineageMarkers, /test -f \/provider\/fork-version\.txt/);
@@ -496,15 +501,16 @@ test('the cold gate secures pristine data roots for the signed app-v24 projectio
     /test "\$\(cat \/provider\/version\.txt\)" = "v11\.9\.0-state-sync-fixture"/,
   );
   assert.match(copyLineageMarkers, /test "\$\(cat \/provider\/fork-version\.txt\)" = "1"/);
-  assert.match(copyLineageMarkers, /test ! -e "\/target\/\$\{marker\}"/);
-  assert.match(copyLineageMarkers, /test ! -L "\/target\/\$\{marker\}"/);
-  assert.match(copyLineageMarkers, /for marker in version\.txt fork-version\.txt/);
+  assert.match(
+    copyLineageMarkers,
+    /for marker in version\.txt fork-version\.txt; do\s+test ! -e "\/target\/\$\{marker\}"\s+test ! -L "\/target\/\$\{marker\}"\s+done\s+for marker in version\.txt fork-version\.txt; do\s+cp "\/provider\/\$\{marker\}" "\/target\/\$\{marker\}"/,
+  );
   assert.match(copyLineageMarkers, /cmp "\/provider\/\$\{marker\}" "\/target\/\$\{marker\}"/);
   assert.match(copyLineageMarkers, /chown "\$1:\$2" "\/target\/\$\{marker\}"/);
   assert.match(copyLineageMarkers, /chmod 0600 "\/target\/\$\{marker\}"/);
   assert.match(
     copyLineageMarkers,
-    /stat -c "%u:%g:%a" "\/target\/\$\{marker\}"/,
+    /test "\$\(stat -c "%u:%g:%a" "\/target\/\$\{marker\}"\)" = "\$1:\$2:600"/,
   );
   assert.match(
     copyLineageMarkers,
