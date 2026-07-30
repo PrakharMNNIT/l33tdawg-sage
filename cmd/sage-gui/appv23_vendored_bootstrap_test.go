@@ -936,7 +936,7 @@ func vendoredInitRequest(
 	}
 }
 
-func TestVendoredAgentBootstrapGenesisToFirstMemoryWrite(t *testing.T) {
+func TestVendoredAgentBootstrapWaitsForAppV24BeforeFirstMemoryWrite(t *testing.T) {
 	genesis, bootstrap, rootKeyPath := vendoredGenesisFixture(t)
 	var appState struct {
 		Sage struct {
@@ -1032,12 +1032,27 @@ func TestVendoredAgentBootstrapGenesisToFirstMemoryWrite(t *testing.T) {
 	require.NoError(t, tx.SignTx(parsed, agentKey))
 	raw, err := tx.EncodeTx(parsed)
 	require.NoError(t, err)
+	require.NoError(t, badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
+		Name: "app-v24", TargetAppVersion: 24, ActivationHeight: 1,
+	}))
 	finalized, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
 		Height: 1, Time: time.Now(), Txs: [][]byte{raw},
 	})
 	require.NoError(t, err)
 	require.Len(t, finalized.TxResults, 1)
-	require.Zero(t, finalized.TxResults[0].Code, finalized.TxResults[0].Log)
+	require.Equal(t, uint32(11), finalized.TxResults[0].Code)
+	require.Contains(t, finalized.TxResults[0].Log, "require governed app-v24 activation")
+	require.NotNil(t, finalized.ConsensusParamUpdates)
+	require.Equal(t, uint64(24), finalized.ConsensusParamUpdates.Version.App)
+	_, err = app.Commit(context.Background(), &abcitypes.RequestCommit{})
+	require.NoError(t, err)
+
+	firstSafe, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+		Height: 2, Time: time.Now().Add(time.Second), Txs: [][]byte{raw},
+	})
+	require.NoError(t, err)
+	require.Len(t, firstSafe.TxResults, 1)
+	require.Zero(t, firstSafe.TxResults[0].Code, firstSafe.TxResults[0].Log)
 }
 
 func TestVendoredAgentBootstrapRejectsMultiValidatorGenesisWithoutDirtyRetry(t *testing.T) {

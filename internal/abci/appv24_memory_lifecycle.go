@@ -130,6 +130,28 @@ func validateAppV24MemorySubmitHash(submit *tx.MemorySubmit) error {
 	return nil
 }
 
+// requireAppV24ForDirectGenesisCompanion keeps the dual-signed first-party
+// companion from creating canonical memories during the short governed
+// app-v23 -> app-v24 climb. Merely reporting /ready=false is insufficient:
+// direct REST/MCP/Comet submissions could ignore readiness and reproduce the
+// v23 terminal-hash defect before the watchdog activates v24.
+//
+// This gate is deliberately limited to a direct-v23-born chain and the exact
+// committed companion profile. Ordinary upgraded nodes and their existing
+// agents retain app-v23 write behavior until the governed fork activates.
+func (app *SageApp) requireAppV24ForDirectGenesisCompanion(
+	enrollment *store.AppV23LocalEnrollment,
+	height int64,
+) error {
+	if !app.appV23GenesisActive ||
+		app.postAppV24Rules(height) ||
+		enrollment == nil ||
+		enrollment.Profile != store.AppV23ProfileCompanion {
+		return nil
+	}
+	return fmt.Errorf("first-party companion memory writes require governed app-v24 activation")
+}
+
 // setTerminalMemoryStatus preserves pre-v24's nil-hash encoding exactly and
 // switches only post-v24 blocks to the strict hash-preserving store primitive.
 func (app *SageApp) setTerminalMemoryStatus(memoryID, status string, height int64) error {

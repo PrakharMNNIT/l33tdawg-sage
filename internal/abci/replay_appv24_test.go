@@ -28,11 +28,16 @@ func TestAppV24ConstantsAndStrictForkBoundary(t *testing.T) {
 }
 
 func TestAppV24DirectV23GenesisGovernedActivationReplayAndFirstTerminalHash(t *testing.T) {
-	app, _, _ := directAppV23GenesisTestApp(t)
+	app, _, companion := directAppV23GenesisTestApp(t)
 
 	require.Equal(t, uint64(23), app.currentAppVersion(),
 		"the signed app-v23 genesis marker must never be reinterpreted as app-v24")
 	require.False(t, app.IsAppV24ActiveForNextTx())
+	preActivation := makeMemorySubmitTx(
+		t, companion, "voice-interface", "must wait for app-v24",
+	)
+	preActivation.MemorySubmit.MemoryID = "direct-v23-companion-pre-v24"
+	preActivationRaw := encodeDirectH0Tx(t, preActivation, companion, 1)
 	require.NoError(t, app.badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
 		Name: appV24UpgradeName, TargetAppVersion: 24,
 		ActivationHeight: 1, ProposedAt: 0,
@@ -40,9 +45,13 @@ func TestAppV24DirectV23GenesisGovernedActivationReplayAndFirstTerminalHash(t *t
 
 	request := &abcitypes.RequestFinalizeBlock{
 		Height: 1, Time: time.Unix(1_800_000_000, 0).UTC(),
+		Txs: [][]byte{preActivationRaw},
 	}
 	first, err := app.FinalizeBlock(context.Background(), request)
 	require.NoError(t, err)
+	require.Len(t, first.TxResults, 1)
+	require.Equal(t, uint32(11), first.TxResults[0].Code)
+	require.Contains(t, first.TxResults[0].Log, "require governed app-v24 activation")
 	require.NotNil(t, first.ConsensusParamUpdates)
 	require.NotNil(t, first.ConsensusParamUpdates.Version)
 	require.Equal(t, uint64(24), first.ConsensusParamUpdates.Version.App)
@@ -61,6 +70,8 @@ func TestAppV24DirectV23GenesisGovernedActivationReplayAndFirstTerminalHash(t *t
 
 	replayed, err := app.FinalizeBlock(context.Background(), request)
 	require.NoError(t, err)
+	require.Len(t, replayed.TxResults, 1)
+	require.Equal(t, first.TxResults[0], replayed.TxResults[0])
 	require.NotNil(t, replayed.ConsensusParamUpdates)
 	require.Equal(t, uint64(24), replayed.ConsensusParamUpdates.Version.App)
 	require.Equal(t, firstHash, replayed.AppHash,
@@ -80,10 +91,17 @@ func TestAppV24DirectV23GenesisGovernedActivationReplayAndFirstTerminalHash(t *t
 	require.NotNil(t, applied)
 	require.Equal(t, int64(1), applied.AppliedHeight)
 
+	firstReadySubmit := makeMemorySubmitTx(
+		t, companion, "voice-interface", "first safe companion memory",
+	)
+	firstReadySubmit.MemorySubmit.MemoryID = "direct-v23-companion-first-v24"
+	firstReadyRaw := encodeDirectH0Tx(t, firstReadySubmit, companion, 1)
 	next, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
-		Height: 2, Time: request.Time.Add(time.Second),
+		Height: 2, Time: request.Time.Add(time.Second), Txs: [][]byte{firstReadyRaw},
 	})
 	require.NoError(t, err)
+	require.Len(t, next.TxResults, 1)
+	require.Equal(t, uint32(0), next.TxResults[0].Code, next.TxResults[0].Log)
 	require.Nil(t, next.ConsensusParamUpdates)
 	_, err = app.Commit(context.Background(), &abcitypes.RequestCommit{})
 	require.NoError(t, err)

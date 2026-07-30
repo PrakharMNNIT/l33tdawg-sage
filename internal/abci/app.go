@@ -4582,6 +4582,9 @@ func (app *SageApp) processMemorySubmit(parsedTx *tx.ParsedTx, height int64, blo
 			uint8(submit.Classification) > enrollment.Clearance {
 			return appV23ControlDenied()
 		}
+		if readinessErr := app.requireAppV24ForDirectGenesisCompanion(enrollment, height); readinessErr != nil {
+			return &abcitypes.ExecTxResult{Code: 11, Log: "memory submit rejected: " + readinessErr.Error()}
+		}
 		appV23Root = root
 		appV23Role = role
 	}
@@ -5152,6 +5155,9 @@ func (app *SageApp) processCoCommitSubmit(parsedTx *tx.ParsedTx, height int64, b
 		}
 		if actorErr != nil || enrollment == nil || uint8(env.Classification) > enrollment.Clearance {
 			return appV23ControlDenied()
+		}
+		if readinessErr := app.requireAppV24ForDirectGenesisCompanion(enrollment, height); readinessErr != nil {
+			return &abcitypes.ExecTxResult{Code: 95, Log: "co-commit rejected: " + readinessErr.Error()}
 		}
 		allowed, denialCode, decisionErr := app.appV23DomainDecision(
 			parsedTx, localCredentialID, env.Domain, store.AppV23VerbWrite, height, blockTime,
