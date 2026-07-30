@@ -390,6 +390,85 @@ test('the mandatory cold gate transfers one exact app-v24 session', () => {
   );
 });
 
+test('the cold gate pins and exercises two independent RPC origins without trusting Docker DNS', () => {
+  const writeReceivingConfig = shellFunction(v119StateSync, 'write_receiving_config');
+  const networkAddress = shellFunction(v119StateSync, 'rpc_network_ipv4');
+  const remoteCommit = shellFunction(v119StateSync, 'remote_rpc_commit_hash');
+  const remoteValidators = shellFunction(v119StateSync, 'remote_rpc_validator_count');
+  const originProof = shellFunction(v119StateSync, 'assert_remote_rpc_origins');
+
+  assert.match(writeReceivingConfig, /local provider_rpc_url=\$7/);
+  assert.match(writeReceivingConfig, /local observer_rpc_url=\$8/);
+  assert.match(writeReceivingConfig, /- "\$\{provider_rpc_url\}"/);
+  assert.match(writeReceivingConfig, /- "\$\{observer_rpc_url\}"/);
+  assert.doesNotMatch(writeReceivingConfig, /provider-rpc:26657|observer-rpc:26657/);
+  assert.match(networkAddress, /ipaddress\.ip_address\(raw\)/);
+  assert.match(networkAddress, /address\.version != 4 or address\.is_unspecified/);
+  assert.match(v119StateSync, /\[ "\$\{provider_rpc_ip\}" = "\$\{observer_rpc_ip\}" \]/);
+  assert.match(remoteCommit, /--post-data=/);
+  assert.match(remoteCommit, /\\"method\\":\\"commit\\"/);
+  assert.match(remoteCommit, /"\$\{rpc_url\}\/"/);
+  assert.match(remoteValidators, /\\"method\\":\\"validators\\"/);
+  assert.match(originProof, /"\$\{snapshot\}" "\$\(\(snapshot \+ 1\)\)" "\$\(\(snapshot \+ 2\)\)"/);
+  assert.match(originProof, /wait_remote_rpc_light_height "\$\{container\}" provider/);
+  assert.match(originProof, /wait_remote_rpc_light_height "\$\{container\}" observer/);
+  assert.equal(
+    (v119StateSync.match(/assert_remote_rpc_origins "\$\{[^}]+\}"/g) || []).length,
+    2,
+  );
+});
+
+test('the cold gate freezes its serving provider before advertising the old snapshot', () => {
+  const servingConfig = shellFunction(v119StateSync, 'write_provider_serving_config');
+  const quiescence = shellFunction(v119StateSync, 'wait_height_quiescent');
+
+  assert.match(servingConfig, /voter:\n  enabled: false/);
+  assert.match(quiescence, /SECONDS - stable_since/);
+  assert.match(v119StateSync, /latest_height=\$\(wait_height_quiescent "\$\{PROVIDER\}" 12\)/);
+  assert.equal(
+    (v119StateSync.match(/"\$\{provider_serving_height\}" != "\$\{latest_height\}"/g) || []).length,
+    2,
+  );
+  assert.equal(
+    (v119StateSync.match(/"\$\{observer_serving_height\}" != "\$\{latest_height\}"/g) || []).length,
+    2,
+  );
+});
+
+test('the cold gate secures pristine data roots for the signed app-v24 projection baseline', () => {
+  const initCometHome = shellFunction(v119StateSync, 'init_pristine_comet_home');
+  const copyGenesis = shellFunction(v119StateSync, 'copy_provider_genesis');
+  const secureDataDir = shellFunction(v119StateSync, 'secure_fixture_data_dir');
+
+  assert.match(
+    v119StateSync,
+    /ABCI_RUNTIME_IDENTITY=\$\(docker run --rm --pull never --network none[\s\S]*?"\$\(id -u\)" "\$\(id -g\)"/,
+  );
+  assert.match(
+    secureDataDir,
+    /"\$\{OBSERVER_HOME\}"\|"\$\{RECEIVER_HOME\}"\|"\$\{SUCCESS_RECEIVER_HOME\}"\|"\$\{ATTACKER_HOME\}"/,
+  );
+  assert.match(secureDataDir, /\[ ! -d "\$\{home\}\/data" \] \|\| \[ -L "\$\{home\}\/data" \]/);
+  assert.match(secureDataDir, /chown "\$1:\$2" \/fixture-data; chmod 0700 \/fixture-data/);
+  assert.match(secureDataDir, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
+  assert.match(initCometHome, /chown -R "\$1:\$2" \/cometbft/);
+  assert.match(initCometHome, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
+  assert.match(copyGenesis, /chown "\$1:\$2" \/target\/genesis\.json/);
+  assert.match(copyGenesis, /"\$\{ABCI_RUNTIME_UID\}" "\$\{ABCI_RUNTIME_GID\}"/);
+  assert.doesNotMatch(initCometHome, /100:101/);
+  assert.doesNotMatch(copyGenesis, /100:101/);
+  assert.doesNotMatch(secureDataDir, /100:101/);
+  assert.match(secureDataDir, /stat -c '%u:%g:%a' \/fixture-data/);
+  assert.match(
+    secureDataDir,
+    /"\$\{state\}" != "\$\{ABCI_RUNTIME_UID\}:\$\{ABCI_RUNTIME_GID\}:700"/,
+  );
+  assert.match(
+    v119StateSync,
+    /copy_provider_genesis "\$\{home\}"\n  secure_fixture_data_dir "\$\{home\}"/,
+  );
+});
+
 test('the mandatory cold gate fails closed unless every seed reports its exact successful count', () => {
   const seedMemories = shellFunction(v119StateSync, 'seed_memories');
   assert.match(seedMemories, /local expected_count=\$3/);
