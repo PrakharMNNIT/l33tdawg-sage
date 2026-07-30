@@ -838,6 +838,16 @@ their registered casing. Thus `mynah` can resolve
 inspect caller-authorized federated contacts; it is not a global agent
 directory.
 
+After app-v23, local discovery uses the same active-ordinary-agent boundary as
+local pipeline resolve/send/inbox for both caller and result: Root and every
+historical Root credential, pending/inactive principals, and inconsistent
+enrollments are excluded even if a stale SQLite row still says `active`. Local
+pipeline discovery is not a memory read, so clearance and Access Group memory
+scope do not hide an otherwise active local recipient; a message delegates no
+memory authority. The signed REST projection owns match and eligibility
+decisions, and MCP consumes its `match_kind` instead of independently dropping
+rows through a second status oracle.
+
 This is discovery metadata, not presence or a reachability probe. Zero matches
 does not mean that a previously known recipient is offline or undeliverable.
 In particular, a saved exact local `agent_id` can still be passed directly to

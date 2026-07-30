@@ -700,7 +700,10 @@ List all registered agents. **No auth required.**
 
 ### `GET /v1/agents/lookup`
 
-Signed, bounded human-name lookup for MCP recipient discovery. `name` is
+Signed, bounded human-name lookup for MCP recipient discovery. After app-v23
+the signed caller must be an active ordinary local agent; Root, historical Root
+credentials, pending/inactive agents, and inconsistent enrollments are
+rejected by the same boundary as pipeline resolve/send/inbox. `name` is
 required (1–512 bytes) and performs a literal substring match over active,
 non-removed agents' display name, immutable registered name, and provider.
 ASCII matching is case-insensitive; non-ASCII code points require their
@@ -708,10 +711,16 @@ registered casing. Exact field matches rank before partial matches, so `mynah`
 can resolve `MYNAH (SAGE Voice Bridge Agent)` without making `%` or `_` act as
 wildcards. `limit` defaults to 20 and is 1–20. It returns the same sanitized
 agent fields as the public roster, but uses a capped metadata projection rather
-than enumerating the roster or deriving memory counts. SQLite and PostgreSQL
-implement the same lookup contract.
+than enumerating the roster or deriving memory counts. Each row also carries
+`match_kind` (`exact` or `substring`), which is the server-owned match decision
+consumed by MCP. SQLite status alone is not enough after app-v23: each target
+must still be an active, internally consistent ordinary consensus enrollment.
+Local pipeline discovery is intentionally independent of memory clearance;
+finding or messaging an agent delegates no memory authority. SQLite and
+PostgreSQL implement the same bounded candidate contract.
 
-**Response** (HTTP 200): `{"agents": [...AgentEntry], "total": N}`
+**Response** (HTTP 200):
+`{"agents": [{...AgentEntry, "match_kind":"exact|substring"}], "total": N}`
 
 ---
 

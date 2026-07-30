@@ -1231,6 +1231,7 @@ type findAgentLocalResult struct {
 	RegisteredName string `json:"registered_name"`
 	Provider       string `json:"provider"`
 	Status         string `json:"status"`
+	MatchKind      string `json:"match_kind"`
 }
 
 type findAgentFederatedContact struct {
@@ -1639,14 +1640,28 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 	localExact := make([]findAgentLocalResult, 0)
 	localPartial := make([]findAgentLocalResult, 0)
 	for _, agent := range localResponse.Agents {
-		if agent.AgentID == "" || !strings.EqualFold(agent.Status, "active") {
+		if agent.AgentID == "" {
 			continue
 		}
-		exact, partial := matchesAgentName(query, agent.Name, agent.RegisteredName, agent.Provider)
-		if exact {
+		// The signed, bounded REST projection owns active-enrollment and name
+		// matching decisions. Do not silently erase a valid result because an
+		// MCP-side status/name copy drifted from that contract. The fallback is
+		// retained only for an older server that predates match_kind; that
+		// endpoint already returned active SQL rows exclusively.
+		switch agent.MatchKind {
+		case "exact":
 			localExact = append(localExact, agent)
-		} else if partial {
+		case "substring":
 			localPartial = append(localPartial, agent)
+		case "":
+			exact, partial := matchesAgentName(
+				query, agent.Name, agent.RegisteredName, agent.Provider,
+			)
+			if exact {
+				localExact = append(localExact, agent)
+			} else if partial {
+				localPartial = append(localPartial, agent)
+			}
 		}
 	}
 	localMatches := localExact

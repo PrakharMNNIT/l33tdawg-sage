@@ -1737,6 +1737,42 @@ func (m *mockAgentStore) GetAgentByName(_ context.Context, name string) (*store.
 	}
 	return nil, nil
 }
+func (m *mockAgentStore) FindAgentsByName(_ context.Context, name string, limit int) ([]*store.AgentEntry, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	query := strings.ToLower(strings.TrimSpace(name))
+	exact := make([]*store.AgentEntry, 0)
+	partial := make([]*store.AgentEntry, 0)
+	for _, agent := range m.agents {
+		if agent == nil || agent.Status != "active" || agent.RemovedAt != nil {
+			continue
+		}
+		fields := []string{agent.Name, agent.RegisteredName, agent.Provider}
+		matched, exactMatch := false, false
+		for _, field := range fields {
+			lower := strings.ToLower(field)
+			if lower == query {
+				exactMatch, matched = true, true
+				break
+			}
+			matched = matched || strings.Contains(lower, query)
+		}
+		switch {
+		case exactMatch:
+			exact = append(exact, agent)
+		case matched:
+			partial = append(partial, agent)
+		}
+	}
+	sort.Slice(exact, func(i, j int) bool { return exact[i].AgentID < exact[j].AgentID })
+	sort.Slice(partial, func(i, j int) bool { return partial[i].AgentID < partial[j].AgentID })
+	results := append(exact, partial...)
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
+}
 func (m *mockAgentStore) ClearStaleRedeployLogs(_ context.Context) (int, error) {
 	return 0, nil
 }

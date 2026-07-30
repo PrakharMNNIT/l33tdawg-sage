@@ -719,6 +719,74 @@ func TestSageFindAgentPrefersLocalActiveMatches(t *testing.T) {
 	assert.Equal(t, "local-innovium", matches[0]["to"])
 }
 
+func TestSageFindAgentUsesSignedLookupMatchWithoutStatusRefilter(t *testing.T) {
+	var federationRequested bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agents/lookup", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "claude", r.URL.Query().Get("name"))
+		// match_kind is the authenticated REST projection's final decision.
+		// Deliberately omit status: MCP must not maintain a second active-state
+		// oracle that can drift and erase an otherwise valid result.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agents": []map[string]any{{
+				"agent_id": "local-claude", "name": "claude-code/sage",
+				"registered_name": "claude-code/sage",
+				"provider":        "claude-code", "match_kind": "substring",
+			}},
+		})
+	})
+	mux.HandleFunc("/v1/federation/available", func(w http.ResponseWriter, _ *http.Request) {
+		federationRequested = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"connections": []any{}})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	result, err := s.toolFindAgent(context.Background(), map[string]any{"name": "claude"})
+	require.NoError(t, err)
+	require.False(t, federationRequested, "a server-authorized local match must not probe federation")
+
+	out := result.(map[string]any)
+	require.Equal(t, []string{"local"}, out["searched"])
+	matches := out["matches"].([]map[string]any)
+	require.Len(t, matches, 1)
+	require.Equal(t, "local-claude", matches[0]["to"])
+	require.Equal(t, "local", matches[0]["scope"])
+}
+
+func TestSageFindAgentRemainsCompatibleWithOlderLookupProjection(t *testing.T) {
+	var federationRequested bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agents/lookup", func(w http.ResponseWriter, _ *http.Request) {
+		// v11.15 did not return match_kind. Its endpoint already bounded the
+		// result to active local rows, so the compatibility classifier only
+		// decides exact-vs-substring ordering.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agents": []map[string]any{{
+				"agent_id": "local-mynah", "name": "Mynah - Sage Voice Bridge",
+				"registered_name": "agent-local-mynah",
+			}},
+		})
+	})
+	mux.HandleFunc("/v1/federation/available", func(w http.ResponseWriter, _ *http.Request) {
+		federationRequested = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"connections": []any{}})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	result, err := s.toolFindAgent(context.Background(), map[string]any{"name": "mynah"})
+	require.NoError(t, err)
+	require.False(t, federationRequested)
+	matches := result.(map[string]any)["matches"].([]map[string]any)
+	require.Len(t, matches, 1)
+	require.Equal(t, "local-mynah", matches[0]["to"])
+}
+
 func TestSageFindAgentFallsBackToContactableFederatedMatches(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/agents/lookup", func(w http.ResponseWriter, _ *http.Request) {
@@ -757,6 +825,47 @@ func TestSageFindAgentFallsBackToContactableFederatedMatches(t *testing.T) {
 	assert.Equal(t, "innovium", matches[0]["registered_name"])
 	assert.Equal(t, "remote-live@chain-innovium", matches[0]["to"])
 	assert.Equal(t, "#innovium/remote-live", matches[0]["handle"])
+}
+
+func TestSageFindAgentMissDoesNotBlockKnownLocalAgentID(t *testing.T) {
+	const knownID = "abababababababababababababababababababababababababababababababab"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agents/lookup", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"agents": []any{}})
+	})
+	mux.HandleFunc("/v1/federation/available", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"connections": []any{}})
+	})
+	mux.HandleFunc("/v1/pipe/resolve", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, knownID, body["to"])
+		_ = json.NewEncoder(w).Encode(map[string]any{"to_agent": knownID})
+	})
+	mux.HandleFunc("/v1/pipe/send", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, knownID, body["to_agent"])
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"pipe_id": "pipe-known", "status": "pending",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	found, err := s.toolFindAgent(context.Background(), map[string]any{"name": "old alias"})
+	require.NoError(t, err)
+	require.Zero(t, found.(map[string]any)["total"])
+	require.Contains(t, found.(map[string]any)["message"], "not an online/offline verdict")
+
+	sent, err := s.toolPipe(context.Background(), map[string]any{
+		"to": knownID, "payload": "status check",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "pipe-known", sent.(map[string]any)["pipe_id"])
 }
 
 func TestSageFindAgentCachesFederatedContactsPerCaller(t *testing.T) {

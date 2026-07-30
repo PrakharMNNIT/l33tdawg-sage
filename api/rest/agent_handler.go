@@ -858,6 +858,43 @@ type agentNameFinder interface {
 	FindAgentsByName(ctx context.Context, name string, limit int) ([]*store.AgentEntry, error)
 }
 
+type agentLookupResult struct {
+	*store.AgentEntry
+	MatchKind string `json:"match_kind"`
+}
+
+// equalAgentLookupField applies the lookup endpoint's documented comparison:
+// ASCII letters are case-insensitive while every non-ASCII byte retains its
+// registered casing. strings.EqualFold is deliberately too broad here.
+func equalAgentLookupField(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range len(left) {
+		l, r := left[i], right[i]
+		if l >= 'A' && l <= 'Z' {
+			l += 'a' - 'A'
+		}
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		if l != r {
+			return false
+		}
+	}
+	return true
+}
+
+func agentLookupMatchKind(query string, agent *store.AgentEntry) string {
+	if agent != nil &&
+		(equalAgentLookupField(query, agent.Name) ||
+			equalAgentLookupField(query, agent.RegisteredName) ||
+			equalAgentLookupField(query, agent.Provider)) {
+		return "exact"
+	}
+	return "substring"
+}
+
 // handleFindRegisteredAgents is the signed, bounded companion to the public
 // roster endpoint. MCP recipient discovery must not fetch ListAgents merely to
 // return at most 20 matches: that full endpoint computes every agent's derived
@@ -891,19 +928,22 @@ func (s *Server) handleFindRegisteredAgents(w http.ResponseWriter, r *http.Reque
 		writeProblem(w, http.StatusInternalServerError, "Lookup error", err.Error())
 		return
 	}
-	sanitized := make([]*store.AgentEntry, 0, len(agents))
+	sanitized := make([]agentLookupResult, 0, len(agents))
 	for _, agent := range agents {
 		if agent != nil {
-			isRoot, rootErr := s.appV23IsRootIdentity(agent.AgentID)
-			if rootErr != nil {
+			active, activeErr := s.appV23ActiveOrdinaryAgent(agent.AgentID)
+			if activeErr != nil {
 				writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
-					"Current CEREBRUM Root state is unavailable.")
+					"Current local enrollment state is unavailable.")
 				return
 			}
-			if isRoot {
+			if !active {
 				continue
 			}
-			sanitized = append(sanitized, sanitizeAgentForRead(agent, false))
+			sanitized = append(sanitized, agentLookupResult{
+				AgentEntry: sanitizeAgentForRead(agent, false),
+				MatchKind:  agentLookupMatchKind(name, agent),
+			})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": sanitized, "total": len(sanitized)})
