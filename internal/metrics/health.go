@@ -57,6 +57,22 @@ type VendoredAgentEnrollmentStatus struct {
 	State    string `json:"state,omitempty"`
 }
 
+// CanonicalMemoryProjectionStatus reports whether the complete ordinary-memory
+// SQL serving projection has been checked against the canonical Badger
+// envelopes required by app-v23. It deliberately contains no record counts,
+// domains, IDs, or error strings: /ready is public and must not become an
+// inventory side channel.
+type CanonicalMemoryProjectionStatus struct {
+	Checked          bool   `json:"checked"`
+	Required         bool   `json:"required"`
+	OK               bool   `json:"ok"`
+	State            string `json:"state"`
+	LegacyCompatible bool   `json:"legacy_compatible,omitempty"`
+	Quarantined      bool   `json:"quarantined,omitempty"`
+}
+
+type canonicalMemoryProjectionProvider func() CanonicalMemoryProjectionStatus
+
 // HealthChecker tracks the health status of dependencies.
 type HealthChecker struct {
 	postgresOK atomic.Bool
@@ -65,6 +81,7 @@ type HealthChecker struct {
 	voter      atomic.Value // VoterStatus, set by SetVoterStatus
 	scoped     atomic.Value // ScopedProjectionStatus, set by recovery wiring
 	vendored   atomic.Value // VendoredAgentEnrollmentStatus, set by bootstrap/repair wiring
+	canonical  atomic.Value // canonicalMemoryProjectionProvider, wired after the final Badger store is selected
 	Version    string
 }
 
@@ -134,6 +151,26 @@ func (h *HealthChecker) vendoredAgentEnrollmentStatus() VendoredAgentEnrollmentS
 	return VendoredAgentEnrollmentStatus{}
 }
 
+// SetCanonicalMemoryProjectionProvider wires the final Badger-backed
+// process-local audit view into /ready. A provider is used instead of a copied
+// status because CEREBRUM collection walks can discover or clear quarantine
+// after startup. The callback is installed before listeners serve.
+func (h *HealthChecker) SetCanonicalMemoryProjectionProvider(
+	provider func() CanonicalMemoryProjectionStatus,
+) {
+	if provider == nil {
+		return
+	}
+	h.canonical.Store(canonicalMemoryProjectionProvider(provider))
+}
+
+func (h *HealthChecker) canonicalMemoryProjectionStatus() CanonicalMemoryProjectionStatus {
+	if provider, ok := h.canonical.Load().(canonicalMemoryProjectionProvider); ok && provider != nil {
+		return provider()
+	}
+	return CanonicalMemoryProjectionStatus{State: "unchecked"}
+}
+
 // SetPostgresHealth updates the PostgreSQL health status.
 func (h *HealthChecker) SetPostgresHealth(ok bool) {
 	h.postgresOK.Store(ok)
@@ -176,6 +213,7 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 	emb := h.embedderStatus()
 	scoped := h.scopedProjectionStatus()
 	vendored := h.vendoredAgentEnrollmentStatus()
+	canonical := h.canonicalMemoryProjectionStatus()
 
 	status := "ready"
 	httpStatus := http.StatusOK
@@ -194,6 +232,13 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 	case vendored.Required && (!vendored.Checked || !vendored.OK):
 		// A configured first-party application must not be reported ready until
 		// its exact consensus enrollment and owned home domain are confirmed.
+		status = "not_ready"
+		httpStatus = http.StatusServiceUnavailable
+	case canonical.Required && (!canonical.Checked || !canonical.OK):
+		// app-v23 ordinary-memory reads are safe only after a complete inventory
+		// audit. A quarantined record is localized and omitted from broad reads,
+		// but the node is not fully serving-ready until governance re-anchors it
+		// and a later complete audit clears the quarantine.
 		status = "not_ready"
 		httpStatus = http.StatusServiceUnavailable
 	case emb.Checked && emb.Semantic && !emb.OK:
@@ -218,6 +263,7 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		"embedder":          emb,
 		"scoped_projection": scoped,
 		"vendored_agent":    vendored,
+		"memory_projection": canonical,
 		// Informational voter/backlog block — never gates the status above
 		// (a voter-less node is legitimate; peers may vote memories through).
 		"voter": h.voterStatus(),

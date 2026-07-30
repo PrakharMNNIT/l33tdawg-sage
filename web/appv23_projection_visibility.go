@@ -110,6 +110,24 @@ type appV23ProjectionWalkAudit struct {
 	quarantined      bool
 }
 
+// AuditAppV23CanonicalMemoryProjection performs the complete, deterministic
+// ordinary-memory inventory walk used by readiness. It publishes only the
+// safe finite-state result through BadgerStore; no memory identifiers or raw
+// counts enter the public health surface.
+func (h *DashboardHandler) AuditAppV23CanonicalMemoryProjection(
+	ctx context.Context,
+) error {
+	if h.BadgerStore == nil {
+		return appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
+	}
+	if !h.appV23IsActive() {
+		h.BadgerStore.PublishCanonicalMemoryProjectionAudit(false, false, false)
+		return nil
+	}
+	_, _, err := h.cerebrumVisibleStatsAndActivity(ctx)
+	return err
+}
+
 // walkAppV23CanonicalDashboardRecords pages deterministically through one SQL
 // result set and validates each row before passing it to visit. It deliberately
 // returns no raw count: even aggregate metadata must be derived only from

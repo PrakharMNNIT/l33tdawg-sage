@@ -1127,6 +1127,9 @@ func runServe(startupProof string) (rerr error) {
 		// callback, so no CheckTx can observe admission open with a locked
 		// projection.
 		bootRuntime.SetLocalTxAdmissionBlocked(false)
+		if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
+			logger.Warn().Err(projectionErr).Msg("canonical ordinary-memory projection audit incomplete after vault unlock")
+		}
 	}
 	// The health watchdog signals every healthy probe, not only startup. This
 	// makes vector repair eventual after a late Ollama start or transient provider
@@ -1193,6 +1196,20 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.AppV20ActiveFn = app.IsAppV20ActiveForNextTx
 	dashboard.AppV22ActiveFn = app.IsAppV22ActiveForNextTx
 	dashboard.AppV23ActiveFn = app.IsAppV23ActiveForNextTx
+	health.SetCanonicalMemoryProjectionProvider(func() metrics.CanonicalMemoryProjectionStatus {
+		status := badgerStore.CanonicalMemoryProjectionHealth()
+		return metrics.CanonicalMemoryProjectionStatus{
+			Checked:          status.Checked,
+			Required:         app.IsAppV23ActiveForNextTx(),
+			OK:               status.OK,
+			State:            status.State,
+			LegacyCompatible: status.LegacyCompatible,
+			Quarantined:      status.Quarantined,
+		}
+	})
+	if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
+		logger.Warn().Err(projectionErr).Msg("canonical ordinary-memory projection audit incomplete")
+	}
 	dashboard.GovernanceDomainFn = app.GovernanceDelegationDomain
 	dashboard.StrictRBAC = cfg.RBAC.Strict // opt-out of the app-v19 default-read flip
 	// Embeddings setup: flip the config to the bundled Ollama + nomic-embed-text
