@@ -163,8 +163,8 @@ func DecodeMemoryHashReanchorPayload(encoded []byte) (*MemoryHashReanchorPayload
 			"%w: %d trailing bytes", errMemoryHashReanchorPayload, len(encoded)-offset,
 		)
 	}
-	if err := validateMemoryHashReanchorPayload(*payload); err != nil {
-		return nil, err
+	if validateErr := validateMemoryHashReanchorPayload(*payload); validateErr != nil {
+		return nil, validateErr
 	}
 
 	// The parser above is intentionally strict; this equality is a final

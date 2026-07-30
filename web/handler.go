@@ -1976,7 +1976,7 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 			return
 		}
 		if ferr == nil {
-			ftsRecs, projectionErr := h.filterAppV23BroadDashboardRecords(ftsRecs)
+			safeFTSRecs, projectionErr := h.filterAppV23BroadDashboardRecords(ftsRecs)
 			if projectionErr != nil {
 				if writeAppV23DashboardProjectionFailure(w, projectionErr) {
 					return
@@ -1984,7 +1984,7 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 				writeError(w, http.StatusInternalServerError, projectionErr.Error())
 				return
 			}
-			records, total = ftsRecs, len(ftsRecs)
+			records, total = safeFTSRecs, len(safeFTSRecs)
 		} else {
 			pool, _, perr := h.store.ListMemories(r.Context(), cerebrumListOptions(store.ListOptions{
 				DomainTag: opts.DomainTag, Tag: opts.Tag, Provider: opts.Provider,

@@ -68,17 +68,6 @@ func (h *DashboardHandler) classifyAppV23DashboardRecord(
 	return disposition, nil
 }
 
-func (h *DashboardHandler) validateAppV23DashboardRecords(
-	records []*memory.MemoryRecord,
-) error {
-	for _, record := range records {
-		if err := h.validateAppV23DashboardRecord(record); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func isAppV23UnsafeDashboardRecord(err error) bool {
 	return errors.Is(err, store.ErrMemoryProjectionUnpublished)
 }
