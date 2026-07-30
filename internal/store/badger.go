@@ -45,6 +45,21 @@ var ErrChallengeV21PrefixScanLimit = errors.New("app-v21 prefix scan work limit 
 // error as proof that a security-sensitive grant was revoked.
 var ErrAccessGrantNotFound = errors.New("access grant not found")
 
+// ErrMemoryNotFound is returned by future-safe memory mutations when the
+// canonical memory:<id> record does not exist.
+var ErrMemoryNotFound = errors.New("memory not found")
+
+// ErrMemoryHashUnavailable marks a structurally valid legacy memory:<id> entry
+// whose content hash was erased. It is distinct from ErrMemoryHashMalformed. A
+// caller must re-anchor that memory before attempting a hash-preserving status
+// transition.
+var ErrMemoryHashUnavailable = errors.New("memory content hash is unavailable")
+
+// ErrMemoryHashMalformed marks a memory:<id> entry whose encoded hash is
+// corrupt or is not the canonical 32-byte SHA-256 value required by a
+// hash-preserving status transition.
+var ErrMemoryHashMalformed = errors.New("memory content hash is malformed")
+
 var agentProofPrefix = []byte("agentproof:")
 
 const canonicalAgentIDHexBytes = 64
@@ -810,6 +825,64 @@ type MemoryDisclosureState struct {
 func (s *BadgerStore) SetMemoryHash(memoryID string, contentHash []byte, status string) error {
 	return s.update(func(txn *badger.Txn) error {
 		return s.txnSet(txn, memoryKey(memoryID), encodeMemoryHashEntry(contentHash, status))
+	})
+}
+
+// SetMemoryStatusPreservingHash atomically changes only a memory's lifecycle
+// status while retaining its exact canonical content hash. The read and write
+// share one Badger transaction, so a concurrent mutation cannot be observed
+// between validation and persistence.
+//
+// This method deliberately refuses a missing record, a legacy zero-length
+// hash, and every non-SHA-256 or malformed encoding. Callers must repair or
+// re-anchor such state explicitly instead of turning a hash-less record into a
+// new terminal state.
+//
+// Keep this separate from SetMemoryHash: historical execution intentionally
+// called SetMemoryHash(memoryID, nil, status), and that zero-length encoding
+// must remain byte-identical for replay. Consensus callers must fork-gate any
+// future use of this stricter primitive.
+func (s *BadgerStore) SetMemoryStatusPreservingHash(memoryID, status string) error {
+	if strings.TrimSpace(memoryID) == "" {
+		return errors.New("memory id is required")
+	}
+	if strings.TrimSpace(status) == "" {
+		return errors.New("memory status is required")
+	}
+	return s.update(func(txn *badger.Txn) error {
+		item, err := txn.Get(memoryKey(memoryID))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return fmt.Errorf("%w: %s", ErrMemoryNotFound, memoryID)
+		}
+		if err != nil {
+			return fmt.Errorf("read memory %s for status update: %w", memoryID, err)
+		}
+
+		var contentHash []byte
+		if err = item.Value(func(value []byte) error {
+			var decodeErr error
+			contentHash, _, decodeErr = decodeMemoryHashEntry(value)
+			return decodeErr
+		}); err != nil {
+			return fmt.Errorf("%w for %s: %v", ErrMemoryHashMalformed, memoryID, err)
+		}
+		if len(contentHash) == 0 {
+			return fmt.Errorf("%w for %s", ErrMemoryHashUnavailable, memoryID)
+		}
+		if len(contentHash) != sha256.Size {
+			return fmt.Errorf(
+				"%w for %s: got %d bytes, want %d",
+				ErrMemoryHashMalformed, memoryID, len(contentHash), sha256.Size,
+			)
+		}
+		if err = s.txnSet(
+			txn,
+			memoryKey(memoryID),
+			encodeMemoryHashEntry(contentHash, status),
+		); err != nil {
+			return fmt.Errorf("set memory %s status preserving hash: %w", memoryID, err)
+		}
+		return nil
 	})
 }
 
