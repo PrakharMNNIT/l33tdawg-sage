@@ -641,6 +641,10 @@ type SageApp struct {
 	// and consensus-backed local access groups. The activation block remains
 	// under app-v22 rules and v23 semantics start strictly at H+1.
 	appV23AppliedHeight int64 // 0 => fork dormant
+	// appV24AppliedHeight gates hash-preserving terminal memory lifecycle
+	// transitions and strict content-hash binding. The activation block remains
+	// under app-v23 rules and v24 semantics start strictly at H+1.
+	appV24AppliedHeight int64 // 0 => fork dormant
 	// appV23GenesisActive is loaded only from the dedicated, AppHash-covered
 	// dual-signed genesis activation marker. It is separate from applied-height
 	// upgrades because a v23-born chain has no historical activation block.
@@ -819,6 +823,7 @@ const appV21UpgradeName = "app-v21"
 
 const appV22UpgradeName = "app-v22"
 const appV23UpgradeName = "app-v23"
+const appV24UpgradeName = "app-v24"
 
 // governanceDelegationDomainStateKey holds the stable, consensus-derived
 // domain that post-app-v20 governance authorizations must sign. It is approved
@@ -2342,6 +2347,16 @@ func NewSageApp(badgerPath string, postgresURL string, logger zerolog.Logger) (*
 		_ = bs.CloseBadger()
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV24Fork(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV24Prerequisite(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	// Reload persisted validators from BadgerDB (survives restart)
@@ -2426,6 +2441,12 @@ func NewSageAppWithStores(bs *store.BadgerStore, offchain store.OffchainStore, l
 	if invariantErr := app.validateAppV23Prerequisite(); invariantErr != nil {
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV24Fork(); invariantErr != nil {
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV24Prerequisite(); invariantErr != nil {
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	persistedVals, err := bs.LoadValidators()
@@ -2504,6 +2525,8 @@ func restoredValidatorInfo(id string, power int64) *validator.ValidatorInfo {
 // 6 <= 7, so the watchdog stops without re-proposing.
 func (app *SageApp) currentAppVersion() uint64 {
 	switch {
+	case app.appV24AppliedHeight > 0:
+		return 24 // app-v24 (hash-preserving terminal memory lifecycle) — highest gate
 	case app.appV23GenesisActive:
 		return 23 // dual-signed first-party chains are born at app-v23
 	case app.appV23AppliedHeight > 0:
@@ -2556,13 +2579,13 @@ func (app *SageApp) currentAppVersion() uint64 {
 }
 
 // maxSupportedAppVersion is the highest app version this binary has a compiled
-// fork gate for (currently app-v23). It is the readiness ceiling for upgrade
+// fork gate for (currently app-v24). It is the readiness ceiling for upgrade
 // auto-voting: a validator must never vote to activate an upgrade it cannot
 // execute — doing so would commit consensus version.app=N while the binary
 // still runs at N-1, halting the chain on the next CometBFT handshake (the
 // maxSupportedAppVersion footgun). Bump this in lockstep with every new
 // appV<N>UpgradeName fork gate added above.
-const maxSupportedAppVersion uint64 = 23
+const maxSupportedAppVersion uint64 = 24
 
 // MaxSupportedAppVersion returns the highest app version this binary has a
 // compiled fork gate for. Operator tooling (cmd/sage-gui `upgrade propose`)
@@ -2803,6 +2826,19 @@ func (app *SageApp) ActiveUpgradeVote() (proposalID string, targetVersion uint64
 		} else if _, ladderErr := app.validatePersistedAppV23PredecessorLadder(); ladderErr != nil {
 			app.logger.Warn().Err(ladderErr).Str("proposal_id", prop.ProposalID).
 				Msg("app-v23 predecessor ladder is invalid; skipping auto-vote")
+			supported = false
+		}
+	}
+	if payload.Name == appV24UpgradeName && payload.TargetAppVersion == 24 {
+		if app.currentAppVersion() != 23 {
+			app.logger.Warn().
+				Str("proposal_id", prop.ProposalID).
+				Uint64("current_app_version", app.currentAppVersion()).
+				Msg("app-v24 upgrade requires app-v23 as its immediate predecessor; skipping auto-vote")
+			supported = false
+		} else if _, predecessorErr := app.validateAppV24Predecessor(); predecessorErr != nil {
+			app.logger.Warn().Err(predecessorErr).Str("proposal_id", prop.ProposalID).
+				Msg("app-v24 predecessor is invalid; skipping auto-vote")
 			supported = false
 		}
 	}
@@ -3443,6 +3479,7 @@ func (app *SageApp) cloneForAppV20Finalize(scopedStore *store.BadgerStore) *Sage
 		appV21AppliedHeight:      app.appV21AppliedHeight,
 		appV22AppliedHeight:      app.appV22AppliedHeight,
 		appV23AppliedHeight:      app.appV23AppliedHeight,
+		appV24AppliedHeight:      app.appV24AppliedHeight,
 		appV23GenesisActive:      app.appV23GenesisActive,
 		retainBlocks:             app.retainBlocks,
 		expectedGovernanceDomain: app.expectedGovernanceDelegationDomain(),
@@ -3486,6 +3523,7 @@ func (app *SageApp) publishAppV20FinalizeLocked(clone *SageApp) {
 	app.appV21AppliedHeight = clone.appV21AppliedHeight
 	app.appV22AppliedHeight = clone.appV22AppliedHeight
 	app.appV23AppliedHeight = clone.appV23AppliedHeight
+	app.appV24AppliedHeight = clone.appV24AppliedHeight
 	app.appV23GenesisActive = clone.appV23GenesisActive
 }
 
@@ -3957,6 +3995,26 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				return nil, fmt.Errorf("sage: refuse app-v23 activation with invalid root state: %w", stateErr)
 			}
 		}
+		if plan.Name == appV24UpgradeName {
+			if plan.TargetAppVersion != 24 {
+				return nil, fmt.Errorf(
+					"sage: refuse malformed app-v24 activation at height %d: target_app_version=%d",
+					req.Height, plan.TargetAppVersion,
+				)
+			}
+			if current := app.currentAppVersion(); current != 23 {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v24 activation at height %d: current committed app version is %d, want 23",
+					req.Height, current,
+				)
+			}
+			if _, predecessorErr := app.validateAppV24Predecessor(); predecessorErr != nil {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v24 activation at height %d: invalid predecessor: %w",
+					req.Height, predecessorErr,
+				)
+			}
+		}
 		// Version-non-regression floor (deterministic on every replica): never
 		// commit a consensus version.app lower than the chain's current app
 		// version. app-v7 (content-validation) is an INDEPENDENT gate that can be
@@ -4050,6 +4108,9 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		}
 		if plan.Name == appV23UpgradeName {
 			app.appV23AppliedHeight = req.Height
+		}
+		if plan.Name == appV24UpgradeName {
+			app.appV24AppliedHeight = req.Height
 		}
 		if plan.Name == appV12UpgradeName {
 			app.appV12AppliedHeight = req.Height
@@ -4492,6 +4553,11 @@ func (app *SageApp) processMemorySubmit(parsedTx *tx.ParsedTx, height int64, blo
 	if app.postAppV23Rules(height) {
 		if err := store.ValidateAppV23DomainName(submit.DomainTag); err != nil {
 			return &abcitypes.ExecTxResult{Code: 11, Log: "invalid memory domain: " + err.Error()}
+		}
+	}
+	if app.postAppV24Rules(height) {
+		if err := validateAppV24MemorySubmitHash(submit); err != nil {
+			return &abcitypes.ExecTxResult{Code: 11, Log: "memory submit rejected: " + err.Error()}
 		}
 	}
 	if app.postAppV20Fork(height) {
@@ -5955,7 +6021,7 @@ func (app *SageApp) checkAndApplyQuorum(memoryID string, height int64, blockTime
 		// swallowed SetMemoryHash error must NOT leave us crediting a verdict (or
 		// mirroring a committed status to Postgres) for a memory whose on-chain
 		// status never actually changed. poe-drift audit finding.
-		if err := app.badgerStore.SetMemoryHash(memoryID, nil, string(memory.StatusCommitted)); err == nil {
+		if err := app.setTerminalMemoryStatus(memoryID, string(memory.StatusCommitted), height); err == nil {
 			app.logger.Info().
 				Str("memory_id", memoryID).
 				Int64("height", height).
@@ -5982,7 +6048,7 @@ func (app *SageApp) checkAndApplyQuorum(memoryID string, height int64, blockTime
 		// Without this, the memory stays "proposed" forever and the validator
 		// ticker resubmits votes every 2 seconds, flooding the chain. Same
 		// write-success gating as the committed branch above.
-		if err := app.badgerStore.SetMemoryHash(memoryID, nil, string(memory.StatusDeprecated)); err == nil {
+		if err := app.setTerminalMemoryStatus(memoryID, string(memory.StatusDeprecated), height); err == nil {
 			app.logger.Info().
 				Str("memory_id", memoryID).
 				Int64("height", height).
@@ -6312,6 +6378,10 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 			} else if scopedHash != nil {
 				resolvedHash = scopedHash
 			}
+			resolvedHash, err = app.terminalResolutionHash(challenge.MemoryID, resolvedHash, height)
+			if err != nil {
+				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + err.Error()}
+			}
 			outcome, endorseErr := app.badgerStore.EndorseChallengeV21(store.EndorseChallengeV21Input{
 				MemoryID:         challenge.MemoryID,
 				ChallengerID:     challengerID,
@@ -6484,6 +6554,10 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 			} else if scopedHash != nil {
 				resolvedHash = scopedHash
 			}
+			resolvedHash, err = app.terminalResolutionHash(challenge.MemoryID, resolvedHash, height)
+			if err != nil {
+				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + err.Error()}
+			}
 			outcome, openErr := app.badgerStore.OpenChallengeV21(store.OpenChallengeV21Input{
 				MemoryID: challenge.MemoryID, OpenerID: challengerID, Domain: domain,
 				ExecutionHeight: height, ExpectedPriorStatus: string(memory.StatusCommitted),
@@ -6576,6 +6650,10 @@ legacyChallengePolicy:
 				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + scopedErr.Error()}
 			} else if scopedHash != nil {
 				resolvedHash = scopedHash
+			}
+			resolvedHash, err = app.terminalResolutionHash(challenge.MemoryID, resolvedHash, height)
+			if err != nil {
+				return &abcitypes.ExecTxResult{Code: 16, Log: "challenge: " + err.Error()}
 			}
 			if err := app.badgerStore.ResolveChallenge(challenge.MemoryID, resolvedHash, string(memory.StatusDeprecated)); err != nil {
 				return &abcitypes.ExecTxResult{Code: 16, Log: err.Error()}
@@ -6722,7 +6800,7 @@ legacyChallengePolicy:
 		if err := app.badgerStore.SetMemoryHash(challenge.MemoryID, scopedHash, string(memory.StatusDeprecated)); err != nil {
 			return &abcitypes.ExecTxResult{Code: 16, Log: err.Error()}
 		}
-	} else if err := app.badgerStore.SetMemoryHash(challenge.MemoryID, nil, string(memory.StatusDeprecated)); err != nil {
+	} else if err := app.setTerminalMemoryStatus(challenge.MemoryID, string(memory.StatusDeprecated), height); err != nil {
 		return &abcitypes.ExecTxResult{Code: 16, Log: err.Error()}
 	}
 
@@ -10515,6 +10593,17 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 			return fmt.Errorf("app-v23 upgrade has invalid predecessor ladder: %w", ladderErr)
 		}
 	}
+	if p.Name == appV24UpgradeName {
+		if p.TargetAppVersion != 24 {
+			return fmt.Errorf("app-v24 upgrade has target version %d, want 24", p.TargetAppVersion)
+		}
+		if current := app.currentAppVersion(); current != 23 {
+			return fmt.Errorf("app-v24 upgrade requires current app version 23, got %d", current)
+		}
+		if _, predecessorErr := app.validateAppV24Predecessor(); predecessorErr != nil {
+			return fmt.Errorf("app-v24 upgrade has invalid predecessor: %w", predecessorErr)
+		}
+	}
 
 	// Execution-height regression re-guard: the chain's committed app version
 	// may have advanced (another upgrade activated) between propose and quorum.
@@ -10657,6 +10746,20 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 		if _, ladderErr := app.validatePersistedAppV23PredecessorLadder(); ladderErr != nil {
 			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
 				"upgrade propose: app-v23 predecessor ladder is invalid: %v", ladderErr)}
+		}
+	}
+	if prop.Name == appV24UpgradeName {
+		if prop.TargetAppVersion != 24 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v24 requires target_app_version 24 (got %d)", prop.TargetAppVersion)}
+		}
+		if current := app.currentAppVersion(); current != 23 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v24 requires current committed app version 23 (got %d)", current)}
+		}
+		if _, predecessorErr := app.validateAppV24Predecessor(); predecessorErr != nil {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v24 predecessor is invalid: %v", predecessorErr)}
 		}
 	}
 
