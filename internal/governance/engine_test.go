@@ -226,6 +226,32 @@ func TestSingleNodeAutoApprove(t *testing.T) {
 	assert.Equal(t, StatusExecuted, executed.Status)
 }
 
+func TestSingleNodeExplicitVoteProposalDoesNotAutoApprove(t *testing.T) {
+	eng, _, _ := makeEngine(map[string]int64{
+		"sole-val": 10,
+	})
+
+	proposalID, err := eng.ProposeWithoutAutoVote(
+		"sole-val", ProposalOp(9), "payload-digest", nil, 0, 0,
+		"repair app-v23 memory commitments", 50, []byte("opaque payload"),
+	)
+	require.NoError(t, err)
+
+	votes, err := eng.GetProposalVotes(proposalID)
+	require.NoError(t, err)
+	require.Empty(t, votes, "the explicit-vote proposal path must not synthesize an accept vote")
+
+	executed, err := eng.ProcessBlock(50)
+	require.NoError(t, err)
+	require.Nil(t, executed, "a single validator must explicitly attest before execution")
+
+	require.NoError(t, eng.Vote(proposalID, "sole-val", "accept", 51))
+	executed, err = eng.ProcessBlock(51)
+	require.NoError(t, err)
+	require.NotNil(t, executed)
+	require.Equal(t, StatusExecuted, executed.Status)
+}
+
 func TestProposalExpiry(t *testing.T) {
 	eng, _, _ := makeEngine(map[string]int64{
 		"val-a": 10,

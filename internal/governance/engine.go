@@ -177,6 +177,21 @@ func (e *Engine) CheckProposerEligibility(proposerID string, height int64) error
 // verbatim on the proposal record so the executing tx (e.g. DomainReassign)
 // can verify body-vs-proposal parity. Pass nil for legacy validator-set ops.
 func (e *Engine) Propose(proposerID string, op ProposalOp, targetID string, targetPubKey []byte, targetPower int64, expiryBlocks int64, reason string, height int64, payload []byte) (string, error) {
+	return e.propose(proposerID, op, targetID, targetPubKey, targetPower, expiryBlocks, reason, height, payload, true)
+}
+
+// ProposeWithoutAutoVote creates a proposal without recording the historical
+// proposer accept vote. It is reserved for fork-aware ABCI operations whose
+// payload requires an independent validator-side attestation before quorum.
+//
+// Keep Propose as the default: changing its auto-vote behavior would alter
+// historical governance results and AppHashes. This opt-in method gives new
+// operations a replay-neutral explicit-vote path.
+func (e *Engine) ProposeWithoutAutoVote(proposerID string, op ProposalOp, targetID string, targetPubKey []byte, targetPower int64, expiryBlocks int64, reason string, height int64, payload []byte) (string, error) {
+	return e.propose(proposerID, op, targetID, targetPubKey, targetPower, expiryBlocks, reason, height, payload, false)
+}
+
+func (e *Engine) propose(proposerID string, op ProposalOp, targetID string, targetPubKey []byte, targetPower int64, expiryBlocks int64, reason string, height int64, payload []byte, autoVote bool) (string, error) {
 	if err := e.CheckProposerEligibility(proposerID, height); err != nil {
 		return "", err
 	}
@@ -262,10 +277,12 @@ func (e *Engine) Propose(proposerID string, op ProposalOp, targetID string, targ
 		return "", fmt.Errorf("set active: %w", err)
 	}
 
-	// Auto-vote accept from proposer.
-	voteKey := "gov:vote:" + proposalID + ":" + proposerID
-	if err := e.store.SetState(voteKey, []byte("accept")); err != nil {
-		return "", fmt.Errorf("auto-vote: %w", err)
+	if autoVote {
+		// Historical path: the proposer immediately records an accept vote.
+		voteKey := "gov:vote:" + proposalID + ":" + proposerID
+		if err := e.store.SetState(voteKey, []byte("accept")); err != nil {
+			return "", fmt.Errorf("auto-vote: %w", err)
+		}
 	}
 
 	// Set proposer cooldown.
