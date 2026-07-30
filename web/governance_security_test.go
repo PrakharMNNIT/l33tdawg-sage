@@ -59,28 +59,32 @@ func dashboardGovernanceHandler(t *testing.T, rpc string) (*DashboardHandler, ed
 	require.NoError(t, err)
 	_, operatorKey, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
-	badgerStore, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, badgerStore.CloseBadger()) })
-	proposal, err := json.Marshal(governance.ProposalState{
-		ProposalID: "proposal-a",
-		Operation:  governance.OpAddValidator,
-		TargetID:   "validator-a",
-		ProposerID: auth.PublicKeyToAgentID(validatorKey.Public().(ed25519.PublicKey)),
-		Status:     governance.StatusVoting,
-	})
-	require.NoError(t, err)
-	require.NoError(t, badgerStore.SetGovProposal("proposal-a", proposal))
 	h := &DashboardHandler{
 		CometBFTRPC:         rpc,
 		SigningKey:          validatorKey,
 		AdminSigningKey:     operatorKey,
-		BadgerStore:         badgerStore,
 		AppV20ActiveFn:      func() bool { return true },
 		GovernanceDomainFn:  func() string { return dashboardTestGovernanceDomain },
 		NodeOperatorAgentID: auth.PublicKeyToAgentID(operatorKey.Public().(ed25519.PublicKey)),
 	}
 	return h, validatorKey, operatorKey
+}
+
+func seedDashboardGovernanceProposal(t *testing.T, h *DashboardHandler, proposalID string) {
+	t.Helper()
+	badgerStore, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, badgerStore.CloseBadger()) })
+	proposal, err := json.Marshal(governance.ProposalState{
+		ProposalID: proposalID,
+		Operation:  governance.OpAddValidator,
+		TargetID:   "validator-a",
+		ProposerID: h.NodeOperatorAgentID,
+		Status:     governance.StatusVoting,
+	})
+	require.NoError(t, err)
+	require.NoError(t, badgerStore.SetGovProposal(proposalID, proposal))
+	h.BadgerStore = badgerStore
 }
 
 func requireDashboardGovernanceProofBody(t *testing.T, parsed *tx.ParsedTx, method, path string) map[string]any {
@@ -202,6 +206,7 @@ func TestDashboardVoteUsesValidatorOuterAndOperatorProofPostV20(t *testing.T) {
 	comet, _, captured := governanceCaptureServer(t)
 	defer comet.Close()
 	h, validatorKey, operatorKey := dashboardGovernanceHandler(t, comet.URL)
+	seedDashboardGovernanceProposal(t, h, "proposal-a")
 
 	body := []byte(`{"proposal_id":"proposal-a","decision":"accept"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/dashboard/governance/vote", bytes.NewReader(body))
@@ -271,6 +276,9 @@ func TestDashboardGovernanceCommitFailuresReturnBadGatewayWithoutGhostEvent(t *t
 			comet, broadcasts, _ := governanceCaptureServerResult(t, tc.checkCode, tc.finalizeCode)
 			defer comet.Close()
 			h, _, _ := dashboardGovernanceHandler(t, comet.URL)
+			if tc.path == "/v1/dashboard/governance/vote" {
+				seedDashboardGovernanceProposal(t, h, "proposal-a")
+			}
 			h.SSE = NewSSEBroadcaster()
 			events := h.SSE.Subscribe()
 			require.NotNil(t, events)
