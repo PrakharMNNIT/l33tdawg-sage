@@ -88,12 +88,13 @@ func TestAppV23KeyedTaskTagsRollbackAndReplayWithCommitBatch(t *testing.T) {
 	sqlite, ok := app.offchainStore.(*store.SQLiteStore)
 	require.True(t, ok)
 	blockTime := time.Now().UTC().Truncate(time.Second)
+	height := activateDirectAppV24ForTest(t, app, blockTime.Add(-time.Second))
 	raw, memoryID := appV23KeyedTaskTx(
 		t, companion, "task-tags-crash-v1",
 		[]string{"hardware", "urgent"}, 1, blockTime,
 	)
 	block := &abcitypes.RequestFinalizeBlock{
-		Height: 1, Time: blockTime, Txs: [][]byte{raw},
+		Height: height, Time: blockTime, Txs: [][]byte{raw},
 	}
 
 	// Inject failure at SetTags inside the projection transaction. If keyed
@@ -126,7 +127,7 @@ func TestAppV23KeyedTaskTagsRollbackAndReplayWithCommitBatch(t *testing.T) {
 	require.Empty(t, tags)
 	persisted, err := LoadState(app.badgerStore)
 	require.NoError(t, err)
-	require.Zero(t, persisted.Height)
+	require.Equal(t, height-1, persisted.Height)
 
 	// Model restart recovery by restoring the healthy projection and replaying
 	// the exact block CometBFT still owes the app. Memory, assignment, receipt,

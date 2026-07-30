@@ -182,7 +182,9 @@ func TestAppV24StrictMemorySubmitHashBoundary(t *testing.T) {
 	legacy.MemorySubmit.MemoryID = "app-v24-submit-at-h"
 	legacy.MemorySubmit.ContentHash = make([]byte, sha256.Size)
 	legacyResult := app.processMemorySubmit(legacy, 10, time.Unix(1_800_000_100, 0).UTC())
-	require.Zero(t, legacyResult.Code, legacyResult.Log)
+	require.Equal(t, uint32(11), legacyResult.Code)
+	require.Contains(t, legacyResult.Log, "require governed app-v24 activation",
+		"the activation block is still app-v23, but first-party direct-genesis writes remain closed")
 
 	invalid := makeMemorySubmitTx(t, companion, "voice-interface", "post-fork mismatch")
 	invalid.MemorySubmit.MemoryID = "app-v24-submit-invalid"

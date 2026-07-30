@@ -93,7 +93,10 @@ func TestAppV23CompanionRESTTaskCommitsAndImmediatelyListsForExactAssignee(t *te
 	require.Nil(t, projectedCompanion.RemovedAt)
 
 	var broadcasts atomic.Int64
-	nextHeight := int64(1)
+	nextHeight := activateDirectAppV24ForTest(
+		t, app, time.Now().UTC().Add(-time.Minute),
+	)
+	firstWriteHeight := nextHeight
 	cometShim := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodGet, r.Method)
 		if r.URL.Path == "/num_unconfirmed_txs" {
@@ -252,7 +255,7 @@ func TestAppV23CompanionRESTTaskCommitsAndImmediatelyListsForExactAssignee(t *te
 	require.NotEmpty(t, committed.MemoryID)
 	require.NotEmpty(t, committed.TxHash)
 	require.True(t, committed.Committed)
-	require.Equal(t, int64(1), committed.CommittedHeight)
+	require.Equal(t, firstWriteHeight, committed.CommittedHeight)
 	require.Equal(t, "proposed", committed.Status)
 	derivedKey, err := taskidempotency.SemanticKey(
 		companion.id,
