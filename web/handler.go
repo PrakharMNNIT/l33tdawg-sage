@@ -1907,6 +1907,9 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		if h.appV23IsActive() {
 			qopts.CandidateFilter = func(record *memory.MemoryRecord) (bool, error) {
 				if err := h.validateAppV23DashboardRecord(record); err != nil {
+					if isAppV23UnsafeDashboardRecord(err) {
+						return false, nil
+					}
 					return false, err
 				}
 				return true, nil
@@ -1928,7 +1931,8 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 			return
 		}
 		if ferr == nil {
-			if projectionErr := h.validateAppV23DashboardRecords(ftsRecs); projectionErr != nil {
+			ftsRecs, projectionErr := h.filterAppV23BroadDashboardRecords(ftsRecs)
+			if projectionErr != nil {
 				if writeAppV23DashboardProjectionFailure(w, projectionErr) {
 					return
 				}
@@ -1948,7 +1952,8 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 				writeError(w, http.StatusInternalServerError, perr.Error())
 				return
 			}
-			if projectionErr := h.validateAppV23DashboardRecords(pool); projectionErr != nil {
+			pool, projectionErr := h.filterAppV23BroadDashboardRecords(pool)
+			if projectionErr != nil {
 				if writeAppV23DashboardProjectionFailure(w, projectionErr) {
 					return
 				}
@@ -2398,7 +2403,8 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 	if err != nil {
 		return nil, err
 	}
-	if err := h.validateAppV23DashboardRecords(records); err != nil {
+	records, err = h.filterAppV23BroadDashboardRecords(records)
+	if err != nil {
 		return nil, err
 	}
 
@@ -2539,7 +2545,8 @@ func (h *DashboardHandler) stratifiedSample(ctx context.Context, base store.List
 		if err != nil {
 			return nil, err
 		}
-		if err := h.validateAppV23DashboardRecords(recs); err != nil {
+		recs, err = h.filterAppV23BroadDashboardRecords(recs)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, recs...)

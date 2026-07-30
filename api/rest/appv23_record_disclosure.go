@@ -31,7 +31,11 @@ func appV23RecordDisclosureError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w: %v", errAppV23RecordDisclosureUnavailable, err)
+	return fmt.Errorf("%w: %w", errAppV23RecordDisclosureUnavailable, err)
+}
+
+func isUnsafeAppV23Projection(err error) bool {
+	return errors.Is(err, store.ErrMemoryProjectionUnpublished)
 }
 
 // appV23RecordDisclosure is the single post-v23 content-disclosure decision.
@@ -117,6 +121,9 @@ func (s *Server) collectAppV23VisibleRecords(
 				credentialID, rec, now,
 			)
 			if disclosureErr != nil {
+				if isUnsafeAppV23Projection(disclosureErr) {
+					continue
+				}
 				return nil, appV23RecordDisclosureError(disclosureErr)
 			}
 			if disclosure.Allowed {

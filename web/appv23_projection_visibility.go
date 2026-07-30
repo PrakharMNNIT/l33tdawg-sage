@@ -25,7 +25,7 @@ func appV23DashboardProjectionError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w: %v", errAppV23DashboardProjectionUnavailable, err)
+	return fmt.Errorf("%w: %w", errAppV23DashboardProjectionUnavailable, err)
 }
 
 func writeAppV23DashboardProjectionFailure(w http.ResponseWriter, err error) bool {
@@ -47,16 +47,25 @@ func writeAppV23DashboardProjectionFailure(w http.ResponseWriter, err error) boo
 func (h *DashboardHandler) validateAppV23DashboardRecord(
 	record *memory.MemoryRecord,
 ) error {
+	_, err := h.classifyAppV23DashboardRecord(record)
+	return err
+}
+
+func (h *DashboardHandler) classifyAppV23DashboardRecord(
+	record *memory.MemoryRecord,
+) (store.MemoryProjectionDisposition, error) {
 	if !h.appV23IsActive() {
-		return nil
+		return store.MemoryProjectionExact, nil
 	}
 	if h.BadgerStore == nil {
-		return appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
+		return store.MemoryProjectionUnpublished,
+			appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
 	}
-	if _, err := h.BadgerStore.ValidateMemoryProjection(record); err != nil {
-		return appV23DashboardProjectionError(err)
+	_, disposition, err := h.BadgerStore.ClassifyMemoryProjection(record)
+	if err != nil {
+		return disposition, appV23DashboardProjectionError(err)
 	}
-	return nil
+	return disposition, nil
 }
 
 func (h *DashboardHandler) validateAppV23DashboardRecords(
@@ -68,6 +77,37 @@ func (h *DashboardHandler) validateAppV23DashboardRecords(
 		}
 	}
 	return nil
+}
+
+func isAppV23UnsafeDashboardRecord(err error) bool {
+	return errors.Is(err, store.ErrMemoryProjectionUnpublished)
+}
+
+// filterAppV23BroadDashboardRecords omits unsafe rows before they consume a
+// visible result/count. Exact/detail and export paths intentionally do not use
+// this helper: they retain fail-closed behavior.
+func (h *DashboardHandler) filterAppV23BroadDashboardRecords(
+	records []*memory.MemoryRecord,
+) ([]*memory.MemoryRecord, error) {
+	if !h.appV23IsActive() {
+		return records, nil
+	}
+	kept := make([]*memory.MemoryRecord, 0, len(records))
+	for _, record := range records {
+		if _, err := h.classifyAppV23DashboardRecord(record); err != nil {
+			if isAppV23UnsafeDashboardRecord(err) {
+				continue
+			}
+			return nil, err
+		}
+		kept = append(kept, record)
+	}
+	return kept, nil
+}
+
+type appV23ProjectionWalkAudit struct {
+	legacyCompatible bool
+	quarantined      bool
 }
 
 // walkAppV23CanonicalDashboardRecords pages deterministically through one SQL
@@ -106,6 +146,55 @@ func (h *DashboardHandler) walkAppV23CanonicalDashboardRecords(
 		}
 		if len(records) < appV23DashboardProjectionPageSize {
 			return nil
+		}
+	}
+}
+
+// walkAppV23BroadDashboardRecords is the collection-safe companion to the exact
+// walker above. Unsafe rows are omitted before visit, pagination, and aggregate
+// counts; the returned audit contains booleans only and never exposes raw hidden
+// counts or identities.
+func (h *DashboardHandler) walkAppV23BroadDashboardRecords(
+	ctx context.Context,
+	opts store.ListOptions,
+	visit func(*memory.MemoryRecord) error,
+) (appV23ProjectionWalkAudit, error) {
+	var audit appV23ProjectionWalkAudit
+	if !h.appV23IsActive() {
+		return audit, errors.New("app-v23 broad dashboard walk requested before activation")
+	}
+	if h.BadgerStore == nil {
+		return audit, appV23DashboardProjectionError(errors.New("canonical store is unavailable"))
+	}
+	opts.Limit = appV23DashboardProjectionPageSize
+	opts.Offset = 0
+	opts.StablePaging = true
+	for offset := 0; ; offset += appV23DashboardProjectionPageSize {
+		opts.Offset = offset
+		records, _, err := h.store.ListMemories(ctx, opts)
+		if err != nil {
+			return audit, err
+		}
+		for _, record := range records {
+			disposition, projectionErr := h.classifyAppV23DashboardRecord(record)
+			if projectionErr != nil {
+				if isAppV23UnsafeDashboardRecord(projectionErr) {
+					audit.quarantined = true
+					continue
+				}
+				return audit, projectionErr
+			}
+			if disposition == store.MemoryProjectionLegacyTerminalHashless {
+				audit.legacyCompatible = true
+			}
+			if visit != nil {
+				if visitErr := visit(record); visitErr != nil {
+					return audit, visitErr
+				}
+			}
+		}
+		if len(records) < appV23DashboardProjectionPageSize {
+			return audit, nil
 		}
 	}
 }
@@ -183,7 +272,7 @@ func (h *DashboardHandler) appV23CanonicalDashboardPage(
 	}
 	page := make([]*memory.MemoryRecord, 0, limit)
 	total := 0
-	if err := h.walkAppV23CanonicalDashboardRecords(
+	if _, err := h.walkAppV23BroadDashboardRecords(
 		ctx, opts,
 		func(record *memory.MemoryRecord) error {
 			if total >= offset && len(page) < limit {
@@ -235,7 +324,7 @@ func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 		stats.DBSizeBytes = rawStats.DBSizeBytes
 	}
 	latestByDomain := make(map[string]time.Time)
-	err = h.walkAppV23CanonicalDashboardRecords(
+	audit, err := h.walkAppV23BroadDashboardRecords(
 		ctx,
 		cerebrumListOptions(store.ListOptions{Sort: "oldest"}),
 		func(record *memory.MemoryRecord) error {
@@ -259,6 +348,9 @@ func (h *DashboardHandler) cerebrumVisibleStatsAndActivity(
 	if err != nil {
 		return nil, nil, err
 	}
+	h.BadgerStore.PublishCanonicalMemoryProjectionAudit(
+		true, audit.legacyCompatible, audit.quarantined,
+	)
 	activity := make(map[string]string, len(latestByDomain))
 	for domain, at := range latestByDomain {
 		activity[domain] = at.UTC().Format(time.RFC3339Nano)
@@ -273,7 +365,7 @@ func (h *DashboardHandler) appV23CanonicalTimeline(
 ) ([]store.TimelineBucket, error) {
 	counts := make(map[string]int)
 	formatter, _ := h.store.(store.TimelinePeriodFormatter)
-	err := h.walkAppV23CanonicalDashboardRecords(
+	_, err := h.walkAppV23BroadDashboardRecords(
 		ctx,
 		cerebrumListOptions(store.ListOptions{
 			DomainTag:   domain,

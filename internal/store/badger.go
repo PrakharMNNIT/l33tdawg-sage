@@ -127,6 +127,9 @@ type BadgerStore struct {
 	// keeps this store independent of the federation package.
 	// An empty remoteChainID denotes a node-global authorization mutation.
 	authorizationMutationHooks *authorizationMutationHookState
+	// canonicalMemoryProjectionHealth is process-local readiness state shared by
+	// ordinary and transaction-scoped handles. It never enters Badger/AppHash.
+	canonicalMemoryProjectionHealth *canonicalMemoryProjectionHealthTracker
 
 	// Startup index repair is constructor-local, but the exported Ensure
 	// methods remain safe if an operator tool calls them concurrently. The
@@ -260,16 +263,17 @@ func (s *BadgerStore) BeginConsensusTransaction(mutationHook func(int)) *BadgerS
 		panic("store: nested consensus transaction")
 	}
 	return &BadgerStore{
-		db:                         s.db,
-		domainOwnershipGate:        s.domainOwnershipGate,
-		appV23MigrationMu:          s.appV23MigrationMu,
-		appV23StageFaultHook:       s.appV23StageFaultHook,
-		authorizationMutationHooks: s.authorizationMutationHooks,
-		txn:                        s.db.NewTransaction(true),
-		mutationHook:               mutationHook,
-		domainOwnershipMutated:     false,
-		authorizationMutated:       false,
-		authorizationPeers:         make(map[string]struct{}),
+		db:                              s.db,
+		domainOwnershipGate:             s.domainOwnershipGate,
+		appV23MigrationMu:               s.appV23MigrationMu,
+		appV23StageFaultHook:            s.appV23StageFaultHook,
+		authorizationMutationHooks:      s.authorizationMutationHooks,
+		canonicalMemoryProjectionHealth: s.canonicalMemoryProjectionHealth,
+		txn:                             s.db.NewTransaction(true),
+		mutationHook:                    mutationHook,
+		domainOwnershipMutated:          false,
+		authorizationMutated:            false,
+		authorizationPeers:              make(map[string]struct{}),
 	}
 }
 
@@ -338,11 +342,12 @@ func (s *BadgerStore) WithOrderedPublicationBarrier(
 	// non-transactional nested handle; the outer function already owns the
 	// publication and authorization locks.
 	scoped := &BadgerStore{
-		db:                         s.db,
-		domainOwnershipGate:        nil,
-		authorizationMutationHooks: &authorizationMutationHookState{},
-		appV23MigrationMu:          s.appV23MigrationMu,
-		appV23StageFaultHook:       s.appV23StageFaultHook,
+		db:                              s.db,
+		domainOwnershipGate:             nil,
+		authorizationMutationHooks:      &authorizationMutationHookState{},
+		appV23MigrationMu:               s.appV23MigrationMu,
+		appV23StageFaultHook:            s.appV23StageFaultHook,
+		canonicalMemoryProjectionHealth: s.canonicalMemoryProjectionHealth,
 	}
 	return fn(scoped)
 }
@@ -565,10 +570,11 @@ func NewBadgerStore(path string) (*BadgerStore, error) {
 	}
 
 	store := &BadgerStore{
-		db:                         db,
-		domainOwnershipGate:        &sync.RWMutex{},
-		appV23MigrationMu:          &sync.Mutex{},
-		authorizationMutationHooks: &authorizationMutationHookState{},
+		db:                              db,
+		domainOwnershipGate:             &sync.RWMutex{},
+		appV23MigrationMu:               &sync.Mutex{},
+		authorizationMutationHooks:      &authorizationMutationHookState{},
+		canonicalMemoryProjectionHealth: newCanonicalMemoryProjectionHealthTracker(),
 	}
 
 	// Backfill the multi-org agent→orgs reverse index from the authoritative
@@ -606,7 +612,8 @@ func OpenBadgerStoreReadOnly(path string) (*BadgerStore, error) {
 	}
 	return &BadgerStore{
 		db: db, domainOwnershipGate: &sync.RWMutex{},
-		authorizationMutationHooks: &authorizationMutationHookState{},
+		authorizationMutationHooks:      &authorizationMutationHookState{},
+		canonicalMemoryProjectionHealth: newCanonicalMemoryProjectionHealthTracker(),
 	}, nil
 }
 
@@ -634,7 +641,8 @@ func OpenBadgerStoreWithoutMigrations(path string) (*BadgerStore, error) {
 	}
 	return &BadgerStore{
 		db: db, domainOwnershipGate: &sync.RWMutex{},
-		authorizationMutationHooks: &authorizationMutationHookState{},
+		authorizationMutationHooks:      &authorizationMutationHookState{},
+		canonicalMemoryProjectionHealth: newCanonicalMemoryProjectionHealthTracker(),
 	}, nil
 }
 

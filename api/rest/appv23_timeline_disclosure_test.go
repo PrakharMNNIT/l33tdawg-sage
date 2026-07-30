@@ -79,7 +79,7 @@ func TestAppV23TimelineCountsOnlyLiveAuthorizedRecordsAcrossRawPages(t *testing.
 	require.Equal(t, 1, response.Total)
 }
 
-func TestAppV23TimelineFailsClosedWhenRecordAuthorizationIsCorrupt(t *testing.T) {
+func TestAppV23TimelineOmitsRecordWhoseCanonicalProjectionIsCorrupt(t *testing.T) {
 	srv, badger, readerID, ownerID, _ := setupAppV23RESTAccess(t)
 	memStore := &appV23PagingStore{rbacMockMemoryStore: newRBACMockMemoryStore()}
 	memStore.badger = badger
@@ -104,9 +104,9 @@ func TestAppV23TimelineFailsClosedWhenRecordAuthorizationIsCorrupt(t *testing.T)
 	req = req.WithContext(middleware.WithAgentID(req.Context(), readerID))
 	out := httptest.NewRecorder()
 	srv.handleTimelineAuth(out, req)
-	require.Equal(t, http.StatusServiceUnavailable, out.Code, out.Body.String())
+	require.Equal(t, http.StatusOK, out.Code, out.Body.String())
 	require.NotContains(t, out.Body.String(), "timeline-corrupt-classification")
-	require.NotContains(t, out.Body.String(), `"count"`)
+	require.Equal(t, `{"buckets":[],"total":0}`+"\n", out.Body.String())
 }
 
 func TestAppV23TimelinePeriodMatchesStableSQLiteShape(t *testing.T) {

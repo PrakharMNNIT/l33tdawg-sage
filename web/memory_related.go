@@ -155,6 +155,9 @@ func (h *DashboardHandler) handleMemoryRelated(w http.ResponseWriter, r *http.Re
 			return
 		}
 		if err := h.validateAppV23DashboardRecord(rec); err != nil {
+			if isAppV23UnsafeDashboardRecord(err) {
+				return
+			}
 			projectionErr = err
 			return
 		}
@@ -198,6 +201,9 @@ func (h *DashboardHandler) handleMemoryRelated(w http.ResponseWriter, r *http.Re
 			if h.appV23IsActive() {
 				queryOpts.CandidateFilter = func(record *memory.MemoryRecord) (bool, error) {
 					if err := h.validateAppV23DashboardRecord(record); err != nil {
+						if isAppV23UnsafeDashboardRecord(err) {
+							return false, nil
+						}
 						return false, err
 					}
 					return true, nil
@@ -231,6 +237,9 @@ func (h *DashboardHandler) handleMemoryRelated(w http.ResponseWriter, r *http.Re
 					continue
 				}
 				if err := h.validateAppV23DashboardRecord(rec); err != nil {
+					if isAppV23UnsafeDashboardRecord(err) {
+						continue
+					}
 					projectionErr = err
 					return
 				}
