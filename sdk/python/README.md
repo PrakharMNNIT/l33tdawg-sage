@@ -128,8 +128,8 @@ profile = client.get_profile()       # GET /v1/agent/me
 agent = client.get_agent("a1b2c3...")  # GET /v1/agent/{id}
 # Returns: AgentInfo(agent_id, name, role, clearance, org_id, dept_id, ...)
 
-# List all registered agents (public info)
-agents = client.list_agents()        # GET /v1/agents
+# List active ordinary agents visible to this signed caller
+agents = client.list_agents()        # GET /v1/agents → {"agents": [...], "total": N}
 
 # Set agent permissions (admin only)
 client.set_agent_permission(

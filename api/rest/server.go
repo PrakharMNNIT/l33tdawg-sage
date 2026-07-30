@@ -669,9 +669,6 @@ func (s *Server) setupRouter() chi.Router {
 	r.Get("/health", s.health.HealthHandler)
 	r.Get("/ready", s.health.ReadinessHandler)
 
-	// Public read-only agent identity endpoints (no auth required)
-	r.Get("/v1/agents", s.handleListRegisteredAgents)
-
 	// Authenticated API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Ed25519AuthMiddleware)
@@ -680,6 +677,7 @@ func (s *Server) setupRouter() chi.Router {
 		// app-v23 the boundary is a no-op; after activation it excludes Root,
 		// pending, inactive, and internally inconsistent principals just like
 		// resolve/send/inbox do.
+		r.With(s.appV23PipelineAgentBoundary).Get("/v1/agents", s.handleListRegisteredAgents)
 		r.With(s.appV23PipelineAgentBoundary).Get("/v1/agents/lookup", s.handleFindRegisteredAgents)
 
 		// Memory endpoints

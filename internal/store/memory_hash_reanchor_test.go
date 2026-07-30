@@ -223,6 +223,92 @@ func TestReanchorMemoryHashesValidatesWholeChunkBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestMemoryHashReanchorSeparatesMutableDriftFromCanonicalCorruption(t *testing.T) {
+	t.Run("status transition is terminal business drift", func(t *testing.T) {
+		store := newTestBadger(t)
+		eligibleHashlessReanchorMemory(t, store, "memory-a", "committed")
+		entry := reanchorTestEntry("memory-a", "deprecated")
+		err := store.ValidateMemoryHashReanchors([]MemoryHashReanchorEntry{entry})
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrMemoryHashReanchorStateDrift)
+	})
+
+	t.Run("missing disclosure projection remains fatal corruption", func(t *testing.T) {
+		store := newTestBadger(t)
+		eligibleHashlessReanchorMemory(t, store, "memory-a", "committed")
+		deleteRawReanchorTestKey(t, store, memoryDomainKey("memory-a"))
+		err := store.ValidateMemoryHashReanchors([]MemoryHashReanchorEntry{
+			reanchorTestEntry("memory-a", "committed"),
+		})
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrMemoryHashReanchorStateDrift)
+	})
+
+	t.Run("missing canonical memory remains fatal corruption", func(t *testing.T) {
+		store := newTestBadger(t)
+		eligibleHashlessReanchorMemory(t, store, "memory-a", "committed")
+		deleteRawReanchorTestKey(t, store, memoryKey("memory-a"))
+		err := store.ValidateMemoryHashReanchors([]MemoryHashReanchorEntry{
+			reanchorTestEntry("memory-a", "committed"),
+		})
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrMemoryNotFound)
+		require.NotErrorIs(t, err, ErrMemoryHashReanchorStateDrift)
+	})
+
+	t.Run("malformed canonical hash remains fatal corruption", func(t *testing.T) {
+		store := newTestBadger(t)
+		eligibleHashlessReanchorMemory(t, store, "memory-a", "committed")
+		setRawMemoryEntry(t, store, "memory-a", []byte{0, 0, 0})
+		err := store.ValidateMemoryHashReanchors([]MemoryHashReanchorEntry{
+			reanchorTestEntry("memory-a", "committed"),
+		})
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrMemoryHashReanchorStateDrift)
+	})
+
+	for _, status := range []string{"", "garbage"} {
+		t.Run("invalid canonical status "+status+" remains fatal corruption", func(t *testing.T) {
+			store := newTestBadger(t)
+			eligibleHashlessReanchorMemory(t, store, "memory-a", "committed")
+			setRawMemoryEntry(t, store, "memory-a", encodeMemoryHashEntry(nil, status))
+			err := store.ValidateMemoryHashReanchors([]MemoryHashReanchorEntry{
+				reanchorTestEntry("memory-a", "committed"),
+			})
+			require.Error(t, err)
+			require.NotErrorIs(t, err, ErrMemoryHashReanchorStateDrift)
+		})
+	}
+
+	t.Run("partial scoped marker remains fatal corruption", func(t *testing.T) {
+		store := newTestBadger(t)
+		eligibleHashlessReanchorMemory(t, store, "memory-a", "committed")
+		setRawReanchorTestKey(t, store, scopeBallotKey("memory-a"), []byte("partial"))
+		err := store.ValidateMemoryHashReanchors([]MemoryHashReanchorEntry{
+			reanchorTestEntry("memory-a", "committed"),
+		})
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrMemoryHashReanchorStateDrift)
+	})
+
+	t.Run("different canonical hash remains fatal conflict", func(t *testing.T) {
+		store := newTestBadger(t)
+		eligibleHashlessReanchorMemory(t, store, "memory-a", "committed")
+		setRawMemoryEntry(
+			t,
+			store,
+			"memory-a",
+			encodeMemoryHashEntry(bytes.Repeat([]byte{0xff}, sha256.Size), "committed"),
+		)
+		err := store.ValidateMemoryHashReanchors([]MemoryHashReanchorEntry{
+			reanchorTestEntry("memory-a", "committed"),
+		})
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrMemoryHashReanchorConflict)
+		require.NotErrorIs(t, err, ErrMemoryHashReanchorStateDrift)
+	})
+}
+
 func TestReanchorMemoryHashesRejectsInvalidInputBeforeStateAccess(t *testing.T) {
 	hash := reanchorTestHash("a")
 	tests := []struct {

@@ -209,6 +209,35 @@ func TestProcessBlockValidatedLeavesFailedExecutionRecoverable(t *testing.T) {
 	assert.Equal(t, proposalID, active.ProposalID)
 }
 
+func TestProcessBlockValidatedWithInvalidationRejectsClassifiedDrift(t *testing.T) {
+	eng, _, _ := makeEngine(map[string]int64{"val-a": 10})
+	proposalID, err := eng.Propose(
+		"val-a", OpAddValidator, "new-val", []byte("key"), 3,
+		0, "stale execution", 100, nil,
+	)
+	require.NoError(t, err)
+
+	drift := fmt.Errorf("deterministic target state changed")
+	executed, invalidated, err := eng.ProcessBlockValidatedWithInvalidation(
+		100,
+		func(*ProposalState) error { return drift },
+		func(proposal *ProposalState, validationErr error) bool {
+			return proposal.Operation == OpAddValidator && validationErr == drift
+		},
+	)
+	require.NoError(t, err)
+	assert.Nil(t, executed)
+	require.NotNil(t, invalidated)
+	assert.Equal(t, proposalID, invalidated.ProposalID)
+
+	proposal, err := eng.LoadProposal(proposalID)
+	require.NoError(t, err)
+	assert.Equal(t, StatusRejected, proposal.Status)
+	active, err := eng.GetActiveProposal()
+	require.NoError(t, err)
+	assert.Nil(t, active)
+}
+
 func TestSingleNodeAutoApprove(t *testing.T) {
 	eng, _, _ := makeEngine(map[string]int64{
 		"sole-val": 10,

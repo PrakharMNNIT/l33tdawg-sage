@@ -249,4 +249,22 @@ func TestCanonicalMemoryProjectionHealthCompleteAuditClearsStickyQuarantine(t *t
 	require.False(t, health.Required)
 	require.True(t, health.OK)
 	require.Equal(t, CanonicalMemoryProjectionNotRequired, health.State)
+
+	badger.PublishCanonicalMemoryProjectionSubsetAudit(false, false)
+	health = badger.CanonicalMemoryProjectionHealth()
+	require.True(t, health.Checked)
+	require.True(t, health.Required)
+	require.True(t, health.OK)
+	require.False(t, health.LegacyCompatible)
+	require.False(t, health.Quarantined)
+	require.Equal(t, CanonicalMemoryProjectionSubset, health.State)
+
+	badger.PublishCanonicalMemoryProjectionSubsetAudit(true, true)
+	health = badger.CanonicalMemoryProjectionHealth()
+	require.True(t, health.Checked)
+	require.True(t, health.Required)
+	require.False(t, health.OK)
+	require.True(t, health.LegacyCompatible)
+	require.True(t, health.Quarantined)
+	require.Equal(t, CanonicalMemoryProjectionQuarantined, health.State)
 }

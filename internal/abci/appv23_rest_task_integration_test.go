@@ -174,7 +174,9 @@ func TestAppV23CompanionRESTTaskCommitsAndImmediatelyListsForExactAssignee(t *te
 	preRegistrationList := httptest.NewRecorder()
 	restServer.Router().ServeHTTP(
 		preRegistrationList,
-		httptest.NewRequest(http.MethodGet, "/v1/agents", nil),
+		signedRESTGovernanceRequest(
+			t, companion, http.MethodGet, "/v1/agents", nil, 39,
+		),
 	)
 	require.Equal(t, http.StatusOK, preRegistrationList.Code, preRegistrationList.Body.String())
 	var preRegisteredAgents struct {
@@ -209,7 +211,9 @@ func TestAppV23CompanionRESTTaskCommitsAndImmediatelyListsForExactAssignee(t *te
 	agentsList := httptest.NewRecorder()
 	restServer.Router().ServeHTTP(
 		agentsList,
-		httptest.NewRequest(http.MethodGet, "/v1/agents", nil),
+		signedRESTGovernanceRequest(
+			t, companion, http.MethodGet, "/v1/agents", nil, 41,
+		),
 	)
 	require.Equal(t, http.StatusOK, agentsList.Code, agentsList.Body.String())
 	var listedAgents struct {

@@ -19,6 +19,13 @@ var (
 	// deliberately narrow app-v24 repair population.
 	ErrMemoryHashReanchorIneligible = errors.New("memory is ineligible for hash reanchor")
 
+	// ErrMemoryHashReanchorStateDrift marks an expected lifecycle transition
+	// that can make an otherwise valid proposal permanently stale.
+	// Malformed canonical encoding and missing disclosure projections never
+	// wrap this sentinel; those are invariant failures that consensus must keep
+	// fatal instead of clearing as ordinary proposal drift.
+	ErrMemoryHashReanchorStateDrift = errors.New("memory hash reanchor target state changed")
+
 	// ErrMemoryHashReanchorConflict marks a replay whose requested evidence
 	// differs from an already canonical 32-byte hash.
 	ErrMemoryHashReanchorConflict = errors.New("memory hash reanchor conflicts with canonical evidence")
@@ -175,7 +182,12 @@ func validateMemoryHashReanchorState(
 ) (bool, error) {
 	item, err := txn.Get(memoryKey(entry.MemoryID))
 	if errors.Is(err, badger.ErrKeyNotFound) {
-		return false, fmt.Errorf("%w: %w: %s", ErrMemoryHashReanchorIneligible, ErrMemoryNotFound, entry.MemoryID)
+		return false, fmt.Errorf(
+			"%w: %w: %s",
+			ErrMemoryHashReanchorIneligible,
+			ErrMemoryNotFound,
+			entry.MemoryID,
+		)
 	}
 	if err != nil {
 		return false, fmt.Errorf("read memory %s for hash reanchor: %w", entry.MemoryID, err)
@@ -193,10 +205,25 @@ func validateMemoryHashReanchorState(
 			ErrMemoryHashReanchorIneligible, ErrMemoryHashMalformed, entry.MemoryID, err,
 		)
 	}
+	// decodeMemoryHashEntry only establishes framing. Validate the lifecycle
+	// enum before treating a mismatch as ordinary mutable drift; an arbitrary
+	// or empty status byte sequence is canonical corruption and must remain
+	// fatal to consensus.
+	switch canonicalStatus {
+	case "proposed", "validated", "committed", "challenged", "deprecated":
+	default:
+		return false, fmt.Errorf(
+			"%w: memory %s has invalid status %q",
+			ErrMemoryHashReanchorIneligible,
+			entry.MemoryID,
+			canonicalStatus,
+		)
+	}
 	if canonicalStatus != entry.ExpectedStatus {
 		return false, fmt.Errorf(
-			"%w: status mismatch for %s: got %q, expected %q",
+			"%w: %w: status mismatch for %s: got %q, expected %q",
 			ErrMemoryHashReanchorIneligible,
+			ErrMemoryHashReanchorStateDrift,
 			entry.MemoryID,
 			canonicalStatus,
 			entry.ExpectedStatus,
@@ -206,8 +233,11 @@ func validateMemoryHashReanchorState(
 	case "committed", "deprecated":
 	default:
 		return false, fmt.Errorf(
-			"%w: memory %s status %q is not terminal",
-			ErrMemoryHashReanchorIneligible, entry.MemoryID, canonicalStatus,
+			"%w: %w: memory %s status %q is not terminal",
+			ErrMemoryHashReanchorIneligible,
+			ErrMemoryHashReanchorStateDrift,
+			entry.MemoryID,
+			canonicalStatus,
 		)
 	}
 
@@ -234,9 +264,11 @@ func validateMemoryHashReanchorState(
 	}
 
 	// Co-commits and scoped memories retain their hash through their own
-	// lifecycle machinery. Seeing either marker on a hash-reanchor target means
-	// the record is outside this ordinary-memory repair path (including partial
-	// marker corruption).
+	// lifecycle machinery. A terminal ordinary repair target cannot legitimately
+	// acquire either marker after the proposal snapshot: scoped submission starts
+	// from proposed state, while this operation accepts only committed/deprecated
+	// records. Treat any marker here as invariant corruption, including a partial
+	// marker set, so consensus never clears the proposal as ordinary drift.
 	for _, marker := range []struct {
 		key  []byte
 		kind string
@@ -249,7 +281,9 @@ func validateMemoryHashReanchorState(
 		if _, getErr := txn.Get(marker.key); getErr == nil {
 			return false, fmt.Errorf(
 				"%w: memory %s has %s state",
-				ErrMemoryHashReanchorIneligible, entry.MemoryID, marker.kind,
+				ErrMemoryHashReanchorIneligible,
+				entry.MemoryID,
+				marker.kind,
 			)
 		} else if !errors.Is(getErr, badger.ErrKeyNotFound) {
 			return false, fmt.Errorf(

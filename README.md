@@ -75,12 +75,14 @@ ordinary upgraded nodes: existing agents retain their app-v23 write authority
 while app-v24 activates.
 
 **Agent recall and caller-scoped discovery work again under the new access
-model.** `sage_turn` now forwards the exact embedding provider returned by
-`/v1/embed`, satisfying the app-v23 federated-vector recall gate. The signed
-`sage_find_agent` path again searches active ordinary local agents first and
-then only federated contacts authorized for that caller. It is discovery
-metadata, not presence: an empty match does not prove that a saved exact Agent
-ID is unreachable, and sends always revalidate the destination.
+model.** `sage_turn` now uses the shared local semantic-recall path and forwards
+the exact embedding provider returned by `/v1/embed`; it no longer
+misclassifies every turn as federated and then trips the app-v23
+federated-vector gate. The signed `sage_find_agent` path again searches active
+ordinary local agents first and then only federated contacts authorized for
+that caller. It is discovery metadata, not presence: an empty match does not
+prove that a saved exact Agent ID is unreachable, and sends always revalidate
+the destination.
 
 **CEREBRUM RBAC now preserves the policy the operator actually approves.**
 Companion enrollment accepts its documented `15`/`31` profiles, valid existing
@@ -90,6 +92,19 @@ approval. Encrypted and unencrypted loopback CEREBRUM use the same Root/Admin
 authorization boundary; an encrypted vault additionally requires its valid
 unlocked session. A level-2 grant is never presented as a cure for a hard
 capability, pending-review, profile, or ownership denial.
+
+**CEREBRUM no longer mistakes a missing ordinary-memory projection for an
+empty brain.** App-v23 readiness now checks the complete canonical Badger
+inventory against the local SQL serving projection, so deletion, rollback, or
+partial projection loss returns `503` instead of a plausible zero-memory
+dashboard or empty backup. A state-sync receiver seals and node-key-signs the
+exact historical canonical IDs whose ordinary plaintext was intentionally not
+transferred; every memory committed after that baseline remains mandatory. Such a node
+reports `canonical_subset`, and portable full-brain export stays disabled
+rather than producing a partial file labeled as a backup. Pre-v11.16 receivers
+that do not have this exact authenticated baseline fail strict readiness and
+must be explicitly repaired or state-synchronized again; upgrade-time SQL state
+is never guessed into an omission allowlist.
 
 Container: `ghcr.io/l33tdawg/sage:11.16.0`. SDK 11.16.0.
 

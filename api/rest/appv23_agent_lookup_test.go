@@ -123,6 +123,49 @@ func TestAppV23AgentLookupIsCallerScopedAndReturnsCanonicalMatches(t *testing.T)
 	require.Zero(t, decodeAgentLookup(t, inactiveRec).Total)
 }
 
+func TestAppV23AgentRosterRequiresSignatureAndFiltersCanonicalEnrollment(t *testing.T) {
+	fixture := newAppV23RESTRouteFixture(t)
+	activeID := addAppV23LookupAgent(
+		t, fixture, "active-roster", "Active roster agent", "active-roster",
+		"test", 1, true,
+	)
+	_ = addAppV23LookupAgent(
+		t, fixture, "pending-roster", "Pending roster agent", "pending-roster",
+		"test", 1, false,
+	)
+
+	unsigned := httptest.NewRecorder()
+	fixture.server.Router().ServeHTTP(
+		unsigned,
+		httptest.NewRequest(http.MethodGet, "/v1/agents", nil),
+	)
+	require.Equal(t, http.StatusUnauthorized, unsigned.Code, unsigned.Body.String())
+
+	req := appV23SignedRESTRouteRequest(
+		t, fixture, "member", http.MethodGet, "/v1/agents", nil, false,
+	)
+	rec := httptest.NewRecorder()
+	fixture.server.Router().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var response struct {
+		Agents []*store.AgentEntry `json:"agents"`
+		Total  int                 `json:"total"`
+	}
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+	require.NotZero(t, response.Total)
+	for _, agent := range response.Agents {
+		require.NotNil(t, agent)
+		require.NotEqual(t, "pending-roster", agent.RegisteredName)
+	}
+	require.Contains(t, func() []string {
+		ids := make([]string, 0, len(response.Agents))
+		for _, agent := range response.Agents {
+			ids = append(ids, agent.AgentID)
+		}
+		return ids
+	}(), activeID)
+}
+
 func TestAppV23AgentLookupRejectsUnknownInactiveAndRootCallers(t *testing.T) {
 	fixture := newAppV23RESTRouteFixture(t)
 	for _, actor := range []struct {

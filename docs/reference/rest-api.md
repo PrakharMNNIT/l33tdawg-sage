@@ -4,7 +4,7 @@
 
 ## Authentication
 
-Most core `/v1/*` REST endpoints require Ed25519 request signing (`api/rest/middleware/auth.go:81-213`). Public and alternate-auth exceptions include `GET /v1/agents`, health/readiness routes, OAuth discovery/flows, and the HTTP MCP transports (`/v1/mcp/sse`, `/v1/mcp/messages`, `/v1/mcp/streamable`), which use MCP bearer-token/OAuth authentication.
+Most core `/v1/*` REST endpoints require Ed25519 request signing (`api/rest/middleware/auth.go:81-213`). Public and alternate-auth exceptions include health/readiness routes, OAuth discovery/flows, and the HTTP MCP transports (`/v1/mcp/sse`, `/v1/mcp/messages`, `/v1/mcp/streamable`), which use MCP bearer-token/OAuth authentication.
 
 | Header | Format | Purpose |
 |---|---|---|
@@ -692,10 +692,13 @@ Returns 503 if not configured on this node.
 
 ### `GET /v1/agents`
 
-List all registered agents. **No auth required.**
-This is an operator/public roster, not caller-scoped recipient discovery or a
-presence/reachability oracle. MCP clients must use the signed
-`GET /v1/agents/lookup` route instead.
+Signed local roster. After app-v23 the caller must be an active ordinary local
+agent and the response contains only active ordinary canonical enrollments.
+Root, historical Root credentials, pending/inactive agents, and inconsistent
+SQL-only rows are excluded. The old unsigned full-roster endpoint was removed
+in v11.16 because it exposed local RBAC/network topology and bypassed
+caller-scoped recipient discovery. MCP clients should normally use the more
+efficient signed `GET /v1/agents/lookup` route.
 
 **Response** (HTTP 200): `{"agents": [...AgentEntry], "total": N}`
 
@@ -2201,6 +2204,14 @@ provider, and any required v11.9 scoped serving projection. No auth.
     "rebuilt": 42,
     "detail": ""
   },
+  "memory_projection": {
+    "checked": true,
+    "required": true,
+    "ok": true,
+    "state": "exact",
+    "legacy_compatible": false,
+    "quarantined": false
+  },
   "embedder": {
     "checked": true,          // false until the watchdog's first probe
     "ok": true,
@@ -2215,8 +2226,11 @@ provider, and any required v11.9 scoped serving projection. No auth.
 Status semantics:
 - `not_ready` → **HTTP 503**: core infrastructure (store or CometBFT) is down,
   or canonical scoped envelopes exist but the local SQL serving projection is
-  locked, incomplete, or failed verification. A locked SQLite vault retries the
-  scoped rebuild after unlock.
+  locked, incomplete, or failed verification. The app-v23
+  `memory_projection` independently verifies the full ordinary-memory
+  Badger inventory against SQL; a missing, rolled-back, SQL-only, or tampered
+  row is quarantined instead of being reported as an empty brain. A locked
+  SQLite vault retries projection verification after unlock.
 - `degraded` → **HTTP 200** by default: core is up but a *semantic* embedder has been
   probed and is unreachable, so hybrid/semantic recall has dropped to keyword-only.
   The node still serves. Pass `?strict=1` to make this a **503** for gates that
@@ -2224,6 +2238,20 @@ Status semantics:
 - `ready` → **HTTP 200**: everything healthy. A hash (non-semantic) provider is
   `ready` — non-semantic is a capability, not a fault. An embedder not yet probed is
   also `ready`.
+
+`memory_projection.state` is `exact` for a complete projection,
+`legacy_compatible` for a complete projection containing only the explicitly
+supported historical terminal hashless shape, and `canonical_subset` for a
+verified state-sync receiver. The subset baseline is bound to that receiver's
+chain, node key, validator key, and canonical height/AppHash; its exact omission
+set is signed by the receiver node key before normal serving begins. The file
+must remain in the receiver's non-group/world-writable data directory. It permits
+only the exact historical IDs whose ordinary plaintext was absent at the sealed
+snapshot. Later memories are still mandatory. A subset node cannot use the portable full-brain dashboard
+export because labeling a partial local projection as a complete backup would
+be unsafe. A receiver completed before v11.16 without this exact baseline
+remains fail-closed until the operator explicitly repairs or repeats state sync;
+startup never infers an allowlist from the receiver's current SQL contents.
 
 The embedder status is refreshed by a ~30s background watchdog (see the node's
 `startEmbedderWatchdog`).

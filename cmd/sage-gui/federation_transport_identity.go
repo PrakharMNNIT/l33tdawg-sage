@@ -39,6 +39,8 @@ func persistedNodeIdentityEvidence(sageHome, dataDir, cometHome string) (string,
 		{"SQLite shared-memory state", filepath.Join(dataDir, "sage.db-shm")},
 		{"SQLite rollback journal", filepath.Join(dataDir, "sage.db-journal")},
 		{"state-sync activation journal", filepath.Join(dataDir, stateSyncActivationJournalName)},
+		{"state-sync projection baseline", stateSyncProjectionBaselinePath(dataDir)},
+		{"pending state-sync projection baseline", stateSyncProjectionBaselinePendingPath(dataDir)},
 		{"post-crash HALT sentinel", filepath.Join(dataDir, "HALT")},
 		{"interrupted post-crash HALT sentinel", filepath.Join(dataDir, ".HALT.tmp")},
 	}

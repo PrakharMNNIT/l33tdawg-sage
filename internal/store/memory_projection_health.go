@@ -7,6 +7,7 @@ const (
 	CanonicalMemoryProjectionNotRequired      = "not_required"
 	CanonicalMemoryProjectionExact            = "exact"
 	CanonicalMemoryProjectionLegacyCompatible = "legacy_compatible"
+	CanonicalMemoryProjectionSubset           = "canonical_subset"
 	CanonicalMemoryProjectionQuarantined      = "quarantined"
 )
 
@@ -54,6 +55,26 @@ func (s *BadgerStore) CanonicalMemoryProjectionHealth() CanonicalMemoryProjectio
 func (s *BadgerStore) PublishCanonicalMemoryProjectionAudit(
 	required, legacyCompatible, quarantined bool,
 ) {
+	s.publishCanonicalMemoryProjectionAudit(
+		required, legacyCompatible, quarantined, false,
+	)
+}
+
+// PublishCanonicalMemoryProjectionSubsetAudit publishes a complete audit of
+// the SQL rows this state-synced node actually stores. Every present row still
+// has to match canonical Badger state; historical canonical IDs absent from SQL
+// are intentional because ordinary plaintext is not part of state sync.
+func (s *BadgerStore) PublishCanonicalMemoryProjectionSubsetAudit(
+	legacyCompatible, quarantined bool,
+) {
+	s.publishCanonicalMemoryProjectionAudit(
+		true, legacyCompatible, quarantined, true,
+	)
+}
+
+func (s *BadgerStore) publishCanonicalMemoryProjectionAudit(
+	required, legacyCompatible, quarantined, subset bool,
+) {
 	if s == nil || s.canonicalMemoryProjectionHealth == nil {
 		return
 	}
@@ -69,6 +90,8 @@ func (s *BadgerStore) PublishCanonicalMemoryProjectionAudit(
 		status.State = CanonicalMemoryProjectionNotRequired
 	case quarantined:
 		status.State = CanonicalMemoryProjectionQuarantined
+	case subset:
+		status.State = CanonicalMemoryProjectionSubset
 	case legacyCompatible:
 		status.State = CanonicalMemoryProjectionLegacyCompatible
 	default:

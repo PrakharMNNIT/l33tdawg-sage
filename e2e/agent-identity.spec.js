@@ -13,17 +13,13 @@ test.beforeEach(async ({ request }) => {
 });
 
 // ---------------------------------------------------------------------------
-//  API — On-chain Agent Identity Endpoints (read-only, no auth required)
+//  API — On-chain Agent Identity Endpoints (caller-scoped and signed)
 // ---------------------------------------------------------------------------
 
 test.describe('API — On-chain Agent Registration', () => {
-    test('list registered agents returns array', async ({ request }) => {
+    test('unsigned agent roster is rejected', async ({ request }) => {
         const res = await request.get(`${BASE}/v1/agents`);
-        expect(res.ok()).toBeTruthy();
-        const body = await res.json();
-        expect(body.agents).toBeDefined();
-        expect(Array.isArray(body.agents)).toBeTruthy();
-        expect(body.total).toBeDefined();
+        expect(res.status()).toBe(401);
     });
 
     test('register agent via dashboard API', async ({ request }) => {
@@ -398,7 +394,7 @@ test.describe('UI — Agent List Shows Registered Agents', () => {
 
 test.describe('API — Agent Identity Data Integrity', () => {
     test('registered agent has expected fields', async ({ request }) => {
-        const agentsRes = await request.get(`${BASE}/v1/agents`);
+        const agentsRes = await request.get(`${BASE}/v1/dashboard/network/agents`);
         const agents = await agentsRes.json();
 
         if (agents.total > 0) {
@@ -414,7 +410,7 @@ test.describe('API — Agent Identity Data Integrity', () => {
     });
 
     test('agent clearance is within valid range', async ({ request }) => {
-        const agentsRes = await request.get(`${BASE}/v1/agents`);
+        const agentsRes = await request.get(`${BASE}/v1/dashboard/network/agents`);
         const agents = await agentsRes.json();
 
         for (const agent of agents.agents) {
@@ -424,7 +420,7 @@ test.describe('API — Agent Identity Data Integrity', () => {
     });
 
     test('agent role is one of admin/member/observer', async ({ request }) => {
-        const agentsRes = await request.get(`${BASE}/v1/agents`);
+        const agentsRes = await request.get(`${BASE}/v1/dashboard/network/agents`);
         const agents = await agentsRes.json();
 
         for (const agent of agents.agents) {
@@ -433,21 +429,15 @@ test.describe('API — Agent Identity Data Integrity', () => {
     });
 
     test('agents total matches array length', async ({ request }) => {
-        const res = await request.get(`${BASE}/v1/agents`);
+        const res = await request.get(`${BASE}/v1/dashboard/network/agents`);
         const body = await res.json();
         expect(body.total).toBe(body.agents.length);
     });
 
-    test('dashboard agents API also returns on-chain agents', async ({ request }) => {
-        // Both endpoints should surface registered agents
-        const onChainRes = await request.get(`${BASE}/v1/agents`);
-        const onChain = await onChainRes.json();
-
+    test('dashboard agents API returns projected on-chain agents', async ({ request }) => {
         const dashRes = await request.get(`${BASE}/v1/dashboard/network/agents`);
         const dash = await dashRes.json();
 
-        // Dashboard should have at least as many as on-chain (it includes all)
         expect(dash.agents.length).toBeGreaterThanOrEqual(1);
-        expect(onChain.agents.length).toBeGreaterThanOrEqual(0);
     });
 });

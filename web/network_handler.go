@@ -58,8 +58,10 @@ func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 		return // Store doesn't support agent management
 	}
 
-	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents", h.handleListAgents(agentStore))
-	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}", h.handleGetAgent(agentStore))
+	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+		Get("/v1/dashboard/network/agents", h.handleListAgents(agentStore))
+	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+		Get("/v1/dashboard/network/agents/{id}", h.handleGetAgent(agentStore))
 	r.Post("/v1/dashboard/network/agents", h.handleCreateAgent(agentStore))
 	r.Patch("/v1/dashboard/network/agents/{id}", h.handleUpdateAgent(agentStore))
 	r.Delete("/v1/dashboard/network/agents/{id}", h.handleRemoveAgent(agentStore))
@@ -70,14 +72,17 @@ func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 	r.Post("/v1/dashboard/network/redeploy", h.handleTriggerRedeploy)
 	r.Post("/v1/dashboard/network/redeploy/clear", h.handleClearRedeploy)
 
-	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/unregistered", h.handleUnregisteredAgents(agentStore))
+	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+		Get("/v1/dashboard/network/unregistered", h.handleUnregisteredAgents(agentStore))
 	r.Post("/v1/dashboard/network/merge", h.handleMergeAgent(agentStore))
-	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}/tags", h.handleAgentTags(agentStore))
+	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+		Get("/v1/dashboard/network/agents/{id}/tags", h.handleAgentTags(agentStore))
 	// v11.3: RBAC domain-ownership transfer (honest replacement for the retired
 	// authorship-rewrite transfer-tag/transfer-domain paths). handleAgentDomains
 	// lists an agent's RBAC domains; handleReassignDomainOwnership moves a
 	// domain's ownership + access on-chain without rewriting authorship.
-	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/agents/{id}/domains", h.handleAgentDomains(agentStore))
+	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+		Get("/v1/dashboard/network/agents/{id}/domains", h.handleAgentDomains(agentStore))
 	r.Post("/v1/dashboard/network/reassign-domain-ownership", h.handleReassignDomainOwnership(agentStore))
 	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/access", h.handleAppV23AccessState(agentStore))
 	r.With(h.cerebrumOperatorGate).Put("/v1/dashboard/network/access/agents/{id}/policy", h.handleAppV23AgentPolicy())
@@ -1441,10 +1446,19 @@ func (h *DashboardHandler) handleTriggerRedeploy(w http.ResponseWriter, r *http.
 func (h *DashboardHandler) handleUnregisteredAgents(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Get all agent IDs from memory data
-		stats, err := h.cerebrumVisibleStats(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to get stats: "+err.Error())
-			return
+		var stats *store.StoreStats
+		if audited, ok := r.Context().Value(appV23ProjectionAuditContextKey{}).(appV23ProjectionAuditSnapshot); ok {
+			stats = audited.stats
+		} else {
+			var err error
+			stats, err = h.cerebrumVisibleStats(r.Context())
+			if err != nil {
+				if writeAppV23DashboardProjectionFailure(w, err) {
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "failed to get stats: "+err.Error())
+				return
+			}
 		}
 
 		// Get registered agents

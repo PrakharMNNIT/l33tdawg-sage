@@ -580,10 +580,14 @@ Returns `AgentInfo` — all fields optional except `agent_id`. Key fields: `name
 #### `list_agents()`
 
 ```python
-list_agents() -> list[dict]
+list_agents() -> dict
 ```
 
 `GET /v1/agents`
+
+The SDK signs this request. Since v11.16/app-v24, the server returns only the
+active ordinary local roster visible through the pipeline identity boundary;
+the endpoint is no longer an unsigned full-directory read.
 
 ---
 

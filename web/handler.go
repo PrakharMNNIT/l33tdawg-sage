@@ -113,6 +113,12 @@ type DashboardHandler struct {
 	// local serving projection after a locked vault becomes writable. nil keeps
 	// pre-v11.9 embeddings/tests unchanged.
 	ScopedProjectionRebuildFn func(context.Context) (int, error)
+	// CanonicalProjectionMissingAllowedFn is installed only from a verified,
+	// chain-bound state-sync projection baseline. It returns true for an exact
+	// historical canonical memory ID whose ordinary plaintext was intentionally
+	// absent from the received SQL projection. Every other canonical ID remains
+	// mandatory, including memories committed after state sync. nil is strict.
+	CanonicalProjectionMissingAllowedFn func(memoryID string) bool
 
 	// graphCache memoises the expensive /memory/graph response with a
 	// stale-while-revalidate policy: the first load computes synchronously, every
@@ -1065,6 +1071,37 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// appV23ProjectionReadGate centralizes the fail-closed audit for every
+// CEREBRUM route that derives a response from ordinary memory rows or their
+// tag/domain aggregates. It must be placed before handlers with caches.
+type appV23ProjectionAuditContextKey struct{}
+
+type appV23ProjectionAuditSnapshot struct {
+	stats    *store.StoreStats
+	activity map[string]string
+}
+
+func (h *DashboardHandler) appV23ProjectionReadGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stats, activity, err := h.requireAppV23DashboardProjectionAvailable(r.Context())
+		if err != nil {
+			if writeAppV23DashboardProjectionFailure(w, err) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if h.appV23IsActive() {
+			r = r.WithContext(context.WithValue(
+				r.Context(),
+				appV23ProjectionAuditContextKey{},
+				appV23ProjectionAuditSnapshot{stats: stats, activity: activity},
+			))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // RegisterRoutes mounts dashboard routes on the given router.
 func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 	// Use a group so securityHeaders doesn't conflict with already-registered routes on the parent router.
@@ -1101,10 +1138,13 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			// Redeploy guard — returns 503 for write endpoints during active redeployment.
 			r.Use(redeployGuard(h.Redeployer))
 
-			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/list", h.handleListMemories)
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+				Get("/v1/dashboard/memory/list", h.handleListMemories)
 			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/export", h.handleExport)
-			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/timeline", h.handleTimeline)
-			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/graph", h.handleGraph)
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+				Get("/v1/dashboard/memory/timeline", h.handleTimeline)
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+				Get("/v1/dashboard/memory/graph", h.handleGraph)
 			r.Get("/v1/dashboard/stats", h.handleStats)
 
 			// Embeddings setup — turn on the bundled semantic embedder + re-embed.
@@ -1168,19 +1208,23 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			})
 
 			// Task backlog
-			r.Get("/v1/dashboard/tasks", h.handleGetTasks)
+			r.With(h.appV23ProjectionReadGate).Get("/v1/dashboard/tasks", h.handleGetTasks)
 			r.Post("/v1/dashboard/tasks", h.handleCreateTaskDashboard)
 			r.Put("/v1/dashboard/tasks/order", h.handleReorderTasksDashboard)
 			r.Put("/v1/dashboard/tasks/{id}/status", h.handleUpdateTaskStatusDashboard)
 			r.Put("/v1/dashboard/tasks/{id}/assign", h.handleAssignTask)
-			r.Get("/v1/dashboard/task-notifications", h.handleTaskNotifications)
+			r.With(h.appV23ProjectionReadGate).
+				Get("/v1/dashboard/task-notifications", h.handleTaskNotifications)
 
 			// Tags
-			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/tags", h.handleListTags)
-			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/{id}/tags", h.handleGetMemoryTags)
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+				Get("/v1/dashboard/tags", h.handleListTags)
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+				Get("/v1/dashboard/memory/{id}/tags", h.handleGetMemoryTags)
 			r.Put("/v1/dashboard/memory/{id}/tags", h.handleSetMemoryTags)
 			// Memory "train of thought" - powers the MRI click-to-explore.
-			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/{id}/related", h.handleMemoryRelated)
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+				Get("/v1/dashboard/memory/{id}/related", h.handleMemoryRelated)
 
 			// Auto-start (open at login)
 			r.Get("/v1/dashboard/settings/autostart", h.handleGetAutostart)
@@ -1911,9 +1955,6 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		if h.appV23IsActive() {
 			qopts.CandidateFilter = func(record *memory.MemoryRecord) (bool, error) {
 				if err := h.validateAppV23DashboardRecord(record); err != nil {
-					if isAppV23UnsafeDashboardRecord(err) {
-						return false, nil
-					}
 					return false, err
 				}
 				return true, nil
@@ -2079,6 +2120,15 @@ func (h *DashboardHandler) handleExport(w http.ResponseWriter, r *http.Request) 
 		Status: "active",
 	})
 	if h.appV23IsActive() {
+		if h.CanonicalProjectionMissingAllowedFn != nil {
+			writeAppV23DashboardProjectionFailure(
+				w,
+				appV23DashboardProjectionError(errors.New(
+					"a complete portable backup is unavailable on a state-sync subset projection",
+				)),
+			)
+			return
+		}
 		snapshot, contentLength, err := h.spoolAppV23CanonicalDashboardExport(
 			r.Context(), exportOpts,
 		)
@@ -2374,7 +2424,14 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 	var domainCounts map[string]int
 	var domainLast map[string]string
 	if seeAll {
-		stats, activity, sErr := h.cerebrumVisibleStatsAndActivity(ctx)
+		var stats *store.StoreStats
+		var activity map[string]string
+		var sErr error
+		if audited, ok := ctx.Value(appV23ProjectionAuditContextKey{}).(appV23ProjectionAuditSnapshot); ok {
+			stats, activity = audited.stats, audited.activity
+		} else {
+			stats, activity, sErr = h.cerebrumVisibleStatsAndActivity(ctx)
+		}
 		if sErr != nil {
 			if h.appV23IsActive() {
 				return nil, sErr
@@ -2755,6 +2812,20 @@ func (h *DashboardHandler) handleGetMemoryTags(w http.ResponseWriter, r *http.Re
 	id := chi.URLParam(r, "id")
 	if h.rejectInternalCerebrumMemory(w, r.Context(), id) {
 		return
+	}
+	if h.appV23IsActive() {
+		record, err := h.store.GetMemory(r.Context(), id)
+		if err != nil || record == nil {
+			writeError(w, http.StatusNotFound, "memory not found")
+			return
+		}
+		if err := h.validateAppV23DashboardRecord(record); err != nil {
+			if writeAppV23DashboardProjectionFailure(w, err) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	tags, err := h.store.GetTags(r.Context(), id)
 	if err != nil {
@@ -3757,7 +3828,11 @@ func (h *DashboardHandler) handleHealth(w http.ResponseWriter, r *http.Request) 
 
 	// Get memory stats
 	stats, err := h.cerebrumVisibleStats(r.Context())
-	if err == nil {
+	if err != nil {
+		if writeAppV23DashboardProjectionFailure(w, err) {
+			return
+		}
+	} else {
 		health["memories"] = stats
 	}
 

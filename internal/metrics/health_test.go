@@ -254,6 +254,17 @@ func TestReadiness_CanonicalMemoryProjectionFailsClosedUntilCompleteAudit(t *tes
 	}
 
 	status = CanonicalMemoryProjectionStatus{
+		Checked:  true,
+		Required: true,
+		OK:       true,
+		State:    "canonical_subset",
+	}
+	code, body = readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "ready" {
+		t.Fatalf("verified state-sync subset projection must be ready, got %d %v", code, body["status"])
+	}
+
+	status = CanonicalMemoryProjectionStatus{
 		Checked:     true,
 		Required:    true,
 		OK:          false,

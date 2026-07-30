@@ -1,6 +1,7 @@
 package abci
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/l33tdawg/sage/internal/governance"
@@ -13,6 +14,27 @@ const appV24MemoryHashReanchorOperationName = "memory_hash_reanchor"
 type appV24MemoryHashReanchorValidation struct {
 	payload *tx.MemoryHashReanchorPayload
 	entries []store.MemoryHashReanchorEntry
+}
+
+type appV24MemoryHashReanchorBusinessStateDriftError struct {
+	cause error
+}
+
+func (e *appV24MemoryHashReanchorBusinessStateDriftError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *appV24MemoryHashReanchorBusinessStateDriftError) Unwrap() error {
+	return e.cause
+}
+
+func appV24MemoryHashReanchorBusinessStateDrift(err error) bool {
+	var drift *appV24MemoryHashReanchorBusinessStateDriftError
+	return errors.As(err, &drift)
+}
+
+func newAppV24MemoryHashReanchorBusinessStateDrift(err error) error {
+	return &appV24MemoryHashReanchorBusinessStateDriftError{cause: err}
 }
 
 // validateAppV24MemoryHashReanchorProposal binds all proposal fields to the
@@ -83,9 +105,9 @@ func (app *SageApp) validateAppV24MemoryHashReanchorFields(
 	}
 	if payload.RootCredentialID != root.CredentialID ||
 		payload.RootGeneration != root.Generation {
-		return nil, fmt.Errorf(
+		return nil, newAppV24MemoryHashReanchorBusinessStateDrift(fmt.Errorf(
 			"memory hash reanchor Root binding is stale or does not match the current Root generation",
-		)
+		))
 	}
 
 	entries := make([]store.MemoryHashReanchorEntry, len(payload.Entries))
@@ -98,6 +120,11 @@ func (app *SageApp) validateAppV24MemoryHashReanchorFields(
 	}
 	if validateEligibility {
 		if err := app.badgerStore.ValidateMemoryHashReanchors(entries); err != nil {
+			if errors.Is(err, store.ErrMemoryHashReanchorStateDrift) {
+				return nil, newAppV24MemoryHashReanchorBusinessStateDrift(
+					fmt.Errorf("memory hash reanchor eligibility: %w", err),
+				)
+			}
 			return nil, fmt.Errorf("memory hash reanchor eligibility: %w", err)
 		}
 	}

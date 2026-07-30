@@ -276,7 +276,7 @@ without a manual repair; generic new keys remain safely pending review.
 
 ---
 
-## v11.16 - planned (agent message delivery and read receipts)
+## Post-v11.16 - planned (agent message delivery and read receipts)
 
 Consolidate pipe, inbox, sent results, and status into one agent-only
 **Messages** service model with idempotent send, explicit idempotent receive,

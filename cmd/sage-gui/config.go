@@ -592,6 +592,9 @@ func persistStateSyncReceiving(receiving bool) error {
 		return fmt.Errorf("parse config quorum.state_sync: %w", err)
 	}
 	setYAMLBool(stateSync, "receiving", receiving)
+	if !receiving {
+		setYAMLBool(stateSync, "received", true)
+	}
 	out, err := yaml.Marshal(&document)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)

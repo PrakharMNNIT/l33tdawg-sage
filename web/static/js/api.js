@@ -5,6 +5,7 @@ const API_BASE = '';
 // Auth check — returns { auth_required, authenticated }
 export async function checkAuth() {
     const res = await fetch(`${API_BASE}/v1/dashboard/auth/check`);
+    if (!res.ok) throw new Error('dashboard authentication check failed');
     return res.json();
 }
 
@@ -54,6 +55,7 @@ export async function fetchMemories(params = {}) {
 export async function fetchGraph(limit = 500, status = '') {
     const q = status ? `?limit=${limit}&status=${encodeURIComponent(status)}` : `?limit=${limit}`;
     const res = await fetch(`${API_BASE}/v1/dashboard/memory/graph${q}`);
+    if (!res.ok) throw new Error('memory graph is temporarily unavailable');
     return res.json();
 }
 
@@ -69,11 +71,13 @@ export async function fetchTimeline(params = {}) {
 
 export async function fetchStats() {
     const res = await fetch(`${API_BASE}/v1/dashboard/stats`);
+    if (!res.ok) throw new Error('memory statistics are temporarily unavailable');
     return res.json();
 }
 
 export async function fetchHealth() {
     const res = await fetch(`${API_BASE}/v1/dashboard/health`);
+    if (!res.ok) throw new Error('dashboard health is temporarily unavailable');
     return res.json();
 }
 

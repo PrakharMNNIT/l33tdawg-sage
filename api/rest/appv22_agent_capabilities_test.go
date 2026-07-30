@@ -54,6 +54,8 @@ func TestPostgresAgentBackendImplementsRESTNameLookup(t *testing.T) {
 	var backend store.AgentStore = (*store.PostgresStore)(nil)
 	_, ok := backend.(agentNameFinder)
 	assert.True(t, ok, "amid's Postgres backend must implement bounded /v1/agents/lookup")
+	_, paged := backend.(agentNamePageFinder)
+	assert.True(t, paged, "amid's Postgres backend must page lookup candidates before canonical filtering")
 }
 
 func TestAppV22AgentReadEndpointsOverlayConsensusCapabilities(t *testing.T) {

@@ -156,6 +156,13 @@
                     root.dataset.sageBootstrapState = "ready";
                     root.setAttribute("aria-busy", "false");
                 }
+                // Preact intentionally preserves the dependency-free shell as
+                // an unmatched sibling while it mounts the real application.
+                // Remove it only after render succeeds; otherwise a healthy,
+                // fully rendered CEREBRUM stays hidden behind "Loading local
+                // controls…" forever.
+                const shell = document.getElementById("sage-bootstrap-shell");
+                if (shell) shell.remove();
             },
             fail,
         });

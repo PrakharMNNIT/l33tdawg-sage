@@ -811,8 +811,10 @@ func (s *Server) handleGetRegisteredAgent(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, sanitizeAgentForRead(agent, privileged))
 }
 
-// handleListRegisteredAgents handles GET /v1/agents.
-// Lists all registered agents from offchain store.
+// handleListRegisteredAgents handles signed GET /v1/agents. After app-v23 it
+// returns only active ordinary canonical enrollments; the unsigned full-roster
+// oracle was removed because it bypassed caller-scoped recipient discovery and
+// exposed local RBAC/network topology.
 func (s *Server) handleListRegisteredAgents(w http.ResponseWriter, r *http.Request) {
 	if s.agentStore == nil {
 		writeProblem(w, http.StatusServiceUnavailable, "Agent store unavailable", "Agent store not configured.")
@@ -821,19 +823,30 @@ func (s *Server) handleListRegisteredAgents(w http.ResponseWriter, r *http.Reque
 
 	agents, err := s.agentStore.ListAgents(r.Context())
 	if err != nil {
-		writeProblem(w, http.StatusInternalServerError, "List error", err.Error())
+		writeProblem(w, http.StatusInternalServerError, "List error", "The agent roster could not be read.")
 		return
 	}
 	if agents == nil {
 		agents = make([]*store.AgentEntry, 0)
 	}
 
-	// /v1/agents is unauthenticated — never expose claim_token (a one-time
-	// credential exchangeable for the agent key seed) or per-agent ACL topology.
+	callerID := middleware.ContextAgentID(r.Context())
+	privileged := s.callerIsOperatorOrAdmin(r.Context(), callerID)
 	sanitized := make([]*store.AgentEntry, 0, len(agents))
 	for _, a := range agents {
 		if a == nil {
 			continue
+		}
+		if s.isPostV23ForNextTx() {
+			active, activeErr := s.appV23ActiveOrdinaryAgent(a.AgentID)
+			if activeErr != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+					"Current local enrollment state is unavailable.")
+				return
+			}
+			if !active {
+				continue
+			}
 		}
 		isRoot, rootErr := s.appV23IsRootIdentity(a.AgentID)
 		if rootErr != nil {
@@ -845,7 +858,10 @@ func (s *Server) handleListRegisteredAgents(w http.ResponseWriter, r *http.Reque
 			continue
 		}
 		s.overlayOnChainAgentPolicyForRead(a)
-		sanitized = append(sanitized, sanitizeAgentForRead(a, false))
+		sanitized = append(sanitized, sanitizeAgentForRead(
+			a,
+			privileged || callerID == a.AgentID,
+		))
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -856,6 +872,10 @@ func (s *Server) handleListRegisteredAgents(w http.ResponseWriter, r *http.Reque
 
 type agentNameFinder interface {
 	FindAgentsByName(ctx context.Context, name string, limit int) ([]*store.AgentEntry, error)
+}
+
+type agentNamePageFinder interface {
+	FindAgentsByNamePage(ctx context.Context, name string, limit, offset int) ([]*store.AgentEntry, error)
 }
 
 type agentLookupResult struct {
@@ -923,14 +943,48 @@ func (s *Server) handleFindRegisteredAgents(w http.ResponseWriter, r *http.Reque
 		}
 		limit = parsed
 	}
-	agents, err := finder.FindAgentsByName(r.Context(), name, limit)
-	if err != nil {
-		writeProblem(w, http.StatusInternalServerError, "Lookup error", err.Error())
-		return
-	}
-	sanitized := make([]agentLookupResult, 0, len(agents))
-	for _, agent := range agents {
-		if agent != nil {
+	// SQL status is only a discovery projection after app-v23; canonical active
+	// enrollment lives in Badger. Page the bounded SQL candidates until the
+	// requested number of canonical recipients is found or the query is
+	// exhausted. Applying the public limit before this filter lets 20 pending
+	// self-registrations hide every later active match.
+	const (
+		candidatePageSize = 20
+		maxCandidatePages = 256
+	)
+	pager, paged := s.agentStore.(agentNamePageFinder)
+	sanitized := make([]agentLookupResult, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	for offset := 0; len(sanitized) < limit; {
+		if paged && offset/candidatePageSize >= maxCandidatePages {
+			writeProblem(w, http.StatusServiceUnavailable, "Lookup incomplete",
+				"The bounded agent candidate scan was exhausted; narrow the name query.")
+			return
+		}
+		var agents []*store.AgentEntry
+		var err error
+		if paged {
+			agents, err = pager.FindAgentsByNamePage(
+				r.Context(), name, candidatePageSize, offset,
+			)
+		} else {
+			// Compatibility for tests and third-party stores that implement the
+			// original bounded finder but not the paged extension.
+			agents, err = finder.FindAgentsByName(r.Context(), name, limit)
+		}
+		if err != nil {
+			writeProblem(w, http.StatusInternalServerError, "Lookup error",
+				"The agent directory could not be searched.")
+			return
+		}
+		for _, agent := range agents {
+			if agent == nil {
+				continue
+			}
+			if _, duplicate := seen[agent.AgentID]; duplicate {
+				continue
+			}
+			seen[agent.AgentID] = struct{}{}
 			active, activeErr := s.appV23ActiveOrdinaryAgent(agent.AgentID)
 			if activeErr != nil {
 				writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
@@ -944,7 +998,14 @@ func (s *Server) handleFindRegisteredAgents(w http.ResponseWriter, r *http.Reque
 				AgentEntry: sanitizeAgentForRead(agent, false),
 				MatchKind:  agentLookupMatchKind(name, agent),
 			})
+			if len(sanitized) == limit {
+				break
+			}
 		}
+		if !paged || len(agents) < candidatePageSize {
+			break
+		}
+		offset += len(agents)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": sanitized, "total": len(sanitized)})
 }

@@ -397,55 +397,78 @@ func (e *Engine) Cancel(proposalID string, cancellerID string, height int64) err
 // If expired, the proposal is marked expired.
 // Returns the executed proposal if one was executed, nil otherwise.
 func (e *Engine) ProcessBlock(height int64) (*ProposalState, error) {
-	return e.processBlock(height, nil)
+	executed, _, err := e.processBlock(height, nil, nil)
+	return executed, err
 }
 
 // ProcessBlockValidated is the app-v20 execution path. preExecute runs only
 // after quorum passes and before the proposal is marked executed or the active
 // marker is cleared. A validation failure therefore leaves the proposal in the
-// recoverable voting state instead of committing a false-success record.
+// recoverable voting state instead of committing a false-success record. This
+// method never classifies validation failures as terminal; callers that need
+// that behavior must opt in through ProcessBlockValidatedWithInvalidation.
 func (e *Engine) ProcessBlockValidated(height int64, preExecute func(*ProposalState) error) (*ProposalState, error) {
-	return e.processBlock(height, preExecute)
+	executed, _, err := e.processBlock(height, preExecute, nil)
+	return executed, err
 }
 
-func (e *Engine) processBlock(height int64, preExecute func(*ProposalState) error) (*ProposalState, error) {
+// ProcessBlockValidatedWithInvalidation extends ProcessBlockValidated with one
+// explicit classifier for deterministic business-state drift. When the
+// classifier accepts a pre-execution validation error, the stale proposal is
+// rejected and the active singleton is cleared instead of retrying the same
+// impossible execution forever. The caller's consensus transaction owns the
+// atomicity of those two writes. Unclassified validation failures retain the
+// historical fatal/retryable behavior.
+func (e *Engine) ProcessBlockValidatedWithInvalidation(
+	height int64,
+	preExecute func(*ProposalState) error,
+	invalidate func(*ProposalState, error) bool,
+) (executed *ProposalState, invalidated *ProposalState, err error) {
+	return e.processBlock(height, preExecute, invalidate)
+}
+
+func (e *Engine) processBlock(
+	height int64,
+	preExecute func(*ProposalState) error,
+	invalidate func(*ProposalState, error) bool,
+) (executed *ProposalState, invalidated *ProposalState, err error) {
 	// Load active proposal.
 	active, err := e.store.GetState("gov:active")
 	if err != nil {
-		return nil, fmt.Errorf("check active proposal: %w", err)
+		return nil, nil, fmt.Errorf("check active proposal: %w", err)
 	}
 	if active == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	proposalID := string(active)
 	proposal, err := e.LoadProposal(proposalID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Check expiry.
 	if height > proposal.ExpiryHeight {
 		proposal.Status = StatusExpired
 		if saveErr := e.saveProposal(proposal); saveErr != nil {
-			return nil, saveErr
+			return nil, nil, saveErr
 		}
 		if clearErr := e.store.DeleteState("gov:active"); clearErr != nil {
-			return nil, fmt.Errorf("clear active: %w", clearErr)
+			return nil, nil, fmt.Errorf("clear active: %w", clearErr)
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Enforce MinVotingBlocks (skip for single validator).
 	if height < proposal.CreatedHeight+MinVotingBlocks && e.validators.Size() > 1 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Gather all votes for this proposal.
 	votePrefix := "gov:vote:" + proposalID + ":"
 	voteKeys, err := e.store.PrefixKeys(votePrefix)
 	if err != nil {
-		return nil, fmt.Errorf("scan votes: %w", err)
+		return nil, nil, fmt.Errorf("scan votes: %w", err)
 	}
 
 	votes := make(map[string]string, len(voteKeys))
@@ -453,7 +476,7 @@ func (e *Engine) processBlock(height int64, preExecute func(*ProposalState) erro
 		voterID := strings.TrimPrefix(key, votePrefix)
 		voteData, getErr := e.store.GetState(key)
 		if getErr != nil {
-			return nil, fmt.Errorf("load vote %s: %w", key, getErr)
+			return nil, nil, fmt.Errorf("load vote %s: %w", key, getErr)
 		}
 		if voteData != nil {
 			votes[voterID] = string(voteData)
@@ -470,32 +493,42 @@ func (e *Engine) processBlock(height int64, preExecute func(*ProposalState) erro
 	if passed {
 		if preExecute != nil {
 			if err := preExecute(proposal); err != nil {
-				return nil, fmt.Errorf("proposal %s execution validation failed: %w", proposal.ProposalID, err)
+				if invalidate != nil && invalidate(proposal, err) {
+					proposal.Status = StatusRejected
+					if saveErr := e.saveProposal(proposal); saveErr != nil {
+						return nil, nil, saveErr
+					}
+					if clearErr := e.store.DeleteState("gov:active"); clearErr != nil {
+						return nil, nil, fmt.Errorf("clear active: %w", clearErr)
+					}
+					return nil, proposal, nil
+				}
+				return nil, nil, fmt.Errorf("proposal %s execution validation failed: %w", proposal.ProposalID, err)
 			}
 		}
 		proposal.Status = StatusExecuted
 		if err := e.saveProposal(proposal); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := e.store.DeleteState("gov:active"); err != nil {
-			return nil, fmt.Errorf("clear active: %w", err)
+			return nil, nil, fmt.Errorf("clear active: %w", err)
 		}
-		return proposal, nil
+		return proposal, nil, nil
 	}
 
 	if rejected {
 		proposal.Status = StatusRejected
 		if err := e.saveProposal(proposal); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := e.store.DeleteState("gov:active"); err != nil {
-			return nil, fmt.Errorf("clear active: %w", err)
+			return nil, nil, fmt.Errorf("clear active: %w", err)
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Still voting.
-	return nil, nil
+	return nil, nil, nil
 }
 
 // GetActiveProposal loads and returns the currently active proposal, or nil if none.

@@ -2814,13 +2814,17 @@ paths:
   /v1/agents:
     get:
       operationId: listRegisteredAgents
-      summary: List all registered agents. No auth required.
+      summary: List agents visible to the authenticated caller.
+      description: >-
+        Requires an Ed25519-signed request. After app-v23 activation the
+        response contains only active ordinary agents within the caller's
+        enforced discovery boundary; pending, inactive, Root, and inconsistent
+        identities are omitted.
       tags:
         - Agent
-      security: []
       responses:
         "200":
-          description: List of agents.
+          description: Caller-scoped list of active ordinary agents.
           content:
             application/json:
               schema:
@@ -2832,6 +2836,10 @@ paths:
                       $ref: "#/components/schemas/RegisteredAgent"
                   total:
                     type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 

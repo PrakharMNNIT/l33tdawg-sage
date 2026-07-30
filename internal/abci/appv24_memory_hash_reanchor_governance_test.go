@@ -1,10 +1,12 @@
 package abci
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -60,6 +62,66 @@ func setupAppV24ReanchorGovernanceFixture(
 	}
 }
 
+func addAppV24ReanchorValidators(
+	t *testing.T,
+	fixture appV24ReanchorGovernanceFixture,
+	count int,
+) []agentKey {
+	t.Helper()
+	powers := make(map[string]int64)
+	for _, existing := range fixture.app.validators.GetAll() {
+		powers[existing.ID] = existing.Power
+	}
+	added := make([]agentKey, 0, count)
+	for i := 0; i < count; i++ {
+		key := newAgentKey(t)
+		registerAgent(t, fixture.app, key, fmt.Sprintf("reanchor-validator-%d", i+2), "member")
+		require.NoError(t, fixture.app.validators.AddValidator(&validator.ValidatorInfo{
+			ID: key.id, PublicKey: key.pub, Power: 10,
+		}))
+		powers[key.id] = 10
+		added = append(added, key)
+	}
+	require.NoError(t, fixture.app.badgerStore.SaveValidators(powers))
+	return added
+}
+
+func appV24ReanchorVote(
+	t *testing.T,
+	signer agentKey,
+	proposalID string,
+	nonce uint64,
+	blockTime time.Time,
+) []byte {
+	t.Helper()
+	vote := &tx.ParsedTx{
+		Type: tx.TxTypeGovVote, Nonce: nonce, Timestamp: blockTime,
+		GovVote: &tx.GovVote{
+			ProposalID: proposalID, Decision: tx.VoteDecisionAccept,
+		},
+	}
+	require.NoError(t, tx.SignTx(vote, signer.priv))
+	return encodeAppV24ReanchorTx(t, vote)
+}
+
+func finalizeAndCommitAppV24ReanchorBlock(
+	t *testing.T,
+	app *SageApp,
+	height int64,
+	blockTime time.Time,
+	txs ...[]byte,
+) *abcitypes.ResponseFinalizeBlock {
+	t.Helper()
+	response, err := app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+		Height: height,
+		Time:   blockTime,
+		Txs:    txs,
+	})
+	require.NoError(t, err)
+	commitGovernanceReplayBlock(t, app)
+	return response
+}
+
 func seedAppV24ReanchorMemory(
 	t *testing.T,
 	app *SageApp,
@@ -73,6 +135,156 @@ func seedAppV24ReanchorMemory(
 	require.NoError(t, app.badgerStore.SetMemoryAuthorPrincipal(memoryID, "principal-"+memoryID))
 	require.NoError(t, app.badgerStore.SetMemoryClassification(memoryID, uint8(store.ClearanceInternal)))
 	return append([]byte(nil), digest[:]...)
+}
+
+func TestAppV24MemoryHashReanchorCanonicalCorruptionIsNotBusinessDrift(t *testing.T) {
+	fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+	hash := seedAppV24ReanchorMemory(
+		t,
+		fixture.app,
+		"memory-corrupt-state",
+		"committed",
+		"corruption must remain fatal",
+	)
+	payload, targetID := appV24ReanchorPayload(
+		t,
+		fixture.root,
+		1,
+		[]tx.MemoryHashReanchorEntry{{
+			MemoryID:       "memory-corrupt-state",
+			ExpectedStatus: "committed",
+			ContentHash:    hash,
+		}},
+	)
+	require.NoError(t, fixture.app.badgerStore.SetRawForTest(
+		[]byte("memory:memory-corrupt-state"),
+		[]byte{0, 0, 0},
+	))
+	_, err := fixture.app.validateAppV24MemoryHashReanchorProposal(
+		&governance.ProposalState{
+			Operation: governance.OpMemoryHashReanchor,
+			TargetID:  targetID,
+			Payload:   payload,
+		},
+		2,
+		true,
+	)
+	require.Error(t, err)
+	require.False(t, appV24MemoryHashReanchorBusinessStateDrift(err),
+		"malformed canonical state must stay fatal instead of clearing the proposal")
+}
+
+func TestAppV24MemoryHashReanchorConflictIsNotBusinessDrift(t *testing.T) {
+	fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+	hash := seedAppV24ReanchorMemory(
+		t,
+		fixture.app,
+		"memory-conflicting-hash",
+		"committed",
+		"requested repair evidence",
+	)
+	payload, targetID := appV24ReanchorPayload(
+		t,
+		fixture.root,
+		1,
+		[]tx.MemoryHashReanchorEntry{{
+			MemoryID:       "memory-conflicting-hash",
+			ExpectedStatus: "committed",
+			ContentHash:    hash,
+		}},
+	)
+	require.NoError(t, fixture.app.badgerStore.SetMemoryHash(
+		"memory-conflicting-hash",
+		bytes.Repeat([]byte{0xff}, sha256.Size),
+		"committed",
+	))
+	_, err := fixture.app.validateAppV24MemoryHashReanchorProposal(
+		&governance.ProposalState{
+			Operation: governance.OpMemoryHashReanchor,
+			TargetID:  targetID,
+			Payload:   payload,
+		},
+		2,
+		true,
+	)
+	require.Error(t, err)
+	require.ErrorIs(t, err, store.ErrMemoryHashReanchorConflict)
+	require.False(t, appV24MemoryHashReanchorBusinessStateDrift(err),
+		"unexplained canonical hash replacement must remain fatal")
+}
+
+func TestAppV24MemoryHashReanchorPartialMarkerIsNotBusinessDrift(t *testing.T) {
+	fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+	hash := seedAppV24ReanchorMemory(
+		t,
+		fixture.app,
+		"memory-partial-marker",
+		"committed",
+		"partial marker corruption",
+	)
+	payload, targetID := appV24ReanchorPayload(
+		t,
+		fixture.root,
+		1,
+		[]tx.MemoryHashReanchorEntry{{
+			MemoryID:       "memory-partial-marker",
+			ExpectedStatus: "committed",
+			ContentHash:    hash,
+		}},
+	)
+	require.NoError(t, fixture.app.badgerStore.SetRawForTest(
+		[]byte("state:scope-proposal:memory-partial-marker"),
+		[]byte("partial"),
+	))
+	_, err := fixture.app.validateAppV24MemoryHashReanchorProposal(
+		&governance.ProposalState{
+			Operation: governance.OpMemoryHashReanchor,
+			TargetID:  targetID,
+			Payload:   payload,
+		},
+		2,
+		true,
+	)
+	require.Error(t, err)
+	require.False(t, appV24MemoryHashReanchorBusinessStateDrift(err),
+		"partial scoped state must remain fatal")
+}
+
+func TestAppV24MemoryHashReanchorMissingCanonicalMemoryIsNotBusinessDrift(t *testing.T) {
+	fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+	memoryID := "memory-missing-canonical"
+	digest := sha256.Sum256([]byte("missing canonical memory"))
+	hash := append([]byte(nil), digest[:]...)
+	require.NoError(t, fixture.app.badgerStore.SetMemoryDomain(memoryID, "app-v24/repair"))
+	require.NoError(t, fixture.app.badgerStore.SetMemoryAuthor(memoryID, "author-"+memoryID))
+	require.NoError(t, fixture.app.badgerStore.SetMemoryAuthorPrincipal(memoryID, "principal-"+memoryID))
+	require.NoError(t, fixture.app.badgerStore.SetMemoryClassification(
+		memoryID,
+		uint8(store.ClearanceInternal),
+	))
+	payload, targetID := appV24ReanchorPayload(
+		t,
+		fixture.root,
+		1,
+		[]tx.MemoryHashReanchorEntry{{
+			MemoryID:       memoryID,
+			ExpectedStatus: "committed",
+			ContentHash:    hash,
+		}},
+	)
+	_, err := fixture.app.validateAppV24MemoryHashReanchorProposal(
+		&governance.ProposalState{
+			Operation: governance.OpMemoryHashReanchor,
+			TargetID:  targetID,
+			Payload:   payload,
+		},
+		2,
+		true,
+	)
+	require.Error(t, err)
+	require.ErrorIs(t, err, store.ErrMemoryNotFound)
+	require.False(t, appV24MemoryHashReanchorBusinessStateDrift(err),
+		"canonical target disappearance must remain fatal")
 }
 
 func appV24ReanchorPayload(
@@ -544,8 +756,9 @@ func TestAppV24MemoryHashReanchorAuditNotifierCannotFailCommittedVote(t *testing
 }
 
 func TestAppV24MemoryHashReanchorRevalidatesRootAndEligibilityBeforeExecution(t *testing.T) {
-	t.Run("Root handover leaves stale proposal voting and vote uncommitted", func(t *testing.T) {
+	t.Run("Root handover terminalizes early-quorum proposal at first eligible empty block", func(t *testing.T) {
 		fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+		additionalValidators := addAppV24ReanchorValidators(t, fixture, 2)
 		hash := seedAppV24ReanchorMemory(
 			t, fixture.app, "memory-root-handover", "committed", "handover content",
 		)
@@ -567,41 +780,67 @@ func TestAppV24MemoryHashReanchorRevalidatesRootAndEligibilityBeforeExecution(t 
 		commitGovernanceReplayBlock(t, fixture.app)
 
 		newRoot := newAgentKey(t)
-		require.NoError(t, fixture.app.badgerStore.RotateAppV23RootCredential(
-			1, newRoot.id, 3,
-		))
 		proposalID := governance.ComputeProposalID(
 			fixture.validator.id, 2, governance.OpMemoryHashReanchor, targetID,
 		)
-		vote := &tx.ParsedTx{
-			Type: tx.TxTypeGovVote, Nonce: 2, Timestamp: time.Unix(24_003, 0).UTC(),
-			GovVote: &tx.GovVote{
-				ProposalID: proposalID, Decision: tx.VoteDecisionAccept,
-			},
-		}
-		require.NoError(t, tx.SignTx(vote, fixture.validator.priv))
-		_, err = fixture.app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
-			Height: 3, Time: vote.Timestamp,
-			Txs: [][]byte{encodeAppV24ReanchorTx(t, vote)},
-		})
-		require.ErrorContains(t, err, "Root binding is stale")
-		require.Nil(t, fixture.app.pendingAppV20Finalize)
+		earlyVoteTime := time.Unix(24_003, 0).UTC()
+		earlyVotes := finalizeAndCommitAppV24ReanchorBlock(
+			t,
+			fixture.app,
+			3,
+			earlyVoteTime,
+			appV24ReanchorVote(t, fixture.validator, proposalID, 2, earlyVoteTime),
+			appV24ReanchorVote(t, additionalValidators[0], proposalID, 1, earlyVoteTime),
+		)
+		require.Len(t, earlyVotes.TxResults, 2)
+		require.Zero(t, earlyVotes.TxResults[0].Code, earlyVotes.TxResults[0].Log)
+		require.Zero(t, earlyVotes.TxResults[1].Code, earlyVotes.TxResults[1].Log)
 		stillVoting, err := fixture.app.govEngine.LoadProposal(proposalID)
 		require.NoError(t, err)
 		require.Equal(t, governance.StatusVoting, stillVoting.Status)
-		recordedVote, err := fixture.app.badgerStore.GetState(
-			"gov:vote:" + proposalID + ":" + fixture.validator.id,
+		require.NoError(t, fixture.app.badgerStore.RotateAppV23RootCredential(
+			1, newRoot.id, 4,
+		))
+
+		for height := int64(4); height < 2+governance.MinVotingBlocks; height++ {
+			finalizeAndCommitAppV24ReanchorBlock(
+				t, fixture.app, height, earlyVoteTime.Add(time.Duration(height)*time.Second),
+			)
+			stillVoting, err = fixture.app.govEngine.LoadProposal(proposalID)
+			require.NoError(t, err)
+			require.Equal(t, governance.StatusVoting, stillVoting.Status)
+		}
+
+		executionHeight := int64(2 + governance.MinVotingBlocks)
+		finalizeAndCommitAppV24ReanchorBlock(
+			t,
+			fixture.app,
+			executionHeight,
+			earlyVoteTime.Add(time.Duration(executionHeight)*time.Second),
+		)
+		require.Equal(t, executionHeight, fixture.app.state.Height)
+		terminal, err := fixture.app.govEngine.LoadProposal(proposalID)
+		require.NoError(t, err)
+		require.Equal(t, governance.StatusRejected, terminal.Status)
+		active, err := fixture.app.govEngine.GetActiveProposal()
+		require.NoError(t, err)
+		require.Nil(t, active)
+		projected, err := fixture.app.offchainStore.GetGovProposal(
+			context.Background(),
+			proposalID,
 		)
 		require.NoError(t, err)
-		require.Empty(t, recordedVote)
+		require.Equal(t, string(governance.StatusRejected), projected.Status)
+		require.Nil(t, projected.ExecutedHeight)
 		gotHash, status, err := fixture.app.badgerStore.GetMemoryHash("memory-root-handover")
 		require.NoError(t, err)
 		require.Empty(t, gotHash)
 		require.Equal(t, "committed", status)
 	})
 
-	t.Run("eligibility drift rejects the whole chunk before any entry is written", func(t *testing.T) {
+	t.Run("eligibility drift terminalizes early-quorum proposal without partial write", func(t *testing.T) {
 		fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+		additionalValidators := addAppV24ReanchorValidators(t, fixture, 2)
 		firstHash := seedAppV24ReanchorMemory(
 			t, fixture.app, "memory-atomic-a", "committed", "atomic first",
 		)
@@ -627,33 +866,244 @@ func TestAppV24MemoryHashReanchorRevalidatesRootAndEligibilityBeforeExecution(t 
 		// A deterministic state change between proposal and vote makes the
 		// second entry ineligible. The pre-execution read-only pass must reject
 		// before ReanchorMemoryHashes can write the first.
-		require.NoError(t, fixture.app.badgerStore.SetMemoryHash(
-			"memory-atomic-b", nil, "proposed",
-		))
 		proposalID := governance.ComputeProposalID(
 			fixture.validator.id, 2, governance.OpMemoryHashReanchor, targetID,
 		)
-		vote := &tx.ParsedTx{
-			Type: tx.TxTypeGovVote, Nonce: 2, Timestamp: time.Unix(25_003, 0).UTC(),
-			GovVote: &tx.GovVote{
-				ProposalID: proposalID, Decision: tx.VoteDecisionAccept,
-			},
+		earlyVoteTime := time.Unix(25_003, 0).UTC()
+		earlyVotes := finalizeAndCommitAppV24ReanchorBlock(
+			t,
+			fixture.app,
+			3,
+			earlyVoteTime,
+			appV24ReanchorVote(t, fixture.validator, proposalID, 2, earlyVoteTime),
+			appV24ReanchorVote(t, additionalValidators[0], proposalID, 1, earlyVoteTime),
+		)
+		require.Len(t, earlyVotes.TxResults, 2)
+		require.Zero(t, earlyVotes.TxResults[0].Code, earlyVotes.TxResults[0].Log)
+		require.Zero(t, earlyVotes.TxResults[1].Code, earlyVotes.TxResults[1].Log)
+		require.NoError(t, fixture.app.badgerStore.SetMemoryHash(
+			"memory-atomic-b", nil, "proposed",
+		))
+
+		for height := int64(4); height < 2+governance.MinVotingBlocks; height++ {
+			finalizeAndCommitAppV24ReanchorBlock(
+				t, fixture.app, height, earlyVoteTime.Add(time.Duration(height)*time.Second),
+			)
 		}
-		require.NoError(t, tx.SignTx(vote, fixture.validator.priv))
-		_, err = fixture.app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
-			Height: 3, Time: vote.Timestamp,
-			Txs: [][]byte{encodeAppV24ReanchorTx(t, vote)},
-		})
-		require.ErrorContains(t, err, "status mismatch")
+		executionHeight := int64(2 + governance.MinVotingBlocks)
+		finalizeAndCommitAppV24ReanchorBlock(
+			t,
+			fixture.app,
+			executionHeight,
+			earlyVoteTime.Add(time.Duration(executionHeight)*time.Second),
+		)
+		require.Equal(t, executionHeight, fixture.app.state.Height)
 		for _, memoryID := range []string{"memory-atomic-a", "memory-atomic-b"} {
 			gotHash, _, hashErr := fixture.app.badgerStore.GetMemoryHash(memoryID)
 			require.NoError(t, hashErr)
 			require.Empty(t, gotHash, fmt.Sprintf("%s must remain untouched", memoryID))
 		}
+		terminal, err := fixture.app.govEngine.LoadProposal(proposalID)
+		require.NoError(t, err)
+		require.Equal(t, governance.StatusRejected, terminal.Status)
+		active, err := fixture.app.govEngine.GetActiveProposal()
+		require.NoError(t, err)
+		require.Nil(t, active)
+	})
+
+	t.Run("canonical proposal corruption remains fatal and active", func(t *testing.T) {
+		fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+		additionalValidators := addAppV24ReanchorValidators(t, fixture, 2)
+		hash := seedAppV24ReanchorMemory(
+			t, fixture.app, "memory-corrupt-proposal", "committed", "corruption sentinel",
+		)
+		payload, targetID := appV24ReanchorPayload(t, fixture.root, 1, []tx.MemoryHashReanchorEntry{{
+			MemoryID:       "memory-corrupt-proposal",
+			ExpectedStatus: "committed",
+			ContentHash:    hash,
+		}})
+		proposal := appV24ReanchorProposal(
+			t, fixture, fixture.root, payload, targetID, nil, 0, 1,
+			time.Unix(26_002, 0).UTC(), "corrupt1",
+		)
+		response, err := fixture.app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+			Height: 2, Time: proposal.Timestamp,
+			Txs: [][]byte{encodeAppV24ReanchorTx(t, proposal)},
+		})
+		require.NoError(t, err)
+		require.Zero(t, response.TxResults[0].Code, response.TxResults[0].Log)
+		commitGovernanceReplayBlock(t, fixture.app)
+
+		proposalID := governance.ComputeProposalID(
+			fixture.validator.id, 2, governance.OpMemoryHashReanchor, targetID,
+		)
+		earlyVoteTime := time.Unix(26_003, 0).UTC()
+		finalizeAndCommitAppV24ReanchorBlock(
+			t,
+			fixture.app,
+			3,
+			earlyVoteTime,
+			appV24ReanchorVote(t, fixture.validator, proposalID, 2, earlyVoteTime),
+			appV24ReanchorVote(t, additionalValidators[0], proposalID, 1, earlyVoteTime),
+		)
+
+		corrupted, err := fixture.app.govEngine.LoadProposal(proposalID)
+		require.NoError(t, err)
+		corrupted.Payload = []byte("not a canonical op9 payload")
+		corruptedBytes, err := json.Marshal(corrupted)
+		require.NoError(t, err)
+		require.NoError(t, fixture.app.badgerStore.SetState(
+			"gov:proposal:"+proposalID,
+			corruptedBytes,
+		))
+
+		for height := int64(4); height < 2+governance.MinVotingBlocks; height++ {
+			finalizeAndCommitAppV24ReanchorBlock(
+				t, fixture.app, height, earlyVoteTime.Add(time.Duration(height)*time.Second),
+			)
+		}
+		executionHeight := int64(2 + governance.MinVotingBlocks)
+		_, err = fixture.app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+			Height: executionHeight,
+			Time:   earlyVoteTime.Add(time.Duration(executionHeight) * time.Second),
+		})
+		require.ErrorContains(t, err, "decode memory hash reanchor payload")
+		require.Nil(t, fixture.app.pendingAppV20Finalize)
+		require.Equal(t, executionHeight-1, fixture.app.state.Height)
+
 		stillVoting, err := fixture.app.govEngine.LoadProposal(proposalID)
 		require.NoError(t, err)
 		require.Equal(t, governance.StatusVoting, stillVoting.Status)
+		active, err := fixture.app.govEngine.GetActiveProposal()
+		require.NoError(t, err)
+		require.NotNil(t, active)
+		require.Equal(t, proposalID, active.ProposalID)
 	})
+}
+
+func TestAppV24MemoryHashReanchorDriftTerminalizationRollsBackWithLaterFinalizeError(t *testing.T) {
+	fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+	additionalValidators := addAppV24ReanchorValidators(t, fixture, 2)
+	hash := seedAppV24ReanchorMemory(
+		t, fixture.app, "memory-drift-rollback", "committed", "rollback content",
+	)
+	payload, targetID := appV24ReanchorPayload(t, fixture.root, 1, []tx.MemoryHashReanchorEntry{{
+		MemoryID:       "memory-drift-rollback",
+		ExpectedStatus: "committed",
+		ContentHash:    hash,
+	}})
+	proposalHeight := int64(100 - governance.MinVotingBlocks)
+	proposalTime := time.Unix(27_000+proposalHeight, 0).UTC()
+	proposal := appV24ReanchorProposal(
+		t, fixture, fixture.root, payload, targetID, nil, 0, 1,
+		proposalTime, "rollbk01",
+	)
+	response := finalizeAndCommitAppV24ReanchorBlock(
+		t,
+		fixture.app,
+		proposalHeight,
+		proposalTime,
+		encodeAppV24ReanchorTx(t, proposal),
+	)
+	require.Len(t, response.TxResults, 1)
+	require.Zero(t, response.TxResults[0].Code, response.TxResults[0].Log)
+
+	proposalID := governance.ComputeProposalID(
+		fixture.validator.id,
+		proposalHeight,
+		governance.OpMemoryHashReanchor,
+		targetID,
+	)
+	voteHeight := proposalHeight + 1
+	voteTime := time.Unix(27_000+voteHeight, 0).UTC()
+	response = finalizeAndCommitAppV24ReanchorBlock(
+		t,
+		fixture.app,
+		voteHeight,
+		voteTime,
+		appV24ReanchorVote(t, fixture.validator, proposalID, 2, voteTime),
+		appV24ReanchorVote(t, additionalValidators[0], proposalID, 1, voteTime),
+	)
+	require.Len(t, response.TxResults, 2)
+	require.Zero(t, response.TxResults[0].Code, response.TxResults[0].Log)
+	require.Zero(t, response.TxResults[1].Code, response.TxResults[1].Log)
+
+	newRoot := newAgentKey(t)
+	require.NoError(t, fixture.app.badgerStore.RotateAppV23RootCredential(
+		1, newRoot.id, voteHeight+1,
+	))
+	for height := voteHeight + 1; height < 100; height++ {
+		finalizeAndCommitAppV24ReanchorBlock(
+			t,
+			fixture.app,
+			height,
+			time.Unix(27_000+height, 0).UTC(),
+		)
+	}
+
+	// Governance runs before epoch processing. This corrupt current-validator
+	// record therefore forces a later FinalizeBlock stage to fail after the
+	// speculative proposal rejection and gov:active deletion have both run.
+	require.NoError(t, fixture.app.badgerStore.SetRawForTest(
+		[]byte("vstats:"+fixture.validator.id),
+		[]byte("bad"),
+	))
+	executionTime := time.Unix(27_100, 0).UTC()
+	response, err := fixture.app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+		Height: 100,
+		Time:   executionTime,
+	})
+	require.ErrorContains(t, err, "atomic epoch processing failed")
+	require.Nil(t, response)
+	require.Nil(t, fixture.app.pendingAppV20Finalize)
+	require.Equal(t, int64(99), fixture.app.state.Height)
+
+	stillVoting, err := fixture.app.govEngine.LoadProposal(proposalID)
+	require.NoError(t, err)
+	require.Equal(t, governance.StatusVoting, stillVoting.Status,
+		"later FinalizeBlock failure must roll back the speculative rejection")
+	active, err := fixture.app.govEngine.GetActiveProposal()
+	require.NoError(t, err)
+	require.NotNil(t, active,
+		"later FinalizeBlock failure must roll back the speculative active-marker deletion")
+	require.Equal(t, proposalID, active.ProposalID)
+	projected, err := fixture.app.offchainStore.GetGovProposal(
+		context.Background(),
+		proposalID,
+	)
+	require.NoError(t, err)
+	require.Equal(t, string(governance.StatusVoting), projected.Status,
+		"failed FinalizeBlock must not leak the rejected SQL projection")
+
+	// Repair the unrelated epoch record and replay the same block. Both
+	// terminal writes now commit together and the empty block advances.
+	require.NoError(t, fixture.app.badgerStore.SetRawForTest(
+		[]byte("vstats:"+fixture.validator.id),
+		make([]byte, 56),
+	))
+	finalizeAndCommitAppV24ReanchorBlock(
+		t,
+		fixture.app,
+		100,
+		executionTime,
+	)
+	require.Equal(t, int64(100), fixture.app.state.Height)
+	terminal, err := fixture.app.govEngine.LoadProposal(proposalID)
+	require.NoError(t, err)
+	require.Equal(t, governance.StatusRejected, terminal.Status)
+	active, err = fixture.app.govEngine.GetActiveProposal()
+	require.NoError(t, err)
+	require.Nil(t, active)
+	projected, err = fixture.app.offchainStore.GetGovProposal(
+		context.Background(),
+		proposalID,
+	)
+	require.NoError(t, err)
+	require.Equal(t, string(governance.StatusRejected), projected.Status)
+	gotHash, status, err := fixture.app.badgerStore.GetMemoryHash("memory-drift-rollback")
+	require.NoError(t, err)
+	require.Empty(t, gotHash)
+	require.Equal(t, "committed", status)
 }
 
 func TestGovernanceOperationNameIncludesForkAwareAppV24Reanchor(t *testing.T) {

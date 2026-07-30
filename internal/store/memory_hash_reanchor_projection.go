@@ -48,7 +48,7 @@ func PlanMemoryHashReanchorEntries(
 	if !ok {
 		return nil, false, errors.New("memory hash reanchor planning requires exact SQL classification reads")
 	}
-	memoryIDs, err := canonicalMemoryIDs(canonical)
+	memoryIDs, err := CanonicalMemoryIDs(canonical)
 	if err != nil {
 		return nil, false, err
 	}
@@ -126,7 +126,14 @@ func AttestMemoryHashReanchorEntries(
 	return nil
 }
 
-func canonicalMemoryIDs(canonical *BadgerStore) ([]string, error) {
+// CanonicalMemoryIDs returns the complete sorted memory:<id> inventory from
+// Badger. It is used only by process-local projection verification and repair
+// planning; callers must not expose the identifiers through public health
+// responses.
+func CanonicalMemoryIDs(canonical *BadgerStore) ([]string, error) {
+	if canonical == nil {
+		return nil, errors.New("canonical memory inventory requires a store")
+	}
 	var ids []string
 	err := canonical.view(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions

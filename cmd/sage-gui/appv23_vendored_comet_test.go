@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	sageabci "github.com/l33tdawg/sage/internal/abci"
+	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 	"github.com/l33tdawg/sage/internal/vault"
 )
@@ -278,7 +279,31 @@ func runVendoredAgentRealCometHandshake(t *testing.T, encrypted bool) {
 		exactVendoredKeyResolver(rootKeyPath),
 		badgerStore,
 	))
+	// Model the already-governed single-validator app-v24 plan. The first
+	// Companion submit deliberately lands at activation height H: it must be
+	// rejected under app-v23 semantics while advancing the consensus protocol.
+	// Replaying the unchanged transaction at H+1 is the first safe write.
+	require.NoError(t, badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
+		Name: tx.CanonicalUpgradeName(24), TargetAppVersion: 24,
+		ActivationHeight: 1, ProposedAt: 0,
+	}))
 	rawMemory := vendoredFirstMemoryRaw(t, bootstrap)
+	activation, err := rpcEnvironment.BroadcastTxCommit(
+		&rpctypes.Context{},
+		cmttypes.Tx(rawMemory),
+	)
+	require.NoError(t, err)
+	require.Zero(t, activation.CheckTx.Code, activation.CheckTx.Log)
+	require.Equal(t, uint32(11), activation.TxResult.Code)
+	require.Contains(t, activation.TxResult.Log, "require governed app-v24 activation")
+	status, err = rpcEnvironment.Status(nil)
+	require.NoError(t, err)
+	require.Equal(t, sageabci.AppV23GenesisAppVersion, status.NodeInfo.ProtocolVersion.App,
+		"Comet advertises its handshake version until restart")
+	activatedInfo, err := app.Info(context.Background(), &abcitypes.RequestInfo{})
+	require.NoError(t, err)
+	require.Equal(t, uint64(24), activatedInfo.AppVersion)
+
 	broadcast, err := rpcEnvironment.BroadcastTxCommit(
 		&rpctypes.Context{},
 		cmttypes.Tx(rawMemory),
@@ -431,13 +456,13 @@ func runVendoredAgentRealCometHandshake(t *testing.T, encrypted bool) {
 	t.Cleanup(func() { require.NoError(t, secondController.StopChain()) })
 	secondInfo, secondInit := secondRecorder.snapshot()
 	require.NotEmpty(t, secondInfo)
-	require.Equal(t, sageabci.AppV23GenesisAppVersion, secondInfo[0])
+	require.Equal(t, uint64(24), secondInfo[0])
 	require.Empty(t, secondInit)
 	secondRPC, err := secondController.GetCometNode().ConfigureRPC()
 	require.NoError(t, err)
 	secondStatus, err := secondRPC.Status(nil)
 	require.NoError(t, err)
-	require.Equal(t, sageabci.AppV23GenesisAppVersion, secondStatus.NodeInfo.ProtocolVersion.App)
+	require.Equal(t, uint64(24), secondStatus.NodeInfo.ProtocolVersion.App)
 	require.GreaterOrEqual(t, secondStatus.SyncInfo.LatestBlockHeight, int64(1))
 	projected, err = projection.GetMemory(context.Background(), memoryID)
 	require.NoError(t, err)

@@ -3805,6 +3805,7 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 	// This handles single-block auto-approve (proposal created + quorum in same block).
 	var valUpdates []abcitypes.ValidatorUpdate
 	var executedProposal *governance.ProposalState
+	var invalidatedProposal *governance.ProposalState
 	var govErr error
 	postAppV20Governance := app.postAppV20Fork(req.Height)
 	freezeValidatorReconfiguration := app.appV20PendingPlanFreezesValidatorReconfiguration()
@@ -3829,26 +3830,33 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		// Governance evaluation begins in the following block, disabling the old
 		// single-block auto-approve edge for target-20.
 	} else if postAppV20Governance || freezeValidatorReconfiguration {
-		executedProposal, govErr = app.govEngine.ProcessBlockValidated(req.Height, func(proposal *governance.ProposalState) error {
-			if proposal.Operation == governance.OpMemoryHashReanchor {
-				_, err := app.validateAppV24MemoryHashReanchorProposal(
-					proposal, req.Height, true,
+		executedProposal, invalidatedProposal, govErr = app.govEngine.ProcessBlockValidatedWithInvalidation(
+			req.Height,
+			func(proposal *governance.ProposalState) error {
+				if proposal.Operation == governance.OpMemoryHashReanchor {
+					_, err := app.validateAppV24MemoryHashReanchorProposal(
+						proposal, req.Height, true,
+					)
+					return err
+				}
+				if !isValidatorSetGovernanceOperation(proposal.Operation) {
+					return nil
+				}
+				if freezeValidatorReconfiguration && !postAppV20Governance {
+					return errors.New("validator reconfiguration is frozen while the app-v20 activation plan is pending")
+				}
+				return app.validateAppV20ValidatorOperation(
+					proposal.Operation,
+					proposal.TargetID,
+					proposal.TargetPubKey,
+					proposal.TargetPower,
 				)
-				return err
-			}
-			if !isValidatorSetGovernanceOperation(proposal.Operation) {
-				return nil
-			}
-			if freezeValidatorReconfiguration && !postAppV20Governance {
-				return errors.New("validator reconfiguration is frozen while the app-v20 activation plan is pending")
-			}
-			return app.validateAppV20ValidatorOperation(
-				proposal.Operation,
-				proposal.TargetID,
-				proposal.TargetPubKey,
-				proposal.TargetPower,
-			)
-		})
+			},
+			func(proposal *governance.ProposalState, validationErr error) bool {
+				return proposal.Operation == governance.OpMemoryHashReanchor &&
+					appV24MemoryHashReanchorBusinessStateDrift(validationErr)
+			},
+		)
 	} else {
 		executedProposal, govErr = app.govEngine.ProcessBlock(req.Height)
 	}
@@ -3905,6 +3913,20 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				ProposalID:     executedProposal.ProposalID,
 				Status:         string(governance.StatusExecuted),
 				ExecutedHeight: req.Height,
+			},
+		})
+	}
+	if invalidatedProposal != nil {
+		app.logger.Info().
+			Str("proposal_id", invalidatedProposal.ProposalID).
+			Uint8("operation", uint8(invalidatedProposal.Operation)).
+			Str("target", invalidatedProposal.TargetID).
+			Msg("governance proposal rejected after deterministic execution-state drift")
+		app.pendingWrites = append(app.pendingWrites, pendingWrite{
+			writeType: "gov_status_update",
+			data: govStatusUpdateData{
+				ProposalID: invalidatedProposal.ProposalID,
+				Status:     string(governance.StatusRejected),
 			},
 		})
 	}

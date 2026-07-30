@@ -859,8 +859,9 @@ memory authority. The signed REST projection owns match and eligibility
 decisions, and MCP consumes its `match_kind` instead of independently dropping
 rows through a second status oracle.
 
-The unsigned `GET /v1/agents` roster is an operator/public listing and must
-never be substituted for this caller-scoped projection.
+`GET /v1/agents` is also signed and active-ordinary scoped as of v11.16, but it
+is a roster operation and must never be substituted for this caller-scoped projection;
+`sage_find_agent` additionally owns bounded name resolution.
 
 This is discovery metadata, not presence or a reachability probe. Zero matches
 does not mean that a previously known recipient is offline or undeliverable.

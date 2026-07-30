@@ -26,8 +26,13 @@ const (
 // QuorumStateSyncConfig is deliberately opt-in. Serving and receiving are
 // separate boot roles and both require the validator-only P2P profile.
 type QuorumStateSyncConfig struct {
-	Serving           bool     `yaml:"serving,omitempty"`
-	Receiving         bool     `yaml:"receiving,omitempty"`
+	Serving   bool `yaml:"serving,omitempty"`
+	Receiving bool `yaml:"receiving,omitempty"`
+	// Received is the durable completion gate for the separate chain-bound
+	// state-sync projection baseline file. The bool alone never authorizes
+	// omissions: readiness permits only the exact historical canonical IDs
+	// sealed in that baseline and still requires every later SQL projection row.
+	Received          bool     `yaml:"received,omitempty"`
 	SnapshotDir       string   `yaml:"snapshot_dir,omitempty"`
 	AuthorizationFile string   `yaml:"authorization_file,omitempty"`
 	AuthorizedPeerIDs []string `yaml:"authorized_peer_ids,omitempty"`

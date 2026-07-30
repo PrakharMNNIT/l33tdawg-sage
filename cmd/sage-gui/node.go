@@ -201,9 +201,19 @@ func runServe(startupProof string) (rerr error) {
 	recoveredReceiverCompleted := false
 	recoveryAction, recoveryFound, recoveryErr := recoverPendingStateSyncActivation(
 		context.Background(), cfg.DataDir, cometHome, badgerPath,
-		func() error {
+		func(height uint64, appHash []byte) error {
 			wasReceiving := cfg.Quorum.StateSync.Receiving
-			if completeErr := completeStateSyncReceivingRole(cfg); completeErr != nil {
+			projectionNodeKey, validatorPublicKey, identityErr := stateSyncProjectionLocalIdentity(cometHome)
+			if identityErr != nil {
+				return identityErr
+			}
+			if completeErr := validateStateSyncProjectionBaselinePendingAndComplete(
+				cfg,
+				projectionNodeKey,
+				validatorPublicKey,
+				height,
+				appHash,
+			); completeErr != nil {
 				return completeErr
 			}
 			recoveredReceiverCompleted = recoveredReceiverCompleted || wasReceiving
@@ -686,6 +696,12 @@ func runServe(startupProof string) (rerr error) {
 			return errors.New("state-sync activation seal has a non-positive height")
 		}
 		sealedHeight := uint64(height) // #nosec G115 -- positive height checked above
+		journal, journalErr := statesync.LoadActivationJournal(
+			filepath.Join(cfg.DataDir, stateSyncActivationJournalName),
+		)
+		if journalErr != nil {
+			return fmt.Errorf("load state-sync activation journal before projection completion: %w", journalErr)
+		}
 		return statesync.SealActivatedDirectory(
 			cfg.DataDir,
 			filepath.Join(cfg.DataDir, stateSyncActivationJournalName),
@@ -693,7 +709,15 @@ func runServe(startupProof string) (rerr error) {
 			appHash,
 			sealedHeight,
 			appHash,
-			func() error { return completeStateSyncReceivingRole(cfg) },
+			func() error {
+				return validateStateSyncProjectionBaselinePendingAndComplete(
+					cfg,
+					nodeKey,
+					receiverValidatorPublicKey,
+					journal.Height,
+					journal.AppHash,
+				)
+			},
 		)
 	}
 	sealCtx, cancelSeal := context.WithTimeout(ctx, stateSyncStartupTimeout)
@@ -855,6 +879,47 @@ func runServe(startupProof string) (rerr error) {
 		logger.Warn().Err(rebuildErr).Msg("scoped serving projection is not ready")
 	} else if rebuilt > 0 {
 		logger.Info().Int("records", rebuilt).Msg("scoped serving projection verified from canonical state")
+	}
+
+	var projectionBaselineMu sync.RWMutex
+	var projectionBaselineAllowed map[string]struct{}
+	projectionBaselineRequired := cfg.Quorum.StateSync.Received
+	ensureProjectionBaseline := func(baselineCtx context.Context) error {
+		if !projectionBaselineRequired {
+			return nil
+		}
+		info, baselineInfoErr := app.Info(baselineCtx, nil)
+		if baselineInfoErr != nil || info == nil {
+			if baselineInfoErr == nil {
+				baselineInfoErr = errors.New("nil application info")
+			}
+			return fmt.Errorf("read canonical state for projection baseline: %w", baselineInfoErr)
+		}
+		projectionNodeKey, validatorPublicKey, identityErr := stateSyncProjectionLocalIdentity(cometHome)
+		if identityErr != nil {
+			return identityErr
+		}
+		baseline, baselineErr := ensureStateSyncProjectionBaseline(
+			cfg.DataDir,
+			cfg.ChainID,
+			projectionNodeKey,
+			validatorPublicKey,
+			info.LastBlockHeight,
+			info.LastBlockAppHash,
+			badgerStore,
+		)
+		if baselineErr != nil {
+			return baselineErr
+		}
+		allowed := baselineAllowedMissingIDs(baseline)
+		projectionBaselineMu.Lock()
+		projectionBaselineAllowed = allowed
+		projectionBaselineMu.Unlock()
+		return nil
+	}
+	if baselineErr := ensureProjectionBaseline(ctx); baselineErr != nil {
+		logger.Error().Err(baselineErr).
+			Msg("state-sync ordinary-memory projection baseline unavailable; using strict readiness")
 	}
 
 	if warn := app.ContentValidationEnforcementWarning(); warn != "" {
@@ -1141,6 +1206,13 @@ func runServe(startupProof string) (rerr error) {
 		} else if rebuilt > 0 {
 			logger.Info().Int("records", rebuilt).Msg("scoped serving projection ready after vault unlock")
 		}
+		if rebuildErr == nil {
+			if baselineErr := ensureProjectionBaseline(rebuildCtx); baselineErr != nil {
+				logger.Error().Err(baselineErr).
+					Msg("state-sync ordinary-memory projection baseline unavailable after vault unlock")
+				rebuildErr = baselineErr
+			}
+		}
 		return rebuilt, rebuildErr
 	}
 
@@ -1235,6 +1307,14 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.AppV22ActiveFn = app.IsAppV22ActiveForNextTx
 	dashboard.AppV23ActiveFn = app.IsAppV23ActiveForNextTx
 	dashboard.AppV24ActiveFn = app.IsAppV24ActiveForNextTx
+	if projectionBaselineRequired {
+		dashboard.CanonicalProjectionMissingAllowedFn = func(memoryID string) bool {
+			projectionBaselineMu.RLock()
+			allowed := projectionBaselineAllowed
+			projectionBaselineMu.RUnlock()
+			return stateSyncProjectionMissingAllowed(allowed, badgerStore, memoryID)
+		}
+	}
 	app.SetCanonicalProjectionAuditNotifier(func() {
 		startWorker(func() {
 			if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {

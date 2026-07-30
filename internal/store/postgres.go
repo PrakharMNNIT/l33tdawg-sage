@@ -2907,12 +2907,12 @@ const postgresFindAgentsByNameSQL = `
 	    OR COALESCE(a.provider, '') COLLATE "C" ILIKE $1 ESCAPE '\'
 	  )
 	ORDER BY CASE
-	  WHEN a.name COLLATE "C" ILIKE $2 ESCAPE '\'
-	    OR COALESCE(a.registered_name, '') COLLATE "C" ILIKE $2 ESCAPE '\'
-	    OR COALESCE(a.provider, '') COLLATE "C" ILIKE $2 ESCAPE '\' THEN 0
-	  ELSE 1
-	END, LOWER(a.name COLLATE "C") COLLATE "C", a.agent_id
-	LIMIT $3`
+		  WHEN a.name COLLATE "C" ILIKE $2 ESCAPE '\'
+		    OR COALESCE(a.registered_name, '') COLLATE "C" ILIKE $2 ESCAPE '\'
+		    OR COALESCE(a.provider, '') COLLATE "C" ILIKE $2 ESCAPE '\' THEN 0
+		  ELSE 1
+		END, LOWER(a.name COLLATE "C") COLLATE "C", a.agent_id
+		LIMIT $3 OFFSET $4`
 
 // scanAgent reads one agents row in agentColumns order. Satisfied by both
 // pgx.Row (QueryRow) and pgx.Rows (after Next).
@@ -2987,11 +2987,25 @@ func (s *PostgresStore) GetAgentByName(ctx context.Context, name string) (*Agent
 // non-ASCII casing; escaped metacharacters remain literal, and exact field
 // matches sort before partials just as they do in SQLite.
 func (s *PostgresStore) FindAgentsByName(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	return s.FindAgentsByNamePage(ctx, query, limit, 0)
+}
+
+// FindAgentsByNamePage is the Postgres parity path for paged canonical
+// recipient lookup. Each SQL page remains capped even though the REST layer may
+// continue to later pages after consensus-pending rows are filtered out.
+func (s *PostgresStore) FindAgentsByNamePage(
+	ctx context.Context,
+	query string,
+	limit, offset int,
+) ([]*AgentEntry, error) {
+	if offset < 0 {
+		return nil, nil
+	}
 	exact, pattern, limit, ok := normalizeAgentNameLookup(query, limit, maxAgentNameLookupResults)
 	if !ok {
 		return nil, nil
 	}
-	rows, err := s.db.Query(ctx, postgresFindAgentsByNameSQL, pattern, exact, limit)
+	rows, err := s.db.Query(ctx, postgresFindAgentsByNameSQL, pattern, exact, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("find agents by name: %w", err)
 	}
