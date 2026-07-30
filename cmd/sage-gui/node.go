@@ -999,12 +999,13 @@ func runServe(startupProof string) (rerr error) {
 		// v10.5.1 auto-advance: personal nodes walk the fork ladder to the
 		// binary ceiling automatically (issue #40 follow-up — updating the
 		// binary now brings the chain up to date too). Quorum clusters keep
-		// the legacy target-6 watchdog. v11.15.0 makes app-v23 the minimum
-		// personal-node security floor; disable_auto_upgrade can stop later
-		// optional movement but cannot strand this release on app-v22.
+		// the legacy target-6 watchdog. v11.16.0 makes app-v24 the minimum
+		// personal-node security floor because app-v23 terminal transitions can
+		// erase the canonical content hash; disable_auto_upgrade must not strand
+		// an updated personal node on that broken lifecycle.
 		PersonalMode:       !cfg.Quorum.Enabled,
 		AutoAdvance:        !cfg.DisableAutoUpgrade,
-		RequiredAppVersion: 23,
+		RequiredAppVersion: 24,
 		// v10.5.2 (issue #41): in-process pending-plan accessor for the
 		// always-on pump and the auto-advance pre-check. GetUpgradePlan's
 		// ErrNoUpgradePlan is flattened to nil by readPendingPlan.
