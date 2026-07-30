@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.15.1
+  version: 11.16.0
   description: |-
     (Sovereign) Agent Governed Experience — network REST API for memory
     submission, validation, and query.
@@ -4484,7 +4484,7 @@ paths:
       description: >-
         This is local queue/workflow state, not proof of remote delivery or
         reading. Sender-queryable successful-delivery and receiver claim/read
-        receipts are explicitly deferred to v11.16.
+        receipts are explicitly deferred beyond v11.16.
       tags:
         - Pipeline
       parameters:

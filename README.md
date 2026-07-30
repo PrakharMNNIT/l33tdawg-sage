@@ -51,6 +51,48 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.16.0
+
+**App-v24 closes the canonical terminal-hash lifecycle defect without rewriting
+history.** New memory submissions bind `content_hash` to the exact SHA-256 of
+their content, and challenge, deprecate, and other terminal transitions preserve
+that canonical hash. App-v24 activates at the strict height after its app-v23
+predecessor, so the activation block and every earlier block retain their exact
+historical semantics. A governed, Root-planned validator vote can re-anchor
+eligible historical terminal rows in bounded, atomic, idempotent batches from
+their unchanged canonical content. The repair changes neither content,
+authorship, domain ownership, nor prior blocks.
+
+**Fresh first-party Mynah nodes now wait for the safe protocol floor instead of
+starting mute or writing through the vulnerable interval.** Direct app-v23
+genesis remains the authenticated bootstrap origin, but `/ready` reports
+`waiting_for_app_v24` until the next admitted transaction will execute under
+app-v24. Consensus independently rejects direct-genesis Companion memory and
+co-commit writes during that short governed climb, so bypassing the readiness
+endpoint cannot reproduce the defect. Personal nodes require app-v24 even when
+optional future auto-upgrades are disabled. This narrow barrier does not mute
+ordinary upgraded nodes: existing agents retain their app-v23 write authority
+while app-v24 activates.
+
+**Agent recall and caller-scoped discovery work again under the new access
+model.** `sage_turn` now forwards the exact embedding provider returned by
+`/v1/embed`, satisfying the app-v23 federated-vector recall gate. The signed
+`sage_find_agent` path again searches active ordinary local agents first and
+then only federated contacts authorized for that caller. It is discovery
+metadata, not presence: an empty match does not prove that a saved exact Agent
+ID is unreachable, and sends always revalidate the destination.
+
+**CEREBRUM RBAC now preserves the policy the operator actually approves.**
+Companion enrollment accepts its documented `15`/`31` profiles, valid existing
+federated-pipe restrictions are not silently stripped, and a newly pending
+mask-`30` principal becomes the documented Companion mask `15` only after
+approval. Encrypted and unencrypted loopback CEREBRUM use the same Root/Admin
+authorization boundary; an encrypted vault additionally requires its valid
+unlocked session. A level-2 grant is never presented as a cure for a hard
+capability, pending-review, profile, or ownership denial.
+
+Container: `ghcr.io/l33tdawg/sage:11.16.0`. SDK 11.16.0.
+
 ## What's New in v11.15.1
 
 **Emergency CEREBRUM rendering recovery.** v11.15.0 shipped one malformed
@@ -915,7 +957,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.15.0`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.16.0`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

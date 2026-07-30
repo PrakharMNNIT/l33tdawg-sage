@@ -1,6 +1,6 @@
 # App-v23 Access Control and Federation Design
 
-Status: implementation contract for SAGE v11.15.1.
+Status: implementation contract for SAGE v11.16.0.
 
 This document fixes the security and product invariants for app-v23. It is not
 permission to weaken an invariant to preserve app-v22 runtime behavior.
@@ -13,10 +13,10 @@ fresh SAGE node and its genesis-operator key. A clean installation must be able
 to store its first memory without a manual CEREBRUM step.
 
 Mynah has no released legacy population. It therefore installs a fresh SAGE
-node whose genesis starts directly at consensus app version 23; it does not
-create an app-v1 node and wait for the historical upgrade ladder. Before SAGE
-reports that vendored node serving-ready, a root-bound bootstrap manifest must
-atomically establish the bundled agent with:
+node whose authenticated genesis starts directly at consensus app version 23;
+it does not create an app-v1 node and wait for the historical upgrade ladder.
+A root-bound bootstrap manifest must atomically establish the bundled agent
+with:
 
 - its canonical Ed25519 agent identity;
 - the Companion security profile (app-v22 capability mask `15`);
@@ -25,12 +25,15 @@ atomically establish the bundled agent with:
 - active local enrollment on this SAGE authority.
 
 The liveness `/health` endpoint may remain healthy while this reconciliation is
-in progress; `/ready` is the serving gate and returns unavailable until the
-exact enrollment is commit-confirmed. The manifest is bound to keys, not the
-display name "Mynah". Generic
+in progress. `/ready` is the serving gate and returns unavailable until the
+exact enrollment is commit-confirmed **and app-v24 is active for the next
+admitted transaction**. During the governed app-v23-to-app-v24 climb, consensus
+also rejects memory and co-commit writes from the exact direct-genesis
+Companion; readiness cannot be bypassed through REST, MCP, or a raw transaction.
+The manifest is bound to keys, not the display name "Mynah". Generic
 self-registered third-party keys retain the restricted default policy. If the
-vendored bootstrap cannot be authenticated or committed, startup fails loudly
-instead of exposing a healthy-but-mute agent.
+vendored bootstrap or app-v24 activation cannot be authenticated and committed,
+startup fails loudly instead of exposing a healthy-but-mute agent.
 
 For first-party task creation, an omitted domain deterministically resolves to
 the caller's currently committed owned home domain. The REST process places
@@ -43,10 +46,13 @@ only after commit and exact-assignee backlog readback; a client must never say
 "added" merely because it attempted the write.
 
 This genesis path is not a compatibility shortcut: it commits an explicit
-app-v23 genesis marker, initializes every latest-version consensus prerequisite,
-reports app version 23 after `InitChain`, and restores the same state across
-restart and state sync. It must not mint a duplicate level-2 grant for the
-Companion's home domain; ownership remains the canonical authority source.
+app-v23 genesis marker, initializes every direct-genesis prerequisite, reports
+app version 23 after `InitChain`, and restores the same state across restart and
+state sync. The personal-node upgrade watchdog then advances through the
+governed app-v24 boundary before serving the Companion, even when optional
+future auto-upgrades are disabled. It must not mint a duplicate level-2 grant
+for the Companion's home domain; ownership remains the canonical authority
+source.
 
 Existing standalone SAGE nodes still reach app-v23 through the governed
 upgrade and deterministic migration path. There is no legacy Mynah-specific
@@ -363,7 +369,7 @@ Permanent write denials include at least:
 - `no_owned_home_domain`; and
 - `manager_scope_denied`.
 
-Remedies are derived from the reason. For `missing_write_grant`, v11.15.0 names
+Remedies are derived from the reason. For `missing_write_grant`, v11.16.0 names
 the owned home domain as the narrow action and, only when shared management is
 actually intended, the Root/Admin-approved Manager Access Group flow.
 CEREBRUM does not claim to offer a direct level-2 grant editor in this release.
@@ -539,13 +545,38 @@ agreement generation. Revoke, expiry, or re-pair moves them to
 - After v23 state or transaction types are committed, recovery is a forward fix
   or a trusted pre-activation snapshot, not an in-band downgrade to v22.
 
+## App-v24 readiness and memory-write barrier
+
+App-v24 is the v11.16.0 memory-integrity successor to app-v23. It requires
+app-v23 as its immediate semantic predecessor. Its activation block H executes
+with app-v23 semantics; app-v24 rules begin at H+1. This strict boundary keeps
+historical replay and the activation block byte-identical.
+
+For a fresh first-party node whose authenticated genesis starts directly at
+app-v23, `/ready` reports `waiting_for_app_v24` until a transaction admitted
+now will execute under app-v24. Consensus independently rejects memory-submit
+and co-commit writes from the exact committed Companion profile during this
+brief interval. The restriction is deliberately narrow: it applies only to a
+direct-v23-born chain and that Companion enrollment. Ordinary upgraded nodes
+and all of their existing agents retain app-v23 write behavior while the
+governed fork activates.
+
+Once active, app-v24 requires every new `MemorySubmit.ContentHash` to equal the
+exact SHA-256 of `Content`. Challenge, deprecate, and other terminal lifecycle
+transitions preserve that canonical hash instead of replacing it with the
+historical nil encoding. A Root-planned, validator-approved repair may re-anchor
+eligible historical terminal rows from their unchanged canonical content and
+status. Its plan is bounded, generation-bound, atomic, and idempotent; it never
+rewrites memory content, authorship, domain ownership, or prior blocks.
+
 ## Mandatory release gates
 
-The v11.15.0 release and app-v23 activation are blocked until all of the
+The v11.16.0 release and app-v24 activation are blocked until all of the
 following pass:
 
-1. Fresh vendored Mynah install performs zero-touch root bootstrap and its
-   first memory write succeeds.
+1. Fresh vendored Mynah performs zero-touch Root bootstrap, remains
+   `waiting_for_app_v24` before the fork, rejects direct pre-v24 writes at
+   consensus, and succeeds on its first memory write after app-v24.
 2. Generic fresh self-registration remains restricted and cannot mint
    Manager/Admin or claim a domain.
 3. Every role × profile × ownership × group × clearance decision is covered by
@@ -569,3 +600,6 @@ following pass:
    intentionally inside the versioned authorization boundary.
 11. Independent consensus, federation, and implementation/UX adversarial
     reviews complete with no unresolved high- or critical-severity findings.
+12. App-v24 submission-hash binding, terminal hash preservation, governed
+    historical re-anchor, replay, crash recovery, and state-sync tests pass
+    across the strict H/H+1 boundary.

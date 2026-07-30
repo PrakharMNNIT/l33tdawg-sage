@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.15.1. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.16.0. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -152,7 +152,7 @@ new request valid.
 
 | `reason_code` | Effective cause | Exact `remedy` |
 |---|---|---|
-| `missing_write_grant` | No effective level-2 write grant | Submit to a domain this agent owns. If shared management is intended, a local Root/Admin can approve the agent as a Manager and place it in an Access Group covering the target domain. v11.15.0 has no direct level-2 grant editor. |
+| `missing_write_grant` | No effective level-2 write grant | Submit to a domain this agent owns. If shared management is intended, a local Root/Admin can approve the agent as a Manager and place it in an Access Group covering the target domain. v11.16.0 has no direct level-2 grant editor. |
 | `foreign_write_restricted` | The effective named profile includes the deny-foreign-write restriction (app-v22 bit 8) | Assign a write-compatible named profile that permits foreign-domain writes, or submit to a domain this agent owns. |
 | `shared_write_restricted` | The effective named profile includes the deny-shared-write restriction (app-v22 bit 2) | Submit to the agent's owned non-shared home domain, or assign a named profile that permits shared-domain writes. |
 | `domain_claim_restricted` | The effective named profile includes the deny-domain-claim restriction (app-v22 bit 4) | Submit to a domain this agent already owns, or ask a local administrator to assign or reassign a non-shared domain; this profile cannot claim an unowned domain. |
@@ -693,6 +693,9 @@ Returns 503 if not configured on this node.
 ### `GET /v1/agents`
 
 List all registered agents. **No auth required.**
+This is an operator/public roster, not caller-scoped recipient discovery or a
+presence/reachability oracle. MCP clients must use the signed
+`GET /v1/agents/lookup` route instead.
 
 **Response** (HTTP 200): `{"agents": [...AgentEntry], "total": N}`
 
@@ -1036,10 +1039,10 @@ Grant domain access. Caller must own the domain or be admin. Broadcasts `TxTypeA
 **Historical CEREBRUM access matrix (v11.3–v11.14):** Saving the
 per-agent Domain Access matrix issued real `AccessGrant`/`AccessRevoke`
 transactions through this consensus path. App-v23 retires that matrix from the
-live Access Controls page in v11.15.0, so documentation and typed denials must
+live Access Controls page in v11.15+, so documentation and typed denials must
 not direct an operator to a nonexistent level-2 editor. The low-level consensus
 grant/revoke routes remain documented here for compatible clients; the shipped
-v11.15 CEREBRUM actions are owned-home-domain policy and, where shared
+v11.16 CEREBRUM actions are owned-home-domain policy and, where shared
 management is intended, Root/Admin-approved Manager Access Groups.
 
 ---
@@ -2151,7 +2154,8 @@ authorization to take a recovery action.
 `sage_turn` polls this route and returns actionable `pipe_delivery_updates`.
 
 Successful delivery and receiver claim/read receipts are deliberately not
-exposed in v11.15.0; that sender-queryable receipt state is deferred to v11.16.
+exposed in v11.16.0; that sender-queryable receipt state is deferred beyond
+v11.16.
 The local `/v1/pipe/{pipe_id}` workflow row and a clean inbox must not be
 presented as evidence that a remote recipient received or read a message.
 

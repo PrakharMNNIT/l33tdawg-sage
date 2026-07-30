@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.15.1. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
+<!-- Reconciled through SAGE v11.16.0. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
 
 # SAGE Reference — Environment Variables
 
@@ -35,7 +35,7 @@ partially privileged companion.
 | Variable | What it does | Default | Read by | Source |
 |----------|--------------|---------|---------|--------|
 | `SAGE_VENDORED_AGENT_KEY_FILE` | Stable, application-owned Ed25519 key path for a first-party companion that creates a fresh node. Genesis creates/loads it, dual-signs the chain-bound bootstrap with Root and companion, and enrolls that distinct identity directly at app-v23. It is not an upgraded-node repair selector; existing third-party or mask-30 agents require reviewed onboarding. | (unset; generic enrollment) | sage-gui | `cmd/sage-gui/config.go` (`applyEnvOverrides`), `cmd/sage-gui/node.go` (`genesisAppStateForVendoredAgent`) |
-| `SAGE_VENDORED_AGENT_HOME_DOMAIN` | Non-shared domain the companion owns after fresh-genesis bootstrap, for example `voice-interface`. This is ownership, not a synthetic level-2 grant. | (required with vendored key) | sage-gui | `cmd/sage-gui/config.go`, `cmd/sage-gui/node.go`, `cmd/sage-gui/appv23_vendored_readiness.go` |
+| `SAGE_VENDORED_AGENT_HOME_DOMAIN` | Non-shared domain the companion owns after fresh-genesis bootstrap, for example `voice-interface`. This is ownership, not a synthetic level-2 grant. Readiness remains fail-closed until app-v24 is active for the next admitted transaction. | (required with vendored key) | sage-gui | `cmd/sage-gui/config.go`, `cmd/sage-gui/node.go`, `cmd/sage-gui/appv23_vendored_readiness.go`, `cmd/sage-gui/vendored_appv24_readiness.go` |
 | `SAGE_VENDORED_AGENT_CLEARANCE` | Maximum classification the companion may read, integer `0..4`. The app-v23 Companion profile remains fixed at role Member and capability mask `15`; this variable cannot promote it to Manager/Admin or weaken the profile. | `1` when another vendored field creates the config | sage-gui | `cmd/sage-gui/config.go`, `cmd/sage-gui/node.go` |
 
 ---

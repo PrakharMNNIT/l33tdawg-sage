@@ -2,7 +2,7 @@
 
 Python client for the SAGE (Sovereign Agent Governed Experience) protocol -- a governed, verifiable institutional memory layer for multi-agent systems.
 
-**Requires Python 3.10+** | **SAGE v11.15.1 SDK** | **TLS, app-v23 roles and Access Groups, read-only federation, domain recovery, scoped governance, and per-record `classification` supported**
+**Requires Python 3.10+** | **SAGE v11.16.0 SDK** | **TLS, app-v23 roles and Access Groups, app-v24 memory integrity, read-only federation, domain recovery, scoped governance, and per-record `classification` supported**
 
 ## Installation
 
@@ -340,7 +340,7 @@ result = client.pipe_result(msg.pipe_id, result="Analysis complete: CVE is criti
 # Returns: PipeResultResponse(status, journal_id) — auto-journaled to memory
 
 # Inspect this node's local workflow row (not a delivery/read receipt;
-# sender-queryable successful delivery/read receipts are deferred to v11.16)
+# sender-queryable successful delivery/read receipts are deferred beyond v11.16)
 status = client.pipe_status(msg.pipe_id)
 
 # List completed results
