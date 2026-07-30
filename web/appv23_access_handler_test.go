@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -636,42 +637,55 @@ func TestAppV23ProductionGateRejectsStaleOperatorAfterRootRotation(t *testing.T)
 	require.Equal(t, http.StatusOK, currentRec.Code, currentRec.Body.String())
 }
 
-func TestAppV23UnencryptedLoopbackCEREBRUMCommitsAccessGroupAsRoot(t *testing.T) {
-	fixture := newAppV23AccessFixture(t)
-	var captured *tx.ParsedTx
-	var calls atomic.Int32
-	rpc := newGrantRPC(t, &captured, &calls)
-	defer rpc.Close()
-	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
+func TestAppV23LoopbackCEREBRUMCommitsAccessGroupAsRootInBothVaultModes(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
+			fixture := newAppV23AccessFixture(t)
+			var captured *tx.ParsedTx
+			var calls atomic.Int32
+			rpc := newGrantRPC(t, &captured, &calls)
+			defer rpc.Close()
+			h := appV23AccessTestHandler(fixture, rpc.URL, nil)
+			h.Encrypted.Store(encrypted)
+			const sessionToken = "app-v23-vault-parity-session"
+			if encrypted {
+				h.VaultLocked.Store(false)
+				h.sessions.Store(sessionToken, time.Now().Add(time.Hour))
+			}
 
-	body := []byte(`{"name":"Local team","members":[],"expected_revision":0}`)
-	req := httptest.NewRequest(
-		http.MethodPut,
-		"/v1/dashboard/network/access/groups/local-team",
-		bytes.NewReader(body),
-	)
-	route := chi.NewRouteContext()
-	route.URLParams.Add("groupID", "local-team")
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, route))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "http://localhost:8080")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Host = "localhost:8080"
-	req.RemoteAddr = "127.0.0.1:54321"
+			body := []byte(`{"name":"Local team","members":[],"expected_revision":0}`)
+			req := httptest.NewRequest(
+				http.MethodPut,
+				"/v1/dashboard/network/access/groups/local-team",
+				bytes.NewReader(body),
+			)
+			route := chi.NewRouteContext()
+			route.URLParams.Add("groupID", "local-team")
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, route))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Origin", "http://localhost:8080")
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			req.Host = "localhost:8080"
+			req.RemoteAddr = "127.0.0.1:54321"
+			if encrypted {
+				req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionToken})
+			}
 
-	rec := httptest.NewRecorder()
-	h.authMiddleware(h.dashboardOperatorMutationGate(h.cerebrumOperatorGate(
-		h.handleAppV23AccessGroupPut(),
-	))).ServeHTTP(rec, req)
+			rec := httptest.NewRecorder()
+			h.authMiddleware(h.dashboardOperatorMutationGate(h.cerebrumOperatorGate(
+				h.handleAppV23AccessGroupPut(),
+			))).ServeHTTP(rec, req)
 
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	require.Equal(t, int32(1), calls.Load())
-	require.NotNil(t, captured)
-	require.NotNil(t, captured.AccessGroupMutate)
-	assert.Equal(t, tx.TxTypeAccessGroupMutate, captured.Type)
-	assert.Equal(t, fixture.rootID, hex.EncodeToString(captured.PublicKey))
-	assert.Equal(t, "local-team", captured.AccessGroupMutate.GroupID)
-	assert.Equal(t, "Local team", captured.AccessGroupMutate.Name)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Equal(t, int32(1), calls.Load())
+			require.NotNil(t, captured)
+			require.NotNil(t, captured.AccessGroupMutate)
+			assert.Equal(t, tx.TxTypeAccessGroupMutate, captured.Type)
+			assert.Equal(t, fixture.rootID, hex.EncodeToString(captured.PublicKey))
+			assert.Equal(t, "local-team", captured.AccessGroupMutate.GroupID)
+			assert.Equal(t, "Local team", captured.AccessGroupMutate.Name)
+		})
+	}
 }
 
 func TestAppV23ProductionGateRejectsOrdinaryMember(t *testing.T) {
