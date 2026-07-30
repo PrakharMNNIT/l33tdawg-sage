@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
@@ -2300,12 +2299,6 @@ func cmtP2PAddr(def string) string {
 	return def
 }
 
-// genesisInitialAdminAppState returns the genesis app_state JSON that seeds the node
-// operator's agent key as the chain-admin, or nil if the operator key is unavailable.
-func genesisInitialAdminAppState() json.RawMessage {
-	return genesisInitialAdminAppStateForKey(filepath.Join(SageHome(), "agent.key"))
-}
-
 func genesisInitialAdminAppStateForKey(keyPath string) json.RawMessage {
 	admin := ensureOperatorAdminIDForKey(keyPath)
 	if admin == "" {
@@ -3256,24 +3249,6 @@ func createEmbeddingProvider(cfg *Config, logger zerolog.Logger) embedding.Provi
 		logger.Info().Int("dimension", dim).Msg("using hash-based pseudo-embeddings")
 		return embedding.NewHashProvider(dim)
 	}
-}
-
-// deriveArchetypeIDs reproduces the 4 seed-derived validator IDs that the retired
-// startAppValidators path persisted, so ReconcileSelfValidator can fingerprint a
-// legacy single-node chain and repair it. The derivation MUST match the old one
-// exactly: sha256(node-seed) -> sha256(seed + "sage-validator-"+name) -> ed25519 key.
-func deriveArchetypeIDs(selfKey ed25519.PrivateKey) []string {
-	var seed [32]byte
-	h := sha256.Sum256(selfKey.Seed())
-	copy(seed[:], h[:])
-	names := []string{"sentinel", "dedup", "quality", "consistency"}
-	ids := make([]string, 0, len(names))
-	for _, name := range names {
-		keySeed := sha256.Sum256(append(seed[:], []byte("sage-validator-"+name)...))
-		key := ed25519.NewKeyFromSeed(keySeed[:])
-		ids = append(ids, hex.EncodeToString(key.Public().(ed25519.PublicKey)))
-	}
-	return ids
 }
 
 // autoImport checks for pending-import.json from the setup wizard and seeds memories.
