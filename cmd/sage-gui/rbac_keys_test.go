@@ -96,6 +96,41 @@ func TestLocalAgentKeyResolverFindsCEREBRUMBundleKey(t *testing.T) {
 	require.Equal(t, bundleKey, resolved)
 }
 
+func TestLocalAgentKeyResolverFindsSDKManagedIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	operatorKey, _ := testAgentKey(t, 0x53)
+	writeTestAgentKey(t, filepath.Join(home, "agent.key"), operatorKey)
+	identityKey, identityID := testAgentKey(t, 0x54)
+	writeTestAgentKey(
+		t,
+		filepath.Join(home, "identities", "agent-01.key"),
+		identityKey,
+	)
+
+	resolver := localAgentKeyResolverWithOperator(filepath.Join(home, "agent.key"))
+	resolved, ok := resolver(identityID)
+	require.True(t, ok)
+	require.Equal(t, identityKey, resolved)
+}
+
+func TestLocalAgentKeyResolverDoesNotFollowSDKIdentitySymlinks(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	externalKey, externalID := testAgentKey(t, 0x55)
+	externalPath := filepath.Join(t.TempDir(), "external.key")
+	writeTestAgentKey(t, externalPath, externalKey)
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "identities"), 0o700))
+	require.NoError(t, os.Symlink(
+		externalPath,
+		filepath.Join(home, "identities", "linked.key"),
+	))
+
+	resolver := localAgentKeyResolverWithOperator(filepath.Join(home, "agent.key"))
+	_, ok := resolver(externalID)
+	require.False(t, ok)
+}
+
 func TestLocalAgentKeyResolverExpiresRotatedPositive(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("SAGE_HOME", home)

@@ -313,6 +313,16 @@ restricted pending state before returning success. A background registration
 or a `201` issued before consensus can strand an unapproved identity without
 its consent key and is forbidden.
 
+For an already self-registered SDK agent, CEREBRUM may offer the same approval
+only when the exact target key is locally resolvable. The production resolver
+recognizes the configured node operator key, `~/.sage/agent.key`,
+`~/.sage/agents/*/agent.key`, `~/.sage/bundles/*/agent.key`, the configured
+vendored-agent key, and the Python SDK's documented
+`~/.sage/identities/*.key` location. It does not recursively scan arbitrary
+paths or follow identity symlinks. A key outside those managed locations must
+be deliberately imported before approval; apparent name/provider locality is
+never substituted for key possession.
+
 The primary UI exposes named profiles and effective permissions. Raw capability
 bits remain a read-only advanced diagnostic surface; they are derived from the
 selected strict profile and cannot be toggled independently.
