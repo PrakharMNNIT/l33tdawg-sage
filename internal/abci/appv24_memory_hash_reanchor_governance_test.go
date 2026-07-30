@@ -396,6 +396,10 @@ func TestAppV24MemoryHashReanchorRejectsPayloadAndTargetMutations(t *testing.T) 
 
 func TestAppV24MemoryHashReanchorSingleValidatorNeedsExplicitVoteAndAppliesAtomically(t *testing.T) {
 	fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+	auditCalls := 0
+	fixture.app.SetCanonicalProjectionAuditNotifier(func() {
+		auditCalls++
+	})
 	firstHash := seedAppV24ReanchorMemory(
 		t, fixture.app, "memory-a", "committed", "first repaired content",
 	)
@@ -419,6 +423,7 @@ func TestAppV24MemoryHashReanchorSingleValidatorNeedsExplicitVoteAndAppliesAtomi
 	require.Len(t, response.TxResults, 1)
 	require.Zero(t, response.TxResults[0].Code, response.TxResults[0].Log)
 	require.NotNil(t, fixture.app.pendingAppV20Finalize)
+	require.Zero(t, auditCalls, "FinalizeBlock must not run a process-local SQL audit")
 	for _, pending := range fixture.app.pendingAppV20Finalize.app.pendingWrites {
 		require.NotEqual(t, "gov_vote", pending.writeType)
 	}
@@ -434,6 +439,7 @@ func TestAppV24MemoryHashReanchorSingleValidatorNeedsExplicitVoteAndAppliesAtomi
 		require.Empty(t, contentHash, "proposal creation alone must never apply a repair")
 	}
 	commitGovernanceReplayBlock(t, fixture.app)
+	require.Zero(t, auditCalls, "creating an op 9 proposal must not run an audit")
 
 	vote := &tx.ParsedTx{
 		Type: tx.TxTypeGovVote, Nonce: 2, Timestamp: time.Unix(23_003, 0).UTC(),
@@ -451,6 +457,7 @@ func TestAppV24MemoryHashReanchorSingleValidatorNeedsExplicitVoteAndAppliesAtomi
 	require.NoError(t, err)
 	require.Zero(t, response.TxResults[0].Code, response.TxResults[0].Log)
 	require.NotNil(t, fixture.app.pendingAppV20Finalize)
+	require.Zero(t, auditCalls, "the audit must wait for durable Commit")
 	executed, err := fixture.app.pendingAppV20Finalize.app.govEngine.LoadProposal(proposalID)
 	require.NoError(t, err)
 	require.Equal(t, governance.StatusExecuted, executed.Status)
@@ -463,6 +470,7 @@ func TestAppV24MemoryHashReanchorSingleValidatorNeedsExplicitVoteAndAppliesAtomi
 	require.Equal(t, secondHash, gotSecond)
 	require.Equal(t, "deprecated", secondStatus)
 	commitGovernanceReplayBlock(t, fixture.app)
+	require.Equal(t, 1, auditCalls, "a committed op 9 execution must refresh readiness exactly once")
 
 	// The exact same approved evidence remains an idempotent no-op if replayed
 	// through the apply helper; neither hash nor terminal status changes.
@@ -472,6 +480,67 @@ func TestAppV24MemoryHashReanchorSingleValidatorNeedsExplicitVoteAndAppliesAtomi
 	require.NoError(t, err)
 	require.Equal(t, firstHash, gotFirst)
 	require.Equal(t, "committed", firstStatus)
+}
+
+func TestAppV24MemoryHashReanchorAuditNotifierCannotFailCommittedVote(t *testing.T) {
+	fixture := setupAppV24ReanchorGovernanceFixture(t, 1)
+	contentHash := seedAppV24ReanchorMemory(
+		t, fixture.app, "memory-audit-panic", "committed", "repair survives local audit failure",
+	)
+	payload, targetID := appV24ReanchorPayload(t, fixture.root, 1, []tx.MemoryHashReanchorEntry{{
+		MemoryID:       "memory-audit-panic",
+		ExpectedStatus: "committed",
+		ContentHash:    contentHash,
+	}})
+	proposal := appV24ReanchorProposal(
+		t, fixture, fixture.root, payload, targetID, nil, 0, 1,
+		time.Unix(23_102, 0).UTC(), "auditp01",
+	)
+	response, err := fixture.app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+		Height: 2,
+		Time:   proposal.Timestamp,
+		Txs:    [][]byte{encodeAppV24ReanchorTx(t, proposal)},
+	})
+	require.NoError(t, err)
+	require.Zero(t, response.TxResults[0].Code, response.TxResults[0].Log)
+	commitGovernanceReplayBlock(t, fixture.app)
+
+	proposalID := governance.ComputeProposalID(
+		fixture.validator.id, 2, governance.OpMemoryHashReanchor, targetID,
+	)
+	vote := &tx.ParsedTx{
+		Type: tx.TxTypeGovVote, Nonce: 2, Timestamp: time.Unix(23_103, 0).UTC(),
+		GovVote: &tx.GovVote{
+			ProposalID: proposalID,
+			Decision:   tx.VoteDecisionAccept,
+		},
+	}
+	require.NoError(t, tx.SignTx(vote, fixture.validator.priv))
+	response, err = fixture.app.FinalizeBlock(context.Background(), &abcitypes.RequestFinalizeBlock{
+		Height: 3,
+		Time:   vote.Timestamp,
+		Txs:    [][]byte{encodeAppV24ReanchorTx(t, vote)},
+	})
+	require.NoError(t, err)
+	require.Zero(t, response.TxResults[0].Code, response.TxResults[0].Log)
+
+	notified := false
+	fixture.app.SetCanonicalProjectionAuditNotifier(func() {
+		notified = true
+		panic("local projection audit scheduler failed")
+	})
+	commitResponse, err := fixture.app.Commit(context.Background(), &abcitypes.RequestCommit{})
+	require.NoError(t, err)
+	require.NotNil(t, commitResponse)
+	require.True(t, notified)
+
+	gotHash, status, err := fixture.app.badgerStore.GetMemoryHash("memory-audit-panic")
+	require.NoError(t, err)
+	require.Equal(t, contentHash, gotHash)
+	require.Equal(t, "committed", status)
+	executed, err := fixture.app.govEngine.LoadProposal(proposalID)
+	require.NoError(t, err)
+	require.Equal(t, governance.StatusExecuted, executed.Status)
 }
 
 func TestAppV24MemoryHashReanchorRevalidatesRootAndEligibilityBeforeExecution(t *testing.T) {

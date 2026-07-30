@@ -1235,6 +1235,14 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.AppV22ActiveFn = app.IsAppV22ActiveForNextTx
 	dashboard.AppV23ActiveFn = app.IsAppV23ActiveForNextTx
 	dashboard.AppV24ActiveFn = app.IsAppV24ActiveForNextTx
+	app.SetCanonicalProjectionAuditNotifier(func() {
+		startWorker(func() {
+			if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
+				logger.Warn().Err(projectionErr).
+					Msg("canonical ordinary-memory projection audit incomplete after memory reanchor")
+			}
+		})
+	})
 	health.SetCanonicalMemoryProjectionProvider(func() metrics.CanonicalMemoryProjectionStatus {
 		status := badgerStore.CanonicalMemoryProjectionHealth()
 		return metrics.CanonicalMemoryProjectionStatus{

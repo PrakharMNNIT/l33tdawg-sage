@@ -395,6 +395,14 @@ type SageApp struct {
 	// Buffered writes — only flushed to PostgreSQL in Commit
 	pendingWrites []pendingWrite
 
+	// canonicalProjectionAuditNeeded is set only on the speculative app when
+	// an app-v24 memory-hash reanchor executes successfully. Commit consumes
+	// it after the SQL projection and Badger consensus transaction are both
+	// durable, then nudges the process-local projection audit below. It is
+	// deliberately excluded from AppHash/state persistence: readiness is a
+	// local serving concern and SQL must never become consensus input.
+	canonicalProjectionAuditNeeded bool
+
 	// flushMaxRetries bounds the SQLITE_BUSY retry loop in Commit. Exposed
 	// as a field (not a const) so tests can shrink it to keep the panic
 	// path fast.
@@ -423,6 +431,13 @@ type SageApp struct {
 	// races Commit's read. The atomic makes that publish/read data-race-free;
 	// nil load = disabled, a no-op.
 	syncNotifier atomic.Pointer[func([]string)]
+
+	// canonicalProjectionAuditNotifier schedules a complete process-local
+	// canonical-memory projection audit after a successfully committed app-v24
+	// memory-hash reanchor. The callback must only enqueue off-consensus work:
+	// it runs after SQL + Badger durability, receives no consensus data, and
+	// its failure can never change the already-committed ABCI result.
+	canonicalProjectionAuditNotifier atomic.Pointer[func()]
 
 	// v8AppliedHeight is the block at which the v8.0 access-control fork
 	// activated. Zero means not yet activated — handlers must take the
@@ -3874,8 +3889,13 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				panic(fmt.Sprintf("sage: validated app-v20 governance proposal %s failed to apply: %v", executedProposal.ProposalID, applyErr))
 			}
 			app.logger.Error().Err(applyErr).Msg("failed to apply governance proposal")
-		} else if update != nil {
-			valUpdates = append(valUpdates, *update)
+		} else {
+			if executedProposal.Operation == governance.OpMemoryHashReanchor {
+				app.canonicalProjectionAuditNeeded = true
+			}
+			if update != nil {
+				valUpdates = append(valUpdates, *update)
+			}
 		}
 
 		// Buffer offchain status update for Commit
@@ -9430,6 +9450,28 @@ func (app *SageApp) Commit(_ context.Context, req *abcitypes.RequestCommit) (*ab
 		app.snapshotScheduler.Tick(app.state.Height, app.state.AppHash)
 	}
 
+	// An app-v24 memory-hash reanchor may turn a previously quarantined SQL row
+	// canonical. Refresh the process-local serving audit only after both
+	// durability domains have committed. The callback is intentionally just a
+	// scheduler nudge; SQL inventory remains entirely off the consensus path.
+	// Recover here because a faulty local integration must never turn an
+	// already-durable governance vote into an ABCI/HTTP error.
+	if working.canonicalProjectionAuditNeeded {
+		working.canonicalProjectionAuditNeeded = false
+		if notify := app.canonicalProjectionAuditNotifier.Load(); notify != nil {
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						app.logger.Error().
+							Interface("panic", recovered).
+							Msg("canonical memory projection audit notifier panicked after commit")
+					}
+				}()
+				(*notify)()
+			}()
+		}
+	}
+
 	// v11.5 domain-sync watcher: report this block's committed memory IDs,
 	// post-flush and post-SaveState. status_update -> committed is the single
 	// choke point for every commit transition (quorum path + co-commit
@@ -9500,6 +9542,18 @@ func (app *SageApp) SetSyncNotifier(fn func([]string)) {
 		return
 	}
 	app.syncNotifier.Store(&fn)
+}
+
+// SetCanonicalProjectionAuditNotifier installs the app-v24 reanchor Commit-tail
+// hook (see the field doc). nil disables the best-effort refresh. Safe to call
+// concurrently with Commit; the notifier must enqueue process-local work and
+// must never feed SQL-derived data back into consensus.
+func (app *SageApp) SetCanonicalProjectionAuditNotifier(fn func()) {
+	if fn == nil {
+		app.canonicalProjectionAuditNotifier.Store(nil)
+		return
+	}
+	app.canonicalProjectionAuditNotifier.Store(&fn)
 }
 
 // flushPendingWrites executes all buffered writes against the given store (which

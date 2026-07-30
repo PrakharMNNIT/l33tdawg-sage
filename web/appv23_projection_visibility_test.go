@@ -244,6 +244,49 @@ func TestAppV23CerebrumPrincipalHashlessProjectionIsQuarantined(t *testing.T) {
 	require.NotContains(t, export.Body.String(), "principal-hashless")
 }
 
+func TestAppV23CanonicalProjectionAuditClearsStickyQuarantineAfterHashReanchor(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "reanchored-terminal", "reanchor-domain")
+	require.NoError(t, fixture.sql.UpdateStatus(
+		context.Background(), "reanchored-terminal", memory.StatusCommitted, time.Now().UTC(),
+	))
+	record, err := fixture.sql.GetMemory(context.Background(), "reanchored-terminal")
+	require.NoError(t, err)
+	require.NoError(t, fixture.badger.SetMemoryHash(
+		record.MemoryID, nil, string(record.Status),
+	))
+	require.NoError(t, fixture.badger.SetMemoryDomain(record.MemoryID, record.DomainTag))
+	require.NoError(t, fixture.badger.SetMemoryAuthor(record.MemoryID, record.SubmittingAgent))
+	require.NoError(t, fixture.badger.SetMemoryAuthorPrincipal(
+		record.MemoryID, record.SubmittingAgent,
+	))
+	require.NoError(t, fixture.badger.SetMemoryClassification(
+		record.MemoryID, uint8(store.ClearanceInternal),
+	))
+
+	require.NoError(t, fixture.handler.AuditAppV23CanonicalMemoryProjection(context.Background()))
+	health := fixture.badger.CanonicalMemoryProjectionHealth()
+	require.True(t, health.Quarantined)
+	require.Equal(t, store.CanonicalMemoryProjectionQuarantined, health.State)
+
+	// Model the consensus-approved app-v24 op 9 mutation. Health remains
+	// fail-closed until the complete post-Commit SQL inventory rescan publishes
+	// a fresh process-local result.
+	require.NoError(t, fixture.badger.SetMemoryHash(
+		record.MemoryID, record.ContentHash, string(record.Status),
+	))
+	require.True(t, fixture.badger.CanonicalMemoryProjectionHealth().Quarantined)
+
+	require.NoError(t, fixture.handler.AuditAppV23CanonicalMemoryProjection(context.Background()))
+	health = fixture.badger.CanonicalMemoryProjectionHealth()
+	require.True(t, health.Checked)
+	require.True(t, health.Required)
+	require.True(t, health.OK)
+	require.False(t, health.LegacyCompatible)
+	require.False(t, health.Quarantined)
+	require.Equal(t, store.CanonicalMemoryProjectionExact, health.State)
+}
+
 func TestAppV23CerebrumMemoryRoutesUseCanonicalProjectionWhenVaultUnlocked(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, true)
 	insertTestMemory(t, fixture.sql, "encrypted-canonical", "encrypted-domain")
