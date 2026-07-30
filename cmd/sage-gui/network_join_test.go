@@ -234,8 +234,8 @@ func TestVendoredPendingJoinRejectsStagingAndDiscardsLegacyStage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal legacy staged join: %v", err)
 	}
-	if err := os.WriteFile(pendingJoinPath(), legacyBundle, 0o600); err != nil {
-		t.Fatalf("seed legacy pending join: %v", err)
+	if writeErr := os.WriteFile(pendingJoinPath(), legacyBundle, 0o600); writeErr != nil {
+		t.Fatalf("seed legacy pending join: %v", writeErr)
 	}
 	applied, err := applyPendingJoinAtStartup(zerolog.Nop())
 	if err != nil {
