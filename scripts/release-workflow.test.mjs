@@ -5,6 +5,13 @@ import test from 'node:test';
 const workflowPath = new URL('../.github/workflows/release.yml', import.meta.url);
 const workflow = readFileSync(workflowPath, 'utf8');
 const ciWorkflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+const codeqlWorkflow = readFileSync(
+  new URL('../.github/workflows/codeql.yml', import.meta.url),
+  'utf8',
+);
+const codeqlBaseline = JSON.parse(
+  readFileSync(new URL('./codeql-cometbft-baseline.json', import.meta.url), 'utf8'),
+);
 const faultWorkflow = readFileSync(
   new URL('../.github/workflows/v11.9-fault-gates.yml', import.meta.url),
   'utf8',
@@ -92,6 +99,24 @@ test('release actions stay pinned to immutable commits', () => {
     if (action.startsWith('./')) continue;
     assert.match(action, /@[0-9a-f]{40}(?:\s+#\s+v[^\s]+)?$/, `unpinned release action: ${action}`);
   }
+});
+
+test('CodeQL uses the exact bundle audited by the CometBFT baseline', () => {
+  const expected = `https://github.com/github/codeql-action/releases/download/codeql-bundle-v${codeqlBaseline.codeql.semanticVersion}/codeql-bundle-linux64.tar.gz`;
+  const initMarkers = [...codeqlWorkflow.matchAll(/^      - name: Initialize CodeQL$/gm)];
+  assert.equal(initMarkers.length, 1);
+  const initStart = initMarkers[0].index;
+  const followingStep = codeqlWorkflow.indexOf('\n      - name:', initStart + 1);
+  const initStep = codeqlWorkflow.slice(
+    initStart,
+    followingStep === -1 ? codeqlWorkflow.length : followingStep,
+  );
+  assert.match(codeqlWorkflow, /^    runs-on: ubuntu-latest$/m);
+  assert.equal([...codeqlWorkflow.matchAll(/^          tools:/gm)].length, 1);
+  assert.match(
+    initStep,
+    new RegExp(`^          tools: '${expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'$`, 'm'),
+  );
 });
 
 test('Docker preparation retries the BuildKit pull before creating Buildx', () => {
