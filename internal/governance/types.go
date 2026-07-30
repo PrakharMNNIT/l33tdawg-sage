@@ -56,6 +56,10 @@ const (
 	// revision, pause/resume, and permanent retirement all use this exact-record
 	// operation; there is no controller-only mutation path.
 	OpScopeAction ProposalOp = 8
+	// OpMemoryHashReanchor (app-v24) repairs the canonical SHA-256 commitment
+	// of narrowly eligible app-v23 terminal memories through a Root-authorized,
+	// explicit-validator-vote, all-or-nothing operation.
+	OpMemoryHashReanchor ProposalOp = 9
 )
 
 // ProposalStatus represents the current state of a governance proposal.

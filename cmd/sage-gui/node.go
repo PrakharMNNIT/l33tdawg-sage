@@ -1234,6 +1234,7 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.AppV20ActiveFn = app.IsAppV20ActiveForNextTx
 	dashboard.AppV22ActiveFn = app.IsAppV22ActiveForNextTx
 	dashboard.AppV23ActiveFn = app.IsAppV23ActiveForNextTx
+	dashboard.AppV24ActiveFn = app.IsAppV24ActiveForNextTx
 	health.SetCanonicalMemoryProjectionProvider(func() metrics.CanonicalMemoryProjectionStatus {
 		status := badgerStore.CanonicalMemoryProjectionHealth()
 		return metrics.CanonicalMemoryProjectionStatus{

@@ -268,6 +268,10 @@ type DashboardHandler struct {
 	// consensus Access Groups can execute in the next block. nil is
 	// fail-closed for every app-v23 dashboard mutation.
 	AppV23ActiveFn func() bool
+	// AppV24ActiveFn reports whether the next admitted transaction executes
+	// under app-v24's hash-safe lifecycle. Memory-hash repair planning and
+	// governance remain unavailable until this strict H+1 boundary.
+	AppV24ActiveFn func() bool
 	// GovernanceDomainFn returns the committed app-v20 chain authorization
 	// domain. Post-v20 dashboard governance fails closed when it is unavailable.
 	GovernanceDomainFn func() string
