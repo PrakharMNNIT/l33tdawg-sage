@@ -300,13 +300,20 @@ function MemoryAdoptionResolutionModal({ progress, onProgress, onClose }) {
             Object.prototype.hasOwnProperty.call(returned, 'projection_revision')
             ? returned
             : null;
+        // Deprecate returns the atomically persisted complete/zero progress.
+        // Publish it before the follow-up GET so the warning clears as soon as
+        // the successful response arrives, even if reconciliation is slow.
+        if (next && typeof onProgress === 'function') onProgress(next);
         try {
-            next = await fetchMemoryAdoptionProgress();
+            const refreshed = await fetchMemoryAdoptionProgress();
+            if (refreshed) {
+                next = refreshed;
+                if (typeof onProgress === 'function') onProgress(next);
+            }
         } catch (_) {
             // The mutation has already succeeded. The regular dashboard poll
             // will reconcile the notice if this immediate refresh is offline.
         }
-        if (next && typeof onProgress === 'function') onProgress(next);
         return next;
     }
 
@@ -697,6 +704,10 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
     const repairFinishedWithResidue = adoptionProgress &&
         adoptionProgress.state === 'recovery' &&
         Number(adoptionProgress.recovery || 0) > 0;
+    const repairExplicitlyResolved = adoptionProgress &&
+        adoptionProgress.state === 'complete' &&
+        Number(adoptionProgress.remaining || 0) === 0 &&
+        Number(adoptionProgress.recovery || 0) === 0;
     const projectionHeading = repairActive
         ? 'Repairing historical memories automatically'
         : repairFinishedWithResidue
@@ -707,7 +718,12 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
         : repairFinishedWithResidue
             ? `${Number(adoptionProgress.converted || 0)} restored. ${Number(adoptionProgress.recovery || 0)} preserved historical records could not be converted and remain safely excluded.`
             : projectionNotice?.message || 'Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed.';
-    const showAutomaticRepairNotice = repairActive || repairFinishedWithResidue || projectionNotice;
+    // A terminal zero-count progress row is durable proof that Root resolved
+    // the recovery inventory. It also suppresses a stale generic projection
+    // notice so successful deprecation clears this entire warning immediately
+    // and after a reload. Without that exact proof, preserve every warning.
+    const showAutomaticRepairNotice = !repairExplicitlyResolved &&
+        (repairActive || repairFinishedWithResidue || projectionNotice);
     return html`<${Fragment}>
     <aside ref=${panelRef} class="brain-domain-inventory ${collapsed ? 'collapsed' : ''}" aria-label="Local and shared domains">
         <div class="brain-domain-head" data-domain-drag-handle>

@@ -76,6 +76,11 @@ func (h *DashboardHandler) appV25LegacyRecoveryControl(
 	if !ok {
 		return nil, nil, false
 	}
+	if !actor.IsRoot {
+		writeAppV23AccessError(w, http.StatusForbidden, "current_root_required",
+			"Only the current CEREBRUM Root may resolve preserved historical memories.")
+		return nil, nil, false
+	}
 	controller, ok := h.store.(appV25LegacyRecoveryController)
 	if !ok {
 		writeError(w, http.StatusNotImplemented,

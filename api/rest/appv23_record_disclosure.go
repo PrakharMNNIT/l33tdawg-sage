@@ -35,7 +35,8 @@ func appV23RecordDisclosureError(err error) error {
 }
 
 func isUnsafeAppV23Projection(err error) bool {
-	return errors.Is(err, store.ErrMemoryProjectionUnpublished)
+	return errors.Is(err, store.ErrMemoryProjectionUnpublished) ||
+		errors.Is(err, store.ErrMemoryProjectionQuarantined)
 }
 
 // appV23RecordDisclosure is the single post-v23 content-disclosure decision.
@@ -56,9 +57,13 @@ func (s *Server) evaluateAppV23RecordDisclosure(
 	if !s.isPostV23ForNextTx() {
 		return appV23RecordDisclosure{Allowed: true}, nil
 	}
-	if s.badgerStore == nil || credentialID == "" || record == nil ||
-		record.MemoryID == "" || record.DomainTag == "" {
+	if s.badgerStore == nil || credentialID == "" {
 		return appV23RecordDisclosure{}, errors.New("app-v23 record authorization state is unavailable")
+	}
+	if record == nil || record.MemoryID == "" {
+		return appV23RecordDisclosure{}, fmt.Errorf(
+			"%w: missing serving record identity", store.ErrMemoryProjectionQuarantined,
+		)
 	}
 
 	canonical, err := s.badgerStore.ValidateMemoryProjection(record)
@@ -68,6 +73,20 @@ func (s *Server) evaluateAppV23RecordDisclosure(
 	domain := record.DomainTag
 	if canonical.DomainRecorded {
 		domain = canonical.Domain
+	}
+	// Historical rows can predate app-v23's unambiguous domain grammar. They
+	// remain preserved for governed recovery/audit, but no current RBAC lookup
+	// can safely interpret a domain containing whitespace, control syntax, or an
+	// empty segment. Treat that as a record-local quarantine: broad list/search/
+	// status reads omit only this row, while exact reads still fail closed. Do
+	// not classify policy/backend errors this way; those continue to abort the
+	// entire request below.
+	if domainErr := store.ValidateAppV23DomainName(domain); domainErr != nil {
+		return appV23RecordDisclosure{}, fmt.Errorf(
+			"%w: invalid canonical memory domain: %w",
+			store.ErrMemoryProjectionQuarantined,
+			domainErr,
+		)
 	}
 	author := record.SubmittingAgent
 	if canonical.AuthorRecorded {

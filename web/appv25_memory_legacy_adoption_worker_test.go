@@ -19,6 +19,53 @@ import (
 	"github.com/l33tdawg/sage/internal/tx"
 )
 
+func TestAppV25LegacyAdoptionRecoveryParksOnlyTerminalRecovery(t *testing.T) {
+	tests := []struct {
+		name string
+		run  *appV25LegacyAdoptionRun
+		want bool
+	}{
+		{name: "nil run", want: false},
+		{name: "not initialized", run: &appV25LegacyAdoptionRun{
+			plan: &appV25LegacyAdoptionPlan{Unresolved: 327},
+		}, want: false},
+		{name: "terminal complete", run: &appV25LegacyAdoptionRun{
+			initialized: true, plan: &appV25LegacyAdoptionPlan{},
+		}, want: false},
+		{name: "migration remains active", run: &appV25LegacyAdoptionRun{
+			initialized: true, plan: &appV25LegacyAdoptionPlan{
+				Entries:    []tx.MemoryLegacyAdoptionEntry{{MemoryID: "pending"}},
+				Unresolved: 327,
+			},
+		}, want: false},
+		{name: "terminal recovery", run: &appV25LegacyAdoptionRun{
+			initialized: true, plan: &appV25LegacyAdoptionPlan{Unresolved: 327},
+		}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want,
+				appV25LegacyAdoptionRecoveryParked(test.run))
+		})
+	}
+}
+
+func TestAppV25LegacyAdoptionExplicitWakeResetsParkedRun(t *testing.T) {
+	run := &appV25LegacyAdoptionRun{
+		initialized:     true,
+		finalScanNeeded: true,
+		plan:            &appV25LegacyAdoptionPlan{Unresolved: 327},
+	}
+	require.True(t, appV25LegacyAdoptionRecoveryParked(run))
+
+	resetAppV25LegacyAdoptionRun(run)
+	require.False(t, appV25LegacyAdoptionRecoveryParked(run))
+	require.False(t, run.initialized)
+	require.False(t, run.finalScanNeeded)
+	require.Nil(t, run.plan,
+		"the next explicit-wake pass must build a fresh stable snapshot")
+}
+
 type blockingAppV25LegacyProjectionSource struct {
 	*store.SQLiteStore
 	scanStarted chan struct{}

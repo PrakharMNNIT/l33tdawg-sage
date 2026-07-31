@@ -25,7 +25,6 @@ import (
 const (
 	appV25LegacyAdoptionOperationName = "memory_legacy_adopt"
 	appV25LegacyAdoptionPollInterval  = 30 * time.Second
-	appV25LegacyAdoptionRecoveryRetry = 10 * time.Minute
 	appV25LegacyAdoptionPageSize      = 512
 	appV25LegacyAdoptionBatchSize     = 256
 )
@@ -86,6 +85,24 @@ type appV25LegacyAdoptionRun struct {
 	initialized     bool
 	finalScanNeeded bool
 	broadcast       func(*tx.ParsedTx, ed25519.PrivateKey) (string, int64, string, error)
+}
+
+// appV25LegacyAdoptionRecoveryParked identifies the terminal state that needs
+// an operator decision rather than background polling. The worker still scans
+// once after every process start, and requestAppV25LegacyAdoptionRetry clears
+// this cached plan before waking it for an explicit re-check.
+func appV25LegacyAdoptionRecoveryParked(run *appV25LegacyAdoptionRun) bool {
+	return run != nil && run.initialized && run.plan != nil &&
+		len(run.plan.Entries) == 0 && run.plan.Unresolved > 0
+}
+
+func resetAppV25LegacyAdoptionRun(run *appV25LegacyAdoptionRun) {
+	if run == nil {
+		return
+	}
+	run.plan = nil
+	run.initialized = false
+	run.finalScanNeeded = false
 }
 
 func appV25LegacyAdoptionBatch(
@@ -405,14 +422,21 @@ func (h *DashboardHandler) RunAppV25LegacyAdoptionWorker(
 			return
 		case <-timer.C:
 		case <-wake:
+			// A wake can arrive while the polling timer is still armed. Stop and
+			// drain it so one explicit retry causes exactly one immediate pass.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
 		if requested := h.appV25AdoptionRetry.Load(); requested != seenRetry {
 			seenRetry = requested
-			run.plan = nil
-			run.initialized = false
-			run.finalScanNeeded = false
+			resetAppV25LegacyAdoptionRun(run)
 		}
 		delay := appV25LegacyAdoptionPollInterval
+		park := false
 		if active() {
 			more, err := h.runAppV25LegacyAdoptionPassWithState(ctx, logger, run)
 			if err != nil && !errors.Is(err, context.Canceled) {
@@ -420,7 +444,14 @@ func (h *DashboardHandler) RunAppV25LegacyAdoptionWorker(
 					Msg("app-v25 legacy-memory adoption pass deferred")
 			} else if more {
 				delay = 5 * time.Second
+			} else if err == nil && appV25LegacyAdoptionRecoveryParked(run) {
+				park = true
 			}
+		}
+		if park {
+			// No timer is armed. Only shutdown or an explicit retry wake can run
+			// another expensive recovery scan/publication in this process.
+			continue
 		}
 		timer.Reset(delay)
 	}
@@ -468,14 +499,6 @@ func (h *DashboardHandler) runAppV25LegacyAdoptionPassWithState(
 	planStale, err := h.refreshAppV25LegacyAdoptionPlan(ctx, source, plan)
 	if err != nil {
 		return false, err
-	}
-	if !planStale && len(plan.Entries) == 0 && plan.Unresolved > 0 &&
-		!plan.PlannedAt.IsZero() &&
-		time.Since(plan.PlannedAt) >= appV25LegacyAdoptionRecoveryRetry {
-		// Recovery classifications are observations, not permanent verdicts.
-		// Retry them periodically even when no revision signal was available,
-		// while keeping the expensive full scan strictly bounded in cadence.
-		planStale = true
 	}
 	if planStale {
 		run.plan = nil

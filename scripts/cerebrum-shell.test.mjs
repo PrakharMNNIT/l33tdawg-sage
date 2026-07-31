@@ -137,8 +137,13 @@ test('preserved historical records have one explicit repair-resolution flow', ()
     assert.match(inventory, /adoptionProgress\.state === 'recovery'/);
     assert.match(inventory, /brain-projection-resolve/);
     assert.match(inventory, />Resolve<\/button>/);
-    assert.match(inventory, /showAutomaticRepairNotice = repairActive \|\| repairFinishedWithResidue \|\| projectionNotice/,
-        'the automatic repair notice must survive even if the generic projection notice is absent');
+    assert.match(inventory, /repairExplicitlyResolved = adoptionProgress &&[\s\S]*adoptionProgress\.state === 'complete' &&[\s\S]*Number\(adoptionProgress\.remaining \|\| 0\) === 0 &&[\s\S]*Number\(adoptionProgress\.recovery \|\| 0\) === 0/,
+        'only explicit terminal zero-count progress may clear the entire repair warning');
+    assert.match(inventory, /showAutomaticRepairNotice = !repairExplicitlyResolved &&[\s\S]*\(repairActive \|\| repairFinishedWithResidue \|\| projectionNotice\)/,
+        'terminal progress must suppress even a stale generic projection notice');
+    assert.match(inventory, /fetchMemoryAdoptionProgress\(\)/);
+    assert.match(inventory, /setAdoptionProgress\(adoption\)/,
+        'a reload must restore the durable complete/zero progress proof before rendering the notice');
 
     assert.match(resolution, /useModalDialog\(requestClose\)/);
     assert.match(resolution, /role="dialog" aria-modal="true"/);
@@ -150,6 +155,14 @@ test('preserved historical records have one explicit repair-resolution flow', ()
     assert.match(resolution, /DEPRECATE \$\{recoveryCount\}/);
     assert.match(resolution, /<strong>\$\{requiredConfirmation\}<\/strong>/);
     assert.match(resolution, /confirmation !== requiredConfirmation/);
+    assert.match(resolution, /const returned = result\?\.progress \|\| result/);
+    const immediateProgress = resolution.indexOf("if (next && typeof onProgress === 'function') onProgress(next)");
+    const reconciliationFetch = resolution.indexOf('const refreshed = await fetchMemoryAdoptionProgress()');
+    assert.ok(immediateProgress !== -1 && reconciliationFetch !== -1 && immediateProgress < reconciliationFetch,
+        'successful deprecation must publish returned complete/zero progress before the refresh request');
+    assert.match(resolution, /if \(refreshed\) \{[\s\S]*next = refreshed;[\s\S]*onProgress\(next\)/,
+        'the follow-up GET must reconcile progress without reviving a stale local state');
+    assert.match(resolution, /const result = await deprecateMemoryAdoption\([\s\S]*await refreshProgress\(result\)/);
     assert.match(resolution, /remain preserved for audit/);
     assert.match(resolution, /not been deleted or rewritten/);
     assert.match(resolution, /permanently excludes these records from future repair attempts and the available-memory view/);
