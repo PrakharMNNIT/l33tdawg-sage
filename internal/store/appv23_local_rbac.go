@@ -1123,6 +1123,35 @@ func (s *BadgerStore) AppV23AllowsGrandfatheredSharedWrite(agentID string) (bool
 	return allowed, err
 }
 
+// AppV23AllowsGrandfatheredSharedDomainWrite applies the legacy shared-write
+// compatibility rule to one exact domain. A non-static domain promoted to
+// shared solely because app-v25 found multiple historical writers is scoped by
+// its recovered continuity group instead: treating that promotion like an
+// ordinary H-1 shared domain would grant every unchanged mask-0 Member write
+// authority even when it never wrote the domain and is not in the group.
+//
+// Compile-time shared names retain their historical semantics. A dynamically
+// shared domain with only one continuity writer was necessarily already shared
+// before recovery, so it also retains the legacy rule. Exact continuity
+// writers are admitted earlier by AppV25AllowsHistoricalDomainWrite; current
+// Admin and explicit grants remain separate additive paths.
+func (s *BadgerStore) AppV23AllowsGrandfatheredSharedDomainWrite(
+	agentID, domain string,
+) (bool, error) {
+	allowed, err := s.AppV23AllowsGrandfatheredSharedWrite(agentID)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	record, err := s.GetAppV25DomainContinuity(domain)
+	if err != nil || record == nil {
+		return allowed, err
+	}
+	if IsSharedDomainName(domain) || len(record.Writers) <= 1 {
+		return true, nil
+	}
+	return false, nil
+}
+
 // AppV23AllowsLegacyForeignModify preserves the narrower app-v22 meaning of
 // DenyForeignDomainWrite for an unchanged migration-only policy. Bit 8 blocked
 // memory creation despite a level-2 grant; it did not revoke an independently
@@ -1450,6 +1479,35 @@ func (s *BadgerStore) AppV23LegacyReadCompatibility(
 	if domain == "" || classification > uint8(ClearanceTopSecret) {
 		return decision, nil
 	}
+	// Current direct authority over an exact app-v25-repaired domain is
+	// independent of the obsolete H-1 compatibility projection. Evaluate it
+	// before decoding that projection so a malformed legacy row cannot make a
+	// governed recovered domain write-only. The helper deliberately excludes
+	// ordinary grants and ordinary Access Groups, which remain bounded by a
+	// valid frozen explicit-domain ceiling.
+	credentialID := agentID
+	root, rootErr := s.GetAppV23Root()
+	if rootErr != nil {
+		return decision, rootErr
+	}
+	if root != nil && agentID == root.PrincipalID {
+		credentialID = root.CredentialID
+	}
+	recovered, recoveredErr := s.AuthorizeAppV25RecoveredDirectRead(credentialID, domain)
+	if recoveredErr != nil {
+		return decision, recoveredErr
+	}
+	if recovered {
+		enrollment, enrollmentErr := s.GetAppV23Enrollment(agentID)
+		if enrollmentErr != nil {
+			return decision, enrollmentErr
+		}
+		if enrollment != nil && enrollment.Active {
+			decision.Eligible = true
+			decision.Allowed = classification <= enrollment.Clearance
+			return decision, nil
+		}
+	}
 	var context appV23LegacyReadContext
 	var eligible bool
 	err := s.view(func(txn *badger.Txn) error {
@@ -1461,6 +1519,31 @@ func (s *BadgerStore) AppV23LegacyReadCompatibility(
 		return decision, err
 	}
 	decision.Eligible = true
+	// Migration may allocate an owned home domain that did not exist in the
+	// agent's immutable app-v22 DomainAccess allowlist. That allowlist remains
+	// a ceiling for every other legacy resource, but it must never make the
+	// required app-v23 home domain write-only: an active agent that owns its
+	// home domain can always read records there up to its current clearance.
+	//
+	// Keep this exception in the central compatibility decision so explicit
+	// domain reads, list/tag reads, semantic recall, tasks, and MCP inception
+	// all observe the same write-implies-read invariant.
+	if context.enrollment.HomeDomain != "" {
+		owner, ownedDomain, ownerErr := s.ResolveAppV23OwningAncestor(domain)
+		if ownerErr != nil {
+			return decision, ownerErr
+		}
+		shared, sharedErr := s.IsAppV23SharedDomain(domain)
+		if sharedErr != nil {
+			return decision, sharedErr
+		}
+		if !shared && owner == agentID &&
+			ownedDomain == context.enrollment.HomeDomain &&
+			classification <= context.enrollment.Clearance {
+			decision.Allowed = true
+			return decision, nil
+		}
+	}
 	if context.enrollment.Capabilities.Has(AgentCapabilityReadAllDomains) {
 		decision.Allowed = classification <= context.enrollment.Clearance
 		return decision, nil
@@ -4392,6 +4475,25 @@ func (s *BadgerStore) authorizeAppV23LocalDomainPolicy(policyID, domain string, 
 	if verb >= AppV23VerbWrite && enrollment.Profile == AppV23ProfileReadOnly {
 		return AppV23Authorization{ExplicitDeny: true, Reason: "read-only profile denies mutation"}, nil
 	}
+	// app-v25 restores only authority proven by an exact, validator-attested
+	// historical (agent, domain) pair. The entitlement itself is revision-bound,
+	// so a later explicit policy, owner, or recovered-group change revokes it.
+	// An unchanged historical mask-2/mask-8 still applies everywhere else.
+	if verb <= AppV23VerbModify {
+		var restored bool
+		var restoreErr error
+		if verb == AppV23VerbModify {
+			restored, restoreErr = s.AppV25AllowsHistoricalDomainModify(policyID, domain)
+		} else {
+			restored, restoreErr = s.AppV25AllowsHistoricalDomainWrite(policyID, domain)
+		}
+		if restoreErr != nil {
+			return AppV23Authorization{}, restoreErr
+		}
+		if restored {
+			return AppV23Authorization{Allowed: true}, nil
+		}
+	}
 	if verb >= AppV23VerbWrite && shared && enrollment.Capabilities.Has(AgentCapabilityDenySharedDomainWrite) {
 		return AppV23Authorization{ExplicitDeny: true, Reason: "profile denies shared-domain writes"}, nil
 	}
@@ -4407,9 +4509,17 @@ func (s *BadgerStore) authorizeAppV23LocalDomainPolicy(policyID, domain string, 
 		return AppV23Authorization{Allowed: true}, nil
 	}
 	if shared {
+		recoveredGroup, recoveredGroupErr :=
+			s.AuthorizeAppV25RecoveredGroupDomain(policyID, domain, verb)
+		if recoveredGroupErr != nil {
+			return AppV23Authorization{}, recoveredGroupErr
+		}
+		if recoveredGroup {
+			return AppV23Authorization{Allowed: true}, nil
+		}
 		if verb == AppV23VerbWrite {
 			grandfathered, grandfatherErr :=
-				s.AppV23AllowsGrandfatheredSharedWrite(policyID)
+				s.AppV23AllowsGrandfatheredSharedDomainWrite(policyID, domain)
 			if grandfatherErr != nil {
 				return AppV23Authorization{}, grandfatherErr
 			}
@@ -4736,6 +4846,7 @@ func (s *BadgerStore) ValidateAppV23State() error {
 			return rosterErr
 		}
 		rosterIDs := make(map[string]struct{}, len(roster))
+		rosterByID := make(map[string]OnChainAgent, len(roster))
 		for _, agent := range roster {
 			if _, duplicate := rosterIDs[agent.AgentID]; duplicate {
 				return fmt.Errorf(
@@ -4744,6 +4855,7 @@ func (s *BadgerStore) ValidateAppV23State() error {
 				)
 			}
 			rosterIDs[agent.AgentID] = struct{}{}
+			rosterByID[agent.AgentID] = agent
 		}
 		if root.CredentialID != root.PrincipalID {
 			if _, err := txn.Get(agentOnChainKey(root.CredentialID)); err == nil {
@@ -5049,6 +5161,29 @@ func (s *BadgerStore) ValidateAppV23State() error {
 		} else if !errors.Is(migrationErr, badger.ErrKeyNotFound) {
 			return migrationErr
 		}
+		pendingRegistrationFloor := int64(0)
+		switch {
+		case migrationErr == nil:
+			pendingRegistrationFloor = migration.Height
+		case errors.Is(migrationErr, badger.ErrKeyNotFound):
+			var activation AppV23GenesisActivation
+			if err := appV23ReadJSON(
+				txn, appV23GenesisActivationKey(), &activation,
+			); err != nil {
+				return errors.New(
+					"app-v23 state without migration has no genesis activation",
+				)
+			}
+			if activation.RootID != root.PrincipalID ||
+				activation.Scope != root.Scope ||
+				activation.BootstrapDigest != root.BootstrapDigest ||
+				root.EstablishedAt <= 0 {
+				return errors.New(
+					"app-v23 genesis activation does not match Root state",
+				)
+			}
+			pendingRegistrationFloor = root.EstablishedAt
+		}
 
 		enrollments := make(map[string]AppV23LocalEnrollment)
 		active := make(map[string]AppV23LocalEnrollment)
@@ -5095,13 +5230,34 @@ func (s *BadgerStore) ValidateAppV23State() error {
 		if len(enrollments) != len(roles) {
 			return errors.New("app-v23 enrollment/role cardinality mismatch")
 		}
-		if len(enrollments) != len(rosterIDs) {
-			return errors.New("app-v23 agent roster/enrollment cardinality mismatch")
-		}
 		for agentID := range rosterIDs {
-			if _, ok := enrollments[agentID]; !ok {
+			if _, enrolled := enrollments[agentID]; enrolled {
+				if _, hasRole := roles[agentID]; !hasRole {
+					return fmt.Errorf(
+						"app-v23 enrolled agent %s has no role", agentID,
+					)
+				}
+				continue
+			}
+			if _, hasRole := roles[agentID]; hasRole {
 				return fmt.Errorf(
-					"app-v23 registered agent %s has no enrollment", agentID,
+					"app-v23 pending agent %s has an orphan role", agentID,
+				)
+			}
+			agent := rosterByID[agentID]
+			_, migrated := migrationDispositions[agentID]
+			if migrated ||
+				agent.RegisteredAt <= pendingRegistrationFloor ||
+				agent.Role != AppV23RoleMember ||
+				agent.Clearance != uint8(ClearanceInternal) ||
+				agent.Capabilities != DefaultSelfRegisteredAgentCapabilities ||
+				agent.OrgID != "" ||
+				agent.DeptID != "" ||
+				agent.DomainAccess != "" ||
+				agent.VisibleAgents != "" {
+				return fmt.Errorf(
+					"app-v23 registered agent %s has no valid pending enrollment",
+					agentID,
 				)
 			}
 		}
@@ -5128,10 +5284,20 @@ func (s *BadgerStore) ValidateAppV23State() error {
 				(enrollment.HomeDomain == "" &&
 					enrollment.Profile == AppV23ProfileCompanion) {
 				disposition, migrated := migrationDispositions[agentID]
-				if !migrated ||
-					disposition.Profile != enrollment.Profile ||
-					disposition.HomeDomain != enrollment.HomeDomain ||
-					disposition.Active != enrollment.Active {
+				matchesMigration := migrated &&
+					disposition.Profile == enrollment.Profile &&
+					disposition.HomeDomain == enrollment.HomeDomain &&
+					disposition.Active == enrollment.Active
+				matchesContinuity := false
+				if migrated && !matchesMigration {
+					var continuityErr error
+					matchesContinuity, continuityErr =
+						s.appV25ContinuityActivationMatchesTxn(txn, enrollment, disposition)
+					if continuityErr != nil {
+						return continuityErr
+					}
+				}
+				if !matchesMigration && !matchesContinuity {
 					return fmt.Errorf(
 						"app-v23 migration-only policy has no matching disposition for agent %s",
 						agentID,

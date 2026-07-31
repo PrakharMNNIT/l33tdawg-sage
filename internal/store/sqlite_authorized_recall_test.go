@@ -80,6 +80,62 @@ func TestSQLiteRecallCandidateFilterFillsPastHundredDeniedRows(t *testing.T) {
 	}
 }
 
+func TestSQLiteTextCandidateBatchFilterUsesOneCallPerRankedPage(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for i := 0; i < 140; i++ {
+		rec := testMemory(
+			fmt.Sprintf("000-denied-%03d", i),
+			"denied-agent",
+			"needle ranked batch authorization",
+			"denied.domain",
+		)
+		rec.Status = memory.StatusCommitted
+		require.NoError(t, s.InsertMemory(ctx, rec))
+	}
+	for i := 0; i < 3; i++ {
+		rec := testMemory(
+			fmt.Sprintf("zzz-allowed-%03d", i),
+			"allowed-agent",
+			"needle ranked batch authorization",
+			"allowed.domain",
+		)
+		rec.Status = memory.StatusCommitted
+		require.NoError(t, s.InsertMemory(ctx, rec))
+	}
+
+	batchCalls := 0
+	maxBatch := 0
+	results, err := s.SearchByText(ctx, "needle", QueryOptions{
+		TopK:         2,
+		StatusFilter: "committed",
+		CandidateBatchFilter: func(
+			page []*memory.MemoryRecord,
+		) ([]*memory.MemoryRecord, error) {
+			batchCalls++
+			if len(page) > maxBatch {
+				maxBatch = len(page)
+			}
+			allowed := page[:0]
+			for _, rec := range page {
+				if strings.HasPrefix(rec.MemoryID, "zzz-allowed-") {
+					allowed = append(allowed, rec)
+				}
+			}
+			return allowed, nil
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.Equal(t, 2, batchCalls,
+		"140 denied hits require exactly two ranked SQL pages, not one policy call per record")
+	require.Equal(t, 128, maxBatch)
+	for _, rec := range results {
+		require.True(t, strings.HasPrefix(rec.MemoryID, "zzz-allowed-"))
+	}
+}
+
 func TestSQLiteHybridCandidateFilterLeafErrorCannotDegradeToPartialSuccess(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

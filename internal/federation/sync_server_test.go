@@ -530,6 +530,68 @@ func TestPendingRecoveryRefusesMismatchedLocalIdentity(t *testing.T) {
 	require.NoError(t, err, "mismatched row must remain quarantined")
 }
 
+func TestDuplicateBroadcastRefusesDeterministicIDSquatter(t *testing.T) {
+	ctx := context.Background()
+	comet := &scriptedComet{responses: []string{cometReject(
+		11, `memory squatted already reached terminal status "committed"; re-submit rejected`,
+	)}}
+	m, ms := newSyncTestManager(t, comet)
+	peer := testPeer(2, "hr")
+	require.NoError(t, ms.SetSyncDomains(ctx, peer.ChainID, []string{"hr"}))
+
+	item := syncItem("m-terminal-collision", "hr", "genuine federated content")
+	localID := syncMemoryID(peer.ChainID, item.OriginMemoryID)
+	squatterHash := sha256.Sum256([]byte("unrelated native content"))
+	require.NoError(t, seedCommittedMemory(
+		ctx, ms, localID, item.Domain, "unrelated native content", squatterHash[:],
+	))
+
+	_, resp := pushAs(t, m, peer, SyncPushRequest{Items: []SyncItem{item}})
+	require.NotNil(t, resp)
+	require.Len(t, resp.Results, 1)
+	assert.Equal(t, SyncOutcomeRetry, resp.Results[0].Outcome)
+	assert.Empty(t, resp.Results[0].LocalMemoryID)
+	assert.Equal(t, int32(1), comet.calls.Load(), "collision still reaches consensus once")
+
+	origin, err := ms.GetSyncOrigin(ctx, peer.ChainID, item.OriginMemoryID)
+	assert.Nil(t, origin)
+	assert.ErrorIs(t, err, sql.ErrNoRows, "a terminal ID collision must never bind provenance")
+	pending, err := ms.GetPendingSyncOrigin(ctx, peer.ChainID, item.OriginMemoryID)
+	require.NoError(t, err, "mismatch remains quarantined for an explicit retry/error")
+	assert.Equal(t, localID, pending.LocalMemoryID)
+}
+
+func TestDuplicateBroadcastAcceptsExactTerminalProjection(t *testing.T) {
+	ctx := context.Background()
+	comet := &scriptedComet{responses: []string{cometReject(
+		11, `memory exact already reached terminal status "committed"; re-submit rejected`,
+	)}}
+	m, ms := newSyncTestManager(t, comet)
+	peer := testPeer(2, "hr")
+	require.NoError(t, ms.SetSyncDomains(ctx, peer.ChainID, []string{"hr"}))
+
+	item := syncItem("m-terminal-redelivery", "hr", "exact federated content")
+	localID := syncMemoryID(peer.ChainID, item.OriginMemoryID)
+	seedErr := make(chan error, 1)
+	comet.after = func() {
+		seedErr <- seedSyncedMirror(ctx, ms, m, localID, item)
+	}
+
+	_, resp := pushAs(t, m, peer, SyncPushRequest{Items: []SyncItem{item}})
+	require.NoError(t, <-seedErr)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Results, 1)
+	assert.Equal(t, SyncOutcomeDuplicate, resp.Results[0].Outcome)
+	assert.Equal(t, localID, resp.Results[0].LocalMemoryID)
+	assert.Equal(t, int32(1), comet.calls.Load())
+
+	origin, err := ms.GetSyncOrigin(ctx, peer.ChainID, item.OriginMemoryID)
+	require.NoError(t, err)
+	assert.Equal(t, localID, origin.LocalMemoryID)
+	_, err = ms.GetPendingSyncOrigin(ctx, peer.ChainID, item.OriginMemoryID)
+	assert.ErrorIs(t, err, sql.ErrNoRows, "verified duplicate promotes and clears quarantine")
+}
+
 func TestSyncPushStructuralViolations(t *testing.T) {
 	comet := &scriptedComet{responses: []string{cometOK}}
 	m, ms := newSyncTestManager(t, comet)

@@ -766,6 +766,30 @@ func (m *Manager) admitSyncItem(r *http.Request, ss *store.SQLiteStore, peer *pe
 		return out
 	}
 	outcome, txHash := m.broadcastSyncSubmit(localID, item)
+	if outcome == SyncOutcomeDuplicate {
+		// A terminal-status rejection is only success-equivalent when the local
+		// projection is the exact copy this origin tuple would have created.
+		// Memory IDs are caller-selectable, so an unrelated native memory can
+		// otherwise squat syncMemoryID(originChainID, originMemoryID), trigger the
+		// broad terminal->duplicate classifier, and become permanently bound to
+		// the foreign origin below. Reuse the durable pending envelope as the
+		// fail-closed comparison source before first-writer-wins sync_origin is
+		// allowed to record anything.
+		exists, matches, verifyErr := ss.PendingSyncMemoryState(
+			context.Background(), expectedPending,
+		)
+		if verifyErr != nil || !exists || !matches {
+			m.logger.Warn().
+				Err(verifyErr).
+				Str("origin", item.OriginChainID+"/"+item.OriginMemoryID).
+				Str("local", localID).
+				Bool("local_exists", exists).
+				Bool("local_matches", matches).
+				Msg("sync: duplicate result has no exact local projection")
+			out.Outcome = SyncOutcomeRetry
+			return out
+		}
+	}
 	if outcome == SyncOutcomeAccepted || outcome == SyncOutcomeDuplicate {
 		if err := recordAdmitted(localID); err != nil {
 			out.Outcome = SyncOutcomeRetry

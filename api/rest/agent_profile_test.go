@@ -76,7 +76,7 @@ func TestGetAgent_OnChainPoESignals_ColdStart(t *testing.T) {
 	assert.Empty(t, resp.DomainExpertise, "no voting history -> no domain expertise emitted")
 }
 
-func TestAppV23GetAgentSelfExposesOnlyActiveOrdinaryHomePolicy(t *testing.T) {
+func TestAppV23GetAgentSelfExposesCallerStandingIncludingPendingReview(t *testing.T) {
 	srv, _, badger, agents := newRBACTestServer(t)
 	rootPub, _, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
@@ -109,6 +109,15 @@ func TestAppV23GetAgentSelfExposesOnlyActiveOrdinaryHomePolicy(t *testing.T) {
 	require.Equal(t, store.AppV23ProfileCompanion, resp.Profile)
 	require.Equal(t, "voice-interface", resp.HomeDomain)
 	require.Equal(t, "active", resp.EnrollmentState)
+	require.Equal(t, "active", resp.RegistrationState)
+	require.Equal(t, uint8(2), resp.Clearance)
+	require.Equal(t, uint32(15), resp.Capabilities)
+	require.NotNil(t, resp.CanRead)
+	require.NotNil(t, resp.CanWrite)
+	require.True(t, *resp.CanRead)
+	require.True(t, *resp.CanWrite)
+	require.Equal(t, "home_domain", resp.AccessScope)
+	require.False(t, resp.ApprovalRequired)
 
 	pendingPub, pendingKey, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
@@ -123,9 +132,47 @@ func TestAppV23GetAgentSelfExposesOnlyActiveOrdinaryHomePolicy(t *testing.T) {
 	deniedReq := signedRequestAs(
 		t, pendingKey, pendingID, http.MethodGet, "/v1/agent/me", nil,
 	)
-	denied := httptest.NewRecorder()
-	srv.Router().ServeHTTP(denied, deniedReq)
-	require.Equal(t, http.StatusForbidden, denied.Code, denied.Body.String())
-	require.Contains(t, denied.Body.String(), "active-agent-required")
-	require.NotContains(t, denied.Body.String(), "home_domain")
+	pending := httptest.NewRecorder()
+	srv.Router().ServeHTTP(pending, deniedReq)
+	require.Equal(t, http.StatusOK, pending.Code, pending.Body.String())
+	var pendingResp AgentProfileResponse
+	require.NoError(t, json.Unmarshal(pending.Body.Bytes(), &pendingResp))
+	require.Equal(t, pendingID, pendingResp.AgentID)
+	require.Equal(t, store.AppV23RoleMember, pendingResp.Role)
+	require.Equal(t, "pending_review", pendingResp.EnrollmentState)
+	require.Equal(t, "pending_review", pendingResp.RegistrationState)
+	require.Equal(t, uint8(1), pendingResp.Clearance,
+		"post-v23 self-registration keeps its consensus pending-review clearance")
+	require.Equal(t, uint32(0), pendingResp.Capabilities)
+	require.True(t, pendingResp.ApprovalRequired)
+	require.NotNil(t, pendingResp.CanRead)
+	require.NotNil(t, pendingResp.CanWrite)
+	require.False(t, *pendingResp.CanRead)
+	require.False(t, *pendingResp.CanWrite)
+	require.Empty(t, pendingResp.HomeDomain)
+	require.Empty(t, pendingResp.Domains)
+}
+
+func TestAppV23GetAgentSelfDoesNotTurnSignedUnknownKeyIntoRosterOracle(t *testing.T) {
+	srv, _, badger, _ := newRBACTestServer(t)
+	rootPub, _, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	memberPub, _, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	require.NoError(t, badger.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: auth.PublicKeyToAgentID(rootPub), Scope: "self-standing-unknown",
+		AgentID: auth.PublicKeyToAgentID(memberPub), Profile: store.AppV23ProfileStandard,
+		HomeDomain: "member-home", Clearance: 1, Capabilities: 0,
+		Height: 1, BootstrapDigest: "self-standing-unknown",
+	}))
+	srv.SetPostV23ForNextTxAccessor(func() bool { return true })
+
+	unknownPub, unknownKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	unknownID := auth.PublicKeyToAgentID(unknownPub)
+	req := signedRequestAs(t, unknownKey, unknownID, http.MethodGet, "/v1/agent/me", nil)
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusNotFound, rr.Code, rr.Body.String())
+	require.NotContains(t, rr.Body.String(), "member-home")
 }

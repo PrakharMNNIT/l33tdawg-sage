@@ -798,14 +798,15 @@ Self-update only. Agent can only update its own name and bio. Broadcasts `TxType
 
 ### `GET /v1/agent/me`
 
-Authenticated agent's profile, including the on-chain Proof-of-Experience
+Signed, caller-only agent profile and standing, including the on-chain Proof-of-Experience
 quorum-weight factors. Since v8.6.0 the response also exposes the lifetime
 corroboration count and per-domain expertise; `accuracy`, `corr_count`, and
 `domain_expertise` are read from the authoritative on-chain `vstats:` /
 `vstats_domain:` records (not the off-chain mirror). After app-v23 activation,
-only an active ordinary agent can use this route; the self response also carries
-its current local `role`, named `profile`, and owned `home_domain`. CEREBRUM Root
-has no ordinary agent profile.
+an authenticated registered ordinary agent can use this route even while it is
+`pending_review` or inactive. That narrow exception lets a client diagnose only
+its own standing; it does not reopen the signed active-only `/v1/agents` roster.
+CEREBRUM Root and unregistered keys have no ordinary agent profile.
 
 **Response** (HTTP 200):
 
@@ -818,6 +819,13 @@ has no ordinary agent profile.
   "profile": "companion",
   "home_domain": "voice-interface",
   "enrollment_status": "active",
+  "registration_status": "active",
+  "approval_required": false,
+  "clearance": 2,
+  "capabilities": 15,
+  "can_read": true,
+  "can_write": true,
+  "access_scope": "home_domain",
   "poe_weight": 0.82,
   "vote_count": 127,
   "accuracy": 0.91,
@@ -833,6 +841,16 @@ has no ordinary agent profile.
 - `home_domain` — the exact app-v23 owned domain a write-capable agent may use
   when an MCP write omits `domain`; explicitly requested domains are never
   silently remapped.
+- `registration_status` / `enrollment_status` — `active`, `pending_review`, or
+  `inactive`, derived from the signed caller's consensus registration and local
+  enrollment only. `approval_required` tells a client whether local CEREBRUM
+  review is needed.
+- `clearance` and `capabilities` — the caller's own consensus values. The raw
+  capability mask is never returned for another agent through this route.
+- `can_read` and `can_write` — the exact current authorization result for the
+  caller's `home_domain`; `access_scope:"home_domain"` prevents clients from
+  misreading these booleans as authority over every domain. Pending/inactive
+  callers receive explicit `false` values without probing memory routes.
 
 ---
 

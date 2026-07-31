@@ -42,6 +42,7 @@ type SQLiteStore struct {
 	dbPath                string
 	vault                 atomic.Pointer[vault.Vault] // nil = no encryption; hot-swapped when CEREBRUM unlocks
 	vaultExpected         atomic.Bool                 // true = encryption should be active; reject writes if vault nil
+	vaultGeneration       *atomic.Uint64              // shared by tx clones; defeats lock/unlock ABA in audited snapshot tokens
 	decryptWarnOnce       sync.Once                   // gates the one-time decryption failure warning
 	writeMu               sync.Mutex                  // serializes ALL writes to prevent SQLITE_BUSY
 	syncPolicyGate        *sync.RWMutex               // shared with tx clones; linearizes consent vs egress
@@ -72,6 +73,19 @@ func (s *SQLiteStore) writeExecContext(ctx context.Context, query string, args .
 		defer s.writeMu.Unlock()
 	}
 	return s.conn.ExecContext(ctx, query, args...) //nolint:wrapcheck // intentional pass-through
+}
+
+// LockProjectionPublicationRead holds every typed SQLite mutation behind the
+// store's existing write serializer while a caller reads a revision token and
+// publishes bytes derived from that exact SQL snapshot generation. Acquire
+// this before BadgerStore.LockProjectionPublicationRead to preserve the
+// consensus SQL-then-Badger lock order.
+func (s *SQLiteStore) LockProjectionPublicationRead() func() {
+	if s == nil || s.db == nil {
+		return func() {}
+	}
+	s.writeMu.Lock()
+	return s.writeMu.Unlock
 }
 
 // beginTxLocked opens a write transaction while holding writeMu, and returns
@@ -106,6 +120,9 @@ const ErrTextSearchVaultEncryptedMsg = "text search unavailable: content is vaul
 // When set, memory content is encrypted on write and decrypted on read.
 func (s *SQLiteStore) SetVault(v *vault.Vault) {
 	s.vault.Store(v)
+	if s.vaultGeneration != nil {
+		s.vaultGeneration.Add(1)
+	}
 }
 
 // SetReranker attaches an optional cross-encoder reranker used by
@@ -150,7 +167,19 @@ func (s *SQLiteStore) VaultActive() bool {
 // VaultExpected marks that encryption should be active. When true and the vault
 // is nil (locked), writes are rejected rather than silently going plaintext.
 func (s *SQLiteStore) SetVaultExpected(expected bool) {
-	s.vaultExpected.Store(expected)
+	changed := s.vaultExpected.Swap(expected) != expected
+	if changed && s.vaultGeneration != nil {
+		s.vaultGeneration.Add(1)
+	}
+}
+
+// VaultGeneration advances on every vault publication and expected-state
+// transition, including lock->unlock ABA and same-state key rotation.
+func (s *SQLiteStore) VaultGeneration() uint64 {
+	if s == nil || s.vaultGeneration == nil {
+		return 0
+	}
+	return s.vaultGeneration.Load()
 }
 
 // VaultLocked reports whether writes would currently be rejected because
@@ -276,7 +305,8 @@ func NewSQLiteStore(ctx context.Context, dbPath string) (*SQLiteStore, error) {
 
 	s := &SQLiteStore{
 		conn: db, db: db, dbPath: dbPath,
-		syncPolicyGate: &sync.RWMutex{}, syncOriginGate: &sync.RWMutex{},
+		vaultGeneration: &atomic.Uint64{},
+		syncPolicyGate:  &sync.RWMutex{}, syncOriginGate: &sync.RWMutex{},
 		agentContactGate:                     &sync.RWMutex{},
 		federationAuthorizationMutationHooks: &authorizationMutationHookState{},
 	}
@@ -341,6 +371,24 @@ func (s *SQLiteStore) RequirePristineStateSyncProjection(ctx context.Context) er
 		if table == "domains" {
 			if err := s.requireDefaultStateSyncDomains(ctx); err != nil {
 				return err
+			}
+			continue
+		}
+		if table == "memory_projection_revision" {
+			var id, revision int64
+			if err := s.conn.QueryRowContext(ctx,
+				`SELECT singleton, revision FROM memory_projection_revision`,
+			).Scan(&id, &revision); err != nil || id != 1 || revision != 0 {
+				return errors.New("state sync receiving requires a pristine memory projection revision")
+			}
+			continue
+		}
+		if table == "graph_projection_revision" {
+			var id, revision int64
+			if err := s.conn.QueryRowContext(ctx,
+				`SELECT singleton, revision FROM graph_projection_revision`,
+			).Scan(&id, &revision); err != nil || id != 1 || revision != 0 {
+				return errors.New("state sync receiving requires a pristine graph projection revision")
 			}
 			continue
 		}
@@ -410,6 +458,23 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain_tag);
 	CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 	CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+
+	CREATE TABLE IF NOT EXISTS legacy_memory_recovery (
+		memory_id TEXT PRIMARY KEY,
+		machine_reason TEXT NOT NULL,
+		projection_revision INTEGER NOT NULL,
+		first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+		last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+		resolved_at TEXT
+	);
+	CREATE TABLE IF NOT EXISTS legacy_memory_recovery_disposition (
+		memory_id TEXT PRIMARY KEY,
+		disposition TEXT NOT NULL CHECK (disposition = 'deprecated'),
+		machine_reason TEXT NOT NULL,
+		projection_revision INTEGER NOT NULL,
+		authorized_by TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+	);
 
 	CREATE TABLE IF NOT EXISTS knowledge_triples (
 		id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -840,8 +905,159 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 			return fmt.Errorf("seed domain %s: %w", seed.tag, err)
 		}
 	}
+	if err := s.ensureMemoryProjectionRevision(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureGraphProjectionRevision(ctx); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+// ensureMemoryProjectionRevision installs a same-transaction invalidation
+// token for audited CEREBRUM snapshots. Triggers are created after every
+// memories-table migration because SQLite drops table-bound triggers when an
+// older schema is rebuilt via DROP/RENAME.
+func (s *SQLiteStore) ensureMemoryProjectionRevision(ctx context.Context) error {
+	const schema = `
+		CREATE INDEX IF NOT EXISTS idx_memories_projection_page
+			ON memories(created_at, memory_id);
+		CREATE TABLE IF NOT EXISTS memory_projection_revision (
+			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			revision  INTEGER NOT NULL CHECK (revision >= 0)
+		);
+		INSERT OR IGNORE INTO memory_projection_revision(singleton, revision)
+			VALUES (1, 0);
+		CREATE TRIGGER IF NOT EXISTS memories_projection_revision_insert
+			AFTER INSERT ON memories
+			BEGIN
+				UPDATE memory_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		DROP TRIGGER IF EXISTS memories_projection_revision_update;
+		CREATE TRIGGER memories_projection_revision_update
+			AFTER UPDATE OF
+				submitting_agent, content, content_hash,
+				domain_tag, status, created_at
+			ON memories
+			BEGIN
+				UPDATE memory_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS memories_projection_revision_delete
+			AFTER DELETE ON memories
+			BEGIN
+				UPDATE memory_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+	`
+	if _, err := s.writeExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("install memory projection revision: %w", err)
+	}
+	return nil
+}
+
+// MemoryProjectionRevision returns the transactionally maintained generation
+// of every SQL memory row. Raw SQL repair/tamper and normal application writes
+// both pass through the same triggers.
+func (s *SQLiteStore) MemoryProjectionRevision(ctx context.Context) (uint64, error) {
+	var revision int64
+	if err := s.conn.QueryRowContext(ctx,
+		`SELECT revision FROM memory_projection_revision WHERE singleton = 1`,
+	).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("read memory projection revision: %w", err)
+	}
+	if revision < 0 {
+		return 0, errors.New("memory projection revision is negative")
+	}
+	return uint64(revision), nil
+}
+
+// ensureGraphProjectionRevision tracks every SQL metadata table rendered into
+// graph bytes. It is deliberately separate from the full memory-audit revision:
+// changing a tag, corroboration, or typed link invalidates graph cache entries
+// without forcing an inventory-wide canonical disclosure audit.
+func (s *SQLiteStore) ensureGraphProjectionRevision(ctx context.Context) error {
+	const schema = `
+		CREATE TABLE IF NOT EXISTS graph_projection_revision (
+			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			revision  INTEGER NOT NULL CHECK (revision >= 0)
+		);
+		INSERT OR IGNORE INTO graph_projection_revision(singleton, revision)
+			VALUES (1, 0);
+		DROP TRIGGER IF EXISTS memories_graph_revision_update;
+		CREATE TRIGGER memories_graph_revision_update
+			AFTER UPDATE OF memory_type, confidence_score, parent_hash ON memories
+			BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS memory_tags_graph_revision_insert
+			AFTER INSERT ON memory_tags BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS memory_tags_graph_revision_update
+			AFTER UPDATE ON memory_tags BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS memory_tags_graph_revision_delete
+			AFTER DELETE ON memory_tags BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS corroborations_graph_revision_insert
+			AFTER INSERT ON corroborations BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS corroborations_graph_revision_update
+			AFTER UPDATE ON corroborations BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS corroborations_graph_revision_delete
+			AFTER DELETE ON corroborations BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS memory_links_graph_revision_insert
+			AFTER INSERT ON memory_links BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS memory_links_graph_revision_update
+			AFTER UPDATE ON memory_links BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TRIGGER IF NOT EXISTS memory_links_graph_revision_delete
+			AFTER DELETE ON memory_links BEGIN
+				UPDATE graph_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+	`
+	if _, err := s.writeExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("install graph projection revision: %w", err)
+	}
+	return nil
+}
+
+// GraphProjectionRevision returns the exact metadata generation rendered into
+// graph nodes and edges.
+func (s *SQLiteStore) GraphProjectionRevision(ctx context.Context) (uint64, error) {
+	var revision int64
+	if err := s.conn.QueryRowContext(ctx,
+		`SELECT revision FROM graph_projection_revision WHERE singleton = 1`,
+	).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("read graph projection revision: %w", err)
+	}
+	if revision < 0 {
+		return 0, errors.New("graph projection revision is negative")
+	}
+	return uint64(revision), nil
 }
 
 // migrateProvider adds the provider column to memories if it doesn't exist.
@@ -1521,6 +1737,47 @@ func (s *SQLiteStore) DeprecateUnreadableMemories(ctx context.Context) (int, err
 	return int(n), nil
 }
 
+// ListUnreadableMemoryIDs returns the stable local work queue for governed
+// deprecation. It deliberately exposes identities only to the in-process
+// CEREBRUM handler; app-v23+ must submit lifecycle changes through consensus
+// instead of updating this SQL projection directly.
+func (s *SQLiteStore) ListUnreadableMemoryIDs(
+	ctx context.Context,
+	afterMemoryID string,
+	limit int,
+) ([]string, int, error) {
+	if limit <= 0 {
+		return nil, 0, errors.New("unreadable memory page limit must be positive")
+	}
+	var total int
+	if err := s.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM memories
+		 WHERE embedding_provider = 'skipped' AND status != 'deprecated'`,
+	).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT memory_id FROM memories
+		 WHERE embedding_provider = 'skipped' AND status != 'deprecated'
+		   AND memory_id > ?
+		 ORDER BY memory_id ASC
+		 LIMIT ?`,
+		afterMemoryID, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, 0, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, total, rows.Err()
+}
+
 func (s *SQLiteStore) GetMemory(ctx context.Context, memoryID string) (*memory.MemoryRecord, error) {
 	row := s.conn.QueryRowContext(ctx,
 		`SELECT memory_id, submitting_agent, content, content_hash, embedding, embedding_hash,
@@ -1645,7 +1902,9 @@ func (s *SQLiteStore) QuerySimilar(ctx context.Context, embedding []float32, opt
 		query += " AND memory_id IN (SELECT memory_id FROM memory_tags WHERE tag IN (" +
 			strings.Join(placeholders, ",") + "))"
 	}
-	if opts.CandidateFilter != nil {
+	hasCandidateFilter := opts.CandidateFilter != nil ||
+		opts.CandidateBatchFilter != nil
+	if hasCandidateFilter {
 		// SQLite ranks vectors in Go. Read at most one sentinel beyond the
 		// authorization budget so an authenticated app-v23 recall cannot force a
 		// full-corpus decrypt/cosine/policy scan. Refuse the broad query instead
@@ -1702,7 +1961,7 @@ func (s *SQLiteStore) QuerySimilar(ctx context.Context, embedding []float32, opt
 		// all matching records are returned regardless of similarity score.
 		sim := cosineSimilarity(embedding, r.Embedding)
 		scored = append(scored, scoredRecord{record: &r, similarity: sim})
-		if opts.CandidateFilter != nil && len(scored) > CandidateFilterScanBudget {
+		if hasCandidateFilter && len(scored) > CandidateFilterScanBudget {
 			return nil, ErrCandidateFilterScanBudgetExceeded
 		}
 	}
@@ -1727,7 +1986,9 @@ func (s *SQLiteStore) QuerySimilar(ctx context.Context, embedding []float32, opt
 		}
 		ordered = applyDecayFloor(ordered, opts.DecayFloor, opts.DecayNow, counts, opts.IncludeDisputed)
 	}
-	ordered, err = applyCandidateFilter(ordered, opts.CandidateFilter)
+	ordered, err = applyCandidateFilters(
+		ordered, opts.CandidateBatchFilter, opts.CandidateFilter,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1832,7 +2093,9 @@ func (s *SQLiteStore) SearchByText(ctx context.Context, query string, opts Query
 	}
 
 	orderBy := " ORDER BY rank"
-	if opts.CandidateFilter != nil {
+	hasCandidateFilter := opts.CandidateFilter != nil ||
+		opts.CandidateBatchFilter != nil
+	if hasCandidateFilter {
 		// Stable secondary order is required when the trusted app-v23 path walks
 		// multiple ranked pages. The historical one-page query is unchanged.
 		orderBy += ", m.memory_id ASC"
@@ -1896,10 +2159,12 @@ func (s *SQLiteStore) SearchByText(ctx context.Context, query string, opts Query
 			}
 			page = applyDecayFloor(page, opts.DecayFloor, opts.DecayNow, counts, opts.IncludeDisputed)
 		}
-		return applyCandidateFilter(page, opts.CandidateFilter)
+		return applyCandidateFilters(
+			page, opts.CandidateBatchFilter, opts.CandidateFilter,
+		)
 	}
 
-	if opts.CandidateFilter == nil {
+	if !hasCandidateFilter {
 		scanLimit := opts.TopK
 		if opts.DecayFloor > 0 {
 			// Preserve the historical bounded decay-only over-fetch.
@@ -2021,7 +2286,10 @@ func (s *SQLiteStore) SearchHybrid(ctx context.Context, query string, embedding 
 			// budget or unavailable policy state into a misleading partial 200.
 			// The same applies when BM25 is the only requested leaf: there is no
 			// successful vector result to degrade to.
-			if subOpts.DecayFloor > 0 || subOpts.CandidateFilter != nil || len(embedding) == 0 {
+			if subOpts.DecayFloor > 0 ||
+				subOpts.CandidateFilter != nil ||
+				subOpts.CandidateBatchFilter != nil ||
+				len(embedding) == 0 {
 				return nil, err
 			}
 		} else {
@@ -2033,7 +2301,10 @@ func (s *SQLiteStore) SearchHybrid(ctx context.Context, query string, embedding 
 
 	if len(embedding) > 0 {
 		r, err := s.QuerySimilar(ctx, embedding, subOpts)
-		if err != nil && (subOpts.DecayFloor > 0 || subOpts.CandidateFilter != nil || len(bm25Results) == 0) {
+		if err != nil && (subOpts.DecayFloor > 0 ||
+			subOpts.CandidateFilter != nil ||
+			subOpts.CandidateBatchFilter != nil ||
+			len(bm25Results) == 0) {
 			return nil, err
 		}
 		vectorResults = r
@@ -2494,6 +2765,66 @@ func (s *SQLiteStore) GetPendingByDomainPage(
 	return results, nil
 }
 
+// GetVotablePendingByDomainPage is the auto-voter's recovery-aware projection
+// scan. Durable unresolved app-v25 recovery rows remain visible to operators,
+// but cannot consume the same bounded voter scan on every poll. Once a later
+// stable migration scan resolves a row, it automatically becomes votable.
+func (s *SQLiteStore) GetVotablePendingByDomainPage(
+	ctx context.Context,
+	domainTag string,
+	limit, offset int,
+) ([]*memory.MemoryRecord, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT m.memory_id, m.submitting_agent, m.content, m.content_hash,
+			m.memory_type, m.domain_tag, m.confidence_score, m.status, m.created_at
+		FROM memories AS m
+		WHERE m.status = 'proposed' AND m.domain_tag LIKE ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM legacy_memory_recovery AS r
+			WHERE r.memory_id = m.memory_id AND r.resolved_at IS NULL
+		  )
+		ORDER BY m.created_at ASC, m.memory_id ASC LIMIT ? OFFSET ?`,
+		domainTag, limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get votable pending page: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	results := make([]*memory.MemoryRecord, 0, limit)
+	for rows.Next() {
+		var r memory.MemoryRecord
+		var mt, st, createdAt string
+		if scanErr := rows.Scan(
+			&r.MemoryID,
+			&r.SubmittingAgent,
+			&r.Content,
+			&r.ContentHash,
+			&mt,
+			&r.DomainTag,
+			&r.ConfidenceScore,
+			&st,
+			&createdAt,
+		); scanErr != nil {
+			return nil, fmt.Errorf("scan votable pending page: %w", scanErr)
+		}
+		r.MemoryType = memory.MemoryType(mt)
+		r.Status = memory.MemoryStatus(st)
+		r.CreatedAt = parseTime(createdAt)
+		results = append(results, &r)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("get votable pending page rows: %w", rowsErr)
+	}
+	return results, nil
+}
+
 // OldestProposedCreatedAt returns MIN(created_at) over status='proposed'
 // memories — the voter-observability probe behind
 // sage_proposed_oldest_age_seconds. ok=false (zero time) when nothing is
@@ -2629,8 +2960,10 @@ func (s *SQLiteStore) ListMemories(ctx context.Context, opts ListOptions) ([]*me
 	queryArgs = append(queryArgs, opts.Limit, opts.Offset)
 
 	var total int
-	if err := s.conn.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("count memories: %w", err)
+	if !opts.SkipTotal {
+		if err := s.conn.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+			return nil, 0, fmt.Errorf("count memories: %w", err)
+		}
 	}
 
 	rows, err := s.conn.QueryContext(ctx, query, queryArgs...)
@@ -4548,7 +4881,8 @@ func (s *SQLiteStore) runInTx(ctx context.Context, contactMutation bool, fn func
 
 	txStore := &SQLiteStore{
 		conn: tx, dbPath: s.dbPath,
-		syncPolicyGate: s.syncPolicyGate, syncOriginGate: s.syncOriginGate,
+		vaultGeneration: s.vaultGeneration,
+		syncPolicyGate:  s.syncPolicyGate, syncOriginGate: s.syncOriginGate,
 		agentContactGate:                     s.agentContactGate,
 		agentContactWriteHeld:                contactMutation,
 		federationAuthorizationMutationHooks: s.federationAuthorizationMutationHooks,

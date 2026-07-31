@@ -861,8 +861,34 @@ components:
           description: The active app-v23 agent's owned non-shared home domain, when its profile is writable.
         enrollment_status:
           type: string
-          enum: [active]
-          description: Present only for an internally consistent approved app-v23 ordinary-agent enrollment.
+          enum: [active, pending_review, inactive]
+          description: Caller-only app-v23 enrollment standing. Pending and inactive identities may inspect only themselves.
+        registration_status:
+          type: string
+          enum: [active, pending_review, inactive]
+          description: Caller-only app-v23 registration standing.
+        approval_required:
+          type: boolean
+          description: Whether local CEREBRUM review is required before memory access is available.
+        clearance:
+          type: integer
+          minimum: 0
+          maximum: 4
+          description: The signed caller's own consensus clearance.
+        capabilities:
+          type: integer
+          format: uint32
+          description: The signed caller's own consensus capability mask.
+        can_read:
+          type: boolean
+          description: Whether the caller can currently read its exact home_domain.
+        can_write:
+          type: boolean
+          description: Whether the caller can currently write its exact home_domain.
+        access_scope:
+          type: string
+          enum: [home_domain]
+          description: Explicit scope for can_read and can_write.
         poe_weight:
           type: number
           format: double
@@ -2848,9 +2874,11 @@ paths:
       operationId: getAgentProfile
       summary: Retrieve the authenticated agent's profile.
       description: >-
-        After app-v23 activation this self-scoped route is available only to an
-        active ordinary agent and includes its current role, named profile, and
-        owned home domain. CEREBRUM Root has no ordinary agent profile.
+        After app-v23 activation this signed self-scoped route is available to
+        a registered ordinary agent, including pending_review and inactive
+        callers, and exposes only that caller's role, policy, capability mask,
+        and home-domain access standing. It does not reopen the active-only
+        signed agent roster. CEREBRUM Root has no ordinary agent profile.
       tags:
         - Agent
       responses:
@@ -2862,8 +2890,8 @@ paths:
                 $ref: "#/components/schemas/AgentProfile"
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "403":
-          description: App-v23 caller is not an active ordinary agent.
+        "404":
+          description: The signed key is unregistered or is CEREBRUM Root rather than an ordinary agent.
           content:
             application/problem+json:
               schema:

@@ -449,10 +449,25 @@ func (s *Server) checkDomainAccess(ctx context.Context, agentID, domain, action 
 			policyID, domain, 0, time.Now(),
 		)
 		if err != nil {
+			recovered, recoveredErr := s.badgerStore.AuthorizeAppV25RecoveredDirectRead(
+				agentID, domain,
+			)
+			if recoveredErr == nil && recovered {
+				return nil
+			}
 			return errors.New("app-v23 access-control state is invalid")
 		}
+		// The frozen H-1 allowlist remains authoritative over ordinary grants,
+		// but it must not make a directly governed current owner, recovered-group
+		// member, or Admin write-only after recovery/transfer.
 		if legacy.ExplicitDomainRestriction && !legacy.Allowed {
-			return fmt.Errorf("agent does not have read access to domain '%s'", domain)
+			recovered, recoveredErr := s.badgerStore.AuthorizeAppV25RecoveredDirectRead(
+				agentID, domain,
+			)
+			if recoveredErr != nil || !recovered {
+				return fmt.Errorf("agent does not have read access to domain '%s'", domain)
+			}
+			return nil
 		}
 		if currentErr == nil || legacy.Allowed {
 			return nil
@@ -633,6 +648,20 @@ func checkAppV23EffectiveWriteAccess(
 			return appV23WriteDenial(authzdenial.CodeNoOwnedHomeDomain)
 		}
 	}
+	restored, err := badgerStore.AppV25AllowsHistoricalDomainWrite(
+		policyID,
+		domain,
+	)
+	if err != nil {
+		return errors.New("app-v23 access-control state is invalid")
+	}
+	if restored {
+		// Match the consensus app-v25 compatibility decision exactly. The
+		// entitlement is exact-domain, validator-attested, and bound to the
+		// unchanged enrollment revision/current ownership or recovered group,
+		// so it bypasses only the historical mask-2/mask-8 migration lockout.
+		return nil
+	}
 
 	shared, err := badgerStore.IsAppV23SharedDomain(domain)
 	if err != nil {
@@ -645,8 +674,16 @@ func checkAppV23EffectiveWriteAccess(
 		if role.Role == store.AppV23RoleAdmin {
 			return nil
 		}
+		recoveredGroup, recoveredGroupErr :=
+			badgerStore.AuthorizeAppV25RecoveredGroupDomain(policyID, domain, store.AppV23VerbWrite)
+		if recoveredGroupErr != nil {
+			return errors.New("app-v23 access-control state is invalid")
+		}
+		if recoveredGroup {
+			return nil
+		}
 		grandfathered, grandfatherErr :=
-			badgerStore.AppV23AllowsGrandfatheredSharedWrite(policyID)
+			badgerStore.AppV23AllowsGrandfatheredSharedDomainWrite(policyID, domain)
 		if grandfatherErr != nil {
 			return errors.New("app-v23 access-control state is invalid")
 		}
@@ -871,6 +908,14 @@ func (s *Server) appV23LegacyVisibilityRestricted(agentID string) bool {
 	return err != nil || restricted
 }
 
+func (s *Server) appV25RecoveredReadOverridesLegacyVisibility(agentID, domain string) bool {
+	if !s.isPostV23ForNextTx() || s.badgerStore == nil || agentID == "" || domain == "" {
+		return false
+	}
+	allowed, err := s.badgerStore.AuthorizeAppV25RecoveredDirectRead(agentID, domain)
+	return err == nil && allowed
+}
+
 // hasMemoryReadAccess applies app-v22's domain-independent read capability
 // without turning it into a clearance bypass. A companion may discover and
 // recall every domain, but records above its on-chain clearance remain hidden.
@@ -889,9 +934,6 @@ func (s *Server) hasMemoryReadAccess(domain, agentID string, classification uint
 		)
 		if err != nil {
 			return false, err
-		}
-		if legacy.ExplicitDomainRestriction && !legacy.Allowed {
-			return false, nil
 		}
 		if classification > enrollment.Clearance {
 			// Current app-v23 authority remains bounded by enrollment
@@ -913,16 +955,20 @@ func (s *Server) hasMemoryReadAccess(domain, agentID string, classification uint
 		if decision.ExplicitDeny {
 			return false, nil
 		}
-		currentAllowed := decision.Allowed
-		if !currentAllowed {
-			currentAllowed, err = s.badgerStore.HasAppV23AccessOrAncestor(
+		policyAllowed := decision.Allowed
+		grantAllowed := false
+		if !policyAllowed {
+			grantAllowed, err = s.badgerStore.HasAppV23AccessOrAncestor(
 				domain, agentID, 1, at, shared,
 			)
 			if err != nil {
 				return false, err
 			}
 		}
-		return currentAllowed || legacy.Allowed, nil
+		if legacy.ExplicitDomainRestriction && !legacy.Allowed {
+			return false, nil
+		}
+		return policyAllowed || grantAllowed || legacy.Allowed, nil
 	}
 	if s.isPostV22ForNextTx() && s.badgerStore != nil {
 		if _, _, err := s.badgerStore.GetRegisteredAgentCapabilities(agentID); err != nil {
@@ -1696,6 +1742,10 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	queryAgentID := middleware.ContextAgentID(r.Context())
 	allowedAgents, seeAll := s.resolveVisibleAgents(queryAgentID)
 	legacyVisibilityRestricted := s.appV23LegacyVisibilityRestricted(queryAgentID)
+	if s.appV25RecoveredReadOverridesLegacyVisibility(queryAgentID, req.DomainTag) {
+		seeAll = true
+		legacyVisibilityRestricted = false
+	}
 
 	// If checkDomainAccess already approved read access for this domain,
 	// skip agent isolation — the agent is authorized to see everything in the domain.
@@ -2394,6 +2444,10 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	queryAgentID := middleware.ContextAgentID(r.Context())
 	allowedAgents, seeAll := s.resolveVisibleAgents(queryAgentID)
 	legacyVisibilityRestricted := s.appV23LegacyVisibilityRestricted(queryAgentID)
+	if s.appV25RecoveredReadOverridesLegacyVisibility(queryAgentID, req.DomainTag) {
+		seeAll = true
+		legacyVisibilityRestricted = false
+	}
 
 	if !seeAll && !legacyVisibilityRestricted && domainAccessApproved {
 		seeAll = true
@@ -2714,6 +2768,10 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	queryAgentID := middleware.ContextAgentID(r.Context())
 	allowedAgents, seeAll := s.resolveVisibleAgents(queryAgentID)
 	legacyVisibilityRestricted := s.appV23LegacyVisibilityRestricted(queryAgentID)
+	if s.appV25RecoveredReadOverridesLegacyVisibility(queryAgentID, req.DomainTag) {
+		seeAll = true
+		legacyVisibilityRestricted = false
+	}
 
 	if !seeAll && !legacyVisibilityRestricted && domainAccessApproved {
 		seeAll = true
@@ -3886,6 +3944,10 @@ func (s *Server) handleListMemoriesAuth(w http.ResponseWriter, r *http.Request) 
 
 	allowedAgents, seeAll := s.resolveVisibleAgents(agentID)
 	legacyVisibilityRestricted := s.appV23LegacyVisibilityRestricted(agentID)
+	if s.appV25RecoveredReadOverridesLegacyVisibility(agentID, domainFilter) {
+		seeAll = true
+		legacyVisibilityRestricted = false
+	}
 
 	// Grant-aware override: if listing a specific domain, skip agent isolation when:
 	// (a) the agent has a direct grant on the domain, or

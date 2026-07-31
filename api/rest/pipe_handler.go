@@ -868,7 +868,7 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	journalID := ""
 	summary := fmt.Sprintf("federated pipeline %s completed", pipeID)
 	journaled := false
-	if msg.SourceChainID == "" {
+	if s.shouldAutoJournalPipeline(msg) {
 		elapsed := ""
 		if msg.ClaimedAt != nil {
 			elapsed = fmt.Sprintf(" in %s", time.Since(*msg.ClaimedAt).Truncate(time.Second))
@@ -1108,9 +1108,15 @@ func (s *Server) handlePipeUpdates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": responseItems, "count": len(updates)})
 }
 
-// autoJournalPipeline inserts a journal entry as an observation memory directly
-// into the off-chain store, bypassing CometBFT. The auto-validator goroutine
-// will pick it up and commit it within seconds.
+func (s *Server) shouldAutoJournalPipeline(msg *store.PipelineMessage) bool {
+	return msg != nil && msg.SourceChainID == "" && !s.isPostV23ForNextTx()
+}
+
+// autoJournalPipeline is a legacy pre-app-v23 compatibility path. Governed
+// nodes must never call it: inserting a proposed SQL row without its canonical
+// consensus envelope makes the CEREBRUM projection unverifiable. Newer nodes
+// retain pipeline completion and delivery receipts without manufacturing a
+// memory outside consensus.
 // Returns the memory_id of the journal entry (empty string on failure).
 func (s *Server) autoJournalPipeline(ctx context.Context, summary string) string {
 	offchain, ok := s.store.(store.OffchainStore)

@@ -589,17 +589,33 @@ periods have no memories; monitoring agent activity across time.
 
 ### sage_status
 
-**Purpose:** Get memory store statistics: total memories, counts by domain and
-status, last activity.
+**Purpose:** Get caller-visible memory statistics: total memories, counts by
+domain and status, and last activity.
 
 **Source:** `tools.go:97-105` (definition), `tools.go:777-783` (handler)
 
 **Parameters:** None.
 
-**Returns:** Raw stats object from the dashboard API — total memories, breakdown
-by domain, breakdown by status, last activity timestamp.
+**Returns:** A caller-scoped object containing `total_memories`, `by_domain`,
+`by_status`, `last_activity`, `total_exact`, `has_more`,
+`breakdowns_complete`, and `scope: "caller"`. App-v23 also includes the signed
+caller's own `registration_status`, `enrollment_status`, `role`, `profile`,
+`home_domain`, `clearance`, `capabilities`, `approval_required`, `can_read`, and
+`can_write`. The access booleans are explicitly scoped to `home_domain`. A
+pending or inactive caller receives this standing with
+`memory_access_available:false` and SAGE does not probe a forbidden memory
+route. An active caller receives the same standing merged with its visible
+memory statistics. No roster or global node counts are returned.
 
-**REST:** `GET /v1/dashboard/stats`
+App-v23 authorization and canonical-disclosure filters are applied before
+memory aggregation. The self-standing projection comes from signed
+`GET /v1/agent/me`, which is caller-only and intentionally available to a
+registered `pending_review` identity so clients can explain what CEREBRUM must
+approve. It does not weaken the active-only signed `/v1/agents` roster.
+
+**REST:** Signed `GET /v1/agent/me`, then bounded signed pagination over
+`GET /v1/memory/list` for an active caller. The
+operator-only CEREBRUM statistics route is never used by an agent.
 
 **When to call:** Quick health check; understanding how full the memory store is;
 verifying memories were committed after storing.

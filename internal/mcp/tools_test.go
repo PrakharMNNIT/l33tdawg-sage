@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,13 @@ import (
 func mockSageAPI(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/v1/agent/register", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": "mock-agent", "name": "mock-agent",
+			"status": "already_registered",
+		})
+	})
 
 	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1404,6 +1412,51 @@ func TestSageList(t *testing.T) {
 	assert.EqualValues(t, 1, m["total_count"])
 }
 
+func TestSageListSurfacesCallerScopedPartialAndFiltering(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/memory/list", r.URL.Path)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories":    []any{},
+			"total":       0,
+			"has_more":    true,
+			"total_exact": false,
+			"filtered": map[string]any{
+				"by": []string{"rbac_submitting_agents"},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	got, err := s.toolList(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	result := got.(map[string]any)
+	require.Equal(t, 0, result["total_count"])
+	require.Equal(t, true, result["has_more"])
+	require.Equal(t, false, result["total_exact"])
+	require.NotEmpty(t, result["filtered"],
+		"an access-filtered empty page must never look like an authoritative empty store")
+}
+
+func TestSageListPreAppV23MissingMetadataDefaultsToExactComplete(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories": []any{},
+			"total":    0,
+		})
+	}))
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	got, err := NewServer(ts.URL, priv).toolList(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	result := got.(map[string]any)
+	require.Equal(t, false, result["has_more"])
+	require.Equal(t, true, result["total_exact"],
+		"a pre-v23 response omitted metadata because its result was exact and complete")
+}
+
 func TestSageTimeline(t *testing.T) {
 	ts := mockSageAPI(t)
 	defer ts.Close()
@@ -1434,7 +1487,231 @@ func TestSageStatus(t *testing.T) {
 	require.NoError(t, err)
 
 	m := result.(map[string]any)
-	assert.Equal(t, float64(42), m["total_memories"])
+	assert.Equal(t, 1, m["total_memories"])
+	assert.Equal(t, "caller", m["scope"])
+}
+
+func TestSageStatusReturnsPendingCallerStandingWithoutMemoryRead(t *testing.T) {
+	var memoryReads int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
+		require.NotEmpty(t, r.Header.Get("X-Agent-ID"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": r.Header.Get("X-Agent-ID"),
+			"role":     "member", "enrollment_status": "pending_review",
+			"registration_status": "pending_review", "approval_required": true,
+			"clearance": 1, "capabilities": 30,
+			"can_read": false, "can_write": false, "access_scope": "home_domain",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		memoryReads++
+		http.Error(w, "pending agents must not reach memory list", http.StatusForbidden)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	result, err := NewServer(ts.URL, priv).toolStatus(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	standing := result.(map[string]any)
+	require.Equal(t, "pending_review", standing["registration_status"])
+	require.Equal(t, "pending_review", standing["enrollment_status"])
+	require.Equal(t, "member", standing["role"])
+	require.Equal(t, uint8(1), standing["clearance"])
+	require.Equal(t, uint32(30), standing["capabilities"])
+	require.Equal(t, true, standing["approval_required"])
+	require.Equal(t, false, standing["can_read"])
+	require.Equal(t, false, standing["can_write"])
+	require.Equal(t, false, standing["memory_access_available"])
+	require.Equal(t, 0, memoryReads)
+}
+
+func TestSageStatusMergesActiveCallerStandingWithCallerMemoryStats(t *testing.T) {
+	var memoryReads int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": r.Header.Get("X-Agent-ID"),
+			"role":     "member", "profile": "companion", "home_domain": "voice-interface",
+			"enrollment_status": "active", "registration_status": "active",
+			"clearance": 2, "capabilities": 15,
+			"can_read": true, "can_write": true, "access_scope": "home_domain",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		memoryReads++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories": []map[string]any{}, "total": 0,
+			"has_more": false, "total_exact": true,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	result, err := NewServer(ts.URL, priv).toolStatus(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	standing := result.(map[string]any)
+	require.Equal(t, "caller", standing["scope"])
+	require.Equal(t, "active", standing["registration_status"])
+	require.Equal(t, uint32(15), standing["capabilities"])
+	require.Equal(t, true, standing["can_read"])
+	require.Equal(t, true, standing["can_write"])
+	require.Equal(t, true, standing["memory_access_available"])
+	require.Equal(t, 1, memoryReads)
+}
+
+func TestCallerScopedMemoryStatsUsesParsedActivityAndExactExhaustion(t *testing.T) {
+	var requests int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		require.Equal(t, "0", r.URL.Query().Get("offset"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories": []map[string]any{
+				{
+					"domain_tag": "home", "status": "committed",
+					"created_at": "2026-01-01T10:00:00-05:00",
+				},
+				{
+					"domain_tag": "home", "status": "committed",
+					"created_at": "2026-01-01T14:30:00Z",
+				},
+				{
+					"domain_tag": "ignored", "status": "committed",
+					"created_at": "not-a-timestamp",
+				},
+			},
+			"total":       3,
+			"has_more":    false,
+			"total_exact": true,
+		})
+	}))
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	stats, err := NewServer(ts.URL, priv).callerScopedMemoryStats(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, requests)
+	require.Equal(t, 3, stats["total_memories"])
+	require.Equal(t, true, stats["total_exact"])
+	require.Equal(t, false, stats["has_more"])
+	require.Equal(t, true, stats["breakdowns_complete"])
+	require.Equal(t, "2026-01-01T10:00:00-05:00", stats["last_activity"],
+		"RFC3339 instants, not their textual offsets, determine latest activity")
+}
+
+func TestCallerScopedMemoryStatsCapsBreakdownWalkAndMarksAggregateInexact(t *testing.T) {
+	const pageSize = 200
+	var requests int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+		require.NoError(t, err)
+		require.Less(t, offset, 8000, "the MCP client must not issue an invalid app-v23 offset")
+		memories := make([]map[string]any, pageSize)
+		for index := range memories {
+			memories[index] = map[string]any{
+				"domain_tag": "large-home",
+				"status":     "committed",
+				"created_at": "2026-01-01T00:00:00Z",
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories":    memories,
+			"total":       9000,
+			"has_more":    true,
+			"total_exact": true,
+		})
+	}))
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	stats, err := NewServer(ts.URL, priv).callerScopedMemoryStats(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 40, requests)
+	require.Equal(t, 9000, stats["total_memories"])
+	require.Equal(t, false, stats["total_exact"],
+		"the bounded client did not observe exhaustion and must not certify the aggregate")
+	require.Equal(t, true, stats["has_more"])
+	require.Equal(t, false, stats["breakdowns_complete"])
+	require.Equal(t, 8000, stats["by_status"].(map[string]int)["committed"])
+}
+
+func TestCallerScopedMemoryStatsStopsOnInconsistentShortPageWithoutClaimingComplete(t *testing.T) {
+	var requests int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories": []map[string]any{{
+				"domain_tag": "home", "status": "committed",
+				"created_at": "2026-01-01T00:00:00Z",
+			}},
+			"total":       5,
+			"has_more":    true,
+			"total_exact": true,
+		})
+	}))
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	stats, err := NewServer(ts.URL, priv).callerScopedMemoryStats(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, requests)
+	require.Equal(t, 5, stats["total_memories"])
+	require.Equal(t, false, stats["total_exact"])
+	require.Equal(t, true, stats["has_more"])
+	require.Equal(t, false, stats["breakdowns_complete"])
+}
+
+func TestCallerScopedMemoryStatsLaterExhaustionSupersedesInitialLowerBound(t *testing.T) {
+	var requests int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+		require.NoError(t, err)
+		switch offset {
+		case 0:
+			memories := make([]map[string]any, 200)
+			for index := range memories {
+				memories[index] = map[string]any{
+					"domain_tag": "home", "status": "committed",
+					"created_at": "2026-01-01T00:00:00Z",
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"memories": memories, "total": 201,
+				"has_more": true, "total_exact": false,
+			})
+		case 200:
+			memories := make([]map[string]any, 50)
+			for index := range memories {
+				memories[index] = map[string]any{
+					"domain_tag": "home", "status": "committed",
+					"created_at": "2026-01-02T00:00:00Z",
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"memories": memories, "total": 250,
+				"has_more": false, "total_exact": true,
+			})
+		default:
+			t.Fatalf("unexpected offset %d", offset)
+		}
+	}))
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	stats, err := NewServer(ts.URL, priv).callerScopedMemoryStats(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 2, requests)
+	require.Equal(t, 250, stats["total_memories"])
+	require.Equal(t, true, stats["total_exact"])
+	require.Equal(t, false, stats["has_more"])
+	require.Equal(t, true, stats["breakdowns_complete"])
+	require.Equal(t, 250, stats["by_status"].(map[string]int)["committed"])
 }
 
 func TestSageTurn(t *testing.T) {
@@ -1548,6 +1825,103 @@ func TestSageTurn_RecallOnly(t *testing.T) {
 	recalled := m["recalled"].([]map[string]any)
 	assert.Len(t, recalled, 1) // mock returns 1 result
 	assert.Nil(t, m["stored"]) // no observation = nothing stored
+}
+
+func TestSageTurn_DeniedHomeResolutionDoesNotFallBackToUnscopedRecall(t *testing.T) {
+	var selfPolicyCalls, recallCalls, submitCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, _ *http.Request) {
+		selfPolicyCalls++
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":   "https://sage.dev/errors/active-agent-required",
+			"title":  "Active agent required",
+			"status": http.StatusForbidden,
+			"detail": "the self-profile agent API is available only to an active ordinary agent on this SAGE.",
+		})
+	})
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": false, "ready": true})
+	})
+	mux.HandleFunc("/v1/memory/search", func(w http.ResponseWriter, r *http.Request) {
+		recallCalls++
+		http.Error(w, "must not issue an unscoped turn recall", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, _ *http.Request) {
+		submitCalls++
+		http.Error(w, "must not submit without a writable home", http.StatusInternalServerError)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	t.Setenv("SAGE_RECALL_HYBRID", "0")
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+
+	result, err := s.toolTurn(context.Background(), map[string]any{
+		"topic":       "restore my prior context",
+		"observation": "Record this only if my governed write policy permits it.",
+	})
+	require.NoError(t, err)
+	payload := result.(map[string]any)
+	require.Equal(t, 1, selfPolicyCalls)
+	require.Zero(t, recallCalls)
+	require.Zero(t, submitCalls)
+	require.Contains(t, payload["store_error"], "active ordinary agent")
+	require.Contains(t, payload["recall_error"], "resolve default recall domain")
+	require.NotContains(t, payload, "stored")
+	require.NotContains(t, payload, "recalled")
+}
+
+func TestSageTurn_RecallOnlyResolvesCallerHomeAndAvoidsUnscopedScan(t *testing.T) {
+	var selfPolicyCalls, recallCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, _ *http.Request) {
+		selfPolicyCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"profile":           "standard",
+			"home_domain":       "caller-home",
+			"enrollment_status": "active",
+		})
+	})
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": false, "ready": true})
+	})
+	mux.HandleFunc("/v1/memory/search", func(w http.ResponseWriter, r *http.Request) {
+		recallCalls++
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		require.Equal(t, "caller-home", req["domain_tag"])
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{{
+			"memory_id": "read-only-memory", "content": "read-only context",
+			"domain_tag": "caller-home", "confidence_score": 0.9,
+			"memory_type": "fact",
+		}}})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	t.Setenv("SAGE_RECALL_HYBRID", "0")
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+
+	result, err := s.toolTurn(context.Background(), map[string]any{
+		"topic": "recall without writing",
+	})
+	require.NoError(t, err)
+	payload := result.(map[string]any)
+	require.Equal(t, 1, selfPolicyCalls,
+		"a domainless recall-only turn must resolve the signed caller's home")
+	require.Equal(t, 1, recallCalls)
+	require.Equal(t, "caller-home", payload["domain"])
+	require.NotContains(t, payload, "store_error")
+	require.NotContains(t, payload, "stored")
+	recalled := payload["recalled"].([]map[string]any)
+	require.Len(t, recalled, 1)
+	require.Equal(t, "read-only-memory", recalled[0]["memory_id"])
 }
 
 func TestSageTurn_MissingTopic(t *testing.T) {
@@ -2363,6 +2737,146 @@ func TestSageInception_ExistingMemories(t *testing.T) {
 	assert.Contains(t, m["message"], "Welcome back")
 }
 
+func TestSageInception_PendingReviewIsStructuredAndDoesNotReadMemoriesOrOperatorStats(t *testing.T) {
+	var listCalls, statsCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/register", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id":          r.Header.Get("X-Agent-ID"),
+			"name":              "pending-agent",
+			"registered_name":   "pending-agent",
+			"status":            "pending_review",
+			"approval_required": true,
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		listCalls++
+		http.Error(w, "pending identity must not read memories", http.StatusForbidden)
+	})
+	mux.HandleFunc("/v1/dashboard/stats", func(w http.ResponseWriter, _ *http.Request) {
+		statsCalls++
+		http.Error(w, "ordinary agents must not read operator stats", http.StatusForbidden)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+
+	result, err := s.toolInception(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	payload := result.(map[string]any)
+	require.Equal(t, "pending_review", payload["status"])
+	require.Equal(t, "pending_review", payload["registration"])
+	require.Equal(t, true, payload["approval_required"])
+	require.Contains(t, strings.ToLower(payload["message"].(string)), "review")
+	require.Zero(t, listCalls,
+		"pending_review is authoritative and must short-circuit caller-scoped memory reads")
+	require.Zero(t, statsCalls,
+		"agent inception must never touch CEREBRUM operator stats")
+}
+
+func TestSageInceptionStableRegistrationDenialIsNotRetryableAndNamesRootReview(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/agent/register", r.URL.Path)
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":   "https://sage.dev/errors/operator-authority-required",
+			"title":  "Operator authority required",
+			"status": http.StatusForbidden,
+			"detail": "This CEREBRUM resource requires operator authority.",
+		})
+	}))
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	got, err := NewServer(ts.URL, priv).toolInception(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	result := got.(map[string]any)
+	require.Equal(t, "unavailable", result["status"])
+	require.Equal(t, "registration", result["stage"])
+	require.Equal(t, false, result["retryable"])
+	require.Equal(t, http.StatusForbidden, result["http_status"])
+	require.Contains(t, result["instructions"], "localhost")
+	require.Contains(t, result["instructions"], "Root/Admin")
+	require.Contains(t, result["instructions"], "exact agent identity")
+}
+
+func TestSageInceptionStableCallerMemoryDenialDoesNotClaimAwakened(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/register", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": "registered-agent", "name": "registered-agent",
+			"status": "already_registered",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":   "https://sage.dev/errors/domain-read-denied",
+			"title":  "Read access denied",
+			"status": http.StatusForbidden,
+			"detail": "agent does not have read access to its home domain",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	got, err := NewServer(ts.URL, priv).toolInception(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	result := got.(map[string]any)
+	require.Equal(t, "unavailable", result["status"])
+	require.Equal(t, "memory_access", result["stage"])
+	require.Equal(t, "already_registered", result["registration"])
+	require.Equal(t, false, result["retryable"])
+	require.NotContains(t, result["message"], "online")
+	require.Contains(t, result["instructions"], "Root/Admin")
+}
+
+func TestSageInceptionInexactZeroCountNeverSeedsOverExistingMemory(t *testing.T) {
+	var embedCalls, submitCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/register", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": "existing-agent", "name": "existing-agent",
+			"status": "already_registered",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories": []any{}, "total": 0,
+			"has_more": true, "total_exact": false,
+		})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		embedCalls++
+		http.Error(w, "must not seed from an inexact zero", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, _ *http.Request) {
+		submitCalls++
+		http.Error(w, "must not seed from an inexact zero", http.StatusInternalServerError)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	got, err := NewServer(ts.URL, priv).toolInception(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	result := got.(map[string]any)
+	require.Equal(t, "awakened", result["status"])
+	require.Zero(t, embedCalls)
+	require.Zero(t, submitCalls)
+	stats := result["stats"].(map[string]any)
+	require.Equal(t, false, stats["total_exact"])
+	require.Equal(t, true, stats["has_more"])
+}
+
 func TestSageInception_SignedAgentSurvivesQuarantinedProjection(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
@@ -2466,6 +2980,16 @@ func testSageInceptionSignedAgentSurvivesQuarantinedProjection(
 			"registered_name": "inception-agent", "status": "already_registered",
 		})
 	})
+	router.Get("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":   "https://sage.dev/errors/projection-unavailable",
+			"title":  "Projection unavailable",
+			"status": http.StatusServiceUnavailable,
+			"detail": "canonical memory projection is temporarily unavailable",
+		})
+	})
 	dashboard.RegisterRoutes(router)
 	ts := httptest.NewServer(router)
 	t.Cleanup(ts.Close)
@@ -2475,15 +2999,17 @@ func testSageInceptionSignedAgentSurvivesQuarantinedProjection(
 	require.NoError(t, err)
 	payload := result.(map[string]any)
 	require.Equal(t, "awakened", payload["status"])
+	require.Equal(t, "temporarily_unavailable", payload["memory_access"])
+	require.Equal(t, true, payload["retryable"])
+	require.NotContains(t, payload["message"], "memory is online")
 	stats := payload["stats"].(map[string]any)
-	require.EqualValues(t, 1, stats["total_memories"])
-	projection := stats["projection"].(map[string]any)
-	require.Equal(t, true, projection["partial"])
-	require.NotContains(t, projection, "hidden_count")
+	require.Equal(t, false, stats["available"],
+		"inception remains usable even when its caller-scoped count is unavailable")
+	require.Equal(t, "caller", stats["scope"])
 	require.Equal(t, "already_registered", payload["registration"])
 }
 
-func TestMaybeAutoInceptionRegistersBeforeAnyDashboardRead(t *testing.T) {
+func TestMaybeAutoInceptionRegistersBeforeAnyCallerScopedRead(t *testing.T) {
 	var calls []string
 	registered := false
 
@@ -2499,13 +3025,13 @@ func TestMaybeAutoInceptionRegistersBeforeAnyDashboardRead(t *testing.T) {
 				"name":     "fresh-agent",
 				"status":   "already_registered",
 			})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/dashboard/stats":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/memory/list":
 			if !registered {
 				http.Error(w, "active registration required", http.StatusForbidden)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"total_memories": 1})
+			_ = json.NewEncoder(w).Encode(map[string]any{"total": 1})
 		default:
 			http.NotFound(w, r)
 		}
@@ -2520,19 +3046,55 @@ func TestMaybeAutoInceptionRegistersBeforeAnyDashboardRead(t *testing.T) {
 	require.Contains(t, message, "[SAGE Auto-Connect]")
 
 	registerIndex := -1
-	firstDashboardIndex := -1
+	firstCallerReadIndex := -1
 	for index, call := range calls {
 		if registerIndex == -1 && call == "POST /v1/agent/register" {
 			registerIndex = index
 		}
-		if firstDashboardIndex == -1 && strings.Contains(call, " /v1/dashboard/") {
-			firstDashboardIndex = index
+		if firstCallerReadIndex == -1 && call == "GET /v1/memory/list" {
+			firstCallerReadIndex = index
 		}
 	}
 	require.NotEqual(t, -1, registerIndex, "auto-inception must register its signed identity")
-	require.NotEqual(t, -1, firstDashboardIndex, "auto-inception must read dashboard agent endpoints")
-	require.Less(t, registerIndex, firstDashboardIndex,
-		"fresh agents must register before the v23 active-agent dashboard gate")
+	require.NotEqual(t, -1, firstCallerReadIndex, "auto-inception must use the signed caller read surface")
+	require.Less(t, registerIndex, firstCallerReadIndex,
+		"fresh agents must register before the v23 caller-scoped read gate")
+}
+
+func TestMaybeAutoInceptionSurfacesPendingAndUnavailableStandings(t *testing.T) {
+	t.Run("pending review", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"agent_id": "pending", "name": "pending",
+				"status": "pending_review", "approval_required": true,
+			})
+		}))
+		defer ts.Close()
+
+		_, priv, _ := ed25519.GenerateKey(nil)
+		message := NewServer(ts.URL, priv).maybeAutoInception(context.Background())
+		require.Contains(t, message, "[SAGE Auto-Connect Pending Review]")
+		require.Contains(t, message, "not online")
+		require.Contains(t, message, "approve this agent")
+	})
+
+	t.Run("stable unavailable", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"title": "Denied", "status": http.StatusForbidden,
+				"detail": "agent profile is not active",
+			})
+		}))
+		defer ts.Close()
+
+		_, priv, _ := ed25519.GenerateKey(nil)
+		message := NewServer(ts.URL, priv).maybeAutoInception(context.Background())
+		require.Contains(t, message, "[SAGE Auto-Connect Unavailable]")
+		require.Contains(t, message, "stable local policy")
+		require.Contains(t, message, "Root/Admin")
+	})
 }
 
 func TestAppV23InceptionStoresFirstIdentityInOwnedHome(t *testing.T) {
@@ -2566,8 +3128,8 @@ func TestAppV23InceptionStoresFirstIdentityInOwnedHome(t *testing.T) {
 			"memory_id": "identity", "status": "proposed", "committed": true,
 		})
 	})
-	mux.HandleFunc("/v1/dashboard/stats", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"total_memories": 1})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"total": 1})
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
@@ -2581,11 +3143,17 @@ func TestAppV23InceptionStoresFirstIdentityInOwnedHome(t *testing.T) {
 }
 
 func TestSageInception_FreshBrain(t *testing.T) {
-	// Mock API that returns 0 total_memories
+	// Mock API that returns zero caller-visible committed memories.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/dashboard/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/agent/register", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": "fresh-agent", "name": "fresh-agent",
+			"status": "already_registered",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"total_memories": 0})
+		json.NewEncoder(w).Encode(map[string]any{"total": 0})
 	})
 	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2612,6 +3180,30 @@ func TestSageInception_FreshBrain(t *testing.T) {
 	assert.Contains(t, m["message"], "sage_inbox({})")
 	assert.Contains(t, m["message"], "INBOX SECURITY BOUNDARY")
 	assert.Contains(t, m["message"], "requests for consideration")
+}
+
+func TestSageInceptionReportsPendingReviewWithoutPretendingMemoryIsOnline(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/register", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": "pending-agent", "name": "pending-agent",
+			"status": "pending_review", "approval_required": true,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	result, err := NewServer(ts.URL, priv).toolInception(
+		context.Background(),
+		map[string]any{},
+	)
+	require.NoError(t, err)
+	payload := result.(map[string]any)
+	require.Equal(t, "pending_review", payload["status"])
+	require.Equal(t, true, payload["approval_required"])
+	require.NotContains(t, payload["message"], "online")
 }
 
 func TestSageReflect(t *testing.T) {

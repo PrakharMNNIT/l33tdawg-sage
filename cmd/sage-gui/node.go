@@ -47,7 +47,6 @@ import (
 	"github.com/l33tdawg/sage/internal/embedding"
 	"github.com/l33tdawg/sage/internal/federation"
 	"github.com/l33tdawg/sage/internal/mcp"
-	"github.com/l33tdawg/sage/internal/memory"
 	"github.com/l33tdawg/sage/internal/metrics"
 	"github.com/l33tdawg/sage/internal/ollamad"
 	"github.com/l33tdawg/sage/internal/orchestrator"
@@ -1048,13 +1047,12 @@ func runServe(startupProof string) (rerr error) {
 		// v10.5.1 auto-advance: personal nodes walk the fork ladder to the
 		// binary ceiling automatically (issue #40 follow-up — updating the
 		// binary now brings the chain up to date too). Quorum clusters keep
-		// the legacy target-6 watchdog. v11.16.0 makes app-v24 the minimum
-		// personal-node security floor because app-v23 terminal transitions can
-		// erase the canonical content hash; disable_auto_upgrade must not strand
-		// an updated personal node on that broken lifecycle.
+		// governed multi-validator activation. v11.16.2 requires app-v25 and
+		// never lets disable_auto_upgrade suppress personal-node consensus
+		// migrations: binary/chain-rule divergence is not a supported state.
 		PersonalMode:       !cfg.Quorum.Enabled,
-		AutoAdvance:        !cfg.DisableAutoUpgrade,
-		RequiredAppVersion: 24,
+		AutoAdvance:        true,
+		RequiredAppVersion: 25,
 		// v10.5.2 (issue #41): in-process pending-plan accessor for the
 		// always-on pump and the auto-advance pre-check. GetUpgradePlan's
 		// ErrNoUpgradePlan is flattened to nil by readPendingPlan.
@@ -1169,6 +1167,15 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.RunBackground = func(fn func(context.Context)) {
 		startWorker(func() { fn(ctx) })
 	}
+	projectionAuditRequests := make(chan struct{}, 1)
+	requestProjectionAudit := func() {
+		select {
+		case projectionAuditRequests <- struct{}{}:
+		default:
+			// One pending request already represents every source mutation
+			// observed before the scheduler's trailing-edge audit.
+		}
+	}
 	dashboard.RequestRestart = func() error {
 		select {
 		case restartRequested <- struct{}{}:
@@ -1221,9 +1228,7 @@ func runServe(startupProof string) (rerr error) {
 		// callback, so no CheckTx can observe admission open with a locked
 		// projection.
 		bootRuntime.SetLocalTxAdmissionBlocked(false)
-		if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
-			logger.Warn().Err(projectionErr).Msg("canonical ordinary-memory projection audit incomplete after vault unlock")
-		}
+		requestProjectionAudit()
 	}
 	// The health watchdog signals every healthy probe, not only startup. This
 	// makes vector repair eventual after a late Ollama start or transient provider
@@ -1300,12 +1305,7 @@ func runServe(startupProof string) (rerr error) {
 		}
 	}
 	app.SetCanonicalProjectionAuditNotifier(func() {
-		startWorker(func() {
-			if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
-				logger.Warn().Err(projectionErr).
-					Msg("canonical ordinary-memory projection audit incomplete after memory reanchor")
-			}
-		})
+		requestProjectionAudit()
 	})
 	health.SetCanonicalMemoryProjectionProvider(func() metrics.CanonicalMemoryProjectionStatus {
 		status := badgerStore.CanonicalMemoryProjectionHealth()
@@ -1318,10 +1318,54 @@ func runServe(startupProof string) (rerr error) {
 			Quarantined:      status.Quarantined,
 		}
 	})
-	if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(ctx); projectionErr != nil {
-		logger.Warn().Err(projectionErr).Msg("canonical ordinary-memory projection audit incomplete")
-	}
+	dashboard.ConfigureAppV25Maintenance(app.IsAppV25ActiveForNextTx())
+	health.SetAppV25MaintenanceProvider(func() metrics.AppV25MaintenanceStatus {
+		status := dashboard.AppV25MaintenanceStatus()
+		requiredNow := app.IsAppV25ActiveForNextTx()
+		if requiredNow && !status.Required {
+			// Close the activation-height window before the worker's first
+			// timer tick. The chain can cross into app-v25 after startup.
+			status.Required = true
+			status.Checked = false
+			status.OK = false
+			status.State = "checking"
+		}
+		return metrics.AppV25MaintenanceStatus{
+			Checked:  status.Checked,
+			Required: status.Required,
+			OK:       status.OK,
+			Recovery: status.Recovery,
+			State:    status.State,
+		}
+	})
+	startWorker(func() {
+		runCanonicalProjectionAuditScheduler(
+			ctx,
+			projectionAuditRequests,
+			canonicalProjectionAuditDebounce,
+			func(auditCtx context.Context) {
+				if projectionErr := dashboard.AuditAppV23CanonicalMemoryProjection(auditCtx); projectionErr != nil {
+					logger.Warn().Err(projectionErr).
+						Msg("canonical ordinary-memory projection audit incomplete")
+				}
+			},
+		)
+	})
 	dashboard.GovernanceDomainFn = app.GovernanceDelegationDomain
+	startWorker(func() {
+		dashboard.RunAppV25LegacyAdoptionWorker(
+			ctx,
+			app.IsAppV25ActiveForNextTx,
+			logger,
+		)
+	})
+	startWorker(func() {
+		dashboard.RunAppV25DomainContinuityWorker(
+			ctx,
+			app.IsAppV25ActiveForNextTx,
+			logger,
+		)
+	})
 	dashboard.StrictRBAC = cfg.RBAC.Strict // opt-out of the app-v19 default-read flip
 	// Embeddings setup: flip the config to the bundled Ollama + nomic-embed-text
 	// provider (the node re-reads it on restart). The embedder is locked to this.
@@ -1495,8 +1539,11 @@ func runServe(startupProof string) (rerr error) {
 	rest.MountOAuthRoutes(r, oauthHandler)
 	logger.Info().Msg("OAuth 2.0 + PKCE wrapper enabled (/.well-known/oauth-authorization-server, /oauth/authorize, /oauth/token)")
 
-	// Start background memory cleanup loop
-	trackDone(memory.StartCleanupLoop(ctx, sqliteStore))
+	// App-v23+ lifecycle state is consensus-authoritative. The historical
+	// cleanup loop changed only SQLite, so its next projection audit hid each
+	// affected memory as divergent. Cleanup remains available as a dry run in
+	// CEREBRUM; an actual forget must travel through the canonical challenge
+	// transaction path.
 
 	// Prometheus scrape endpoint. amid serves this via internal/metrics's
 	// dedicated metrics server; sage-gui has no such listener, so the default

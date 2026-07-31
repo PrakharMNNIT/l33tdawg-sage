@@ -221,6 +221,7 @@ func TestConsensusOnlyFormatRoundTripsCanonicalBadgerStateAndAppHash(t *testing.
 	require.NoError(t, err)
 	require.NoError(t, source.SetState("scope:fixture", []byte("canonical scope state")))
 	require.NoError(t, source.SetState("scope-content:fixture", []byte("selected content only")))
+	require.NoError(t, source.SetMemorySubmissionHeight("app-v25-cutoff", 78))
 	appHash, err := source.ComputeAppHashExcludingBookkeeping()
 	require.NoError(t, err)
 	var backup bytes.Buffer
@@ -263,6 +264,11 @@ func TestConsensusOnlyFormatRoundTripsCanonicalBadgerStateAndAppHash(t *testing.
 	restoredHash, err := restored.ComputeAppHashExcludingBookkeeping()
 	require.NoError(t, err)
 	assert.Equal(t, appHash, restoredHash)
+	submittedHeight, found, err := restored.GetMemorySubmissionHeight("app-v25-cutoff")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(78), submittedHeight,
+		"state sync must preserve the AppHash-covered continuity cutoff")
 }
 
 func FuzzDecodeMetadata(f *testing.F) {

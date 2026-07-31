@@ -436,6 +436,27 @@ func (app *SageApp) appV23DomainDecision(
 			return false, authzdenial.CodeNoOwnedHomeDomain, nil
 		}
 	}
+	if verb <= store.AppV23VerbModify {
+		var restored bool
+		var restoreErr error
+		if verb == store.AppV23VerbModify {
+			restored, restoreErr =
+				app.badgerStore.AppV25AllowsHistoricalDomainModify(agentID, domain)
+		} else {
+			restored, restoreErr =
+				app.badgerStore.AppV25AllowsHistoricalDomainWrite(agentID, domain)
+		}
+		if restoreErr != nil {
+			return false, "", restoreErr
+		}
+		if restored {
+			// Exact app-v25 continuity is evaluated only after pending,
+			// Read-only, and home-integrity hard denials. Its consensus record is
+			// revision- and current-policy-bound, so this bypasses only the
+			// historical mask-2/mask-8 that caused the migration lockout.
+			return true, "", nil
+		}
+	}
 	shared := app.isSharedDomain(domain, height)
 	if verb >= store.AppV23VerbWrite && shared &&
 		enrollment.Capabilities.Has(store.AgentCapabilityDenySharedDomainWrite) {
@@ -449,9 +470,17 @@ func (app *SageApp) appV23DomainDecision(
 		if role.Role == store.AppV23RoleAdmin {
 			return true, "", nil
 		}
+		recoveredGroup, recoveredGroupErr :=
+			app.badgerStore.AuthorizeAppV25RecoveredGroupDomain(agentID, domain, verb)
+		if recoveredGroupErr != nil {
+			return false, "", recoveredGroupErr
+		}
+		if recoveredGroup {
+			return true, "", nil
+		}
 		if verb == store.AppV23VerbWrite {
 			grandfathered, grandfatherErr :=
-				app.badgerStore.AppV23AllowsGrandfatheredSharedWrite(agentID)
+				app.badgerStore.AppV23AllowsGrandfatheredSharedDomainWrite(agentID, domain)
 			if grandfatherErr != nil {
 				return false, "", grandfatherErr
 			}

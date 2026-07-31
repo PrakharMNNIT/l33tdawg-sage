@@ -181,6 +181,10 @@ func TestAppV23MergeRejectsBeforeLocalMemoryMutation(t *testing.T) {
 	require.NoError(t, err)
 	sourceID := agentIDForKey(sourceKey)
 	insertTestMemoryWithAgent(t, sqlStore, "orphan-memory", "companion-home", sourceID)
+	publishAppV23DashboardRecord(
+		t, sqlStore, fixture.badger, "orphan-memory",
+		uint8(store.ClearanceInternal), true,
+	)
 
 	var captured *tx.ParsedTx
 	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -202,15 +206,18 @@ func TestAppV23MergeRejectsBeforeLocalMemoryMutation(t *testing.T) {
 	req = appV23AccessAs(req, fixture.rootID)
 	rec := httptest.NewRecorder()
 	h.handleMergeAgent(sqlStore).ServeHTTP(rec, req)
-	require.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
-	assert.Contains(t, rec.Body.String(), "memory_reassign_rejected")
-	require.NotNil(t, captured)
-	assert.Equal(t, tx.TxTypeMemoryReassign, captured.Type)
-	assert.Equal(t, fixture.rootID, hex.EncodeToString(captured.AgentPubKey))
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "memory_reassign_retired")
+	require.Nil(t, captured, "retired mutation must not reach consensus RPC")
 
 	memoryAfter, err := sqlStore.GetMemory(context.Background(), "orphan-memory")
 	require.NoError(t, err)
 	assert.Equal(t, sourceID, memoryAfter.SubmittingAgent)
+	canonicalAuthor, err := fixture.badger.GetMemoryAuthor("orphan-memory")
+	require.NoError(t, err)
+	assert.Equal(t, sourceID, canonicalAuthor)
+	_, err = fixture.badger.ValidateMemoryProjection(memoryAfter)
+	require.NoError(t, err, "rejected reassignment must leave CEREBRUM disclosure valid")
 }
 
 func TestAppV23RootRotationUsesTx39AndStoresRecoveryBundle(t *testing.T) {

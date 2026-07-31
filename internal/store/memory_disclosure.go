@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 
+	badger "github.com/dgraph-io/badger/v4"
+
 	"github.com/l33tdawg/sage/internal/memory"
 )
 
@@ -53,6 +55,63 @@ const (
 	MemoryProjectionUnpublished      MemoryProjectionDisposition = "unpublished"
 )
 
+// MemoryProjectionClassification is one row's exact result from a shared
+// Badger read snapshot. Err retains the same typed error chain returned by
+// ClassifyMemoryProjection.
+type MemoryProjectionClassification struct {
+	Disposition MemoryProjectionDisposition
+	State       *MemoryDisclosureState
+	Err         error
+}
+
+// ClassifyMemoryProjections validates a SQL page inside one Badger read
+// transaction. The single-row classifier historically opened a transaction
+// for every record (and performed up to seven gets), making a 17k-memory
+// CEREBRUM audit needlessly expensive. This batch form preserves disposition
+// and error semantics while pinning the whole page to one canonical snapshot.
+// Per-row degraded dispositions are still observed by the shared process
+// tracker so broad readers can surface a proven unsafe row immediately. A
+// complete stable audit remains the only path that may replace that tracker
+// with a healthy result.
+func (s *BadgerStore) ClassifyMemoryProjections(
+	records []*memory.MemoryRecord,
+) ([]MemoryProjectionClassification, error) {
+	if s == nil {
+		return nil, errors.New("canonical store is unavailable")
+	}
+	results := make([]MemoryProjectionClassification, len(records))
+	err := s.view(func(txn *badger.Txn) error {
+		reader := &BadgerStore{
+			db:                              s.db,
+			txn:                             txn,
+			canonicalMemoryProjectionHealth: s.canonicalMemoryProjectionHealth,
+		}
+		for i, record := range records {
+			requireCompleteEnvelope := false
+			if record != nil {
+				var gateErr error
+				requireCompleteEnvelope, gateErr =
+					reader.appV25MemoryEnvelopeRequired(record.MemoryID)
+				if gateErr != nil {
+					return gateErr
+				}
+			}
+			state, disposition, classifyErr :=
+				reader.classifyMemoryProjection(record, requireCompleteEnvelope)
+			results[i] = MemoryProjectionClassification{
+				Disposition: disposition,
+				State:       state,
+				Err:         classifyErr,
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 // ValidateMemoryProjection verifies that a serving-layer record is the exact
 // projection of one committed on-chain memory snapshot. It also returns the
 // classification from that same Badger read transaction so disclosure policy
@@ -70,6 +129,49 @@ func (s *BadgerStore) ValidateMemoryProjection(
 func (s *BadgerStore) ClassifyMemoryProjection(
 	record *memory.MemoryRecord,
 ) (projection *MemoryDisclosureState, disposition MemoryProjectionDisposition, resultErr error) {
+	requireCompleteEnvelope := false
+	var err error
+	if record != nil {
+		requireCompleteEnvelope, err =
+			s.appV25MemoryEnvelopeRequired(record.MemoryID)
+	}
+	if err != nil {
+		return nil, MemoryProjectionUnpublished, fmt.Errorf(
+			"%w: read app-v25 disclosure gate: %w",
+			ErrMemoryProjectionUnpublished, err,
+		)
+	}
+	return s.classifyMemoryProjection(record, requireCompleteEnvelope)
+}
+
+func (s *BadgerStore) appV25MemoryEnvelopeRequired(memoryID string) (bool, error) {
+	if s == nil {
+		return false, errors.New("canonical store is unavailable")
+	}
+	applied, err := s.GetAppliedUpgrade("app-v25")
+	if err != nil {
+		return false, err
+	}
+	if applied == nil {
+		return false, nil
+	}
+	// app-v25 records the first consensus submission height for every memory
+	// born under its rules. That AppHash-covered marker is the safe disclosure
+	// cutoff: new records must always carry a complete canonical envelope, while
+	// historical records retain the narrow pre-v25 compatibility view until the
+	// governed background adoption worker installs their missing fields. A
+	// global upgrade switch would hide the historical corpus during migration.
+	_, found, err := s.GetMemorySubmissionHeight(memoryID)
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+func (s *BadgerStore) classifyMemoryProjection(
+	record *memory.MemoryRecord,
+	requireCompleteEnvelope bool,
+) (projection *MemoryDisclosureState, disposition MemoryProjectionDisposition, resultErr error) {
 	defer func() {
 		s.observeMemoryProjectionDisposition(disposition)
 	}()
@@ -80,7 +182,7 @@ func (s *BadgerStore) ClassifyMemoryProjection(
 	}
 	state, err := s.GetMemoryDisclosureState(record.MemoryID)
 	if err != nil {
-		disposition := MemoryProjectionUnpublished
+		disposition = MemoryProjectionUnpublished
 		if errors.Is(err, ErrMemoryDisclosureNotFound) {
 			disposition = MemoryProjectionLegacyUnanchored
 		}
@@ -92,6 +194,13 @@ func (s *BadgerStore) ClassifyMemoryProjection(
 		}
 		return nil, disposition, fmt.Errorf(
 			"%w: %w", ErrMemoryProjectionUnpublished, err,
+		)
+	}
+	if requireCompleteEnvelope &&
+		(!state.DomainRecorded || !state.AuthorRecorded || !state.ClassificationRecorded) {
+		return nil, MemoryProjectionQuarantined, fmt.Errorf(
+			"%w: %w: app-v25 canonical envelope is incomplete for %s",
+			ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, record.MemoryID,
 		)
 	}
 	if string(record.Status) != state.Status {

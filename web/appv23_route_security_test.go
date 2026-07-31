@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -219,6 +220,31 @@ func TestAppV23SignedDashboardCompatibilityRequiresOrdinaryConsensusIdentity(t *
 			protected.ServeHTTP(rec, req)
 			require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
 		})
+	}
+}
+
+func TestAppV23LegacyMCPStatsReturnsOnlyCallerPresenceLowerBound(t *testing.T) {
+	fixture := newAppV23DashboardRouteFixture(t)
+	router := testRouter(fixture.handler)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/stats", nil)
+	req.RemoteAddr = "192.0.2.20:54321"
+	req.Host = "192.0.2.10:8080"
+	signAgentGET(t, req, fixture.keys["member"])
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	require.Equal(t, float64(1), response["total_memories"])
+	require.Equal(t, false, response["total_exact"])
+	require.Equal(t, true, response["has_more"])
+	require.Equal(t, "caller", response["scope"])
+	for _, forbidden := range []string{
+		"projection", "db_size_bytes", "by_agent", "by_domain", "by_status",
+	} {
+		require.NotContains(t, response, forbidden)
 	}
 }
 

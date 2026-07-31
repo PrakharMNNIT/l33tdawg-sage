@@ -559,6 +559,21 @@ func (s *Server) maybeAutoInception(ctx context.Context) string {
 		// Fresh brain — return full inception message
 		msg, _ := resultMap["message"].(string)
 		return "[SAGE Auto-Inception] First connection detected — initializing your brain.\n\n" + msg
+	case "pending_review":
+		msg, _ := resultMap["message"].(string)
+		instructions, _ := resultMap["instructions"].(string)
+		return "[SAGE Auto-Connect Pending Review] Persistent memory is not online for this agent yet.\n\n" +
+			strings.TrimSpace(msg+"\n\n"+instructions)
+	case "unavailable":
+		msg, _ := resultMap["message"].(string)
+		instructions, _ := resultMap["instructions"].(string)
+		retryable, _ := resultMap["retryable"].(bool)
+		standing := "This is a stable local policy or compatibility failure; automatic retries are disabled."
+		if retryable {
+			standing = "This appears temporary; retry sage_inception after the reported condition clears."
+		}
+		return "[SAGE Auto-Connect Unavailable] Persistent memory could not be verified for this agent.\n\n" +
+			strings.TrimSpace(msg+"\n\n"+standing+"\n\n"+instructions)
 	}
 
 	return ""

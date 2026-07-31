@@ -133,6 +133,15 @@ const (
 	// versioned binary MemoryHashReanchorPayload and TargetID is its
 	// domain-separated digest.
 	GovOpMemoryHashReanchor GovProposalOp = 9
+	// GovOpMemoryLegacyAdopt (app-v25) materializes a bounded, validator-
+	// attested batch of terminal memories that exist in an unchanged legacy
+	// projection but have no canonical memory envelope. Consensus never reads
+	// that projection: the exact author/domain/classification/status/hash
+	// evidence is carried in the canonical proposal payload.
+	GovOpMemoryLegacyAdopt GovProposalOp = 10
+	// GovOpDomainContinuityAdopt (app-v25) restores exact pre-upgrade local
+	// writer authority for one domain from a canonical attested payload.
+	GovOpDomainContinuityAdopt GovProposalOp = 11
 )
 
 // VoteDecision represents a validator's vote on a proposed memory.
@@ -424,6 +433,32 @@ type MemoryHashReanchorEntry struct {
 	MemoryID       string
 	ExpectedStatus string
 	ContentHash    []byte
+}
+
+// MemoryLegacyAdoptionPayload is the canonical app-v25 governance body for one
+// bounded legacy-adoption batch. PlanDigest identifies the node-local migration
+// inventory from which validators independently derived the batch; it is
+// evidence only and is never dereferenced by consensus.
+type MemoryLegacyAdoptionPayload struct {
+	Version          uint8
+	RootCredentialID string
+	RootGeneration   uint64
+	PlanDigest       []byte
+	Entries          []MemoryLegacyAdoptionEntry
+}
+
+// MemoryLegacyAdoptionEntry is the complete canonical disclosure envelope
+// adopted for one SQL-only historical memory. Content itself never enters this
+// governance payload; validators attest its SHA-256 digest after independently
+// checking their local projection.
+type MemoryLegacyAdoptionEntry struct {
+	MemoryID        string
+	Status          string
+	ContentHash     []byte
+	Domain          string
+	Author          string
+	AuthorPrincipal string
+	Classification  uint8
 }
 
 // CoCommitCoauthor is one foreign counter-signer of a co-committed envelope.

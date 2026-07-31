@@ -74,6 +74,53 @@ func promoteAppV23TestAdmin(
 	))
 }
 
+func TestAppV23MemoryReassignIsRetiredWithoutProjectionMutation(t *testing.T) {
+	app := setupTestApp(t)
+	source := newAgentKey(t)
+	target := newAgentKey(t)
+	content := "immutable historical authorship"
+	contentHash := memory.ComputeContentHash(content)
+	record := &memory.MemoryRecord{
+		MemoryID:        "app-v23-immutable-author",
+		SubmittingAgent: source.id,
+		Content:         content,
+		ContentHash:     contentHash,
+		MemoryType:      memory.TypeObservation,
+		DomainTag:       "history",
+		ConfidenceScore: 0.9,
+		Status:          memory.StatusProposed,
+		CreatedAt:       appV23BlockTime(),
+	}
+	require.NoError(t, app.offchainStore.InsertMemory(context.Background(), record))
+	require.NoError(t, app.badgerStore.SetMemoryHash(
+		record.MemoryID, record.ContentHash, string(record.Status),
+	))
+	require.NoError(t, app.badgerStore.SetMemoryDomain(record.MemoryID, record.DomainTag))
+	require.NoError(t, app.badgerStore.SetMemoryAuthor(record.MemoryID, source.id))
+	require.NoError(t, app.badgerStore.SetMemoryClassification(
+		record.MemoryID, uint8(store.ClearanceInternal),
+	))
+
+	app.appV23AppliedHeight = 10
+	pendingBefore := len(app.pendingWrites)
+	result := app.processMemoryReassign(
+		makeMemoryReassignTx(t, source, source.id, target.id),
+		11, appV23BlockTime(),
+	)
+	require.Equal(t, uint32(66), result.Code, result.Log)
+	require.Contains(t, result.Log, "canonical authorship is immutable")
+	require.Len(t, app.pendingWrites, pendingBefore)
+
+	projected, err := app.offchainStore.GetMemory(context.Background(), record.MemoryID)
+	require.NoError(t, err)
+	require.Equal(t, source.id, projected.SubmittingAgent)
+	canonicalAuthor, err := app.badgerStore.GetMemoryAuthor(record.MemoryID)
+	require.NoError(t, err)
+	require.Equal(t, source.id, canonicalAuthor)
+	_, err = app.badgerStore.ValidateMemoryProjection(projected)
+	require.NoError(t, err, "the rejected mutation must leave CEREBRUM disclosure valid")
+}
+
 func TestAppV23DomainReassignCannotReleaseActiveRequiredHome(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -595,6 +642,11 @@ func TestAppV23EveryRootGenerationIsExcludedFromGenericConsensusTargets(t *testi
 		t.Helper()
 		require.Equal(t, uint32(110), result.Code, "%s: %s", name, result.Log)
 	}
+	requireMemoryReassignRetired := func(name string, result *abcitypes.ExecTxResult) {
+		t.Helper()
+		require.Equal(t, uint32(66), result.Code, "%s: %s", name, result.Log)
+		require.Contains(t, result.Log, "immutable")
+	}
 
 	rootGenerations := []agentKey{initialRoot, secondRoot, currentRoot}
 	for _, rootIdentity := range rootGenerations {
@@ -638,11 +690,11 @@ func TestAppV23EveryRootGenerationIsExcludedFromGenericConsensusTargets(t *testi
 				makeAccessRevokeTx(t, currentRoot, target, "general"),
 				13, appV23BlockTime(),
 			))
-			requireDenied("memory reassign source", app.processMemoryReassign(
+			requireMemoryReassignRetired("memory reassign source", app.processMemoryReassign(
 				makeMemoryReassignTx(t, currentRoot, target, member.id),
 				13, appV23BlockTime(),
 			))
-			requireDenied("memory reassign target", app.processMemoryReassign(
+			requireMemoryReassignRetired("memory reassign target", app.processMemoryReassign(
 				makeMemoryReassignTx(t, currentRoot, member.id, target),
 				13, appV23BlockTime(),
 			))

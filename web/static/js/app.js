@@ -1,6 +1,6 @@
 // CEREBRUM — Your SAGE Brain
 import { SSEClient } from './sse.js';
-import { fetchStats, fetchGraph, fetchMemories, deleteMemory, updateMemory, fetchHealth, fetchValidators, fetchScopes, fetchMcpConfig, checkAuth, login, recoverVault, lockSession, importMemories, importPreview, importConfirm, fetchCleanupSettings, saveCleanupSettings, runCleanup, fetchAgents, fetchAppV23Access, updateAppV23AgentPolicy, putAppV23AccessGroup, deleteAppV23AccessGroup, fetchAppV23LinkedReaders, fetchAppV23LinkedReaderIdentities, checkAppV23LinkedReaderEligibility, mutateAppV23LinkedReader, fetchAppV23LinkedMessageConsent, fetchAppV23RemoteHostedMessageCandidates, putAppV23LinkedMessageConsent, fetchAgent, createAgent, updateAgent, removeAgent, downloadBundle, fetchTemplates, fetchRedeployStatus, startRedeploy, createPairingCode, rotateAgentKey, handoverRootCredential, fetchBootInstructions, saveBootInstructions, fetchLedgerStatus, enableLedger, changeLedgerPassphrase, disableLedger, fetchTags, fetchMemoryTags, setMemoryTags, fetchAutostart, setAutostart, checkForUpdate, applyUpdate, restartServer, fetchReranker, saveReranker, testReranker, detectReranker, fetchOnboarding, saveOnboarding,
+import { fetchStats, fetchMemoryAdoptionProgress, retryMemoryAdoption, deprecateMemoryAdoption, fetchGraph, fetchMemories, deleteMemory, updateMemory, fetchHealth, fetchValidators, fetchScopes, fetchMcpConfig, checkAuth, login, recoverVault, lockSession, importMemories, importPreview, importConfirm, fetchCleanupSettings, saveCleanupSettings, runCleanup, fetchAgents, fetchAppV23Access, updateAppV23AgentPolicy, putAppV23AccessGroup, deleteAppV23AccessGroup, fetchAppV23LinkedReaders, fetchAppV23LinkedReaderIdentities, checkAppV23LinkedReaderEligibility, mutateAppV23LinkedReader, fetchAppV23LinkedMessageConsent, fetchAppV23RemoteHostedMessageCandidates, putAppV23LinkedMessageConsent, fetchAgent, createAgent, updateAgent, removeAgent, downloadBundle, fetchTemplates, fetchRedeployStatus, startRedeploy, createPairingCode, rotateAgentKey, handoverRootCredential, fetchBootInstructions, saveBootInstructions, fetchLedgerStatus, enableLedger, changeLedgerPassphrase, disableLedger, fetchTags, fetchMemoryTags, setMemoryTags, fetchAutostart, setAutostart, checkForUpdate, applyUpdate, restartServer, fetchReranker, saveReranker, testReranker, detectReranker, fetchOnboarding, saveOnboarding,
 rerankerSetupStatus, rerankerSetupDownload, rerankerSetupStart, rerankerSetupStop, rerankerSetupInstallEngine, fetchTasks, updateTaskStatus, reorderTasks, createTask, assignTask, fetchUnregisteredAgents, mergeAgent, fetchRecallSettings, saveRecallSettings, fetchAgentDomains, reassignDomainOwnership, bulkUpdateMemories, fetchMemoryMode, saveMemoryMode, fetchPipeline, fetchPipelineStats, sendPipelineNote, fetchGovProposals, fetchGovProposalDetail, submitGovProposal, submitGovVote, fetchMemoryReanchorPlan, wizardCheckCloudflared, wizardInstallCloudflared, wizardStartLogin, wizardLoginStatus, wizardCreateTunnel, wizardMintToken, connectProvider, connectRemoteUrl, fetchUpdateStatus, selectEmbeddingProvider,
 embeddingsStatus, checkOllamaEmbed, installOllamaRuntime, startOllamaRuntime, pullEmbedModel, reembedMemories, reembedProgress, enableSemanticEmbeddings,
 deprecateUnreadable, getRecoveryKey, confirmRecoveryKeyBackup, recoverOrphansPreview, recoverOrphans,
@@ -41,7 +41,7 @@ import {
     normalizeFederationRoutePlan,
 } from './federation-route-state.js';
 
-const { h, render, createContext } = preact;
+const { h, render, createContext, Fragment } = preact;
 const { useState, useEffect, useRef, useLayoutEffect, useCallback, useContext } = preactHooks;
 const html = window.html;
 
@@ -278,10 +278,143 @@ function useModalDialog(onRequestClose, active = true) {
     return dialogRef;
 }
 
+function MemoryAdoptionResolutionModal({ progress, onProgress, onClose }) {
+    const [confirmation, setConfirmation] = useState('');
+    const [submitting, setSubmitting] = useState('');
+    const [error, setError] = useState('');
+    const [success, setSuccess] = useState('');
+    const recoveryCount = Number(progress?.recovery || 0);
+    const projectionRevision = progress?.projection_revision;
+    const requiredConfirmation = `DEPRECATE ${recoveryCount}`;
+    const requestClose = () => { if (!submitting) onClose(); };
+    const dialogRef = useModalDialog(requestClose);
+
+    useEffect(() => {
+        setConfirmation('');
+        setError('');
+    }, [recoveryCount, projectionRevision]);
+
+    async function refreshProgress(result) {
+        const returned = result?.progress || result;
+        let next = returned && typeof returned.recovery === 'number' &&
+            Object.prototype.hasOwnProperty.call(returned, 'projection_revision')
+            ? returned
+            : null;
+        try {
+            next = await fetchMemoryAdoptionProgress();
+        } catch (_) {
+            // The mutation has already succeeded. The regular dashboard poll
+            // will reconcile the notice if this immediate refresh is offline.
+        }
+        if (next && typeof onProgress === 'function') onProgress(next);
+        return next;
+    }
+
+    async function retryRepair() {
+        setSubmitting('retry');
+        setError('');
+        setSuccess('');
+        try {
+            const result = await retryMemoryAdoption({
+                projectionRevision,
+                expectedCount: recoveryCount,
+            });
+            await refreshProgress(result);
+            setSuccess('Automatic repair was queued successfully. CEREBRUM is re-checking every preserved historical record and will update this notice when the attempt finishes.');
+        } catch (err) {
+            setError(err?.message || 'Automatic repair could not be retried.');
+        } finally {
+            setSubmitting('');
+        }
+    }
+
+    async function deprecateRemaining() {
+        if (confirmation !== requiredConfirmation) return;
+        setSubmitting('deprecate');
+        setError('');
+        setSuccess('');
+        try {
+            const result = await deprecateMemoryAdoption({
+                projectionRevision,
+                expectedCount: recoveryCount,
+                confirmation,
+            });
+            await refreshProgress(result);
+            setConfirmation('');
+            setSuccess(`${recoveryCount.toLocaleString()} historical record${recoveryCount === 1 ? '' : 's'} deprecated. They remain preserved for audit and were not deleted or rewritten.`);
+        } catch (err) {
+            setError(err?.message || 'The preserved records could not be deprecated.');
+        } finally {
+            setSubmitting('');
+        }
+    }
+
+    return html`
+        <div class="cerebrum-repair-overlay">
+            <section class="cerebrum-repair-dialog" ref=${dialogRef} role="dialog" aria-modal="true"
+                aria-labelledby="memory-repair-resolution-title" aria-describedby="memory-repair-resolution-summary"
+                tabIndex="-1">
+                <header class="cerebrum-repair-header">
+                    <div>
+                        <span>Automatic memory repair</span>
+                        <h2 id="memory-repair-resolution-title">Resolve preserved historical records</h2>
+                    </div>
+                    <button type="button" class="wizard-close" aria-label="Close memory repair resolution"
+                        disabled=${!!submitting} onClick=${requestClose}>×</button>
+                </header>
+                <div class="cerebrum-repair-body">
+                    <p id="memory-repair-resolution-summary">
+                        ${recoveryCount.toLocaleString()} historical record${recoveryCount === 1 ? '' : 's'} could not be converted automatically.
+                        They are preserved for audit, safely excluded from the available-memory view, and have not been deleted or rewritten.
+                    </p>
+
+                    ${error && html`<div class="cerebrum-repair-feedback error" role="alert">${error}</div>`}
+                    ${success && html`<div class="cerebrum-repair-feedback success" role="status">${success}</div>`}
+
+                    <section class="cerebrum-repair-choice" aria-labelledby="memory-repair-retry-title">
+                        <div>
+                            <h3 id="memory-repair-retry-title">Try automatic repair again</h3>
+                            <p>Run the safe conversion again against the current preserved records. Nothing is deleted if they still cannot be converted.</p>
+                        </div>
+                        <button type="button" class="btn btn-primary" disabled=${!!submitting || recoveryCount < 1}
+                            onClick=${retryRepair}>
+                            ${submitting === 'retry' ? 'Retrying repair…' : 'Retry automatic repair'}
+                        </button>
+                    </section>
+
+                    <section class="cerebrum-repair-choice danger" aria-labelledby="memory-repair-deprecate-title">
+                        <div>
+                            <h3 id="memory-repair-deprecate-title">Deprecate remaining records</h3>
+                            <p>This permanently excludes these records from future repair attempts and the available-memory view. They remain preserved for audit; their content and history are not deleted or rewritten.</p>
+                        </div>
+                        <label class="cerebrum-repair-confirmation">
+                            <span>Type <strong>${requiredConfirmation}</strong> to confirm</span>
+                            <input type="text" value=${confirmation} autocomplete="off" spellcheck="false"
+                                aria-label=${`Type ${requiredConfirmation} to confirm deprecation`}
+                                disabled=${!!submitting || recoveryCount < 1}
+                                onInput=${event => setConfirmation(event.currentTarget.value)} />
+                        </label>
+                        <button type="button" class="btn btn-danger"
+                            disabled=${!!submitting || recoveryCount < 1 || confirmation !== requiredConfirmation}
+                            onClick=${deprecateRemaining}>
+                            ${submitting === 'deprecate' ? 'Deprecating records…' : 'Deprecate remaining records'}
+                        </button>
+                    </section>
+                </div>
+                <footer class="cerebrum-repair-footer">
+                    <button type="button" class="btn" disabled=${!!submitting} onClick=${requestClose}>Close</button>
+                </footer>
+            </section>
+        </div>
+    `;
+}
+
 function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onSelectDomain }) {
     const [inventory, setInventory] = useState(null);
     const [localProjectionError, setLocalProjectionError] = useState(false);
     const [projectionNotice, setProjectionNotice] = useState(null);
+    const [adoptionProgress, setAdoptionProgress] = useState(null);
+    const [showRepairResolution, setShowRepairResolution] = useState(false);
     const [loadingRemote, setLoadingRemote] = useState(false);
     const [federationError, setFederationError] = useState('');
     const [domainFilter, setDomainFilter] = useState('');
@@ -296,33 +429,66 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
     useEffect(() => {
         let alive = true;
         let timer = null;
+        let retryTimer = null;
+        let retryDelay = 2000;
         let inFlight = false;
+        const scheduleRetry = () => {
+            clearTimeout(retryTimer);
+            const delay = retryDelay;
+            retryDelay = Math.min(retryDelay * 2, 30000);
+            retryTimer = setTimeout(load, delay);
+        };
         const load = async () => {
             if (inFlight || document.hidden) return;
             inFlight = true;
-            const [statsResult, catalogueResult, connectionsResult] = await Promise.allSettled([
+            const [statsResult, adoptionResult, catalogueResult, connectionsResult] = await Promise.allSettled([
                 fetchStats(),
+                fetchMemoryAdoptionProgress(),
                 fedShareableDomains(),
                 fedConnections(),
             ]);
             if (!alive) return;
 
             const stats = statsResult.status === 'fulfilled' ? statsResult.value : null;
+            const adoption = adoptionResult.status === 'fulfilled' ? adoptionResult.value : null;
+            setAdoptionProgress(adoption);
             const localCatalogue = catalogueResult.status === 'fulfilled' ? catalogueResult.value : null;
             const connectionsPayload = connectionsResult.status === 'fulfilled' ? connectionsResult.value : null;
+            const projection = stats && stats.projection;
+            const projectionChecking = projection && (
+                projection.state === 'checking' ||
+                projection.state === 'refreshing' ||
+                projection.refreshing === true
+            );
             if (!stats || typeof stats.total_memories !== 'number' ||
                 !stats.by_domain || typeof stats.by_domain !== 'object') {
+                if (projectionChecking) {
+                    // A cold app-v23 node returns the honest checking projection
+                    // before global totals are available. Keep the already-loaded
+                    // MRI visible and retry promptly; this is not a data-plane
+                    // failure and must never become an empty/unavailable brain.
+                    setLocalProjectionError(false);
+                    setProjectionNotice(projection);
+                    setLoadingRemote(false);
+                    if (onAvailability) onAvailability('partial');
+                    inFlight = false;
+                    scheduleRetry();
+                    return;
+                }
                 setInventory(null);
                 setLocalProjectionError(true);
                 setLoadingRemote(false);
                 if (onInventory) onInventory(null);
                 if (onAvailability) onAvailability('unavailable');
                 inFlight = false;
+                scheduleRetry();
                 return;
             }
+            clearTimeout(retryTimer);
+            retryDelay = 2000;
             setLocalProjectionError(false);
-            const partialProjection = stats.projection?.partial === true;
-            setProjectionNotice(partialProjection ? stats.projection : null);
+            const partialProjection = projection?.partial === true;
+            setProjectionNotice(partialProjection ? projection : null);
             if (onAvailability) onAvailability(partialProjection ? 'partial' : 'ready');
             const connections = connectionsPayload && Array.isArray(connectionsPayload.connections)
                 ? connectionsPayload.connections
@@ -376,6 +542,7 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
         return () => {
             alive = false;
             clearInterval(timer);
+            clearTimeout(retryTimer);
             document.removeEventListener('visibilitychange', onVisibility);
         };
     }, []);
@@ -523,7 +690,26 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
         : inventory.localDomains;
     const localPreview = localMatches.slice(0, 30);
     const sharedPreview = inventory.sharedDomains.slice(0, 10);
-    return html`<aside ref=${panelRef} class="brain-domain-inventory ${collapsed ? 'collapsed' : ''}" aria-label="Local and shared domains">
+    const repairActive = adoptionProgress && (
+        adoptionProgress.state === 'migrating' ||
+        adoptionProgress.state === 'waiting'
+    ) && Number(adoptionProgress.remaining || 0) > 0;
+    const repairFinishedWithResidue = adoptionProgress &&
+        adoptionProgress.state === 'recovery' &&
+        Number(adoptionProgress.recovery || 0) > 0;
+    const projectionHeading = repairActive
+        ? 'Repairing historical memories automatically'
+        : repairFinishedWithResidue
+            ? 'Automatic memory repair finished'
+            : 'Available memories shown';
+    const projectionMessage = repairActive
+        ? `${Number(adoptionProgress.converted || 0)} restored · ${Number(adoptionProgress.remaining || 0)} remaining. Normal work continues while SAGE repairs them in the background.`
+        : repairFinishedWithResidue
+            ? `${Number(adoptionProgress.converted || 0)} restored. ${Number(adoptionProgress.recovery || 0)} preserved historical records could not be converted and remain safely excluded.`
+            : projectionNotice?.message || 'Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed.';
+    const showAutomaticRepairNotice = repairActive || repairFinishedWithResidue || projectionNotice;
+    return html`<${Fragment}>
+    <aside ref=${panelRef} class="brain-domain-inventory ${collapsed ? 'collapsed' : ''}" aria-label="Local and shared domains">
         <div class="brain-domain-head" data-domain-drag-handle>
             <div>
                 <strong>Domain sources</strong>
@@ -540,10 +726,16 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
                 </button>
             </div>
         </div>
-        ${projectionNotice && html`
+        ${showAutomaticRepairNotice && html`
             <div class="brain-projection-warning" role="alert">
-                <strong>Available memories shown</strong>
-                <span>${projectionNotice.message || 'Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed.'}</span>
+                <div class="brain-projection-warning-copy">
+                    <strong>${projectionHeading}</strong>
+                    <span>${projectionMessage}</span>
+                </div>
+                ${repairFinishedWithResidue && html`
+                    <button type="button" class="brain-projection-resolve"
+                        onClick=${() => setShowRepairResolution(true)}>Resolve</button>
+                `}
             </div>
         `}
         ${!collapsed && html`<div class="brain-domain-body">
@@ -650,7 +842,12 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
                 </button>
             </section>
         </div>`}
-    </aside>`;
+    </aside>
+    ${showRepairResolution && html`
+        <${MemoryAdoptionResolutionModal} progress=${adoptionProgress}
+            onProgress=${setAdoptionProgress} onClose=${() => setShowRepairResolution(false)} />
+    `}
+    </${Fragment}>`;
 }
 
 // MriView — the 3D MRI memory-brain, rendered natively (the dashboard's
@@ -660,15 +857,27 @@ function MriView({ sse }) {
     const ref = useRef(null);
     const [inventory, setInventory] = useState(null);
     const [projectionAvailability, setProjectionAvailability] = useState('loading');
+    const [graphAvailability, setGraphAvailability] = useState('loading');
     const [selectedDomain, setSelectedDomain] = useState('');
     useEffect(() => {
         if (!ref.current) return;
+        const element = ref.current;
+        const onGraphAvailability = event => {
+            const state = event?.detail?.state;
+            if (state === 'ready' || state === 'unavailable' || state === 'loading') {
+                setGraphAvailability(state);
+            }
+        };
+        element.addEventListener('sage:mri-graph-availability', onGraphAvailability);
         const cleanup = mountMriBrain(ref.current, {
             showScan: false,
             showDomainLegend: false,
             sse,
         });
-        return cleanup;
+        return () => {
+            element.removeEventListener('sage:mri-graph-availability', onGraphAvailability);
+            cleanup();
+        };
     }, [sse]);
     const selectDomain = domain => {
         const next = String(domain || '');
@@ -682,23 +891,25 @@ function MriView({ sse }) {
     const noLocalMemories = inventory && inventory.localMemoryTotal === 0;
     const hasSharedDomains = inventory && inventory.sharedDomains.length > 0;
     const partialProjection = projectionAvailability === 'partial';
+    const memoryViewUnavailable = projectionAvailability === 'unavailable' ||
+        graphAvailability === 'unavailable';
     return html`<div class="mri-wrap">
         <div class="mri-stage" ref=${ref}></div>
         <${BrainDomainInventory} onInventory=${setInventory} onAvailability=${setProjectionAvailability}
             selectedDomain=${selectedDomain} onSelectDomain=${selectDomain} />
-        ${projectionAvailability === 'unavailable' && html`<div class="brain-empty-overlay" role="alert">
+        ${memoryViewUnavailable && html`<div class="brain-empty-overlay" role="alert">
             <${EmptyState} icon="brain"
                 headline="Memory view temporarily unavailable"
                 hint="Your memories are still stored and unchanged. CEREBRUM refused to display an unverified or incomplete projection instead of pretending the brain is empty."
                 actionLabel="Reload CEREBRUM"
                 onAction=${() => window.location.reload()} />
         </div>`}
-        ${noLocalMemories && partialProjection && html`<div class="brain-empty-overlay" role="alert">
+        ${!memoryViewUnavailable && noLocalMemories && partialProjection && html`<div class="brain-empty-overlay" role="alert">
             <${EmptyState} icon="brain"
                 headline="No memories can be safely shown yet"
                 hint="Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed." />
         </div>`}
-        ${noLocalMemories && !partialProjection && html`<div class="brain-empty-overlay">
+        ${!memoryViewUnavailable && noLocalMemories && !partialProjection && html`<div class="brain-empty-overlay">
             <${EmptyState} icon="brain"
                 headline=${hasSharedDomains ? 'No memories stored locally' : 'Your brain is empty'}
                 hint=${hasSharedDomains
@@ -1146,6 +1357,7 @@ function BrainView({ sse, onSelectMemory, timelineFilter }) {
     const [filterDomains, setFilterDomains] = useState(new Set());
     const [domainsCollapsed, setDomainsCollapsed] = useState(true); // collapse the domain filter strip by default (it can be 200+ chips)
     const [graphLoaded, setGraphLoaded] = useState(false); // first graph fetch done — gate a "synthesizing" hint so the canvas never just looks blank
+    const [graphNodeCount, setGraphNodeCount] = useState(null);
     const [searchText, setSearchText] = useState('');
     const [searchOpen, setSearchOpen] = useState(false);
     const [tooltip, setTooltip] = useState(null);
@@ -1179,8 +1391,20 @@ function BrainView({ sse, onSelectMemory, timelineFilter }) {
     }, []);
 
     async function loadData() {
+        // Global aggregates may still be warming after restart. They update the
+        // counters independently and must never hold the bounded, candidate-
+        // verified graph behind an inventory-wide audit.
+        fetchStats().then(data => {
+            const projection = data && data.projection;
+            if (typeof data?.total_memories === 'number' &&
+                projection?.complete === true &&
+                projection?.stale !== true &&
+                projection?.refreshing !== true) {
+                setStats(data);
+            }
+        }).catch(() => {});
         try {
-            const [graphData, statsData] = await Promise.all([fetchGraph(), fetchStats()]);
+            const graphData = await fetchGraph();
             const s = stateRef.current;
 
             // Preserve positions of existing nodes
@@ -1204,7 +1428,7 @@ function BrainView({ sse, onSelectMemory, timelineFilter }) {
 
             s.nodes = nodes;
             s.edges = graphData.edges || [];
-            setStats(statsData);
+            setGraphNodeCount(nodes.length);
             setGraphLoaded(true);
 
             const domainSet = new Set(nodes.map(n => n.domain).filter(Boolean));
@@ -1921,7 +2145,11 @@ function BrainView({ sse, onSelectMemory, timelineFilter }) {
         <div class="brain-container">
             <canvas ref=${canvasRef} class="brain-canvas"></canvas>
             ${!graphLoaded ? html`<div class="brain-loading">◍ synthesizing memory graph…</div>` : ''}
-            ${graphLoaded && stats && (stats.total_memories || 0) === 0 ? html`
+            ${graphLoaded && graphNodeCount === 0 && stats &&
+              stats.total_memories === 0 &&
+              stats.projection?.complete === true &&
+              stats.projection?.stale !== true &&
+              stats.projection?.refreshing !== true ? html`
                 <div class="brain-empty-overlay">
                     <${EmptyState} icon="brain"
                         headline="Your brain is empty"
@@ -3236,6 +3464,8 @@ function SearchPage() {
     const [customTo, setCustomTo] = useState(''); // YYYY-MM-DD
     const [dateRange, setDateRange] = useState({ from: '', to: '' }); // resolved ISO bounds
     const [sortOrder, setSortOrder] = useState('newest'); // newest | oldest | confidence
+    const [searchCursor, setSearchCursor] = useState('');
+    const [loadingOlderSearch, setLoadingOlderSearch] = useState(false);
     const searchTimer = useRef(null);
     const reqSeq = useRef(0); // last-issued-wins guard for out-of-order loadMemories responses
 
@@ -3374,6 +3604,7 @@ function SearchPage() {
             });
             setResults(memories);
             setTotal(data.total || memories.length);
+            setSearchCursor(search ? (data.next_cursor || '') : '');
             // Prune the bulk selection to what is actually on screen - a
             // filter/search change must not leave invisible memories armed
             // for Move/Tag/Forget.
@@ -3391,6 +3622,40 @@ function SearchPage() {
             setError(err && err.message ? err.message : 'Failed to load memories');
         }
         if (myReq === reqSeq.current) setLoading(false);
+    }
+
+    async function loadOlderSearch() {
+        if (!query || !searchCursor || loadingOlderSearch) return;
+        setLoadingOlderSearch(true);
+        setError(null);
+        try {
+            const params = { limit: 200, sort: sortOrder, q: query, cursor: searchCursor };
+            if (agentFilter) params.agent = agentFilter;
+            if (domainFilter) params.domain = domainFilter;
+            if (tagFilter) params.tag = tagFilter;
+            if (statusFilter) params.status = statusFilter;
+            if (dateRange.from) params.from = dateRange.from;
+            if (dateRange.to) params.to = dateRange.to;
+            const data = await fetchMemories(params);
+            const authorLabels = data.author_labels || {};
+            const incoming = (data.memories || []).map(memory => {
+                const authorLabel = authorLabels[memory.submitting_agent] || '';
+                return authorLabel
+                    ? { ...memory, agent_label: authorLabel, agent_is_root: authorLabel === 'CEREBRUM Root' }
+                    : memory;
+            });
+            setResults(current => {
+                const seen = new Set(current.map(memory => memory.memory_id));
+                return current.concat(incoming.filter(memory => !seen.has(memory.memory_id)));
+            });
+            setSearchCursor(data.next_cursor || '');
+            setTotal(current =>
+                Math.max(0, current - 1) + incoming.length + (data.next_cursor ? 1 : 0)
+            );
+        } catch (err) {
+            setError(err && err.message ? err.message : 'Failed to search older memories');
+        }
+        setLoadingOlderSearch(false);
     }
 
     function handleSearch(e) {
@@ -3576,6 +3841,14 @@ function SearchPage() {
                     <div style="background:var(--danger-tint);border:1px solid rgba(239,68,68,0.4);color:var(--danger);padding:12px 16px;border-radius:8px;margin-bottom:12px;display:flex;align-items:center;gap:12px;font-size:13px;">
                         <span style="flex:1;">Couldn't load memories: ${error}</span>
                         <button class="btn" onClick=${() => loadMemories(query, agentFilter, domainFilter, tagFilter)}>Retry</button>
+                    </div>
+                `}
+                ${query && searchCursor && html`
+                    <div class="info-banner" style="margin-bottom:12px;display:flex;align-items:center;gap:12px;">
+                        <span style="flex:1;">More older memories remain to be searched.</span>
+                        <button class="btn" disabled=${loadingOlderSearch} onClick=${loadOlderSearch}>
+                            ${loadingOlderSearch ? 'Searching…' : 'Search older memories'}
+                        </button>
                     </div>
                 `}
                 ${selected.size > 0 && html`
@@ -5036,11 +5309,17 @@ function UnreadableMemoriesPanel({ status, onChange, onBusy }) {
         } catch (e) { setErr(e.message || String(e)); }
         setBusy(false);
     };
-    const doDeprecate = async () => {
+    const doDeprecate = async (cursor = '') => {
         setBusy(true); setErr(null);
         try {
-            const r = await deprecateUnreadable();
-            setResult({ deprecated: r.deprecated, remaining: 0 }); // deprecating hides the whole unreadable set
+            const r = await deprecateUnreadable(cursor);
+            setResult({
+                deprecated: r.deprecated,
+                submitted: r.submitted,
+                remaining: r.remaining_unreadable ?? Math.max(0, unreadable - (r.deprecated || 0)),
+                nextCursor: r.next_cursor || '',
+                continuationRequired: !!r.continuation_required,
+            });
             if (onChange) onChange();
         } catch (e) { setErr(e.message || String(e)); }
         setBusy(false);
@@ -5052,14 +5331,18 @@ function UnreadableMemoriesPanel({ status, onChange, onBusy }) {
                 <div style="color:var(--text-dim);">
                     ${result.recovered !== undefined
                         ? `✓ Recovered ${result.recovered} memor${result.recovered === 1 ? 'y' : 'ies'} — re-encrypted with your current key and queued for re-embedding.${remaining > 0 ? ` ${remaining} still unreadable — re-run with another old key.` : ''}`
-                        : `✓ Deprecated ${result.deprecated} unreadable memor${result.deprecated === 1 ? 'y' : 'ies'} — hidden from view.`}
-                    ${remaining > 0 && html`<button class="btn" style="font-size:11px;padding:4px 10px;margin-top:8px;" onClick=${() => { setResult(null); setMode('actions'); }}>Handle the remaining ${remaining} →</button>`}
+                        : result.submitted > result.deprecated
+                            ? `Submitted ${result.submitted} unreadable memor${result.submitted === 1 ? 'y' : 'ies'} for governed deprecation; ${result.deprecated} reached final deprecation in this request.${remaining > 0 ? ` ${remaining} remain visible to authorized recovery until the challenge policy resolves them.` : ''}`
+                            : `✓ Deprecated ${result.deprecated} unreadable memor${result.deprecated === 1 ? 'y' : 'ies'} — hidden from view.`}
+                    ${remaining > 0 && (result.continuationRequired
+                        ? html`<button class="btn" style="font-size:11px;padding:4px 10px;margin-top:8px;" disabled=${busy} onClick=${() => doDeprecate(result.nextCursor)}>Continue with the next safe batch →</button>`
+                        : html`<button class="btn" style="font-size:11px;padding:4px 10px;margin-top:8px;" onClick=${() => { setResult(null); setMode('actions'); }}>Handle the remaining ${remaining} →</button>`)}
                 </div>
             ` : mode === 'actions' ? html`
                 <div style="margin-bottom:8px;"><strong>${unreadable} memor${unreadable === 1 ? 'y' : 'ies'} couldn't be read.</strong> ${unreadable === 1 ? 'It was' : 'They were'} encrypted with a <em>previous</em> vault key.</div>
                 <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     <button class="btn btn-primary" style="font-size:12px;padding:6px 12px;" onClick=${() => { setMode('recover'); setErr(null); }}>Recover with an old key</button>
-                    <button class="btn" style="font-size:12px;padding:6px 12px;" onClick=${doDeprecate} disabled=${busy}>${busy ? 'Working…' : 'Deprecate (hide)'}</button>
+                    <button class="btn" style="font-size:12px;padding:6px 12px;" onClick=${() => doDeprecate()} disabled=${busy}>${busy ? 'Working…' : 'Deprecate (hide)'}</button>
                 </div>
                 <div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Recover re-reads them with an old recovery key and keeps everything (agent, dates, links). Deprecate just hides them — reversible, but the content stays unreadable.</div>
             ` : html`
@@ -7261,13 +7544,6 @@ function HealthBar() {
             <div class="health-item">
                 <span style="color: var(--text-muted)">uptime</span> ${formatUptime(uptimeSec)} <${PageHelp} section="cerebrum-view" label="Cerebrum guide" />
             </div>
-            ${partialProjection && html`
-                <div class="health-item health-projection-warning" role="alert">
-                    <div class="health-dot warning"></div>
-                    <strong>Available view</strong>
-                    <span>Some historical records are hidden; stored data is unchanged.</span>
-                </div>
-            `}
         </div>
     `;
 }
@@ -13158,8 +13434,8 @@ function OverviewPage({ sse }) {
     // report a consensus app version yet, so do not cry "behind" (amber) on it.
     // Only a real version below the v11 baseline is genuinely behind. During a
     // rolling activation the intermediate fork rungs remain neutral; the
-    // current protocol turns green only once the app-v24 gate is active.
-    const appVerTone = appVer === '24' ? 'healthy' : (appVerNum > 0 && appVerNum < 15 ? 'degraded' : 'neutral');
+    // current protocol turns green only once the mandatory app-v25 gate is active.
+    const appVerTone = appVer === '25' ? 'healthy' : (appVerNum > 0 && appVerNum < 15 ? 'degraded' : 'neutral');
     const appVerShown = (appVer && appVer !== '0') ? ('v' + appVer) : '--';
     const mempoolTxs = (chain && chain.mempool_txs != null) ? Number(chain.mempool_txs) : null;
     const mempoolHot = mempoolTxs != null && !isNaN(mempoolTxs) && mempoolTxs > 50;
@@ -13184,7 +13460,7 @@ function OverviewPage({ sse }) {
         tile(chain ? Number(chain.block_height || 0).toLocaleString() : '--', 'Block height', { color: '#10b981', title: 'Total blocks committed to the chain.' }),
         tile(fmtAge(blockElapsed), 'Last block age', { title: 'Time since the last committed block.', sub: chainIdle ? 'idle - not a stall' : '' }),
         tile(chain ? (chain.catching_up ? 'Catching up' : 'In sync') : '--', 'Sync state', { small: true, color: chain ? (chain.catching_up ? '#f59e0b' : '#10b981') : undefined }),
-        tile(appVerShown, 'App version', { small: true, color: appVerTone === 'healthy' ? '#10b981' : (appVerTone === 'degraded' ? '#f59e0b' : undefined), title: 'CometBFT app protocol version. Green when current (24).' }),
+        tile(appVerShown, 'App version', { small: true, color: appVerTone === 'healthy' ? '#10b981' : (appVerTone === 'degraded' ? '#f59e0b' : undefined), title: 'CometBFT app protocol version. Green when current (25).' }),
         tile(chainIdle ? 'Idle' : (blockRate ? blockRate.toFixed(1) + 's' : '--'), 'Block rate', { small: chainIdle, title: 'Seconds per block, derived client-side from height deltas.' }),
         tile(uptimeDisplay, 'Node uptime', { small: true, title: 'Time since this node process started.' }),
         tile(chain && chain.mempool_txs != null ? chain.mempool_txs : '--', 'Pending transactions', { color: mempoolHot ? '#f59e0b' : undefined, title: 'Unconfirmed transactions waiting in the mempool. Amber above 50 signals a backlog.' }),

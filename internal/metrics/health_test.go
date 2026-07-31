@@ -242,6 +242,19 @@ func TestReadiness_CanonicalMemoryProjectionFailsClosedUntilCompleteAudit(t *tes
 	}
 
 	status = CanonicalMemoryProjectionStatus{
+		Required: true,
+		State:    "checking",
+	}
+	code, body = readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "degraded" {
+		t.Fatalf("active background projection check must remain operational, got %d %v", code, body["status"])
+	}
+	code, body = readiness(t, h, "?strict=1")
+	if code != http.StatusServiceUnavailable || body["status"] != "degraded" {
+		t.Fatalf("strict readiness must gate an active projection check, got %d %v", code, body["status"])
+	}
+
+	status = CanonicalMemoryProjectionStatus{
 		Checked:          true,
 		Required:         true,
 		OK:               true,
@@ -267,7 +280,7 @@ func TestReadiness_CanonicalMemoryProjectionFailsClosedUntilCompleteAudit(t *tes
 	status = CanonicalMemoryProjectionStatus{
 		Checked:     true,
 		Required:    true,
-		OK:          false,
+		OK:          true,
 		State:       "quarantined",
 		Quarantined: true,
 	}
@@ -284,5 +297,94 @@ func TestReadiness_CanonicalMemoryProjectionFailsClosedUntilCompleteAudit(t *tes
 	code, body = readiness(t, h, "")
 	if code != http.StatusServiceUnavailable || body["status"] != "not_ready" {
 		t.Fatalf("request-local quarantine without a complete audit must be 503, got %d %v", code, body["status"])
+	}
+}
+
+func TestReadiness_AppV25MaintenanceRequiresCurrentProcessVerification(t *testing.T) {
+	h := NewHealthChecker()
+	h.SetPostgresHealth(true)
+	h.SetCometBFTHealth(true)
+
+	status := AppV25MaintenanceStatus{
+		Required: true,
+		State:    "checking",
+	}
+	h.SetAppV25MaintenanceProvider(func() AppV25MaintenanceStatus {
+		return status
+	})
+	code, body := readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "degraded" {
+		t.Fatalf("app-v25 maintenance warm-up must remain operational, got %d %v", code, body["status"])
+	}
+	code, body = readiness(t, h, "?strict=1")
+	if code != http.StatusServiceUnavailable || body["status"] != "degraded" {
+		t.Fatalf("strict readiness must gate app-v25 maintenance warm-up, got %d %v", code, body["status"])
+	}
+
+	status = AppV25MaintenanceStatus{
+		Checked:  true,
+		Required: true,
+		OK:       true,
+		State:    "complete",
+	}
+	code, body = readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "ready" {
+		t.Fatalf("verified app-v25 maintenance must recover readiness, got %d %v", code, body["status"])
+	}
+
+	status = AppV25MaintenanceStatus{
+		Checked:  true,
+		Required: true,
+		OK:       true,
+		Recovery: true,
+		State:    "recovery",
+	}
+	code, body = readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "degraded" {
+		t.Fatalf("preserved historical recovery rows must remain operational, got %d %v", code, body["status"])
+	}
+	code, body = readiness(t, h, "?strict=1")
+	if code != http.StatusServiceUnavailable || body["status"] != "degraded" {
+		t.Fatalf("strict readiness must surface recovery as degraded, got %d %v", code, body["status"])
+	}
+
+	for _, state := range []string{"migrating", "waiting", "attesting"} {
+		t.Run(state, func(t *testing.T) {
+			status = AppV25MaintenanceStatus{
+				Checked:  true,
+				Required: true,
+				OK:       true,
+				State:    state,
+			}
+			code, body = readiness(t, h, "")
+			if code != http.StatusOK || body["status"] != "degraded" {
+				t.Fatalf("stable %s maintenance must remain operational, got %d %v", state, code, body["status"])
+			}
+			code, body = readiness(t, h, "?strict=1")
+			if code != http.StatusServiceUnavailable || body["status"] != "degraded" {
+				t.Fatalf("strict readiness must reject %s maintenance, got %d %v", state, code, body["status"])
+			}
+		})
+	}
+
+	status = AppV25MaintenanceStatus{
+		Checked: true, Required: true, OK: true, State: "migrating",
+	}
+	h.SetCanonicalMemoryProjectionProvider(func() CanonicalMemoryProjectionStatus {
+		return CanonicalMemoryProjectionStatus{
+			Checked: false, Required: true, OK: false, State: "failed",
+		}
+	})
+	code, body = readiness(t, h, "")
+	if code != http.StatusServiceUnavailable || body["status"] != "not_ready" {
+		t.Fatalf("maintenance degradation must not mask a hard projection failure, got %d %v", code, body["status"])
+	}
+
+	status = AppV25MaintenanceStatus{
+		Required: true, State: "checking",
+	}
+	code, body = readiness(t, h, "")
+	if code != http.StatusServiceUnavailable || body["status"] != "not_ready" {
+		t.Fatalf("maintenance warm-up must not mask a hard projection failure, got %d %v", code, body["status"])
 	}
 }

@@ -48,6 +48,15 @@ func Evaluate(
 	if enrollment == nil || !enrollment.Active {
 		return Decision{}, nil
 	}
+	recoveredDirect, recoveredErr := badgerStore.AuthorizeAppV25RecoveredDirectRead(
+		credentialID, record.Domain,
+	)
+	if recoveredErr != nil {
+		return Decision{}, recoveredErr
+	}
+	if recoveredDirect {
+		return Decision{Allowed: record.Classification <= enrollment.Clearance}, nil
+	}
 
 	visibleAgents, restricted, err := badgerStore.AppV23LegacyVisibleAgents(policyID)
 	if err != nil {
@@ -83,9 +92,6 @@ func Evaluate(
 	if err != nil {
 		return Decision{}, err
 	}
-	if legacy.ExplicitDomainRestriction && !legacy.Allowed {
-		return Decision{}, nil
-	}
 	if record.Classification > enrollment.Clearance {
 		// Migration-only org/federation clearance may preserve exactly the H-1
 		// local read envelope even when the new enrollment slot is lower.
@@ -105,16 +111,23 @@ func Evaluate(
 	if current.ExplicitDeny {
 		return Decision{}, nil
 	}
-	currentAllowed := current.Allowed
-	if !currentAllowed {
-		currentAllowed, err = badgerStore.HasAppV23AccessOrAncestor(
+	policyAllowed := current.Allowed
+	grantAllowed := false
+	if !policyAllowed {
+		grantAllowed, err = badgerStore.HasAppV23AccessOrAncestor(
 			record.Domain, credentialID, 1, at, shared,
 		)
 		if err != nil {
 			return Decision{}, err
 		}
 	}
-	return Decision{Allowed: currentAllowed || legacy.Allowed}, nil
+	if legacy.ExplicitDomainRestriction && !legacy.Allowed {
+		// A frozen explicit allowlist continues to restrict ordinary grants. It
+		// cannot, however, make a directly governed recovered-domain owner,
+		// continuity writer/group member, Admin, or Root write-only.
+		return Decision{}, nil
+	}
+	return Decision{Allowed: policyAllowed || grantAllowed || legacy.Allowed}, nil
 }
 
 func policyPrincipal(

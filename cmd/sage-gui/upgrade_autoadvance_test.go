@@ -33,7 +33,7 @@ func TestPickAutoAdvanceTarget(t *testing.T) {
 }
 
 func TestPersonalAutoAdvanceCeilingHonorsMandatoryFloor(t *testing.T) {
-	const maxV = uint64(24)
+	const maxV = uint64(25)
 
 	assert.Equal(t, uint64(0), personalAutoAdvanceCeiling(upgradeWatchdogConfig{
 		PersonalMode: false, AutoAdvance: true, RequiredAppVersion: 24,
@@ -41,12 +41,12 @@ func TestPersonalAutoAdvanceCeilingHonorsMandatoryFloor(t *testing.T) {
 	assert.Equal(t, maxV, personalAutoAdvanceCeiling(upgradeWatchdogConfig{
 		PersonalMode: true, AutoAdvance: true, RequiredAppVersion: 24,
 	}, maxV), "ordinary personal auto-advance reaches the binary ceiling")
-	assert.Equal(t, uint64(24), personalAutoAdvanceCeiling(upgradeWatchdogConfig{
-		PersonalMode: true, AutoAdvance: false, RequiredAppVersion: 24,
-	}, maxV), "disable_auto_upgrade cannot strand this release on app-v23's broken lifecycle")
 	assert.Equal(t, maxV, personalAutoAdvanceCeiling(upgradeWatchdogConfig{
-		PersonalMode: true, AutoAdvance: false, RequiredAppVersion: 25,
-	}, maxV), "a malformed future floor never exceeds compiled support")
+		PersonalMode: true, AutoAdvance: false, RequiredAppVersion: 24,
+	}, maxV), "disable_auto_upgrade cannot suppress consensus migrations")
+	assert.Equal(t, maxV, personalAutoAdvanceCeiling(upgradeWatchdogConfig{
+		PersonalMode: true, AutoAdvance: false, RequiredAppVersion: 26,
+	}, maxV), "personal nodes always stop at compiled support")
 }
 
 // scriptedCommitRPC scripts /broadcast_tx_commit responses for outcome

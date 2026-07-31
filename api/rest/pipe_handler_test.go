@@ -645,6 +645,20 @@ func TestHandlePipeResult_ForeignWorkNeverAutoJournals(t *testing.T) {
 	assert.Zero(t, stats.ByDomain["agent-pipeline"], "foreign pipeline content must never enter memory")
 }
 
+func TestAppV23LocalPipeCompletionNeverCreatesOffConsensusMemory(t *testing.T) {
+	s, _ := newPipeServer(t)
+	local := &store.PipelineMessage{PipeID: "pipe-local"}
+	require.True(t, s.shouldAutoJournalPipeline(local),
+		"legacy nodes retain their compatibility journal")
+
+	s.SetPostV23ForNextTxAccessor(func() bool { return true })
+	require.False(t, s.shouldAutoJournalPipeline(local),
+		"governed nodes must not insert a SQL-only memory without a canonical envelope")
+	require.False(t, s.shouldAutoJournalPipeline(&store.PipelineMessage{
+		PipeID: "pipe-foreign", SourceChainID: "peer",
+	}))
+}
+
 func TestHandlePipeResult_LocalJournalDoesNotLaunderAgentPromptInjection(t *testing.T) {
 	s, memStore := newPipeServer(t)
 	ctx := context.Background()

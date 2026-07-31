@@ -62,6 +62,16 @@ const (
 	// encoding/digest. Admission is restricted to the current Root credential
 	// acting through an active validator, and validators must vote explicitly.
 	OpMemoryHashReanchor ProposalOp = 9
+	// OpMemoryLegacyAdopt (app-v25) installs canonical envelopes for a bounded
+	// set of terminal memories that validators independently verified from
+	// their local legacy projections. It is current-Root authorized, requires
+	// explicit validator votes, and never carries memory plaintext.
+	OpMemoryLegacyAdopt ProposalOp = 10
+	// OpDomainContinuityAdopt (app-v25) restores only exact pre-upgrade local
+	// (agent, domain) authority independently attested from historical terminal
+	// memories. One writer becomes owner; multiple writers become a local
+	// shared group. It never admits federated or post-upgrade identities.
+	OpDomainContinuityAdopt ProposalOp = 11
 )
 
 // ProposalStatus represents the current state of a governance proposal.

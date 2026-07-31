@@ -41,6 +41,59 @@ func NewEngine(store GovStore, validators ValidatorProvider) *Engine {
 	return &Engine{store: store, validators: validators}
 }
 
+func isAppV25MaintenanceOperation(op ProposalOp) bool {
+	return op == OpMemoryLegacyAdopt || op == OpDomainContinuityAdopt
+}
+
+// MaintenanceRejectionReceiptKey is the AppHash-covered terminal receipt for
+// one exact evidence-bound app-v25 target. The target is hashed so state-sync
+// key inventories do not disclose domain or migration identifiers.
+func MaintenanceRejectionReceiptKey(op ProposalOp, targetID string) string {
+	if !isAppV25MaintenanceOperation(op) || targetID == "" {
+		return ""
+	}
+	digest := sha256.New()
+	_, _ = digest.Write([]byte("sage/app-v25/maintenance-rejection/v1\x00"))
+	_, _ = digest.Write([]byte{byte(op)})
+	_, _ = digest.Write([]byte(targetID))
+	return "gov:maintenance-rejected:" + hex.EncodeToString(digest.Sum(nil))
+}
+
+func (e *Engine) recordMaintenanceRejection(proposal *ProposalState) error {
+	if proposal == nil {
+		return nil
+	}
+	key := MaintenanceRejectionReceiptKey(proposal.Operation, proposal.TargetID)
+	if key == "" {
+		return nil
+	}
+	if err := e.store.SetState(key, []byte(proposal.ProposalID)); err != nil {
+		return fmt.Errorf("record terminal maintenance rejection: %w", err)
+	}
+	return nil
+}
+
+// clearTerminalMaintenanceVotes bounds AppHash-covered state created by the
+// automatic app-v25 repair lanes. The terminal proposal record remains the
+// durable audit receipt; individual ballots are needed only while voting.
+// Ordinary governance retains its historical vote records unchanged.
+func (e *Engine) clearTerminalMaintenanceVotes(proposal *ProposalState) error {
+	if proposal == nil || !isAppV25MaintenanceOperation(proposal.Operation) {
+		return nil
+	}
+	prefix := "gov:vote:" + proposal.ProposalID + ":"
+	keys, err := e.store.PrefixKeys(prefix)
+	if err != nil {
+		return fmt.Errorf("scan terminal maintenance votes: %w", err)
+	}
+	for _, key := range keys {
+		if err := e.store.DeleteState(key); err != nil {
+			return fmt.Errorf("clear terminal maintenance vote %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
 // ValidateValidatorOperationV20 applies the strict validator-set invariants
 // introduced by app-v20 without changing the replay behavior of Engine.Propose
 // for historical blocks. The ABCI layer additionally validates that targetID is
@@ -146,6 +199,14 @@ func ComputeProposalID(proposerID string, height int64, op ProposalOp, targetID 
 // CheckProposerEligibility is factored out so deterministic proposal selection
 // can ask the exact same active-slot/cooldown question without mutating state.
 func (e *Engine) CheckProposerEligibility(proposerID string, height int64) error {
+	return e.checkProposerEligibility(proposerID, height, true)
+}
+
+func (e *Engine) checkProposerEligibility(
+	proposerID string,
+	height int64,
+	enforceCooldown bool,
+) error {
 	// Check no active proposal exists.
 	active, err := e.store.GetState("gov:active")
 	if err != nil {
@@ -153,6 +214,10 @@ func (e *Engine) CheckProposerEligibility(proposerID string, height int64) error
 	}
 	if active != nil {
 		return fmt.Errorf("an active proposal already exists: %s", string(active))
+	}
+
+	if !enforceCooldown {
+		return nil
 	}
 
 	// Check proposer cooldown.
@@ -177,7 +242,7 @@ func (e *Engine) CheckProposerEligibility(proposerID string, height int64) error
 // verbatim on the proposal record so the executing tx (e.g. DomainReassign)
 // can verify body-vs-proposal parity. Pass nil for legacy validator-set ops.
 func (e *Engine) Propose(proposerID string, op ProposalOp, targetID string, targetPubKey []byte, targetPower int64, expiryBlocks int64, reason string, height int64, payload []byte) (string, error) {
-	return e.propose(proposerID, op, targetID, targetPubKey, targetPower, expiryBlocks, reason, height, payload, true)
+	return e.propose(proposerID, op, targetID, targetPubKey, targetPower, expiryBlocks, reason, height, payload, true, true)
 }
 
 // ProposeWithoutAutoVote creates a proposal without recording the historical
@@ -188,11 +253,70 @@ func (e *Engine) Propose(proposerID string, op ProposalOp, targetID string, targ
 // historical governance results and AppHashes. This opt-in method gives new
 // operations a replay-neutral explicit-vote path.
 func (e *Engine) ProposeWithoutAutoVote(proposerID string, op ProposalOp, targetID string, targetPubKey []byte, targetPower int64, expiryBlocks int64, reason string, height int64, payload []byte) (string, error) {
-	return e.propose(proposerID, op, targetID, targetPubKey, targetPower, expiryBlocks, reason, height, payload, false)
+	return e.propose(proposerID, op, targetID, targetPubKey, targetPower, expiryBlocks, reason, height, payload, false, true)
 }
 
-func (e *Engine) propose(proposerID string, op ProposalOp, targetID string, targetPubKey []byte, targetPower int64, expiryBlocks int64, reason string, height int64, payload []byte, autoVote bool) (string, error) {
-	if err := e.CheckProposerEligibility(proposerID, height); err != nil {
+// ProposeMemoryLegacyAdoption is the app-v25 maintenance lane. Its operation is
+// hard-coded so callers cannot use the expedited lane for any other governance
+// mutation. It retains the global active-proposal singleton and explicit
+// validator voting, but does not consume or consult the ordinary human-review
+// proposer cooldown.
+func (e *Engine) ProposeMemoryLegacyAdoption(
+	proposerID string,
+	targetID string,
+	targetPubKey []byte,
+	targetPower int64,
+	expiryBlocks int64,
+	reason string,
+	height int64,
+	payload []byte,
+) (string, error) {
+	return e.propose(
+		proposerID,
+		OpMemoryLegacyAdopt,
+		targetID,
+		targetPubKey,
+		targetPower,
+		expiryBlocks,
+		reason,
+		height,
+		payload,
+		false,
+		false,
+	)
+}
+
+// ProposeDomainContinuityAdoption is the second operation-bound app-v25
+// maintenance lane. It retains explicit validator voting and the global active
+// singleton while avoiding an ordinary human-review cooldown between hundreds
+// of deterministic migration domains.
+func (e *Engine) ProposeDomainContinuityAdoption(
+	proposerID string,
+	targetID string,
+	targetPubKey []byte,
+	targetPower int64,
+	expiryBlocks int64,
+	reason string,
+	height int64,
+	payload []byte,
+) (string, error) {
+	return e.propose(
+		proposerID,
+		OpDomainContinuityAdopt,
+		targetID,
+		targetPubKey,
+		targetPower,
+		expiryBlocks,
+		reason,
+		height,
+		payload,
+		false,
+		false,
+	)
+}
+
+func (e *Engine) propose(proposerID string, op ProposalOp, targetID string, targetPubKey []byte, targetPower int64, expiryBlocks int64, reason string, height int64, payload []byte, autoVote, enforceCooldown bool) (string, error) {
+	if err := e.checkProposerEligibility(proposerID, height, enforceCooldown); err != nil {
 		return "", err
 	}
 
@@ -285,12 +409,14 @@ func (e *Engine) propose(proposerID string, op ProposalOp, targetID string, targ
 		}
 	}
 
-	// Set proposer cooldown.
-	cooldownKey := "gov:cooldown:" + proposerID
-	cooldownVal := make([]byte, 8)
-	binary.BigEndian.PutUint64(cooldownVal, uint64(height))
-	if err := e.store.SetState(cooldownKey, cooldownVal); err != nil {
-		return "", fmt.Errorf("set cooldown: %w", err)
+	if enforceCooldown {
+		// Set proposer cooldown.
+		cooldownKey := "gov:cooldown:" + proposerID
+		cooldownVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(cooldownVal, uint64(height))
+		if err := e.store.SetState(cooldownKey, cooldownVal); err != nil {
+			return "", fmt.Errorf("set cooldown: %w", err)
+		}
 	}
 
 	return proposalID, nil
@@ -349,6 +475,26 @@ func (e *Engine) Vote(proposalID string, voterID string, decision string, height
 
 // Cancel cancels the active proposal. Only the proposer can cancel.
 func (e *Engine) Cancel(proposalID string, cancellerID string, height int64) error {
+	return e.cancel(proposalID, cancellerID, height, false)
+}
+
+// CancelMemoryLegacyAdoption cancels only the hard-coded app-v25 maintenance
+// operation and does not consume the ordinary proposer cooldown. The proposer
+// identity and global active-proposal checks remain unchanged.
+func (e *Engine) CancelMemoryLegacyAdoption(
+	proposalID string,
+	cancellerID string,
+	height int64,
+) error {
+	return e.cancel(proposalID, cancellerID, height, true)
+}
+
+func (e *Engine) cancel(
+	proposalID string,
+	cancellerID string,
+	height int64,
+	memoryLegacyAdoption bool,
+) error {
 	// Load active proposal.
 	active, err := e.store.GetState("gov:active")
 	if err != nil {
@@ -365,6 +511,13 @@ func (e *Engine) Cancel(proposalID string, cancellerID string, height int64) err
 	if err != nil {
 		return err
 	}
+	if memoryLegacyAdoption && proposal.Operation != OpMemoryLegacyAdopt {
+		return fmt.Errorf(
+			"proposal %s is operation %d, not memory legacy adoption",
+			proposalID,
+			proposal.Operation,
+		)
+	}
 
 	// Only proposer can cancel.
 	if proposal.ProposerID != cancellerID {
@@ -376,17 +529,22 @@ func (e *Engine) Cancel(proposalID string, cancellerID string, height int64) err
 	if err := e.saveProposal(proposal); err != nil {
 		return err
 	}
+	if err := e.clearTerminalMaintenanceVotes(proposal); err != nil {
+		return err
+	}
 
 	// Clear active.
 	if err := e.store.DeleteState("gov:active"); err != nil {
 		return fmt.Errorf("clear active: %w", err)
 	}
 
-	// Set cooldown for proposer.
-	cooldownVal := make([]byte, 8)
-	binary.BigEndian.PutUint64(cooldownVal, uint64(height))
-	if err := e.store.SetState("gov:cooldown:"+cancellerID, cooldownVal); err != nil {
-		return fmt.Errorf("set cooldown: %w", err)
+	if !memoryLegacyAdoption {
+		// Set cooldown for proposer.
+		cooldownVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(cooldownVal, uint64(height))
+		if err := e.store.SetState("gov:cooldown:"+cancellerID, cooldownVal); err != nil {
+			return fmt.Errorf("set cooldown: %w", err)
+		}
 	}
 
 	return nil
@@ -397,7 +555,7 @@ func (e *Engine) Cancel(proposalID string, cancellerID string, height int64) err
 // If expired, the proposal is marked expired.
 // Returns the executed proposal if one was executed, nil otherwise.
 func (e *Engine) ProcessBlock(height int64) (*ProposalState, error) {
-	executed, _, err := e.processBlock(height, nil, nil)
+	executed, _, err := e.processBlock(height, nil, nil, false)
 	return executed, err
 }
 
@@ -408,7 +566,7 @@ func (e *Engine) ProcessBlock(height int64) (*ProposalState, error) {
 // method never classifies validation failures as terminal; callers that need
 // that behavior must opt in through ProcessBlockValidatedWithInvalidation.
 func (e *Engine) ProcessBlockValidated(height int64, preExecute func(*ProposalState) error) (*ProposalState, error) {
-	executed, _, err := e.processBlock(height, preExecute, nil)
+	executed, _, err := e.processBlock(height, preExecute, nil, false)
 	return executed, err
 }
 
@@ -424,13 +582,26 @@ func (e *Engine) ProcessBlockValidatedWithInvalidation(
 	preExecute func(*ProposalState) error,
 	invalidate func(*ProposalState, error) bool,
 ) (executed *ProposalState, invalidated *ProposalState, err error) {
-	return e.processBlock(height, preExecute, invalidate)
+	return e.processBlock(height, preExecute, invalidate, false)
+}
+
+// ProcessBlockValidatedWithMemoryLegacyAdoption is the app-v25 maintenance
+// execution path. Only the two operation-bound app-v25 repair ops may bypass
+// MinVotingBlocks; every ordinary active operation retains the historical
+// waiting period.
+func (e *Engine) ProcessBlockValidatedWithMemoryLegacyAdoption(
+	height int64,
+	preExecute func(*ProposalState) error,
+	invalidate func(*ProposalState, error) bool,
+) (executed *ProposalState, invalidated *ProposalState, err error) {
+	return e.processBlock(height, preExecute, invalidate, true)
 }
 
 func (e *Engine) processBlock(
 	height int64,
 	preExecute func(*ProposalState) error,
 	invalidate func(*ProposalState, error) bool,
+	allowImmediateMemoryLegacyAdoption bool,
 ) (executed *ProposalState, invalidated *ProposalState, err error) {
 	// Load active proposal.
 	active, err := e.store.GetState("gov:active")
@@ -453,6 +624,9 @@ func (e *Engine) processBlock(
 		if saveErr := e.saveProposal(proposal); saveErr != nil {
 			return nil, nil, saveErr
 		}
+		if clearErr := e.clearTerminalMaintenanceVotes(proposal); clearErr != nil {
+			return nil, nil, clearErr
+		}
 		if clearErr := e.store.DeleteState("gov:active"); clearErr != nil {
 			return nil, nil, fmt.Errorf("clear active: %w", clearErr)
 		}
@@ -460,7 +634,13 @@ func (e *Engine) processBlock(
 	}
 
 	// Enforce MinVotingBlocks (skip for single validator).
-	if height < proposal.CreatedHeight+MinVotingBlocks && e.validators.Size() > 1 {
+	immediateMemoryLegacyAdoption :=
+		allowImmediateMemoryLegacyAdoption &&
+			(proposal.Operation == OpMemoryLegacyAdopt ||
+				proposal.Operation == OpDomainContinuityAdopt)
+	if height < proposal.CreatedHeight+MinVotingBlocks &&
+		e.validators.Size() > 1 &&
+		!immediateMemoryLegacyAdoption {
 		return nil, nil, nil
 	}
 
@@ -498,6 +678,12 @@ func (e *Engine) processBlock(
 					if saveErr := e.saveProposal(proposal); saveErr != nil {
 						return nil, nil, saveErr
 					}
+					if receiptErr := e.recordMaintenanceRejection(proposal); receiptErr != nil {
+						return nil, nil, receiptErr
+					}
+					if clearErr := e.clearTerminalMaintenanceVotes(proposal); clearErr != nil {
+						return nil, nil, clearErr
+					}
 					if clearErr := e.store.DeleteState("gov:active"); clearErr != nil {
 						return nil, nil, fmt.Errorf("clear active: %w", clearErr)
 					}
@@ -510,6 +696,9 @@ func (e *Engine) processBlock(
 		if err := e.saveProposal(proposal); err != nil {
 			return nil, nil, err
 		}
+		if err := e.clearTerminalMaintenanceVotes(proposal); err != nil {
+			return nil, nil, err
+		}
 		if err := e.store.DeleteState("gov:active"); err != nil {
 			return nil, nil, fmt.Errorf("clear active: %w", err)
 		}
@@ -519,6 +708,12 @@ func (e *Engine) processBlock(
 	if rejected {
 		proposal.Status = StatusRejected
 		if err := e.saveProposal(proposal); err != nil {
+			return nil, nil, err
+		}
+		if err := e.recordMaintenanceRejection(proposal); err != nil {
+			return nil, nil, err
+		}
+		if err := e.clearTerminalMaintenanceVotes(proposal); err != nil {
 			return nil, nil, err
 		}
 		if err := e.store.DeleteState("gov:active"); err != nil {

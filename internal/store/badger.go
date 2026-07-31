@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -151,6 +152,21 @@ type BadgerStore struct {
 	// canonicalMemoryProjectionHealth is process-local readiness state shared by
 	// ordinary and transaction-scoped handles. It never enters Badger/AppHash.
 	canonicalMemoryProjectionHealth *canonicalMemoryProjectionHealthTracker
+	// canonicalMemoryProjectionRevision is a process-local invalidation token
+	// for CEREBRUM's audited SQL/Badger projection snapshot. Unlike Badger's
+	// global MaxVersion it advances only when a canonical memory disclosure
+	// envelope changes, so empty blocks and unrelated RBAC/federation writes do
+	// not continuously invalidate a hot dashboard cache.
+	canonicalMemoryProjectionRevision *atomic.Uint64
+	canonicalMemoryProjectionMutated  bool
+	// graphAuthorizationRevision invalidates graph bytes whose RBAC scope or
+	// Root-author labels were derived from mutable authorization state.
+	graphAuthorizationRevision *atomic.Uint64
+	graphAuthorizationMutated  bool
+	// standaloneProjectionPublicationGate makes the mutation flags below
+	// transaction-local for ordinary one-shot Badger updates. Publication occurs
+	// only after DB.Update reports a successful commit.
+	projectionPublicationGate *sync.RWMutex
 
 	// Startup index repair is constructor-local, but the exported Ensure
 	// methods remain safe if an operator tool calls them concurrently. The
@@ -204,7 +220,29 @@ func (s *BadgerStore) view(fn func(*badger.Txn) error) error {
 // of those boundaries becomes durable until CommitConsensusTransaction.
 func (s *BadgerStore) update(fn func(*badger.Txn) error) error {
 	if s.txn == nil {
-		return s.db.Update(fn)
+		if s.projectionPublicationGate != nil {
+			s.projectionPublicationGate.Lock()
+			defer s.projectionPublicationGate.Unlock()
+		}
+		s.canonicalMemoryProjectionMutated = false
+		s.graphAuthorizationMutated = false
+		err := s.db.Update(fn)
+		if err != nil {
+			s.canonicalMemoryProjectionMutated = false
+			s.graphAuthorizationMutated = false
+			return err
+		}
+		if s.canonicalMemoryProjectionMutated &&
+			s.canonicalMemoryProjectionRevision != nil {
+			s.canonicalMemoryProjectionRevision.Add(1)
+		}
+		if s.graphAuthorizationMutated &&
+			s.graphAuthorizationRevision != nil {
+			s.graphAuthorizationRevision.Add(1)
+		}
+		s.canonicalMemoryProjectionMutated = false
+		s.graphAuthorizationMutated = false
+		return nil
 	}
 	if s.poisoned != nil {
 		return s.poisoned
@@ -245,6 +283,12 @@ func (s *BadgerStore) txnSet(txn *badger.Txn, key, value []byte) error {
 		}
 	}
 	err := txn.Set(key, value)
+	if err == nil && isCanonicalMemoryProjectionKey(key) {
+		s.canonicalMemoryProjectionMutated = true
+	}
+	if err == nil && isGraphAuthorizationKey(key) {
+		s.graphAuthorizationMutated = true
+	}
 	if s.txn != nil {
 		if err != nil {
 			s.writeFailed = true
@@ -266,6 +310,12 @@ func (s *BadgerStore) txnDelete(txn *badger.Txn, key []byte) error {
 		}
 	}
 	err := txn.Delete(key)
+	if err == nil && isCanonicalMemoryProjectionKey(key) {
+		s.canonicalMemoryProjectionMutated = true
+	}
+	if err == nil && isGraphAuthorizationKey(key) {
+		s.graphAuthorizationMutated = true
+	}
 	if s.txn != nil {
 		if err != nil {
 			s.writeFailed = true
@@ -276,6 +326,80 @@ func (s *BadgerStore) txnDelete(txn *badger.Txn, key []byte) error {
 	return err
 }
 
+func isCanonicalMemoryProjectionKey(key []byte) bool {
+	for _, prefix := range [][]byte{
+		[]byte("memory:"),
+		[]byte("memdomain:"),
+		[]byte("memauthor:"),
+		[]byte("memauthorprincipal:"),
+		[]byte("memheight:"),
+		[]byte("mem_class:"),
+		[]byte("cocommit:core:"),
+		[]byte("cocommit:shared:"),
+	} {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGraphAuthorizationKey(key []byte) bool {
+	if bytes.HasPrefix(key, []byte("state:shared_domain:")) {
+		return true
+	}
+	for _, prefix := range [][]byte{
+		[]byte("appv23:"),
+		[]byte("appv25:domain_continuity"),
+		[]byte("agent:"),
+		[]byte("domain:"),
+		[]byte("grant:"),
+		[]byte("org:"),
+		[]byte("orgmember:"),
+		[]byte("agentorg:"),
+		[]byte("agentorgmember:"),
+		[]byte("dept:"),
+		[]byte("deptmember:"),
+		[]byte("agentdept:"),
+		[]byte("federation:"),
+	} {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// CanonicalMemoryProjectionRevision returns the process-local revision used to
+// bind an audited CEREBRUM snapshot to the exact canonical memory envelope
+// generation that produced it. It deliberately excludes unrelated consensus
+// state.
+func (s *BadgerStore) CanonicalMemoryProjectionRevision() uint64 {
+	if s == nil || s.canonicalMemoryProjectionRevision == nil {
+		return 0
+	}
+	return s.canonicalMemoryProjectionRevision.Load()
+}
+
+// GraphAuthorizationRevision binds cached graph bytes to the exact Root/RBAC
+// generation used for caller scope and author labels.
+func (s *BadgerStore) GraphAuthorizationRevision() uint64 {
+	if s == nil || s.graphAuthorizationRevision == nil {
+		return 0
+	}
+	return s.graphAuthorizationRevision.Load()
+}
+
+// LockProjectionPublicationRead holds canonical memory and authorization state
+// stable across a cache-token read and response publication.
+func (s *BadgerStore) LockProjectionPublicationRead() func() {
+	if s == nil || s.projectionPublicationGate == nil {
+		return func() {}
+	}
+	s.projectionPublicationGate.RLock()
+	return s.projectionPublicationGate.RUnlock
+}
+
 // BeginConsensusTransaction returns a clone whose complete typed read/write
 // surface shares one Badger write transaction. The caller must eventually call
 // CommitConsensusTransaction or DiscardConsensusTransaction on the clone.
@@ -284,17 +408,20 @@ func (s *BadgerStore) BeginConsensusTransaction(mutationHook func(int)) *BadgerS
 		panic("store: nested consensus transaction")
 	}
 	return &BadgerStore{
-		db:                              s.db,
-		domainOwnershipGate:             s.domainOwnershipGate,
-		appV23MigrationMu:               s.appV23MigrationMu,
-		appV23StageFaultHook:            s.appV23StageFaultHook,
-		authorizationMutationHooks:      s.authorizationMutationHooks,
-		canonicalMemoryProjectionHealth: s.canonicalMemoryProjectionHealth,
-		txn:                             s.db.NewTransaction(true),
-		mutationHook:                    mutationHook,
-		domainOwnershipMutated:          false,
-		authorizationMutated:            false,
-		authorizationPeers:              make(map[string]struct{}),
+		db:                                s.db,
+		domainOwnershipGate:               s.domainOwnershipGate,
+		appV23MigrationMu:                 s.appV23MigrationMu,
+		appV23StageFaultHook:              s.appV23StageFaultHook,
+		authorizationMutationHooks:        s.authorizationMutationHooks,
+		canonicalMemoryProjectionHealth:   s.canonicalMemoryProjectionHealth,
+		canonicalMemoryProjectionRevision: s.canonicalMemoryProjectionRevision,
+		graphAuthorizationRevision:        s.graphAuthorizationRevision,
+		projectionPublicationGate:         s.projectionPublicationGate,
+		txn:                               s.db.NewTransaction(true),
+		mutationHook:                      mutationHook,
+		domainOwnershipMutated:            false,
+		authorizationMutated:              false,
+		authorizationPeers:                make(map[string]struct{}),
 	}
 }
 
@@ -363,12 +490,15 @@ func (s *BadgerStore) WithOrderedPublicationBarrier(
 	// non-transactional nested handle; the outer function already owns the
 	// publication and authorization locks.
 	scoped := &BadgerStore{
-		db:                              s.db,
-		domainOwnershipGate:             nil,
-		authorizationMutationHooks:      &authorizationMutationHookState{},
-		appV23MigrationMu:               s.appV23MigrationMu,
-		appV23StageFaultHook:            s.appV23StageFaultHook,
-		canonicalMemoryProjectionHealth: s.canonicalMemoryProjectionHealth,
+		db:                                s.db,
+		domainOwnershipGate:               nil,
+		authorizationMutationHooks:        &authorizationMutationHookState{},
+		appV23MigrationMu:                 s.appV23MigrationMu,
+		appV23StageFaultHook:              s.appV23StageFaultHook,
+		canonicalMemoryProjectionHealth:   s.canonicalMemoryProjectionHealth,
+		canonicalMemoryProjectionRevision: s.canonicalMemoryProjectionRevision,
+		graphAuthorizationRevision:        s.graphAuthorizationRevision,
+		projectionPublicationGate:         s.projectionPublicationGate,
 	}
 	return fn(scoped)
 }
@@ -527,10 +657,24 @@ func (s *BadgerStore) CommitConsensusTransactionWithPublication(
 			return err
 		}
 	}
+	if s.projectionPublicationGate != nil {
+		s.projectionPublicationGate.Lock()
+		defer s.projectionPublicationGate.Unlock()
+	}
 	if err := s.txn.Commit(); err != nil {
 		return err
 	}
 	s.txn = nil
+	if s.canonicalMemoryProjectionMutated &&
+		s.canonicalMemoryProjectionRevision != nil {
+		s.canonicalMemoryProjectionRevision.Add(1)
+		s.canonicalMemoryProjectionMutated = false
+	}
+	if s.graphAuthorizationMutated &&
+		s.graphAuthorizationRevision != nil {
+		s.graphAuthorizationRevision.Add(1)
+		s.graphAuthorizationMutated = false
+	}
 	// The normal SaveState path has the same durability contract. A successful
 	// app-v20 Commit must not return until the transaction containing every
 	// FinalizeBlock mutation and the handshake tuple has crossed Badger's Sync
@@ -591,11 +735,14 @@ func NewBadgerStore(path string) (*BadgerStore, error) {
 	}
 
 	store := &BadgerStore{
-		db:                              db,
-		domainOwnershipGate:             &sync.RWMutex{},
-		appV23MigrationMu:               &sync.Mutex{},
-		authorizationMutationHooks:      &authorizationMutationHookState{},
-		canonicalMemoryProjectionHealth: newCanonicalMemoryProjectionHealthTracker(),
+		db:                                db,
+		domainOwnershipGate:               &sync.RWMutex{},
+		appV23MigrationMu:                 &sync.Mutex{},
+		authorizationMutationHooks:        &authorizationMutationHookState{},
+		canonicalMemoryProjectionHealth:   newCanonicalMemoryProjectionHealthTracker(),
+		canonicalMemoryProjectionRevision: &atomic.Uint64{},
+		graphAuthorizationRevision:        &atomic.Uint64{},
+		projectionPublicationGate:         &sync.RWMutex{},
 	}
 
 	// Backfill the multi-org agent→orgs reverse index from the authoritative
@@ -633,8 +780,11 @@ func OpenBadgerStoreReadOnly(path string) (*BadgerStore, error) {
 	}
 	return &BadgerStore{
 		db: db, domainOwnershipGate: &sync.RWMutex{},
-		authorizationMutationHooks:      &authorizationMutationHookState{},
-		canonicalMemoryProjectionHealth: newCanonicalMemoryProjectionHealthTracker(),
+		authorizationMutationHooks:        &authorizationMutationHookState{},
+		canonicalMemoryProjectionHealth:   newCanonicalMemoryProjectionHealthTracker(),
+		canonicalMemoryProjectionRevision: &atomic.Uint64{},
+		graphAuthorizationRevision:        &atomic.Uint64{},
+		projectionPublicationGate:         &sync.RWMutex{},
 	}, nil
 }
 
@@ -662,8 +812,11 @@ func OpenBadgerStoreWithoutMigrations(path string) (*BadgerStore, error) {
 	}
 	return &BadgerStore{
 		db: db, domainOwnershipGate: &sync.RWMutex{},
-		authorizationMutationHooks:      &authorizationMutationHookState{},
-		canonicalMemoryProjectionHealth: newCanonicalMemoryProjectionHealthTracker(),
+		authorizationMutationHooks:        &authorizationMutationHookState{},
+		canonicalMemoryProjectionHealth:   newCanonicalMemoryProjectionHealthTracker(),
+		canonicalMemoryProjectionRevision: &atomic.Uint64{},
+		graphAuthorizationRevision:        &atomic.Uint64{},
+		projectionPublicationGate:         &sync.RWMutex{},
 	}, nil
 }
 
@@ -1629,6 +1782,102 @@ func validatorDomainStatsKey(validatorID, domain string) []byte {
 // contentHash+status, not the domain.
 func memoryDomainKey(memoryID string) []byte {
 	return []byte("memdomain:" + memoryID)
+}
+
+func memorySubmissionHeightKey(memoryID string) []byte {
+	return []byte("memheight:" + memoryID)
+}
+
+// SetMemorySubmissionHeight records the consensus height for memories first
+// accepted under app-v25. Historical memories intentionally have no marker,
+// giving the continuity migration a deterministic cutoff that cannot be
+// expanded by writes racing the background inventory.
+func (s *BadgerStore) SetMemorySubmissionHeight(memoryID string, height int64) error {
+	if memoryID == "" || height <= 0 {
+		return errors.New("memory submission height requires identity and positive height")
+	}
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(height)) // #nosec G115 -- positive int64
+	return s.update(func(txn *badger.Txn) error {
+		key := memorySubmissionHeightKey(memoryID)
+		item, err := txn.Get(key)
+		if err == nil {
+			return item.Value(func(value []byte) error {
+				if len(value) != len(encoded) ||
+					!bytes.Equal(value, encoded[:]) {
+					return errors.New("memory submission height is immutable")
+				}
+				return nil
+			})
+		}
+		if !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		return s.txnSet(txn, key, encoded[:])
+	})
+}
+
+// GetMemorySubmissionHeight reports whether a memory was first accepted under
+// the app-v25 height marker. No marker means historical/pre-v25.
+func (s *BadgerStore) GetMemorySubmissionHeight(memoryID string) (int64, bool, error) {
+	var height int64
+	found := false
+	err := s.view(func(txn *badger.Txn) error {
+		item, err := txn.Get(memorySubmissionHeightKey(memoryID))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(value []byte) error {
+			if len(value) != 8 {
+				return errors.New("invalid memory submission height")
+			}
+			raw := binary.BigEndian.Uint64(value)
+			if raw == 0 || raw > math.MaxInt64 {
+				return errors.New("invalid memory submission height")
+			}
+			height = int64(raw) // #nosec G115 -- bounded above
+			found = true
+			return nil
+		})
+	})
+	return height, found, err
+}
+
+// GetMemorySubmissionHeights reads one page of app-v25 cutoff markers in one
+// canonical snapshot. Missing IDs are historical and absent from the result.
+func (s *BadgerStore) GetMemorySubmissionHeights(
+	memoryIDs []string,
+) (map[string]int64, error) {
+	result := make(map[string]int64)
+	err := s.view(func(txn *badger.Txn) error {
+		for _, memoryID := range memoryIDs {
+			item, err := txn.Get(memorySubmissionHeightKey(memoryID))
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err := item.Value(func(value []byte) error {
+				if len(value) != 8 {
+					return errors.New("invalid memory submission height")
+				}
+				raw := binary.BigEndian.Uint64(value)
+				if raw == 0 || raw > math.MaxInt64 {
+					return errors.New("invalid memory submission height")
+				}
+				result[memoryID] = int64(raw) // #nosec G115 -- bounded above
+				return nil
+			}); err != nil {
+				return fmt.Errorf("read memory submission height for %s: %w", memoryID, err)
+			}
+		}
+		return nil
+	})
+	return result, err
 }
 
 // SetMemoryDomain records a memory's domain tag on-chain. The caller gates the
@@ -6439,7 +6688,7 @@ func (s *BadgerStore) ValidateAppV20ResourceBounds(maxIdentifierBytes, maxMetada
 		return errors.New("app-v20 resource bounds must be positive")
 	}
 	singleSuffixPrefixes := [][]byte{
-		[]byte("memory:"), []byte("memdomain:"), []byte("memauthor:"), []byte("memauthorprincipal:"), []byte("memclass:"),
+		[]byte("memory:"), []byte("memdomain:"), []byte("memauthor:"), []byte("memauthorprincipal:"), []byte("mem_class:"),
 		[]byte("nonce:"), []byte("agent:"), []byte("validator:"), []byte("vstats:"),
 		[]byte("domain:"), []byte("org:"), []byte("access_req:"), []byte("federation:"),
 		[]byte("cross_fed:"), []byte("poew:"), []byte("cocommit:core:"),

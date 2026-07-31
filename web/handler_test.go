@@ -1525,10 +1525,10 @@ func TestHandleGraph(t *testing.T) {
 
 func TestGraphMaxNodesDefaultsToDenseMRISample(t *testing.T) {
 	t.Setenv("SAGE_GRAPH_MAX_NODES", "")
-	assert.Equal(t, 2500, graphMaxNodes())
+	assert.Equal(t, 1500, graphMaxNodes())
 
 	t.Setenv("SAGE_GRAPH_MAX_NODES", "8000")
-	assert.Equal(t, 8000, graphMaxNodes())
+	assert.Equal(t, appV23CerebrumInteractiveScanBudget, graphMaxNodes())
 }
 
 func TestHandleAuthCheck_NoAuth(t *testing.T) {

@@ -46,3 +46,30 @@ func TestPostgresListMemoriesAppliesCreatedRangeToCountAndPage(t *testing.T) {
 	require.Zero(t, total)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestPostgresListMemoriesCanSkipTotal(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	require.NoError(t, err)
+	t.Cleanup(mock.Close)
+	s := &PostgresStore{db: mock}
+
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT memory_id, submitting_agent, content, content_hash,
+		memory_type, domain_tag, provider, confidence_score, status, parent_hash, created_at,
+		committed_at, deprecated_at FROM memories WHERE 1=1 ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+	)).
+		WithArgs(50, 0).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"memory_id", "submitting_agent", "content", "content_hash",
+			"memory_type", "domain_tag", "provider", "confidence_score",
+			"status", "parent_hash", "created_at", "committed_at", "deprecated_at",
+		}))
+
+	records, total, err := s.ListMemories(context.Background(), ListOptions{
+		Limit: 50, SkipTotal: true,
+	})
+	require.NoError(t, err)
+	require.Empty(t, records)
+	require.Zero(t, total)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
