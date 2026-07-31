@@ -51,7 +51,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.16.1';
+const SAGE_VERSION = 'v11.16.2';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -542,7 +542,7 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
         </div>
         ${projectionNotice && html`
             <div class="brain-projection-warning" role="alert">
-                <strong>Verified memories shown</strong>
+                <strong>Available memories shown</strong>
                 <span>${projectionNotice.message || 'Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed.'}</span>
             </div>
         `}
@@ -695,7 +695,7 @@ function MriView({ sse }) {
         </div>`}
         ${noLocalMemories && partialProjection && html`<div class="brain-empty-overlay" role="alert">
             <${EmptyState} icon="brain"
-                headline="No verified memories can be shown yet"
+                headline="No memories can be safely shown yet"
                 hint="Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed." />
         </div>`}
         ${noLocalMemories && !partialProjection && html`<div class="brain-empty-overlay">
@@ -7230,6 +7230,7 @@ function HealthBar() {
         ? Object.keys(health.memories.by_domain).length
         : null;
     const partialProjection = health.memory_projection?.partial === true;
+    const canonicalOnly = health.memory_projection?.verified_only !== false;
 
     return html`
         <div class="health-bar ${partialProjection ? 'health-bar-partial' : ''}">
@@ -7245,9 +7246,11 @@ function HealthBar() {
             <div class="health-sep"></div>
             <div class="health-item">
                 <span class="health-num">${totalMem === null ? '—' : totalMem}</span>
-                ${partialProjection ? 'verified memories' : 'memories'}
+                ${partialProjection ? (canonicalOnly ? 'verified memories' : 'available memories') : 'memories'}
                 <${HelpTip} text=${partialProjection
-                    ? 'Canonically verified memories currently visible. Some historical records are temporarily hidden.'
+                    ? (canonicalOnly
+                        ? 'Canonically verified memories currently visible. Some historical records are temporarily hidden.'
+                        : 'Readable historical memories currently visible. Some records are hidden because their canonical state could not be verified.')
                     : 'Total committed memories across all domains and agents.'} />
             </div>
             <div class="health-sep"></div>
@@ -7261,7 +7264,7 @@ function HealthBar() {
             ${partialProjection && html`
                 <div class="health-item health-projection-warning" role="alert">
                     <div class="health-dot warning"></div>
-                    <strong>Verified view</strong>
+                    <strong>Available view</strong>
                     <span>Some historical records are hidden; stored data is unchanged.</span>
                 </div>
             `}

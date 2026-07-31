@@ -954,7 +954,11 @@ func (s *BadgerStore) GetMemoryDisclosureState(memoryID string) (*MemoryDisclosu
 		if valueErr := item.Value(func(val []byte) error {
 			var decodeErr error
 			state.ContentHash, state.Status, decodeErr = decodeMemoryHashEntry(val)
-			return decodeErr
+			if decodeErr != nil {
+				return fmt.Errorf("%w: invalid memory envelope for %s: %v",
+					ErrMemoryDisclosureCorrupt, memoryID, decodeErr)
+			}
+			return nil
 		}); valueErr != nil {
 			return valueErr
 		}
@@ -1024,17 +1028,20 @@ func (s *BadgerStore) GetMemoryDisclosureState(memoryID string) (*MemoryDisclosu
 			return getErr
 		}
 		if coCommitCore != coCommitShared {
-			return errors.New("incomplete co-commit disclosure state")
+			return fmt.Errorf("%w: incomplete co-commit disclosure state for %s",
+				ErrMemoryDisclosureCorrupt, memoryID)
 		}
 		state.CoCommitRecorded = coCommitCore
 
 		if item, getErr = txn.Get(memClassKey(memoryID)); getErr == nil {
 			if valueErr := item.Value(func(val []byte) error {
 				if len(val) != 1 {
-					return errors.New("invalid classification entry")
+					return fmt.Errorf("%w: invalid classification entry for %s",
+						ErrMemoryDisclosureCorrupt, memoryID)
 				}
 				if val[0] > uint8(ClearanceTopSecret) {
-					return fmt.Errorf("invalid classification level %d", val[0])
+					return fmt.Errorf("%w: invalid classification level %d for %s",
+						ErrMemoryDisclosureCorrupt, val[0], memoryID)
 				}
 				state.Classification = val[0]
 				state.ClassificationRecorded = true
@@ -1056,7 +1063,8 @@ func (s *BadgerStore) GetMemoryDisclosureState(memoryID string) (*MemoryDisclosu
 	if state.AuthorPrincipalRecorded &&
 		(!state.DomainRecorded || !state.AuthorRecorded || !state.ClassificationRecorded) {
 		return nil, fmt.Errorf(
-			"app-v23 memory disclosure state is incomplete: %s", memoryID,
+			"%w: app-v23 memory disclosure state is incomplete: %s",
+			ErrMemoryDisclosureCorrupt, memoryID,
 		)
 	}
 	return state, nil

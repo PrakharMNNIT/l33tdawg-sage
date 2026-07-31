@@ -27,6 +27,12 @@ var ErrMemoryProjectionUnpublished = errors.New("memory projection is not canoni
 // visible result/count.
 var ErrMemoryProjectionQuarantined = errors.New("memory projection is quarantined")
 
+// ErrMemoryDisclosureCorrupt marks a record-local canonical envelope that was
+// found but cannot be decoded or is internally incomplete. It is distinct from
+// a Badger/backend failure: broad reads may quarantine this one record, while
+// exact reads still fail closed and infrastructure errors still fail globally.
+var ErrMemoryDisclosureCorrupt = errors.New("canonical memory disclosure is corrupt")
+
 // MemoryProjectionDisposition describes why a serving-layer row is publishable.
 // Only Exact and LegacyTerminalHashless are returned without an error.
 type MemoryProjectionDisposition string
@@ -78,23 +84,32 @@ func (s *BadgerStore) ClassifyMemoryProjection(
 		if errors.Is(err, ErrMemoryDisclosureNotFound) {
 			disposition = MemoryProjectionLegacyUnanchored
 		}
+		if errors.Is(err, ErrMemoryDisclosureCorrupt) {
+			return nil, MemoryProjectionQuarantined, fmt.Errorf(
+				"%w: %w: %w",
+				ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, err,
+			)
+		}
 		return nil, disposition, fmt.Errorf(
 			"%w: %w", ErrMemoryProjectionUnpublished, err,
 		)
 	}
 	if string(record.Status) != state.Status {
-		return nil, MemoryProjectionUnpublished, fmt.Errorf(
-			"%w: status mismatch for %s", ErrMemoryProjectionUnpublished, record.MemoryID,
+		return nil, MemoryProjectionQuarantined, fmt.Errorf(
+			"%w: %w: status mismatch for %s",
+			ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, record.MemoryID,
 		)
 	}
 	if state.DomainRecorded && record.DomainTag != state.Domain {
-		return nil, MemoryProjectionUnpublished, fmt.Errorf(
-			"%w: domain mismatch for %s", ErrMemoryProjectionUnpublished, record.MemoryID,
+		return nil, MemoryProjectionQuarantined, fmt.Errorf(
+			"%w: %w: domain mismatch for %s",
+			ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, record.MemoryID,
 		)
 	}
 	if state.AuthorRecorded && record.SubmittingAgent != state.Author {
-		return nil, MemoryProjectionUnpublished, fmt.Errorf(
-			"%w: author mismatch for %s", ErrMemoryProjectionUnpublished, record.MemoryID,
+		return nil, MemoryProjectionQuarantined, fmt.Errorf(
+			"%w: %w: author mismatch for %s",
+			ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, record.MemoryID,
 		)
 	}
 
@@ -110,21 +125,22 @@ func (s *BadgerStore) ClassifyMemoryProjection(
 	if len(state.ContentHash) != sha256.Size ||
 		len(record.ContentHash) != sha256.Size ||
 		!bytes.Equal(record.ContentHash, state.ContentHash) {
-		return nil, MemoryProjectionUnpublished, fmt.Errorf(
-			"%w: content hash mismatch for %s", ErrMemoryProjectionUnpublished, record.MemoryID,
+		return nil, MemoryProjectionQuarantined, fmt.Errorf(
+			"%w: %w: content hash mismatch for %s",
+			ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, record.MemoryID,
 		)
 	}
 	if record.Content == "" {
 		if !state.CoCommitRecorded {
-			return nil, MemoryProjectionUnpublished, fmt.Errorf(
-				"%w: empty content is not a canonical hash-only co-commit for %s",
-				ErrMemoryProjectionUnpublished, record.MemoryID,
+			return nil, MemoryProjectionQuarantined, fmt.Errorf(
+				"%w: %w: empty content is not a canonical hash-only co-commit for %s",
+				ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, record.MemoryID,
 			)
 		}
 	} else if computed := memory.ComputeContentHash(record.Content); !bytes.Equal(computed, state.ContentHash) {
-		return nil, MemoryProjectionUnpublished, fmt.Errorf(
-			"%w: content does not match canonical hash for %s",
-			ErrMemoryProjectionUnpublished, record.MemoryID,
+		return nil, MemoryProjectionQuarantined, fmt.Errorf(
+			"%w: %w: content does not match canonical hash for %s",
+			ErrMemoryProjectionUnpublished, ErrMemoryProjectionQuarantined, record.MemoryID,
 		)
 	}
 	return state, MemoryProjectionExact, nil

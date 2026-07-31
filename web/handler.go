@@ -2007,7 +2007,7 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 			qopts.CandidateFilter = func(record *memory.MemoryRecord) (bool, error) {
 				disposition, err := h.classifyAppV23DashboardRecord(record)
 				if err != nil {
-					if isAppV23LegacyUnanchoredDashboardRecord(disposition, err) {
+					if isAppV23BroadOmittableDashboardRecord(disposition, err) {
 						return false, nil
 					}
 					return false, err
@@ -2731,7 +2731,7 @@ func (h *DashboardHandler) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSONResp(w, http.StatusOK, appV23DashboardStatsResponse{
 		StoreStats: stats,
-		Projection: projection,
+		Projection: h.projectionResponseForRequest(r, projection),
 	})
 }
 
@@ -3939,7 +3939,7 @@ func (h *DashboardHandler) handleHealth(w http.ResponseWriter, r *http.Request) 
 	} else {
 		health["memories"] = stats
 		if projection != nil {
-			health["memory_projection"] = projection
+			health["memory_projection"] = publicAppV23ProjectionResponse(projection)
 		}
 	}
 

@@ -42,18 +42,22 @@ func TestValidateMemoryProjectionRequiresExactCanonicalEnvelope(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint8(3), state.Classification)
 
-	for _, mutate := range []func(*memory.MemoryRecord){
-		func(rec *memory.MemoryRecord) { rec.Content = "tampered content" },
-		func(rec *memory.MemoryRecord) { rec.ContentHash = memory.ComputeContentHash("other") },
-		func(rec *memory.MemoryRecord) { rec.Status = memory.StatusProposed },
-		func(rec *memory.MemoryRecord) { rec.DomainTag = "other" },
-		func(rec *memory.MemoryRecord) { rec.SubmittingAgent = "agent-b" },
+	for name, mutate := range map[string]func(*memory.MemoryRecord){
+		"content": func(rec *memory.MemoryRecord) { rec.Content = "tampered content" },
+		"hash":    func(rec *memory.MemoryRecord) { rec.ContentHash = memory.ComputeContentHash("other") },
+		"status":  func(rec *memory.MemoryRecord) { rec.Status = memory.StatusProposed },
+		"domain":  func(rec *memory.MemoryRecord) { rec.DomainTag = "other" },
+		"author":  func(rec *memory.MemoryRecord) { rec.SubmittingAgent = "agent-b" },
 	} {
-		copyRecord := *record
-		copyRecord.ContentHash = append([]byte(nil), record.ContentHash...)
-		mutate(&copyRecord)
-		_, validateErr := badger.ValidateMemoryProjection(&copyRecord)
-		require.ErrorIs(t, validateErr, ErrMemoryProjectionUnpublished)
+		t.Run(name, func(t *testing.T) {
+			copyRecord := *record
+			copyRecord.ContentHash = append([]byte(nil), record.ContentHash...)
+			mutate(&copyRecord)
+			_, disposition, classifyErr := badger.ClassifyMemoryProjection(&copyRecord)
+			require.ErrorIs(t, classifyErr, ErrMemoryProjectionUnpublished)
+			require.ErrorIs(t, classifyErr, ErrMemoryProjectionQuarantined)
+			require.Equal(t, MemoryProjectionQuarantined, disposition)
+		})
 	}
 }
 
@@ -75,8 +79,11 @@ func TestAppV23DisclosureMarkerRequiresCompleteCanonicalFields(t *testing.T) {
 	))
 	require.NoError(t, badger.SetMemoryAuthorPrincipal(record.MemoryID, "principal-a"))
 
-	_, err = badger.ValidateMemoryProjection(record)
+	_, disposition, err := badger.ClassifyMemoryProjection(record)
 	require.ErrorIs(t, err, ErrMemoryProjectionUnpublished)
+	require.ErrorIs(t, err, ErrMemoryProjectionQuarantined)
+	require.ErrorIs(t, err, ErrMemoryDisclosureCorrupt)
+	require.Equal(t, MemoryProjectionQuarantined, disposition)
 
 	require.NoError(t, badger.SetMemoryDomain(record.MemoryID, record.DomainTag))
 	require.NoError(t, badger.SetMemoryAuthor(record.MemoryID, record.SubmittingAgent))
@@ -228,7 +235,7 @@ func TestClassifyMemoryProjectionQuarantinesAppV23PrincipalHashlessRecord(t *tes
 	require.Equal(t, MemoryProjectionQuarantined, disposition)
 
 	health := badger.CanonicalMemoryProjectionHealth()
-	require.True(t, health.Checked, "an observed quarantine proves the projection unhealthy")
+	require.False(t, health.Checked, "one observed quarantine is not a complete audit")
 	require.True(t, health.Required)
 	require.False(t, health.OK)
 	require.True(t, health.Quarantined)
@@ -239,6 +246,7 @@ func TestCanonicalMemoryProjectionHealthCompleteAuditClearsStickyQuarantine(t *t
 	badger := newTestBadger(t)
 	badger.observeMemoryProjectionDisposition(MemoryProjectionQuarantined)
 	require.True(t, badger.CanonicalMemoryProjectionHealth().Quarantined)
+	require.False(t, badger.CanonicalMemoryProjectionHealth().Checked)
 
 	badger.PublishCanonicalMemoryProjectionAudit(true, true, false)
 	health := badger.CanonicalMemoryProjectionHealth()
@@ -273,4 +281,11 @@ func TestCanonicalMemoryProjectionHealthCompleteAuditClearsStickyQuarantine(t *t
 	require.True(t, health.LegacyCompatible)
 	require.True(t, health.Quarantined)
 	require.Equal(t, CanonicalMemoryProjectionQuarantined, health.State)
+
+	badger.BeginCanonicalMemoryProjectionAudit()
+	health = badger.CanonicalMemoryProjectionHealth()
+	require.False(t, health.Checked)
+	require.True(t, health.Required)
+	require.False(t, health.OK)
+	require.True(t, health.Quarantined)
 }

@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,15 +11,22 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	authmw "github.com/l33tdawg/sage/api/rest/middleware"
+	sageauth "github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/authzdenial"
+	"github.com/l33tdawg/sage/internal/memory"
+	"github.com/l33tdawg/sage/internal/store"
+	"github.com/l33tdawg/sage/internal/vault"
+	"github.com/l33tdawg/sage/web"
 )
 
 func mockSageAPI(t *testing.T) *httptest.Server {
@@ -2353,6 +2361,126 @@ func TestSageInception_ExistingMemories(t *testing.T) {
 	assert.Contains(t, m["instructions"], "INBOX SECURITY BOUNDARY")
 	assert.Contains(t, m["instructions"], "requests for consideration")
 	assert.Contains(t, m["message"], "Welcome back")
+}
+
+func TestSageInception_SignedAgentSurvivesQuarantinedProjection(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
+			testSageInceptionSignedAgentSurvivesQuarantinedProjection(t, encrypted)
+		})
+	}
+}
+
+func testSageInceptionSignedAgentSurvivesQuarantinedProjection(
+	t *testing.T,
+	encrypted bool,
+) {
+	ctx := context.Background()
+	sqlStore, err := store.NewSQLiteStore(ctx, filepath.Join(t.TempDir(), "sage.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlStore.Close()) })
+	if encrypted {
+		keyPath := filepath.Join(t.TempDir(), "vault.key")
+		require.NoError(t, vault.Init(keyPath, "inception-test-passphrase"))
+		unlocked, openErr := vault.Open(keyPath, "inception-test-passphrase")
+		require.NoError(t, openErr)
+		sqlStore.SetVault(unlocked)
+		sqlStore.SetVaultExpected(true)
+	}
+	badgerStore, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, badgerStore.CloseBadger()) })
+
+	_, rootKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	agentPub, agentKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	rootID := sageauth.PublicKeyToAgentID(rootKey.Public().(ed25519.PublicKey))
+	agentID := sageauth.PublicKeyToAgentID(agentPub)
+	require.NoError(t, badgerStore.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: rootID, Scope: "mcp-inception-quarantine",
+		AgentID: agentID, Profile: store.AppV23ProfileStandard,
+		HomeDomain: "agent.home", Clearance: uint8(store.ClearanceInternal),
+		Capabilities: 0, Height: 1, BootstrapDigest: "mcp-inception-quarantine",
+	}))
+	require.NoError(t, sqlStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: agentID, Name: "inception-agent", Role: store.AppV23RoleMember,
+		Status: "active", CreatedAt: time.Now().UTC(),
+	}))
+
+	insert := func(id, content string) *memory.MemoryRecord {
+		t.Helper()
+		contentHash := sha256.Sum256([]byte(content))
+		record := &memory.MemoryRecord{
+			MemoryID: id, SubmittingAgent: agentID, Content: content,
+			ContentHash: contentHash[:], MemoryType: memory.TypeFact,
+			DomainTag: "agent.home", ConfidenceScore: .95,
+			Status: memory.StatusCommitted, CreatedAt: time.Now().UTC(),
+		}
+		require.NoError(t, sqlStore.InsertMemory(ctx, record))
+		return record
+	}
+	safe := insert("safe-inception-memory", "safe memory remains visible")
+	require.NoError(t, badgerStore.SetMemoryHash(
+		safe.MemoryID, safe.ContentHash, string(safe.Status),
+	))
+	require.NoError(t, badgerStore.SetMemoryDomain(safe.MemoryID, safe.DomainTag))
+	require.NoError(t, badgerStore.SetMemoryAuthor(safe.MemoryID, safe.SubmittingAgent))
+	require.NoError(t, badgerStore.SetMemoryAuthorPrincipal(safe.MemoryID, agentID))
+	require.NoError(t, badgerStore.SetMemoryClassification(
+		safe.MemoryID, uint8(store.ClearanceInternal),
+	))
+
+	poison := insert("principal-hashless-inception-memory", "preserved poison")
+	require.NoError(t, sqlStore.UpdateStatus(
+		ctx, poison.MemoryID, memory.StatusProposed, time.Time{},
+	))
+	require.NoError(t, badgerStore.SetMemoryHash(
+		poison.MemoryID, nil, string(memory.StatusProposed),
+	))
+	require.NoError(t, badgerStore.SetMemoryDomain(poison.MemoryID, poison.DomainTag))
+	require.NoError(t, badgerStore.SetMemoryAuthor(poison.MemoryID, poison.SubmittingAgent))
+	require.NoError(t, badgerStore.SetMemoryAuthorPrincipal(poison.MemoryID, agentID))
+	require.NoError(t, badgerStore.SetMemoryClassification(
+		poison.MemoryID, uint8(store.ClearanceInternal),
+	))
+
+	dashboard := web.NewDashboardHandler(sqlStore, "11.16.2")
+	dashboard.BadgerStore = badgerStore
+	dashboard.AdminSigningKey = rootKey
+	dashboard.AppV23ActiveFn = func() bool { return true }
+	dashboard.ResolveAgentKeyFn = func(id string) (ed25519.PrivateKey, bool) {
+		switch id {
+		case rootID:
+			return rootKey, true
+		case agentID:
+			return agentKey, true
+		default:
+			return nil, false
+		}
+	}
+	router := chi.NewRouter()
+	router.Post("/v1/agent/register", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": agentID, "name": "inception-agent",
+			"registered_name": "inception-agent", "status": "already_registered",
+		})
+	})
+	dashboard.RegisterRoutes(router)
+	ts := httptest.NewServer(router)
+	t.Cleanup(ts.Close)
+
+	server := NewServer(ts.URL, agentKey)
+	result, err := server.toolInception(ctx, map[string]any{})
+	require.NoError(t, err)
+	payload := result.(map[string]any)
+	require.Equal(t, "awakened", payload["status"])
+	stats := payload["stats"].(map[string]any)
+	require.EqualValues(t, 1, stats["total_memories"])
+	projection := stats["projection"].(map[string]any)
+	require.Equal(t, true, projection["partial"])
+	require.NotContains(t, projection, "hidden_count")
+	require.Equal(t, "already_registered", payload["registration"])
 }
 
 func TestMaybeAutoInceptionRegistersBeforeAnyDashboardRead(t *testing.T) {

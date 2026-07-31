@@ -234,11 +234,10 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		// its exact consensus enrollment and owned home domain are confirmed.
 		status = "not_ready"
 		httpStatus = http.StatusServiceUnavailable
-	case canonical.Required && (!canonical.Checked || !canonical.OK):
-		// app-v23 ordinary-memory reads are safe only after a complete inventory
-		// audit. A quarantined record is localized and omitted from broad reads,
-		// but the node is not fully serving-ready until governance re-anchors it
-		// and a later complete audit clears the quarantine.
+	case canonical.Required &&
+		(!canonical.Checked || (!canonical.OK && !canonical.Quarantined)):
+		// No completed audit, or an unlocalized projection failure: broad reads
+		// cannot prove which records are safe, so the serving process is not ready.
 		status = "not_ready"
 		httpStatus = http.StatusServiceUnavailable
 	case emb.Checked && emb.Semantic && !emb.OK:
@@ -248,6 +247,14 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		// strictness; ?strict=1 makes it a hard 503 for readiness gates that require
 		// semantic recall. A hash provider (Semantic=false) is a capability, not a
 		// fault, so it stays "ready".
+		status = "degraded"
+		if r.URL.Query().Get("strict") == "1" {
+			httpStatus = http.StatusServiceUnavailable
+		}
+	case canonical.Required && canonical.Quarantined:
+		// Record-local projection faults are isolated and omitted from broad
+		// reads. Keep the node operational and advertise the degraded state
+		// instead of making one historical record brick every agent.
 		status = "degraded"
 		if r.URL.Query().Get("strict") == "1" {
 			httpStatus = http.StatusServiceUnavailable

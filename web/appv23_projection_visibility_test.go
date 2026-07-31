@@ -118,6 +118,24 @@ func requestLocalProjectionRoute(
 	return rec
 }
 
+func TestAppV23ProjectionHiddenCountIsLocalOperatorOnly(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	projection := appV23ProjectionResponseFromAudit(false, true, false, 7)
+
+	local := httptest.NewRequest(http.MethodGet, "/v1/dashboard/stats", nil)
+	markLocalCEREBRUM(fixture.handler, local)
+	localProjection := fixture.handler.projectionResponseForRequest(local, projection)
+	require.Equal(t, 7, localProjection.HiddenCount)
+	require.Contains(t, localProjection.Message, "7 historical memories")
+
+	remote := httptest.NewRequest(http.MethodGet, "/v1/dashboard/stats", nil)
+	remote.RemoteAddr = "192.0.2.20:54321"
+	remote.Host = "192.0.2.10:8080"
+	remoteProjection := fixture.handler.projectionResponseForRequest(remote, projection)
+	require.Zero(t, remoteProjection.HiddenCount)
+	require.Equal(t, appV23PartialProjectionMessage, remoteProjection.Message)
+}
+
 func TestAppV23CerebrumBroadRoutesOmitLegacyUnanchoredProjection(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
@@ -201,7 +219,14 @@ func testAppV23CerebrumBroadRoutesOmitLegacyUnanchoredProjection(
 			require.Equal(t, true, projection["partial"])
 			require.Equal(t, true, projection["verified_only"])
 			require.Equal(t, string(store.CanonicalMemoryProjectionQuarantined), projection["state"])
-			require.Equal(t, appV23PartialProjectionMessage, projection["message"])
+			if name == "health" {
+				require.NotContains(t, projection, "hidden_count")
+				require.Equal(t, appV23PartialProjectionMessage, projection["message"])
+			} else {
+				require.Equal(t, float64(1), projection["hidden_count"])
+				require.Contains(t, projection["message"], "1 historical memory")
+				require.Contains(t, projection["message"], "is hidden")
+			}
 		})
 	}
 
@@ -271,12 +296,14 @@ func TestAppV23CerebrumLegacyTerminalHashlessProjectionRemainsReadable(t *testin
 	require.Equal(t, store.CanonicalMemoryProjectionLegacyCompatible, health.State)
 }
 
-func TestAppV23CerebrumPrincipalHashlessProjectionIsQuarantined(t *testing.T) {
+func TestAppV23CerebrumBroadRoutesOmitPrincipalHashlessProposedProjection(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "safe-anchor", "safe-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "safe-anchor",
+		uint8(store.ClearanceInternal), true,
+	)
 	insertTestMemory(t, fixture.sql, "principal-hashless", "principal-domain")
-	require.NoError(t, fixture.sql.UpdateStatus(
-		context.Background(), "principal-hashless", memory.StatusCommitted, time.Now().UTC(),
-	))
 	record, err := fixture.sql.GetMemory(context.Background(), "principal-hashless")
 	require.NoError(t, err)
 	require.NoError(t, fixture.badger.SetMemoryHash(
@@ -291,20 +318,165 @@ func TestAppV23CerebrumPrincipalHashlessProjectionIsQuarantined(t *testing.T) {
 		record.MemoryID, uint8(store.ClearanceInternal),
 	))
 
-	for name, path := range map[string]string{
-		"list":  "/v1/dashboard/memory/list?status=committed",
-		"stats": "/v1/dashboard/stats",
-	} {
+	now := time.Now().UTC()
+	routes := map[string]struct {
+		path          string
+		projectionKey string
+	}{
+		"list": {
+			path:          "/v1/dashboard/memory/list?status=proposed",
+			projectionKey: "projection",
+		},
+		"search": {
+			path:          "/v1/dashboard/memory/list?q=content&status=proposed",
+			projectionKey: "projection",
+		},
+		"graph": {
+			path:          "/v1/dashboard/memory/graph?status=proposed",
+			projectionKey: "projection",
+		},
+		"stats": {
+			path:          "/v1/dashboard/stats",
+			projectionKey: "projection",
+		},
+		"health": {
+			path:          "/v1/dashboard/health",
+			projectionKey: "memory_projection",
+		},
+		"timeline": {
+			path: fmt.Sprintf(
+				"/v1/dashboard/memory/timeline?from=%s&to=%s&bucket=hour",
+				now.Add(-time.Hour).Format(time.RFC3339),
+				now.Add(time.Hour).Format(time.RFC3339),
+			),
+			projectionKey: "projection",
+		},
+	}
+	for name, route := range routes {
 		t.Run(name, func(t *testing.T) {
-			rec := requestLocalProjectionRoute(t, fixture, path)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			rec := requestLocalProjectionRoute(t, fixture, route.path)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			require.NotContains(t, rec.Body.String(), "principal-hashless")
 			require.NotContains(t, rec.Body.String(), "principal-domain")
+			if name == "list" || name == "search" || name == "graph" {
+				require.Contains(t, rec.Body.String(), "safe-anchor")
+				require.Contains(t, rec.Body.String(), "safe-domain")
+			}
+			if name == "stats" || name == "health" {
+				require.Contains(t, rec.Body.String(), `"total_memories":1`)
+				require.Contains(t, rec.Body.String(), `"safe-domain":1`)
+			}
+			if name == "timeline" {
+				require.Contains(t, rec.Body.String(), `"count":1`)
+			}
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+			projection, ok := payload[route.projectionKey].(map[string]any)
+			require.True(t, ok, rec.Body.String())
+			require.Equal(t, true, projection["partial"])
+			if name == "health" {
+				require.NotContains(t, projection, "hidden_count")
+				require.Equal(t, appV23PartialProjectionMessage, projection["message"])
+			} else {
+				require.Equal(t, float64(1), projection["hidden_count"])
+				require.Contains(t, projection["message"], "1 historical memory")
+			}
 		})
 	}
 	export := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/export")
 	require.Equal(t, http.StatusServiceUnavailable, export.Code, export.Body.String())
 	require.NotContains(t, export.Body.String(), "principal-hashless")
+}
+
+func TestAppV23CerebrumBroadRoutesOmitCanonicalStatusMismatch(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "safe-anchor", "safe-domain")
+	require.NoError(t, fixture.sql.UpdateStatus(
+		context.Background(), "safe-anchor", memory.StatusCommitted, time.Now().UTC(),
+	))
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "safe-anchor",
+		uint8(store.ClearanceInternal), true,
+	)
+	insertTestMemory(t, fixture.sql, "status-mismatch", "mismatch-domain")
+	require.NoError(t, fixture.sql.UpdateStatus(
+		context.Background(), "status-mismatch", memory.StatusCommitted, time.Now().UTC(),
+	))
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "status-mismatch",
+		uint8(store.ClearanceInternal), true,
+	)
+	require.NoError(t, fixture.sql.UpdateStatus(
+		context.Background(), "status-mismatch", memory.StatusDeprecated, time.Now().UTC(),
+	))
+
+	now := time.Now().UTC()
+	routes := map[string]struct {
+		path          string
+		projectionKey string
+	}{
+		"list": {
+			path:          "/v1/dashboard/memory/list",
+			projectionKey: "projection",
+		},
+		"search": {
+			path:          "/v1/dashboard/memory/list?q=content",
+			projectionKey: "projection",
+		},
+		"graph": {
+			path:          "/v1/dashboard/memory/graph",
+			projectionKey: "projection",
+		},
+		"stats": {
+			path:          "/v1/dashboard/stats",
+			projectionKey: "projection",
+		},
+		"health": {
+			path:          "/v1/dashboard/health",
+			projectionKey: "memory_projection",
+		},
+		"timeline": {
+			path: fmt.Sprintf(
+				"/v1/dashboard/memory/timeline?from=%s&to=%s&bucket=hour",
+				now.Add(-time.Hour).Format(time.RFC3339),
+				now.Add(time.Hour).Format(time.RFC3339),
+			),
+			projectionKey: "projection",
+		},
+	}
+	for name, route := range routes {
+		t.Run(name, func(t *testing.T) {
+			rec := requestLocalProjectionRoute(t, fixture, route.path)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.NotContains(t, rec.Body.String(), "status-mismatch")
+			require.NotContains(t, rec.Body.String(), "mismatch-domain")
+			if name == "list" || name == "search" || name == "graph" {
+				require.Contains(t, rec.Body.String(), "safe-anchor")
+				require.Contains(t, rec.Body.String(), "safe-domain")
+			}
+			if name == "stats" || name == "health" {
+				require.Contains(t, rec.Body.String(), `"total_memories":1`)
+				require.Contains(t, rec.Body.String(), `"safe-domain":1`)
+			}
+			if name == "timeline" {
+				require.Contains(t, rec.Body.String(), `"count":1`)
+			}
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+			projection, ok := payload[route.projectionKey].(map[string]any)
+			require.True(t, ok, rec.Body.String())
+			require.Equal(t, true, projection["partial"])
+			if name == "health" {
+				require.NotContains(t, projection, "hidden_count")
+				require.Equal(t, appV23PartialProjectionMessage, projection["message"])
+			} else {
+				require.Equal(t, float64(1), projection["hidden_count"])
+			}
+		})
+	}
+	export := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/export")
+	require.Equal(t, http.StatusServiceUnavailable, export.Code, export.Body.String())
+	require.NotContains(t, export.Body.String(), "status-mismatch")
 }
 
 func TestAppV23CanonicalProjectionAuditClearsStickyQuarantineAfterHashReanchor(t *testing.T) {
@@ -354,7 +526,7 @@ func TestAppV23CanonicalProjectionAuditClearsStickyQuarantineAfterHashReanchor(t
 	require.Equal(t, store.CanonicalMemoryProjectionExact, health.State)
 }
 
-func TestAppV23CanonicalProjectionAuditRejectsMissingSQLRowsAcrossVaultModes(t *testing.T) {
+func TestAppV23CanonicalProjectionAuditQuarantinesMissingSQLRowsAcrossVaultModes(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
 			fixture := newAppV23ProjectionRouteFixture(t, encrypted)
@@ -380,8 +552,10 @@ func TestAppV23CanonicalProjectionAuditRejectsMissingSQLRowsAcrossVaultModes(t *
 			require.Equal(t, store.CanonicalMemoryProjectionQuarantined, health.State)
 
 			stats := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
-			require.Equal(t, http.StatusServiceUnavailable, stats.Code, stats.Body.String())
-			require.NotContains(t, stats.Body.String(), `"total_memories":0`)
+			require.Equal(t, http.StatusOK, stats.Code, stats.Body.String())
+			require.Contains(t, stats.Body.String(), `"total_memories":0`)
+			require.Contains(t, stats.Body.String(), `"partial":true`)
+			require.Contains(t, stats.Body.String(), `"hidden_count":1`)
 			export := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/export")
 			require.Equal(t, http.StatusServiceUnavailable, export.Code, export.Body.String())
 			require.NotContains(t, export.Header().Get("Content-Disposition"), "sage-backup-")
@@ -398,7 +572,7 @@ func TestAppV23CanonicalProjectionAuditRejectsMissingSQLRowsAcrossVaultModes(t *
 	}
 }
 
-func TestAppV23CerebrumRoutesRejectStickyQuarantineForMissingSQLRow(t *testing.T) {
+func TestAppV23CerebrumBroadRoutesOmitMissingSQLRowAndExactRoutesStayStrict(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
 	insertTestMemory(t, fixture.sql, "safe-anchor", "anchor-domain")
 	publishAppV23DashboardRecord(
@@ -426,33 +600,95 @@ func TestAppV23CerebrumRoutesRejectStickyQuarantineForMissingSQLRow(t *testing.T
 	require.False(t, health.OK)
 	require.True(t, health.Quarantined)
 
+	for name, route := range map[string]struct {
+		path          string
+		projectionKey string
+	}{
+		"list": {
+			path:          "/v1/dashboard/memory/list?status=proposed",
+			projectionKey: "projection",
+		},
+		"search": {
+			path:          "/v1/dashboard/memory/list?q=safe-anchor&status=proposed",
+			projectionKey: "projection",
+		},
+		"timeline": {
+			path:          "/v1/dashboard/memory/timeline?domain=anchor-domain",
+			projectionKey: "projection",
+		},
+		"graph": {
+			path:          "/v1/dashboard/memory/graph?status=proposed",
+			projectionKey: "projection",
+		},
+		"projection-stats": {
+			path:          "/v1/dashboard/stats",
+			projectionKey: "projection",
+		},
+		"health": {
+			path:          "/v1/dashboard/health",
+			projectionKey: "memory_projection",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := requestLocalProjectionRoute(t, fixture, route.path)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			if name == "list" || name == "search" || name == "graph" {
+				require.Contains(t, rec.Body.String(), "safe-anchor")
+			}
+			if name == "projection-stats" || name == "health" {
+				require.Contains(t, rec.Body.String(), `"total_memories":1`)
+				require.Contains(t, rec.Body.String(), `"anchor-domain":1`)
+			}
+			if name == "timeline" {
+				require.Contains(t, rec.Body.String(), `"count":1`)
+			}
+			require.NotContains(t, rec.Body.String(), missingID)
+			require.NotContains(t, rec.Body.String(), "missing-domain")
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+			projection, ok := payload[route.projectionKey].(map[string]any)
+			require.True(t, ok, rec.Body.String())
+			require.Equal(t, true, projection["partial"])
+			if name == "health" {
+				require.NotContains(t, projection, "hidden_count")
+			} else {
+				require.Equal(t, float64(1), projection["hidden_count"])
+			}
+		})
+	}
+
 	for name, path := range map[string]string{
-		"list":             "/v1/dashboard/memory/list?status=proposed",
-		"search":           "/v1/dashboard/memory/list?q=safe-anchor&status=proposed",
-		"related":          "/v1/dashboard/memory/safe-anchor/related",
-		"timeline":         "/v1/dashboard/memory/timeline?domain=anchor-domain",
-		"graph":            "/v1/dashboard/memory/graph?status=proposed",
-		"tags":             "/v1/dashboard/tags",
-		"memory-tags":      "/v1/dashboard/memory/safe-anchor/tags",
-		"tasks":            "/v1/dashboard/tasks?all=true",
-		"agent-tags":       "/v1/dashboard/network/agents/agent1/tags",
-		"agent-domains":    "/v1/dashboard/network/agents/agent1/domains",
-		"agent-list":       "/v1/dashboard/network/agents",
-		"agent-detail":     "/v1/dashboard/network/agents/agent1",
-		"unregistered":     "/v1/dashboard/network/unregistered",
-		"task-notices":     "/v1/dashboard/task-notifications",
-		"projection-stats": "/v1/dashboard/stats",
+		"related":       "/v1/dashboard/memory/safe-anchor/related",
+		"tags":          "/v1/dashboard/tags",
+		"memory-tags":   "/v1/dashboard/memory/safe-anchor/tags",
+		"tasks":         "/v1/dashboard/tasks?all=true",
+		"agent-tags":    "/v1/dashboard/network/agents/agent1/tags",
+		"agent-domains": "/v1/dashboard/network/agents/agent1/domains",
+		"agent-list":    "/v1/dashboard/network/agents",
+		"agent-detail":  "/v1/dashboard/network/agents/agent1",
+		"unregistered":  "/v1/dashboard/network/unregistered",
+		"task-notices":  "/v1/dashboard/task-notifications",
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec := requestLocalProjectionRoute(t, fixture, path)
 			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
-			require.NotContains(t, rec.Body.String(), "safe-anchor")
+			require.NotContains(t, rec.Body.String(), missingID)
 			require.NotContains(t, rec.Body.String(), "missing-domain")
 		})
 	}
 }
 
-func TestAppV23CerebrumFilteredReadsReauditAfterHealthyProjection(t *testing.T) {
+func TestAppV23CerebrumBroadRoutesStillFailForUnavailableCanonicalStore(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	fixture.handler.BadgerStore = nil
+
+	rec := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	require.NotContains(t, rec.Body.String(), `"total_memories":0`)
+	require.NotContains(t, rec.Body.String(), `"partial":true`)
+}
+
+func TestAppV23CerebrumFilteredReadsIsolateDeterministicProjectionDrift(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		path   string
@@ -534,7 +770,9 @@ func TestAppV23CerebrumFilteredReadsReauditAfterHealthyProjection(t *testing.T) 
 
 			tc.tamper(t, fixture)
 			rec := requestLocalProjectionRoute(t, fixture, tc.path)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Contains(t, rec.Body.String(), `"partial":true`)
+			require.Contains(t, rec.Body.String(), `"hidden_count":1`)
 			require.NotContains(t, rec.Body.String(), "filtered-target")
 			require.True(t, fixture.badger.CanonicalMemoryProjectionHealth().Quarantined)
 		})
@@ -566,7 +804,7 @@ func TestAppV23CerebrumRelatedReauditsFilteredCandidateAfterHealthyProjection(t 
 	require.NotContains(t, rec.Body.String(), "related-filtered-candidate")
 }
 
-func TestAppV23CerebrumGraphReauditsBeforeServingCachedJSON(t *testing.T) {
+func TestAppV23CerebrumGraphReauditsAndOmitsTamperedCachedRow(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
 	insertTestMemory(t, fixture.sql, "cached-graph-memory", "graph-domain")
 	require.NoError(t, fixture.sql.UpdateStatus(
@@ -597,7 +835,9 @@ func TestAppV23CerebrumGraphReauditsBeforeServingCachedJSON(t *testing.T) {
 	second := requestLocalProjectionRoute(
 		t, fixture, "/v1/dashboard/memory/graph?status=committed",
 	)
-	require.Equal(t, http.StatusServiceUnavailable, second.Code, second.Body.String())
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	require.Contains(t, second.Body.String(), `"partial":true`)
+	require.Contains(t, second.Body.String(), `"hidden_count":1`)
 	require.NotContains(t, second.Body.String(), "cached-graph-memory")
 	require.NotContains(t, second.Body.String(), "tampered cached graph content")
 }
@@ -631,7 +871,7 @@ func TestAppV23CerebrumGraphDoesNotServeExactCacheAfterProjectionBecomesPartial(
 	require.Contains(t, second.Body.String(), "cached-safe-memory")
 	require.Contains(t, second.Body.String(), `"complete":false`)
 	require.Contains(t, second.Body.String(), `"partial":true`)
-	require.Contains(t, second.Body.String(), appV23PartialProjectionMessage)
+	require.Contains(t, second.Body.String(), "1 historical memory")
 	require.NotContains(t, second.Body.String(), "post-cache-sql-only-ghost")
 	require.NotContains(t, second.Body.String(), "ghost-domain")
 	require.NotEqual(t, first.Body.String(), second.Body.String())
@@ -677,7 +917,7 @@ func TestAppV23CerebrumBroadResponseCannotHidePostAuditQuarantine(t *testing.T) 
 	require.NotContains(t, rec.Body.String(), "ghost-domain")
 }
 
-func TestAppV23CerebrumTimelineReauditsFilteredDomainAfterHealthyProjection(t *testing.T) {
+func TestAppV23CerebrumTimelineOmitsFilteredDomainAfterHealthyProjection(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
 	insertTestMemory(t, fixture.sql, "timeline-filtered-memory", "timeline-domain")
 	publishAppV23DashboardRecord(
@@ -695,8 +935,10 @@ func TestAppV23CerebrumTimelineReauditsFilteredDomainAfterHealthyProjection(t *t
 	rec := requestLocalProjectionRoute(
 		t, fixture, "/v1/dashboard/memory/timeline?domain=timeline-domain",
 	)
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
-	require.NotContains(t, rec.Body.String(), `"buckets":[]`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), `"buckets":[]`)
+	require.Contains(t, rec.Body.String(), `"partial":true`)
+	require.Contains(t, rec.Body.String(), `"hidden_count":1`)
 }
 
 func TestAppV23CerebrumTagReadsRejectSQLOnlyGhostAndValidateExactTarget(t *testing.T) {
@@ -1080,7 +1322,7 @@ func TestAppV23CerebrumExportStreamsSealedSnapshotAcrossConcurrentProjectionMuta
 	require.Equal(t, "canonical-after-gap", second.MemoryID)
 }
 
-func TestAppV23CerebrumBroadListFailsClosedForTamperedProjectionFields(t *testing.T) {
+func TestAppV23CerebrumBroadListOmitsTamperedProjectionFields(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		tamper func(*testing.T, appV23ProjectionRouteFixture)
@@ -1135,7 +1377,9 @@ func TestAppV23CerebrumBroadListFailsClosedForTamperedProjectionFields(t *testin
 			rec := requestLocalProjectionRoute(
 				t, fixture, "/v1/dashboard/memory/list",
 			)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Contains(t, rec.Body.String(), `"partial":true`)
+			require.Contains(t, rec.Body.String(), `"hidden_count":1`)
 			require.NotContains(t, rec.Body.String(), "content-tampered-record")
 			require.NotContains(t, rec.Body.String(), "other-domain")
 		})

@@ -272,7 +272,17 @@ func TestReadiness_CanonicalMemoryProjectionFailsClosedUntilCompleteAudit(t *tes
 		Quarantined: true,
 	}
 	code, body = readiness(t, h, "")
+	if code != http.StatusOK || body["status"] != "degraded" {
+		t.Fatalf("localized canonical quarantine must remain operational, got %d %v", code, body["status"])
+	}
+	code, body = readiness(t, h, "?strict=1")
+	if code != http.StatusServiceUnavailable || body["status"] != "degraded" {
+		t.Fatalf("strict readiness must reject canonical quarantine, got %d %v", code, body["status"])
+	}
+
+	status.Checked = false
+	code, body = readiness(t, h, "")
 	if code != http.StatusServiceUnavailable || body["status"] != "not_ready" {
-		t.Fatalf("quarantined canonical projection must be 503, got %d %v", code, body["status"])
+		t.Fatalf("request-local quarantine without a complete audit must be 503, got %d %v", code, body["status"])
 	}
 }

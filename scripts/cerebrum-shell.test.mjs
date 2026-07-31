@@ -102,14 +102,17 @@ test('CEREBRUM labels a partial canonical projection and never calls it an empty
     );
 
     assert.match(inventory, /stats\.projection\?\.partial === true/);
-    assert.match(inventory, /Verified memories shown/);
+    assert.match(inventory, /Available memories shown/);
     assert.match(inventory, /Your stored data was not changed/);
-    assert.match(mri, /No verified memories can be shown yet/);
+    assert.match(mri, /No memories can be safely shown yet/);
     assert.match(mri, /noLocalMemories && !partialProjection/);
     assert.match(healthBar, /health\.memory_projection\?\.partial === true/);
+    assert.match(healthBar, /health\.memory_projection\?\.verified_only !== false/);
     assert.match(healthBar, /verified memories/);
+    assert.match(healthBar, /available memories/);
     assert.match(healthBar, /Canonically verified memories currently visible/);
-    assert.match(healthBar, /Verified view/);
+    assert.match(healthBar, /Readable historical memories currently visible/);
+    assert.match(healthBar, /Available view/);
 });
 
 test('Search page renders projection failures as errors, never empty search results', () => {
