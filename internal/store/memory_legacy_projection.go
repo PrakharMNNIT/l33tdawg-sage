@@ -563,7 +563,10 @@ func (s *SQLiteStore) DeprecateLegacyMemoryRecoverySnapshot(
 		return 0, fmt.Errorf("read legacy memory recovery inventory: %w", queryErr)
 	}
 	type disposition struct{ memoryID, reason string }
-	items := make([]disposition, 0, expectedCount)
+	// expectedCount is supplied by the Root's signed recovery snapshot. It is
+	// verified against this transaction's inventory below, but must not control
+	// an up-front allocation before that verification has happened.
+	var items []disposition
 	for rows.Next() {
 		var item disposition
 		if scanErr := rows.Scan(&item.memoryID, &item.reason); scanErr != nil {

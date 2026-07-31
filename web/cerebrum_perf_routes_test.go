@@ -320,6 +320,23 @@ func TestRepresentativeGraphWindowsCountOnlyOnce(t *testing.T) {
 		"only the first representative window should count the filtered table")
 }
 
+func TestRepresentativeGraphCapsUntrustedPresentationBudgets(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "bounded-graph-memory", "bounded-graph-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "bounded-graph-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+
+	records, _, err := fixture.handler.appV23CanonicalDashboardCandidates(
+		context.Background(),
+		store.ListOptions{Limit: 1 << 20, Sort: "newest"},
+		1<<20, 1<<20,
+	)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(records), appV23CerebrumInteractiveScanBudget)
+}
+
 func TestValidatedStableGraphIsPromotedToExactRevisionCache(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
 	counting := &graphProjectionCountingStore{SQLiteStore: fixture.sql}

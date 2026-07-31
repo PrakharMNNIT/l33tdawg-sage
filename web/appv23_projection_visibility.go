@@ -999,6 +999,9 @@ func (h *DashboardHandler) appV23CanonicalDashboardPageObserved(
 	if visibleLimit <= 0 {
 		visibleLimit = 50
 	}
+	if visibleLimit > appV23DashboardProjectionPageSize {
+		visibleLimit = appV23DashboardProjectionPageSize
+	}
 	visibleOffset := opts.Offset
 	if visibleOffset < 0 {
 		visibleOffset = 0
@@ -1134,6 +1137,9 @@ func (h *DashboardHandler) appV23CanonicalKeywordPage(
 	if visibleLimit <= 0 {
 		visibleLimit = 50
 	}
+	if visibleLimit > appV23DashboardProjectionPageSize {
+		visibleLimit = appV23DashboardProjectionPageSize
+	}
 	visibleOffset := opts.Offset
 	if visibleOffset < 0 {
 		visibleOffset = 0
@@ -1246,6 +1252,12 @@ func (h *DashboardHandler) appV23CanonicalDashboardCandidates(
 ) ([]*memory.MemoryRecord, bool, error) {
 	if visibleLimit <= 0 {
 		return nil, false, nil
+	}
+	if visibleLimit > appV23CerebrumInteractiveScanBudget {
+		visibleLimit = appV23CerebrumInteractiveScanBudget
+	}
+	if scanBudget > appV23CerebrumInteractiveScanBudget {
+		scanBudget = appV23CerebrumInteractiveScanBudget
 	}
 	if scanBudget < visibleLimit {
 		scanBudget = visibleLimit
