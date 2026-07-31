@@ -1030,7 +1030,7 @@ func (h *DashboardHandler) appV23CanonicalDashboardPageObserved(
 	}
 
 	const rawPageSize = appV23DashboardProjectionPageSize
-	page := make([]*memory.MemoryRecord, 0, visibleLimit)
+	page := make([]*memory.MemoryRecord, 0, appV23DashboardProjectionPageSize)
 	visibleSeen := 0
 	rawOffset := 0
 	queryKey := appV23DashboardListQueryKey(opts)
@@ -1163,7 +1163,7 @@ func (h *DashboardHandler) appV23CanonicalKeywordPage(
 
 	const rawPageSize = appV23DashboardProjectionPageSize
 	needle := strings.ToLower(keyword)
-	page := make([]*memory.MemoryRecord, 0, visibleLimit)
+	page := make([]*memory.MemoryRecord, 0, appV23DashboardProjectionPageSize)
 	scanStart := rawOffset
 	rawExhausted := false
 	observedHidden := 0
@@ -1284,7 +1284,11 @@ func (h *DashboardHandler) appV23CanonicalDashboardCandidates(
 	if maxOffset < 0 {
 		maxOffset = 0
 	}
-	offsets := make([]int, 0, windowCount)
+	offsets := make(
+		[]int,
+		0,
+		appV23CerebrumInteractiveScanBudget/rawPageSize,
+	)
 	for i := 0; i < windowCount; i++ {
 		offset := 0
 		if windowCount > 1 {
@@ -1295,8 +1299,12 @@ func (h *DashboardHandler) appV23CanonicalDashboardCandidates(
 		}
 	}
 
-	candidates := make([]*memory.MemoryRecord, 0, scanBudget)
-	seen := make(map[string]struct{}, scanBudget)
+	candidates := make(
+		[]*memory.MemoryRecord,
+		0,
+		appV23CerebrumInteractiveScanBudget,
+	)
+	seen := make(map[string]struct{}, appV23CerebrumInteractiveScanBudget)
 	scanned := 0
 	for windowIndex, rawOffset := range offsets {
 		if err := ctx.Err(); err != nil {
