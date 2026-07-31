@@ -369,12 +369,12 @@ test('the Linux cold gate proves the closed placeholder through the real Comet d
   assert.doesNotMatch(v119StateSync, /busybox nslookup provider-p2p/);
 });
 
-test('the mandatory cold gate transfers one exact app-v24 session', () => {
+test('the mandatory cold gate transfers one exact app-v25 session', () => {
   assert.match(
     faultWorkflow,
-    /name: App-v24 real Comet\/ABCI crash, partition, and state-sync gate/,
+    /name: App-v25 real Comet\/ABCI crash, partition, and state-sync gate/,
   );
-  assert.match(v119StateSync, /^TARGET_APP_VERSION=24$/m);
+  assert.match(v119StateSync, /^TARGET_APP_VERSION=25$/m);
   assert.match(v119StateSync, /"app_version": \$\{TARGET_APP_VERSION\}/);
   assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21|22|23)/);
   assert.match(
@@ -538,12 +538,12 @@ test('the mandatory cold gate fails closed unless every seed reports its exact s
   assert.match(seedMemories, /lines\[-1\] != summary/);
   assert.match(seedMemories, /matches\[0\] != summary/);
   assert.doesNotMatch(seedMemories, />\/dev\/null/);
-  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v24\.txt 1/);
+  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v25\.txt 1/);
   assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/advance\.txt 2/);
   assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/restart\.txt 1/);
   assert.match(
     v119StateSync,
-    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v24\.txt 1\nwait_height_at_least/,
+    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v25\.txt 1\nwait_height_at_least/,
   );
   assert.match(
     v119StateSync,
