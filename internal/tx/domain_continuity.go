@@ -127,8 +127,8 @@ func DecodeDomainContinuityPayload(encoded []byte) (*DomainContinuityPayload, er
 	if offset != len(encoded) {
 		return nil, fmt.Errorf("%w: %d trailing bytes", errDomainContinuityPayload, len(encoded)-offset)
 	}
-	if err := validateDomainContinuityPayload(*payload); err != nil {
-		return nil, err
+	if validationErr := validateDomainContinuityPayload(*payload); validationErr != nil {
+		return nil, validationErr
 	}
 	canonical, err := EncodeDomainContinuityPayload(*payload)
 	if err != nil {

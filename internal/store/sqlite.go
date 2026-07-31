@@ -1766,7 +1766,7 @@ func (s *SQLiteStore) ListUnreadableMemoryIDs(
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var ids []string
 	for rows.Next() {
 		var id string

@@ -134,10 +134,10 @@ type preparedMemoryLegacyAdoption struct {
 	creditedVoteMarkers [][]byte
 }
 
-const memoryLegacyRevoteCreditStatePrefix = "appv25:legacy_revote_credit:"
+const memoryLegacyRevoteStatePrefix = "appv25:legacy_revote_credit:"
 
 func memoryLegacyRevoteCreditStateKey(memoryID, validatorID string) string {
-	return memoryLegacyRevoteCreditStatePrefix + memoryID + ":" + validatorID
+	return memoryLegacyRevoteStatePrefix + memoryID + ":" + validatorID
 }
 
 // ConsumeMemoryLegacyRevoteCredit suppresses duplicate PoE accounting for the

@@ -170,8 +170,8 @@ func DecodeMemoryLegacyAdoptionPayload(encoded []byte) (*MemoryLegacyAdoptionPay
 			"%w: %d trailing bytes", errMemoryLegacyAdoptionPayload, len(encoded)-offset,
 		)
 	}
-	if err := validateMemoryLegacyAdoptionPayload(*payload); err != nil {
-		return nil, err
+	if validationErr := validateMemoryLegacyAdoptionPayload(*payload); validationErr != nil {
+		return nil, validationErr
 	}
 	canonical, err := EncodeMemoryLegacyAdoptionPayload(*payload)
 	if err != nil {

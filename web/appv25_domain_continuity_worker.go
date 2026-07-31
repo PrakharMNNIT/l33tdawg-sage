@@ -179,15 +179,6 @@ func (h *DashboardHandler) RunAppV25DomainContinuityWorker(
 	}
 }
 
-func (h *DashboardHandler) runAppV25DomainContinuityPass(
-	ctx context.Context,
-	logger zerolog.Logger,
-) (bool, error) {
-	return h.runAppV25DomainContinuityPassWithRun(
-		ctx, logger, &appV25DomainContinuityRun{},
-	)
-}
-
 func (h *DashboardHandler) runAppV25DomainContinuityPassWithRun(
 	ctx context.Context,
 	logger zerolog.Logger,
@@ -223,9 +214,9 @@ func (h *DashboardHandler) runAppV25DomainContinuityPassWithRun(
 		return false, err
 	}
 	if activeProposalID != "" {
-		proposal, err := h.dashboardGovernanceProposal(activeProposalID)
-		if err != nil {
-			return false, err
+		proposal, proposalErr := h.dashboardGovernanceProposal(activeProposalID)
+		if proposalErr != nil {
+			return false, proposalErr
 		}
 		if proposal.Operation != governance.OpDomainContinuityAdopt {
 			return false, nil
@@ -432,10 +423,10 @@ func (h *DashboardHandler) runAppV25DomainContinuityPassWithRun(
 			Payload: payload,
 		},
 	}
-	if err := embedDashboardGovernanceProof(
+	if proofErr := embedDashboardGovernanceProof(
 		proposalTx, rootKey, "POST", "/v1/governance/propose", body,
-	); err != nil {
-		return false, err
+	); proofErr != nil {
+		return false, proofErr
 	}
 	_, committedHeight, _, err := h.signAndBroadcastCommit(proposalTx, h.SigningKey)
 	if err != nil {

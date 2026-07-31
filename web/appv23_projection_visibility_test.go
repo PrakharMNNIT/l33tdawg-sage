@@ -592,7 +592,7 @@ func TestAppV23PartialProjectionContinuesDeepVisibleOffsetInBoundedScans(t *test
 		"one request must remain bounded")
 
 	deep.offsets = nil
-	records, total, next, continuation, err :=
+	records, _, next, continuation, err :=
 		fixture.handler.appV23CanonicalDashboardPage(
 			context.Background(), opts, cursor,
 		)
@@ -1080,9 +1080,9 @@ func TestAppV23CanonicalProjectionAuditQuarantinesMissingSQLRowsAcrossVaultModes
 			require.True(t, health.Quarantined)
 			require.Equal(t, store.CanonicalMemoryProjectionQuarantined, health.State)
 
-			stats := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
+			requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
 			waitForAppV23ProjectionRefresh(t, fixture.handler)
-			stats = requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
+			stats := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
 			require.Equal(t, http.StatusOK, stats.Code, stats.Body.String())
 			require.Contains(t, stats.Body.String(), `"total_memories":0`)
 			require.Contains(t, stats.Body.String(), `"partial":true`)

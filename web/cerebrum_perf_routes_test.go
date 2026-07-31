@@ -490,7 +490,7 @@ func TestAppV23CerebrumGraphServesValidatedCacheWhileNewMemoryRefreshes(
 	}
 	close(blocking.release)
 	require.Eventually(t, func() bool {
-		blocking.SQLiteStore.MemoryProjectionRevision(context.Background())
+		blocking.MemoryProjectionRevision(context.Background())
 		fixture.handler.graphCacheMu.Lock()
 		defer fixture.handler.graphCacheMu.Unlock()
 		for _, entry := range fixture.handler.graphCache {

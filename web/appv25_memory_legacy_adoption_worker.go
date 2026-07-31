@@ -457,17 +457,6 @@ func (h *DashboardHandler) RunAppV25LegacyAdoptionWorker(
 	}
 }
 
-func (h *DashboardHandler) runAppV25LegacyAdoptionPass(
-	ctx context.Context,
-	logger zerolog.Logger,
-) (bool, error) {
-	return h.runAppV25LegacyAdoptionPassWithState(
-		ctx,
-		logger,
-		&appV25LegacyAdoptionRun{},
-	)
-}
-
 func (h *DashboardHandler) runAppV25LegacyAdoptionPassWithState(
 	ctx context.Context,
 	logger zerolog.Logger,
@@ -626,16 +615,16 @@ func (h *DashboardHandler) runAppV25LegacyAdoptionPassWithState(
 		sort.Slice(plan.Recovery, func(i, j int) bool {
 			return plan.Recovery[i].MemoryID < plan.Recovery[j].MemoryID
 		})
-		if err := source.SyncLegacyMemoryRecoveryQueue(
+		if syncErr := source.SyncLegacyMemoryRecoveryQueue(
 			ctx, plan.SQLRevision, plan.Recovery,
-		); err != nil {
-			return false, err
+		); syncErr != nil {
+			return false, syncErr
 		}
-		if err := h.publishAppV25LegacyAdoptionProgress(
+		if publishErr := h.publishAppV25LegacyAdoptionProgress(
 			ctx, source, plan, "migrating",
 			"Memory upgrade preserved an exact batch rejected by governed validation.",
-		); err != nil {
-			return false, err
+		); publishErr != nil {
+			return false, publishErr
 		}
 		return true, nil
 	}
@@ -690,14 +679,14 @@ func (h *DashboardHandler) runAppV25LegacyAdoptionPassWithState(
 			Payload:   payload,
 		},
 	}
-	if err := embedDashboardGovernanceProof(
+	if proofErr := embedDashboardGovernanceProof(
 		proposalTx,
 		rootKey,
 		"POST",
 		"/v1/governance/propose",
 		body,
-	); err != nil {
-		return false, fmt.Errorf("authorize app-v25 legacy adoption proposal: %w", err)
+	); proofErr != nil {
+		return false, fmt.Errorf("authorize app-v25 legacy adoption proposal: %w", proofErr)
 	}
 	_, committedHeight, _, err := h.broadcastAppV25LegacyAdoption(
 		run, proposalTx, h.SigningKey,
@@ -1181,9 +1170,10 @@ func (h *DashboardHandler) handleActiveAppV25LegacyAdoption(
 		return false, fmt.Errorf("commit app-v25 validator attestation: %w", err)
 	}
 	message := "Memory upgrade is waiting for validator attestations."
-	if decision == tx.VoteDecisionReject {
+	switch decision {
+	case tx.VoteDecisionReject:
 		message = "This node rejected a stale or divergent memory upgrade batch."
-	} else if decision == tx.VoteDecisionAbstain {
+	case tx.VoteDecisionAbstain:
 		message = "This node could not verify the memory upgrade batch and abstained."
 	}
 	if err := h.publishAppV25LegacyAdoptionProgress(

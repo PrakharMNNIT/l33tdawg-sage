@@ -1175,31 +1175,6 @@ func (h *DashboardHandler) appV23ProjectionResponseForContext(
 	return h.appV23ProjectionResponse()
 }
 
-func (h *DashboardHandler) appV23ProjectionReadGate(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		stats, activity, projection, err :=
-			h.requireAppV23DashboardProjectionAvailable(r.Context())
-		if err != nil {
-			if writeAppV23DashboardProjectionFailure(w, err) {
-				return
-			}
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if h.appV23IsActive() {
-			r = r.WithContext(context.WithValue(
-				r.Context(),
-				appV23ProjectionAuditContextKey{},
-				appV23ProjectionAuditSnapshot{
-					stats: stats, activity: activity,
-					projection: projection,
-				},
-			))
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 // appV23ProjectionBroadReadGate performs the same complete audit as the strict
 // gate, but allows individually verified broad routes to serve while one or
 // more unsafe historical rows remain quarantined. The route handler must omit
@@ -3483,41 +3458,6 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 // of the most recent non-deprecated memory, feeding the MRI lobe ordering.
 type domainActivityProvider interface {
 	GetDomainLastActivity(ctx context.Context) (map[string]string, error)
-}
-
-// stratifiedSample draws a representative, importance-ranked sample for the
-// overview brain: each domain gets a quota proportional to its share of the
-// total, filled with that domain's highest-confidence memories. Keeps lobe
-// density faithful to reality and surfaces the most significant memories, while
-// never exceeding the cap. One bounded ListMemories call per domain.
-func (h *DashboardHandler) stratifiedSample(ctx context.Context, base store.ListOptions, domainCounts map[string]int, total, cap int) ([]*memory.MemoryRecord, error) {
-	out := make([]*memory.MemoryRecord, 0, cap)
-	for domain, cnt := range domainCounts {
-		if cnt <= 0 {
-			continue
-		}
-		quota := (cap*cnt + total/2) / total // round(cap * cnt/total)
-		if quota < 1 {
-			quota = 1
-		}
-		o := base
-		o.DomainTag = domain
-		o.Sort = "confidence"
-		o.Limit = quota
-		recs, _, err := h.store.ListMemories(ctx, o)
-		if err != nil {
-			return nil, err
-		}
-		recs, err = h.filterAppV23BroadDashboardRecords(recs)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, recs...)
-	}
-	if len(out) > cap {
-		out = out[:cap]
-	}
-	return out, nil
 }
 
 type appV23DashboardStatsResponse struct {

@@ -209,6 +209,8 @@ func (s *SQLiteStore) GetLegacyMemoryProjectionRecords(
 		return nil, fmt.Errorf("begin legacy memory projection batch: %w", err)
 	}
 	defer func() { _ = readTx.Rollback() }()
+	// #nosec G202 -- placeholders contains only generated "?" tokens; every
+	// memory ID remains a separately bound query argument.
 	rows, err := readTx.QueryContext(
 		ctx,
 		`SELECT memory_id, submitting_agent, content, content_hash,
@@ -537,45 +539,45 @@ func (s *SQLiteStore) DeprecateLegacyMemoryRecoverySnapshot(
 	if expectedRevision == 0 || expectedCount <= 0 || strings.TrimSpace(authorizedBy) == "" {
 		return 0, ErrLegacyMemoryRecoverySnapshotChanged
 	}
-	txn, unlock, err := s.beginTxLocked(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin legacy memory recovery disposition: %w", err)
+	txn, unlock, beginErr := s.beginTxLocked(ctx)
+	if beginErr != nil {
+		return 0, fmt.Errorf("begin legacy memory recovery disposition: %w", beginErr)
 	}
 	defer unlock()
 	defer func() { _ = txn.Rollback() }()
 
 	var revision int64
-	if err := txn.QueryRowContext(ctx,
+	if revisionErr := txn.QueryRowContext(ctx,
 		`SELECT revision FROM memory_projection_revision WHERE singleton = 1`,
-	).Scan(&revision); err != nil {
-		return 0, fmt.Errorf("read memory projection revision: %w", err)
+	).Scan(&revision); revisionErr != nil {
+		return 0, fmt.Errorf("read memory projection revision: %w", revisionErr)
 	}
 	if revision < 0 || uint64(revision) != expectedRevision {
 		return 0, ErrLegacyMemoryRecoverySnapshotChanged
 	}
-	rows, err := txn.QueryContext(ctx,
+	rows, queryErr := txn.QueryContext(ctx,
 		`SELECT memory_id, machine_reason FROM legacy_memory_recovery
 		 WHERE resolved_at IS NULL AND projection_revision = ?
 		 ORDER BY memory_id ASC`, expectedRevision)
-	if err != nil {
-		return 0, fmt.Errorf("read legacy memory recovery inventory: %w", err)
+	if queryErr != nil {
+		return 0, fmt.Errorf("read legacy memory recovery inventory: %w", queryErr)
 	}
 	type disposition struct{ memoryID, reason string }
 	items := make([]disposition, 0, expectedCount)
 	for rows.Next() {
 		var item disposition
-		if err := rows.Scan(&item.memoryID, &item.reason); err != nil {
+		if scanErr := rows.Scan(&item.memoryID, &item.reason); scanErr != nil {
 			_ = rows.Close()
-			return 0, fmt.Errorf("scan legacy memory recovery inventory: %w", err)
+			return 0, fmt.Errorf("scan legacy memory recovery inventory: %w", scanErr)
 		}
 		items = append(items, item)
 	}
-	if err := rows.Err(); err != nil {
+	if rowsErr := rows.Err(); rowsErr != nil {
 		_ = rows.Close()
-		return 0, fmt.Errorf("walk legacy memory recovery inventory: %w", err)
+		return 0, fmt.Errorf("walk legacy memory recovery inventory: %w", rowsErr)
 	}
-	if err := rows.Close(); err != nil {
-		return 0, fmt.Errorf("close legacy memory recovery inventory: %w", err)
+	if closeErr := rows.Close(); closeErr != nil {
+		return 0, fmt.Errorf("close legacy memory recovery inventory: %w", closeErr)
 	}
 	var other int
 	if err := txn.QueryRowContext(ctx,

@@ -187,8 +187,8 @@ func appV25AllocateContinuityHomeTxn(
 		switch {
 		case errors.Is(err, badger.ErrKeyNotFound):
 			if apply {
-				if err := s.txnSet(txn, domainKey(candidate), appV23EncodeDomain(agentID, height)); err != nil {
-					return "", err
+				if setErr := s.txnSet(txn, domainKey(candidate), appV23EncodeDomain(agentID, height)); setErr != nil {
+					return "", setErr
 				}
 			}
 			return candidate, nil
@@ -384,10 +384,10 @@ func (s *BadgerStore) prepareAppV25DomainContinuityBatchTxn(
 
 		prepared := appV25PreparedContinuityDomain{entry: entry}
 		if item, err := txn.Get(appV25DomainContinuityKey(entry.Domain)); err == nil {
-			if err := item.Value(func(value []byte) error {
+			if valueErr := item.Value(func(value []byte) error {
 				var existing AppV25DomainContinuity
-				if err := json.Unmarshal(value, &existing); err != nil {
-					return err
+				if unmarshalErr := json.Unmarshal(value, &existing); unmarshalErr != nil {
+					return unmarshalErr
 				}
 				if existing.Version != appV25DomainContinuityVersion || existing.Domain != entry.Domain ||
 					existing.RootGeneration != rootGeneration || !reflectStringSlicesEqual(existing.Writers, entry.Writers) {
@@ -405,8 +405,8 @@ func (s *BadgerStore) prepareAppV25DomainContinuityBatchTxn(
 					prepared.repairOwner = true
 				}
 				return nil
-			}); err != nil {
-				return nil, err
+			}); valueErr != nil {
+				return nil, valueErr
 			}
 		} else if !errors.Is(err, badger.ErrKeyNotFound) {
 			return nil, err
@@ -696,8 +696,8 @@ func (s *BadgerStore) applyAppV25DomainContinuityBatchTxn(
 		if err != nil {
 			return err
 		}
-		if err := s.txnSet(txn, appV23EnrollmentKey(writer), data); err != nil {
-			return err
+		if setErr := s.txnSet(txn, appV23EnrollmentKey(writer), data); setErr != nil {
+			return setErr
 		}
 		activation, err := appV23Marshal(AppV25DomainContinuityActivation{
 			AgentID: writer, HomeDomain: prepared.enrollment.HomeDomain,
@@ -792,8 +792,8 @@ func (s *BadgerStore) prepareAndMaybeApplyAppV25DomainContinuityTxn(
 	if existingItem, err := txn.Get(appV25DomainContinuityKey(domain)); err == nil {
 		return existingItem.Value(func(value []byte) error {
 			var existing AppV25DomainContinuity
-			if err := json.Unmarshal(value, &existing); err != nil {
-				return err
+			if unmarshalErr := json.Unmarshal(value, &existing); unmarshalErr != nil {
+				return unmarshalErr
 			}
 			if existing.Domain == domain &&
 				existing.RootGeneration == rootGeneration &&
@@ -871,23 +871,23 @@ func (s *BadgerStore) prepareAndMaybeApplyAppV25DomainContinuityTxn(
 		dispositions[writer] = disposition
 	}
 
-	effectiveShared, err := appV23DomainIsSharedTxn(txn, domain)
-	if err != nil {
-		return err
+	effectiveShared, sharedErr := appV23DomainIsSharedTxn(txn, domain)
+	if sharedErr != nil {
+		return sharedErr
 	}
 	shared := len(writers) > 1 || effectiveShared
 	groupID := ""
 	owner := ""
 	if shared {
 		groupID = AppV25DomainContinuityGroupID(writers)
-		if err := validateAppV23GroupID(groupID); err != nil {
-			return err
+		if validationErr := validateAppV23GroupID(groupID); validationErr != nil {
+			return validationErr
 		}
 	} else {
 		owner = writers[0]
 	}
 
-	if value, err := s.appV23ReadEffectiveValueTxn(txn, domainKey(domain)); err == nil {
+	if value, readErr := s.appV23ReadEffectiveValueTxn(txn, domainKey(domain)); readErr == nil {
 		currentOwner, _, decodeErr := decodeString(value, 0)
 		if decodeErr != nil {
 			return decodeErr
@@ -900,8 +900,8 @@ func (s *BadgerStore) prepareAndMaybeApplyAppV25DomainContinuityTxn(
 				ErrAppV25DomainContinuityStateConflict, currentOwner,
 			)
 		}
-	} else if !errors.Is(err, badger.ErrKeyNotFound) {
-		return err
+	} else if !errors.Is(readErr, badger.ErrKeyNotFound) {
+		return readErr
 	}
 
 	for _, writer := range writers {
@@ -916,11 +916,9 @@ func (s *BadgerStore) prepareAndMaybeApplyAppV25DomainContinuityTxn(
 			changed = true
 		} else if shared &&
 			(enrollment.HomeDomain == "" || enrollment.HomeDomain == domain) {
-			home := domain
-			var err error
-			home, err = appV25AllocateContinuityHomeTxn(s, txn, writer, height, apply)
-			if err != nil {
-				return err
+			home, allocationErr := appV25AllocateContinuityHomeTxn(s, txn, writer, height, apply)
+			if allocationErr != nil {
+				return allocationErr
 			}
 			enrollment.HomeDomain = home
 			changed = true
@@ -928,13 +926,13 @@ func (s *BadgerStore) prepareAndMaybeApplyAppV25DomainContinuityTxn(
 		if changed {
 			enrollment.Revision++
 			enrollment.UpdatedHeight = height
-			data, err := appV23Marshal(enrollment)
-			if err != nil {
-				return err
+			data, marshalErr := appV23Marshal(enrollment)
+			if marshalErr != nil {
+				return marshalErr
 			}
 			if apply {
-				if err := s.txnSet(txn, appV23EnrollmentKey(writer), data); err != nil {
-					return err
+				if setErr := s.txnSet(txn, appV23EnrollmentKey(writer), data); setErr != nil {
+					return setErr
 				}
 			}
 			activation := AppV25DomainContinuityActivation{
@@ -943,15 +941,15 @@ func (s *BadgerStore) prepareAndMaybeApplyAppV25DomainContinuityTxn(
 				EnrollmentRevision: enrollment.Revision,
 				AppliedHeight:      height,
 			}
-			activationData, err := appV23Marshal(activation)
-			if err != nil {
-				return err
+			activationData, activationMarshalErr := appV23Marshal(activation)
+			if activationMarshalErr != nil {
+				return activationMarshalErr
 			}
 			if apply {
-				if err := s.txnSet(
+				if setErr := s.txnSet(
 					txn, appV25DomainContinuityActivationKey(writer), activationData,
-				); err != nil {
-					return err
+				); setErr != nil {
+					return setErr
 				}
 			}
 		}
@@ -960,8 +958,8 @@ func (s *BadgerStore) prepareAndMaybeApplyAppV25DomainContinuityTxn(
 
 	if shared {
 		if apply {
-			if err := s.txnSet(txn, stateKey("shared_domain:"+domain), []byte{1}); err != nil {
-				return err
+			if setErr := s.txnSet(txn, stateKey("shared_domain:"+domain), []byte{1}); setErr != nil {
+				return setErr
 			}
 		}
 		var existing AppV23AccessGroup
@@ -1109,26 +1107,26 @@ func (s *BadgerStore) AppV25AllowsHistoricalDomainWrite(agentID, domain string) 
 		return false, err
 	}
 	allowed := false
-	err := s.view(func(txn *badger.Txn) error {
-		grant, err := txn.Get(appV25DomainContinuityGrantKey(agentID, domain))
-		if errors.Is(err, badger.ErrKeyNotFound) {
+	viewErr := s.view(func(txn *badger.Txn) error {
+		grant, getErr := txn.Get(appV25DomainContinuityGrantKey(agentID, domain))
+		if errors.Is(getErr, badger.ErrKeyNotFound) {
 			return nil
-		} else if err != nil {
-			return err
+		} else if getErr != nil {
+			return getErr
 		}
 		var grantRevision uint64
-		if err := grant.Value(func(value []byte) error {
+		if valueErr := grant.Value(func(value []byte) error {
 			if len(value) != 8 {
 				return errors.New("invalid app-v25 domain continuity grant")
 			}
 			grantRevision = binary.BigEndian.Uint64(value)
 			return nil
-		}); err != nil {
-			return err
+		}); valueErr != nil {
+			return valueErr
 		}
 		var record AppV25DomainContinuity
-		if err := appV23ReadJSON(txn, appV25DomainContinuityKey(domain), &record); err != nil {
-			return err
+		if readRecordErr := appV23ReadJSON(txn, appV25DomainContinuityKey(domain), &record); readRecordErr != nil {
+			return readRecordErr
 		}
 		if record.Version != appV25DomainContinuityVersion ||
 			record.Domain != domain ||
@@ -1140,10 +1138,10 @@ func (s *BadgerStore) AppV25AllowsHistoricalDomainWrite(agentID, domain string) 
 			return nil
 		}
 		var enrollment AppV23LocalEnrollment
-		if err := s.appV23ReadEffectiveJSONTxn(
+		if enrollmentErr := s.appV23ReadEffectiveJSONTxn(
 			txn, appV23EnrollmentKey(agentID), &enrollment,
-		); err != nil {
-			return err
+		); enrollmentErr != nil {
+			return enrollmentErr
 		}
 		// The grant is a migration compatibility entitlement, not an immortal
 		// override. Any later explicit policy mutation increments the enrollment
@@ -1152,9 +1150,9 @@ func (s *BadgerStore) AppV25AllowsHistoricalDomainWrite(agentID, domain string) 
 			enrollment.Revision != grantRevision {
 			return nil
 		}
-		shared, err := appV23DomainIsSharedTxn(txn, domain)
-		if err != nil {
-			return err
+		shared, sharedErr := appV23DomainIsSharedTxn(txn, domain)
+		if sharedErr != nil {
+			return sharedErr
 		}
 		if shared != record.Shared {
 			return nil
@@ -1190,7 +1188,7 @@ func (s *BadgerStore) AppV25AllowsHistoricalDomainWrite(agentID, domain string) 
 		allowed = record.Owner == agentID && owner == agentID
 		return nil
 	})
-	return allowed, err
+	return allowed, viewErr
 }
 
 // AppV25AllowsHistoricalDomainModify extends the revision-bound exact
