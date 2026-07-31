@@ -145,7 +145,7 @@ func (s *BadgerStore) observeMemoryProjectionDisposition(
 		// inventory walk may first publish Checked=true with Quarantined=true.
 		// Revalidating an already localized quarantine cannot make that completed
 		// walk incomplete; a new full walk calls Begin... before touching rows.
-		if !(status.Checked && status.Quarantined) {
+		if !status.Checked || !status.Quarantined {
 			status.Checked = false
 		}
 		status.OK = false
