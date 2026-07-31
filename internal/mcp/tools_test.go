@@ -1525,6 +1525,7 @@ func TestSageStatusReturnsPendingCallerStandingWithoutMemoryRead(t *testing.T) {
 	require.Equal(t, false, standing["can_read"])
 	require.Equal(t, false, standing["can_write"])
 	require.Equal(t, false, standing["memory_access_available"])
+	require.Equal(t, false, standing["counts_available"])
 	require.Equal(t, 0, memoryReads)
 }
 
@@ -1562,6 +1563,265 @@ func TestSageStatusMergesActiveCallerStandingWithCallerMemoryStats(t *testing.T)
 	require.Equal(t, true, standing["can_write"])
 	require.Equal(t, true, standing["memory_access_available"])
 	require.Equal(t, 1, memoryReads)
+}
+
+func TestSageStatusKeepsStandingAndFallsBackToHomeDomainOnScanBudget(t *testing.T) {
+	var allDomainReads, homeDomainReads int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": r.Header.Get("X-Agent-ID"),
+			"role":     "member", "profile": "standard", "home_domain": "voice+interface",
+			"enrollment_status": "active", "registration_status": "active",
+			"clearance": 1, "capabilities": 0,
+			"can_read": true, "can_write": true, "access_scope": "home_domain",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
+		require.NotEmpty(t, r.Header.Get("X-Agent-ID"))
+		require.NotEmpty(t, r.Header.Get("X-Signature"))
+		require.NotEmpty(t, r.Header.Get("X-Timestamp"))
+		require.Len(t, r.Header.Get("X-Nonce"), 16)
+		if r.URL.Query().Get("domain") == "" {
+			allDomainReads++
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"title": "Query too broad", "status": http.StatusUnprocessableEntity,
+				"detail": "app-v23 authorization scan budget exceeded",
+			})
+			return
+		}
+		homeDomainReads++
+		require.Equal(t, "voice+interface", r.URL.Query().Get("domain"),
+			"the exact home domain must survive query escaping")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories": []map[string]any{}, "total": 0,
+			"has_more": false, "total_exact": true,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	result, err := NewServer(ts.URL, priv).toolStatus(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	status := result.(map[string]any)
+	require.Equal(t, "active", status["registration_status"])
+	require.Equal(t, true, status["memory_access_available"])
+	require.Equal(t, true, status["counts_available"])
+	require.Equal(t, "caller_home_domain", status["scope"])
+	require.Equal(t, "home_domain", status["counts_scope"])
+	require.Equal(t, "voice+interface", status["domain_scope"])
+	require.Equal(t, 0, status["total_memories"])
+	require.Contains(t, status["counts_degraded_reason"], "bounded authorization scan")
+	require.Equal(t, 1, allDomainReads)
+	require.Equal(t, 1, homeDomainReads)
+}
+
+func TestSageStatusDoesNotFallbackForUnrelatedUnprocessableResponse(t *testing.T) {
+	var homeDomainReads int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": r.Header.Get("X-Agent-ID"),
+			"role":     "member", "profile": "standard", "home_domain": "owned-home",
+			"enrollment_status": "active", "registration_status": "active",
+			"clearance": 1, "capabilities": 0,
+			"can_read": true, "can_write": true, "access_scope": "home_domain",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("domain") != "" {
+			homeDomainReads++
+		}
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title": "Invalid request", "status": http.StatusUnprocessableEntity,
+			"detail": "an unrelated validation failure",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	result, err := NewServer(ts.URL, priv).toolStatus(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	status := result.(map[string]any)
+	require.Equal(t, "active", status["registration_status"])
+	require.Equal(t, false, status["counts_available"])
+	require.NotContains(t, status, "total_memories")
+	require.Zero(t, homeDomainReads,
+		"only the canonical authorization-scan-budget 422 may trigger fallback")
+}
+
+func TestSageStatusReturnsStandingWhenAllBoundedCountsRemainTooBroad(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": r.Header.Get("X-Agent-ID"),
+			"role":     "member", "profile": "standard", "home_domain": "large-home",
+			"enrollment_status": "active", "registration_status": "active",
+			"clearance": 1, "capabilities": 0,
+			"can_read": true, "can_write": true, "access_scope": "home_domain",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title": "Query too broad", "status": http.StatusUnprocessableEntity,
+			"detail": "app-v23 authorization scan budget exceeded",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	result, err := NewServer(ts.URL, priv).toolStatus(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	status := result.(map[string]any)
+	require.Equal(t, "active", status["registration_status"])
+	require.Equal(t, true, status["memory_access_available"])
+	require.Equal(t, false, status["counts_available"])
+	require.Equal(t, "caller", status["counts_scope"])
+	require.Contains(t, status["counts_degraded_reason"], "bounded authorization scan")
+	require.NotContains(t, status, "total_memories",
+		"an unavailable aggregate must not be represented as a false zero")
+}
+
+func TestSageStatusNeverReportsAnInexactZeroCount(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		broadTooLarge bool
+	}{
+		{name: "caller aggregate"},
+		{name: "home-domain fallback", broadTooLarge: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"agent_id": r.Header.Get("X-Agent-ID"),
+					"role":     "member", "profile": "standard", "home_domain": "owned-home",
+					"enrollment_status": "active", "registration_status": "active",
+					"can_read": true, "can_write": true,
+				})
+			})
+			mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
+				if test.broadTooLarge && r.URL.Query().Get("domain") == "" {
+					w.Header().Set("Content-Type", "application/problem+json")
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"title": "Query too broad", "status": http.StatusUnprocessableEntity,
+						"detail": "app-v23 authorization scan budget exceeded",
+					})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"memories": []map[string]any{}, "total": 0,
+					"has_more": true, "total_exact": false,
+				})
+			})
+			ts := httptest.NewServer(mux)
+			defer ts.Close()
+
+			_, priv, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
+			result, err := NewServer(ts.URL, priv).toolStatus(
+				context.Background(), map[string]any{},
+			)
+			require.NoError(t, err)
+			status := result.(map[string]any)
+			require.Equal(t, "active", status["registration_status"])
+			require.Equal(t, false, status["counts_available"])
+			require.NotContains(t, status, "total_memories",
+				"an inexact lower-bound zero must never look like an empty memory set")
+		})
+	}
+}
+
+func TestSageStatusFailsClosedWhenCallerStandingCannotBeAuthenticated(t *testing.T) {
+	var memoryReads int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title": "Access control unavailable", "status": http.StatusServiceUnavailable,
+			"detail": "Current local enrollment state is unavailable.",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		memoryReads++
+		w.WriteHeader(http.StatusOK)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	_, err = NewServer(ts.URL, priv).toolStatus(context.Background(), map[string]any{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "get caller standing")
+	require.Equal(t, 0, memoryReads,
+		"memory aggregation must not run after self-standing authentication fails")
+}
+
+func TestSageStatusFailsClosedForCanonicalAgentNotFoundStanding(t *testing.T) {
+	var memoryReads int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": "https://sage.dev/errors/404", "title": "Agent not found",
+			"status": http.StatusNotFound,
+			"detail": "This authenticated identity is not registered as an ordinary agent on this SAGE.",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		memoryReads++
+		_ = json.NewEncoder(w).Encode(map[string]any{"total": 0})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	_, err = NewServer(ts.URL, priv).toolStatus(context.Background(), map[string]any{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "get caller standing")
+	require.Zero(t, memoryReads,
+		"a canonical app-v23 identity failure must not fall through to counts")
+}
+
+func TestSageStatusFailsClosedForMismatchedSelfStandingIdentity(t *testing.T) {
+	var memoryReads int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": "different-authenticated-principal",
+			"profile":  "standard", "enrollment_status": "active",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		memoryReads++
+		_ = json.NewEncoder(w).Encode(map[string]any{"total": 0})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	_, err = NewServer(ts.URL, priv).toolStatus(context.Background(), map[string]any{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "authenticated self-standing identity mismatch")
+	require.Zero(t, memoryReads)
 }
 
 func TestCallerScopedMemoryStatsUsesParsedActivityAndExactExhaustion(t *testing.T) {
@@ -1878,9 +2138,10 @@ func TestSageTurn_DeniedHomeResolutionDoesNotFallBackToUnscopedRecall(t *testing
 func TestSageTurn_RecallOnlyResolvesCallerHomeAndAvoidsUnscopedScan(t *testing.T) {
 	var selfPolicyCalls, recallCalls int
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
 		selfPolicyCalls++
 		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id":          r.Header.Get("X-Agent-ID"),
 			"profile":           "standard",
 			"home_domain":       "caller-home",
 			"enrollment_status": "active",
@@ -3105,9 +3366,10 @@ func TestAppV23InceptionStoresFirstIdentityInOwnedHome(t *testing.T) {
 			"agent_id": "companion", "name": "Mynah", "status": "registered",
 		})
 	})
-	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/v1/agent/me", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"profile": "companion", "home_domain": "voice-interface",
+			"agent_id": r.Header.Get("X-Agent-ID"),
+			"profile":  "companion", "home_domain": "voice-interface",
 			"enrollment_status": "active",
 		})
 	})

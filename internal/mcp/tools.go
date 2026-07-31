@@ -489,14 +489,29 @@ func (s *Server) selfWritePolicy(ctx context.Context) (selfWritePolicy, bool, er
 	if err := s.doSignedJSON(ctx, "GET", "/v1/agent/me", nil, &self); err != nil {
 		// Pre-app-v23 nodes may not expose the self-policy fields (or, on old
 		// releases, the route itself). Preserve their legacy behavior only for
-		// an actual 404; active/policy denials must remain loud.
-		if isAPIStatus(err, http.StatusNotFound) {
+		// a legacy non-Problem-Details 404. Current nodes use a canonical signed
+		// 404 for an unknown/Root identity; that is an authentication-standing
+		// failure and must remain loud.
+		if isLegacySelfPolicyRouteNotFound(err) {
 			return self, false, nil
 		}
 		return self, false, err
 	}
+	if self.AgentID == "" || self.AgentID != s.effectiveAgentID(ctx) {
+		return self, false, errors.New("authenticated self-standing identity mismatch")
+	}
 	appV23 := self.EnrollmentState != "" || self.Profile != ""
 	return self, appV23, nil
+}
+
+func isLegacySelfPolicyRouteNotFound(err error) bool {
+	var problem *apiProblemError
+	if !errors.As(err, &problem) || problem.StatusCode != http.StatusNotFound {
+		return false
+	}
+	return problem.ProblemStatus == nil ||
+		*problem.ProblemStatus != http.StatusNotFound ||
+		!strings.HasPrefix(problem.ContentType, "application/problem+json")
 }
 
 // resolveWriteDomain preserves an explicitly requested domain exactly. Only an
@@ -2016,18 +2031,87 @@ func (s *Server) toolStatus(ctx context.Context, _ map[string]any) (any, error) 
 		return nil, fmt.Errorf("get caller standing: %w", err)
 	}
 	if appV23 && self.EnrollmentState != "active" {
-		return callerStanding(self, false), nil
+		standing := callerStanding(self, false)
+		standing["counts_available"] = false
+		standing["counts_scope"] = "caller"
+		standing["counts_degraded_reason"] = "memory counts are unavailable until this agent is active"
+		return standing, nil
 	}
 	stats, err := s.callerScopedMemoryStats(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("get caller-scoped memory status: %w", err)
+		if !appV23 {
+			return nil, fmt.Errorf("get caller-scoped memory status: %w", err)
+		}
+		standing := callerStanding(self, true)
+		// Counts are optional diagnostics, not proof of the authenticated
+		// caller's identity or policy. A mature store can legitimately exceed
+		// the bounded authorization walk; try the exact home domain without
+		// increasing that budget or broadening visibility.
+		if isCallerStatusAuthorizationScanBudget(err) && self.HomeDomain != "" {
+			if homeStats, homeErr := s.callerScopedMemoryStatsForDomain(ctx, self.HomeDomain); homeErr == nil &&
+				callerStatusCountsAreReportable(homeStats) {
+				for key, value := range standing {
+					homeStats[key] = value
+				}
+				homeStats["scope"] = "caller_home_domain"
+				homeStats["counts_scope"] = "home_domain"
+				homeStats["domain_scope"] = self.HomeDomain
+				homeStats["counts_available"] = true
+				homeStats["counts_degraded_reason"] = "caller-wide memory aggregation exceeded the bounded authorization scan; showing home-domain counts only"
+				return homeStats, nil
+			}
+		}
+		standing["counts_available"] = false
+		standing["counts_scope"] = "caller"
+		standing["counts_degraded_reason"] = callerStatusCountsDegradedReason(err)
+		return standing, nil
 	}
 	if appV23 {
+		if !callerStatusCountsAreReportable(stats) {
+			standing := callerStanding(self, true)
+			standing["counts_available"] = false
+			standing["counts_scope"] = "caller"
+			standing["counts_degraded_reason"] = "caller memory counts are not exact enough to report an empty result"
+			return standing, nil
+		}
 		for key, value := range callerStanding(self, true) {
 			stats[key] = value
 		}
+		stats["counts_available"] = true
+		stats["counts_scope"] = "caller"
 	}
 	return stats, nil
+}
+
+// callerStatusCountsAreReportable prevents an inexact lower-bound zero from
+// becoming an apparently real empty corpus. A positive lower bound remains
+// useful when explicitly paired with total_exact:false; zero requires proof of
+// exact exhaustion.
+func callerStatusCountsAreReportable(stats map[string]any) bool {
+	total, ok := stats["total_memories"].(int)
+	if !ok || total < 0 {
+		return false
+	}
+	exact, _ := stats["total_exact"].(bool)
+	return total > 0 || exact
+}
+
+func callerStatusCountsDegradedReason(err error) string {
+	if isCallerStatusAuthorizationScanBudget(err) {
+		return "caller memory aggregation exceeded the bounded authorization scan; use a domain filter for memory counts"
+	}
+	return "caller memory counts are temporarily unavailable; authenticated self-standing remains valid"
+}
+
+func isCallerStatusAuthorizationScanBudget(err error) bool {
+	var problem *apiProblemError
+	return errors.As(err, &problem) &&
+		problem.StatusCode == http.StatusUnprocessableEntity &&
+		problem.ProblemStatus != nil &&
+		*problem.ProblemStatus == http.StatusUnprocessableEntity &&
+		strings.HasPrefix(problem.ContentType, "application/problem+json") &&
+		problem.Title == "Query too broad" &&
+		strings.Contains(problem.Detail, "authorization scan budget exceeded")
 }
 
 // callerStanding projects only the authenticated key's own consensus policy.
@@ -2081,6 +2165,13 @@ func (s *Server) callerScopedMemoryCount(ctx context.Context) (map[string]any, e
 // disclosure-filtered list surface and caps work at the app-v23 visible offset
 // budget; node-wide dashboard statistics are never consulted.
 func (s *Server) callerScopedMemoryStats(ctx context.Context) (map[string]any, error) {
+	return s.callerScopedMemoryStatsForDomain(ctx, "")
+}
+
+func (s *Server) callerScopedMemoryStatsForDomain(
+	ctx context.Context,
+	domain string,
+) (map[string]any, error) {
 	const (
 		pageSize = 200
 		// App-v23 permits visible offsets through 7,900. Forty 200-row
@@ -2114,6 +2205,9 @@ func (s *Server) callerScopedMemoryStats(ctx context.Context) (map[string]any, e
 		offset := page * pageSize
 		var response statusPage
 		path := fmt.Sprintf("/v1/memory/list?limit=%d&offset=%d", pageSize, offset)
+		if domain != "" {
+			path += "&domain=" + url.QueryEscape(domain)
+		}
 		if err := s.doSignedJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
 			return nil, err
 		}

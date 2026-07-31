@@ -605,7 +605,15 @@ caller's own `registration_status`, `enrollment_status`, `role`, `profile`,
 pending or inactive caller receives this standing with
 `memory_access_available:false` and SAGE does not probe a forbidden memory
 route. An active caller receives the same standing merged with its visible
-memory statistics. No roster or global node counts are returned.
+memory statistics. If a mature caller-visible corpus returns the canonical
+authorization-scan-budget `422`, `sage_status` retries only the exact governed
+`home_domain`; a successful fallback reports `scope:"caller_home_domain"` and
+`counts_scope:"home_domain"`. If even that bounded aggregate is unavailable,
+the authenticated standing is still returned with `counts_available:false`
+and no misleading zero total. An inexact lower-bound zero is likewise omitted,
+not reported as an empty corpus. No scan budget is raised, and no roster or
+global node counts are returned. Failure to authenticate/read the self-standing
+itself still fails the tool closed.
 
 App-v23 authorization and canonical-disclosure filters are applied before
 memory aggregation. The self-standing projection comes from signed
