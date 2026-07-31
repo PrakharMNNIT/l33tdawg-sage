@@ -12,7 +12,7 @@
 # governed upgrade-delay floor is three blocks instead of 200, and the proposer
 # cooldown is one block instead of 50. It also recognizes a test-only dormant
 # pre-publication pause hook used to place the exact crash below. A fresh
-# provider still performs the real signed auto-advance ceremony through app-v24,
+# provider still performs the real signed auto-advance ceremony through app-v25,
 # including app-v20's chain-derived governance domain at a positive activation
 # height.
 # Authorization, quorum, identity, state-sync, P2P, receiver-session,
@@ -27,7 +27,7 @@ NODE_IMAGE=${V119_STATE_SYNC_NODE_IMAGE:-sage-v119-chaos-node:local}
 REBUILD=${V119_STATE_SYNC_REBUILD:-${V119_CHAOS_REBUILD:-1}}
 KEEP=${V119_STATE_SYNC_KEEP:-0}
 TIMEOUT=${V119_STATE_SYNC_TIMEOUT:-240}
-TARGET_APP_VERSION=24
+TARGET_APP_VERSION=25
 
 for setting in "REBUILD=${REBUILD}" "KEEP=${KEEP}"; do
   case "${setting#*=}" in
@@ -1057,18 +1057,18 @@ echo "=== v11.9 integrated authorized state-sync wire gate ==="
 echo "source: ${SOURCE_ID} (both image labels verified before topology start)"
 echo "fixture: one validator provider; observer/receiver/unauthorized peers are distinct non-validator full nodes"
 
-# 1. Drive a fresh real chain through the signed app-v24 ladder. The scoped
+# 1. Drive a fresh real chain through the signed app-v25 ladder. The scoped
 # projection installed below still proves app-v20's governance-domain semantics.
 write_provider_personal_config
-cat >"${PROVIDER_HOME}/post-v24.txt" <<'EOF'
-This committed post-app-v24 fixture record proves the provider snapshot is beyond the positive activation height.
+cat >"${PROVIDER_HOME}/post-v25.txt" <<'EOF'
+This committed post-app-v25 fixture record proves the provider snapshot is beyond the positive activation height.
 EOF
 cat >"${PROVIDER_HOME}/advance.txt" <<'EOF'
 This first state-sync eligibility record advances the provider beyond the exported snapshot height.
 
 This second state-sync eligibility record supplies additional committed blocks for the H plus two light-client window.
 EOF
-chmod 0644 "${PROVIDER_HOME}/post-v24.txt" "${PROVIDER_HOME}/advance.txt"
+chmod 0644 "${PROVIDER_HOME}/post-v25.txt" "${PROVIDER_HOME}/advance.txt"
 
 start_sage "${PROVIDER}" "${PROVIDER_HOME}" provider-rpc
 docker network connect --alias provider-p2p "${P2P_NETWORK}" "${PROVIDER}"
@@ -1076,7 +1076,7 @@ wait_rpc "${PROVIDER}"
 wait_rest "${PROVIDER}"
 wait_app_version "${PROVIDER}" "${TARGET_APP_VERSION}"
 pre_seed_height=$(rpc_height "${PROVIDER}")
-seed_memories "${PROVIDER}" /sage/post-v24.txt 1
+seed_memories "${PROVIDER}" /sage/post-v25.txt 1
 wait_height_at_least "${PROVIDER}" "$((pre_seed_height + 1))"
 scoped_memory_id=$(docker exec "${PROVIDER}" ./sage-gui-v119-fixture \
   v119-state-sync-fixture install-scoped-proof)
@@ -1131,7 +1131,7 @@ wait_convergence "${PROVIDER}" "${OBSERVER}"
 snapshot_height=$(rpc_height "${PROVIDER}")
 snapshot_app_hash=$(rpc_app_hash "${PROVIDER}")
 if [ "${snapshot_height}" -le 1 ]; then
-  echo "ERROR: provider did not reach a positive post-app-v24 snapshot height" >&2
+  echo "ERROR: provider did not reach a positive post-app-v25 snapshot height" >&2
   exit 1
 fi
 if ! is_canonical_hash "${snapshot_app_hash}"; then
@@ -1504,7 +1504,7 @@ if [ "${receiver_app_version}" != "${TARGET_APP_VERSION}" ] ||
    ! is_canonical_hash "${receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v24 state" >&2
+  echo "ERROR: restarted receiver/provider did not remain on and converge at exact app-v25 state" >&2
   exit 1
 fi
 assert_root_semantics "${PROVIDER}" "${RECEIVER}"
@@ -1565,7 +1565,7 @@ if [ "${success_receiver_app_version}" != "${TARGET_APP_VERSION}" ] ||
    ! is_canonical_hash "${success_receiver_app_hash}" ||
    ! is_canonical_hash "${provider_app_hash}" ||
    [ "${success_receiver_app_hash}" != "${provider_app_hash}" ]; then
-  echo "ERROR: successful receiver/provider did not publish exact app-v24 state" >&2
+  echo "ERROR: successful receiver/provider did not publish exact app-v25 state" >&2
   exit 1
 fi
 assert_root_semantics "${PROVIDER}" "${SUCCESS_RECEIVER}"
@@ -1607,7 +1607,7 @@ post_restart_provider_version=$(rpc_app_version "${PROVIDER}" 2>/dev/null || tru
 post_restart_receiver_version=$(rpc_app_version "${SUCCESS_RECEIVER}" 2>/dev/null || true)
 if [ "${post_restart_provider_version}" != "${TARGET_APP_VERSION}" ] ||
    [ "${post_restart_receiver_version}" != "${TARGET_APP_VERSION}" ]; then
-  echo "ERROR: provider SIGKILL recovery regressed exact app-v24 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
+  echo "ERROR: provider SIGKILL recovery regressed exact app-v25 state (${post_restart_provider_version:-unknown}/${post_restart_receiver_version:-unknown})" >&2
   exit 1
 fi
 
@@ -1630,5 +1630,5 @@ for image in "${ABCI_IMAGE}" "${NODE_IMAGE}"; do
 done
 
 echo "=== v11.9 AUTHORIZED STATE-SYNC WIRE GATE PASSED ==="
-echo "PASS: frozen source ${SOURCE_ID}; governed app-v24 provider; real signed app-v20 scope+memory; exact app-v24 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
+echo "PASS: frozen source ${SOURCE_ID}; governed app-v25 provider; real signed app-v20 scope+memory; exact app-v25 authorization/session/projection rebuild; independent provider+observer light origins; H+2 snapshot; exact P2P authorization; approved-sender sessions; concurrent seal-before-REST proof; unauthorized rejection; receiver pre-publication SIGKILL with automatic ordinary restart; separate session<seal<REST completion; provider SIGKILL; block/AppHash convergence"
 echo "ROLE: receiver is intentionally a synchronized NON-VALIDATOR full node; validator-set admission remains a separate signed governance action"
