@@ -2067,6 +2067,56 @@ func TestSageTurnScopesKeywordRecallToExactDomain(t *testing.T) {
 	require.Equal(t, "tii-sage", recalled[0]["domain"])
 }
 
+func TestSageTurnFirstWritableDomainDoesNotReportBogusReadDenial(t *testing.T) {
+	var queryCalls, submitCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": true, "ready": true})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1, 0.2}})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"memories": []map[string]any{}})
+	})
+	mux.HandleFunc("/v1/memory/pre-validate", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, _ *http.Request) {
+		submitCalls++
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"memory_id": "first", "committed": true})
+	})
+	mux.HandleFunc("/v1/memory/query", func(w http.ResponseWriter, _ *http.Request) {
+		queryCalls++
+		if queryCalls == 1 {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type": "https://sage.dev/errors/domain-read-denied", "title": "Access denied",
+				"status": http.StatusForbidden, "detail": "agent does not have read access to domain clean-probe",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{}})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	result, err := NewServer(ts.URL, priv).toolTurn(context.Background(), map[string]any{
+		"topic": "new domain work", "domain": "clean-probe",
+		"observation": "This first durable observation claims a clean probe domain.",
+	})
+	require.NoError(t, err)
+	payload := result.(map[string]any)
+	require.Equal(t, true, payload["stored"])
+	require.NotContains(t, payload, "recall_error")
+	require.Equal(t, 2, queryCalls, "retry after the first committed write")
+	require.Equal(t, 1, submitCalls)
+}
+
 func TestSageTurn_RecallOnly(t *testing.T) {
 	ts := mockSageAPI(t)
 	defer ts.Close()

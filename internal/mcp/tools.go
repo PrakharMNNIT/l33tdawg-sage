@@ -2334,6 +2334,25 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 		result["degraded_reason"] = nonSemanticRecallReason
 	}
 
+	runTurnRecall := func() error {
+		turnRecall = recallResp{}
+		if semantic {
+			return s.recallSemantic(
+				ctx, topic, recallDomain, recallTopK, recallMinConf,
+				recallFederationOptions{}, &turnRecall,
+			)
+		}
+		searchReq, _ := json.Marshal(map[string]any{
+			"query":          topic,
+			"domain_tag":     recallDomain,
+			"provider":       s.provider,
+			"status_filter":  "committed",
+			"top_k":          recallTopK,
+			"min_confidence": recallMinConf,
+		})
+		return s.doSignedJSON(ctx, "POST", "/v1/memory/search", searchReq, &turnRecall)
+	}
+	var deferredFirstUseRecallErr error
 	if domainResolutionErr != nil {
 		result["recall_error"] = fmt.Sprintf(
 			"resolve default recall domain: %v",
@@ -2345,81 +2364,25 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 		// embedding_provider; hand-rolling this request previously dropped that
 		// field and also opted every local turn into federation without an
 		// authorized recall plan.
-		if err := s.recallSemantic(
-			ctx,
-			topic,
-			recallDomain,
-			recallTopK,
-			recallMinConf,
-			recallFederationOptions{},
-			&turnRecall,
-		); err != nil {
-			result["recall_error"] = err.Error()
-			result["semantic_degraded"] = true
-			result["degraded_reason"] = "semantic_recall_failed: " + err.Error()
+		if err := runTurnRecall(); err != nil {
+			if observation != "" && isFirstUseDomainReadDenial(err) {
+				deferredFirstUseRecallErr = err
+			} else {
+				result["recall_error"] = err.Error()
+				result["semantic_degraded"] = true
+				result["degraded_reason"] = "semantic_recall_failed: " + err.Error()
+			}
 		}
 	} else {
 		// FTS5 path: full-text search when embeddings aren't semantic. A turn is
 		// local by contract; explicit cross-node recall goes through sage_recall,
 		// whose federation planner binds the signed destination proofs.
-		searchReq, _ := json.Marshal(map[string]any{
-			"query":          topic,
-			"domain_tag":     recallDomain,
-			"provider":       s.provider,
-			"status_filter":  "committed",
-			"top_k":          recallTopK,
-			"min_confidence": recallMinConf,
-		})
-		if err := s.doSignedJSON(ctx, "POST", "/v1/memory/search", searchReq, &turnRecall); err != nil {
-			result["recall_error"] = err.Error()
-		}
-	}
-
-	if turnRecall.Federation != nil {
-		result["federation"] = turnRecall.Federation
-		if len(turnRecall.Federation.Queried) == 0 && len(turnRecall.Federation.Errors) > 0 {
-			result["federation_notice"] = "No reachable connected SAGE currently exposes this exact domain to this agent. Use sage_federation to inspect authorized connections, or ask the remote owner to enable Read."
-		}
-	}
-	if _, hasErr := result["recall_error"]; !hasErr && len(turnRecall.Results) > 0 {
-		memories := make([]map[string]any, 0, len(turnRecall.Results))
-		for _, r := range turnRecall.Results {
-			// Fail closed if an older or misbehaving node ignores domain_tag.
-			// A turn belongs to exactly one project/domain; cross-domain memories
-			// can silently re-anchor an agent in the wrong repository.
-			if recallDomain != "" && r.DomainTag != recallDomain {
-				continue
+		if err := runTurnRecall(); err != nil {
+			if observation != "" && isFirstUseDomainReadDenial(err) {
+				deferredFirstUseRecallErr = err
+			} else {
+				result["recall_error"] = err.Error()
 			}
-			content := r.Content
-			entry := map[string]any{
-				"memory_id":   r.MemoryID,
-				"content":     content,
-				"domain":      r.DomainTag,
-				"confidence":  r.ConfidenceScore,
-				"type":        r.MemoryType,
-				"created_at":  r.CreatedAt,
-				"source_kind": r.SourceKind,
-				"foreign":     r.Foreign,
-				"trust":       r.Trust,
-			}
-			if r.SourceChainID != "" {
-				entry["source_chain_id"] = r.SourceChainID
-			}
-			if r.OriginMemoryID != "" {
-				entry["origin_memory_id"] = r.OriginMemoryID
-			}
-			if r.OriginAgentID != "" {
-				entry["origin_agent_id"] = r.OriginAgentID
-			}
-			if r.Disputed {
-				entry["content"] = disputedContentPrefix + content
-				entry["disputed"] = true
-			}
-			memories = append(memories, entry)
-		}
-		if len(memories) > 0 {
-			result["recalled"] = memories
-			result["recalled_count"] = len(memories)
 		}
 	}
 
@@ -2447,6 +2410,29 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 		result["skip_reason"] = "observation below quality threshold"
 	}
 
+	// A brand-new writable domain does not exist until this turn's submission
+	// commits. Older app-v23 nodes can reject the preceding scoped read as a
+	// domain denial during that short window. A successful write proves this was
+	// that first-use race, not a standing denial: retry once and never tell the
+	// agent it lacks access to a domain it just successfully created.
+	if deferredFirstUseRecallErr != nil {
+		stored, _ := result["stored"].(bool)
+		if stored {
+			if err := runTurnRecall(); err != nil {
+				result["recall_pending"] = true
+				result["recall_notice"] = "Memory stored in this new domain; earlier context will appear after its first committed read is visible."
+			} else {
+				result["semantic_degraded"] = false
+				delete(result, "degraded_reason")
+			}
+		} else {
+			result["recall_error"] = deferredFirstUseRecallErr.Error()
+		}
+	}
+	if _, hasErr := result["recall_error"]; !hasErr {
+		appendTurnRecallResult(result, turnRecall, recallDomain)
+	}
+
 	// Phase 3: Pipeline — check for incoming work and completed results.
 	pipeData := s.checkPipelineInbox(ctx)
 	for k, v := range pipeData {
@@ -2454,6 +2440,68 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 	}
 
 	return result, nil
+}
+
+// isFirstUseDomainReadDenial recognizes only the canonical app-v23 error the
+// node emits while a writable domain has not yet been claimed by its first
+// committed memory. Generic 403s remain visible; suppressing those would hide
+// a real access-policy problem.
+func isFirstUseDomainReadDenial(err error) bool {
+	var problem *apiProblemError
+	return errors.As(err, &problem) &&
+		problem.StatusCode == http.StatusForbidden &&
+		problem.ProblemStatus != nil && *problem.ProblemStatus == http.StatusForbidden &&
+		strings.HasPrefix(problem.ContentType, "application/problem+json") &&
+		strings.HasSuffix(problem.Type, "/domain-read-denied")
+}
+
+func appendTurnRecallResult(result map[string]any, recall recallResp, domain string) {
+	if recall.Federation != nil {
+		result["federation"] = recall.Federation
+		if len(recall.Federation.Queried) == 0 && len(recall.Federation.Errors) > 0 {
+			result["federation_notice"] = "No reachable connected SAGE currently exposes this exact domain to this agent. Use sage_federation to inspect authorized connections, or ask the remote owner to enable Read."
+		}
+	}
+	if len(recall.Results) == 0 {
+		return
+	}
+	memories := make([]map[string]any, 0, len(recall.Results))
+	for _, r := range recall.Results {
+		// Fail closed if an older or misbehaving node ignores domain_tag.
+		if domain != "" && r.DomainTag != domain {
+			continue
+		}
+		content := r.Content
+		entry := map[string]any{
+			"memory_id":   r.MemoryID,
+			"content":     content,
+			"domain":      r.DomainTag,
+			"confidence":  r.ConfidenceScore,
+			"type":        r.MemoryType,
+			"created_at":  r.CreatedAt,
+			"source_kind": r.SourceKind,
+			"foreign":     r.Foreign,
+			"trust":       r.Trust,
+		}
+		if r.SourceChainID != "" {
+			entry["source_chain_id"] = r.SourceChainID
+		}
+		if r.OriginMemoryID != "" {
+			entry["origin_memory_id"] = r.OriginMemoryID
+		}
+		if r.OriginAgentID != "" {
+			entry["origin_agent_id"] = r.OriginAgentID
+		}
+		if r.Disputed {
+			entry["content"] = disputedContentPrefix + content
+			entry["disputed"] = true
+		}
+		memories = append(memories, entry)
+	}
+	if len(memories) > 0 {
+		result["recalled"] = memories
+		result["recalled_count"] = len(memories)
+	}
 }
 
 func inceptionErrorStanding(err error) (retryable bool, statusCode int, guidance string) {

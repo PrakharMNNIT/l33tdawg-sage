@@ -44,11 +44,16 @@ func withTestSageEnv(t *testing.T, apiURL string) string {
 
 func TestHookSessionStart_PrintsMemoriesContextBlock(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/agent/me" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"home_domain": "sage-development", "access_scope": "home_domain"})
+			return
+		}
 		assert.Equal(t, http.MethodGet, r.Method)
 		assert.Equal(t, "/v1/memory/list", r.URL.Path)
 		assert.Equal(t, "10", r.URL.Query().Get("limit"))
 		assert.Equal(t, "newest", r.URL.Query().Get("sort"))
 		assert.Equal(t, "committed", r.URL.Query().Get("status"))
+		assert.Equal(t, "sage-development", r.URL.Query().Get("domain"))
 		assert.NotEmpty(t, r.Header.Get("X-Signature"))
 		assert.NotEmpty(t, r.Header.Get("X-Agent-ID"))
 
@@ -75,7 +80,12 @@ func TestHookSessionStart_PrintsMemoriesContextBlock(t *testing.T) {
 }
 
 func TestHookSessionStart_EmptyResultsEmitAck(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/agent/me" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"home_domain": "caller-home"})
+			return
+		}
+		require.Equal(t, "caller-home", r.URL.Query().Get("domain"))
 		_ = json.NewEncoder(w).Encode(map[string]any{"memories": []map[string]any{}})
 	}))
 	defer srv.Close()
@@ -85,6 +95,36 @@ func TestHookSessionStart_EmptyResultsEmitAck(t *testing.T) {
 		require.NoError(t, runHookSessionStart())
 	})
 	assert.Equal(t, "SAGE: connected, no recent memories to surface.\n", stdout)
+}
+
+func TestHookSessionStart_DoesNotFallBackToUnscopedList(t *testing.T) {
+	var listCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/agent/me" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_scope": "home_domain"})
+			return
+		}
+		listCalls++
+		http.Error(w, "must not read another agent's memories", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	withTestSageEnv(t, srv.URL)
+
+	stdout := captureStdout(t, func() {
+		require.NoError(t, runHookSessionStart())
+	})
+	require.Zero(t, listCalls)
+	assert.Contains(t, stdout, "no caller-scoped home domain")
+}
+
+func TestRunHookHelpDoesNotRunSessionStart(t *testing.T) {
+	original := os.Args
+	t.Cleanup(func() { os.Args = original })
+	os.Args = []string{"sage-gui", "hook", "session-start", "--help"}
+	stdout := captureStdout(t, func() {
+		require.NoError(t, runHook())
+	})
+	assert.Contains(t, stdout, "Usage: sage-gui hook session-start")
 }
 
 func TestHookSessionStart_NodeUnreachableReturnsError(t *testing.T) {
