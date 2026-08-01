@@ -12,6 +12,22 @@ signer, regardless of optional ledger state. Older vault-sealed keyed rows
 rewrap on their next successful unlocked authentication. Only
 consensus-committed memories are returned to callers.
 
+### App-v25 recovery is automatic; agents do not repair history themselves
+
+On an app-v25 node, SAGE automatically repairs complete, hash-verified
+historical memory evidence and restores verified local writer continuity in
+bounded governed batches. A malformed or conflicting old record is quarantined
+individually; it must not make a healthy agent claim that its whole memory is
+empty. `sage_status` is the caller-safe way to learn the signed identity's
+standing and usable counts. It is not a recovery control.
+
+There is intentionally no MCP tool to rewrite, re-submit, assign, or
+deprecate the preserved historical inventory. Root-only retry/deprecation is a
+localhost CEREBRUM recovery action; see
+[`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md). Agents should
+continue ordinary work on verified domains, report any exact read/write error,
+and never manufacture a replacement for a historical record.
+
 ---
 
 ## Boot Sequence — Read This First

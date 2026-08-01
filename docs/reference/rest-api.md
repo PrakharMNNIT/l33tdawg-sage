@@ -739,7 +739,7 @@ Register agent on-chain. Idempotent — returns existing record if already regis
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `name` | string | yes | Display name |
-| `role` | string | no | `admin`, `member`, `observer`; defaults to `member` |
+| `role` | string | no | Compatibility registration hint. On app-v23/app-v25 a self-registration is an ordinary pending Member; this field cannot self-grant `manager` or `admin`. CEREBRUM Root approves the real local role/profile/home-domain bundle atomically. |
 | `boot_bio` | string | no | Agent system prompt / bio |
 | `provider` | string | no | e.g. `claude-code`, `cursor` |
 | `p2p_address` | string | no | Peer-to-peer address |
@@ -758,6 +758,13 @@ Register agent on-chain. Idempotent — returns existing record if already regis
   "on_chain_height": 42
 }
 ```
+
+An app-v23/app-v25 client should immediately call signed `GET /v1/agent/me`.
+That caller-only response reports whether the key is `pending_review`, its
+capability restrictions, and the exact operator action still required. It is
+the supported self-diagnostic surface; `GET /v1/agents` is a signed,
+active-only visible roster and must not be used to infer a pending caller's
+standing.
 
 **Response (existing, HTTP 200):** Same shape with `"status": "already_registered"`. `on_chain_height` is populated on both paths since v6.6.0.
 
@@ -938,6 +945,9 @@ Pre-app-v23 nodes retain their legacy projection behavior.
 | `GET /v1/dashboard/network/access/linked-messages/consent?remote_chain_id=...&remote_agent_id=...&local_agent_id=...` | Read the receiver-local, default-off consent and CAS revision for one exact currently linked remote-to-local agent tuple. |
 | `PUT /v1/dashboard/network/access/linked-messages/consent` | Set `accepting` for one exact tuple using `expected_revision`; never creates a read link, contact, group membership, domain grant, role, or write authority. |
 | `POST /v1/dashboard/network/access/root/handover` | Dedicated current-Root-only credential handover with irreversible confirmation, exact phrase, and expected Root generation. Returns the replacement recovery archive once with `Cache-Control: no-store`. |
+| `GET /v1/dashboard/memory/adoption-progress` | Root/operator aggregate App-v25 historical-recovery progress. It returns counts and state only—never the hidden records' content, domains, authors, or reasons. |
+| `POST /v1/dashboard/memory/adoption-retry` | Current-Root-only request for a fresh scan of the exact unresolved App-v25 snapshot. Requires its `projection_revision` and `expected_count`; it never deletes rows or clears earlier dispositions. |
+| `POST /v1/dashboard/memory/adoption-deprecate` | Current-Root-only retirement of the exact unresolved snapshot. Requires `projection_revision`, `expected_count`, and typed `DEPRECATE <count>` confirmation. Records remain preserved for audit and are skipped by future automatic repair. |
 
 The roles are `member`, `manager`, and `admin`. Roles define verbs; consensus
 Access Groups define local scope; clearance caps readable classification; and
@@ -2306,6 +2316,14 @@ export because labeling a partial local projection as a complete backup would
 be unsafe. A receiver completed before v11.16 without this exact baseline
 remains fail-closed until the operator explicitly repairs or repeats state sync;
 startup never infers an allowlist from the receiver's current SQL contents.
+
+`app_v25_maintenance` reports the current process's one-time historical
+adoption/continuity verification. It is intentionally a readiness signal, not
+a record-disclosure API. While its state is `waiting`, `migrating`,
+`attesting`, or localized `recovery`, normal verified serving remains available
+as `degraded` (HTTP 200 by default; `?strict=1` makes it 503). An incomplete
+or unlocalized canonical projection remains `not_ready` regardless of this
+field. See [`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md).
 
 The embedder status is refreshed by a ~30s background watchdog (see the node's
 `startEmbedderWatchdog`).

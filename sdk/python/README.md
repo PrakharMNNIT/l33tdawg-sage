@@ -2,7 +2,7 @@
 
 Python client for the SAGE (Sovereign Agent Governed Experience) protocol -- a governed, verifiable institutional memory layer for multi-agent systems.
 
-**Requires Python 3.10+** | **SAGE v11.16.3 SDK** | **TLS, app-v23 roles and Access Groups, app-v24 memory integrity, read-only federation, domain recovery, scoped governance, and per-record `classification` supported**
+**Requires Python 3.10+** | **SAGE v11.16.3 SDK** | **TLS, app-v23 roles and Access Groups, app-v24 memory integrity, app-v25 immutable envelopes and automatic historical continuity recovery, read-only federation, domain recovery, scoped governance, and per-record `classification` supported**
 
 ## Installation
 
@@ -112,7 +112,7 @@ Before an agent can participate in the SAGE network, it must register on-chain. 
 # Register on-chain (first time only — idempotent)
 reg = client.register_agent(
     name="security-analyst",       # Human-readable name
-    role="member",                 # "member", "admin", or "observer"
+    role="member",                 # self-registration never self-promotes
     boot_bio="Analyzes CVEs",      # Optional: agent description
     provider="claude-code",        # Optional: LLM provider identifier
 )
@@ -121,8 +121,9 @@ reg = client.register_agent(
 # Update your profile
 client.update_agent(name="security-analyst-v2", boot_bio="Updated bio")
 
-# Get your profile (PoE weight, vote count)
+# Get your caller-scoped profile and access standing
 profile = client.get_profile()       # GET /v1/agent/me
+print(profile.enrollment_status, profile.home_domain, profile.can_write)
 
 # Get any registered agent's info
 agent = client.get_agent("a1b2c3...")  # GET /v1/agent/{id}
@@ -131,13 +132,9 @@ agent = client.get_agent("a1b2c3...")  # GET /v1/agent/{id}
 # List active ordinary agents visible to this signed caller
 agents = client.list_agents()        # GET /v1/agents → {"agents": [...], "total": N}
 
-# Set agent permissions (admin only)
-client.set_agent_permission(
-    agent_id="a1b2c3...",
-    clearance=2,                     # 0=Public, 1=Internal, 2=Confidential, 3=Secret, 4=TopSecret
-    org_id="org-uuid",
-    dept_id="dept-uuid",
-)
+# On app-v23/app-v25, role/profile/group changes happen through the local
+# CEREBRUM Root/Admin controls. Do not call the legacy set_agent_permission()
+# endpoint: the server retires it with HTTP 410 after activation.
 ```
 
 ### Memory Operations
@@ -871,7 +868,7 @@ def hash_embed(text: str, dim: int = 768) -> list[float]:
 | `PUT` | `/v1/agent/update` | `update_agent()` |
 | `GET` | `/v1/agent/me` | `get_profile()` |
 | `GET` | `/v1/agent/{id}` | `get_agent()` |
-| `PUT` | `/v1/agent/{id}/permission` | `set_agent_permission()` |
+| `PUT` | `/v1/agent/{id}/permission` | `set_agent_permission()` — pre-app-v23 compatibility only; v11.16 returns HTTP 410 and directs policy changes to local CEREBRUM. |
 | `GET` | `/v1/agents` | `list_agents()` |
 
 ### Pipeline

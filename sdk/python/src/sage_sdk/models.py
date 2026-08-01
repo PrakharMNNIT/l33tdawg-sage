@@ -293,6 +293,19 @@ class AgentProfile(BaseModel):
     # present for domains the agent has actually voted in.
     domain_expertise: dict[str, float] | None = None
     on_chain_height: int | None = None
+    # App-v23 caller-scoped standing. These are intentionally additive so an
+    # SDK can still read a profile from an older server that omits them.
+    role: str | None = None
+    profile: str | None = None
+    home_domain: str | None = None
+    enrollment_status: str | None = None
+    registration_status: str | None = None
+    approval_required: bool | None = None
+    clearance: int | None = None
+    capabilities: int | None = None
+    can_read: bool | None = None
+    can_write: bool | None = None
+    access_scope: str | None = None
 
 
 class AgentRegistration(BaseModel):

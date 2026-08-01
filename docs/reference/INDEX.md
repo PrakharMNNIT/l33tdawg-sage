@@ -25,6 +25,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | [`concepts/clearance-classification.md`](concepts/clearance-classification.md) | Per-record classification (0–4), the REST-vs-wire default gotcha, and the per-record query gate. |
 | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) | Orgs, departments, agent clearance, cross-org federation, cross-chain peer Read/Copy RBAC, why peer Write is reserved but unavailable in v11.9, the five-gate query pipeline, and the app-v20 one-chain quorum-scope boundary. |
 | [`app-v23-access-control-design.md`](app-v23-access-control-design.md) | The v11.16.0 contract for Root, Member/Manager/Admin roles, named security profiles, Access Groups, atomic enrollment, linked federated readers, app-v24 readiness and memory integrity, migration, replay, and state sync. |
+| [`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md) | The v11.16.2 strict App-v25 upgrade: immutable new-memory envelopes, automatic historical repair, local writer continuity, record-local quarantine, Root retry/deprecation controls, and readiness semantics. |
 | [`concepts/consensus-confidence-decay.md`](concepts/consensus-confidence-decay.md) | CometBFT BFT path, "CometBFT-committed" vs "SAGE-committed", quorum, PoE weights, epochs. |
 | [`concepts/block-production-and-idle.md`](concepts/block-production-and-idle.md) | Why an idle chain mints **no** blocks (SAGE has no heartbeat), when a block *is* minted, and how to tell healthy-idle from actually-stuck. Read this before alarming on a frozen block height. |
 | [`concepts/voter-operations.md`](concepts/voter-operations.md) | How `proposed` memories become `committed` (the per-node auto-voter), how to *guarantee* auto-commit (`--require-voter` / `voter:` config), the stuck-memory alarm + triage, key safety, and the honest REST-vote caveat. |
@@ -51,6 +52,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | Discover connected SAGEs and live-read a domain they share | [`mcp-tools.md`](mcp-tools.md) — `sage_federation`, then `sage_recall` with `federated=true` |
 | Distinguish internet federation, app-v20 quorum replication, and local-vs-network snapshot recovery | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) — “v11.9 quorum scopes are not cross-chain federation” |
 | Understand Root handover, local Access Groups, or why a federated agent is read-only | [`app-v23-access-control-design.md`](app-v23-access-control-design.md) + [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) |
+| Understand why an upgrade is repairing, partially displaying, or preserving historical memories | [`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md) |
 | Configure SAGE via environment variables | [`environment-variables.md`](environment-variables.md) |
 
 ---
@@ -97,6 +99,25 @@ does not apply to ordinary upgraded agents, which retain app-v23 write behavior
 while activation completes. See
 [`app-v23-access-control-design.md`](app-v23-access-control-design.md) — “App-v24
 readiness and memory-write barrier.”
+
+### App-v25 historical recovery and domain continuity
+
+App-v25 is the strict H+1 successor to app-v24. It gives every new memory ID a
+single immutable canonical envelope—content hash, author, domain, and
+classification—so an ID can be replayed exactly but cannot be repurposed into a
+different memory. During the one-time upgrade worker, sound historical evidence
+is repaired automatically through bounded, Root-authorized and
+validator-attested batches. Invalid or incomplete evidence is quarantined one
+record at a time; it does not make the whole brain empty or prevent other
+agents from working.
+
+For a recovered multi-writer local domain, SAGE restores the verified writers'
+read/write continuity through a dedicated local Access Group. The earliest
+verified historical writer remains owner; if that identity cannot safely be
+used, CEREBRUM Root owns the domain rather than guessing. Unresolved records
+remain preserved, and only current Root may retry the scan or explicitly
+deprecate the exact unresolved inventory. See
+[`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md).
 
 ### Clearance / classification (legacy overloaded integer)
 
