@@ -163,6 +163,8 @@ test('preserved historical records have one explicit repair-resolution flow', ()
     assert.match(resolution, /if \(refreshed\) \{[\s\S]*next = refreshed;[\s\S]*onProgress\(next\)/,
         'the follow-up GET must reconcile progress without reviving a stale local state');
     assert.match(resolution, /const result = await deprecateMemoryAdoption\([\s\S]*await refreshProgress\(result\)/);
+    assert.match(resolution, /CEREBRUM refreshed it; review the current count and try again/,
+        'a genuine inventory race must refresh the operator\'s snapshot instead of leaving a stale modal');
     assert.match(resolution, /remain preserved for audit/);
     assert.match(resolution, /not been deleted or rewritten/);
     assert.match(resolution, /permanently excludes these records from future repair attempts and the available-memory view/);

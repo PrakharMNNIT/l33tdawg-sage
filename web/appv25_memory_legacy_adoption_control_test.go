@@ -261,7 +261,7 @@ func TestAppV25LegacyAdoptionDeprecatePreservesRowsAndSkipsFuturePlans(t *testin
 	require.Empty(t, restartedPlan.Recovery)
 }
 
-func TestAppV25LegacyAdoptionDeprecateRequiresCurrentProcessProof(t *testing.T) {
+func TestAppV25LegacyAdoptionDeprecateUsesDurableRecoverySnapshotAfterRestart(t *testing.T) {
 	handler, sqlite, _, revision, _ := appV25RecoveryControlFixture(t)
 	handler.ConfigureAppV25Maintenance(true)
 
@@ -270,11 +270,41 @@ func TestAppV25LegacyAdoptionDeprecateRequiresCurrentProcessProof(t *testing.T) 
 		"DEPRECATE 1")
 	recorder := httptest.NewRecorder()
 	handler.handleAppV25LegacyAdoptionDeprecate(recorder, request)
-	require.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 
 	dispositions, err := sqlite.ListLegacyMemoryRecoveryDispositions(context.Background())
 	require.NoError(t, err)
-	require.Empty(t, dispositions)
+	require.Len(t, dispositions, 1)
+}
+
+func TestAppV25LegacyAdoptionDeprecateSurvivesOrdinaryMemoryWrites(t *testing.T) {
+	handler, sqlite, fixture, revision, _ := appV25RecoveryControlFixture(t)
+	content := "ordinary post-upgrade memory must not invalidate recovery"
+	contentHash := sha256.Sum256([]byte(content))
+	require.NoError(t, sqlite.InsertMemory(context.Background(), &memory.MemoryRecord{
+		MemoryID:        "ordinary-current-memory",
+		SubmittingAgent: fixture.agentID,
+		Content:         content,
+		ContentHash:     contentHash[:],
+		MemoryType:      memory.TypeFact,
+		DomainTag:       "current/domain",
+		Status:          memory.StatusCommitted,
+	}))
+	currentRevision, err := sqlite.MemoryProjectionRevision(context.Background())
+	require.NoError(t, err)
+	require.NotEqual(t, revision, currentRevision,
+		"the regression only appears after an ordinary write advances global projection state")
+
+	request := appV25RecoveryControlRequest(t,
+		"/v1/dashboard/memory/adoption-deprecate", revision, 1,
+		"DEPRECATE 1")
+	recorder := httptest.NewRecorder()
+	handler.handleAppV25LegacyAdoptionDeprecate(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+
+	dispositions, err := sqlite.ListLegacyMemoryRecoveryDispositions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, dispositions, 1)
 }
 
 func TestAppV25LegacyRecoveryControlsRejectNonLocalRequests(t *testing.T) {

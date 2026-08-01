@@ -330,7 +330,12 @@ function MemoryAdoptionResolutionModal({ progress, onProgress, onClose }) {
             await refreshProgress(result);
             setSuccess('Automatic repair was queued successfully. CEREBRUM is re-checking every preserved historical record and will update this notice when the attempt finishes.');
         } catch (err) {
-            setError(err?.message || 'Automatic repair could not be retried.');
+            if (String(err?.message || '').includes('historical memory recovery inventory changed')) {
+                await refreshProgress();
+                setError('The recovery inventory changed while this window was open. CEREBRUM refreshed it; review the current count and try again.');
+            } else {
+                setError(err?.message || 'Automatic repair could not be retried.');
+            }
         } finally {
             setSubmitting('');
         }
@@ -351,7 +356,12 @@ function MemoryAdoptionResolutionModal({ progress, onProgress, onClose }) {
             setConfirmation('');
             setSuccess(`${recoveryCount.toLocaleString()} historical record${recoveryCount === 1 ? '' : 's'} deprecated. They remain preserved for audit and were not deleted or rewritten.`);
         } catch (err) {
-            setError(err?.message || 'The preserved records could not be deprecated.');
+            if (String(err?.message || '').includes('historical memory recovery inventory changed')) {
+                await refreshProgress();
+                setError('The recovery inventory changed while this window was open. CEREBRUM refreshed it; review the current count and try again.');
+            } else {
+                setError(err?.message || 'The preserved records could not be deprecated.');
+            }
         } finally {
             setSubmitting('');
         }
