@@ -25,6 +25,7 @@ import {
     appV23ProfileNeedsReview,
     appV23RoleDefaults,
     appV23ClampLinkedClearance,
+    appV23DirectLocalGroupPlan,
     appV23GroupDropKind,
     appV23LinkedClearanceCeiling,
     APPV23_ROOT_HANDOVER_PHRASE,
@@ -8323,6 +8324,209 @@ function canonicalLegacyGroupID(raw, occupied) {
     return candidate;
 }
 
+// This deliberately lives beside Access Controls rather than only in Search:
+// when an old or retired agent needs review, the human can inspect the records
+// that informed the decision without first reconstructing an ID elsewhere.
+// Search remains the full cross-agent workbench; this is the focused recovery
+// view for the selected local principal.
+function AgentMemoryRecoveryPanel({ agent, agents, canControl }) {
+    const [memories, setMemories] = useState([]);
+    const [total, setTotal] = useState(0);
+    const [query, setQuery] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+    const [selected, setSelected] = useState(() => new Set());
+    const [targetID, setTargetID] = useState('');
+    const [busy, setBusy] = useState('');
+
+    const loadMemories = useCallback(async (search = '') => {
+        if (!agent?.agent_id) return;
+        setLoading(true);
+        setError('');
+        try {
+            const response = await fetchMemories({
+                agent: agent.agent_id,
+                q: search.trim() || undefined,
+                status: 'active',
+                sort: 'newest',
+                limit: 100,
+            });
+            const next = Array.isArray(response?.memories) ? response.memories : [];
+            setMemories(next);
+            setTotal(Number(response?.total || next.length));
+            setSelected(previous => {
+                const visible = new Set(next.map(item => item.memory_id));
+                return new Set([...previous].filter(id => visible.has(id)));
+            });
+        } catch (e) {
+            setMemories([]);
+            setTotal(0);
+            setError(e.message || 'Could not load this agent’s memories.');
+        } finally {
+            setLoading(false);
+        }
+    }, [agent?.agent_id]);
+
+    useEffect(() => {
+        setQuery('');
+        setSelected(new Set());
+        setTargetID('');
+        loadMemories('');
+    }, [agent?.agent_id, loadMemories]);
+
+    const selectedMemories = memories.filter(item => selected.has(item.memory_id));
+    const selectedDomains = [...new Set(selectedMemories
+        .map(item => String(item.domain_tag || '').trim())
+        .filter(Boolean))];
+    const activeTargets = agents.filter(candidate =>
+        candidate.agent_id !== agent?.agent_id && candidate.enrollment_active &&
+        !candidate.needs_reauthorization);
+
+    const toggle = (memoryID) => setSelected(previous => {
+        const next = new Set(previous);
+        if (next.has(memoryID)) next.delete(memoryID); else next.add(memoryID);
+        return next;
+    });
+    const toggleAll = () => setSelected(previous =>
+        previous.size === memories.length && memories.length > 0
+            ? new Set()
+            : new Set(memories.map(item => item.memory_id)));
+
+    const forgetSelected = async () => {
+        if (!selectedMemories.length || busy) return;
+        const suffix = total > memories.length
+            ? ` Only the ${memories.length} loaded matching records are available in this view; use Search to work through more.`
+            : '';
+        if (!await showConfirmation(
+            `Deprecate ${selectedMemories.length} selected ${selectedMemories.length === 1 ? 'memory' : 'memories'} from ${agent.name || 'this agent'}? Their historical records stay preserved for audit; this does not rewrite authorship or delete blocks.${suffix}`,
+            { title: 'Deprecate selected memories?', confirmLabel: 'Deprecate selected', tone: 'danger' },
+        )) return;
+        setBusy('deprecate');
+        try {
+            for (const item of selectedMemories) await deleteMemory(item.memory_id);
+            showToast(`${selectedMemories.length} ${selectedMemories.length === 1 ? 'memory was' : 'memories were'} deprecated.`, 'success');
+            setSelected(new Set());
+            await loadMemories(query);
+        } catch (e) {
+            showToast(e.message || 'Could not deprecate the selected memories.', 'error', 9000);
+        } finally {
+            setBusy('');
+        }
+    };
+
+    const transferSelectedDomains = async () => {
+        if (!selectedDomains.length || !targetID || busy) return;
+        const target = activeTargets.find(candidate => candidate.agent_id === targetID);
+        if (!target) return;
+        const domainLabel = selectedDomains.map(domain => `• ${domain}`).join('\n');
+        if (!await showConfirmation(
+            `Transfer control of ${selectedDomains.length} selected ${selectedDomains.length === 1 ? 'domain' : 'domains'} to ${target.name || target.agent_id.slice(0, 12)}?\n\n${domainLabel}\n\nThis is an on-chain domain transfer. Every memory in each listed domain moves under the new owner’s current control, including records not selected here. Historical authorship remains unchanged.`,
+            { title: 'Transfer domain control?', confirmLabel: 'Transfer domains', tone: 'danger' },
+        )) return;
+        setBusy('transfer');
+        try {
+            for (const domain of selectedDomains) {
+                await reassignDomainOwnership({
+                    source_agent_id: agent.agent_id,
+                    target_agent_id: targetID,
+                    domain,
+                });
+            }
+            showToast(`${selectedDomains.length} ${selectedDomains.length === 1 ? 'domain was' : 'domains were'} transferred on-chain.`, 'success', 8000);
+            setSelected(new Set());
+            await loadMemories(query);
+        } catch (e) {
+            showToast(e.message || 'Could not transfer the selected domains.', 'error', 9000);
+        } finally {
+            setBusy('');
+        }
+    };
+
+    return html`
+        <section class="v23-agent-memory-control" aria-labelledby="v23-agent-memory-heading">
+            <div class="v23-agent-memory-heading">
+                <div>
+                    <div class="v23-eyebrow">Memory ownership & recovery</div>
+                    <h4 id="v23-agent-memory-heading">${total.toLocaleString()} associated ${total === 1 ? 'memory' : 'memories'}</h4>
+                </div>
+                <button type="button" class="btn" onClick=${() => {
+                    window.location.hash = `#/search?agent=${encodeURIComponent(agent.agent_id)}`;
+                }}>Open full Search</button>
+            </div>
+            <p class="v23-agent-memory-explainer">
+                Review this agent’s active records here. You can deprecate selected records one by one or transfer the selected records’ <strong>whole domains</strong> to another active local agent. Historical authorship never changes.
+            </p>
+            ${agent.needs_approval && agent.local_key_available && html`
+                <div class="v23-inline-note warning">
+                    To restore this agent’s own access, choose its normal operating policy above and use <strong>Approve & activate</strong>. Its original managed local key is available for that approval.
+                </div>
+            `}
+            ${!agent.local_key_available && html`
+                <div class="v23-inline-note warning">
+                    This identity’s exact local key is not available, so CEREBRUM cannot restore its own signing authority. You can still preserve the work by transferring its domains or deprecating selected records. Put the original key in SAGE’s managed agent store to approve this identity again.
+                </div>
+            `}
+            <form class="v23-agent-memory-search" onSubmit=${event => { event.preventDefault(); loadMemories(query); }}>
+                <input value=${query} disabled=${loading || !!busy}
+                    onInput=${event => setQuery(event.currentTarget.value)}
+                    placeholder="Search this agent’s memories…" aria-label="Search this agent’s memories" />
+                <button type="submit" class="btn" disabled=${loading || !!busy}>Search</button>
+            </form>
+            ${error && html`<div class="v23-inline-note danger" role="alert">${error}</div>`}
+            <div class="v23-agent-memory-list" aria-live="polite">
+                <label class="v23-agent-memory-select-all">
+                    <input type="checkbox" checked=${memories.length > 0 && selected.size === memories.length}
+                        disabled=${!memories.length || !!busy || !canControl}
+                        onChange=${toggleAll} />
+                    Select loaded records
+                </label>
+                ${loading && html`<p class="v23-agent-memory-loading">Loading associated memories…</p>`}
+                ${!loading && memories.map(item => html`
+                    <label class="v23-agent-memory-row" key=${item.memory_id}>
+                        <input type="checkbox" checked=${selected.has(item.memory_id)} disabled=${!!busy || !canControl}
+                            onChange=${() => toggle(item.memory_id)} />
+                        <span>
+                            <strong>${item.domain_tag || 'No recorded domain'}</strong>
+                            <small>${item.memory_type || 'memory'} · ${item.status || 'unknown'}</small>
+                            <em>${item.content || 'No readable content'}</em>
+                        </span>
+                    </label>
+                `)}
+                ${!loading && !error && memories.length === 0 && html`
+                    <p class="v23-agent-memory-empty">No active memories match this agent and search.</p>
+                `}
+            </div>
+            ${total > memories.length && html`
+                <p class="v23-agent-memory-page-note">Showing the newest ${memories.length} of ${total.toLocaleString()}. Use search or Open full Search to work through the rest.</p>
+            `}
+            <div class="v23-agent-memory-actions">
+                <label>
+                    <span>Move selected domains to</span>
+                    <select value=${targetID} disabled=${!!busy || !canControl || activeTargets.length === 0}
+                        onChange=${event => setTargetID(event.currentTarget.value)}>
+                        <option value="">Choose an active local agent…</option>
+                        ${activeTargets.map(target => html`<option value=${target.agent_id}>${target.name || target.agent_id.slice(0, 12)}</option>`)}
+                    </select>
+                </label>
+                <button type="button" class="btn btn-primary"
+                    disabled=${!!busy || !canControl || !selectedDomains.length || !targetID}
+                    onClick=${transferSelectedDomains}>
+                    ${busy === 'transfer' ? 'Transferring…' : selectedDomains.length
+                        ? `Transfer ${selectedDomains.length} selected domain${selectedDomains.length === 1 ? '' : 's'}`
+                        : 'Transfer selected domains'}
+                </button>
+                <button type="button" class="btn btn-danger"
+                    disabled=${!!busy || !canControl || !selectedMemories.length}
+                    onClick=${forgetSelected}>
+                    ${busy === 'deprecate' ? 'Deprecating…' : selectedMemories.length
+                        ? `Deprecate ${selectedMemories.length} selected`
+                        : 'Deprecate selected'}
+                </button>
+            </div>
+        </section>
+    `;
+}
+
 function AppV23AccessControl() {
     const [state, setState] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -8332,6 +8536,7 @@ function AppV23AccessControl() {
     const [saving, setSaving] = useState(false);
     const [groupBusy, setGroupBusy] = useState('');
     const [dragAgentID, setDragAgentID] = useState('');
+    const [dragSourceGroupID, setDragSourceGroupID] = useState('');
     const [dragRemoteKey, setDragRemoteKey] = useState('');
     const [newGroupName, setNewGroupName] = useState('');
     const [remoteCandidates, setRemoteCandidates] = useState([]);
@@ -8668,6 +8873,16 @@ function AppV23AccessControl() {
         }
     };
 
+    const clearLocalDrag = () => {
+        setDragAgentID('');
+        setDragSourceGroupID('');
+    };
+    const startLocalDrag = (agentID, sourceGroupID = '') => {
+        setDragRemoteKey('');
+        setDragAgentID(agentID);
+        setDragSourceGroupID(sourceGroupID);
+    };
+
     const createGroup = async () => {
         const name = newGroupName.trim();
         if (!name || groupBusy) return;
@@ -8692,6 +8907,39 @@ function AppV23AccessControl() {
         } finally {
             setGroupBusy('');
         }
+    };
+
+    const createDirectLocalGroup = async (target) => {
+        const source = localAgents.find(agent => agent.agent_id === dragAgentID);
+        const plan = appV23DirectLocalGroupPlan(state?.groups || [], source, target);
+        clearLocalDrag();
+        if (!plan || groupBusy || !mutationReady) return;
+        if (plan.action === 'existing') {
+            showToast(`These agents already share Access Group “${plan.name}”.`, 'info');
+            return;
+        }
+        setGroupBusy(plan.group_id);
+        try {
+            await putAppV23AccessGroup(plan.group_id, {
+                name: plan.name,
+                members: plan.members,
+                expected_revision: 0,
+            });
+            showToast(`Access Group “${plan.name}” created on-chain. Members can read one another’s owned domains; write remains with owners and Managers.`, 'success', 8000);
+            await load();
+        } catch (e) {
+            showToast(e.message || 'The shared Access Group was not created.', 'error', 9000);
+        } finally {
+            setGroupBusy('');
+        }
+    };
+
+    const removeDraggedMemberFromSourceGroup = async () => {
+        const group = (state?.groups || []).find(item => item.group_id === dragSourceGroupID);
+        const agentID = dragAgentID;
+        clearLocalDrag();
+        if (!group || !agentID || !group.members.includes(agentID) || groupBusy || !mutationReady) return;
+        await saveGroup(group, group.members.filter(id => id !== agentID));
     };
 
     const deleteGroup = async (group) => {
@@ -8726,7 +8974,7 @@ function AppV23AccessControl() {
             return;
         }
         const agent = localAgents.find(a => a.agent_id === dragAgentID);
-        setDragAgentID('');
+        clearLocalDrag();
         if (!agent || !agent.enrollment_active || group.members.includes(agent.agent_id)) return;
         // Membership is intentionally additive. An agent may belong to several
         // groups and its effective local authority is their union.
@@ -9111,7 +9359,15 @@ function AppV23AccessControl() {
             </div>
 
             <div class="v23-access-grid">
-                <div class="v23-agent-rail" aria-label="Local agents">
+                <div class="v23-agent-rail ${dragSourceGroupID ? 'remove-drop-ready' : ''}" aria-label="Local agents"
+                    onDragOver=${e => {
+                        if (dragSourceGroupID) e.preventDefault();
+                    }}
+                    onDrop=${e => {
+                        if (!dragSourceGroupID) return;
+                        e.preventDefault();
+                        removeDraggedMemberFromSourceGroup();
+                    }}>
                     <div class="v23-section-heading">
                         <div>
                             <div class="v23-eyebrow">Local principals</div>
@@ -9119,11 +9375,34 @@ function AppV23AccessControl() {
                         </div>
                         <span>${localAgents.length}</span>
                     </div>
+                    ${dragSourceGroupID && html`
+                        <div class="v23-rail-drop-hint" role="status">
+                            Drop here to remove this agent from its current Access Group. Its own domains stay private and fully usable.
+                        </div>
+                    `}
                     ${localAgents.map(agent => html`
-                        <button class="v23-agent-choice local ${selectedID === agent.agent_id ? 'selected' : ''}"
+                        <button class="v23-agent-choice local ${selectedID === agent.agent_id ? 'selected' : ''} ${dragAgentID && dragAgentID !== agent.agent_id && agent.enrollment_active ? 'drop-ready' : ''}"
                             aria-current=${selectedID === agent.agent_id ? 'true' : undefined}
                             disabled=${saving}
-                            onClick=${() => selectLocalAgent(agent.agent_id)}>
+                            draggable=${agent.enrollment_active && mutationReady && !groupBusy && !saving}
+                            onClick=${() => selectLocalAgent(agent.agent_id)}
+                            onDragStart=${event => {
+                                event.stopPropagation();
+                                startLocalDrag(agent.agent_id);
+                            }}
+                            onDragEnd=${clearLocalDrag}
+                            onDragOver=${event => {
+                                if (dragAgentID && dragAgentID !== agent.agent_id && agent.enrollment_active) {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                }
+                            }}
+                            onDrop=${event => {
+                                if (!dragAgentID || dragAgentID === agent.agent_id || !agent.enrollment_active) return;
+                                event.preventDefault();
+                                event.stopPropagation();
+                                createDirectLocalGroup(agent);
+                            }}>
                             <span class="agent-avatar">${agent.avatar || '\u{1F916}'}</span>
                             <span class="v23-agent-choice-copy">
                                 <strong>${agent.name || `Agent ${agent.agent_id.slice(0, 8)}`}</strong>
@@ -9298,6 +9577,10 @@ function AppV23AccessControl() {
                                             : 'Save policy'}
                             </button>
                         </div>
+                        <${AgentMemoryRecoveryPanel}
+                            agent=${selected}
+                            agents=${localAgents}
+                            canControl=${mutationReady} />
                     ` : html`<div class="v23-empty large">Select a local agent to review its policy.</div>`}
                 </div>
             </div>
@@ -9307,7 +9590,7 @@ function AppV23AccessControl() {
                     <div>
                         <div class="v23-eyebrow">Consensus Access Groups</div>
                         <h3>Local sharing groups</h3>
-                        <p>Local teammates read each other’s owned domains. A Manager can also write and modify domains owned by local teammates in the same groups. Admins already control all local data.</p>
+                        <p>Drag one approved local agent onto another to create a committed sharing group. Members read one another’s owned domains by default; each owner keeps full control. A human operator may promote a local agent to Manager for write and modify authority within its groups. Admins already control all local data.</p>
                     </div>
                     <form class="v23-create-group" onSubmit=${event => { event.preventDefault(); createGroup(); }}>
                         <label class="sr-only" for="v23-new-group-name">New local group name</label>
@@ -9319,12 +9602,12 @@ function AppV23AccessControl() {
                 </div>
 
                 <div class="v23-agent-tray" aria-label="Approved local agents available for groups">
-                    <span>Drag a local agent into a group, or use its Add local agent menu</span>
+                    <span>Drag an agent into a group to add it, or onto another agent above to make a new two-agent group. Use its Add local agent menu instead if you prefer.</span>
                     ${localAgents.filter(a => a.enrollment_active).map(agent => html`
                         <div class="v23-agent-pill local" draggable="true"
                             title=${`${agent.role || 'member'} · drag into a local group`}
-                            onDragStart=${() => setDragAgentID(agent.agent_id)}
-                            onDragEnd=${() => setDragAgentID('')}>
+                            onDragStart=${() => startLocalDrag(agent.agent_id)}
+                            onDragEnd=${clearLocalDrag}>
                             ${agent.avatar || '\u{1F916}'} ${agent.name || agent.agent_id.slice(0, 8)}
                             <em>${agent.role || 'member'}</em>
                         </div>
@@ -9371,7 +9654,13 @@ function AppV23AccessControl() {
                                 ${group.members.map(memberID => {
                                     const member = localAgents.find(a => a.agent_id === memberID);
                                     return html`
-                                        <div class="v23-member-chip local">
+                                        <div class="v23-member-chip local" draggable=${!!member?.enrollment_active && mutationReady && !groupBusy}
+                                            title="Drag back to the agent list to remove from this group"
+                                            onDragStart=${event => {
+                                                event.stopPropagation();
+                                                startLocalDrag(memberID, group.group_id);
+                                            }}
+                                            onDragEnd=${clearLocalDrag}>
                                             <span>${member?.avatar || '\u{1F916}'}</span>
                                             <strong>${member?.name || memberID.slice(0, 8)}</strong>
                                             <em>${member?.role || 'member'}${member?.needs_reauthorization ? ' · suspended' : ''}</em>
@@ -10144,16 +10433,22 @@ function NetworkPage({ sse, accessMode = false }) {
     const handleRemove = useCallback(async (agent) => {
         try {
             const res = await removeAgent(agent.agent_id, true);
-            if (res.error) { showToast(res.error, 'error'); return; }
+            if (res.error) { showToast(res.error, 'error'); return false; }
             if (res.redeploy_required !== false) {
                 const rdRes = await startRedeploy('remove_agent', agent.agent_id);
-                if (rdRes.error) showToast('Agent removed but redeployment failed: ' + rdRes.error, 'warning');
+                if (rdRes.error) {
+                    showToast('Agent removed but redeployment failed: ' + rdRes.error, 'warning');
+                }
                 else { setRedeployStatus(rdRes); if (rdRes.status !== 'completed') startRedeployPoll(); } // single-node: instant, no poll
             } else {
                 showToast('Agent deactivated on-chain and removed from every Access Group.', 'success');
             }
             setShowRemoveConfirm(null); setExpandedId(null); loadAgents();
-        } catch (e) { showToast(e.message || 'Failed to remove agent', 'error'); }
+            return true;
+        } catch (e) {
+            showToast(e.message || 'Failed to remove agent', 'error');
+            return false;
+        }
     }, [loadAgents, startRedeployPoll]);
 
     const handleRotateKey = useCallback(async (agent) => {
@@ -12820,7 +13115,8 @@ function RemoveConfirmModal({ agent, onConfirm, onCancel }) {
 
     const handleConfirm = async () => {
         setRemoving(true);
-        onConfirm();
+        const completed = await onConfirm();
+        if (!completed) setRemoving(false);
     };
 
     const isDeploying = removing;
@@ -12847,12 +13143,12 @@ function RemoveConfirmModal({ agent, onConfirm, onCancel }) {
                     : html`
                         <h3>Removing ${agent.name}...</h3>
                         <p style="font-size:13px;color:var(--text-dim);margin-bottom:12px;">
-                            Reconfiguring the network without this agent.
+                            Confirming its removal and preserving its historical memory attribution.
                         </p>
                         <div class="deploy-progress">
                             <div class="deploy-phase in-progress">
                                 <div class="deploy-phase-icon"><span class="deploy-spinner"></span></div>
-                                <span class="deploy-phase-label">Removing agent and redeploying...</span>
+                                <span class="deploy-phase-label">Removing agent…</span>
                             </div>
                         </div>
                     `
