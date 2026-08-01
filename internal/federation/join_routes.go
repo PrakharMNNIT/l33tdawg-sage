@@ -684,10 +684,10 @@ func (m *Manager) HostCreate(hostEndpoint string) (*HostCreateResult, error) {
 	return m.HostCreateMode(hostEndpoint, false)
 }
 
-// HostCreateAuto is the single product intent. When a relay-backed bundle is
-// ready it creates one code carrying direct HTTPS, P2P-direct and relay
-// candidates. If relay preparation is unavailable but a direct endpoint is
-// usable, it emits the legacy LAN-shaped code so older peers still connect.
+// HostCreateAuto is the single product intent. When a direct or relay-backed
+// P2P bundle is ready it creates one code carrying every available candidate.
+// A relay improves roaming across NATs; a direct-only bundle remains usable
+// for a same-LAN connection.
 func (m *Manager) HostCreateAuto(hostEndpoint string) (*HostCreateResult, error) {
 	hooks := m.joinP2PHooks()
 	if hooks.LocalBundle != nil {
@@ -704,9 +704,10 @@ func (m *Manager) HostCreateAuto(hostEndpoint string) (*HostCreateResult, error)
 	return m.HostCreate(hostEndpoint)
 }
 
-// HostCreateMode requires a ready relay bundle for explicit internet setup.
-// Normal LAN setup keeps its legacy QR byte shape; two v11.6 peers exchange
-// roaming routes over authenticated mTLS only after the agreement is active.
+// HostCreateMode requires a ready direct or relay bundle for explicit internet
+// setup. Normal LAN setup keeps its legacy QR byte shape; two v11.6 peers
+// exchange roaming routes over authenticated mTLS only after the agreement is
+// active.
 func (m *Manager) HostCreateMode(hostEndpoint string, requireP2P bool) (*HostCreateResult, error) {
 	if !m.transportIsEnabled() {
 		return nil, fmt.Errorf("federation transport is disabled")

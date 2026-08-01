@@ -37,6 +37,21 @@ func testRouteBundle(t *testing.T, ip string) JoinP2PBundle {
 	}}
 }
 
+func testDirectRouteBundle(t *testing.T, ip string) JoinP2PBundle {
+	t.Helper()
+	peerKey, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	peerID, err := peer.IDFromPrivateKey(peerKey)
+	require.NoError(t, err)
+	return JoinP2PBundle{PeerID: peerID.String(), Protocol: "/sage/fed/1.0.0", Addrs: []string{
+		"/ip4/" + ip + "/tcp/4001/p2p/" + peerID.String(),
+	}}
+}
+
+func TestValidateP2PBundleAllowsDirectOnlyRoute(t *testing.T) {
+	require.NoError(t, validateP2PBundle(testDirectRouteBundle(t, "192.168.1.25")))
+}
+
 func bindP2PRouteControl(t *testing.T, m *Manager, remoteChainID, peerAgentID, epoch string) *store.CrossFedRecord {
 	t.Helper()
 	ss := m.syncStore()
