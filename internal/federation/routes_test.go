@@ -194,7 +194,7 @@ func TestLocalRouteStatusDoesNotClaimUnknownDirectRouteReady(t *testing.T) {
 	require.True(t, ok)
 	assert.Empty(t, candidates)
 	assert.NotContains(t, status, "selected")
-	assert.Contains(t, status["message"], "No route is selected")
+	assert.Contains(t, status["message"], "No route is ready")
 }
 
 func TestPersistRouteSnapshotRejectsStaleAndConflictingRevision(t *testing.T) {

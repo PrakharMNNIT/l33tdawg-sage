@@ -749,7 +749,7 @@ func (m *Manager) HostCreateMode(hostEndpoint string, requireP2P bool) (*HostCre
 	}
 	if requireP2P && transport != "p2p" {
 		_ = m.joins.Abort(js.ID)
-		return nil, fmt.Errorf("internet connection is not ready: enable P2P and wait for a relay reservation")
+		return nil, fmt.Errorf("internet connection is not ready: enable P2P and wait for a direct or relay route")
 	}
 	return &HostCreateResult{
 		SessionID:  js.ID,
@@ -1198,7 +1198,7 @@ func (m *Manager) GuestScan(ctx context.Context, uri, guestEndpoint string) (*Gu
 		}
 		bundle, bundleErr := hooks.LocalBundle()
 		if bundleErr != nil || bundle.PeerID == "" || len(bundle.Addrs) == 0 {
-			return nil, fmt.Errorf("internet join relay is not ready: %w", bundleErr)
+			return nil, fmt.Errorf("internet join route is not ready: %w", bundleErr)
 		}
 		draft.guestPeerID = bundle.PeerID
 		draft.guestP2PAddrs = append([]string(nil), bundle.Addrs...)
