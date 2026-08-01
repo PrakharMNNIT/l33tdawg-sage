@@ -219,6 +219,22 @@ func TestSelfHeal_DoesNotRewriteCurrentHooks(t *testing.T) {
 	assert.Equal(t, infoBefore.ModTime(), infoAfter.ModTime(), "current hooks should not be re-written")
 }
 
+func TestProjectMCPConfigMigratesLegacySharedNodeIdentity(t *testing.T) {
+	projectDir := t.TempDir()
+	sageHome := t.TempDir()
+	mcpPath := filepath.Join(projectDir, ".mcp.json")
+	sharedNodeKey := filepath.Join(sageHome, "agent.key")
+	require.NoError(t, os.WriteFile(mcpPath, []byte(`{"mcpServers":{"sage":{"env":{"SAGE_IDENTITY_PATH":"`+sharedNodeKey+`"}}}}`), 0600))
+
+	_, err := mergeMCPServerConfig(mcpPath, "/bin/sage-gui", sageHome, "claude-code")
+	require.NoError(t, err)
+	data, err := os.ReadFile(mcpPath)
+	require.NoError(t, err)
+	expected := filepath.Join(providerProjectAgentDir(sageHome, projectDir, "claude-code"), "agent.key")
+	assert.Contains(t, string(data), expected)
+	assert.NotContains(t, string(data), sharedNodeKey)
+}
+
 func TestSelfHeal_RewritesStaleBinaryPath(t *testing.T) {
 	projectDir := t.TempDir()
 	sageHome := t.TempDir()
