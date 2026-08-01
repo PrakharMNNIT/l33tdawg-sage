@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.16.1. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.16.2. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -798,14 +798,15 @@ Self-update only. Agent can only update its own name and bio. Broadcasts `TxType
 
 ### `GET /v1/agent/me`
 
-Authenticated agent's profile, including the on-chain Proof-of-Experience
+Signed, caller-only agent profile and standing, including the on-chain Proof-of-Experience
 quorum-weight factors. Since v8.6.0 the response also exposes the lifetime
 corroboration count and per-domain expertise; `accuracy`, `corr_count`, and
 `domain_expertise` are read from the authoritative on-chain `vstats:` /
 `vstats_domain:` records (not the off-chain mirror). After app-v23 activation,
-only an active ordinary agent can use this route; the self response also carries
-its current local `role`, named `profile`, and owned `home_domain`. CEREBRUM Root
-has no ordinary agent profile.
+an authenticated registered ordinary agent can use this route even while it is
+`pending_review` or inactive. That narrow exception lets a client diagnose only
+its own standing; it does not reopen the signed active-only `/v1/agents` roster.
+CEREBRUM Root and unregistered keys have no ordinary agent profile.
 
 **Response** (HTTP 200):
 
@@ -818,6 +819,13 @@ has no ordinary agent profile.
   "profile": "companion",
   "home_domain": "voice-interface",
   "enrollment_status": "active",
+  "registration_status": "active",
+  "approval_required": false,
+  "clearance": 2,
+  "capabilities": 15,
+  "can_read": true,
+  "can_write": true,
+  "access_scope": "home_domain",
   "poe_weight": 0.82,
   "vote_count": 127,
   "accuracy": 0.91,
@@ -833,6 +841,16 @@ has no ordinary agent profile.
 - `home_domain` — the exact app-v23 owned domain a write-capable agent may use
   when an MCP write omits `domain`; explicitly requested domains are never
   silently remapped.
+- `registration_status` / `enrollment_status` — `active`, `pending_review`, or
+  `inactive`, derived from the signed caller's consensus registration and local
+  enrollment only. `approval_required` tells a client whether local CEREBRUM
+  review is needed.
+- `clearance` and `capabilities` — the caller's own consensus values. The raw
+  capability mask is never returned for another agent through this route.
+- `can_read` and `can_write` — the exact current authorization result for the
+  caller's `home_domain`; `access_scope:"home_domain"` prevents clients from
+  misreading these booleans as authority over every domain. Pending/inactive
+  callers receive explicit `false` values without probing memory routes.
 
 ---
 
@@ -868,34 +886,44 @@ App-v23 also treats canonical memory publication as a CEREBRUM read boundary.
 `/v1/dashboard/memory/graph`, `/v1/dashboard/memory/{id}/related`,
 `/v1/dashboard/stats`, and `/v1/dashboard/memory/timeline` validate every
 candidate against its exact canonical hash/status/domain/author/classification
-projection before exposing content or aggregates. A tampered or malformed
-serving projection, canonical record missing from SQL, or temporarily
-unavailable canonical store fails closed with a sanitized HTTP `503`.
+projection before exposing content or aggregates. Exact/detail and portable
+export routes fail closed with a sanitized HTTP `503` when any required record
+cannot be verified. Broad collection routes use the record-local policy below.
 
-v11.16.1 adds one narrow degraded CEREBRUM lane for historical SQL rows whose
-entire canonical `memory:<id>` envelope is absent. Broad list/search, graph,
-timeline, stats, and dashboard-health reads omit only that unanchored row before
-content, paging, or aggregate processing and return the remaining individually
-verified records. List/search, graph, timeline, and stats responses include:
+v11.16.2 makes the degraded lane record-local. Broad list/search, graph,
+timeline, stats, and dashboard-health reads omit an affected record when its
+canonical envelope is absent, zero-hash and ineligible for legacy terminal
+compatibility, deterministically mismatched against SQL, locally malformed, or
+missing from the SQL projection. Backend/storage failures and incomplete audits
+still fail the whole request. Local-operator list/search, graph, timeline, and
+stats responses include:
 
 ```json
 {
   "projection": {
     "complete": false,
     "partial": true,
-    "verified_only": true,
+    "verified_only": false,
     "state": "quarantined",
-    "message": "Some memories are temporarily hidden because their canonical state could not be verified. Your stored data was not changed."
+    "hidden_count": 3,
+    "message": "3 historical memories could not be canonically verified and are hidden. Readable memories remain available; hidden records stay preserved for governed recovery or deprecation."
   }
 }
 ```
 
-Dashboard health exposes the same object as `memory_projection`. The marker
-never includes a skipped count, identity, domain, author, status, or reason.
+`verified_only` is false when the returned set includes the narrow legacy
+terminal-hashless compatibility class; it is true when every returned row has
+an exact canonical content commitment. Dashboard health exposes a sanitized
+`memory_projection` object with the generic partial warning and no hidden
+count. Ordinary signed agents receive that same sanitized object from stats, so
+they cannot infer the global quarantine count outside their RBAC scope. No
+route includes a hidden identity, domain, author, status, or reason.
 Exact/detail, related, tags, task-derived views, and export remain fail-closed,
-and `/ready` remains HTTP `503`; a partial CEREBRUM view is never a complete
-backup or readiness claim. Pre-app-v23 nodes retain their legacy projection
-behavior.
+and `/ready` returns HTTP `200` with `status:"degraded"` after a complete audit
+has localized the bad records. `?strict=1` keeps that quarantine at HTTP `503`.
+Readiness also remains `503` when the audit itself is unavailable or a core
+dependency is down. A partial CEREBRUM view is never a complete backup.
+Pre-app-v23 nodes retain their legacy projection behavior.
 
 | Method + path | Purpose |
 |---|---|
@@ -2255,10 +2283,12 @@ Status semantics:
   Badger inventory against SQL; a missing, rolled-back, SQL-only, or tampered
   row is quarantined instead of being reported as an empty brain. A locked
   SQLite vault retries projection verification after unlock.
-- `degraded` → **HTTP 200** by default: core is up but a *semantic* embedder has been
-  probed and is unreachable, so hybrid/semantic recall has dropped to keyword-only.
-  The node still serves. Pass `?strict=1` to make this a **503** for gates that
-  require semantic recall.
+- `degraded` → **HTTP 200** by default: core is up but either a complete audit
+  localized record-level memory projection quarantines, or a *semantic*
+  embedder was probed and is unreachable so hybrid/semantic recall has dropped
+  to keyword-only. The node still serves broad healthy records. Pass
+  `?strict=1` to make either degraded condition a **503** for gates that require
+  a complete projection and semantic recall.
 - `ready` → **HTTP 200**: everything healthy. A hash (non-semantic) provider is
   `ready` — non-semantic is a capability, not a fault. An embedder not yet probed is
   also `ready`.

@@ -404,5 +404,21 @@ func inspectAppV20StateSyncStore(ctx context.Context, badgerStore *store.BadgerS
 			return 0, nil, fmt.Errorf("%s app-v24 activation does not follow app-v23", label)
 		}
 	}
+	appV25, upgradeErr := badgerStore.GetAppliedUpgrade(appV25UpgradeName)
+	if upgradeErr != nil {
+		return 0, nil, fmt.Errorf("read %s app-v25 activation: %w", label, upgradeErr)
+	}
+	if appV25 != nil {
+		if appV25.Name != appV25UpgradeName || appV25.TargetAppVersion != 25 ||
+			appV25.AppliedHeight <= 0 || state.Height <= appV25.AppliedHeight {
+			return 0, nil, fmt.Errorf("%s has invalid active app-v25 record", label)
+		}
+		if appV24 == nil {
+			return 0, nil, fmt.Errorf("%s app-v25 activation is missing app-v24 predecessor", label)
+		}
+		if appV25.AppliedHeight <= appV24.AppliedHeight {
+			return 0, nil, fmt.Errorf("%s app-v25 activation does not follow app-v24", label)
+		}
+	}
 	return uint64(state.Height), computed, nil // #nosec G115 -- positive int64 checked above
 }

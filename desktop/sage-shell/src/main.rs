@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -131,6 +131,30 @@ fn main() {
         .setup({
             let session = Arc::clone(&session);
             move |app| {
+                // SSCP negotiation and daemon launch are control-plane work. Keep
+                // them independent of WebView construction: on Windows the
+                // renderer can transiently stall during initialization, but that
+                // must not prevent the verified daemon from starting or exposing
+                // its status pipe.
+                let app_handle = app.handle().clone();
+                let supervisor_session = Arc::clone(&session);
+                let (supervisor_started, supervisor_ready) = mpsc::sync_channel(1);
+                thread::spawn(move || {
+                    supervise(
+                        app_handle.clone(),
+                        sage_home(&app_handle),
+                        supervisor_session,
+                        Some(supervisor_started),
+                    )
+                });
+                supervisor_ready
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "native-shell control plane did not initialize: {error}"
+                        ))
+                    })?;
+
                 let nav_session = Arc::clone(&session);
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("SAGE")
@@ -164,10 +188,6 @@ fn main() {
                     focus_main_window(&deep_handle);
                 });
 
-                let app_handle = app.handle().clone();
-                thread::spawn(move || {
-                    supervise(app_handle.clone(), sage_home(&app_handle), session)
-                });
                 Ok(())
             }
         })
@@ -179,6 +199,7 @@ fn supervise<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     sage_home: PathBuf,
     session: SharedSession,
+    mut initialized: Option<mpsc::SyncSender<()>>,
 ) {
     let mut launch_attempt = None;
     let mut launch_attempted = false;
@@ -222,6 +243,7 @@ fn supervise<R: tauri::Runtime>(
                         if let Ok(attempt) = launch_bundled_daemon(&app, &sage_home) {
                             launch_attempt = Some(attempt);
                             show_recovery(&app, &session, RecoveryView::Starting, None);
+                            signal_initialized(&mut initialized);
                             thread::sleep(Duration::from_millis(250));
                             continue;
                         }
@@ -242,7 +264,14 @@ fn supervise<R: tauri::Runtime>(
                 }
             }
         }
+        signal_initialized(&mut initialized);
         thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn signal_initialized(initialized: &mut Option<mpsc::SyncSender<()>>) {
+    if let Some(sender) = initialized.take() {
+        let _ = sender.send(());
     }
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,6 +57,15 @@ func captureServer(t *testing.T, cap *capturedTxs) *httptest.Server {
 	}))
 }
 
+func unavailableAdmissionServer(requests *atomic.Int64) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(
+			`{"result":{"code":112,"log":"transaction admission is unavailable until the local encrypted vault is unlocked"}}`,
+		))
+	}))
+}
+
 type fakeStore struct {
 	pending []*memory.MemoryRecord
 	dups    map[string]bool
@@ -63,6 +73,13 @@ type fakeStore struct {
 
 func (f *fakeStore) GetPendingByDomain(_ context.Context, _ string, _ int) ([]*memory.MemoryRecord, error) {
 	return f.pending, nil
+}
+func (f *fakeStore) GetPendingByDomainPage(_ context.Context, _ string, limit, offset int) ([]*memory.MemoryRecord, error) {
+	if offset >= len(f.pending) {
+		return nil, nil
+	}
+	end := min(len(f.pending), offset+limit)
+	return f.pending[offset:end], nil
 }
 func (f *fakeStore) FindByContentHash(_ context.Context, h string) (bool, error) {
 	return f.dups[h], nil
@@ -82,12 +99,23 @@ type fakeApp struct {
 	target        uint64
 	supported, ok bool
 	hasVote       map[string]bool
+	eligible      map[string]bool
+	recorded      map[string]bool
 }
 
 func (f *fakeApp) ActiveUpgradeVote() (string, uint64, bool, bool) {
 	return f.pid, f.target, f.supported, f.ok
 }
 func (f *fakeApp) UpgradeProposalHasVote(_, voterID string) bool { return f.hasVote[voterID] }
+func (f *fakeApp) MemoryVoteTargetState(memoryID, _ string) (bool, bool) {
+	if f.recorded[memoryID] {
+		return false, true
+	}
+	if f.eligible == nil {
+		return true, false
+	}
+	return f.eligible[memoryID], false
+}
 
 // TestVoteOnPendingMemories_OneVotePerMemory verifies the core per-node-model
 // property: exactly ONE signed vote per pending memory (not 4), signed by the
@@ -111,8 +139,13 @@ func TestVoteOnPendingMemories_OneVotePerMemory(t *testing.T) {
 	}
 	cfg := Config{Key: priv, CometRPC: srv.URL}
 	voted := map[string]bool{}
+	inflight := map[string]time.Time{}
+	offset := 0
 
-	voteOnPendingMemories(context.Background(), store, cfg, voted, zerolog.Nop())
+	voteOnPendingMemories(
+		context.Background(), &fakeApp{}, store, cfg,
+		voted, inflight, &offset, zerolog.Nop(),
+	)
 	txs := cap.all()
 	if len(txs) != 2 {
 		t.Fatalf("want exactly 2 votes (one per memory), got %d", len(txs))
@@ -143,10 +176,159 @@ func TestVoteOnPendingMemories_OneVotePerMemory(t *testing.T) {
 		t.Fatalf("m-reject: want reject vote (content too short), got %+v", d)
 	}
 
-	// Second tick with the same `voted` map must NOT re-broadcast.
-	voteOnPendingMemories(context.Background(), store, cfg, voted, zerolog.Nop())
+	// A CheckTx-accepted vote stays in-flight until committed state confirms it.
+	voteOnPendingMemories(
+		context.Background(), &fakeApp{}, store, cfg,
+		voted, inflight, &offset, zerolog.Nop(),
+	)
 	if again := cap.all(); len(again) != 2 {
 		t.Fatalf("re-vote not suppressed: want 2 total, got %d", len(again))
+	}
+}
+
+func TestVoteOnPendingMemories_AppV25GhostPrefixCannotStarveCanonicalWork(t *testing.T) {
+	cap := &capturedTxs{}
+	srv := captureServer(t, cap)
+	defer srv.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ghosts = memoryVotePageSize + 7
+	pending := make([]*memory.MemoryRecord, 0, ghosts+2)
+	app := &fakeApp{
+		eligible: make(map[string]bool),
+		recorded: make(map[string]bool),
+	}
+	for i := 0; i < ghosts; i++ {
+		pending = append(pending, &memory.MemoryRecord{
+			MemoryID: "sql-ghost-" + time.Unix(int64(i), 0).Format("150405"),
+			Content:  "legacy SQL-only proposed row which must not receive a vote",
+		})
+	}
+	for _, id := range []string{"canonical-new-a", "canonical-new-b"} {
+		pending = append(pending, &memory.MemoryRecord{
+			MemoryID:        id,
+			Content:         "a sufficiently long canonical memory ready for a vote",
+			ContentHash:     []byte{1, 2, 3},
+			DomainTag:       "work",
+			MemoryType:      memory.TypeObservation,
+			ConfidenceScore: 0.9,
+		})
+		app.eligible[id] = true
+	}
+	store := &fakeStore{pending: pending}
+	cfg := Config{Key: priv, CometRPC: srv.URL}
+	voted := map[string]bool{}
+	inflight := map[string]time.Time{}
+	offset := 0
+
+	cast := voteOnPendingMemories(
+		context.Background(), app, store, cfg,
+		voted, inflight, &offset, zerolog.Nop(),
+	)
+	if cast != 2 {
+		t.Fatalf("want both canonical memories voted past ghost prefix, got %d", cast)
+	}
+	got := cap.all()
+	if len(got) != 2 {
+		t.Fatalf("want 2 broadcasts, got %d", len(got))
+	}
+	for _, parsed := range got {
+		if !app.eligible[parsed.MemoryVote.MemoryID] {
+			t.Fatalf("voted non-canonical candidate %q", parsed.MemoryVote.MemoryID)
+		}
+	}
+	if len(voted) != 0 {
+		t.Fatalf("CheckTx acceptance must not mark votes committed: %#v", voted)
+	}
+
+	// Canonical confirmation, not the process-local in-flight marker, closes
+	// the work item. A fresh process with empty maps also suppresses re-voting.
+	app.recorded["canonical-new-a"] = true
+	app.recorded["canonical-new-b"] = true
+	freshVoted := map[string]bool{}
+	freshInflight := map[string]time.Time{}
+	freshOffset := 0
+	cast = voteOnPendingMemories(
+		context.Background(), app, store, cfg,
+		freshVoted, freshInflight, &freshOffset, zerolog.Nop(),
+	)
+	if cast != 0 || len(cap.all()) != 2 {
+		t.Fatalf("restart must honor committed vote receipts: cast=%d broadcasts=%d", cast, len(cap.all()))
+	}
+	if !freshVoted["canonical-new-a"] || !freshVoted["canonical-new-b"] {
+		t.Fatalf("committed receipts were not recorded locally: %#v", freshVoted)
+	}
+}
+
+func TestVoteOnPendingMemories_AdmissionUnavailableStopsBatch(t *testing.T) {
+	var requests atomic.Int64
+	srv := unavailableAdmissionServer(&requests)
+	defer srv.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := make([]*memory.MemoryRecord, 40)
+	for i := range pending {
+		pending[i] = &memory.MemoryRecord{
+			MemoryID:        "locked-vault-memory-" + time.Unix(int64(i), 0).Format("150405"),
+			Content:         "a sufficiently long canonical memory awaiting a vote",
+			ContentHash:     []byte{1, 2, 3},
+			DomainTag:       "work",
+			MemoryType:      memory.TypeObservation,
+			ConfidenceScore: 0.9,
+		}
+	}
+	offset := 0
+	cast, unavailable := voteOnPendingMemoriesResult(
+		context.Background(),
+		&fakeApp{},
+		&fakeStore{pending: pending},
+		Config{Key: priv, CometRPC: srv.URL},
+		map[string]bool{},
+		map[string]time.Time{},
+		&offset,
+		zerolog.Nop(),
+	)
+	if cast != 0 || !unavailable {
+		t.Fatalf("want unavailable batch with no accepted votes, got cast=%d unavailable=%v", cast, unavailable)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("locked vault must stop after one rejected broadcast, got %d", got)
+	}
+	if offset != 0 {
+		t.Fatalf("unavailable batch must restart safely after unlock, offset=%d", offset)
+	}
+}
+
+func TestRun_AdmissionUnavailableBacksOffAcrossPolls(t *testing.T) {
+	var requests atomic.Int64
+	srv := unavailableAdmissionServer(&requests)
+	defer srv.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeStore{pending: []*memory.MemoryRecord{{
+		MemoryID:        "locked-vault-memory",
+		Content:         "a sufficiently long canonical memory awaiting a vote",
+		ContentHash:     []byte{1, 2, 3},
+		DomainTag:       "work",
+		MemoryType:      memory.TypeObservation,
+		ConfidenceScore: 0.9,
+	}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	Run(ctx, &fakeApp{}, store, Config{
+		Key: priv, CometRPC: srv.URL, PollInterval: 5 * time.Millisecond,
+	}, zerolog.Nop())
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("locked-vault backoff should allow one probe, got %d", got)
 	}
 }
 

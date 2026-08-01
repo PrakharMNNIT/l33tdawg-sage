@@ -87,16 +87,23 @@ type CorroborateResponse struct {
 
 // AgentProfileResponse is the JSON body for GET /v1/agent/me.
 type AgentProfileResponse struct {
-	AgentID         string   `json:"agent_id"`
-	DisplayName     string   `json:"display_name"`
-	Domains         []string `json:"domains"`
-	Role            string   `json:"role,omitempty"`
-	Profile         string   `json:"profile,omitempty"`
-	HomeDomain      string   `json:"home_domain,omitempty"`
-	EnrollmentState string   `json:"enrollment_status,omitempty"`
-	PoEWeight       float64  `json:"poe_weight"`
-	VoteCount       int64    `json:"vote_count"`
-	Accuracy        float64  `json:"accuracy"`
+	AgentID           string   `json:"agent_id"`
+	DisplayName       string   `json:"display_name"`
+	Domains           []string `json:"domains"`
+	Role              string   `json:"role,omitempty"`
+	Profile           string   `json:"profile,omitempty"`
+	HomeDomain        string   `json:"home_domain,omitempty"`
+	EnrollmentState   string   `json:"enrollment_status,omitempty"`
+	RegistrationState string   `json:"registration_status,omitempty"`
+	ApprovalRequired  bool     `json:"approval_required"`
+	Clearance         uint8    `json:"clearance"`
+	Capabilities      uint32   `json:"capabilities"`
+	CanRead           *bool    `json:"can_read,omitempty"`
+	CanWrite          *bool    `json:"can_write,omitempty"`
+	AccessScope       string   `json:"access_scope,omitempty"`
+	PoEWeight         float64  `json:"poe_weight"`
+	VoteCount         int64    `json:"vote_count"`
+	Accuracy          float64  `json:"accuracy"`
 	// CorrCount is the validator's lifetime corroboration count (votes that
 	// matched a terminal verdict) — the δ factor of the PoE quorum weight,
 	// read from the authoritative on-chain vstats:<id> record. Not mirrored
@@ -564,26 +571,93 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 			"CEREBRUM Root does not have an ordinary agent profile.")
 		return
 	}
-	if !s.requireAppV23ActiveOrdinaryAgent(w, agentID, "the self-profile agent API") {
-		return
-	}
-
 	resp := AgentProfileResponse{
 		AgentID: agentID,
 		Domains: []string{},
 	}
 	if s.isPostV23ForNextTx() {
+		if s.badgerStore == nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Consensus access-control state is unavailable.")
+			return
+		}
+		registered, registeredErr := s.badgerStore.GetRegisteredAgent(agentID)
+		if registeredErr != nil || registered == nil || registered.AgentID != agentID {
+			writeProblem(w, http.StatusNotFound, "Agent not found",
+				"This authenticated identity is not registered as an ordinary agent on this SAGE.")
+			return
+		}
+		resp.DisplayName = registered.Name
+		resp.OnChainHeight = registered.RegisteredAt
+		resp.Role = registered.Role
+		resp.Clearance = registered.Clearance
+		resp.Capabilities = uint32(registered.Capabilities)
+
 		enrollment, enrollmentErr := s.badgerStore.GetAppV23Enrollment(agentID)
 		roleState, roleErr := s.badgerStore.GetAppV23Role(agentID)
-		if enrollmentErr != nil || roleErr != nil || enrollment == nil || roleState == nil {
+		if enrollmentErr != nil || roleErr != nil {
 			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
 				"Current local enrollment state is unavailable.")
 			return
 		}
-		resp.Role = roleState.Role
-		resp.Profile = enrollment.Profile
-		resp.HomeDomain = enrollment.HomeDomain
-		resp.EnrollmentState = "active"
+		active, activeErr := s.appV23ActiveOrdinaryAgent(agentID)
+		if activeErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current local enrollment state is unavailable.")
+			return
+		}
+		canRead, canWrite := false, false
+		resp.CanRead = &canRead
+		resp.CanWrite = &canWrite
+		resp.AccessScope = "home_domain"
+		switch {
+		case enrollment == nil:
+			resp.EnrollmentState = "pending_review"
+			resp.RegistrationState = "pending_review"
+			resp.ApprovalRequired = true
+		case !active:
+			resp.Profile = enrollment.Profile
+			resp.HomeDomain = enrollment.HomeDomain
+			resp.Clearance = enrollment.Clearance
+			resp.Capabilities = uint32(enrollment.Capabilities)
+			if roleState != nil {
+				resp.Role = roleState.Role
+			}
+			resp.EnrollmentState = "inactive"
+			resp.RegistrationState = "inactive"
+			resp.ApprovalRequired = true
+		default:
+			resp.Role = roleState.Role
+			resp.Profile = enrollment.Profile
+			resp.HomeDomain = enrollment.HomeDomain
+			resp.Clearance = enrollment.Clearance
+			resp.Capabilities = uint32(enrollment.Capabilities)
+			resp.EnrollmentState = "active"
+			resp.RegistrationState = "active"
+			if enrollment.HomeDomain != "" {
+				shared, sharedErr := s.badgerStore.IsAppV23SharedDomain(enrollment.HomeDomain)
+				if sharedErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+						"Current home-domain state is unavailable.")
+					return
+				}
+				readAuth, readErr := s.badgerStore.AuthorizeAppV23LocalDomain(
+					agentID, enrollment.HomeDomain, store.AppV23VerbRead, shared,
+				)
+				writeAuth, writeErr := s.badgerStore.AuthorizeAppV23LocalDomain(
+					agentID, enrollment.HomeDomain, store.AppV23VerbWrite, shared,
+				)
+				if readErr != nil || writeErr != nil {
+					writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+						"Current home-domain access state is unavailable.")
+					return
+				}
+				canRead = readAuth.Allowed
+				canWrite = writeAuth.Allowed
+			}
+			resp.CanRead = &canRead
+			resp.CanWrite = &canWrite
+		}
 	}
 
 	if s.agentStore != nil {

@@ -248,7 +248,7 @@ function injectStyleOnce() {
   document.head.appendChild(s);
 }
 
-export const DEFAULT_MRI_NODE_LIMIT = 2500;
+export const DEFAULT_MRI_NODE_LIMIT = 1500;
 
 async function loadGraph(fetchUrl) {
   try {
@@ -268,9 +268,11 @@ async function loadGraph(fetchUrl) {
       total: (g && g.total) || 0, domainCounts: (g && g.domain_counts) || null,
       domainLast: (g && g.domain_last) || null };
   } catch (err) {
-    // No live node / fetch error: render the empty brain, never synthetic data.
+    // A transport or parse failure is not an empty brain. Let the renderer keep
+    // its previous verified graph (or its initial loading state) and surface an
+    // explicit unavailable signal to CEREBRUM.
     console.warn('[mri] live graph unavailable:', err.message);
-    return { live: false, nodes: [], links: [], total: 0, domainCounts: null, domainLast: null };
+    throw err;
   }
 }
 
@@ -462,6 +464,22 @@ export function mountMriBrain(container, opts = {}) {
   const baseUrl = fetchUrl;
   const urlFor = () => baseUrl + (currentDomain ? '&domain=' + encodeURIComponent(currentDomain) : '');
   const subs = [];
+  let graphRetryTimer = null;
+  let graphRetryDelay = 2000;
+  let graphLoadInFlight = false;
+  let graphReloadPending = false;
+  const resetGraphRetry = () => { graphRetryDelay = 2000; };
+  const scheduleGraphRetry = callback => {
+    clearTimeout(graphRetryTimer);
+    const delay = graphRetryDelay;
+    graphRetryDelay = Math.min(graphRetryDelay * 2, 30000);
+    graphRetryTimer = setTimeout(callback, delay);
+  };
+  const reportGraphAvailability = state => {
+    container.dispatchEvent(new CustomEvent('sage:mri-graph-availability', {
+      detail: { state },
+    }));
+  };
 
   function setHullOpacity(o){
     curOpacity = o;
@@ -558,14 +576,33 @@ export function mountMriBrain(container, opts = {}) {
   // Re-fetch (respecting the drill domain) and re-render. Deterministic placement
   // keeps existing nodes put; no re-heat.
   function load(){
+    if (graphLoadInFlight) {
+      graphReloadPending = true;
+      return;
+    }
+    graphLoadInFlight = true;
     // A drill / reload leaves focus mode.
     focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
     loadGraph(urlFor()).then(d => {
       if (disposed || !Graph) return;
+      clearTimeout(graphRetryTimer);
+      resetGraphRetry();
+      reportGraphAvailability('ready');
       placeNodes(d.nodes);
       Graph.graphData(d);
       refreshCounts(d);
       buildLobes(d);
+    }).catch(() => {
+      if (disposed) return;
+      reportGraphAvailability('unavailable');
+      if (!graphReloadPending) scheduleGraphRetry(load);
+    }).finally(() => {
+      graphLoadInFlight = false;
+      if (graphReloadPending && !disposed) {
+        graphReloadPending = false;
+        clearTimeout(graphRetryTimer);
+        load();
+      }
     });
   }
 
@@ -804,8 +841,11 @@ export function mountMriBrain(container, opts = {}) {
   function cleanContent(s){ return String(s||'').replace(/^\s*\[[^\]]{1,24}\]\s*/, '').trim() || String(s||''); }
   function hideExplorePanel(){ const p = $('.explore'); if (p) p.style.display = 'none'; }
 
-  loadGraph(urlFor()).then(data => {
+  function initializeGraph(data) {
     if (disposed) return;
+    clearTimeout(graphRetryTimer);
+    resetGraphRetry();
+    reportGraphAvailability('ready');
     $('.boot').style.display = 'none';
     placeNodes(data.nodes);
     Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'))
@@ -978,11 +1018,27 @@ export function mountMriBrain(container, opts = {}) {
     // re-heat, no reshuffle, no per-node position bookkeeping.
     if (opts.sse && typeof opts.sse.on === 'function') {
       let t = null;
-      const reload = () => { clearTimeout(t); t = setTimeout(load, 450); };
+      // A busy agent can commit every second. Wait for a short quiet window and
+      // collapse the burst into one graph refresh instead of revalidating the
+      // encrypted projection for every individual event.
+      const reload = () => { clearTimeout(t); t = setTimeout(load, 3000); };
+      subs.push(() => clearTimeout(t));
       subs.push(opts.sse.on('remember', reload));
       subs.push(opts.sse.on('forget', reload));
     }
-  });
+  }
+
+  function acquireInitialGraph() {
+    reportGraphAvailability('loading');
+    loadGraph(urlFor()).then(initializeGraph).catch(() => {
+      if (disposed) return;
+      const boot = $('.boot');
+      if (boot) boot.textContent = '◉ MEMORY GRAPH TEMPORARILY UNAVAILABLE — RETRYING…';
+      reportGraphAvailability('unavailable');
+      scheduleGraphRetry(acquireInitialGraph);
+    });
+  }
+  acquireInitialGraph();
 
   function showTip(n){ const tip=$('.tip'); if(!n){ tip.style.display='none'; return; }
     tip.style.display='block';
@@ -1010,6 +1066,7 @@ export function mountMriBrain(container, opts = {}) {
 
   return function cleanup(){
     disposed = true;
+    clearTimeout(graphRetryTimer);
     subs.forEach(u => { try { u && u(); } catch(e){ /* noop */ } });
     root.removeEventListener('mousemove', onMove);
     root.removeEventListener('pointerdown', onGraphPointerDown);

@@ -51,38 +51,34 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.16.1
+## What's New in v11.16.2
 
-**CEREBRUM recovers verified memories on upgraded personal nodes without
-guessing or rewriting history.** A small class of long-lived nodes can contain
-an old SQL serving row whose canonical `memory:<id>` envelope was never carried
-across a historical pre-v11 chain reset. v11.16.0 correctly quarantined that
-row, but its all-or-nothing dashboard gate also hid every healthy memory behind
-a `503` and made the brain appear unavailable. v11.16.1 gives only broad
-CEREBRUM views a narrow verified-only mode: every canonically verified memory
-is shown and counted, the unanchored row is omitted before content or aggregate
-processing, and the UI persistently says that some historical records are
-temporarily hidden and stored data was not changed.
+**One historical record can no longer take CEREBRUM or every agent offline.**
+v11.16.1 still returned a global `503` when it encountered a canonical
+zero-hash record, a deterministic SQL/canonical envelope mismatch, a malformed
+record-local envelope, or a canonical record whose SQL projection was missing.
+v11.16.2 quarantines each affected record individually. Broad list/search,
+graph, timeline, stats, and dashboard-health reads continue with the readable
+set and carry an explicit partial-projection marker. Authenticated broad routes
+used by the local CEREBRUM operator also report only the aggregate hidden
+count. Public health and ordinary signed agents keep the generic warning and
+never receive that count.
 
-The release also disables two inherited automatic reset paths. An incompatible
-fork marker or legacy shared network id now fails closed or remains unchanged
-instead of deleting Badger/CometBFT history and trying to reconstruct authority
-from SQLite. The unsafe `repair-chain` command is disabled entirely; recovery
-requires a complete stopped-node backup until a history-preserving migration exists.
-Normal same-fork upgrades remain automatic and preserve the chain in place.
-Automatic executable rollback is also disabled at this safety boundary so a
-later startup error cannot restart an older binary containing the retired reset.
+`/ready` now returns HTTP `200` with status `degraded` after a complete audit
+has localized the unsafe records. It still returns `503` when the audit did not
+complete, the canonical store is unavailable, or a real infrastructure
+dependency is down. This keeps supervisors, MCP bootstrap, `sage_inception`,
+and healthy agent work online while preserving strict handling of actual
+backend failures.
 
-The exception applies only when the entire canonical envelope is absent.
-Status, domain, author, content, hash, classification, malformed-state, storage,
-and paging errors still fail closed. Exact memory reads, related-memory views,
-tags, task-derived views, portable export, and `/ready` remain unavailable
-while the projection is quarantined, so a partial view can never be mislabeled
-as a complete backup or a healthy node. This patch changes no consensus rule,
-transaction, AppHash input, application version, memory, domain, key, or chain
-history.
+Exact/detail, related, tags, task-derived views, and portable export remain
+unavailable while any requested result cannot be verified. Hidden records are
+not deleted, rewritten, or silently called verified: CEREBRUM says they remain
+preserved for governed recovery or deprecation. Existing consensus rules,
+AppHash inputs, application version 24, memories, domains, keys, and chain
+history are unchanged.
 
-Container: `ghcr.io/l33tdawg/sage:11.16.1`. SDK 11.16.1.
+Container: `ghcr.io/l33tdawg/sage:11.16.2`. SDK 11.16.2.
 
 ## What's New in v11.16.0
 
@@ -1013,7 +1009,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.16.1`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.16.2`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

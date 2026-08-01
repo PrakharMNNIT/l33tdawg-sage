@@ -4,6 +4,7 @@ import "sync"
 
 const (
 	CanonicalMemoryProjectionUnchecked        = "unchecked"
+	CanonicalMemoryProjectionChecking         = "checking"
 	CanonicalMemoryProjectionNotRequired      = "not_required"
 	CanonicalMemoryProjectionExact            = "exact"
 	CanonicalMemoryProjectionLegacyCompatible = "legacy_compatible"
@@ -49,6 +50,25 @@ func (s *BadgerStore) CanonicalMemoryProjectionHealth() CanonicalMemoryProjectio
 	return s.canonicalMemoryProjectionHealth.status
 }
 
+// BeginCanonicalMemoryProjectionAudit gates only the first startup audit.
+// Once a complete result exists, refreshes preserve it until another complete,
+// source-stable audit is atomically published. This prevents readiness from
+// flapping to 503 merely because a large projection is being rechecked.
+func (s *BadgerStore) BeginCanonicalMemoryProjectionAudit() {
+	if s == nil || s.canonicalMemoryProjectionHealth == nil {
+		return
+	}
+	s.canonicalMemoryProjectionHealth.mu.Lock()
+	status := s.canonicalMemoryProjectionHealth.status
+	status.Required = true
+	if !status.Checked {
+		status.OK = false
+		status.State = CanonicalMemoryProjectionChecking
+	}
+	s.canonicalMemoryProjectionHealth.status = status
+	s.canonicalMemoryProjectionHealth.mu.Unlock()
+}
+
 // PublishCanonicalMemoryProjectionAudit publishes the result of one complete
 // serving-projection inventory walk. Partial list/search requests must not call
 // this method because seeing one valid page cannot clear a quarantine elsewhere.
@@ -79,9 +99,12 @@ func (s *BadgerStore) publishCanonicalMemoryProjectionAudit(
 		return
 	}
 	status := CanonicalMemoryProjectionHealth{
-		Checked:          true,
-		Required:         required,
-		OK:               !required || !quarantined,
+		Checked:  true,
+		Required: required,
+		// A completed audit is service-ready even when it localized rows that
+		// broad reads must quarantine. Quarantined drives HTTP 200 "degraded";
+		// unchecked/backend-unavailable remains the only readiness failure.
+		OK:               true,
 		LegacyCompatible: legacyCompatible,
 		Quarantined:      quarantined,
 	}
@@ -123,8 +146,11 @@ func (s *BadgerStore) observeMemoryProjectionDisposition(
 			status.State = CanonicalMemoryProjectionLegacyCompatible
 		}
 	case MemoryProjectionLegacyUnanchored, MemoryProjectionQuarantined, MemoryProjectionUnpublished:
-		status.Checked = true
-		status.OK = false
+		// A single failed validation proves degradation immediately. Preserve a
+		// prior completed audit's Checked bit so readiness remains HTTP 200
+		// degraded while the replacement full audit runs. Before the first
+		// completed audit Checked remains false and startup stays gated.
+		status.OK = status.Checked
 		status.Quarantined = true
 		status.State = CanonicalMemoryProjectionQuarantined
 	}

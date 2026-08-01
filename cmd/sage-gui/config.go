@@ -87,14 +87,11 @@ type Config struct {
 	// against retained blocks. See issue #40.
 	RetainBlocks int64 `yaml:"retain_blocks,omitempty"`
 
-	// DisableAutoUpgrade opts a personal node out of the v10.5.1 upgrade
-	// auto-advance: by default a single-validator node walks the governance
-	// fork ladder to the binary's compiled ceiling automatically (propose →
-	// auto-vote → activate, one fork at a time), so updating the binary also
-	// brings the CHAIN up to date. Quorum clusters never auto-advance
-	// regardless of this knob — fork scheduling there is an operator decision.
-	// DisableAutoUpgrade stops optional personal-node ladder movement above the
-	// binary's mandatory security floor. It cannot keep v11.15.0 below app-v23.
+	// DisableAutoUpgrade is a deprecated configuration compatibility field.
+	// It is intentionally ignored: personal nodes must walk the governed fork
+	// ladder to the binary's compiled ceiling so binary and chain rules cannot
+	// diverge. Quorum clusters still require governed multi-validator
+	// activation and never use the personal-node auto-advance worker.
 	DisableAutoUpgrade bool `yaml:"disable_auto_upgrade,omitempty"`
 }
 

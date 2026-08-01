@@ -120,6 +120,100 @@ func TestAppV23MigrationDispositionMatrixAndDeterminism(t *testing.T) {
 	require.Equal(t, rootState, rootAgain)
 }
 
+func TestAppV23StateAcceptsOnlyExactPostActivationPendingRegistrations(t *testing.T) {
+	t.Run("restricted pending identity remains bootable", func(t *testing.T) {
+		s, err := NewBadgerStore(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, s.CloseBadger()) })
+
+		_ = appV23Register(t, s, "root", AppV23RoleAdmin, 1, 0)
+		require.NoError(t, s.EnsureAppV23Root("pending-registration-scope", 10))
+		pending := appV23Register(
+			t, s, "post-activation-pending", AppV23RoleMember, 11,
+			DefaultSelfRegisteredAgentCapabilities,
+		)
+
+		enrollment, err := s.GetAppV23Enrollment(pending)
+		require.NoError(t, err)
+		require.Nil(t, enrollment)
+		role, err := s.GetAppV23Role(pending)
+		require.NoError(t, err)
+		require.Nil(t, role)
+		require.NoError(t, s.ValidateAppV23State(),
+			"the consensus-defined pending-registration state must not brick restart")
+	})
+
+	t.Run("direct genesis pending identity remains bootable", func(t *testing.T) {
+		s, err := NewBadgerStore(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, s.CloseBadger()) })
+
+		rootID := appV23TestID("direct-genesis-root")
+		companionID := appV23TestID("direct-genesis-companion")
+		validatorID := appV23TestID("direct-genesis-validator")
+		scope := sha256.Sum256([]byte("direct-genesis-scope"))
+		bootstrap := sha256.Sum256([]byte("direct-genesis-bootstrap"))
+		require.NoError(t, s.BootstrapAppV23Genesis(AppV23GenesisBootstrap{
+			RootID:            rootID,
+			Scope:             hex.EncodeToString(scope[:]),
+			AgentID:           companionID,
+			Profile:           AppV23ProfileCompanion,
+			HomeDomain:        "voice-interface",
+			Clearance:         1,
+			Capabilities:      15,
+			Height:            1,
+			BootstrapDigest:   hex.EncodeToString(bootstrap[:]),
+			ValidatorID:       validatorID,
+			ValidatorPower:    10,
+			ActivateAtGenesis: true,
+		}))
+		_ = appV23Register(
+			t, s, "direct-genesis-pending", AppV23RoleMember, 2,
+			DefaultSelfRegisteredAgentCapabilities,
+		)
+		require.NoError(t, s.ValidateAppV23State(),
+			"a direct app-v23 genesis must accept the same exact pending identity shape")
+	})
+
+	for _, tc := range []struct {
+		name   string
+		height int64
+		role   string
+		caps   AgentCapabilities
+	}{
+		{
+			name:   "registration is not after activation",
+			height: 10,
+			role:   AppV23RoleMember,
+			caps:   DefaultSelfRegisteredAgentCapabilities,
+		},
+		{
+			name:   "pending role is privileged",
+			height: 11,
+			role:   AppV23RoleManager,
+			caps:   DefaultSelfRegisteredAgentCapabilities,
+		},
+		{
+			name:   "pending capability mask is not fail closed",
+			height: 11,
+			role:   AppV23RoleMember,
+			caps:   0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := NewBadgerStore(t.TempDir())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, s.CloseBadger()) })
+
+			_ = appV23Register(t, s, "root-"+tc.name, AppV23RoleAdmin, 1, 0)
+			require.NoError(t, s.EnsureAppV23Root("pending-registration-scope", 10))
+			_ = appV23Register(t, s, "invalid-"+tc.name, tc.role, tc.height, tc.caps)
+
+			require.ErrorContains(t, s.ValidateAppV23State(), "has no valid pending enrollment")
+		})
+	}
+}
+
 func TestAppV23GenesisBootstrapRosterReconciliation(t *testing.T) {
 	s, err := NewBadgerStore(t.TempDir())
 	require.NoError(t, err)

@@ -41,6 +41,7 @@ export async function fetchMemories(params = {}) {
     if (params.status) q.set('status', params.status);
     if (params.limit) q.set('limit', params.limit);
     if (params.offset) q.set('offset', params.offset);
+    if (params.cursor) q.set('cursor', params.cursor);
     if (params.sort) q.set('sort', params.sort);
     if (params.agent) q.set('agent', params.agent);
     if (params.tag) q.set('tag', params.tag);
@@ -73,6 +74,40 @@ export async function fetchStats() {
     const res = await fetch(`${API_BASE}/v1/dashboard/stats`);
     if (!res.ok) throw new Error('memory statistics are temporarily unavailable');
     return res.json();
+}
+
+export async function fetchMemoryAdoptionProgress() {
+    const res = await fetch(`${API_BASE}/v1/dashboard/memory/adoption-progress`);
+    if (!res.ok) throw new Error('automatic memory repair status is temporarily unavailable');
+    return res.json();
+}
+
+async function postMemoryAdoptionResolution(path, body) {
+    const res = await fetch(`${API_BASE}/v1/dashboard/memory/${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        throw new Error(payload.error || 'automatic memory repair could not be updated');
+    }
+    return payload;
+}
+
+export async function retryMemoryAdoption({ projectionRevision, expectedCount }) {
+    return postMemoryAdoptionResolution('adoption-retry', {
+        projection_revision: projectionRevision,
+        expected_count: expectedCount,
+    });
+}
+
+export async function deprecateMemoryAdoption({ projectionRevision, expectedCount, confirmation }) {
+    return postMemoryAdoptionResolution('adoption-deprecate', {
+        projection_revision: projectionRevision,
+        expected_count: expectedCount,
+        confirmation,
+    });
 }
 
 export async function fetchHealth() {
@@ -890,8 +925,9 @@ export async function selectEmbeddingProvider(provider) {
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
     return res.json();
 }
-export async function deprecateUnreadable() {
-    const res = await fetch(`${API_BASE}/v1/dashboard/embeddings/deprecate-unreadable`, { method: 'POST' });
+export async function deprecateUnreadable(cursor = '') {
+    const suffix = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    const res = await fetch(`${API_BASE}/v1/dashboard/embeddings/deprecate-unreadable${suffix}`, { method: 'POST' });
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `HTTP ${res.status}`); }
     return res.json();
 }

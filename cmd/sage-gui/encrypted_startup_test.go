@@ -250,9 +250,11 @@ func TestLockedPersonalRawLocalRPCRejectsUntilVaultPublication(t *testing.T) {
 	// The vault publication gate and the app-v24 first-party write gate are
 	// independent. Install the already-governed activation plan, prove H still
 	// rejects the Companion write under app-v23 rules, then accept it at H+1.
+	status, err := rpcEnvironment.Status(nil)
+	require.NoError(t, err)
 	require.NoError(t, badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
 		Name: tx.CanonicalUpgradeName(24), TargetAppVersion: 24,
-		ActivationHeight: 1, ProposedAt: 0,
+		ActivationHeight: status.SyncInfo.LatestBlockHeight + 1, ProposedAt: 0,
 	}))
 	activation, err := rpcEnvironment.BroadcastTxCommit(
 		&rpctypes.Context{},

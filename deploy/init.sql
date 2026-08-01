@@ -35,6 +35,66 @@ CREATE TABLE memories (
     deprecated_at    TIMESTAMPTZ
 );
 CREATE INDEX idx_memories_embedding_provider ON memories(embedding_provider);
+CREATE INDEX idx_memories_projection_page ON memories(created_at, memory_id);
+
+-- Transactional invalidation token for CEREBRUM's complete memory-projection
+-- audit. Statement-level triggers keep bulk mutations O(1) for revision writes.
+CREATE TABLE memory_projection_revision (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+);
+INSERT INTO memory_projection_revision(singleton, revision) VALUES (TRUE, 0);
+
+CREATE FUNCTION sage_bump_memory_projection_revision()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE memory_projection_revision
+    SET revision = revision + 1
+    WHERE singleton = TRUE;
+    RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER memories_projection_revision_insert_v1
+AFTER INSERT ON memories FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_memory_projection_revision();
+
+CREATE TRIGGER memories_projection_revision_update_v1
+AFTER UPDATE OF submitting_agent, content, content_hash, domain_tag, status, created_at ON memories
+FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_memory_projection_revision();
+
+CREATE TRIGGER memories_projection_revision_delete_v1
+AFTER DELETE ON memories FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_memory_projection_revision();
+
+-- Metadata invalidation token for graph nodes and edges. Memory fields already
+-- covered by memory_projection_revision are combined with this token in the
+-- graph cache key; this tracks the remaining rendered fields and link tables.
+CREATE TABLE graph_projection_revision (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+);
+INSERT INTO graph_projection_revision(singleton, revision) VALUES (TRUE, 0);
+
+CREATE FUNCTION sage_bump_graph_projection_revision()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE graph_projection_revision
+    SET revision = revision + 1
+    WHERE singleton = TRUE;
+    RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER memories_graph_revision_update_v1
+AFTER UPDATE OF memory_type, confidence_score, parent_hash ON memories
+FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
 
 -- ============================================================
 -- 1b. memory_links
@@ -47,6 +107,15 @@ CREATE TABLE memory_links (
     PRIMARY KEY (source_id, target_id)
 );
 CREATE INDEX idx_memory_links_target ON memory_links(target_id);
+CREATE TRIGGER memory_links_graph_revision_insert_v1
+AFTER INSERT ON memory_links FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
+CREATE TRIGGER memory_links_graph_revision_update_v1
+AFTER UPDATE ON memory_links FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
+CREATE TRIGGER memory_links_graph_revision_delete_v1
+AFTER DELETE ON memory_links FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
 
 CREATE TABLE memory_tags (
     memory_id UUID NOT NULL REFERENCES memories(memory_id) ON DELETE CASCADE,
@@ -54,6 +123,15 @@ CREATE TABLE memory_tags (
     PRIMARY KEY (memory_id, tag)
 );
 CREATE INDEX idx_memory_tags_tag ON memory_tags(tag);
+CREATE TRIGGER memory_tags_graph_revision_insert_v1
+AFTER INSERT ON memory_tags FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
+CREATE TRIGGER memory_tags_graph_revision_update_v1
+AFTER UPDATE ON memory_tags FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
+CREATE TRIGGER memory_tags_graph_revision_delete_v1
+AFTER DELETE ON memory_tags FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
 
 -- ============================================================
 -- 2. knowledge_triples
@@ -93,6 +171,15 @@ CREATE TABLE corroborations (
     evidence  TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TRIGGER corroborations_graph_revision_insert_v1
+AFTER INSERT ON corroborations FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
+CREATE TRIGGER corroborations_graph_revision_update_v1
+AFTER UPDATE ON corroborations FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
+CREATE TRIGGER corroborations_graph_revision_delete_v1
+AFTER DELETE ON corroborations FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_graph_projection_revision();
 
 -- ============================================================
 -- 5. challenges

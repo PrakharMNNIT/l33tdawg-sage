@@ -101,15 +101,81 @@ test('CEREBRUM labels a partial canonical projection and never calls it an empty
         appSource.indexOf('// ============================================================================', appSource.indexOf('function HealthBar()')),
     );
 
-    assert.match(inventory, /stats\.projection\?\.partial === true/);
-    assert.match(inventory, /Verified memories shown/);
+    assert.match(inventory, /projection\?\.partial === true/);
+    assert.match(inventory, /Available memories shown/);
     assert.match(inventory, /Your stored data was not changed/);
-    assert.match(mri, /No verified memories can be shown yet/);
+    assert.match(mri, /No memories can be safely shown yet/);
     assert.match(mri, /noLocalMemories && !partialProjection/);
     assert.match(healthBar, /health\.memory_projection\?\.partial === true/);
+    assert.match(healthBar, /health\.memory_projection\?\.verified_only !== false/);
     assert.match(healthBar, /verified memories/);
+    assert.match(healthBar, /available memories/);
     assert.match(healthBar, /Canonically verified memories currently visible/);
-    assert.match(healthBar, /Verified view/);
+    assert.match(healthBar, /Readable historical memories currently visible/);
+    assert.doesNotMatch(healthBar, /Available view/,
+        'the health bar must not duplicate the automatic repair notice in the domain panel');
+});
+
+test('preserved historical records have one explicit repair-resolution flow', () => {
+    const resolution = appSource.slice(
+        appSource.indexOf('function MemoryAdoptionResolutionModal('),
+        appSource.indexOf('function BrainDomainInventory('),
+    );
+    const inventory = appSource.slice(
+        appSource.indexOf('function BrainDomainInventory('),
+        appSource.indexOf('// MriView'),
+    );
+    const retryAPI = apiSource.slice(
+        apiSource.indexOf('export async function retryMemoryAdoption('),
+        apiSource.indexOf('export async function deprecateMemoryAdoption('),
+    );
+    const deprecateAPI = apiSource.slice(
+        apiSource.indexOf('export async function deprecateMemoryAdoption('),
+        apiSource.indexOf('export async function fetchHealth('),
+    );
+
+    assert.match(inventory, /adoptionProgress\.state === 'recovery'/);
+    assert.match(inventory, /brain-projection-resolve/);
+    assert.match(inventory, />Resolve<\/button>/);
+    assert.match(inventory, /repairExplicitlyResolved = adoptionProgress &&[\s\S]*adoptionProgress\.state === 'complete' &&[\s\S]*Number\(adoptionProgress\.remaining \|\| 0\) === 0 &&[\s\S]*Number\(adoptionProgress\.recovery \|\| 0\) === 0/,
+        'only explicit terminal zero-count progress may clear the entire repair warning');
+    assert.match(inventory, /showAutomaticRepairNotice = !repairExplicitlyResolved &&[\s\S]*\(repairActive \|\| repairFinishedWithResidue \|\| projectionNotice\)/,
+        'terminal progress must suppress even a stale generic projection notice');
+    assert.match(inventory, /fetchMemoryAdoptionProgress\(\)/);
+    assert.match(inventory, /setAdoptionProgress\(adoption\)/,
+        'a reload must restore the durable complete/zero progress proof before rendering the notice');
+
+    assert.match(resolution, /useModalDialog\(requestClose\)/);
+    assert.match(resolution, /role="dialog" aria-modal="true"/);
+    assert.match(resolution, /aria-labelledby="memory-repair-resolution-title"/);
+    assert.match(resolution, /role="alert"/);
+    assert.match(resolution, /role="status"/);
+    assert.match(resolution, /Retrying repair…/);
+    assert.match(resolution, /Deprecating records…/);
+    assert.match(resolution, /DEPRECATE \$\{recoveryCount\}/);
+    assert.match(resolution, /<strong>\$\{requiredConfirmation\}<\/strong>/);
+    assert.match(resolution, /confirmation !== requiredConfirmation/);
+    assert.match(resolution, /const returned = result\?\.progress \|\| result/);
+    const immediateProgress = resolution.indexOf("if (next && typeof onProgress === 'function') onProgress(next)");
+    const reconciliationFetch = resolution.indexOf('const refreshed = await fetchMemoryAdoptionProgress()');
+    assert.ok(immediateProgress !== -1 && reconciliationFetch !== -1 && immediateProgress < reconciliationFetch,
+        'successful deprecation must publish returned complete/zero progress before the refresh request');
+    assert.match(resolution, /if \(refreshed\) \{[\s\S]*next = refreshed;[\s\S]*onProgress\(next\)/,
+        'the follow-up GET must reconcile progress without reviving a stale local state');
+    assert.match(resolution, /const result = await deprecateMemoryAdoption\([\s\S]*await refreshProgress\(result\)/);
+    assert.match(resolution, /remain preserved for audit/);
+    assert.match(resolution, /not been deleted or rewritten/);
+    assert.match(resolution, /permanently excludes these records from future repair attempts and the available-memory view/);
+
+    assert.match(retryAPI, /adoption-retry/);
+    assert.match(retryAPI, /projection_revision: projectionRevision/);
+    assert.match(retryAPI, /expected_count: expectedCount/);
+    assert.doesNotMatch(retryAPI, /confirmation/,
+        'retry is revision/count guarded but must not invent a typed confirmation contract');
+    assert.match(deprecateAPI, /adoption-deprecate/);
+    assert.match(deprecateAPI, /projection_revision: projectionRevision/);
+    assert.match(deprecateAPI, /expected_count: expectedCount/);
+    assert.match(deprecateAPI, /confirmation/);
 });
 
 test('Search page renders projection failures as errors, never empty search results', () => {
@@ -499,9 +565,9 @@ test('chain activity exposes committed RBAC changes and remains usable while emp
     assert.match(activity, /aria-label="Resize Chain Activity"/);
 });
 
-test('chain health recognizes app-v24 as the current consensus protocol', () => {
-    assert.match(appSource, /const appVerTone = appVer === '24'/);
-    assert.match(appSource, /Green when current \(24\)\./);
+test('chain health recognizes app-v25 as the current consensus protocol', () => {
+    assert.match(appSource, /const appVerTone = appVer === '25'/);
+    assert.match(appSource, /Green when current \(25\)\./);
     assert.doesNotMatch(appSource, /appVer === '22'/);
     assert.doesNotMatch(appSource, /appVer === '15'/);
 });
@@ -1202,11 +1268,23 @@ test('macOS tray focuses an existing CEREBRUM tab before opening a new one', () 
 });
 
 test('MRI uses one dense shared memory sample limit', () => {
-    assert.match(mriSource, /export const DEFAULT_MRI_NODE_LIMIT = 2500/);
+    assert.match(mriSource, /export const DEFAULT_MRI_NODE_LIMIT = 1500/);
     assert.match(mriSource, /limit=\$\{DEFAULT_MRI_NODE_LIMIT\}/);
     assert.match(mriPageSource, /String\(DEFAULT_MRI_NODE_LIMIT\)/);
+    assert.match(mriSource,
+        /\.nn'\)\.textContent = fmtN\(d\.total && d\.total > d\.nodes\.length \? d\.total : d\.nodes\.length\)/,
+        'the HUD memory count must prefer the server total over the rendered sample size');
+    assert.match(mriSource, /showing \$\{d\.nodes\.length\} of \$\{fmtN\(d\.total\)\} · representative sample/,
+        'a sampled graph must label the rendered node count separately from total memories');
     const mriView = appSource.slice(appSource.indexOf('function MriView('), appSource.indexOf('// Global tooltips state'));
     assert.doesNotMatch(mriView, /limit=500/);
+});
+
+test('MRI coalesces live memory bursts and never overlaps graph reloads', () => {
+    assert.match(mriSource, /let graphLoadInFlight = false/);
+    assert.match(mriSource, /if \(graphLoadInFlight\) \{[\s\S]*graphReloadPending = true/);
+    assert.match(mriSource, /setTimeout\(load, 3000\)/);
+    assert.doesNotMatch(mriSource, /setTimeout\(load, 450\)/);
 });
 
 test('MRI distinguishes domains stored here from domains shared by other SAGE nodes', () => {

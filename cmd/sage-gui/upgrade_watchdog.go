@@ -88,17 +88,14 @@ type upgradeWatchdogConfig struct {
 	// legacy watchdog — fork scheduling there is an operator decision.
 	PersonalMode bool
 
-	// AutoAdvance enables the v10.5.1 personal-mode ladder walk (the
-	// "clicking update brings the chain up to date" fix, issue #40 follow-up).
-	// Wired from config: disable_auto_upgrade inverts it above the mandatory
-	// release floor.
+	// AutoAdvance is retained for configuration compatibility. Personal-node
+	// consensus migrations are mandatory: a local preference must never leave
+	// the binary and its chain state on different application versions.
 	AutoAdvance bool
 
-	// RequiredAppVersion is the minimum consensus security floor this binary
-	// must reach on a personal node even when the operator disabled optional
-	// automatic upgrades. It never bypasses the sequential fork ladder and is
-	// deliberately ignored for quorum networks, where every activation remains
-	// a governed multi-validator decision.
+	// RequiredAppVersion is retained as the release's documented minimum floor.
+	// Personal nodes always walk to the compiled ceiling; quorum networks still
+	// require their governed multi-validator activation.
 	RequiredAppVersion uint64
 
 	// PendingPlan reads the chain's pending UpgradePlan straight from the
@@ -147,17 +144,15 @@ func startUpgradeWatchdog(ctx context.Context, cfg upgradeWatchdogConfig) bool {
 	// quiescent chain is frozen governance regardless of how it was proposed.
 	startPendingPlanPump(ctx, cfg)
 
-	// Personal-mode auto-advance walks either to the compiled ceiling or, when
-	// optional automation is disabled, only to this release's mandatory
-	// security floor. A personal node is its whole validator set, so the ladder
-	// still uses the ordinary governed proposal/activation path rather than a
-	// local state rewrite.
+	// A personal node is its whole validator set, so it must walk the governed
+	// ladder to the compiled ceiling. A local disable_auto_upgrade preference
+	// cannot suppress consensus migrations: doing so would run new code against
+	// stale chain rules and recreate the divergence this ladder prevents.
 	autoAdvanceCeiling := personalAutoAdvanceCeiling(cfg, sageabci.MaxSupportedAppVersion())
 	if cfg.PersonalMode && autoAdvanceCeiling > 1 {
 		startUpgradeWorker(cfg, func() { runAutoAdvance(ctx, cfg, interval) })
 		cfg.Logger.Info().
 			Uint64("target_app_version", autoAdvanceCeiling).
-			Bool("optional_auto_advance", cfg.AutoAdvance).
 			Str("binary_version", cfg.BinaryVersion).
 			Dur("interval", interval).
 			Msg("personal-node upgrade ladder armed")
@@ -257,13 +252,7 @@ func personalAutoAdvanceCeiling(cfg upgradeWatchdogConfig, maxSupported uint64) 
 	if !cfg.PersonalMode {
 		return 0
 	}
-	if cfg.AutoAdvance {
-		return maxSupported
-	}
-	if cfg.RequiredAppVersion > maxSupported {
-		return maxSupported
-	}
-	return cfg.RequiredAppVersion
+	return maxSupported
 }
 
 func runAutoAdvance(ctx context.Context, cfg upgradeWatchdogConfig, interval time.Duration) {

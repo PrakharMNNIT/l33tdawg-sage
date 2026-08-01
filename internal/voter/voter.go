@@ -18,6 +18,14 @@ import (
 // at most one idempotent re-vote per still-proposed memory.
 const maxVotedTracked = 100_000
 
+const (
+	memoryVotePageSize            = 128
+	memoryVoteScanBudget          = 1024
+	memoryVotesPerTick            = 20
+	memoryVoteRetryAfter          = 10 * time.Second
+	memoryVoteAdmissionRetryAfter = 30 * time.Second
+)
+
 // Config configures a per-node memory auto-voter.
 type Config struct {
 	// Key is the node's consensus signing key (priv_validator_key.json). The voter
@@ -48,11 +56,31 @@ type App interface {
 	// UpgradeProposalHasVote reports whether voterID already has an on-chain vote
 	// recorded for the proposal (so the voter doesn't re-broadcast).
 	UpgradeProposalHasVote(proposalID, voterID string) bool
+	// MemoryVoteTargetState binds app-v25 voting to canonical memory state.
+	// eligible is true only when this ID may currently receive a vote; recorded
+	// is true only after this validator's vote is visible in committed state.
+	MemoryVoteTargetState(memoryID, voterID string) (eligible, recorded bool)
 }
 
 // PendingSource yields proposed memories awaiting votes.
 type PendingSource interface {
 	GetPendingByDomain(ctx context.Context, domainTag string, limit int) ([]*memory.MemoryRecord, error)
+}
+
+type PendingPageSource interface {
+	GetPendingByDomainPage(
+		ctx context.Context,
+		domainTag string,
+		limit, offset int,
+	) ([]*memory.MemoryRecord, error)
+}
+
+type VotablePendingPageSource interface {
+	GetVotablePendingByDomainPage(
+		ctx context.Context,
+		domainTag string,
+		limit, offset int,
+	) ([]*memory.MemoryRecord, error)
 }
 
 // BacklogSource exposes the proposed-backlog watermark behind the stuck-memory
@@ -110,9 +138,16 @@ func Run(ctx context.Context, app App, store Store, cfg Config, logger zerolog.L
 		Msg("memory auto-voter started — one node, one vote (signing with node consensus key)")
 
 	// Memories already voted on this session — avoids re-broadcasting every tick.
-	// A stuck memory (e.g. a 2-2 tie on a multi-node chain) is left alone rather
-	// than reflooded.
+	// Entries are added only after committed canonical state confirms the vote.
 	voted := make(map[string]bool)
+	// A CheckTx-accepted broadcast is merely in flight. Retry it after a bounded
+	// interval unless committed state confirms it; never confuse admission with
+	// a durable vote.
+	inflight := make(map[string]time.Time)
+	// The raw SQL backlog can contain legacy rows which app-v25 correctly refuses
+	// to vote. Carry a stable page offset across ticks so a large ghost prefix
+	// cannot starve newer canonical submissions or make one tick unbounded.
+	voteScanOffset := 0
 	// Upgrade proposals we've already warned are unsupported, so the tick doesn't
 	// re-log the same warning. (Supported proposals are NOT suppressed here — the
 	// on-chain UpgradeProposalHasVote check self-heals a dropped broadcast.)
@@ -124,6 +159,7 @@ func Run(ctx context.Context, app App, store Store, cfg Config, logger zerolog.L
 	// lastVote is when this session last broadcast a memory vote tx (zero =
 	// never). Surfaced via /ready's voter block as last_vote_unix.
 	var lastVote time.Time
+	var voteRetryAt time.Time
 
 	for {
 		select {
@@ -137,10 +173,30 @@ func Run(ctx context.Context, app App, store Store, cfg Config, logger zerolog.L
 			if len(voted) > maxVotedTracked {
 				voted = make(map[string]bool)
 			}
-			if voteOnPendingMemories(ctx, store, cfg, voted, logger) > 0 {
+			if len(inflight) > maxVotedTracked {
+				inflight = make(map[string]time.Time)
+			}
+			if time.Now().Before(voteRetryAt) {
+				publishBacklogTelemetry(ctx, store, cfg.Health, selfID, lastVote)
+				continue
+			}
+			cast, unavailable := voteOnPendingMemoriesResult(
+				ctx, app, store, cfg, voted, inflight, &voteScanOffset, logger,
+			)
+			if cast > 0 {
 				lastVote = time.Now()
 			}
-			voteOnUpgradeProposal(ctx, app, cfg, selfID, warnedProposals, logger)
+			if !unavailable {
+				unavailable = voteOnUpgradeProposalResult(
+					ctx, app, cfg, selfID, warnedProposals, logger,
+				)
+			}
+			if unavailable {
+				voteRetryAt = time.Now().Add(memoryVoteAdmissionRetryAfter)
+				logger.Warn().
+					Dur("retry_after", memoryVoteAdmissionRetryAfter).
+					Msg("memory auto-voter paused because consensus admission is unavailable")
+			}
 			publishBacklogTelemetry(ctx, store, cfg.Health, selfID, lastVote)
 		}
 	}
@@ -187,53 +243,152 @@ func publishBacklogTelemetry(ctx context.Context, store Store, health *metrics.H
 // voteOnPendingMemories scans proposed memories and casts one signed vote per
 // newly-seen memory. Returns how many vote txs were broadcast this tick (feeds
 // the /ready voter block's last_vote_unix).
-func voteOnPendingMemories(ctx context.Context, store Store, cfg Config, voted map[string]bool, logger zerolog.Logger) int {
-	pending, err := store.GetPendingByDomain(ctx, "%", 20)
-	if err != nil {
-		return 0
-	}
-	cast := 0
-	for _, mem := range pending {
-		if voted[mem.MemoryID] {
-			continue
-		}
-		contentHash := hex.EncodeToString(mem.ContentHash)
-		decision := Decide(ctx, store, MemoryInput{
-			Content:     mem.Content,
-			ContentHash: contentHash,
-			Domain:      mem.DomainTag,
-			MemType:     string(mem.MemoryType),
-			Confidence:  mem.ConfidenceScore,
-		})
-		decStr := "reject"
-		if decision.Accept {
-			decStr = "accept"
-		}
-
-		voteTx := &tx.ParsedTx{
-			Type:      tx.TxTypeMemoryVote,
-			Nonce:     tx.MonotonicNonce(cfg.Key), // strictly increasing per key (app-v9 nonce gate)
-			Timestamp: time.Now(),
-			MemoryVote: &tx.MemoryVote{
-				MemoryID:  mem.MemoryID,
-				Decision:  voteDecisionFromString(decStr),
-				Rationale: decision.Reason,
-			},
-		}
-		if err := tx.SignTx(voteTx, cfg.Key); err != nil {
-			logger.Debug().Err(err).Msg("failed to sign vote tx")
-			continue
-		}
-		encoded, err := tx.EncodeTx(voteTx)
-		if err != nil {
-			logger.Debug().Err(err).Msg("failed to encode vote tx")
-			continue
-		}
-		broadcastVoteTx(ctx, cfg.CometRPC, encoded, logger)
-		voted[mem.MemoryID] = true
-		cast++
-	}
+func voteOnPendingMemories(
+	ctx context.Context,
+	app App,
+	store Store,
+	cfg Config,
+	voted map[string]bool,
+	inflight map[string]time.Time,
+	scanOffset *int,
+	logger zerolog.Logger,
+) int {
+	cast, _ := voteOnPendingMemoriesResult(
+		ctx, app, store, cfg, voted, inflight, scanOffset, logger,
+	)
 	return cast
+}
+
+func voteOnPendingMemoriesResult(
+	ctx context.Context,
+	app App,
+	store Store,
+	cfg Config,
+	voted map[string]bool,
+	inflight map[string]time.Time,
+	scanOffset *int,
+	logger zerolog.Logger,
+) (int, bool) {
+	if scanOffset == nil {
+		return 0, false
+	}
+	selfID := hex.EncodeToString(cfg.Key.Public().(ed25519.PublicKey))
+	cast := 0
+	scanned := 0
+	offset := *scanOffset
+	wrapped := false
+	now := time.Now()
+	pager, paged := store.(PendingPageSource)
+	votablePager, recoveryAware := store.(VotablePendingPageSource)
+	for scanned < memoryVoteScanBudget && cast < memoryVotesPerTick {
+		pageLimit := memoryVotePageSize
+		if remaining := memoryVoteScanBudget - scanned; remaining < pageLimit {
+			pageLimit = remaining
+		}
+		var (
+			pending []*memory.MemoryRecord
+			err     error
+		)
+		if recoveryAware {
+			pending, err = votablePager.GetVotablePendingByDomainPage(
+				ctx, "%", pageLimit, offset,
+			)
+		} else if paged {
+			pending, err = pager.GetPendingByDomainPage(ctx, "%", pageLimit, offset)
+		} else {
+			// Compatibility lane for third-party stores implementing the original
+			// voter interface. Built-in SQLite/Postgres always take the paged
+			// branch, which is required to pass legacy ghost prefixes.
+			if offset > 0 {
+				offset = 0
+				break
+			}
+			pending, err = store.GetPendingByDomain(ctx, "%", pageLimit)
+		}
+		if err != nil {
+			break
+		}
+		if len(pending) == 0 {
+			if offset > 0 && !wrapped {
+				offset = 0
+				wrapped = true
+				continue
+			}
+			break
+		}
+		for _, mem := range pending {
+			offset++
+			scanned++
+			eligible, recorded := app.MemoryVoteTargetState(mem.MemoryID, selfID)
+			if recorded {
+				voted[mem.MemoryID] = true
+				delete(inflight, mem.MemoryID)
+				continue
+			}
+			if !eligible {
+				delete(inflight, mem.MemoryID)
+				continue
+			}
+			// Committed state is authoritative. Adoption deliberately clears
+			// stale pre-envelope vote receipts; discard the matching process
+			// cache so the newly canonical proposed memory can receive a vote.
+			delete(voted, mem.MemoryID)
+			if sentAt, ok := inflight[mem.MemoryID]; ok &&
+				now.Sub(sentAt) < memoryVoteRetryAfter {
+				continue
+			}
+			contentHash := hex.EncodeToString(mem.ContentHash)
+			decision := Decide(ctx, store, MemoryInput{
+				Content:     mem.Content,
+				ContentHash: contentHash,
+				Domain:      mem.DomainTag,
+				MemType:     string(mem.MemoryType),
+				Confidence:  mem.ConfidenceScore,
+			})
+			decStr := "reject"
+			if decision.Accept {
+				decStr = "accept"
+			}
+
+			voteTx := &tx.ParsedTx{
+				Type:      tx.TxTypeMemoryVote,
+				Nonce:     tx.MonotonicNonce(cfg.Key), // strictly increasing per key (app-v9 nonce gate)
+				Timestamp: time.Now(),
+				MemoryVote: &tx.MemoryVote{
+					MemoryID:  mem.MemoryID,
+					Decision:  voteDecisionFromString(decStr),
+					Rationale: decision.Reason,
+				},
+			}
+			if err := tx.SignTx(voteTx, cfg.Key); err != nil {
+				logger.Debug().Err(err).Msg("failed to sign vote tx")
+				continue
+			}
+			encoded, err := tx.EncodeTx(voteTx)
+			if err != nil {
+				logger.Debug().Err(err).Msg("failed to encode vote tx")
+				continue
+			}
+			result := broadcastVoteTx(ctx, cfg.CometRPC, encoded, logger)
+			if result.unavailable {
+				*scanOffset = 0
+				return cast, true
+			}
+			if result.accepted {
+				inflight[mem.MemoryID] = now
+				cast++
+			}
+			if cast == memoryVotesPerTick {
+				break
+			}
+		}
+		if len(pending) < pageLimit {
+			offset = 0
+			break
+		}
+	}
+	*scanOffset = offset
+	return cast, false
 }
 
 // voteOnUpgradeProposal auto-votes ACCEPT on an active app-version upgrade
@@ -243,9 +398,13 @@ func voteOnPendingMemories(ctx context.Context, store Store, cfg Config, voted m
 // when ready — strictly safer than the old 4-archetype abstention scheme — and the
 // multi-node 2/3 governance quorum still binds the outcome.
 func voteOnUpgradeProposal(ctx context.Context, app App, cfg Config, selfID string, warnedProposals map[string]bool, logger zerolog.Logger) {
+	_ = voteOnUpgradeProposalResult(ctx, app, cfg, selfID, warnedProposals, logger)
+}
+
+func voteOnUpgradeProposalResult(ctx context.Context, app App, cfg Config, selfID string, warnedProposals map[string]bool, logger zerolog.Logger) bool {
 	proposalID, target, supported, ok := app.ActiveUpgradeVote()
 	if !ok {
-		return
+		return false
 	}
 	if !supported {
 		if !warnedProposals[proposalID] {
@@ -255,10 +414,10 @@ func voteOnUpgradeProposal(ctx context.Context, app App, cfg Config, selfID stri
 				Msg("active upgrade proposal targets an app version this binary does not support — NOT auto-voting; upgrade this binary to participate")
 			warnedProposals[proposalID] = true
 		}
-		return
+		return false
 	}
 	if app.UpgradeProposalHasVote(proposalID, selfID) {
-		return // already recorded on-chain — don't re-broadcast
+		return false // already recorded on-chain — don't re-broadcast
 	}
 
 	voteTx := &tx.ParsedTx{
@@ -272,16 +431,16 @@ func voteOnUpgradeProposal(ctx context.Context, app App, cfg Config, selfID stri
 	}
 	if err := tx.SignTx(voteTx, cfg.Key); err != nil {
 		logger.Debug().Err(err).Msg("failed to sign gov vote tx")
-		return
+		return false
 	}
 	encoded, err := tx.EncodeTx(voteTx)
 	if err != nil {
 		logger.Debug().Err(err).Msg("failed to encode gov vote tx")
-		return
+		return false
 	}
 	logger.Info().
 		Str("proposal_id", proposalID).
 		Uint64("target_app_version", target).
 		Msg("auto-voting ACCEPT on supported upgrade proposal")
-	broadcastVoteTx(ctx, cfg.CometRPC, encoded, logger)
+	return broadcastVoteTx(ctx, cfg.CometRPC, encoded, logger).unavailable
 }

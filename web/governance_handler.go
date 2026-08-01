@@ -433,6 +433,23 @@ func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http
 				return
 			}
 		}
+		if proposal.Operation == governance.OpMemoryLegacyAdopt {
+			source, ok := h.store.(appV25LegacyProjectionSource)
+			if !ok {
+				writeError(w, http.StatusConflict,
+					"legacy-memory adoption vote blocked: local projection evidence is unavailable")
+				return
+			}
+			if attestErr := h.attestAppV25LegacyAdoptionProposal(
+				r.Context(),
+				source,
+				proposal,
+			); attestErr != nil {
+				writeError(w, http.StatusConflict,
+					"legacy-memory adoption vote blocked: "+attestErr.Error())
+				return
+			}
+		}
 	}
 
 	voteTx := &tx.ParsedTx{

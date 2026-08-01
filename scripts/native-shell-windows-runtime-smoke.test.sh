@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 HARNESS="${ROOT}/scripts/native-shell-windows-runtime-smoke.ps1"
+SHELL_SOURCE="${ROOT}/desktop/sage-shell/src/main.rs"
 test -s "${HARNESS}"
+test -s "${SHELL_SOURCE}"
 
 for required in \
   'GetNamedPipeServerProcessId' \
@@ -51,6 +53,17 @@ fi
 
 if grep -Eiq '\$(sage)?home([[:space:]]|[),=])' "${HARNESS}"; then
   echo 'Windows runtime harness shadows the read-only PowerShell HOME variable' >&2
+  exit 1
+fi
+
+# The Windows renderer can stall before WebviewWindowBuilder::build returns.
+# Verified SSCP startup is control-plane work and must already be running by
+# then; otherwise the installed-package test can observe a live shell with no
+# daemon launch log and no status pipe.
+supervisor_line=$(grep -n 'supervisor_ready' "${SHELL_SOURCE}" | tail -1 | cut -d: -f1)
+webview_line=$(grep -n 'WebviewWindowBuilder::new' "${SHELL_SOURCE}" | head -1 | cut -d: -f1)
+if [ -z "${supervisor_line}" ] || [ -z "${webview_line}" ] || [ "${supervisor_line}" -ge "${webview_line}" ]; then
+  echo 'native-shell supervisor must start before WebView construction' >&2
   exit 1
 fi
 

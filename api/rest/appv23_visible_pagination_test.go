@@ -199,6 +199,63 @@ func TestAppV23MemoryListFirstPageOverFiveThousandDoesNotFail(t *testing.T) {
 	require.False(t, response.TotalExact)
 }
 
+func TestAppV23MemoryListQuarantinesMalformedHistoricalDomainWithoutHidingValidRows(t *testing.T) {
+	srv, badger, readerID, ownerID, _ := setupAppV23RESTAccess(t)
+	memStore := &appV23PagingStore{rbacMockMemoryStore: newRBACMockMemoryStore()}
+	memStore.badger = badger
+	srv.store = memStore
+
+	now := time.Now()
+	invalid := appV23PagingRecord(
+		"legacy-invalid-domain", ownerID, "legacy domain with whitespace",
+		"preserved historical row", memory.TypeObservation,
+		memory.StatusCommitted, now,
+	)
+	valid := appV23PagingRecord(
+		"valid-domain-row", ownerID, "owner.home", "readable current row",
+		memory.TypeObservation, memory.StatusCommitted, now.Add(-time.Second),
+	)
+	memStore.listed = []*memory.MemoryRecord{invalid, valid}
+	for _, rec := range memStore.listed {
+		memStore.memories[rec.MemoryID] = rec
+		require.NoError(t, badger.SetMemoryHash(
+			rec.MemoryID, rec.ContentHash, string(rec.Status),
+		))
+	}
+
+	// The exact row remains non-disclosable: the broad-read compatibility is a
+	// skip, not permission to interpret malformed historical metadata.
+	_, exactErr := srv.evaluateAppV23RecordDisclosure(readerID, invalid, now)
+	require.Error(t, exactErr)
+	require.ErrorIs(t, exactErr, store.ErrMemoryProjectionQuarantined)
+	require.True(t, isUnsafeAppV23Projection(exactErr))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/memory/list?limit=50", nil)
+	req = req.WithContext(middleware.WithAgentID(req.Context(), readerID))
+	out := httptest.NewRecorder()
+	srv.handleListMemoriesAuth(out, req)
+	require.Equal(t, http.StatusOK, out.Code, out.Body.String())
+	var response struct {
+		Memories   []*memory.MemoryRecord `json:"memories"`
+		Total      int                    `json:"total"`
+		HasMore    bool                   `json:"has_more"`
+		TotalExact bool                   `json:"total_exact"`
+	}
+	require.NoError(t, json.Unmarshal(out.Body.Bytes(), &response))
+	require.Len(t, response.Memories, 1)
+	require.Equal(t, valid.MemoryID, response.Memories[0].MemoryID)
+	require.Equal(t, 1, response.Total)
+	require.False(t, response.HasMore)
+	require.True(t, response.TotalExact)
+
+	// Missing policy infrastructure is a genuine request-wide authorization
+	// failure and must never be reclassified as a skippable legacy row.
+	srv.badgerStore = nil
+	_, backendErr := srv.evaluateAppV23RecordDisclosure(readerID, valid, now)
+	require.Error(t, backendErr)
+	require.False(t, isUnsafeAppV23Projection(backendErr))
+}
+
 func TestAppV23VisiblePaginationFillsPastRevokedPrefixAcrossRoutes(t *testing.T) {
 	srv, badger, readerID, ownerID, outsiderID := setupAppV23RESTAccess(t)
 	memStore := &appV23PagingStore{rbacMockMemoryStore: newRBACMockMemoryStore()}

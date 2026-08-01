@@ -73,16 +73,30 @@ type CanonicalMemoryProjectionStatus struct {
 
 type canonicalMemoryProjectionProvider func() CanonicalMemoryProjectionStatus
 
+// AppV25MaintenanceStatus reports whether this running process has verified
+// the automatic legacy-memory adoption cutoff. Recovery means only localized
+// historical rows remain preserved; it is operational but degraded.
+type AppV25MaintenanceStatus struct {
+	Checked  bool   `json:"checked"`
+	Required bool   `json:"required"`
+	OK       bool   `json:"ok"`
+	Recovery bool   `json:"recovery,omitempty"`
+	State    string `json:"state"`
+}
+
+type appV25MaintenanceProvider func() AppV25MaintenanceStatus
+
 // HealthChecker tracks the health status of dependencies.
 type HealthChecker struct {
-	postgresOK atomic.Bool
-	cometbftOK atomic.Bool
-	embedder   atomic.Value // EmbedderStatus, set by SetEmbedderHealth
-	voter      atomic.Value // VoterStatus, set by SetVoterStatus
-	scoped     atomic.Value // ScopedProjectionStatus, set by recovery wiring
-	vendored   atomic.Value // VendoredAgentEnrollmentStatus, set by bootstrap/repair wiring
-	canonical  atomic.Value // canonicalMemoryProjectionProvider, wired after the final Badger store is selected
-	Version    string
+	postgresOK  atomic.Bool
+	cometbftOK  atomic.Bool
+	embedder    atomic.Value // EmbedderStatus, set by SetEmbedderHealth
+	voter       atomic.Value // VoterStatus, set by SetVoterStatus
+	scoped      atomic.Value // ScopedProjectionStatus, set by recovery wiring
+	vendored    atomic.Value // VendoredAgentEnrollmentStatus, set by bootstrap/repair wiring
+	canonical   atomic.Value // canonicalMemoryProjectionProvider, wired after the final Badger store is selected
+	maintenance atomic.Value // appV25MaintenanceProvider, current-process migration proof
+	Version     string
 }
 
 // NewHealthChecker creates a new health checker.
@@ -171,6 +185,23 @@ func (h *HealthChecker) canonicalMemoryProjectionStatus() CanonicalMemoryProject
 	return CanonicalMemoryProjectionStatus{State: "unchecked"}
 }
 
+func (h *HealthChecker) SetAppV25MaintenanceProvider(
+	provider func() AppV25MaintenanceStatus,
+) {
+	if provider == nil {
+		return
+	}
+	h.maintenance.Store(appV25MaintenanceProvider(provider))
+}
+
+func (h *HealthChecker) appV25MaintenanceStatus() AppV25MaintenanceStatus {
+	if provider, ok := h.maintenance.Load().(appV25MaintenanceProvider); ok &&
+		provider != nil {
+		return provider()
+	}
+	return AppV25MaintenanceStatus{State: "unchecked"}
+}
+
 // SetPostgresHealth updates the PostgreSQL health status.
 func (h *HealthChecker) SetPostgresHealth(ok bool) {
 	h.postgresOK.Store(ok)
@@ -214,6 +245,7 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 	scoped := h.scopedProjectionStatus()
 	vendored := h.vendoredAgentEnrollmentStatus()
 	canonical := h.canonicalMemoryProjectionStatus()
+	maintenance := h.appV25MaintenanceStatus()
 
 	status := "ready"
 	httpStatus := http.StatusOK
@@ -234,13 +266,32 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		// its exact consensus enrollment and owned home domain are confirmed.
 		status = "not_ready"
 		httpStatus = http.StatusServiceUnavailable
-	case canonical.Required && (!canonical.Checked || !canonical.OK):
-		// app-v23 ordinary-memory reads are safe only after a complete inventory
-		// audit. A quarantined record is localized and omitted from broad reads,
-		// but the node is not fully serving-ready until governance re-anchors it
-		// and a later complete audit clears the quarantine.
+	case canonical.Required && !canonical.Checked &&
+		canonical.State == "checking":
+		// Broad memory routes validate their bounded candidates and sealed
+		// export still performs a complete walk. Do not restart-loop a healthy
+		// node merely because its background aggregate audit is still warming.
+		status = "degraded"
+		if r.URL.Query().Get("strict") == "1" {
+			httpStatus = http.StatusServiceUnavailable
+		}
+	case canonical.Required &&
+		(!canonical.Checked || (!canonical.OK && !canonical.Quarantined)):
+		// No completed audit, or an unlocalized projection failure: broad reads
+		// cannot prove which records are safe, so the serving process is not ready.
 		status = "not_ready"
 		httpStatus = http.StatusServiceUnavailable
+	case maintenance.Required && (!maintenance.Checked || !maintenance.OK):
+		// The current process still has to verify the app-v25 adoption cutoff,
+		// but bounded serving routes perform their own canonical checks. Keep
+		// ordinary traffic available while the background inventory warms; a
+		// strict readiness consumer can still wait for the complete proof. This
+		// case intentionally follows the hard projection gate so maintenance
+		// warm-up can never hide an unlocalized canonical failure.
+		status = "degraded"
+		if r.URL.Query().Get("strict") == "1" {
+			httpStatus = http.StatusServiceUnavailable
+		}
 	case emb.Checked && emb.Semantic && !emb.OK:
 		// A semantic embedder that has been probed and is down: the node still SERVES
 		// (keyword recall works) but semantic/hybrid recall is unavailable. Report
@@ -252,20 +303,54 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		if r.URL.Query().Get("strict") == "1" {
 			httpStatus = http.StatusServiceUnavailable
 		}
+	case canonical.Required && canonical.Quarantined:
+		// Record-local projection faults are isolated and omitted from broad
+		// reads. Keep the node operational and advertise the degraded state
+		// instead of making one historical record brick every agent.
+		status = "degraded"
+		if r.URL.Query().Get("strict") == "1" {
+			httpStatus = http.StatusServiceUnavailable
+		}
+	case maintenance.Required && appV25MaintenanceIsOperationallyDegraded(maintenance.State):
+		// A stable current-process adoption scan has localized the historical
+		// rows. Governance/signing remains in progress, but ordinary serving is
+		// safe; strict operators may still choose to wait for completion. Keep
+		// this after every hard projection gate so it cannot mask another fault.
+		status = "degraded"
+		if r.URL.Query().Get("strict") == "1" {
+			httpStatus = http.StatusServiceUnavailable
+		}
+	case maintenance.Required && maintenance.Recovery:
+		// Unconvertible historical rows remain preserved and isolated. Ordinary
+		// agents continue operating while CEREBRUM reports recovery as degraded.
+		status = "degraded"
+		if r.URL.Query().Get("strict") == "1" {
+			httpStatus = http.StatusServiceUnavailable
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatus)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":            status,
-		"postgres":          pgOK,
-		"cometbft":          cmtOK,
-		"embedder":          emb,
-		"scoped_projection": scoped,
-		"vendored_agent":    vendored,
-		"memory_projection": canonical,
+		"status":              status,
+		"postgres":            pgOK,
+		"cometbft":            cmtOK,
+		"embedder":            emb,
+		"scoped_projection":   scoped,
+		"vendored_agent":      vendored,
+		"memory_projection":   canonical,
+		"app_v25_maintenance": maintenance,
 		// Informational voter/backlog block — never gates the status above
 		// (a voter-less node is legitimate; peers may vote memories through).
 		"voter": h.voterStatus(),
 	})
+}
+
+func appV25MaintenanceIsOperationallyDegraded(state string) bool {
+	switch state {
+	case "migrating", "waiting", "attesting":
+		return true
+	default:
+		return false
+	}
 }

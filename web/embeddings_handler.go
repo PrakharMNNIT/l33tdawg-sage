@@ -24,6 +24,8 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/l33tdawg/sage/internal/embedding"
+	"github.com/l33tdawg/sage/internal/memory"
+	"github.com/l33tdawg/sage/internal/tx"
 	"github.com/l33tdawg/sage/internal/vault"
 )
 
@@ -549,12 +551,89 @@ func (h *DashboardHandler) handleEmbeddingsReembedProgress(w http.ResponseWriter
 	writeJSONResp(w, http.StatusOK, h.reembed.snapshot())
 }
 
-// handleEmbeddingsDeprecateUnreadable soft-deprecates the memories that couldn't
-// be read (embedding_provider = 'skipped'; undecryptable with the current vault
-// key). Deprecated = hidden from all views, row + on-chain hash retained
-// (reversible, NOT a hard delete). Only touches unreadable memories — readable
-// memories that merely failed to embed ('error') are never deprecated.
+type unreadableMemoryIDLister interface {
+	ListUnreadableMemoryIDs(context.Context, string, int) ([]string, int, error)
+}
+
+const governedUnreadableDeprecationBatchSize = 8
+
+// handleEmbeddingsDeprecateUnreadable retires only memories marked unreadable.
+// From app-v23 onward every lifecycle transition is consensus-backed: editing
+// SQLite alone would make the serving projection disagree with the chain and
+// could quarantine an otherwise healthy CEREBRUM after the next audit.
 func (h *DashboardHandler) handleEmbeddingsDeprecateUnreadable(w http.ResponseWriter, r *http.Request) {
+	if !h.isCEREBRUMOperatorRequest(r) {
+		writeCEREBRUMOperatorForbidden(w, "Deprecating unreadable memories requires operator authority.")
+		return
+	}
+	if h.appV23IsActive() {
+		actor, ok := h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+		lister, ok := h.store.(unreadableMemoryIDLister)
+		if !ok {
+			writeError(w, http.StatusNotImplemented,
+				"this storage backend cannot enumerate unreadable memories safely")
+			return
+		}
+		cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+		ids, total, err := lister.ListUnreadableMemoryIDs(
+			r.Context(), cursor, governedUnreadableDeprecationBatchSize,
+		)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError,
+				"list unreadable memories: "+err.Error())
+			return
+		}
+		submitted := 0
+		deprecated := 0
+		nextCursor := ""
+		for _, id := range ids {
+			forgetTx := &tx.ParsedTx{
+				Type:      tx.TxTypeMemoryChallenge,
+				Timestamp: time.Now(),
+				MemoryChallenge: &tx.MemoryChallenge{
+					MemoryID: id,
+					Reason:   "governed deprecation of unreadable encrypted memory",
+				},
+			}
+			if _, _, _, err := h.signAndBroadcastCommit(forgetTx, actor.Key); err != nil {
+				writeJSONResp(w, http.StatusBadGateway, map[string]any{
+					"ok":                   false,
+					"error":                "consensus stopped the unreadable-memory retirement: " + err.Error(),
+					"submitted":            submitted,
+					"deprecated":           deprecated,
+					"remaining_unreadable": max(0, total-deprecated),
+					"next_cursor":          nextCursor,
+				})
+				return
+			}
+			submitted++
+			nextCursor = id
+			record, getErr := h.store.GetMemory(r.Context(), id)
+			if getErr == nil && record.Status == memory.StatusDeprecated {
+				deprecated++
+			}
+			if h.SSE != nil {
+				h.SSE.Broadcast(SSEEvent{Type: EventForget, MemoryID: id})
+			}
+		}
+		continuationRequired :=
+			len(ids) == governedUnreadableDeprecationBatchSize &&
+				total-deprecated > 0
+		if !continuationRequired {
+			nextCursor = ""
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"submitted":             submitted,
+			"deprecated":            deprecated,
+			"remaining_unreadable":  max(0, total-deprecated),
+			"continuation_required": continuationRequired,
+			"next_cursor":           nextCursor,
+		})
+		return
+	}
 	n, err := h.store.DeprecateUnreadableMemories(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "deprecate unreadable: "+err.Error())

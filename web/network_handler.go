@@ -58,9 +58,9 @@ func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 		return // Store doesn't support agent management
 	}
 
-	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+	r.With(h.cerebrumOperatorGate).
 		Get("/v1/dashboard/network/agents", h.handleListAgents(agentStore))
-	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+	r.With(h.cerebrumOperatorGate).
 		Get("/v1/dashboard/network/agents/{id}", h.handleGetAgent(agentStore))
 	r.Post("/v1/dashboard/network/agents", h.handleCreateAgent(agentStore))
 	r.Patch("/v1/dashboard/network/agents/{id}", h.handleUpdateAgent(agentStore))
@@ -72,16 +72,16 @@ func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 	r.Post("/v1/dashboard/network/redeploy", h.handleTriggerRedeploy)
 	r.Post("/v1/dashboard/network/redeploy/clear", h.handleClearRedeploy)
 
-	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+	r.With(h.cerebrumOperatorGate).
 		Get("/v1/dashboard/network/unregistered", h.handleUnregisteredAgents(agentStore))
 	r.Post("/v1/dashboard/network/merge", h.handleMergeAgent(agentStore))
-	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+	r.With(h.cerebrumOperatorGate).
 		Get("/v1/dashboard/network/agents/{id}/tags", h.handleAgentTags(agentStore))
 	// v11.3: RBAC domain-ownership transfer (honest replacement for the retired
 	// authorship-rewrite transfer-tag/transfer-domain paths). handleAgentDomains
 	// lists an agent's RBAC domains; handleReassignDomainOwnership moves a
 	// domain's ownership + access on-chain without rewriting authorship.
-	r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+	r.With(h.cerebrumOperatorGate).
 		Get("/v1/dashboard/network/agents/{id}/domains", h.handleAgentDomains(agentStore))
 	r.Post("/v1/dashboard/network/reassign-domain-ownership", h.handleReassignDomainOwnership(agentStore))
 	r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/network/access", h.handleAppV23AccessState(agentStore))
@@ -1447,11 +1447,13 @@ func (h *DashboardHandler) handleUnregisteredAgents(agentStore store.AgentStore)
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Get all agent IDs from memory data
 		var stats *store.StoreStats
+		var projection *appV23ProjectionResponse
 		if audited, ok := r.Context().Value(appV23ProjectionAuditContextKey{}).(appV23ProjectionAuditSnapshot); ok {
 			stats = audited.stats
+			projection = audited.projection
 		} else {
 			var err error
-			stats, err = h.cerebrumVisibleStats(r.Context())
+			stats, _, projection, err = h.cerebrumVisibleStatsAndActivity(r.Context())
 			if err != nil {
 				if writeAppV23DashboardProjectionFailure(w, err) {
 					return
@@ -1479,27 +1481,33 @@ func (h *DashboardHandler) handleUnregisteredAgents(agentStore store.AgentStore)
 			ShortID     string `json:"short_id"`
 		}
 		var unregistered []unregisteredAgent
-		for agentID, count := range stats.ByAgent {
-			if agentID == "" {
-				continue
-			}
-			if h.appV23IsRootIdentity(agentID) {
-				continue
-			}
-			if !knownIDs[agentID] {
-				shortID := agentID
-				if len(shortID) > 16 {
-					shortID = shortID[:8] + "…" + shortID[len(shortID)-8:]
+		if stats != nil {
+			for agentID, count := range stats.ByAgent {
+				if agentID == "" {
+					continue
 				}
-				unregistered = append(unregistered, unregisteredAgent{
-					AgentID:     agentID,
-					MemoryCount: count,
-					ShortID:     shortID,
-				})
+				if h.appV23IsRootIdentity(agentID) {
+					continue
+				}
+				if !knownIDs[agentID] {
+					shortID := agentID
+					if len(shortID) > 16 {
+						shortID = shortID[:8] + "…" + shortID[len(shortID)-8:]
+					}
+					unregistered = append(unregistered, unregisteredAgent{
+						AgentID:     agentID,
+						MemoryCount: count,
+						ShortID:     shortID,
+					})
+				}
 			}
 		}
 
-		writeJSONResp(w, http.StatusOK, map[string]any{"unregistered": unregistered})
+		response := map[string]any{"unregistered": unregistered}
+		if projection != nil {
+			response["projection"] = h.projectionResponseForRequest(r, projection)
+		}
+		writeJSONResp(w, http.StatusOK, response)
 	}
 }
 
@@ -1535,40 +1543,15 @@ func (h *DashboardHandler) handleMergeAgent(agentStore store.AgentStore) http.Ha
 				"CEREBRUM Root is not an agent and cannot participate in memory reassignment.")
 			return
 		}
+		if appV23Actor != nil {
+			writeAppV23AccessError(w, http.StatusConflict, "memory_reassign_retired",
+				"Historical memory authorship is immutable. Use governed domain continuity to preserve access without rewriting history.")
+			return
+		}
 
 		// Verify target agent is registered
 		if _, err := agentStore.GetAgent(r.Context(), req.TargetAgentID); err != nil {
 			writeError(w, http.StatusBadRequest, "target agent not found in registry")
-			return
-		}
-
-		if appV23Actor != nil {
-			memoriesMoved := 0
-			if stats, statsErr := h.cerebrumVisibleStats(r.Context()); statsErr == nil {
-				memoriesMoved = stats.ByAgent[req.SourceAgentID]
-			}
-			reassignTx := &tx.ParsedTx{
-				Type: tx.TxTypeMemoryReassign,
-				MemoryReassign: &tx.MemoryReassign{
-					SourceAgentID: req.SourceAgentID,
-					TargetAgentID: req.TargetAgentID,
-				},
-			}
-			txHash, height, _, broadcastErr := h.signAndBroadcastAppV23Control(reassignTx, appV23Actor)
-			if broadcastErr != nil {
-				writeAppV23AccessError(w, http.StatusBadGateway, "memory_reassign_rejected",
-					"Consensus rejected the memory reassignment; no local memory was changed.")
-				return
-			}
-			writeJSONResp(w, http.StatusOK, map[string]any{
-				"status":         "completed",
-				"message":        fmt.Sprintf("%d memories reassigned from source to target.", memoriesMoved),
-				"memories_moved": memoriesMoved,
-				"source":         req.SourceAgentID,
-				"target":         req.TargetAgentID,
-				"tx_hash":        txHash,
-				"height":         height,
-			})
 			return
 		}
 
@@ -1621,7 +1604,14 @@ func (h *DashboardHandler) handleAgentTags(agentStore store.AgentStore) http.Han
 			writeError(w, http.StatusNotFound, "agent not found")
 			return
 		}
-		tags, err := agentStore.ListAgentTags(r.Context(), id)
+		var tags []store.TagCount
+		partial := false
+		var err error
+		if h.appV23IsActive() {
+			tags, partial, err = h.appV23SafeTagCounts(r.Context(), id)
+		} else {
+			tags, err = agentStore.ListAgentTags(r.Context(), id)
+		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list agent tags: "+err.Error())
 			return
@@ -1629,7 +1619,9 @@ func (h *DashboardHandler) handleAgentTags(agentStore store.AgentStore) http.Han
 		if tags == nil {
 			tags = []store.TagCount{}
 		}
-		writeJSONResp(w, http.StatusOK, map[string]any{"agent_id": id, "tags": tags})
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"agent_id": id, "tags": tags, "partial": partial,
+		})
 	}
 }
 

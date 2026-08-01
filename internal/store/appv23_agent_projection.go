@@ -125,6 +125,17 @@ func reconcileAppV23AgentProjections(
 				onChain.AgentID, errors.Join(enrollmentErr, roleErr),
 			)
 		}
+		// A post-activation self-registration is intentionally discoverable
+		// before Root review but has neither enrollment nor role yet.
+		// ValidateAppV23State above already proved the exact bounded pending
+		// shape, so the local serving projection must skip it rather than make
+		// one pending agent abort startup for every active agent.
+		if enrollment == nil && role == nil {
+			if onlyAgentID != "" {
+				return projected, ErrAppV23NeedsApproval
+			}
+			continue
+		}
 		if enrollment == nil || role == nil ||
 			enrollment.AgentID != onChain.AgentID ||
 			role.AgentID != onChain.AgentID {

@@ -121,13 +121,18 @@ type QueryOptions struct {
 	// recall to apply live authorization before TopK is consumed. Stores must
 	// preserve rank order, continue scanning until TopK admitted records are
 	// found or the ranked stream is exhausted, and propagate filter errors.
+	// CandidateBatchFilter has the same contract for one ranked page at a time;
+	// callers that can validate a page in one immutable policy snapshot should
+	// prefer it over opening one policy transaction per record. When both are set,
+	// the batch filter runs first and CandidateFilter refines its output.
 	// REST re-checks disclosure before serialization to close authorization
-	// races. It is never accepted from JSON and is never used by consensus.
-	CandidateFilter  func(*memory.MemoryRecord) (bool, error) `json:"-"`
-	SubmittingAgents []string                                 `json:"submitting_agents,omitempty"` // RBAC: restrict to these agent IDs
-	Tags             []string                                 `json:"tags,omitempty"`              // any-match filter on user-defined tags
-	CreatedFrom      string                                   `json:"created_from,omitempty"`      // ISO-8601 lower bound on created_at (inclusive)
-	CreatedTo        string                                   `json:"created_to,omitempty"`        // ISO-8601 upper bound on created_at (inclusive)
+	// races. Neither hook is accepted from JSON or used by consensus.
+	CandidateFilter      func(*memory.MemoryRecord) (bool, error)                     `json:"-"`
+	CandidateBatchFilter func([]*memory.MemoryRecord) ([]*memory.MemoryRecord, error) `json:"-"`
+	SubmittingAgents     []string                                                     `json:"submitting_agents,omitempty"` // RBAC: restrict to these agent IDs
+	Tags                 []string                                                     `json:"tags,omitempty"`              // any-match filter on user-defined tags
+	CreatedFrom          string                                                       `json:"created_from,omitempty"`      // ISO-8601 lower bound on created_at (inclusive)
+	CreatedTo            string                                                       `json:"created_to,omitempty"`        // ISO-8601 upper bound on created_at (inclusive)
 }
 
 // decayFilterScanCap bounds how many rank/distance-ordered candidates a
@@ -159,6 +164,21 @@ func applyCandidateFilter(
 		}
 	}
 	return out, nil
+}
+
+func applyCandidateFilters(
+	recs []*memory.MemoryRecord,
+	batchFilter func([]*memory.MemoryRecord) ([]*memory.MemoryRecord, error),
+	filter func(*memory.MemoryRecord) (bool, error),
+) ([]*memory.MemoryRecord, error) {
+	var err error
+	if batchFilter != nil {
+		recs, err = batchFilter(recs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return applyCandidateFilter(recs, filter)
 }
 
 // recordIDs extracts the memory IDs from a record slice, order-preserving.
@@ -230,6 +250,10 @@ type ListOptions struct {
 	// App-v23 authorization walks multiple raw pages and enables this flag;
 	// historical one-page callers retain their exact ordering.
 	StablePaging bool
+	// SkipTotal avoids the separate COUNT query when a caller is walking
+	// additional presentation-only windows and already obtained the total from
+	// its first page. The returned total is zero when this is set.
+	SkipTotal bool
 }
 
 // StoreStats holds aggregate statistics.
@@ -254,6 +278,31 @@ type TimelineBucket struct {
 // SQLite and PostgreSQL intentionally have different legacy shapes.
 type TimelinePeriodFormatter interface {
 	FormatTimelinePeriod(at time.Time, bucket string) string
+}
+
+// MemoryProjectionPageCursor is the opaque stable position used by the
+// optional no-count projection inventory pager. CreatedAt preserves the
+// backend's exact chronological cursor representation; MemoryID breaks ties.
+// Both fields are empty for the first page and populated together thereafter.
+type MemoryProjectionPageCursor struct {
+	CreatedAt string
+	MemoryID  string
+}
+
+// MemoryProjectionPageStore is an optional serving-projection capability used
+// by complete CEREBRUM audits and sealed exports. Unlike ListMemories it never
+// executes a COUNT(*) and never uses OFFSET: each page starts strictly after
+// the supplied (created_at, memory_id) keyset cursor. Implementations must
+// return records in ascending created_at/memory_id order and a cursor for the
+// final returned row. Third-party stores may omit this interface; callers must
+// retain the bounded ListMemories fallback.
+type MemoryProjectionPageStore interface {
+	ListMemoryProjectionPage(
+		ctx context.Context,
+		opts ListOptions,
+		after MemoryProjectionPageCursor,
+		limit int,
+	) ([]*memory.MemoryRecord, MemoryProjectionPageCursor, error)
 }
 
 // MemoryStore defines the interface for memory storage operations.

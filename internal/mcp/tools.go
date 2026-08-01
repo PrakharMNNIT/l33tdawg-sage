@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -151,7 +152,7 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_status": {
 			Name:        "sage_status",
-			Description: "Get memory store statistics. Shows total memories, counts by domain and status, and last activity.",
+			Description: "Get this signed caller's own registration and access standing. Active agents also receive caller-visible memory counts by domain and status; pending-review agents receive actionable approval state without probing forbidden memory routes. Never returns a roster or global node counts.",
 			InputSchema: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
@@ -469,9 +470,18 @@ func (s *Server) checkVaultLocked(ctx context.Context) bool {
 }
 
 type selfWritePolicy struct {
-	HomeDomain      string `json:"home_domain"`
-	Profile         string `json:"profile"`
-	EnrollmentState string `json:"enrollment_status"`
+	AgentID           string `json:"agent_id"`
+	Role              string `json:"role"`
+	HomeDomain        string `json:"home_domain"`
+	Profile           string `json:"profile"`
+	EnrollmentState   string `json:"enrollment_status"`
+	RegistrationState string `json:"registration_status"`
+	ApprovalRequired  bool   `json:"approval_required"`
+	Clearance         uint8  `json:"clearance"`
+	Capabilities      uint32 `json:"capabilities"`
+	CanRead           bool   `json:"can_read"`
+	CanWrite          bool   `json:"can_write"`
+	AccessScope       string `json:"access_scope"`
 }
 
 func (s *Server) selfWritePolicy(ctx context.Context) (selfWritePolicy, bool, error) {
@@ -479,14 +489,29 @@ func (s *Server) selfWritePolicy(ctx context.Context) (selfWritePolicy, bool, er
 	if err := s.doSignedJSON(ctx, "GET", "/v1/agent/me", nil, &self); err != nil {
 		// Pre-app-v23 nodes may not expose the self-policy fields (or, on old
 		// releases, the route itself). Preserve their legacy behavior only for
-		// an actual 404; active/policy denials must remain loud.
-		if isAPIStatus(err, http.StatusNotFound) {
+		// a legacy non-Problem-Details 404. Current nodes use a canonical signed
+		// 404 for an unknown/Root identity; that is an authentication-standing
+		// failure and must remain loud.
+		if isLegacySelfPolicyRouteNotFound(err) {
 			return self, false, nil
 		}
 		return self, false, err
 	}
+	if self.AgentID == "" || self.AgentID != s.effectiveAgentID(ctx) {
+		return self, false, errors.New("authenticated self-standing identity mismatch")
+	}
 	appV23 := self.EnrollmentState != "" || self.Profile != ""
 	return self, appV23, nil
+}
+
+func isLegacySelfPolicyRouteNotFound(err error) bool {
+	var problem *apiProblemError
+	if !errors.As(err, &problem) || problem.StatusCode != http.StatusNotFound {
+		return false
+	}
+	return problem.ProblemStatus == nil ||
+		*problem.ProblemStatus != http.StatusNotFound ||
+		!strings.HasPrefix(problem.ContentType, "application/problem+json")
 }
 
 // resolveWriteDomain preserves an explicitly requested domain exactly. Only an
@@ -1903,7 +1928,10 @@ func (s *Server) toolList(ctx context.Context, params map[string]any) (any, erro
 			Status          string  `json:"status"`
 			CreatedAt       string  `json:"created_at"`
 		} `json:"memories"`
-		Total int `json:"total"`
+		Total      int            `json:"total"`
+		HasMore    *bool          `json:"has_more"`
+		TotalExact *bool          `json:"total_exact"`
+		Filtered   map[string]any `json:"filtered,omitempty"`
 	}
 	if err := s.doSignedJSON(ctx, "GET", path, nil, &listResp); err != nil {
 		return nil, fmt.Errorf("list memories: %w", err)
@@ -1922,10 +1950,37 @@ func (s *Server) toolList(ctx context.Context, params map[string]any) (any, erro
 		})
 	}
 
-	return map[string]any{
+	hasMore, totalExact := callerListMetadata(listResp.HasMore, listResp.TotalExact)
+	result := map[string]any{
 		"memories":    memories,
 		"total_count": listResp.Total,
-	}, nil
+		"has_more":    hasMore,
+		"total_exact": totalExact,
+	}
+	if len(listResp.Filtered) > 0 {
+		// Never turn a caller-scoped partial/filtered list into an apparently
+		// authoritative empty result. The REST surface intentionally avoids
+		// disclosing hidden records, but the signed caller still needs to know
+		// that policy filtering occurred.
+		result["filtered"] = listResp.Filtered
+	}
+	return result, nil
+}
+
+// callerListMetadata preserves the app-v23 lower-bound pagination signal while
+// remaining compatible with pre-v23 list responses, which did not emit either
+// field. Absence historically meant a complete exact response; decoding into
+// plain bools made that indistinguishable from an explicit total_exact:false.
+func callerListMetadata(hasMore, totalExact *bool) (bool, bool) {
+	more := false
+	if hasMore != nil {
+		more = *hasMore
+	}
+	exact := true
+	if totalExact != nil {
+		exact = *totalExact
+	}
+	return more, exact
 }
 
 func (s *Server) toolTimeline(ctx context.Context, params map[string]any) (any, error) {
@@ -1971,11 +2026,258 @@ func (s *Server) toolTimeline(ctx context.Context, params map[string]any) (any, 
 }
 
 func (s *Server) toolStatus(ctx context.Context, _ map[string]any) (any, error) {
-	var statsResp map[string]any
-	if err := s.doSignedJSON(ctx, "GET", "/v1/dashboard/stats", nil, &statsResp); err != nil {
-		return nil, fmt.Errorf("get stats: %w", err)
+	self, appV23, err := s.selfWritePolicy(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get caller standing: %w", err)
 	}
-	return statsResp, nil
+	if appV23 && self.EnrollmentState != "active" {
+		standing := callerStanding(self, false)
+		standing["counts_available"] = false
+		standing["counts_scope"] = "caller"
+		standing["counts_degraded_reason"] = "memory counts are unavailable until this agent is active"
+		return standing, nil
+	}
+	stats, err := s.callerScopedMemoryStats(ctx)
+	if err != nil {
+		if !appV23 {
+			return nil, fmt.Errorf("get caller-scoped memory status: %w", err)
+		}
+		standing := callerStanding(self, true)
+		// Counts are optional diagnostics, not proof of the authenticated
+		// caller's identity or policy. A mature store can legitimately exceed
+		// the bounded authorization walk; try the exact home domain without
+		// increasing that budget or broadening visibility.
+		if isCallerStatusAuthorizationScanBudget(err) && self.HomeDomain != "" {
+			if homeStats, homeErr := s.callerScopedMemoryStatsForDomain(ctx, self.HomeDomain); homeErr == nil &&
+				callerStatusCountsAreReportable(homeStats) {
+				for key, value := range standing {
+					homeStats[key] = value
+				}
+				homeStats["scope"] = "caller_home_domain"
+				homeStats["counts_scope"] = "home_domain"
+				homeStats["domain_scope"] = self.HomeDomain
+				homeStats["counts_available"] = true
+				homeStats["counts_degraded_reason"] = "caller-wide memory aggregation exceeded the bounded authorization scan; showing home-domain counts only"
+				return homeStats, nil
+			}
+		}
+		standing["counts_available"] = false
+		standing["counts_scope"] = "caller"
+		standing["counts_degraded_reason"] = callerStatusCountsDegradedReason(err)
+		return standing, nil
+	}
+	if appV23 {
+		if !callerStatusCountsAreReportable(stats) {
+			standing := callerStanding(self, true)
+			standing["counts_available"] = false
+			standing["counts_scope"] = "caller"
+			standing["counts_degraded_reason"] = "caller memory counts are not exact enough to report an empty result"
+			return standing, nil
+		}
+		for key, value := range callerStanding(self, true) {
+			stats[key] = value
+		}
+		stats["counts_available"] = true
+		stats["counts_scope"] = "caller"
+	}
+	return stats, nil
+}
+
+// callerStatusCountsAreReportable prevents an inexact lower-bound zero from
+// becoming an apparently real empty corpus. A positive lower bound remains
+// useful when explicitly paired with total_exact:false; zero requires proof of
+// exact exhaustion.
+func callerStatusCountsAreReportable(stats map[string]any) bool {
+	total, ok := stats["total_memories"].(int)
+	if !ok || total < 0 {
+		return false
+	}
+	exact, _ := stats["total_exact"].(bool)
+	return total > 0 || exact
+}
+
+func callerStatusCountsDegradedReason(err error) string {
+	if isCallerStatusAuthorizationScanBudget(err) {
+		return "caller memory aggregation exceeded the bounded authorization scan; use a domain filter for memory counts"
+	}
+	return "caller memory counts are temporarily unavailable; authenticated self-standing remains valid"
+}
+
+func isCallerStatusAuthorizationScanBudget(err error) bool {
+	var problem *apiProblemError
+	return errors.As(err, &problem) &&
+		problem.StatusCode == http.StatusUnprocessableEntity &&
+		problem.ProblemStatus != nil &&
+		*problem.ProblemStatus == http.StatusUnprocessableEntity &&
+		strings.HasPrefix(problem.ContentType, "application/problem+json") &&
+		problem.Title == "Query too broad" &&
+		strings.Contains(problem.Detail, "authorization scan budget exceeded")
+}
+
+// callerStanding projects only the authenticated key's own consensus policy.
+// It deliberately carries no roster, peer, or global-count information.
+func callerStanding(self selfWritePolicy, memoryAccessAvailable bool) map[string]any {
+	return map[string]any{
+		"agent_id":                self.AgentID,
+		"registration_status":     self.RegistrationState,
+		"enrollment_status":       self.EnrollmentState,
+		"role":                    self.Role,
+		"profile":                 self.Profile,
+		"home_domain":             self.HomeDomain,
+		"clearance":               self.Clearance,
+		"capabilities":            self.Capabilities,
+		"approval_required":       self.ApprovalRequired,
+		"can_read":                self.CanRead,
+		"can_write":               self.CanWrite,
+		"access_scope":            self.AccessScope,
+		"memory_access_available": memoryAccessAvailable,
+	}
+}
+
+// callerScopedMemoryCount is the cheap boot path. It intentionally uses the
+// signed agent read surface, never a CEREBRUM operator endpoint.
+func (s *Server) callerScopedMemoryCount(ctx context.Context) (map[string]any, error) {
+	var listResp struct {
+		Total      int   `json:"total"`
+		HasMore    *bool `json:"has_more"`
+		TotalExact *bool `json:"total_exact"`
+	}
+	if err := s.doSignedJSON(
+		ctx,
+		http.MethodGet,
+		"/v1/memory/list?limit=1&status=committed",
+		nil,
+		&listResp,
+	); err != nil {
+		return nil, err
+	}
+	hasMore, totalExact := callerListMetadata(listResp.HasMore, listResp.TotalExact)
+	return map[string]any{
+		"total_memories": listResp.Total,
+		"total_exact":    totalExact,
+		"has_more":       hasMore,
+		"scope":          "caller",
+	}, nil
+}
+
+// callerScopedMemoryStats preserves sage_status's historical breakdowns while
+// keeping every aggregate caller-scoped. It walks only the signed, RBAC- and
+// disclosure-filtered list surface and caps work at the app-v23 visible offset
+// budget; node-wide dashboard statistics are never consulted.
+func (s *Server) callerScopedMemoryStats(ctx context.Context) (map[string]any, error) {
+	return s.callerScopedMemoryStatsForDomain(ctx, "")
+}
+
+func (s *Server) callerScopedMemoryStatsForDomain(
+	ctx context.Context,
+	domain string,
+) (map[string]any, error) {
+	const (
+		pageSize = 200
+		// App-v23 permits visible offsets through 7,900. Forty 200-row
+		// pages cover offsets 0..7,800 without issuing an invalid 8,000
+		// request for large caller-scoped stores.
+		maxPages = 40
+	)
+	type statusMemory struct {
+		DomainTag string `json:"domain_tag"`
+		Status    string `json:"status"`
+		CreatedAt string `json:"created_at"`
+	}
+	type statusPage struct {
+		Memories   []statusMemory `json:"memories"`
+		Total      int            `json:"total"`
+		HasMore    *bool          `json:"has_more"`
+		TotalExact *bool          `json:"total_exact"`
+	}
+	byDomain := make(map[string]int)
+	byStatus := make(map[string]int)
+	lastActivity := ""
+	var lastActivityTime time.Time
+	total := 0
+	totalExact := true
+	hasMore := false
+	breakdownsComplete := true
+	scanned := 0
+	var exactTotal *int
+
+	for page := 0; page < maxPages; page++ {
+		offset := page * pageSize
+		var response statusPage
+		path := fmt.Sprintf("/v1/memory/list?limit=%d&offset=%d", pageSize, offset)
+		if domain != "" {
+			path += "&domain=" + url.QueryEscape(domain)
+		}
+		if err := s.doSignedJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
+			return nil, err
+		}
+		pageHasMore, pageTotalExact := callerListMetadata(
+			response.HasMore,
+			response.TotalExact,
+		)
+		if response.Total > total {
+			total = response.Total
+		}
+		// A later page may prove exhaustion and replace an earlier lower-bound
+		// total. The newest page is therefore authoritative for exactness,
+		// subject to the consistency checks below.
+		totalExact = pageTotalExact
+		if pageTotalExact {
+			if exactTotal == nil {
+				value := response.Total
+				exactTotal = &value
+			} else if *exactTotal != response.Total {
+				// A changing "exact" total is not exact for this snapshot.
+				totalExact = false
+			}
+		}
+		for _, item := range response.Memories {
+			if item.DomainTag != "" {
+				byDomain[item.DomainTag]++
+			}
+			if item.Status != "" {
+				byStatus[item.Status]++
+			}
+			if createdAt, err := time.Parse(time.RFC3339Nano, item.CreatedAt); err == nil &&
+				(lastActivityTime.IsZero() || createdAt.After(lastActivityTime)) {
+				lastActivityTime = createdAt
+				lastActivity = item.CreatedAt
+			}
+		}
+		scanned += len(response.Memories)
+		hasMore = pageHasMore
+		if !pageHasMore {
+			if pageTotalExact && response.Total != scanned {
+				// Exhaustion and an exact total must agree. Do not turn a
+				// drifting/short snapshot into authoritative status.
+				totalExact = false
+			}
+			break
+		}
+		if len(response.Memories) < pageSize {
+			// Advancing by pageSize after a short page can skip visible rows.
+			// The response simultaneously says there are more visible rows and
+			// fails to provide a full page, so neither its total nor its
+			// breakdown can be claimed authoritative.
+			breakdownsComplete = false
+			totalExact = false
+			break
+		}
+		if page == maxPages-1 {
+			breakdownsComplete = false
+			totalExact = false
+		}
+	}
+	return map[string]any{
+		"total_memories":      total,
+		"by_domain":           byDomain,
+		"by_status":           byStatus,
+		"last_activity":       lastActivity,
+		"total_exact":         totalExact,
+		"has_more":            hasMore,
+		"breakdowns_complete": breakdownsComplete,
+		"scope":               "caller",
+	}, nil
 }
 
 func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, error) {
@@ -1993,14 +2295,25 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 	}
 
 	observation := stringParam(params, "observation", "")
-	domain, err := s.resolveWriteDomain(ctx, params)
-	if err != nil {
-		return nil, err
+	recallDomain := stringParam(params, "domain", "")
+	writeDomain := recallDomain
+	var domainResolutionErr error
+	if recallDomain == "" {
+		// A turn is one bounded stream of experience. Even a recall-only turn
+		// with no observation belongs to the signed caller's governed home
+		// domain; leaving domain_tag empty can trigger an expensive cross-domain
+		// authorization walk and can re-anchor the agent in unrelated context.
+		writeDomain, domainResolutionErr = s.resolveWriteDomain(ctx, params)
+		if domainResolutionErr == nil {
+			recallDomain = writeDomain
+		}
 	}
 
 	result := map[string]any{
-		"topic":  topic,
-		"domain": domain,
+		"topic": topic,
+	}
+	if recallDomain != "" {
+		result["domain"] = recallDomain
 	}
 
 	// Phase 1: Recall — get consensus-committed memories relevant to this topic.
@@ -2021,7 +2334,12 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 		result["degraded_reason"] = nonSemanticRecallReason
 	}
 
-	if semantic {
+	if domainResolutionErr != nil {
+		result["recall_error"] = fmt.Sprintf(
+			"resolve default recall domain: %v",
+			domainResolutionErr,
+		)
+	} else if semantic {
 		// Keep turn recall on the same request builder as sage_recall. In
 		// particular, app-v23 binds vector requests to the embedder's exact
 		// embedding_provider; hand-rolling this request previously dropped that
@@ -2030,7 +2348,7 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 		if err := s.recallSemantic(
 			ctx,
 			topic,
-			domain,
+			recallDomain,
 			recallTopK,
 			recallMinConf,
 			recallFederationOptions{},
@@ -2046,7 +2364,7 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 		// whose federation planner binds the signed destination proofs.
 		searchReq, _ := json.Marshal(map[string]any{
 			"query":          topic,
-			"domain_tag":     domain,
+			"domain_tag":     recallDomain,
 			"provider":       s.provider,
 			"status_filter":  "committed",
 			"top_k":          recallTopK,
@@ -2069,7 +2387,7 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 			// Fail closed if an older or misbehaving node ignores domain_tag.
 			// A turn belongs to exactly one project/domain; cross-domain memories
 			// can silently re-anchor an agent in the wrong repository.
-			if r.DomainTag != domain {
+			if recallDomain != "" && r.DomainTag != recallDomain {
 				continue
 			}
 			content := r.Content
@@ -2108,8 +2426,11 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 	// Phase 2: Store — save this turn's observation as an episodic memory.
 	// Goes through consensus: submit → CheckTx → FinalizeBlock → Commit → auto-validator → committed.
 	// Skip duplicates — don't store if a very similar memory already exists in this domain.
-	if observation != "" && !isLowValueObservation(observation) && !s.similarMemoryExists(ctx, observation, domain) {
-		if storeDegraded, err := s.storeMemory(ctx, observation, domain, "observation", 0.80); err != nil {
+	if observation != "" && domainResolutionErr != nil {
+		result["store_error"] = domainResolutionErr.Error()
+	} else if observation != "" && !isLowValueObservation(observation) &&
+		!s.similarMemoryExists(ctx, observation, writeDomain) {
+		if storeDegraded, err := s.storeMemory(ctx, observation, writeDomain, "observation", 0.80); err != nil {
 			result["store_error"] = err.Error()
 		} else {
 			result["stored"] = true
@@ -2135,6 +2456,63 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 	return result, nil
 }
 
+func inceptionErrorStanding(err error) (retryable bool, statusCode int, guidance string) {
+	retryable = true
+	var problem *apiProblemError
+	if !errors.As(err, &problem) {
+		return retryable, 0, "Retry sage_inception after the local SAGE service is reachable."
+	}
+	statusCode = problem.StatusCode
+	if statusCode < 400 || statusCode >= 500 ||
+		statusCode == http.StatusRequestTimeout ||
+		statusCode == http.StatusTooManyRequests {
+		return retryable, statusCode,
+			"Retry sage_inception after the temporary node condition clears."
+	}
+
+	retryable = false
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		guidance = "Do not retry in a loop or substitute the node Root key into this agent. Ask the user to open CEREBRUM through localhost as the node Root/Admin, review this exact agent identity, and retry sage_inception only after its local profile and home-domain access are active."
+	case http.StatusNotFound:
+		guidance = "Do not retry in a loop. This SAGE node does not expose the required caller-scoped boot API; install a compatible SAGE version, then reconnect this agent."
+	default:
+		guidance = "Do not retry in a loop. This request was rejected as a stable client or policy error; correct the reported local SAGE configuration or agent standing first."
+	}
+	return retryable, statusCode, guidance
+}
+
+func inceptionUnavailable(
+	stage string,
+	err error,
+	registration string,
+	agentID string,
+	agentName string,
+) map[string]any {
+	retryable, statusCode, guidance := inceptionErrorStanding(err)
+	result := map[string]any{
+		"status":       "unavailable",
+		"message":      "SAGE reached the node, but this signed agent could not establish caller-scoped memory access.",
+		"stage":        stage,
+		"registration": registration,
+		"retryable":    retryable,
+		"instructions": guidance,
+	}
+	if err != nil {
+		result[stage+"_error"] = err.Error()
+	}
+	if statusCode != 0 {
+		result["http_status"] = statusCode
+	}
+	if agentID != "" {
+		result["agent_id"] = agentID
+	}
+	if agentName != "" {
+		result["agent_name"] = agentName
+	}
+	return result
+}
+
 func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, error) {
 	// Auto-register on chain if not already registered.
 	// This ensures the agent has an on-chain identity so RBAC domain access works.
@@ -2148,15 +2526,22 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 		"provider": s.provider,
 	})
 	var regResp struct {
-		AgentID        string `json:"agent_id"`
-		Name           string `json:"name"`
-		RegisteredName string `json:"registered_name"`
-		Status         string `json:"status"`
+		AgentID          string `json:"agent_id"`
+		Name             string `json:"name"`
+		RegisteredName   string `json:"registered_name"`
+		Status           string `json:"status"`
+		ApprovalRequired bool   `json:"approval_required"`
 	}
 	if err := s.doSignedJSON(ctx, "POST", "/v1/agent/register", regBody, &regResp); err != nil {
-		registrationStatus = "failed: " + err.Error()
+		return inceptionUnavailable(
+			"registration",
+			err,
+			"unavailable",
+			s.effectiveAgentID(ctx),
+			"",
+		), nil
 	} else {
-		registrationStatus = regResp.Status // "registered" or "already_registered"
+		registrationStatus = regResp.Status
 		// On first registration, store identity as a memory so the agent always knows who it is
 		if regResp.Status == "registered" {
 			identityContent := fmt.Sprintf(
@@ -2173,19 +2558,62 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 			}
 		}
 	}
-
-	// Stats is an agent-facing read, but the dashboard boundary intentionally
-	// requires an active registered identity before exposing it remotely. Keep
-	// registration first so a brand-new MCP client cannot deadlock on its own
-	// bootstrap: register -> committed/local projection -> signed stats.
-	var statsResp map[string]any
-	if err := s.doSignedJSON(ctx, "GET", "/v1/dashboard/stats", nil, &statsResp); err != nil {
-		return nil, fmt.Errorf("check stats after registration (%s): %w", registrationStatus, err)
+	if regResp.Status == "pending_review" || regResp.ApprovalRequired {
+		return map[string]any{
+			"status":            "pending_review",
+			"message":           "This agent is registered, but its local access profile is awaiting review in CEREBRUM.",
+			"agent_id":          s.effectiveAgentID(ctx),
+			"agent_name":        regResp.Name,
+			"registered_name":   regResp.RegisteredName,
+			"registration":      "pending_review",
+			"approval_required": true,
+			"instructions":      "Do not claim that memory is online yet. Ask the user to open local CEREBRUM and approve this agent's profile. Retry sage_inception after approval.",
+		}, nil
+	}
+	if regResp.Status != "registered" && regResp.Status != "already_registered" {
+		return map[string]any{
+			"status":       "unavailable",
+			"message":      "SAGE could not establish a stable agent registration state.",
+			"registration": regResp.Status,
+			"retryable":    true,
+		}, nil
 	}
 
-	totalMemories := 0
-	if v, ok := statsResp["total_memories"].(float64); ok {
-		totalMemories = int(v)
+	// Registration remains first so a brand-new MCP client has a committed
+	// caller identity before the RBAC-filtered memory read. CEREBRUM's global
+	// operator stats are deliberately not part of agent boot.
+	statsResp, err := s.callerScopedMemoryCount(ctx)
+	memoryAccessAvailable := true
+	if err != nil {
+		retryable, statusCode, _ := inceptionErrorStanding(err)
+		if !retryable && statusCode >= 400 && statusCode < 500 {
+			return inceptionUnavailable(
+				"memory_access",
+				err,
+				registrationStatus,
+				s.effectiveAgentID(ctx),
+				regResp.Name,
+			), nil
+		}
+		// Boot must never depend on an aggregate/projection read. A pending
+		// migration enrollment or temporarily unavailable projection can make
+		// the caller-scoped count unavailable while identity and MCP transport
+		// are otherwise healthy. Return operating instructions and let the
+		// individual recall/write tools report their own scoped standing.
+		statsResp = map[string]any{
+			"available": false,
+			"scope":     "caller",
+		}
+		memoryAccessAvailable = false
+	}
+
+	// When the count is unavailable, prefer the non-mutating welcome-back path:
+	// guessing "fresh" would seed writes into an agent whose migration/home
+	// approval may still be pending.
+	totalMemories := 1
+	countExact, _ := statsResp["total_exact"].(bool)
+	if v, ok := statsResp["total_memories"].(int); ok && countExact {
+		totalMemories = v
 	}
 
 	// Fetch custom boot instructions from preferences
@@ -2274,9 +2702,13 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 			instructions += "\n\nCUSTOM BOOT INSTRUCTIONS (from admin):\n" + bootInstructions
 		}
 
+		message := "Welcome back. Your institutional memory is online."
+		if !memoryAccessAvailable {
+			message = "Connected to SAGE, but caller-scoped memory access is temporarily unavailable. Your stored memories are unchanged; individual recall and write tools will report when access is ready."
+		}
 		resp := map[string]any{
 			"status":          "awakened",
-			"message":         "Welcome back. Your institutional memory is online.",
+			"message":         message,
 			"agent_id":        s.effectiveAgentID(ctx),
 			"agent_name":      regResp.Name,
 			"registered_name": regResp.RegisteredName,
@@ -2284,6 +2716,10 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 			"registration":    registrationStatus,
 			"instructions":    instructions,
 			"memory_mode":     memMode,
+		}
+		if !memoryAccessAvailable {
+			resp["memory_access"] = "temporarily_unavailable"
+			resp["retryable"] = true
 		}
 
 		// Warn agent if the Synaptic Ledger is locked — reads will return placeholders,

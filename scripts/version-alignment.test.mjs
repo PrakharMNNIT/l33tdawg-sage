@@ -48,7 +48,7 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/reference/app-v23-access-control-design.md', '## App-v24 readiness and memory-write barrier'],
     ['docs/reference/mcp-tools.md', 'A level-2 grant is never a remedy for a hard'],
     ['docs/reference/mcp-tools.md', 'never be substituted for this caller-scoped projection'],
-    ['internal/abci/app.go', 'const maxSupportedAppVersion uint64 = 24'],
+    ['internal/abci/app.go', 'const maxSupportedAppVersion uint64 = 25'],
     [
       'docs/ROADMAP.md',
       version.includes('-')

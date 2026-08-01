@@ -56,6 +56,20 @@ func TestNewSQLiteStore(t *testing.T) {
 	require.NoError(t, s.InsertMemory(context.Background(), rec))
 }
 
+func TestSQLiteListMemoriesCanSkipTotal(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.InsertMemory(
+		context.Background(), testMemory("skip-total", "agent", "content", "domain"),
+	))
+
+	records, total, err := s.ListMemories(context.Background(), ListOptions{
+		Limit: 10, SkipTotal: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	require.Zero(t, total)
+}
+
 func TestRequirePristineStateSyncProjectionAcceptsOnlyCanonicalSchemaSeeds(t *testing.T) {
 	ctx := context.Background()
 	t.Run("fresh", func(t *testing.T) {
@@ -1749,6 +1763,11 @@ func TestDeprecateUnreadableMemories(t *testing.T) {
 	require.NoError(t, s.InsertMemory(ctx, testMemory("err", "a", "readable but embed failed", "g")))
 	require.NoError(t, s.MarkMemoryEmbeddingError(ctx, "err"))
 
+	unreadable, total, err := s.ListUnreadableMemoryIDs(ctx, "", 8)
+	require.NoError(t, err)
+	require.Equal(t, []string{"bad"}, unreadable)
+	require.Equal(t, 1, total)
+
 	n, err := s.DeprecateUnreadableMemories(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 1, n, "only the unreadable memory is deprecated")
@@ -1763,6 +1782,29 @@ func TestDeprecateUnreadableMemories(t *testing.T) {
 	n2, err := s.DeprecateUnreadableMemories(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 0, n2, "idempotent — nothing left to deprecate")
+	unreadable, total, err = s.ListUnreadableMemoryIDs(ctx, "", 8)
+	require.NoError(t, err)
+	require.Empty(t, unreadable)
+	require.Zero(t, total)
+}
+
+func TestListUnreadableMemoryIDsUsesBoundedStableContinuation(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"unreadable-a", "unreadable-b", "unreadable-c"} {
+		require.NoError(t, s.InsertMemory(ctx, testMemory(id, "a", id, "g")))
+		require.NoError(t, s.MarkMemoryEmbeddingSkipped(ctx, id))
+	}
+
+	first, total, err := s.ListUnreadableMemoryIDs(ctx, "", 2)
+	require.NoError(t, err)
+	require.Equal(t, 3, total)
+	require.Equal(t, []string{"unreadable-a", "unreadable-b"}, first)
+
+	second, total, err := s.ListUnreadableMemoryIDs(ctx, first[len(first)-1], 2)
+	require.NoError(t, err)
+	require.Equal(t, 3, total)
+	require.Equal(t, []string{"unreadable-c"}, second)
 }
 
 // TestRekeyUnreadableMemories verifies orphaned-memory recovery: a memory

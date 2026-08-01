@@ -667,6 +667,195 @@ func TestCancelSetsCooldown(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestMemoryLegacyAdoptionMaintenanceLaneIsOperationBound(t *testing.T) {
+	eng, store, _ := makeEngine(map[string]int64{
+		"val-a": 10,
+		"val-b": 10,
+		"val-c": 10,
+	})
+
+	ordinaryID, err := eng.Propose(
+		"val-a", OpAddValidator, "new-val", []byte("pk"), 5, 0,
+		"ordinary", 100, nil,
+	)
+	require.NoError(t, err)
+	require.NoError(t, eng.Cancel(ordinaryID, "val-a", 101))
+	ordinaryCooldown := append([]byte(nil), store.data["gov:cooldown:val-a"]...)
+	require.Len(t, ordinaryCooldown, 8)
+
+	adoptionID, err := eng.ProposeMemoryLegacyAdoption(
+		"val-a", "batch-digest", nil, 0, 0, "adopt exact legacy rows",
+		102, []byte(`{"entries":[]}`),
+	)
+	require.NoError(t, err,
+		"the exact maintenance operation may proceed during ordinary cooldown")
+	require.Equal(t, OpMemoryLegacyAdopt, mustLoadProposal(t, eng, adoptionID).Operation)
+	require.Equal(t, ordinaryCooldown, store.data["gov:cooldown:val-a"],
+		"maintenance proposal must not change ordinary cooldown")
+	require.Nil(t, store.data["gov:vote:"+adoptionID+":val-a"],
+		"maintenance proposals require explicit independent votes")
+
+	require.NoError(t, eng.Vote(adoptionID, "val-a", "accept", 102))
+	require.NoError(t, eng.Vote(adoptionID, "val-b", "accept", 102))
+
+	executed, invalidated, err := eng.ProcessBlockValidatedWithInvalidation(
+		102, nil, nil,
+	)
+	require.NoError(t, err)
+	require.Nil(t, executed,
+		"the historical execution API must retain MinVotingBlocks")
+	require.Nil(t, invalidated)
+
+	executed, invalidated, err = eng.ProcessBlockValidatedWithMemoryLegacyAdoption(
+		102, nil, nil,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, executed,
+		"only the exact maintenance execution path bypasses MinVotingBlocks")
+	require.Equal(t, adoptionID, executed.ProposalID)
+	require.Nil(t, invalidated)
+}
+
+func TestDomainContinuityMaintenanceLaneIsExplicitVoteAndOperationBound(t *testing.T) {
+	eng, store, _ := makeEngine(map[string]int64{
+		"val-a": 10,
+		"val-b": 10,
+		"val-c": 10,
+	})
+
+	ordinaryID, err := eng.Propose(
+		"val-a", OpAddValidator, "new-val", []byte("pk"), 5, 0,
+		"ordinary", 100, nil,
+	)
+	require.NoError(t, err)
+	require.NoError(t, eng.Cancel(ordinaryID, "val-a", 101))
+	ordinaryCooldown := append([]byte(nil), store.data["gov:cooldown:val-a"]...)
+
+	continuityID, err := eng.ProposeDomainContinuityAdoption(
+		"val-a", "domain-manifest", nil, 0, 0,
+		"restore exact historical writers", 102, []byte("manifest"),
+	)
+	require.NoError(t, err,
+		"the exact maintenance operation may proceed during ordinary cooldown")
+	require.Equal(t, OpDomainContinuityAdopt, mustLoadProposal(t, eng, continuityID).Operation)
+	require.Equal(t, ordinaryCooldown, store.data["gov:cooldown:val-a"])
+	require.Nil(t, store.data["gov:vote:"+continuityID+":val-a"],
+		"domain continuity must retain explicit independent validator voting")
+
+	require.NoError(t, eng.Vote(continuityID, "val-a", "accept", 102))
+	require.NoError(t, eng.Vote(continuityID, "val-b", "accept", 102))
+	executed, invalidated, err := eng.ProcessBlockValidatedWithInvalidation(
+		102, nil, nil,
+	)
+	require.NoError(t, err)
+	require.Nil(t, executed,
+		"ordinary execution API must retain MinVotingBlocks for op11")
+	require.Nil(t, invalidated)
+
+	executed, invalidated, err = eng.ProcessBlockValidatedWithMemoryLegacyAdoption(
+		102, nil, nil,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, executed)
+	require.Equal(t, continuityID, executed.ProposalID)
+	require.Nil(t, invalidated)
+
+	// ProposeWithoutAutoVote is not a maintenance escape hatch for an ordinary
+	// operation: the original cancellation cooldown remains effective.
+	_, err = eng.ProposeWithoutAutoVote(
+		"val-a", OpUpdatePower, "val-b", nil, 11, 0,
+		"ordinary no-auto-vote", 103, nil,
+	)
+	require.ErrorContains(t, err, "cooldown")
+}
+
+func TestMemoryLegacyAdoptionCancellationCannotAccelerateOtherOperations(t *testing.T) {
+	eng, store, _ := makeEngine(map[string]int64{
+		"val-a": 10,
+		"val-b": 10,
+		"val-c": 10,
+	})
+
+	ordinaryID, err := eng.Propose(
+		"val-a", OpAddValidator, "new-val", []byte("pk"), 5, 0,
+		"ordinary", 100, nil,
+	)
+	require.NoError(t, err)
+	require.ErrorContains(
+		t,
+		eng.CancelMemoryLegacyAdoption(ordinaryID, "val-a", 101),
+		"not memory legacy adoption",
+	)
+	active, err := eng.GetActiveProposal()
+	require.NoError(t, err)
+	require.Equal(t, ordinaryID, active.ProposalID,
+		"a mismatched maintenance cancel must leave the proposal active")
+
+	require.NoError(t, eng.Cancel(ordinaryID, "val-a", 101))
+	cooldown := append([]byte(nil), store.data["gov:cooldown:val-a"]...)
+	adoptionID, err := eng.ProposeMemoryLegacyAdoption(
+		"val-a", "batch-digest", nil, 0, 0, "adopt exact legacy rows",
+		102, []byte(`{"entries":[]}`),
+	)
+	require.NoError(t, err)
+	require.NoError(t, eng.CancelMemoryLegacyAdoption(adoptionID, "val-a", 103))
+	require.Equal(t, cooldown, store.data["gov:cooldown:val-a"],
+		"maintenance cancellation must not change ordinary cooldown")
+
+	_, err = eng.Propose(
+		"val-a", OpAddValidator, "new-val-2", []byte("pk2"), 5, 0,
+		"still cooling down", 104, nil,
+	)
+	require.ErrorContains(t, err, "cooldown",
+		"the maintenance lane must not weaken ordinary governance timing")
+}
+
+func TestMaintenanceRejectionReceiptPreventsExactRestartLoop(t *testing.T) {
+	eng, state, _ := makeEngine(map[string]int64{
+		"val-a": 10,
+		"val-b": 10,
+		"val-c": 10,
+	})
+	proposalID, err := eng.ProposeMemoryLegacyAdoption(
+		"val-a", "exact-evidence-target", nil, 0, 0,
+		"reject exact evidence", 100, []byte("bound payload"),
+	)
+	require.NoError(t, err)
+	require.NoError(t, eng.Vote(proposalID, "val-a", "reject", 100))
+	require.NoError(t, eng.Vote(proposalID, "val-b", "reject", 100))
+
+	executed, invalidated, err :=
+		eng.ProcessBlockValidatedWithMemoryLegacyAdoption(100, nil, nil)
+	require.NoError(t, err)
+	require.Nil(t, executed)
+	require.Nil(t, invalidated)
+	terminal := mustLoadProposal(t, eng, proposalID)
+	require.Equal(t, StatusRejected, terminal.Status)
+	require.Nil(t, state.data["gov:active"])
+	require.Equal(
+		t,
+		[]byte(proposalID),
+		state.data[MaintenanceRejectionReceiptKey(
+			OpMemoryLegacyAdopt, "exact-evidence-target",
+		)],
+	)
+	require.Nil(t, state.data["gov:vote:"+proposalID+":val-a"])
+	require.Nil(t, state.data["gov:vote:"+proposalID+":val-b"])
+	require.Nil(t, state.data[MaintenanceRejectionReceiptKey(
+		OpMemoryLegacyAdopt, "changed-evidence-target",
+	)], "changed evidence must remain eligible")
+	require.Empty(t, MaintenanceRejectionReceiptKey(
+		OpAddValidator, "ordinary-governance",
+	), "ordinary governance must not acquire the maintenance escape lane")
+}
+
+func mustLoadProposal(t *testing.T, eng *Engine, proposalID string) *ProposalState {
+	t.Helper()
+	proposal, err := eng.LoadProposal(proposalID)
+	require.NoError(t, err)
+	return proposal
+}
+
 func TestProcessBlock_MultipleBlocks_EventualExecution(t *testing.T) {
 	eng, _, _ := makeEngine(map[string]int64{
 		"val-a": 10,

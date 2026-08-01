@@ -30,6 +30,10 @@ func TestValidateMemoryProjectionRequiresExactCanonicalEnvelope(t *testing.T) {
 	require.ErrorIs(t, err, ErrMemoryProjectionUnpublished)
 	require.ErrorIs(t, err, ErrMemoryDisclosureNotFound)
 	require.Equal(t, MemoryProjectionLegacyUnanchored, disposition)
+	health := badger.CanonicalMemoryProjectionHealth()
+	require.True(t, health.Required)
+	require.True(t, health.Quarantined)
+	require.Equal(t, CanonicalMemoryProjectionQuarantined, health.State)
 
 	require.NoError(t, badger.SetMemoryHash(
 		record.MemoryID, record.ContentHash, string(record.Status),
@@ -42,19 +46,156 @@ func TestValidateMemoryProjectionRequiresExactCanonicalEnvelope(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint8(3), state.Classification)
 
-	for _, mutate := range []func(*memory.MemoryRecord){
-		func(rec *memory.MemoryRecord) { rec.Content = "tampered content" },
-		func(rec *memory.MemoryRecord) { rec.ContentHash = memory.ComputeContentHash("other") },
-		func(rec *memory.MemoryRecord) { rec.Status = memory.StatusProposed },
-		func(rec *memory.MemoryRecord) { rec.DomainTag = "other" },
-		func(rec *memory.MemoryRecord) { rec.SubmittingAgent = "agent-b" },
+	for name, mutate := range map[string]func(*memory.MemoryRecord){
+		"content": func(rec *memory.MemoryRecord) { rec.Content = "tampered content" },
+		"hash":    func(rec *memory.MemoryRecord) { rec.ContentHash = memory.ComputeContentHash("other") },
+		"status":  func(rec *memory.MemoryRecord) { rec.Status = memory.StatusProposed },
+		"domain":  func(rec *memory.MemoryRecord) { rec.DomainTag = "other" },
+		"author":  func(rec *memory.MemoryRecord) { rec.SubmittingAgent = "agent-b" },
 	} {
-		copyRecord := *record
-		copyRecord.ContentHash = append([]byte(nil), record.ContentHash...)
-		mutate(&copyRecord)
-		_, validateErr := badger.ValidateMemoryProjection(&copyRecord)
-		require.ErrorIs(t, validateErr, ErrMemoryProjectionUnpublished)
+		t.Run(name, func(t *testing.T) {
+			copyRecord := *record
+			copyRecord.ContentHash = append([]byte(nil), record.ContentHash...)
+			mutate(&copyRecord)
+			_, disposition, classifyErr := badger.ClassifyMemoryProjection(&copyRecord)
+			require.ErrorIs(t, classifyErr, ErrMemoryProjectionUnpublished)
+			require.ErrorIs(t, classifyErr, ErrMemoryProjectionQuarantined)
+			require.Equal(t, MemoryProjectionQuarantined, disposition)
+		})
 	}
+}
+
+func TestClassifyMemoryProjectionsMatchesSingleRowSemantics(t *testing.T) {
+	canonical, err := NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, canonical.CloseBadger()) })
+
+	exact := &memory.MemoryRecord{
+		MemoryID:        "batch-exact",
+		SubmittingAgent: "agent-a",
+		Content:         "batch exact content",
+		ContentHash:     memory.ComputeContentHash("batch exact content"),
+		MemoryType:      memory.TypeFact,
+		DomainTag:       "batch-domain",
+		Status:          memory.StatusCommitted,
+	}
+	require.NoError(t, canonical.SetMemoryHash(
+		exact.MemoryID, exact.ContentHash, string(exact.Status),
+	))
+	require.NoError(t, canonical.SetMemoryDomain(exact.MemoryID, exact.DomainTag))
+	require.NoError(t, canonical.SetMemoryAuthor(exact.MemoryID, exact.SubmittingAgent))
+
+	tampered := *exact
+	tampered.MemoryID = "batch-tampered"
+	tampered.Content = "tampered"
+	tampered.ContentHash = memory.ComputeContentHash("tampered")
+	require.NoError(t, canonical.SetMemoryHash(
+		tampered.MemoryID, memory.ComputeContentHash("canonical"),
+		string(tampered.Status),
+	))
+	require.NoError(t, canonical.SetMemoryDomain(tampered.MemoryID, tampered.DomainTag))
+	require.NoError(t, canonical.SetMemoryAuthor(tampered.MemoryID, tampered.SubmittingAgent))
+
+	missing := *exact
+	missing.MemoryID = "batch-missing"
+	records := []*memory.MemoryRecord{exact, &tampered, &missing}
+	batch, err := canonical.ClassifyMemoryProjections(records)
+	require.NoError(t, err)
+	require.Len(t, batch, len(records))
+
+	for i, record := range records {
+		_, disposition, singleErr := canonical.ClassifyMemoryProjection(record)
+		require.Equal(t, disposition, batch[i].Disposition)
+		if singleErr == nil {
+			require.NoError(t, batch[i].Err)
+		} else {
+			require.EqualError(t, batch[i].Err, singleErr.Error())
+		}
+	}
+}
+
+func TestClassifyMemoryProjectionsPublishesUnsafeDispositionToSharedHealth(t *testing.T) {
+	canonical := newTestBadger(t)
+	canonical.PublishCanonicalMemoryProjectionAudit(true, false, false)
+	before := canonical.CanonicalMemoryProjectionHealth()
+	require.True(t, before.Checked)
+	require.True(t, before.OK)
+	require.False(t, before.Quarantined)
+
+	record := &memory.MemoryRecord{
+		MemoryID:        "batch-health-unanchored",
+		SubmittingAgent: "agent-a",
+		Content:         "projection row without a canonical envelope",
+		ContentHash: memory.ComputeContentHash(
+			"projection row without a canonical envelope",
+		),
+		MemoryType: memory.TypeFact,
+		DomainTag:  "batch-health",
+		Status:     memory.StatusCommitted,
+	}
+	results, err := canonical.ClassifyMemoryProjections(
+		[]*memory.MemoryRecord{record},
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, MemoryProjectionLegacyUnanchored, results[0].Disposition)
+	require.ErrorIs(t, results[0].Err, ErrMemoryProjectionUnpublished)
+
+	after := canonical.CanonicalMemoryProjectionHealth()
+	require.True(t, after.Checked,
+		"a row-level batch observation must preserve the last complete audit")
+	require.True(t, after.OK,
+		"a post-audit quarantine is degraded but must not brick readiness")
+	require.True(t, after.Quarantined,
+		"the transaction-scoped batch reader must share the process health tracker")
+	require.Equal(t, CanonicalMemoryProjectionQuarantined, after.State)
+}
+
+func TestClassifyMemoryProjectionUsesAppV25SubmissionCutoffForCompleteEnvelope(t *testing.T) {
+	badger := newTestBadger(t)
+	content := "legacy content with a hash and status but no canonical identity envelope"
+	record := &memory.MemoryRecord{
+		MemoryID:        "legacy-incomplete-envelope",
+		SubmittingAgent: "legacy-agent",
+		Content:         content,
+		ContentHash:     memory.ComputeContentHash(content),
+		DomainTag:       "legacy-domain",
+		Status:          memory.StatusCommitted,
+	}
+	require.NoError(t, badger.SetMemoryHash(
+		record.MemoryID, record.ContentHash, string(record.Status),
+	))
+
+	state, disposition, err := badger.ClassifyMemoryProjection(record)
+	require.NoError(t, err)
+	require.Equal(t, MemoryProjectionExact, disposition)
+	require.False(t, state.DomainRecorded)
+	require.False(t, state.AuthorRecorded)
+	require.False(t, state.ClassificationRecorded)
+
+	require.NoError(t, badger.MarkUpgradeApplied("app-v25", 25, 100))
+	state, disposition, err = badger.ClassifyMemoryProjection(record)
+	require.NoError(t, err)
+	require.Equal(t, MemoryProjectionExact, disposition)
+	require.False(t, state.DomainRecorded)
+	require.False(t, state.AuthorRecorded)
+	require.False(t, state.ClassificationRecorded)
+
+	require.NoError(t, badger.SetMemorySubmissionHeight(record.MemoryID, 101))
+	_, disposition, err = badger.ClassifyMemoryProjection(record)
+	require.ErrorIs(t, err, ErrMemoryProjectionUnpublished)
+	require.ErrorIs(t, err, ErrMemoryProjectionQuarantined)
+	require.Equal(t, MemoryProjectionQuarantined, disposition)
+
+	require.NoError(t, badger.SetMemoryDomain(record.MemoryID, record.DomainTag))
+	require.NoError(t, badger.SetMemoryAuthor(record.MemoryID, record.SubmittingAgent))
+	require.NoError(t, badger.SetMemoryClassification(record.MemoryID, 2))
+	state, disposition, err = badger.ClassifyMemoryProjection(record)
+	require.NoError(t, err)
+	require.Equal(t, MemoryProjectionExact, disposition)
+	require.True(t, state.DomainRecorded)
+	require.True(t, state.AuthorRecorded)
+	require.True(t, state.ClassificationRecorded)
 }
 
 func TestAppV23DisclosureMarkerRequiresCompleteCanonicalFields(t *testing.T) {
@@ -75,8 +216,11 @@ func TestAppV23DisclosureMarkerRequiresCompleteCanonicalFields(t *testing.T) {
 	))
 	require.NoError(t, badger.SetMemoryAuthorPrincipal(record.MemoryID, "principal-a"))
 
-	_, err = badger.ValidateMemoryProjection(record)
+	_, disposition, err := badger.ClassifyMemoryProjection(record)
 	require.ErrorIs(t, err, ErrMemoryProjectionUnpublished)
+	require.ErrorIs(t, err, ErrMemoryProjectionQuarantined)
+	require.ErrorIs(t, err, ErrMemoryDisclosureCorrupt)
+	require.Equal(t, MemoryProjectionQuarantined, disposition)
 
 	require.NoError(t, badger.SetMemoryDomain(record.MemoryID, record.DomainTag))
 	require.NoError(t, badger.SetMemoryAuthor(record.MemoryID, record.SubmittingAgent))
@@ -228,9 +372,10 @@ func TestClassifyMemoryProjectionQuarantinesAppV23PrincipalHashlessRecord(t *tes
 	require.Equal(t, MemoryProjectionQuarantined, disposition)
 
 	health := badger.CanonicalMemoryProjectionHealth()
-	require.True(t, health.Checked, "an observed quarantine proves the projection unhealthy")
+	require.False(t, health.Checked, "one observed quarantine is not a complete audit")
 	require.True(t, health.Required)
-	require.False(t, health.OK)
+	require.False(t, health.OK,
+		"an observed quarantine before the first complete audit remains gated")
 	require.True(t, health.Quarantined)
 	require.Equal(t, CanonicalMemoryProjectionQuarantined, health.State)
 }
@@ -239,6 +384,7 @@ func TestCanonicalMemoryProjectionHealthCompleteAuditClearsStickyQuarantine(t *t
 	badger := newTestBadger(t)
 	badger.observeMemoryProjectionDisposition(MemoryProjectionQuarantined)
 	require.True(t, badger.CanonicalMemoryProjectionHealth().Quarantined)
+	require.False(t, badger.CanonicalMemoryProjectionHealth().Checked)
 
 	badger.PublishCanonicalMemoryProjectionAudit(true, true, false)
 	health := badger.CanonicalMemoryProjectionHealth()
@@ -269,8 +415,21 @@ func TestCanonicalMemoryProjectionHealthCompleteAuditClearsStickyQuarantine(t *t
 	health = badger.CanonicalMemoryProjectionHealth()
 	require.True(t, health.Checked)
 	require.True(t, health.Required)
-	require.False(t, health.OK)
+	require.True(t, health.OK)
 	require.True(t, health.LegacyCompatible)
 	require.True(t, health.Quarantined)
 	require.Equal(t, CanonicalMemoryProjectionQuarantined, health.State)
+
+	badger.BeginCanonicalMemoryProjectionAudit()
+	health = badger.CanonicalMemoryProjectionHealth()
+	require.True(t, health.Checked,
+		"a refresh preserves the last completed health publication")
+	require.True(t, health.Required)
+	require.True(t, health.OK)
+	require.True(t, health.Quarantined)
+
+	fresh := newTestBadger(t)
+	fresh.BeginCanonicalMemoryProjectionAudit()
+	require.False(t, fresh.CanonicalMemoryProjectionHealth().Checked,
+		"startup remains gated until its first complete audit")
 }

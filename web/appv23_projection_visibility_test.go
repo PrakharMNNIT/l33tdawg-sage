@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +35,155 @@ type headerMutationRecorder struct {
 	*httptest.ResponseRecorder
 	mutated bool
 	mutate  func()
+}
+
+type blockingWriteRecorder struct {
+	*httptest.ResponseRecorder
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingWriteRecorder) Write(body []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return w.ResponseRecorder.Write(body)
+}
+
+type projectionAuditCountingStore struct {
+	store.MemoryStore
+	revisions interface {
+		memoryProjectionRevisionProvider
+		graphProjectionRevisionProvider
+		projectionPublicationReader
+	}
+	firstPage atomic.Int64
+	entered   chan struct{}
+	release   chan struct{}
+	enterOnce sync.Once
+}
+
+type projectionKeysetCountingStore struct {
+	store.MemoryStore
+	pager         store.MemoryProjectionPageStore
+	keysetPages   atomic.Int64
+	fallbackPages atomic.Int64
+}
+
+func (s *projectionKeysetCountingStore) ListMemoryProjectionPage(
+	ctx context.Context,
+	opts store.ListOptions,
+	after store.MemoryProjectionPageCursor,
+	limit int,
+) ([]*memory.MemoryRecord, store.MemoryProjectionPageCursor, error) {
+	s.keysetPages.Add(1)
+	return s.pager.ListMemoryProjectionPage(ctx, opts, after, limit)
+}
+
+func (s *projectionKeysetCountingStore) ListMemories(
+	ctx context.Context,
+	opts store.ListOptions,
+) ([]*memory.MemoryRecord, int, error) {
+	s.fallbackPages.Add(1)
+	return s.MemoryStore.ListMemories(ctx, opts)
+}
+
+type projectionDeepPageStore struct {
+	store.MemoryStore
+	revisions interface {
+		memoryProjectionRevisionProvider
+		graphProjectionRevisionProvider
+		projectionPublicationReader
+	}
+	record     *memory.MemoryRecord
+	total      int
+	offsets    []int
+	skipTotals []bool
+}
+
+func (s *projectionDeepPageStore) MemoryProjectionRevision(
+	ctx context.Context,
+) (uint64, error) {
+	return s.revisions.MemoryProjectionRevision(ctx)
+}
+
+func (s *projectionDeepPageStore) VaultGeneration() uint64 {
+	return s.revisions.VaultGeneration()
+}
+
+func (s *projectionDeepPageStore) GraphProjectionRevision(
+	ctx context.Context,
+) (uint64, error) {
+	return s.revisions.GraphProjectionRevision(ctx)
+}
+
+func (s *projectionDeepPageStore) LockProjectionPublicationRead() func() {
+	return s.revisions.LockProjectionPublicationRead()
+}
+
+func (s *projectionDeepPageStore) ListMemories(
+	_ context.Context,
+	opts store.ListOptions,
+) ([]*memory.MemoryRecord, int, error) {
+	s.offsets = append(s.offsets, opts.Offset)
+	s.skipTotals = append(s.skipTotals, opts.SkipTotal)
+	if opts.Offset >= s.total {
+		return nil, s.total, nil
+	}
+	count := opts.Limit
+	if remaining := s.total - opts.Offset; count > remaining {
+		count = remaining
+	}
+	records := make([]*memory.MemoryRecord, count)
+	for i := range records {
+		records[i] = s.record
+	}
+	return records, s.total, nil
+}
+
+func newProjectionAuditCountingStore(
+	sqlStore *store.SQLiteStore,
+) *projectionAuditCountingStore {
+	return &projectionAuditCountingStore{
+		MemoryStore: sqlStore,
+		revisions:   sqlStore,
+	}
+}
+
+func (s *projectionAuditCountingStore) MemoryProjectionRevision(
+	ctx context.Context,
+) (uint64, error) {
+	return s.revisions.MemoryProjectionRevision(ctx)
+}
+
+func (s *projectionAuditCountingStore) VaultGeneration() uint64 {
+	return s.revisions.VaultGeneration()
+}
+
+func (s *projectionAuditCountingStore) GraphProjectionRevision(
+	ctx context.Context,
+) (uint64, error) {
+	return s.revisions.GraphProjectionRevision(ctx)
+}
+
+func (s *projectionAuditCountingStore) LockProjectionPublicationRead() func() {
+	return s.revisions.LockProjectionPublicationRead()
+}
+
+func (s *projectionAuditCountingStore) ListMemories(
+	ctx context.Context,
+	opts store.ListOptions,
+) ([]*memory.MemoryRecord, int, error) {
+	if opts.StablePaging && opts.Sort == "oldest" && opts.Offset == 0 {
+		s.firstPage.Add(1)
+		if s.entered != nil {
+			s.enterOnce.Do(func() {
+				close(s.entered)
+				<-s.release
+			})
+		}
+	}
+	return s.MemoryStore.ListMemories(ctx, opts)
 }
 
 func (w *headerMutationRecorder) Header() http.Header {
@@ -118,6 +269,398 @@ func requestLocalProjectionRoute(
 	return rec
 }
 
+func waitForAppV23ProjectionRefresh(t *testing.T, handler *DashboardHandler) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		handler.projectionAuditMu.Lock()
+		defer handler.projectionAuditMu.Unlock()
+		return handler.projectionAuditFlight == nil
+	}, 2*time.Second, 5*time.Millisecond)
+}
+
+func primeAppV23ProjectionSnapshot(
+	t *testing.T,
+	fixture appV23ProjectionRouteFixture,
+) {
+	t.Helper()
+	rec := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+}
+
+func TestAppV23ProjectionHiddenCountIsLocalOperatorOnly(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	projection := appV23ProjectionResponseFromAudit(false, true, false, 7)
+
+	local := httptest.NewRequest(http.MethodGet, "/v1/dashboard/stats", nil)
+	markLocalCEREBRUM(fixture.handler, local)
+	localProjection := fixture.handler.projectionResponseForRequest(local, projection)
+	require.Equal(t, 7, localProjection.HiddenCount)
+	require.Contains(t, localProjection.Message, "7 historical memories")
+
+	remote := httptest.NewRequest(http.MethodGet, "/v1/dashboard/stats", nil)
+	remote.RemoteAddr = "192.0.2.20:54321"
+	remote.Host = "192.0.2.10:8080"
+	remoteProjection := fixture.handler.projectionResponseForRequest(remote, projection)
+	require.Zero(t, remoteProjection.HiddenCount)
+	require.Equal(t, appV23PartialProjectionMessage, remoteProjection.Message)
+}
+
+func TestAppV23ProjectionWalkPrefersNoCountKeysetPager(t *testing.T) {
+	require.Equal(t, 1024, appV23DashboardProjectionPageSize)
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "keyset-memory", "keyset-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "keyset-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+	counting := &projectionKeysetCountingStore{
+		MemoryStore: fixture.sql,
+		pager:       fixture.sql,
+	}
+	fixture.handler.store = counting
+
+	var visited []string
+	_, err := fixture.handler.walkAppV23BroadDashboardRecords(
+		context.Background(),
+		store.ListOptions{Sort: "oldest"},
+		func(record *memory.MemoryRecord) error {
+			visited = append(visited, record.MemoryID)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{"keyset-memory"}, visited)
+	require.EqualValues(t, 1, counting.keysetPages.Load())
+	require.Zero(t, counting.fallbackPages.Load())
+}
+
+func TestAppV23BroadProjectionSnapshotIsRevisionBound(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "revision-bound-memory", "revision-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "revision-bound-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+	counting := newProjectionAuditCountingStore(fixture.sql)
+	fixture.handler.store = counting
+
+	_, _, projection, _, err :=
+		fixture.handler.requireAppV23DashboardProjectionSnapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, store.CanonicalMemoryProjectionChecking, projection.State)
+	require.True(t, projection.Partial)
+	require.True(t, projection.Stale)
+	require.True(t, projection.Refreshing)
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+	require.EqualValues(t, 1, counting.firstPage.Load())
+
+	_, _, projection, _, err =
+		fixture.handler.requireAppV23DashboardProjectionSnapshot(context.Background())
+	require.NoError(t, err)
+	require.True(t, projection.Complete)
+	require.EqualValues(t, 1, counting.firstPage.Load(),
+		"unchanged broad reads reuse the immutable audited snapshot")
+
+	for i := 0; i < 100; i++ {
+		require.NoError(t, fixture.badger.SetNonce(
+			fmt.Sprintf("unrelated-agent-%03d", i), uint64(i+1),
+		))
+	}
+	_, _, projection, _, err =
+		fixture.handler.requireAppV23DashboardProjectionSnapshot(context.Background())
+	require.NoError(t, err)
+	require.True(t, projection.Complete)
+	require.EqualValues(t, 1, counting.firstPage.Load(),
+		"unrelated consensus state must not invalidate memory projection")
+
+	counting.entered = make(chan struct{})
+	counting.release = make(chan struct{})
+	raw, err := sql.Open("sqlite", fixture.dbPath)
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		_, err = raw.ExecContext(context.Background(),
+			`UPDATE memories SET content = content WHERE memory_id = ?`,
+			"revision-bound-memory")
+		require.NoError(t, err)
+	}
+	require.NoError(t, raw.Close())
+	_, _, projection, _, err =
+		fixture.handler.requireAppV23DashboardProjectionSnapshot(context.Background())
+	require.NoError(t, err)
+	require.True(t, projection.Partial)
+	require.True(t, projection.Stale)
+	require.True(t, projection.Refreshing)
+	require.Zero(t, projection.HiddenCount)
+	<-counting.entered
+
+	hotCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := 0; i < 100; i++ {
+		_, _, projection, _, err =
+			fixture.handler.requireAppV23DashboardProjectionSnapshot(hotCtx)
+		require.NoError(t, err)
+		require.True(t, projection.Stale)
+	}
+	require.EqualValues(t, 2, counting.firstPage.Load(),
+		"successive broad reads join one background refresh")
+	close(counting.release)
+	require.Eventually(t, func() bool {
+		fixture.handler.projectionAuditMu.Lock()
+		defer fixture.handler.projectionAuditMu.Unlock()
+		return fixture.handler.projectionAuditFlight == nil
+	}, time.Second, 10*time.Millisecond)
+
+	beforeVaultPublication := counting.firstPage.Load()
+	fixture.sql.SetVault(nil)
+	_, _, projection, _, err =
+		fixture.handler.requireAppV23DashboardProjectionSnapshot(context.Background())
+	require.NoError(t, err)
+	require.True(t, projection.Stale,
+		"same-state vault publication/key rotation invalidates the audited snapshot")
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+	require.EqualValues(t, beforeVaultPublication+1, counting.firstPage.Load())
+}
+
+func TestAppV23ColdGraphReturnsCheckingWithoutWaitingForFullAudit(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "cold-graph-memory", "cold-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "cold-graph-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+	counting := newProjectionAuditCountingStore(fixture.sql)
+	counting.entered = make(chan struct{})
+	counting.release = make(chan struct{})
+	fixture.handler.store = counting
+
+	started := time.Now()
+	rec := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=proposed",
+	)
+	elapsed := time.Since(started)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Less(t, elapsed, 500*time.Millisecond,
+		"a cold graph must not wait for the inventory-wide projection audit")
+	require.Contains(t, rec.Body.String(), `"state":"checking"`)
+	require.Contains(t, rec.Body.String(), `"partial":true`)
+	require.Contains(t, rec.Body.String(), `"stale":true`)
+	require.Contains(t, rec.Body.String(), `"refreshing":true`)
+	require.Contains(t, rec.Body.String(), "cold-graph-memory",
+		"bounded candidates remain available after per-record validation")
+
+	select {
+	case <-counting.entered:
+	case <-time.After(time.Second):
+		t.Fatal("background projection audit did not start")
+	}
+	close(counting.release)
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+}
+
+func TestAppV23ColdUnregisteredAgentsReturnsCheckingWithoutNilStatsPanic(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "cold-unregistered-memory", "cold-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "cold-unregistered-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+	counting := newProjectionAuditCountingStore(fixture.sql)
+	counting.entered = make(chan struct{})
+	counting.release = make(chan struct{})
+	fixture.handler.store = counting
+
+	rec := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/network/unregistered",
+	)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), `"state":"checking"`)
+	require.Contains(t, rec.Body.String(), `"partial":true`)
+	require.Contains(t, rec.Body.String(), `"refreshing":true`)
+	require.NotContains(t, rec.Body.String(), "cold-unregistered-memory",
+		"a checking aggregate must not invent an unregistered-agent inventory")
+
+	select {
+	case <-counting.entered:
+	case <-time.After(time.Second):
+		t.Fatal("background projection audit did not start")
+	}
+	close(counting.release)
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+}
+
+func TestAppV23HotBroadRoutesDoNotRepeatFullProjectionAudit(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "hot-route-memory", "hot-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "hot-route-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+	counting := newProjectionAuditCountingStore(fixture.sql)
+	fixture.handler.store = counting
+
+	require.NoError(
+		t,
+		fixture.handler.AuditAppV23CanonicalMemoryProjection(context.Background()),
+	)
+	require.EqualValues(t, 1, counting.firstPage.Load())
+
+	for _, path := range []string{
+		"/v1/dashboard/memory/list?limit=10",
+		"/v1/dashboard/tasks?all=true",
+		"/v1/dashboard/memory/graph?status=proposed",
+		"/v1/dashboard/memory/list?limit=10",
+		"/v1/dashboard/tasks?all=true",
+		"/v1/dashboard/memory/graph?status=proposed",
+	} {
+		rec := requestLocalProjectionRoute(t, fixture, path)
+		require.Equal(t, http.StatusOK, rec.Code, "%s: %s", path, rec.Body.String())
+	}
+	require.EqualValues(t, 1, counting.firstPage.Load(),
+		"hot list, task, and graph reads must reuse the revision-bound audit")
+}
+
+func TestAppV23ExactProjectionPagesDirectlyBeyondSeventeenThousand(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "deep-exact-memory", "deep-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "deep-exact-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+	record, err := fixture.sql.GetMemory(context.Background(), "deep-exact-memory")
+	require.NoError(t, err)
+	deep := &projectionDeepPageStore{
+		MemoryStore: fixture.sql,
+		revisions:   fixture.sql,
+		record:      record,
+		total:       17001,
+	}
+	fixture.handler.store = deep
+	source, cacheable, err := fixture.handler.appV23ProjectionSource(context.Background())
+	require.NoError(t, err)
+	require.True(t, cacheable)
+	fixture.handler.projectionAuditLast = &appV23ProjectionAuditResult{
+		source: source, cacheable: true,
+		projection: appV23ProjectionResponseFromAudit(false, false, false, 0),
+	}
+
+	records, total, cursor, continuation, err :=
+		fixture.handler.appV23CanonicalDashboardPage(
+			context.Background(),
+			store.ListOptions{Limit: 1, Offset: 17000, Sort: "newest"},
+			"",
+		)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	require.Equal(t, "deep-exact-memory", records[0].MemoryID)
+	require.Equal(t, 17001, total)
+	require.Empty(t, cursor)
+	require.False(t, continuation)
+	require.Equal(t, []int{17000}, deep.offsets,
+		"an exact revision-bound projection must page directly, not rescan from genesis")
+}
+
+func TestAppV23PartialProjectionContinuesDeepVisibleOffsetInBoundedScans(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "deep-partial-memory", "deep-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "deep-partial-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+	record, err := fixture.sql.GetMemory(context.Background(), "deep-partial-memory")
+	require.NoError(t, err)
+	deep := &projectionDeepPageStore{
+		MemoryStore: fixture.sql,
+		revisions:   fixture.sql,
+		record:      record,
+		total:       9001,
+	}
+	fixture.handler.store = deep
+	opts := store.ListOptions{Limit: 1, Offset: 9000, Sort: "newest"}
+
+	records, total, cursor, continuation, err :=
+		fixture.handler.appV23CanonicalDashboardPage(
+			context.Background(), opts, "",
+		)
+	require.NoError(t, err)
+	require.Empty(t, records)
+	require.Equal(t, 9001, total)
+	require.NotEmpty(t, cursor)
+	require.True(t, continuation)
+	require.LessOrEqual(t, deep.offsets[len(deep.offsets)-1],
+		appV23CerebrumInteractiveScanBudget,
+		"one request must remain bounded")
+
+	deep.offsets = nil
+	records, _, next, continuation, err :=
+		fixture.handler.appV23CanonicalDashboardPage(
+			context.Background(), opts, cursor,
+		)
+	require.NoError(t, err)
+	require.Empty(t, records)
+	require.NotEmpty(t, next)
+	require.True(t, continuation)
+	require.NotEmpty(t, deep.offsets)
+	require.Equal(t, appV23CerebrumInteractiveScanBudget, deep.offsets[0],
+		"the opaque continuation resumes from the prior bounded scan")
+	require.LessOrEqual(t,
+		deep.offsets[len(deep.offsets)-1]-deep.offsets[0],
+		appV23CerebrumInteractiveScanBudget,
+		"the continuation request remains independently bounded")
+
+	deep.offsets = nil
+	records, total, next, continuation, err =
+		fixture.handler.appV23CanonicalDashboardPage(
+			context.Background(), opts, next,
+		)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	require.Equal(t, "deep-partial-memory", records[0].MemoryID)
+	require.Equal(t, 9001, total)
+	require.Empty(t, next)
+	require.False(t, continuation)
+}
+
+func TestAppV23ProjectionAuditCoalescesConcurrentStrictReaders(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "coalesced-memory", "coalesced-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "coalesced-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+	counting := newProjectionAuditCountingStore(fixture.sql)
+	counting.entered = make(chan struct{})
+	counting.release = make(chan struct{})
+	fixture.handler.store = counting
+
+	const readers = 3
+	start := make(chan struct{})
+	errs := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			<-start
+			_, _, _, err :=
+				fixture.handler.requireAppV23DashboardProjectionAudited(
+					context.Background(),
+				)
+			errs <- err
+		}()
+	}
+	close(start)
+	<-counting.entered
+	require.Eventually(t, func() bool {
+		fixture.handler.projectionAuditMu.Lock()
+		defer fixture.handler.projectionAuditMu.Unlock()
+		return fixture.handler.projectionAuditFlight != nil &&
+			fixture.handler.projectionAuditFlight.waiters == readers
+	}, time.Second, time.Millisecond)
+	close(counting.release)
+	for i := 0; i < readers; i++ {
+		require.NoError(t, <-errs)
+	}
+	require.EqualValues(t, 1, counting.firstPage.Load())
+}
+
 func TestAppV23CerebrumBroadRoutesOmitLegacyUnanchoredProjection(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
@@ -139,6 +682,7 @@ func testAppV23CerebrumBroadRoutesOmitLegacyUnanchoredProjection(
 		t, fixture.sql, fixture.badger, "safe-anchor",
 		uint8(store.ClearanceInternal), true,
 	)
+	primeAppV23ProjectionSnapshot(t, fixture)
 
 	now := time.Now().UTC()
 	routes := map[string]struct {
@@ -201,14 +745,21 @@ func testAppV23CerebrumBroadRoutesOmitLegacyUnanchoredProjection(
 			require.Equal(t, true, projection["partial"])
 			require.Equal(t, true, projection["verified_only"])
 			require.Equal(t, string(store.CanonicalMemoryProjectionQuarantined), projection["state"])
-			require.Equal(t, appV23PartialProjectionMessage, projection["message"])
+			if name == "health" {
+				require.NotContains(t, projection, "hidden_count")
+				require.Equal(t, appV23PartialProjectionMessage, projection["message"])
+			} else if _, present := projection["hidden_count"]; present {
+				require.Equal(t, float64(1), projection["hidden_count"])
+				require.Contains(t, projection["message"], "1 historical memory")
+				require.Contains(t, projection["message"], "is hidden")
+			}
 		})
 	}
 
 	health := fixture.badger.CanonicalMemoryProjectionHealth()
 	require.True(t, health.Checked)
 	require.True(t, health.Required)
-	require.False(t, health.OK)
+	require.True(t, health.OK)
 	require.True(t, health.Quarantined)
 	require.Equal(t, store.CanonicalMemoryProjectionQuarantined, health.State)
 }
@@ -246,6 +797,7 @@ func TestAppV23CerebrumLegacyTerminalHashlessProjectionRemainsReadable(t *testin
 	require.NoError(t, fixture.badger.SetMemoryClassification(
 		record.MemoryID, uint8(store.ClearanceInternal),
 	))
+	primeAppV23ProjectionSnapshot(t, fixture)
 
 	for name, path := range map[string]string{
 		"list":   "/v1/dashboard/memory/list?status=committed",
@@ -271,12 +823,14 @@ func TestAppV23CerebrumLegacyTerminalHashlessProjectionRemainsReadable(t *testin
 	require.Equal(t, store.CanonicalMemoryProjectionLegacyCompatible, health.State)
 }
 
-func TestAppV23CerebrumPrincipalHashlessProjectionIsQuarantined(t *testing.T) {
+func TestAppV23CerebrumBroadRoutesOmitPrincipalHashlessProposedProjection(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "safe-anchor", "safe-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "safe-anchor",
+		uint8(store.ClearanceInternal), true,
+	)
 	insertTestMemory(t, fixture.sql, "principal-hashless", "principal-domain")
-	require.NoError(t, fixture.sql.UpdateStatus(
-		context.Background(), "principal-hashless", memory.StatusCommitted, time.Now().UTC(),
-	))
 	record, err := fixture.sql.GetMemory(context.Background(), "principal-hashless")
 	require.NoError(t, err)
 	require.NoError(t, fixture.badger.SetMemoryHash(
@@ -290,21 +844,168 @@ func TestAppV23CerebrumPrincipalHashlessProjectionIsQuarantined(t *testing.T) {
 	require.NoError(t, fixture.badger.SetMemoryClassification(
 		record.MemoryID, uint8(store.ClearanceInternal),
 	))
+	primeAppV23ProjectionSnapshot(t, fixture)
 
-	for name, path := range map[string]string{
-		"list":  "/v1/dashboard/memory/list?status=committed",
-		"stats": "/v1/dashboard/stats",
-	} {
+	now := time.Now().UTC()
+	routes := map[string]struct {
+		path          string
+		projectionKey string
+	}{
+		"list": {
+			path:          "/v1/dashboard/memory/list?status=proposed",
+			projectionKey: "projection",
+		},
+		"search": {
+			path:          "/v1/dashboard/memory/list?q=content&status=proposed",
+			projectionKey: "projection",
+		},
+		"graph": {
+			path:          "/v1/dashboard/memory/graph?status=proposed",
+			projectionKey: "projection",
+		},
+		"stats": {
+			path:          "/v1/dashboard/stats",
+			projectionKey: "projection",
+		},
+		"health": {
+			path:          "/v1/dashboard/health",
+			projectionKey: "memory_projection",
+		},
+		"timeline": {
+			path: fmt.Sprintf(
+				"/v1/dashboard/memory/timeline?from=%s&to=%s&bucket=hour",
+				now.Add(-time.Hour).Format(time.RFC3339),
+				now.Add(time.Hour).Format(time.RFC3339),
+			),
+			projectionKey: "projection",
+		},
+	}
+	for name, route := range routes {
 		t.Run(name, func(t *testing.T) {
-			rec := requestLocalProjectionRoute(t, fixture, path)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			rec := requestLocalProjectionRoute(t, fixture, route.path)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			require.NotContains(t, rec.Body.String(), "principal-hashless")
 			require.NotContains(t, rec.Body.String(), "principal-domain")
+			if name == "list" || name == "search" || name == "graph" {
+				require.Contains(t, rec.Body.String(), "safe-anchor")
+				require.Contains(t, rec.Body.String(), "safe-domain")
+			}
+			if name == "stats" || name == "health" {
+				require.Contains(t, rec.Body.String(), `"total_memories":1`)
+				require.Contains(t, rec.Body.String(), `"safe-domain":1`)
+			}
+			if name == "timeline" {
+				require.Contains(t, rec.Body.String(), `"count":1`)
+			}
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+			projection, ok := payload[route.projectionKey].(map[string]any)
+			require.True(t, ok, rec.Body.String())
+			require.Equal(t, true, projection["partial"])
+			if name == "health" {
+				require.NotContains(t, projection, "hidden_count")
+				require.Equal(t, appV23PartialProjectionMessage, projection["message"])
+			} else if _, present := projection["hidden_count"]; present {
+				require.Equal(t, float64(1), projection["hidden_count"])
+				require.Contains(t, projection["message"], "1 historical memory")
+			}
 		})
 	}
 	export := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/export")
 	require.Equal(t, http.StatusServiceUnavailable, export.Code, export.Body.String())
 	require.NotContains(t, export.Body.String(), "principal-hashless")
+}
+
+func TestAppV23CerebrumBroadRoutesOmitCanonicalStatusMismatch(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "safe-anchor", "safe-domain")
+	require.NoError(t, fixture.sql.UpdateStatus(
+		context.Background(), "safe-anchor", memory.StatusCommitted, time.Now().UTC(),
+	))
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "safe-anchor",
+		uint8(store.ClearanceInternal), true,
+	)
+	insertTestMemory(t, fixture.sql, "status-mismatch", "mismatch-domain")
+	require.NoError(t, fixture.sql.UpdateStatus(
+		context.Background(), "status-mismatch", memory.StatusCommitted, time.Now().UTC(),
+	))
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "status-mismatch",
+		uint8(store.ClearanceInternal), true,
+	)
+	require.NoError(t, fixture.sql.UpdateStatus(
+		context.Background(), "status-mismatch", memory.StatusDeprecated, time.Now().UTC(),
+	))
+	primeAppV23ProjectionSnapshot(t, fixture)
+
+	now := time.Now().UTC()
+	routes := map[string]struct {
+		path          string
+		projectionKey string
+	}{
+		"list": {
+			path:          "/v1/dashboard/memory/list",
+			projectionKey: "projection",
+		},
+		"search": {
+			path:          "/v1/dashboard/memory/list?q=content",
+			projectionKey: "projection",
+		},
+		"graph": {
+			path:          "/v1/dashboard/memory/graph",
+			projectionKey: "projection",
+		},
+		"stats": {
+			path:          "/v1/dashboard/stats",
+			projectionKey: "projection",
+		},
+		"health": {
+			path:          "/v1/dashboard/health",
+			projectionKey: "memory_projection",
+		},
+		"timeline": {
+			path: fmt.Sprintf(
+				"/v1/dashboard/memory/timeline?from=%s&to=%s&bucket=hour",
+				now.Add(-time.Hour).Format(time.RFC3339),
+				now.Add(time.Hour).Format(time.RFC3339),
+			),
+			projectionKey: "projection",
+		},
+	}
+	for name, route := range routes {
+		t.Run(name, func(t *testing.T) {
+			rec := requestLocalProjectionRoute(t, fixture, route.path)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.NotContains(t, rec.Body.String(), "status-mismatch")
+			require.NotContains(t, rec.Body.String(), "mismatch-domain")
+			if name == "list" || name == "search" || name == "graph" {
+				require.Contains(t, rec.Body.String(), "safe-anchor")
+				require.Contains(t, rec.Body.String(), "safe-domain")
+			}
+			if name == "stats" || name == "health" {
+				require.Contains(t, rec.Body.String(), `"total_memories":1`)
+				require.Contains(t, rec.Body.String(), `"safe-domain":1`)
+			}
+			if name == "timeline" {
+				require.Contains(t, rec.Body.String(), `"count":1`)
+			}
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+			projection, ok := payload[route.projectionKey].(map[string]any)
+			require.True(t, ok, rec.Body.String())
+			require.Equal(t, true, projection["partial"])
+			if name == "health" {
+				require.NotContains(t, projection, "hidden_count")
+				require.Equal(t, appV23PartialProjectionMessage, projection["message"])
+			} else if _, present := projection["hidden_count"]; present {
+				require.Equal(t, float64(1), projection["hidden_count"])
+			}
+		})
+	}
+	export := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/export")
+	require.Equal(t, http.StatusServiceUnavailable, export.Code, export.Body.String())
+	require.NotContains(t, export.Body.String(), "status-mismatch")
 }
 
 func TestAppV23CanonicalProjectionAuditClearsStickyQuarantineAfterHashReanchor(t *testing.T) {
@@ -354,7 +1055,7 @@ func TestAppV23CanonicalProjectionAuditClearsStickyQuarantineAfterHashReanchor(t
 	require.Equal(t, store.CanonicalMemoryProjectionExact, health.State)
 }
 
-func TestAppV23CanonicalProjectionAuditRejectsMissingSQLRowsAcrossVaultModes(t *testing.T) {
+func TestAppV23CanonicalProjectionAuditQuarantinesMissingSQLRowsAcrossVaultModes(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
 			fixture := newAppV23ProjectionRouteFixture(t, encrypted)
@@ -375,13 +1076,17 @@ func TestAppV23CanonicalProjectionAuditRejectsMissingSQLRowsAcrossVaultModes(t *
 			health := fixture.badger.CanonicalMemoryProjectionHealth()
 			require.True(t, health.Checked)
 			require.True(t, health.Required)
-			require.False(t, health.OK)
+			require.True(t, health.OK)
 			require.True(t, health.Quarantined)
 			require.Equal(t, store.CanonicalMemoryProjectionQuarantined, health.State)
 
+			requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
+			waitForAppV23ProjectionRefresh(t, fixture.handler)
 			stats := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
-			require.Equal(t, http.StatusServiceUnavailable, stats.Code, stats.Body.String())
-			require.NotContains(t, stats.Body.String(), `"total_memories":0`)
+			require.Equal(t, http.StatusOK, stats.Code, stats.Body.String())
+			require.Contains(t, stats.Body.String(), `"total_memories":0`)
+			require.Contains(t, stats.Body.String(), `"partial":true`)
+			require.Contains(t, stats.Body.String(), `"hidden_count":1`)
 			export := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/export")
 			require.Equal(t, http.StatusServiceUnavailable, export.Code, export.Body.String())
 			require.NotContains(t, export.Header().Get("Content-Disposition"), "sage-backup-")
@@ -398,7 +1103,7 @@ func TestAppV23CanonicalProjectionAuditRejectsMissingSQLRowsAcrossVaultModes(t *
 	}
 }
 
-func TestAppV23CerebrumRoutesRejectStickyQuarantineForMissingSQLRow(t *testing.T) {
+func TestAppV23CerebrumBroadRoutesOmitMissingSQLRowAndExactRoutesStayStrict(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
 	insertTestMemory(t, fixture.sql, "safe-anchor", "anchor-domain")
 	publishAppV23DashboardRecord(
@@ -423,36 +1128,127 @@ func TestAppV23CerebrumRoutesRejectStickyQuarantineForMissingSQLRow(t *testing.T
 	health := fixture.badger.CanonicalMemoryProjectionHealth()
 	require.True(t, health.Checked)
 	require.True(t, health.Required)
-	require.False(t, health.OK)
+	require.True(t, health.OK)
 	require.True(t, health.Quarantined)
-
-	for name, path := range map[string]string{
-		"list":             "/v1/dashboard/memory/list?status=proposed",
-		"search":           "/v1/dashboard/memory/list?q=safe-anchor&status=proposed",
-		"related":          "/v1/dashboard/memory/safe-anchor/related",
-		"timeline":         "/v1/dashboard/memory/timeline?domain=anchor-domain",
-		"graph":            "/v1/dashboard/memory/graph?status=proposed",
-		"tags":             "/v1/dashboard/tags",
-		"memory-tags":      "/v1/dashboard/memory/safe-anchor/tags",
-		"tasks":            "/v1/dashboard/tasks?all=true",
-		"agent-tags":       "/v1/dashboard/network/agents/agent1/tags",
-		"agent-domains":    "/v1/dashboard/network/agents/agent1/domains",
-		"agent-list":       "/v1/dashboard/network/agents",
-		"agent-detail":     "/v1/dashboard/network/agents/agent1",
-		"unregistered":     "/v1/dashboard/network/unregistered",
-		"task-notices":     "/v1/dashboard/task-notifications",
-		"projection-stats": "/v1/dashboard/stats",
+	primeAppV23ProjectionSnapshot(t, fixture)
+	for name, route := range map[string]struct {
+		path          string
+		projectionKey string
+	}{
+		"list": {
+			path:          "/v1/dashboard/memory/list?status=proposed",
+			projectionKey: "projection",
+		},
+		"search": {
+			path:          "/v1/dashboard/memory/list?q=safe-anchor&status=proposed",
+			projectionKey: "projection",
+		},
+		"timeline": {
+			path:          "/v1/dashboard/memory/timeline?domain=anchor-domain",
+			projectionKey: "projection",
+		},
+		"graph": {
+			path:          "/v1/dashboard/memory/graph?status=proposed",
+			projectionKey: "projection",
+		},
+		"projection-stats": {
+			path:          "/v1/dashboard/stats",
+			projectionKey: "projection",
+		},
+		"health": {
+			path:          "/v1/dashboard/health",
+			projectionKey: "memory_projection",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			rec := requestLocalProjectionRoute(t, fixture, path)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
-			require.NotContains(t, rec.Body.String(), "safe-anchor")
+			rec := requestLocalProjectionRoute(t, fixture, route.path)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			if name == "list" || name == "search" || name == "graph" {
+				require.Contains(t, rec.Body.String(), "safe-anchor")
+			}
+			if name == "projection-stats" || name == "health" {
+				require.Contains(t, rec.Body.String(), `"total_memories":1`)
+				require.Contains(t, rec.Body.String(), `"anchor-domain":1`)
+			}
+			if name == "timeline" {
+				require.Contains(t, rec.Body.String(), `"count":1`)
+			}
+			require.NotContains(t, rec.Body.String(), missingID)
+			require.NotContains(t, rec.Body.String(), "missing-domain")
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+			projection, ok := payload[route.projectionKey].(map[string]any)
+			require.True(t, ok, rec.Body.String())
+			require.Equal(t, true, projection["partial"])
+			if name == "health" {
+				require.NotContains(t, projection, "hidden_count")
+			} else if hiddenCount, present := projection["hidden_count"]; present {
+				// Filtered collection routes classify only their bounded
+				// candidates, so the global hidden aggregate is optional. When
+				// present it must still be the completed local audit count.
+				require.Equal(t, float64(1), hiddenCount)
+			} else {
+				require.Contains(t, []string{"list", "search"}, name)
+			}
+		})
+	}
+
+	for name, route := range map[string]struct {
+		path   string
+		status int
+	}{
+		"related": {
+			path: "/v1/dashboard/memory/safe-anchor/related", status: http.StatusOK,
+		},
+		"tags": {
+			path: "/v1/dashboard/tags", status: http.StatusOK,
+		},
+		"memory-tags": {
+			path: "/v1/dashboard/memory/safe-anchor/tags", status: http.StatusOK,
+		},
+		"tasks": {
+			path: "/v1/dashboard/tasks?all=true", status: http.StatusOK,
+		},
+		"agent-tags": {
+			path: "/v1/dashboard/network/agents/agent1/tags", status: http.StatusOK,
+		},
+		"agent-domains": {
+			path: "/v1/dashboard/network/agents/agent1/domains", status: http.StatusOK,
+		},
+		"agent-list": {
+			path: "/v1/dashboard/network/agents", status: http.StatusOK,
+		},
+		"agent-detail": {
+			path: "/v1/dashboard/network/agents/agent1", status: http.StatusNotFound,
+		},
+		"unregistered": {
+			path: "/v1/dashboard/network/unregistered", status: http.StatusOK,
+		},
+		"task-notices": {
+			path: "/v1/dashboard/task-notifications", status: http.StatusForbidden,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := requestLocalProjectionRoute(t, fixture, route.path)
+			require.Equal(t, route.status, rec.Code, rec.Body.String())
+			require.NotContains(t, rec.Body.String(), missingID)
 			require.NotContains(t, rec.Body.String(), "missing-domain")
 		})
 	}
 }
 
-func TestAppV23CerebrumFilteredReadsReauditAfterHealthyProjection(t *testing.T) {
+func TestAppV23CerebrumBroadRoutesStillFailForUnavailableCanonicalStore(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	fixture.handler.BadgerStore = nil
+
+	rec := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "canonical memory projection is temporarily unavailable")
+	require.NotContains(t, rec.Body.String(), `"total_memories":0`)
+	require.NotContains(t, rec.Body.String(), `"partial":true`)
+}
+
+func TestAppV23CerebrumFilteredReadsIsolateDeterministicProjectionDrift(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		path   string
@@ -534,9 +1330,17 @@ func TestAppV23CerebrumFilteredReadsReauditAfterHealthyProjection(t *testing.T) 
 
 			tc.tamper(t, fixture)
 			rec := requestLocalProjectionRoute(t, fixture, tc.path)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			require.NotContains(t, rec.Body.String(), "filtered-target")
-			require.True(t, fixture.badger.CanonicalMemoryProjectionHealth().Quarantined)
+			health := fixture.badger.CanonicalMemoryProjectionHealth()
+			if health.Quarantined {
+				require.Contains(t, rec.Body.String(), `"partial":true`)
+				require.NotContains(t, rec.Body.String(), `"hidden_count"`,
+					"a bounded candidate read must not claim a global hidden total")
+			} else {
+				require.Contains(t, rec.Body.String(), `"complete":true`,
+					"a row excluded by the SQL filter is outside this bounded candidate read")
+			}
 		})
 	}
 }
@@ -566,7 +1370,7 @@ func TestAppV23CerebrumRelatedReauditsFilteredCandidateAfterHealthyProjection(t 
 	require.NotContains(t, rec.Body.String(), "related-filtered-candidate")
 }
 
-func TestAppV23CerebrumGraphReauditsBeforeServingCachedJSON(t *testing.T) {
+func TestAppV23CerebrumGraphReauditsAndOmitsTamperedCachedRow(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
 	insertTestMemory(t, fixture.sql, "cached-graph-memory", "graph-domain")
 	require.NoError(t, fixture.sql.UpdateStatus(
@@ -597,9 +1401,21 @@ func TestAppV23CerebrumGraphReauditsBeforeServingCachedJSON(t *testing.T) {
 	second := requestLocalProjectionRoute(
 		t, fixture, "/v1/dashboard/memory/graph?status=committed",
 	)
-	require.Equal(t, http.StatusServiceUnavailable, second.Code, second.Body.String())
-	require.NotContains(t, second.Body.String(), "cached-graph-memory")
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	require.Contains(t, second.Body.String(), `"partial":true`)
+	require.Contains(t, second.Body.String(), `"stale":true`)
+	require.NotContains(t, second.Body.String(), "cached-graph-memory",
+		"graph bytes from an older source token must never be served")
 	require.NotContains(t, second.Body.String(), "tampered cached graph content")
+
+	primeAppV23ProjectionSnapshot(t, fixture)
+	refreshed := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=committed",
+	)
+	require.Equal(t, http.StatusOK, refreshed.Code, refreshed.Body.String())
+	require.Contains(t, refreshed.Body.String(), `"hidden_count":1`)
+	require.NotContains(t, refreshed.Body.String(), "cached-graph-memory")
+	require.NotContains(t, refreshed.Body.String(), "tampered cached graph content")
 }
 
 func TestAppV23CerebrumGraphDoesNotServeExactCacheAfterProjectionBecomesPartial(t *testing.T) {
@@ -613,6 +1429,13 @@ func TestAppV23CerebrumGraphDoesNotServeExactCacheAfterProjectionBecomesPartial(
 		t, fixture.sql, fixture.badger, "cached-safe-memory",
 		uint8(store.ClearanceInternal), true,
 	)
+
+	cold := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=committed",
+	)
+	require.Equal(t, http.StatusOK, cold.Code, cold.Body.String())
+	require.Contains(t, cold.Body.String(), `"state":"checking"`)
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
 
 	first := requestLocalProjectionRoute(
 		t, fixture, "/v1/dashboard/memory/graph?status=committed",
@@ -631,10 +1454,123 @@ func TestAppV23CerebrumGraphDoesNotServeExactCacheAfterProjectionBecomesPartial(
 	require.Contains(t, second.Body.String(), "cached-safe-memory")
 	require.Contains(t, second.Body.String(), `"complete":false`)
 	require.Contains(t, second.Body.String(), `"partial":true`)
-	require.Contains(t, second.Body.String(), appV23PartialProjectionMessage)
+	require.Contains(t, second.Body.String(), `"stale":true`)
 	require.NotContains(t, second.Body.String(), "post-cache-sql-only-ghost")
 	require.NotContains(t, second.Body.String(), "ghost-domain")
 	require.NotEqual(t, first.Body.String(), second.Body.String())
+
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+	refreshed := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=committed",
+	)
+	require.Equal(t, http.StatusOK, refreshed.Code, refreshed.Body.String())
+	require.Contains(t, refreshed.Body.String(), "1 historical memory")
+	require.NotContains(t, refreshed.Body.String(), "post-cache-sql-only-ghost")
+}
+
+func TestAppV23CerebrumGraphMetadataRevisionInvalidatesExactCache(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "metadata-cache-memory", "graph-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "metadata-cache-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+
+	cold := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=proposed",
+	)
+	require.Equal(t, http.StatusOK, cold.Code, cold.Body.String())
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+	first := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=proposed",
+	)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	require.Contains(t, first.Body.String(), "metadata-cache-memory")
+	require.NotContains(t, first.Body.String(), "metadata-revision-tag")
+
+	require.NoError(t, fixture.sql.SetTags(
+		context.Background(),
+		"metadata-cache-memory",
+		[]string{"metadata-revision-tag"},
+	))
+	second := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=proposed",
+	)
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	require.Contains(t, second.Body.String(), "metadata-revision-tag",
+		"tag publication must invalidate an otherwise exact graph cache entry")
+	require.NotEqual(t, first.Body.String(), second.Body.String())
+}
+
+func TestAppV23CerebrumGraphSocketWriteDoesNotBlockCanonicalRevocation(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "publication-race-memory", "graph-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "publication-race-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+
+	cold := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=proposed",
+	)
+	require.Equal(t, http.StatusOK, cold.Code, cold.Body.String())
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+	warm := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=proposed",
+	)
+	require.Equal(t, http.StatusOK, warm.Code, warm.Body.String())
+	require.Contains(t, warm.Body.String(), "publication-race-memory")
+
+	req := httptest.NewRequest(
+		http.MethodGet, "/v1/dashboard/memory/graph?status=proposed", nil,
+	)
+	markLocalCEREBRUM(fixture.handler, req)
+	blocked := &blockingWriteRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		entered:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	responseDone := make(chan struct{})
+	go func() {
+		fixture.router.ServeHTTP(blocked, req)
+		close(responseDone)
+	}()
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("cached graph response did not reach its write boundary")
+	}
+
+	revokeDone := make(chan error, 1)
+	go func() {
+		revokeDone <- fixture.badger.SetMemoryDomain(
+			"publication-race-memory", "revoked-domain",
+		)
+	}()
+	select {
+	case err := <-revokeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("slow response socket blocked canonical revocation publication")
+	}
+
+	close(blocked.release)
+	select {
+	case <-responseDone:
+	case <-time.After(time.Second):
+		t.Fatal("cached graph response did not finish")
+	}
+	require.Equal(t, http.StatusOK, blocked.Code, blocked.Body.String())
+	require.Contains(t, blocked.Body.String(), "publication-race-memory",
+		"the response was sealed before the revocation publication")
+
+	after := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/graph?status=proposed",
+	)
+	require.Equal(t, http.StatusOK, after.Code, after.Body.String())
+	require.Contains(t, after.Body.String(), `"partial":true`)
+	require.NotContains(t, after.Body.String(), "publication-race-memory",
+		"no response after revocation may reuse the old cached graph bytes")
 }
 
 func TestAppV23CerebrumBroadResponseCannotHidePostAuditQuarantine(t *testing.T) {
@@ -677,7 +1613,45 @@ func TestAppV23CerebrumBroadResponseCannotHidePostAuditQuarantine(t *testing.T) 
 	require.NotContains(t, rec.Body.String(), "ghost-domain")
 }
 
-func TestAppV23CerebrumTimelineReauditsFilteredDomainAfterHealthyProjection(t *testing.T) {
+func TestAppV23PartialGraphReportsVerifiedTotalNotRenderedSample(t *testing.T) {
+	fixture := newAppV23ProjectionRouteFixture(t, false)
+	insertTestMemory(t, fixture.sql, "sample-memory", "sample-domain")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "sample-memory",
+		uint8(store.ClearanceInternal), true,
+	)
+
+	ctx := context.WithValue(
+		context.Background(),
+		appV23ProjectionAuditContextKey{},
+		appV23ProjectionAuditSnapshot{
+			stats: &store.StoreStats{
+				TotalMemories: 13869,
+				ByDomain:      map[string]int{"sample-domain": 13869},
+			},
+			activity: map[string]string{"sample-domain": "2026-07-31T20:58:24Z"},
+			projection: &appV23ProjectionResponse{
+				State: "quarantined", Partial: true,
+			},
+			stale: true,
+		},
+	)
+	body, err := fixture.handler.computeGraphJSON(
+		ctx, "proposed", "", 1, true, nil,
+	)
+	require.NoError(t, err)
+	var response struct {
+		Nodes        []graphNode    `json:"nodes"`
+		Total        int            `json:"total"`
+		DomainCounts map[string]int `json:"domain_counts"`
+	}
+	require.NoError(t, json.Unmarshal(body, &response))
+	require.Len(t, response.Nodes, 1)
+	require.Equal(t, 13869, response.Total)
+	require.Equal(t, 13869, response.DomainCounts["sample-domain"])
+}
+
+func TestAppV23CerebrumTimelineOmitsFilteredDomainAfterHealthyProjection(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
 	insertTestMemory(t, fixture.sql, "timeline-filtered-memory", "timeline-domain")
 	publishAppV23DashboardRecord(
@@ -695,8 +1669,15 @@ func TestAppV23CerebrumTimelineReauditsFilteredDomainAfterHealthyProjection(t *t
 	rec := requestLocalProjectionRoute(
 		t, fixture, "/v1/dashboard/memory/timeline?domain=timeline-domain",
 	)
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
-	require.NotContains(t, rec.Body.String(), `"buckets":[]`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), `"buckets":[]`)
+	require.Contains(t, rec.Body.String(), `"partial":true`)
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+	refreshed := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/timeline?domain=timeline-domain",
+	)
+	require.Equal(t, http.StatusOK, refreshed.Code, refreshed.Body.String())
+	require.Contains(t, refreshed.Body.String(), `"hidden_count":1`)
 }
 
 func TestAppV23CerebrumTagReadsRejectSQLOnlyGhostAndValidateExactTarget(t *testing.T) {
@@ -720,21 +1701,32 @@ func TestAppV23CerebrumTagReadsRejectSQLOnlyGhostAndValidateExactTarget(t *testi
 	require.NoError(t, fixture.sql.SetTags(
 		context.Background(), "sql-only-tag-ghost", []string{"ghost-tag"},
 	))
-	for name, path := range map[string]string{
-		"all-tags":   "/v1/dashboard/tags",
-		"exact-tags": "/v1/dashboard/memory/sql-only-tag-ghost/tags",
-		"agent-tags": "/v1/dashboard/network/agents/agent1/tags",
+	for name, tc := range map[string]struct {
+		path string
+		code int
+	}{
+		"all-tags": {
+			path: "/v1/dashboard/tags", code: http.StatusOK,
+		},
+		"exact-tags": {
+			path: "/v1/dashboard/memory/sql-only-tag-ghost/tags",
+			code: http.StatusServiceUnavailable,
+		},
+		"agent-tags": {
+			path: "/v1/dashboard/network/agents/agent1/tags",
+			code: http.StatusOK,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			rec := requestLocalProjectionRoute(t, fixture, path)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			rec := requestLocalProjectionRoute(t, fixture, tc.path)
+			require.Equal(t, tc.code, rec.Code, rec.Body.String())
 			require.NotContains(t, rec.Body.String(), "ghost-tag")
 			require.NotContains(t, rec.Body.String(), "ghost-domain")
 		})
 	}
 }
 
-func TestAppV23CerebrumTaskBoardRejectsPostAuditMissingCanonicalTask(t *testing.T) {
+func TestAppV23CerebrumTaskBoardOmitsPostAuditMissingCanonicalTask(t *testing.T) {
 	fixture := newAppV23ProjectionRouteFixture(t, false)
 	insertTestTask(t, fixture.sql, "missing-board-task", "task-domain", "codex")
 	publishAppV23DashboardRecord(
@@ -752,8 +1744,9 @@ func TestAppV23CerebrumTaskBoardRejectsPostAuditMissingCanonicalTask(t *testing.
 	)
 
 	rec := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/tasks?all=true")
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
-	require.NotContains(t, rec.Body.String(), `"tasks":[]`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), `"tasks":[]`)
+	require.NotContains(t, rec.Body.String(), "missing-board-task")
 }
 
 func TestAppV23CerebrumAgentMemoryCountsReauditAfterHealthyProjection(t *testing.T) {
@@ -785,7 +1778,7 @@ func TestAppV23CerebrumAgentMemoryCountsReauditAfterHealthyProjection(t *testing
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec := requestLocalProjectionRoute(t, fixture, path)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			require.NotContains(t, rec.Body.String(), `"memory_count":0`)
 			require.NotContains(t, rec.Body.String(), "forged-agent")
 		})
@@ -818,6 +1811,12 @@ func TestAppV23CerebrumRoutesCompleteRequiredUncheckedAuditBeforeServing(t *test
 	require.False(t, health.Quarantined)
 
 	rec := requestLocalProjectionRoute(
+		t, fixture, "/v1/dashboard/memory/list?status=committed",
+	)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "legacy-before-full-audit")
+	primeAppV23ProjectionSnapshot(t, fixture)
+	rec = requestLocalProjectionRoute(
 		t, fixture, "/v1/dashboard/memory/list?status=committed",
 	)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
@@ -861,6 +1860,9 @@ func TestAppV23StateSyncedProjectionAuditsCanonicalSubsetHonestly(t *testing.T) 
 
 	stats := requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
 	require.Equal(t, http.StatusOK, stats.Code, stats.Body.String())
+	waitForAppV23ProjectionRefresh(t, fixture.handler)
+	stats = requestLocalProjectionRoute(t, fixture, "/v1/dashboard/stats")
+	require.Equal(t, http.StatusOK, stats.Code, stats.Body.String())
 	require.Contains(t, stats.Body.String(), `"total_memories":0`)
 
 	// A later canonical memory was not named by the sealed state-sync baseline,
@@ -878,7 +1880,7 @@ func TestAppV23StateSyncedProjectionAuditsCanonicalSubsetHonestly(t *testing.T) 
 	err := fixture.handler.AuditAppV23CanonicalMemoryProjection(context.Background())
 	require.ErrorContains(t, err, "projection is unavailable")
 	health = fixture.badger.CanonicalMemoryProjectionHealth()
-	require.False(t, health.OK)
+	require.True(t, health.OK)
 	require.True(t, health.Quarantined)
 
 	insertTestMemoryWithAgent(
@@ -903,7 +1905,7 @@ func TestAppV23StateSyncedProjectionAuditsCanonicalSubsetHonestly(t *testing.T) 
 	err = fixture.handler.AuditAppV23CanonicalMemoryProjection(context.Background())
 	require.ErrorContains(t, err, "projection is unavailable")
 	health = fixture.badger.CanonicalMemoryProjectionHealth()
-	require.False(t, health.OK)
+	require.True(t, health.OK)
 	require.True(t, health.Quarantined)
 	insertTestMemoryWithAgent(
 		t, fixture.sql, "post-sync-local", "local-after-sync", "local-agent",
@@ -919,7 +1921,7 @@ func TestAppV23StateSyncedProjectionAuditsCanonicalSubsetHonestly(t *testing.T) 
 	err = fixture.handler.AuditAppV23CanonicalMemoryProjection(context.Background())
 	require.ErrorContains(t, err, "projection is unavailable")
 	health = fixture.badger.CanonicalMemoryProjectionHealth()
-	require.False(t, health.OK)
+	require.True(t, health.OK)
 	require.True(t, health.Quarantined)
 	require.Equal(t, store.CanonicalMemoryProjectionQuarantined, health.State)
 }
@@ -957,6 +1959,7 @@ func TestAppV23EncryptedStateSyncSubsetRejectsPostBaselineRollback(t *testing.T)
 		store.CanonicalMemoryProjectionSubset,
 		fixture.badger.CanonicalMemoryProjectionHealth().State,
 	)
+	primeAppV23ProjectionSnapshot(t, fixture)
 
 	tamperAppV23ProjectionRow(
 		t, fixture.dbPath,
@@ -966,7 +1969,7 @@ func TestAppV23EncryptedStateSyncSubsetRejectsPostBaselineRollback(t *testing.T)
 	err := fixture.handler.AuditAppV23CanonicalMemoryProjection(context.Background())
 	require.ErrorContains(t, err, "projection is unavailable")
 	health := fixture.badger.CanonicalMemoryProjectionHealth()
-	require.False(t, health.OK)
+	require.True(t, health.OK)
 	require.True(t, health.Quarantined)
 }
 
@@ -977,6 +1980,7 @@ func TestAppV23CerebrumMemoryRoutesUseCanonicalProjectionWhenVaultUnlocked(t *te
 		t, fixture.sql, fixture.badger, "encrypted-canonical",
 		uint8(store.ClearanceInternal), true,
 	)
+	primeAppV23ProjectionSnapshot(t, fixture)
 
 	now := time.Now().UTC()
 	routes := map[string]string{
@@ -1080,7 +2084,7 @@ func TestAppV23CerebrumExportStreamsSealedSnapshotAcrossConcurrentProjectionMuta
 	require.Equal(t, "canonical-after-gap", second.MemoryID)
 }
 
-func TestAppV23CerebrumBroadListFailsClosedForTamperedProjectionFields(t *testing.T) {
+func TestAppV23CerebrumBroadListOmitsTamperedProjectionFields(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		tamper func(*testing.T, appV23ProjectionRouteFixture)
@@ -1135,7 +2139,9 @@ func TestAppV23CerebrumBroadListFailsClosedForTamperedProjectionFields(t *testin
 			rec := requestLocalProjectionRoute(
 				t, fixture, "/v1/dashboard/memory/list",
 			)
-			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Contains(t, rec.Body.String(), `"partial":true`)
+			require.Contains(t, rec.Body.String(), `"hidden_count":1`)
 			require.NotContains(t, rec.Body.String(), "content-tampered-record")
 			require.NotContains(t, rec.Body.String(), "other-domain")
 		})

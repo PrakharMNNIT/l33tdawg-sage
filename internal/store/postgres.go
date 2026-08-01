@@ -247,28 +247,161 @@ func (s *PostgresStore) ensureGovSchema(ctx context.Context) error {
 // quorum nodes sharing one PostgreSQL deployment.
 const projectionSchemaLockKey int64 = 0x5341_4745_5052_4A54 // "SAGEPRJT"
 
+// postgresProjectionSchema is deliberately ordered. Each update trigger is
+// dropped and recreated inside the advisory-locked migration transaction so a
+// development or older release that installed a broad AFTER UPDATE trigger is
+// narrowed atomically before this process starts serving requests.
+var postgresProjectionSchema = []string{
+	`CREATE TABLE IF NOT EXISTS abci_projection_batches (
+		block_height BIGINT PRIMARY KEY,
+		app_hash     BYTEA NOT NULL CHECK (octet_length(app_hash) = 32),
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`,
+	`CREATE TABLE IF NOT EXISTS memory_evidence_projection_incomplete (
+		memory_id UUID PRIMARY KEY REFERENCES memories(memory_id) ON DELETE CASCADE
+	)`,
+	`CREATE TABLE IF NOT EXISTS memory_projection_revision (
+		singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+		revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+	)`,
+	`INSERT INTO memory_projection_revision(singleton, revision)
+	 VALUES (TRUE, 0) ON CONFLICT (singleton) DO NOTHING`,
+	`CREATE OR REPLACE FUNCTION sage_bump_memory_projection_revision()
+	 RETURNS TRIGGER
+	 LANGUAGE plpgsql
+	 AS $$
+	 BEGIN
+	   UPDATE memory_projection_revision
+	   SET revision = revision + 1
+	   WHERE singleton = TRUE;
+	   RETURN NULL;
+	 END
+	 $$`,
+	`DROP TRIGGER IF EXISTS memories_projection_revision_insert_v1 ON memories`,
+	`CREATE TRIGGER memories_projection_revision_insert_v1
+	 AFTER INSERT ON memories FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
+	`DROP TRIGGER IF EXISTS memories_projection_revision_update_v1 ON memories`,
+	`CREATE TRIGGER memories_projection_revision_update_v1
+	 AFTER UPDATE OF submitting_agent, content, content_hash,
+	   domain_tag, status, created_at ON memories
+	 FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
+	`DROP TRIGGER IF EXISTS memories_projection_revision_delete_v1 ON memories`,
+	`CREATE TRIGGER memories_projection_revision_delete_v1
+	 AFTER DELETE ON memories FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
+	`CREATE TABLE IF NOT EXISTS graph_projection_revision (
+		singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+		revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+	)`,
+	`INSERT INTO graph_projection_revision(singleton, revision)
+	 VALUES (TRUE, 0) ON CONFLICT (singleton) DO NOTHING`,
+	`CREATE OR REPLACE FUNCTION sage_bump_graph_projection_revision()
+	 RETURNS TRIGGER
+	 LANGUAGE plpgsql
+	 AS $$
+	 BEGIN
+	   UPDATE graph_projection_revision
+	   SET revision = revision + 1
+	   WHERE singleton = TRUE;
+	   RETURN NULL;
+	 END
+	 $$`,
+	`DROP TRIGGER IF EXISTS memories_graph_revision_update_v1 ON memories`,
+	`CREATE TRIGGER memories_graph_revision_update_v1
+	 AFTER UPDATE OF memory_type, confidence_score, parent_hash ON memories
+	 FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS memory_tags_graph_revision_insert_v1 ON memory_tags`,
+	`CREATE TRIGGER memory_tags_graph_revision_insert_v1
+	 AFTER INSERT ON memory_tags FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS memory_tags_graph_revision_update_v1 ON memory_tags`,
+	`CREATE TRIGGER memory_tags_graph_revision_update_v1
+	 AFTER UPDATE ON memory_tags FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS memory_tags_graph_revision_delete_v1 ON memory_tags`,
+	`CREATE TRIGGER memory_tags_graph_revision_delete_v1
+	 AFTER DELETE ON memory_tags FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS corroborations_graph_revision_insert_v1 ON corroborations`,
+	`CREATE TRIGGER corroborations_graph_revision_insert_v1
+	 AFTER INSERT ON corroborations FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS corroborations_graph_revision_update_v1 ON corroborations`,
+	`CREATE TRIGGER corroborations_graph_revision_update_v1
+	 AFTER UPDATE ON corroborations FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS corroborations_graph_revision_delete_v1 ON corroborations`,
+	`CREATE TRIGGER corroborations_graph_revision_delete_v1
+	 AFTER DELETE ON corroborations FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS memory_links_graph_revision_insert_v1 ON memory_links`,
+	`CREATE TRIGGER memory_links_graph_revision_insert_v1
+	 AFTER INSERT ON memory_links FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS memory_links_graph_revision_update_v1 ON memory_links`,
+	`CREATE TRIGGER memory_links_graph_revision_update_v1
+	 AFTER UPDATE ON memory_links FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+	`DROP TRIGGER IF EXISTS memory_links_graph_revision_delete_v1 ON memory_links`,
+	`CREATE TRIGGER memory_links_graph_revision_delete_v1
+	 AFTER DELETE ON memory_links FOR EACH STATEMENT
+	 EXECUTE FUNCTION sage_bump_graph_projection_revision()`,
+}
+
 func (s *PostgresStore) ensureProjectionSchema(ctx context.Context) error {
 	return s.RunInTx(ctx, func(tx OffchainStore) error {
 		ps := tx.(*PostgresStore)
 		if _, err := ps.db.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, projectionSchemaLockKey); err != nil {
 			return fmt.Errorf("acquire projection schema lock: %w", err)
 		}
-		for _, statement := range []string{
-			`CREATE TABLE IF NOT EXISTS abci_projection_batches (
-				block_height BIGINT PRIMARY KEY,
-				app_hash     BYTEA NOT NULL CHECK (octet_length(app_hash) = 32),
-				created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-			)`,
-			`CREATE TABLE IF NOT EXISTS memory_evidence_projection_incomplete (
-				memory_id UUID PRIMARY KEY REFERENCES memories(memory_id) ON DELETE CASCADE
-			)`,
-		} {
+		for _, statement := range postgresProjectionSchema {
 			if _, err := ps.db.Exec(ctx, statement); err != nil {
-				return fmt.Errorf("create projection metadata table: %w", err)
+				return fmt.Errorf("install projection metadata schema: %w", err)
 			}
 		}
 		return nil
 	})
+}
+
+// MemoryProjectionRevision returns the transactionally maintained generation
+// for the PostgreSQL memory projection. Statement-level triggers make bulk
+// updates one invalidation rather than one revision increment per row.
+func (s *PostgresStore) MemoryProjectionRevision(ctx context.Context) (uint64, error) {
+	var revision int64
+	if err := s.db.QueryRow(ctx,
+		`SELECT revision FROM memory_projection_revision WHERE singleton = TRUE`,
+	).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("read memory projection revision: %w", err)
+	}
+	if revision < 0 {
+		return 0, errors.New("memory projection revision is negative")
+	}
+	return uint64(revision), nil
+}
+
+// GraphProjectionRevision returns the transactionally maintained generation of
+// SQL metadata rendered into graph nodes and edges.
+func (s *PostgresStore) GraphProjectionRevision(ctx context.Context) (uint64, error) {
+	var revision int64
+	if err := s.db.QueryRow(ctx,
+		`SELECT revision FROM graph_projection_revision WHERE singleton = TRUE`,
+	).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("read graph projection revision: %w", err)
+	}
+	if revision < 0 {
+		return 0, errors.New("graph projection revision is negative")
+	}
+	return uint64(revision), nil
+}
+
+// VaultGeneration satisfies the audited-projection source contract. PostgreSQL
+// deployments do not use SQLite's process-local content vault, so their vault
+// generation is permanently zero.
+func (s *PostgresStore) VaultGeneration() uint64 {
+	return 0
 }
 
 // memoriesSchemaLockKey serializes concurrent memories-table migrations across
@@ -286,6 +419,7 @@ var postgresTaskAssignmentSchema = []string{
 	`CREATE INDEX IF NOT EXISTS idx_memories_assignee ON memories (assignee) WHERE assignee != ''`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_task_picked_up_by ON memories (task_picked_up_by) WHERE task_picked_up_by != ''`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_memories_projection_page ON memories (created_at, memory_id)`,
 	// FindByContentHash became a live query in v11.11 (it previously returned a
 	// constant false), and voter.Run evaluates it per pending memory on a 2s
 	// poll. Without this index that is a sequential scan of a table carrying
@@ -587,6 +721,40 @@ func (s *PostgresStore) DeprecateUnreadableMemories(_ context.Context) (int, err
 	return 0, fmt.Errorf("DeprecateUnreadableMemories not implemented for PostgresStore")
 }
 
+func (s *PostgresStore) ListUnreadableMemoryIDs(
+	ctx context.Context,
+	afterMemoryID string,
+	limit int,
+) ([]string, int, error) {
+	if limit <= 0 {
+		return nil, 0, fmt.Errorf("unreadable memory page limit must be positive")
+	}
+	var total int
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM memories
+		WHERE embedding_provider = 'skipped' AND status != 'deprecated'`,
+	).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT memory_id FROM memories
+		WHERE embedding_provider = 'skipped' AND status != 'deprecated'
+		  AND memory_id > $1
+		ORDER BY memory_id ASC
+		LIMIT $2`, afterMemoryID, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, 0, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, total, rows.Err()
+}
+
 func (s *PostgresStore) ResetErroredEmbeddings(ctx context.Context) (int, error) {
 	tag, err := s.db.Exec(ctx, `UPDATE memories SET embedding_provider = '' WHERE embedding_provider = 'error'`)
 	if err != nil {
@@ -759,10 +927,14 @@ func (s *PostgresStore) QuerySimilar(ctx context.Context, embedding []float32, o
 			}
 			page = applyDecayFloor(page, opts.DecayFloor, opts.DecayNow, counts, opts.IncludeDisputed)
 		}
-		return applyCandidateFilter(page, opts.CandidateFilter)
+		return applyCandidateFilters(
+			page, opts.CandidateBatchFilter, opts.CandidateFilter,
+		)
 	}
 
-	if opts.CandidateFilter == nil {
+	hasCandidateFilter := opts.CandidateFilter != nil ||
+		opts.CandidateBatchFilter != nil
+	if !hasCandidateFilter {
 		scanLimit := opts.TopK
 		if opts.DecayFloor > 0 {
 			// Preserve the historical bounded decay-only over-fetch.
@@ -1820,8 +1992,10 @@ func (s *PostgresStore) ListMemories(ctx context.Context, opts ListOptions) ([]*
 	queryArgs := append(args, opts.Limit, opts.Offset)
 
 	var total int
-	if err := s.db.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("count memories: %w", err)
+	if !opts.SkipTotal {
+		if err := s.db.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+			return nil, 0, fmt.Errorf("count memories: %w", err)
+		}
 	}
 
 	rows, err := s.db.Query(ctx, query, queryArgs...)

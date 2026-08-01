@@ -20,6 +20,7 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -124,20 +125,32 @@ type DashboardHandler struct {
 	// stale-while-revalidate policy: the first load computes synchronously, every
 	// repeat load is served instantly from cache while a background refresh keeps
 	// it warm. Keyed by query params + RBAC scope so it never leaks across agents.
-	graphCacheMu     sync.Mutex
-	graphCache       map[string]*graphCacheEntry
-	ExecPath         string // path to sage-gui binary, used by /v1/mcp-config
-	RESTAddr         string // configured REST listen address (cfg.RESTAddr), surfaced read-only in Settings > Connection
-	MCPTLSAddr       string // configured MCP TLS (bearer) listen address, used by /v1/dashboard/connect/remote-url to report whether the node is reachable from another computer (loopback bind = local-only)
-	FederationAddr   string // effective federation mTLS listen address, used to generate JOIN codes with the port the node actually bound
-	TunnelClient     TunnelClientManager
-	Encrypted        atomic.Bool
-	VaultLocked      atomic.Bool // true when encryption is enabled but vault hasn't been unlocked yet
-	UpdateInProgress atomic.Bool
-	updateStateMu    sync.RWMutex
-	updateState      map[string]string
-	agentReplayMu    sync.Mutex
-	agentReplaySeen  map[string]time.Time
+	graphCacheMu sync.Mutex
+	graphCache   map[string]*graphCacheEntry
+	// projectionAudit coalesces the expensive complete SQL/Badger inventory
+	// walk and retains one immutable result bound to exact memory-specific
+	// source revisions. Strict routes still request a fresh audit; broad routes
+	// may reuse the completed result only while both revisions are unchanged.
+	projectionAuditMu      sync.Mutex
+	projectionAuditFlight  *appV23ProjectionAuditFlight
+	projectionAuditLast    *appV23ProjectionAuditResult
+	appV25MaintenanceMu    sync.RWMutex
+	appV25Maintenance      AppV25MaintenanceStatus
+	appV25AdoptionWakeOnce sync.Once
+	appV25AdoptionWake     chan struct{}
+	appV25AdoptionRetry    atomic.Uint64
+	ExecPath               string // path to sage-gui binary, used by /v1/mcp-config
+	RESTAddr               string // configured REST listen address (cfg.RESTAddr), surfaced read-only in Settings > Connection
+	MCPTLSAddr             string // configured MCP TLS (bearer) listen address, used by /v1/dashboard/connect/remote-url to report whether the node is reachable from another computer (loopback bind = local-only)
+	FederationAddr         string // effective federation mTLS listen address, used to generate JOIN codes with the port the node actually bound
+	TunnelClient           TunnelClientManager
+	Encrypted              atomic.Bool
+	VaultLocked            atomic.Bool // true when encryption is enabled but vault hasn't been unlocked yet
+	UpdateInProgress       atomic.Bool
+	updateStateMu          sync.RWMutex
+	updateState            map[string]string
+	agentReplayMu          sync.Mutex
+	agentReplaySeen        map[string]time.Time
 
 	// Auth — only active when Encrypted is true.
 	VaultKeyPath  string
@@ -415,15 +428,16 @@ func (h *DashboardHandler) resolveAgentRBAC(r *http.Request) ([]string, bool) {
 // NewDashboardHandler creates a new dashboard handler.
 func NewDashboardHandler(memStore store.MemoryStore, version string) *DashboardHandler {
 	h := &DashboardHandler{
-		store:           memStore,
-		SSE:             NewSSEBroadcaster(),
-		Version:         version,
-		BootID:          uuid.NewString(),
-		Pairing:         NewPairingStore(),
-		NetworkJoin:     NewNetworkJoinStore(),
-		GuestJoin:       NewGuestJoinStore(),
-		updateState:     map[string]string{"step": "idle", "status": "idle", "message": ""},
-		agentReplaySeen: make(map[string]time.Time),
+		store:              memStore,
+		SSE:                NewSSEBroadcaster(),
+		Version:            version,
+		BootID:             uuid.NewString(),
+		Pairing:            NewPairingStore(),
+		NetworkJoin:        NewNetworkJoinStore(),
+		GuestJoin:          NewGuestJoinStore(),
+		updateState:        map[string]string{"step": "idle", "status": "idle", "message": ""},
+		agentReplaySeen:    make(map[string]time.Time),
+		appV25AdoptionWake: make(chan struct{}, 1),
 	}
 	// If the store implements PreferencesStore, wire it up.
 	if ps, ok := memStore.(PreferencesStore); ok {
@@ -843,12 +857,10 @@ func (h *DashboardHandler) isActiveRegisteredDashboardAgent(ctx context.Context,
 	if !ok || strings.TrimSpace(agentID) == "" {
 		return false
 	}
-	agent, err := agentStore.GetAgent(ctx, agentID)
-	if err != nil || agent == nil || agent.Status != "active" || agent.RemovedAt != nil {
-		return false
-	}
 	if !h.appV23IsActive() {
-		return true
+		agent, err := agentStore.GetAgent(ctx, agentID)
+		return err == nil && agent != nil &&
+			agent.Status == "active" && agent.RemovedAt == nil
 	}
 	if h.BadgerStore == nil {
 		return false
@@ -885,9 +897,38 @@ func (h *DashboardHandler) isActiveRegisteredDashboardAgent(ctx context.Context,
 	default:
 		return false
 	}
-	return store.ValidateAppV23Policy(
+	if store.ValidateAppV23Policy(
 		role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
-	) == nil
+	) != nil {
+		return false
+	}
+	registered, err := h.BadgerStore.GetRegisteredAgent(agentID)
+	if err != nil || registered == nil || registered.AgentID != agentID ||
+		registered.Role != role.Role ||
+		registered.Clearance != enrollment.Clearance ||
+		registered.Capabilities != enrollment.Capabilities {
+		return false
+	}
+
+	// Consensus is authoritative; the local directory is only a serving
+	// projection. A direct app-v23 genesis, state sync, or interrupted upgrade
+	// can leave the exact signed active agent missing or stale in SQL. Repair
+	// only after proving the caller is a current ordinary consensus principal.
+	// Pending/inactive agents and every current or historical Root return above
+	// and can never materialize themselves through this read-side path.
+	agent, projectionErr := agentStore.GetAgent(ctx, agentID)
+	projectionStale := projectionErr != nil || agent == nil ||
+		agent.AgentID != agentID || agent.Status != "active" || agent.RemovedAt != nil
+	if projectionStale {
+		agent, projectionErr = store.EnsureAppV23AgentProjection(
+			ctx, agentStore, h.BadgerStore, agentID, nil,
+		)
+		if projectionErr != nil {
+			return false
+		}
+	}
+	return agent != nil && agent.AgentID == agentID &&
+		agent.Status == "active" && agent.RemovedAt == nil
 }
 
 // isEligibleRemoteSignedDashboardAgent narrows the legacy dashboard API
@@ -910,6 +951,35 @@ func (h *DashboardHandler) isEligibleRemoteSignedDashboardAgent(
 	}
 	return role.Role == store.AppV23RoleMember ||
 		role.Role == store.AppV23RoleManager
+}
+
+// isEligibleTaskDashboardAgent preserves an approved agent's task identity
+// after local promotion to Admin without turning Admin into a remotely usable
+// compatibility identity. isActiveRegisteredDashboardAgent already rejects
+// Root credentials, historical Roots, stale Admin generations, inactive
+// enrollments, and incompatible policy state.
+func (h *DashboardHandler) isEligibleTaskDashboardAgent(
+	r *http.Request,
+	agentID string,
+) bool {
+	if !h.isActiveRegisteredDashboardAgent(r.Context(), agentID) {
+		return false
+	}
+	if !h.appV23IsActive() {
+		return true
+	}
+	role, err := h.BadgerStore.GetAppV23Role(agentID)
+	if err != nil || role == nil || role.AgentID != agentID {
+		return false
+	}
+	switch role.Role {
+	case store.AppV23RoleMember, store.AppV23RoleManager:
+		return true
+	case store.AppV23RoleAdmin:
+		return isLoopbackCEREBRUMRequest(r)
+	default:
+		return false
+	}
 }
 
 // isAgentOnlyDashboardRoute identifies compatibility routes whose semantics
@@ -1080,6 +1150,9 @@ type appV23ProjectionAuditSnapshot struct {
 	stats      *store.StoreStats
 	activity   map[string]string
 	projection *appV23ProjectionResponse
+	source     appV23ProjectionSourceToken
+	stale      bool
+	cacheState string
 }
 
 func (h *DashboardHandler) appV23ProjectionResponseForContext(
@@ -1091,7 +1164,9 @@ func (h *DashboardHandler) appV23ProjectionResponseForContext(
 		// between the gate audit and response serialization; classification of
 		// its unanchored serving row updates the process-local health marker.
 		if audited.projection != nil && !audited.projection.Partial {
-			if latest := h.appV23ProjectionResponse(); latest != nil && latest.Partial {
+			health := h.BadgerStore.CanonicalMemoryProjectionHealth()
+			if health.Quarantined {
+				latest := h.appV23ProjectionResponse()
 				return latest
 			}
 		}
@@ -1100,10 +1175,14 @@ func (h *DashboardHandler) appV23ProjectionResponseForContext(
 	return h.appV23ProjectionResponse()
 }
 
-func (h *DashboardHandler) appV23ProjectionReadGate(next http.Handler) http.Handler {
+// appV23ProjectionBroadReadGate performs the same complete audit as the strict
+// gate, but allows individually verified broad routes to serve while one or
+// more unsafe historical rows remain quarantined. The route handler must omit
+// every unsafe record and must not provide an exact/export response.
+func (h *DashboardHandler) appV23ProjectionBroadReadGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		stats, activity, projection, err :=
-			h.requireAppV23DashboardProjectionAvailable(r.Context())
+		stats, activity, projection, source, err :=
+			h.requireAppV23DashboardProjectionSnapshot(r.Context())
 		if err != nil {
 			if writeAppV23DashboardProjectionFailure(w, err) {
 				return
@@ -1118,6 +1197,21 @@ func (h *DashboardHandler) appV23ProjectionReadGate(next http.Handler) http.Hand
 				appV23ProjectionAuditSnapshot{
 					stats: stats, activity: activity,
 					projection: projection,
+					source:     source,
+					stale:      projection != nil && projection.Stale,
+					cacheState: func() string {
+						if projection != nil && projection.Stale {
+							h.projectionAuditMu.Lock()
+							defer h.projectionAuditMu.Unlock()
+							if h.projectionAuditLast != nil {
+								return h.projectionAuditLast.cacheState
+							}
+						}
+						if projection != nil {
+							return projection.State
+						}
+						return ""
+					}(),
 				},
 			))
 		}
@@ -1125,29 +1219,35 @@ func (h *DashboardHandler) appV23ProjectionReadGate(next http.Handler) http.Hand
 	})
 }
 
-// appV23ProjectionBroadReadGate performs the same complete audit as the strict
-// gate, but allows individually verified broad routes to serve while one or
-// more unsafe historical rows remain quarantined. The route handler must omit
-// every unsafe record and must not provide an exact/export response.
-func (h *DashboardHandler) appV23ProjectionBroadReadGate(next http.Handler) http.Handler {
+// dashboardTaskListAccessGate is the cheap identity boundary for the mixed
+// task route. Canonical disclosure is enforced per returned task by the
+// handler; this gate deliberately performs no ordinary-memory inventory walk.
+func (h *DashboardHandler) dashboardTaskListAccessGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		stats, activity, projection, err := h.requireAppV23DashboardProjectionAudited(r.Context())
-		if err != nil {
-			if writeAppV23DashboardProjectionFailure(w, err) {
-				return
-			}
-			writeError(w, http.StatusInternalServerError, err.Error())
+		if h.isCEREBRUMReadRequest(r) {
+			next.ServeHTTP(w, r)
 			return
 		}
-		if h.appV23IsActive() {
-			r = r.WithContext(context.WithValue(
-				r.Context(),
-				appV23ProjectionAuditContextKey{},
-				appV23ProjectionAuditSnapshot{
-					stats: stats, activity: activity,
-					projection: projection,
-				},
-			))
+		agentID := verifiedDashboardAgentID(r.Context())
+		active := h.isEligibleTaskDashboardAgent(r, agentID)
+		if agentID == "" || !active {
+			writeError(w, http.StatusForbidden,
+				"the task backlog is available only to an active signed agent or authenticated local CEREBRUM")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// dashboardTaskNotificationAccessGate keeps assignment notices agent-only
+// without coupling their bounded candidate checks to a full memory audit.
+func (h *DashboardHandler) dashboardTaskNotificationAccessGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		agentID := verifiedDashboardAgentID(r.Context())
+		active := h.isEligibleTaskDashboardAgent(r, agentID)
+		if agentID == "" || !active {
+			writeError(w, http.StatusForbidden, "active signed agent identity required")
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -1189,13 +1289,20 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			// Redeploy guard — returns 503 for write endpoints during active redeployment.
 			r.Use(redeployGuard(h.Redeployer))
 
-			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
+			r.With(h.cerebrumOperatorGate).
 				Get("/v1/dashboard/memory/list", h.handleListMemories)
 			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/export", h.handleExport)
 			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
 				Get("/v1/dashboard/memory/timeline", h.handleTimeline)
 			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
 				Get("/v1/dashboard/memory/graph", h.handleGraph)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/adoption-progress", h.handleAppV25LegacyAdoptionProgress)
+			r.With(h.cerebrumOperatorGate).Post("/v1/dashboard/memory/adoption-retry", h.handleAppV25LegacyAdoptionRetry)
+			r.With(h.cerebrumOperatorGate).Post("/v1/dashboard/memory/adoption-deprecate", h.handleAppV25LegacyAdoptionDeprecate)
+			// Pre-v11.16.2 MCP bridges still call this dashboard-shaped read during
+			// inception. The handler returns eligible ordinary agents only a
+			// caller-scoped non-exact lower bound; complete node statistics remain
+			// available exclusively to authenticated local CEREBRUM/operator calls.
 			r.Get("/v1/dashboard/stats", h.handleStats)
 
 			// Embeddings setup — turn on the bundled semantic embedder + re-embed.
@@ -1259,22 +1366,22 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			})
 
 			// Task backlog
-			r.With(h.appV23ProjectionReadGate).Get("/v1/dashboard/tasks", h.handleGetTasks)
+			r.With(h.dashboardTaskListAccessGate).Get("/v1/dashboard/tasks", h.handleGetTasks)
 			r.Post("/v1/dashboard/tasks", h.handleCreateTaskDashboard)
 			r.Put("/v1/dashboard/tasks/order", h.handleReorderTasksDashboard)
 			r.Put("/v1/dashboard/tasks/{id}/status", h.handleUpdateTaskStatusDashboard)
 			r.Put("/v1/dashboard/tasks/{id}/assign", h.handleAssignTask)
-			r.With(h.appV23ProjectionReadGate).
+			r.With(h.dashboardTaskNotificationAccessGate).
 				Get("/v1/dashboard/task-notifications", h.handleTaskNotifications)
 
 			// Tags
-			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+			r.With(h.cerebrumOperatorGate).
 				Get("/v1/dashboard/tags", h.handleListTags)
-			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+			r.With(h.cerebrumOperatorGate).
 				Get("/v1/dashboard/memory/{id}/tags", h.handleGetMemoryTags)
 			r.Put("/v1/dashboard/memory/{id}/tags", h.handleSetMemoryTags)
 			// Memory "train of thought" - powers the MRI click-to-explore.
-			r.With(h.cerebrumOperatorGate, h.appV23ProjectionReadGate).
+			r.With(h.cerebrumOperatorGate).
 				Get("/v1/dashboard/memory/{id}/related", h.handleMemoryRelated)
 
 			// Auto-start (open at login)
@@ -1936,8 +2043,131 @@ func generateToken() string {
 	return hex.EncodeToString(b)
 }
 
+type sealedDashboardResponse struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func newSealedDashboardResponse() *sealedDashboardResponse {
+	return &sealedDashboardResponse{header: make(http.Header)}
+}
+
+func (w *sealedDashboardResponse) Header() http.Header {
+	return w.header
+}
+
+func (w *sealedDashboardResponse) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *sealedDashboardResponse) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(body)
+}
+
+func writeSealedDashboardResponse(w http.ResponseWriter, sealed *sealedDashboardResponse) {
+	for key, values := range sealed.header {
+		w.Header()[key] = append([]string(nil), values...)
+	}
+	status := sealed.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(sealed.body.Bytes()) //nolint:gosec // server-built response
+}
+
+// sealAppV23DashboardSource briefly linearizes an already-built response
+// against SQL, canonical-memory, metadata, and authorization publication. The
+// locks are released before any network write: a slow browser must never stop
+// consensus projection or agent writes. A true result means the bytes were
+// valid at one exact publication point.
+func (h *DashboardHandler) sealAppV23DashboardSource(
+	ctx context.Context,
+	expected appV23GraphSourceToken,
+) (bool, error) {
+	releaseSQL := func() {}
+	if locker, ok := h.store.(projectionPublicationReader); ok {
+		releaseSQL = locker.LockProjectionPublicationRead()
+	}
+	releaseCanonical := func() {}
+	if h.BadgerStore != nil {
+		releaseCanonical = h.BadgerStore.LockProjectionPublicationRead()
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		releaseCanonical()
+		releaseSQL()
+	}
+	defer release()
+
+	actual, cacheable, err := h.appV23GraphSource(ctx)
+	if err != nil {
+		return false, err
+	}
+	return cacheable && actual == expected, nil
+}
+
 // handleListMemories returns paginated, filterable memory list.
 func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Request) {
+	if !h.appV23IsActive() {
+		h.handleListMemoriesUnsealed(w, r)
+		return
+	}
+
+	// Build and serialize outside every global publication lock. The final
+	// source-token check is short and produces immutable response bytes, so
+	// decrypting a broad encrypted page or writing to a slow client cannot
+	// freeze memory commits.
+	for attempt := 0; attempt < 3; attempt++ {
+		source, cacheable, err := h.appV23GraphSource(r.Context())
+		if err != nil {
+			if writeAppV23DashboardProjectionFailure(w, err) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !cacheable {
+			writeAppV23DashboardProjectionFailure(
+				w,
+				appV23DashboardProjectionError(errors.New(
+					"memory list source revisions are unavailable",
+				)),
+			)
+			return
+		}
+
+		sealed := newSealedDashboardResponse()
+		h.handleListMemoriesUnsealed(sealed, r)
+		current, sealErr := h.sealAppV23DashboardSource(r.Context(), source)
+		if sealErr != nil {
+			if writeAppV23DashboardProjectionFailure(w, sealErr) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, sealErr.Error())
+			return
+		}
+		if !current {
+			continue
+		}
+		writeSealedDashboardResponse(w, sealed)
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable,
+		"memory list changed while it was being prepared; retry")
+}
+
+func (h *DashboardHandler) handleListMemoriesUnsealed(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 || limit > 200 {
@@ -1957,7 +2187,6 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		Offset:          offset,
 		Sort:            q.Get("sort"),
 	})
-
 	// On-chain RBAC: if request comes from an MCP agent, enforce agent isolation.
 	if allowedAgents, seeAll := h.resolveAgentRBAC(r); !seeAll {
 		// Grant-aware override: skip agent isolation when agent has a grant OR domain is unregistered
@@ -1990,6 +2219,9 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 	// applied on both paths.
 	var records []*memory.MemoryRecord
 	var total int
+	var nextCursor string
+	continuationRequired := false
+	observedHidden := 0
 	if qStr := strings.TrimSpace(q.Get("q")); qStr != "" {
 		qopts := cerebrumQueryOptions(store.QueryOptions{
 			DomainTag:        opts.DomainTag,
@@ -2004,15 +2236,13 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 			qopts.Tags = []string{opts.Tag} // honor the tag filter on the FTS path too (the fallback already did)
 		}
 		if h.appV23IsActive() {
-			qopts.CandidateFilter = func(record *memory.MemoryRecord) (bool, error) {
-				disposition, err := h.classifyAppV23DashboardRecord(record)
-				if err != nil {
-					if isAppV23LegacyUnanchoredDashboardRecord(disposition, err) {
-						return false, nil
-					}
-					return false, err
-				}
-				return true, nil
+			qopts.CandidateBatchFilter = func(
+				records []*memory.MemoryRecord,
+			) ([]*memory.MemoryRecord, error) {
+				// One ranked SQL page shares one immutable canonical Badger
+				// snapshot. Opening one transaction per hit made a broad FTS
+				// query perform thousands of tiny policy transactions.
+				return h.filterAppV23BroadDashboardRecords(records)
 			}
 		}
 		var ftsRecs []*memory.MemoryRecord
@@ -2040,6 +2270,25 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 				return
 			}
 			records, total = safeFTSRecs, len(safeFTSRecs)
+		} else if h.appV23IsActive() {
+			var keywordErr error
+			records, total, nextCursor, continuationRequired, observedHidden, keywordErr =
+				h.appV23CanonicalKeywordPage(
+					r.Context(), opts, strings.ToLower(qStr),
+					strings.TrimSpace(q.Get("cursor")),
+				)
+			if keywordErr != nil {
+				if errors.Is(keywordErr, errAppV23DashboardListCursorInvalid) {
+					writeError(w, http.StatusBadRequest,
+						"invalid or stale memory-search continuation")
+					return
+				}
+				if writeAppV23DashboardProjectionFailure(w, keywordErr) {
+					return
+				}
+				writeError(w, http.StatusInternalServerError, keywordErr.Error())
+				return
+			}
 		} else {
 			pool, _, perr := h.store.ListMemories(r.Context(), cerebrumListOptions(store.ListOptions{
 				DomainTag: opts.DomainTag, Tag: opts.Tag, Provider: opts.Provider,
@@ -2074,11 +2323,18 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 	} else {
 		var lerr error
 		if h.appV23IsActive() {
-			records, total, lerr = h.appV23CanonicalDashboardPage(r.Context(), opts)
+			records, total, nextCursor, continuationRequired, observedHidden, lerr =
+				h.appV23CanonicalDashboardPageObserved(
+					r.Context(), opts, strings.TrimSpace(q.Get("cursor")),
+				)
 		} else {
 			records, total, lerr = h.store.ListMemories(r.Context(), opts)
 		}
 		if lerr != nil {
+			if errors.Is(lerr, errAppV23DashboardListCursorInvalid) {
+				writeError(w, http.StatusBadRequest, "invalid or stale memory-list continuation")
+				return
+			}
 			if writeAppV23DashboardProjectionFailure(w, lerr) {
 				return
 			}
@@ -2107,8 +2363,31 @@ func (h *DashboardHandler) handleListMemories(w http.ResponseWriter, r *http.Req
 		"limit":    limit,
 		"offset":   offset,
 	}
+	if nextCursor != "" {
+		response["next_cursor"] = nextCursor
+	}
+	if continuationRequired {
+		response["continuation_required"] = true
+	}
 	if projection := h.appV23ProjectionResponseForContext(r.Context()); projection != nil {
-		response["projection"] = projection
+		_, hasAuditSnapshot := r.Context().Value(
+			appV23ProjectionAuditContextKey{},
+		).(appV23ProjectionAuditSnapshot)
+		unfiltered := strings.TrimSpace(q.Get("q")) == "" &&
+			opts.DomainTag == "" && opts.Tag == "" && opts.Provider == "" &&
+			opts.Status == "" && opts.SubmittingAgent == "" &&
+			len(opts.SubmittingAgents) == 0 &&
+			opts.CreatedFrom == "" && opts.CreatedTo == ""
+		if !hasAuditSnapshot && unfiltered &&
+			observedHidden > projection.HiddenCount {
+			observed := appV23ProjectionResponseFromAudit(
+				false, true, false, observedHidden,
+			)
+			observed.Stale = projection.Stale
+			observed.Refreshing = projection.Refreshing
+			projection = observed
+		}
+		response["projection"] = h.projectionResponseForRequest(r, projection)
 	}
 	// Keep immutable signer attribution in every record, but give the local
 	// CEREBRUM UI a non-agent display label for every historical Root
@@ -2345,19 +2624,68 @@ type graphCacheEntry struct {
 	body       []byte
 	at         time.Time
 	refreshing bool
+	nodes      []graphNode
 }
 
 const (
-	defaultGraphMaxNodes = 2500             // dense enough to fill the instanced MRI without overwhelming weaker GPUs
+	defaultGraphMaxNodes = 1500             // dense enough to fill the instanced MRI without overwhelming weaker GPUs
 	graphCacheFresh      = 25 * time.Second // serve from cache without refreshing if younger than this
 	graphCacheTTL        = 10 * time.Minute // hard cap — older than this, recompute synchronously
+	// One first-paint request must never decrypt/classify tens of thousands of
+	// rows. The sampler distributes this fixed budget across the complete raw
+	// result set, so a 2,500-node MRI remains representative without making a
+	// weak laptop walk 40k-65k candidates synchronously.
+	graphFirstPaintScanBudget = appV23CerebrumInteractiveScanBudget
 )
 
 func graphMaxNodes() int {
 	if v, _ := strconv.Atoi(os.Getenv("SAGE_GRAPH_MAX_NODES")); v > 0 {
-		return v
+		return min(v, graphFirstPaintScanBudget)
 	}
 	return defaultGraphMaxNodes
+}
+
+func graphCandidateScanBudget(visibleLimit int) int {
+	if visibleLimit <= 0 {
+		return 0
+	}
+	return graphFirstPaintScanBudget
+}
+
+func graphStableCacheKey(
+	appV23 bool,
+	seeAll bool,
+	statusParam string,
+	drillDomain string,
+	limit int,
+	scope []string,
+	source appV23GraphSourceToken,
+) string {
+	// Memory revisions are deliberately absent. A newly appended memory may
+	// reuse the previous graph only after every cached node is re-read and
+	// canonically revalidated. Metadata, authorization, vault generation, and
+	// state-sync subset changes still invalidate the alias immediately.
+	return fmt.Sprintf(
+		"stable|v23=%v|%v|%s|%s|%d|%s|metadata=%d|authorization=%d|vault=%d|subset=%t",
+		appV23, seeAll, statusParam, drillDomain, limit,
+		strings.Join(scope, ","), source.Metadata, source.Authorization,
+		source.Memory.VaultGeneration, source.Memory.CanonicalSubset,
+	)
+}
+
+func graphSourceChangedOnlyByMemoryRevision(
+	before, after appV23GraphSourceToken,
+) bool {
+	if before == after {
+		return false
+	}
+	// The stable alias may bridge only SQL/canonical memory publication. Tags,
+	// links, corroborations, authorization, vault unlock, and state-sync subset
+	// changes can alter already-rendered graph data and must force a fresh build.
+	return before.Metadata == after.Metadata &&
+		before.Authorization == after.Authorization &&
+		before.Memory.VaultGeneration == after.Memory.VaultGeneration &&
+		before.Memory.CanonicalSubset == after.Memory.CanonicalSubset
 }
 
 // handleGraph returns all memories with edges for force-directed layout. The
@@ -2377,53 +2705,242 @@ func (h *DashboardHandler) handleGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	statusParam := q.Get("status")
 	drillDomain := q.Get("domain")
-	// On-chain RBAC: if the request comes from an MCP agent, enforce agent isolation.
-	allowedAgents, seeAll := h.resolveAgentRBAC(r)
+	appV23 := h.appV23IsActive()
+	for attempt := 0; attempt < 3; attempt++ {
+		var source appV23GraphSourceToken
+		sourceCacheable := false
+		var err error
+		if appV23 {
+			source, sourceCacheable, err = h.appV23GraphSource(r.Context())
+			if err != nil {
+				if writeAppV23DashboardProjectionFailure(w, err) {
+					return
+				}
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 
-	// Cache key: every input that changes the output, incl. the RBAC scope so a
-	// restricted agent is never served an operator (or another agent's) graph.
-	scope := append([]string(nil), allowedAgents...)
-	sort.Strings(scope)
-	projection := h.appV23ProjectionResponseForContext(r.Context())
-	projectionState := ""
-	partialProjection := false
-	if projection != nil {
-		projectionState = projection.State
-		partialProjection = projection.Partial
-	}
-	cacheKey := fmt.Sprintf(
-		"v23=%v|%v|%s|%s|%d|%s|projection=%s",
-		h.appV23IsActive(), seeAll, statusParam, drillDomain, limit,
-		strings.Join(scope, ","), projectionState,
-	)
+		// RBAC resolution is inside the authorization revision bracket. A role,
+		// grant, group, or Root handover racing this request forces a retry.
+		allowedAgents, seeAll := h.resolveAgentRBAC(r)
+		scope := append([]string(nil), allowedAgents...)
+		sort.Strings(scope)
+		if appV23 && sourceCacheable {
+			afterScope, afterCacheable, sourceErr :=
+				h.appV23GraphSource(r.Context())
+			if sourceErr != nil || !afterCacheable || afterScope != source {
+				continue
+			}
+		}
 
-	if !partialProjection {
+		projectionState := ""
+		if projection := h.appV23ProjectionResponseForContext(r.Context()); projection != nil {
+			projectionState = projection.State
+			if projection.Stale {
+				projectionState += ":refreshing"
+			}
+		}
+		cacheKey := fmt.Sprintf(
+			"v23=%v|%v|%s|%s|%d|%s|projection=%s|source=%s",
+			appV23, seeAll, statusParam, drillDomain, limit,
+			strings.Join(scope, ","), projectionState, source.cacheKey(),
+		)
+		stableCacheKey := graphStableCacheKey(
+			appV23, seeAll, statusParam, drillDomain, limit, scope, source,
+		)
+
 		if body := h.serveGraphFromCache(
 			cacheKey, statusParam, drillDomain, limit, seeAll, allowedAgents,
-			!h.appV23IsActive(),
+			!appV23, appV23 && sourceCacheable,
 		); body != nil {
+			if appV23 {
+				written, writeErr := h.writeAppV23GraphSnapshot(
+					w, r, source, seeAll, scope, body,
+				)
+				if writeErr != nil {
+					if writeAppV23DashboardProjectionFailure(w, writeErr) {
+						return
+					}
+					writeError(w, http.StatusInternalServerError, writeErr.Error())
+					return
+				}
+				if !written {
+					continue
+				}
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(body) //nolint:gosec // G705: body is server-built JSON sent as application/json, not HTML — no XSS sink
+			_, _ = w.Write(body) //nolint:gosec // server-built JSON
 			return
 		}
-	}
-	body, err := h.computeGraphJSON(r.Context(), statusParam, drillDomain, limit, seeAll, allowedAgents)
-	if err != nil {
-		if writeAppV23DashboardProjectionFailure(w, err) {
+
+		if appV23 && sourceCacheable {
+			staleBody, refresh, staleErr :=
+				h.validatedStaleGraphBody(
+					r.Context(), cacheKey, stableCacheKey,
+				)
+			if staleErr != nil {
+				if writeAppV23DashboardProjectionFailure(w, staleErr) {
+					return
+				}
+				writeError(w, http.StatusInternalServerError, staleErr.Error())
+				return
+			}
+			if staleBody != nil {
+				if refresh {
+					auditSnapshot, _ := r.Context().Value(
+						appV23ProjectionAuditContextKey{},
+					).(appV23ProjectionAuditSnapshot)
+					h.runBackground(func(ctx context.Context) {
+						ctx = context.WithValue(
+							ctx,
+							appV23ProjectionAuditContextKey{},
+							auditSnapshot,
+						)
+						h.refreshAppV23GraphCache(
+							ctx, cacheKey, stableCacheKey, source,
+							statusParam, drillDomain, limit,
+							seeAll, allowedAgents,
+						)
+					})
+				}
+				written, writeErr := h.writeAppV23GraphSnapshot(
+					w, r, source, seeAll, scope, staleBody,
+				)
+				if writeErr != nil {
+					if writeAppV23DashboardProjectionFailure(w, writeErr) {
+						return
+					}
+					writeError(w, http.StatusInternalServerError, writeErr.Error())
+					return
+				}
+				if !written {
+					continue
+				}
+				return
+			}
+		}
+
+		body, computeErr := h.computeGraphJSON(
+			r.Context(), statusParam, drillDomain, limit, seeAll, allowedAgents,
+		)
+		if computeErr != nil {
+			if writeAppV23DashboardProjectionFailure(w, computeErr) {
+				return
+			}
+			writeError(w, http.StatusInternalServerError, computeErr.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		if appV23 && sourceCacheable {
+			after, afterCacheable, sourceErr :=
+				h.appV23GraphSource(r.Context())
+			if sourceErr != nil || !afterCacheable {
+				continue
+			}
+			if after != source {
+				// A memory Commit may land while the bounded graph scan is running.
+				// Do not throw away the full scan and immediately repeat it when the
+				// computed nodes are still an exact, canonically valid subset of the
+				// new source. Retain only the stable alias; the retry below revalidates
+				// those IDs and seals against the new token before serving. Any changed
+				// or quarantined cached node rejects this fast path.
+				if graphSourceChangedOnlyByMemoryRevision(source, after) {
+					valid, validationErr := h.validateStaleGraphNodes(
+						r.Context(), graphNodesFromBody(body),
+					)
+					if validationErr != nil {
+						if writeAppV23DashboardProjectionFailure(w, validationErr) {
+							return
+						}
+						writeError(w, http.StatusInternalServerError, validationErr.Error())
+						return
+					}
+					if valid {
+						h.putGraphCache("", stableCacheKey, body)
+					}
+				}
+				continue
+			}
+			h.putGraphCache(cacheKey, stableCacheKey, body)
+			written, writeErr := h.writeAppV23GraphSnapshot(
+				w, r, source, seeAll, scope, body,
+			)
+			if writeErr != nil {
+				if writeAppV23DashboardProjectionFailure(w, writeErr) {
+					return
+				}
+				writeError(w, http.StatusInternalServerError, writeErr.Error())
+				return
+			}
+			if !written {
+				continue
+			}
+			return
+		} else if !appV23 {
+			h.putGraphCache(cacheKey, "", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body) //nolint:gosec // server-built JSON
 		return
 	}
-	finalProjection := h.appV23ProjectionResponseForContext(r.Context())
-	if finalProjection != nil && finalProjection.Partial {
-		partialProjection = true
+	writeError(w, http.StatusServiceUnavailable,
+		"memory graph changed while it was being prepared; retry")
+}
+
+// writeAppV23GraphSnapshot gives an already-built response a short, exact
+// publication window. Expensive graph computation and cache lookup happen
+// without holding global mutation locks; only the final source/RBAC recheck
+// and response write are linearized against SQL, canonical, and authorization
+// publication. This preserves revocation safety without freezing agent writes
+// for the duration of a cold graph build.
+func (h *DashboardHandler) writeAppV23GraphSnapshot(
+	w http.ResponseWriter,
+	r *http.Request,
+	source appV23GraphSourceToken,
+	seeAll bool,
+	scope []string,
+	body []byte,
+) (bool, error) {
+	releaseSQL := func() {}
+	if locker, ok := h.store.(projectionPublicationReader); ok {
+		releaseSQL = locker.LockProjectionPublicationRead()
 	}
-	if !partialProjection {
-		h.putGraphCache(cacheKey, body)
+	releaseCanonical := func() {}
+	if h.BadgerStore != nil {
+		releaseCanonical = h.BadgerStore.LockProjectionPublicationRead()
 	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		releaseCanonical()
+		releaseSQL()
+	}
+	defer release()
+
+	after, cacheable, err := h.appV23GraphSource(r.Context())
+	if err != nil {
+		return false, err
+	}
+	if !cacheable || after != source {
+		return false, nil
+	}
+	afterAllowed, afterSeeAll := h.resolveAgentRBAC(r)
+	afterScope := append([]string(nil), afterAllowed...)
+	sort.Strings(afterScope)
+	if afterSeeAll != seeAll || !slices.Equal(afterScope, scope) {
+		return false, nil
+	}
+	// The bytes and their exact authorization/source token are now sealed.
+	// Release both publication locks before touching the network: a stalled
+	// browser must never stop consensus or canonical projection publication.
+	release()
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(body) //nolint:gosec // G705: body is server-built JSON sent as application/json, not HTML — no XSS sink
+	_, _ = w.Write(body) //nolint:gosec // server-built JSON
+	return true, nil
 }
 
 // serveGraphFromCache returns a cached graph body when one is fresh enough to
@@ -2435,6 +2952,7 @@ func (h *DashboardHandler) serveGraphFromCache(
 	seeAll bool,
 	allowedAgents []string,
 	allowStaleRefresh bool,
+	exactToken bool,
 ) []byte {
 	now := time.Now()
 	h.graphCacheMu.Lock()
@@ -2443,32 +2961,71 @@ func (h *DashboardHandler) serveGraphFromCache(
 	if ent == nil || now.Sub(ent.at) >= graphCacheTTL {
 		return nil
 	}
+	if exactToken {
+		// Every graph-affecting input, including RBAC and metadata, is in the
+		// key. Reuse is exact through the hard TTL; the caller rechecks that
+		// source token immediately before writing the bytes.
+		return ent.body
+	}
 	if now.Sub(ent.at) >= graphCacheFresh && !allowStaleRefresh {
 		return nil
 	}
 	if now.Sub(ent.at) >= graphCacheFresh && !ent.refreshing {
 		ent.refreshing = true
 		h.runBackground(func(ctx context.Context) {
-			h.refreshGraphCache(ctx, key, statusParam, drillDomain, limit, seeAll, allowedAgents)
+			h.refreshGraphCache(
+				ctx, key, "", statusParam, drillDomain, limit,
+				seeAll, allowedAgents,
+			)
 		})
 	}
 	return ent.body
 }
 
-// putGraphCache stores a freshly-computed body, resetting the map if it has
-// grown unbounded (e.g. from many drill-down domains).
-func (h *DashboardHandler) putGraphCache(key string, body []byte) {
+func graphNodesFromBody(body []byte) []graphNode {
+	var response struct {
+		Nodes []graphNode `json:"nodes"`
+	}
+	if len(body) == 0 || json.Unmarshal(body, &response) != nil {
+		return nil
+	}
+	return response.Nodes
+}
+
+// putGraphCache stores a freshly-computed body under its exact source token and
+// an optional stable alias. The alias is never served blindly: app-v23 first
+// re-reads and canonically validates every cached node against the new source.
+func (h *DashboardHandler) putGraphCache(
+	key, stableKey string,
+	body []byte,
+) {
 	h.graphCacheMu.Lock()
 	defer h.graphCacheMu.Unlock()
 	if h.graphCache == nil || len(h.graphCache) > 128 {
 		h.graphCache = make(map[string]*graphCacheEntry)
 	}
-	h.graphCache[key] = &graphCacheEntry{body: body, at: time.Now()}
+	entry := &graphCacheEntry{
+		body:  append([]byte(nil), body...),
+		at:    time.Now(),
+		nodes: graphNodesFromBody(body),
+	}
+	if key != "" {
+		h.graphCache[key] = entry
+	}
+	if stableKey != "" {
+		h.graphCache[stableKey] = entry
+	}
 }
 
 // refreshGraphCache recomputes a cache entry off the request path (the
 // "revalidate" half of stale-while-revalidate).
-func (h *DashboardHandler) refreshGraphCache(parent context.Context, key, statusParam, drillDomain string, limit int, seeAll bool, allowedAgents []string) {
+func (h *DashboardHandler) refreshGraphCache(
+	parent context.Context,
+	key, stableKey, statusParam, drillDomain string,
+	limit int,
+	seeAll bool,
+	allowedAgents []string,
+) {
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	body, err := h.computeGraphJSON(ctx, statusParam, drillDomain, limit, seeAll, allowedAgents)
@@ -2482,8 +3039,206 @@ func (h *DashboardHandler) refreshGraphCache(parent context.Context, key, status
 	ent.refreshing = false
 	if err == nil {
 		ent.body = body
+		ent.nodes = graphNodesFromBody(body)
 		ent.at = time.Now()
+		if stableKey != "" {
+			h.graphCache[stableKey] = ent
+		}
 	}
+}
+
+type graphProjectionBatchReader interface {
+	GetLegacyMemoryProjectionRecords(
+		context.Context,
+		[]string,
+	) ([]*store.LegacyMemoryProjectionRecord, error)
+}
+
+func graphNodeMatchesProjection(
+	node graphNode,
+	record *store.LegacyMemoryProjectionRecord,
+) bool {
+	if record == nil {
+		return false
+	}
+	return node.ID == record.MemoryID &&
+		node.Content == truncate(record.Content, 200) &&
+		node.Domain == record.Domain &&
+		node.Status == string(record.Status) &&
+		node.Agent == record.SubmittingAgent &&
+		node.CreatedAt == record.CreatedAt.Format(time.RFC3339)
+}
+
+// validateStaleGraphNodes proves that an old graph remains a safe subset after
+// a memory-source revision changed. This is the additive-write fast path: only
+// the at-most-2,500 cached IDs are re-read in bounded batches, and every current
+// row is classified in one canonical snapshot per batch. SQL tamper, removal,
+// deprecation, domain/author change, or canonical revocation invalidates the
+// alias and falls through to a fresh bounded sample.
+func (h *DashboardHandler) validateStaleGraphNodes(
+	ctx context.Context,
+	nodes []graphNode,
+) (bool, error) {
+	if len(nodes) == 0 || h.BadgerStore == nil {
+		return false, nil
+	}
+	reader, ok := h.store.(graphProjectionBatchReader)
+	if !ok {
+		return false, nil
+	}
+	const batchSize = 256
+	for start := 0; start < len(nodes); start += batchSize {
+		end := start + batchSize
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		ids := make([]string, end-start)
+		for i := start; i < end; i++ {
+			ids[i-start] = nodes[i].ID
+		}
+		current, err := reader.GetLegacyMemoryProjectionRecords(ctx, ids)
+		if err != nil {
+			return false, err
+		}
+		records := make([]*memory.MemoryRecord, len(current))
+		for i, record := range current {
+			if record == nil || !graphNodeMatchesProjection(nodes[start+i], record) {
+				return false, nil
+			}
+			records[i] = &memory.MemoryRecord{
+				MemoryID:        record.MemoryID,
+				SubmittingAgent: record.SubmittingAgent,
+				Content:         record.Content,
+				ContentHash:     append([]byte(nil), record.ContentHash...),
+				DomainTag:       record.Domain,
+				Status:          record.Status,
+				CreatedAt:       record.CreatedAt,
+			}
+		}
+		classifications, err := h.BadgerStore.ClassifyMemoryProjections(records)
+		if err != nil {
+			return false, appV23DashboardProjectionError(err)
+		}
+		for i, classification := range classifications {
+			if classification.Err != nil {
+				if isAppV23BroadOmittableDashboardRecord(
+					classification.Disposition,
+					appV23DashboardProjectionError(classification.Err),
+				) {
+					return false, nil
+				}
+				return false, appV23DashboardProjectionError(classification.Err)
+			}
+			if classification.State != nil &&
+				classification.State.ClassificationRecorded &&
+				classification.State.Classification != current[i].Classification {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+func graphBodyWithCurrentProjection(
+	body []byte,
+	projection *appV23ProjectionResponse,
+) ([]byte, error) {
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+	if projection != nil {
+		encoded, err := json.Marshal(projection)
+		if err != nil {
+			return nil, err
+		}
+		response["projection"] = encoded
+	}
+	response["stale_cache"] = json.RawMessage("true")
+	return json.Marshal(response)
+}
+
+func (h *DashboardHandler) validatedStaleGraphBody(
+	ctx context.Context,
+	exactKey string,
+	stableKey string,
+) ([]byte, bool, error) {
+	h.graphCacheMu.Lock()
+	entry := h.graphCache[stableKey]
+	if entry == nil || time.Since(entry.at) >= graphCacheTTL {
+		h.graphCacheMu.Unlock()
+		return nil, false, nil
+	}
+	body := append([]byte(nil), entry.body...)
+	nodes := append([]graphNode(nil), entry.nodes...)
+	refresh := !entry.refreshing
+	h.graphCacheMu.Unlock()
+
+	valid, err := h.validateStaleGraphNodes(ctx, nodes)
+	if err != nil || !valid {
+		return nil, false, err
+	}
+	body, err = graphBodyWithCurrentProjection(
+		body,
+		h.appV23ProjectionResponseForContext(ctx),
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	// Validation is exact for the caller's current source token. Remember that
+	// result under the exact key so another tab/reload at the same revision does
+	// not decrypt and revalidate the same cached nodes again.
+	h.graphCacheMu.Lock()
+	if current := h.graphCache[stableKey]; current == entry && exactKey != "" {
+		h.graphCache[exactKey] = &graphCacheEntry{
+			body:  append([]byte(nil), body...),
+			at:    entry.at,
+			nodes: append([]graphNode(nil), nodes...),
+		}
+	}
+	h.graphCacheMu.Unlock()
+	if refresh {
+		h.graphCacheMu.Lock()
+		if current := h.graphCache[stableKey]; current == entry &&
+			!current.refreshing {
+			current.refreshing = true
+		} else {
+			refresh = false
+		}
+		h.graphCacheMu.Unlock()
+	}
+	return body, refresh, nil
+}
+
+func (h *DashboardHandler) refreshAppV23GraphCache(
+	parent context.Context,
+	exactKey, stableKey string,
+	expected appV23GraphSourceToken,
+	statusParam, drillDomain string,
+	limit int,
+	seeAll bool,
+	allowedAgents []string,
+) {
+	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+	defer cancel()
+	body, err := h.computeGraphJSON(
+		ctx, statusParam, drillDomain, limit, seeAll, allowedAgents,
+	)
+	if err == nil {
+		after, cacheable, sourceErr := h.appV23GraphSource(ctx)
+		if sourceErr != nil || !cacheable || after != expected {
+			err = errors.New("graph source changed during background refresh")
+		}
+	}
+	if err == nil {
+		h.putGraphCache(exactKey, stableKey, body)
+		return
+	}
+	h.graphCacheMu.Lock()
+	if entry := h.graphCache[stableKey]; entry != nil {
+		entry.refreshing = false
+	}
+	h.graphCacheMu.Unlock()
 }
 
 // computeGraphJSON performs the (expensive) graph build and returns the
@@ -2520,9 +3275,16 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 		var stats *store.StoreStats
 		var activity map[string]string
 		var sErr error
-		if audited, ok := ctx.Value(appV23ProjectionAuditContextKey{}).(appV23ProjectionAuditSnapshot); ok {
+		if audited, ok := ctx.Value(
+			appV23ProjectionAuditContextKey{},
+		).(appV23ProjectionAuditSnapshot); ok {
+			// A partial/quarantined snapshot still contains the exact aggregate
+			// of records individually verified safe for display. Its stale flag
+			// means "not the complete historical ledger", not "sample count".
+			// Use that verified total so the MRI HUD never substitutes the bounded
+			// rendered-node sample for the available-memory count.
 			stats, activity = audited.stats, audited.activity
-		} else {
+		} else if !h.appV23IsActive() {
 			stats, activity, _, sErr = h.cerebrumVisibleStatsAndActivity(ctx)
 		}
 		if sErr != nil {
@@ -2544,22 +3306,27 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 	//     shown are the meaningful ones;
 	//   - otherwise: newest within the cap.
 	var records []*memory.MemoryRecord
+	continuationRequired := false
 	var err error
-	switch {
-	case drillDomain != "":
+	if drillDomain != "" {
 		opts.Sort = "confidence"
-		records, _, err = h.store.ListMemories(ctx, opts)
-	case seeAll && grandTotal > limit && len(domainCounts) > 1:
-		records, err = h.stratifiedSample(ctx, opts, domainCounts, grandTotal, limit)
-	default:
+	}
+	if h.appV23IsActive() {
+		records, continuationRequired, err =
+			h.appV23CanonicalDashboardCandidates(
+				ctx, opts, limit, graphCandidateScanBudget(limit),
+			)
+	} else {
 		records, _, err = h.store.ListMemories(ctx, opts)
 	}
 	if err != nil {
 		return nil, err
 	}
-	records, err = h.filterAppV23BroadDashboardRecords(records)
-	if err != nil {
-		return nil, err
+	if !h.appV23IsActive() {
+		records, err = h.filterAppV23BroadDashboardRecords(records)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	nodes := make([]graphNode, 0, len(records))
@@ -2570,15 +3337,25 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 	for i, rec := range records {
 		memIDs[i] = rec.MemoryID
 	}
-	tagMap, _ := h.store.GetTagsBatch(ctx, memIDs)
+	tagMap, tagErr := h.store.GetTagsBatch(ctx, memIDs)
+	if tagErr != nil {
+		return nil, tagErr
+	}
 	// Batched corroboration counts for all rendered nodes — one query instead of
 	// one GetCorroborations per node (the per-node form was an N+1 that made the
 	// graph endpoint slow on large brains).
-	corrCounts, _ := h.store.GetCorroborationCounts(ctx, memIDs)
+	corrCounts, corrErr := h.store.GetCorroborationCounts(ctx, memIDs)
+	if corrErr != nil {
+		return nil, corrErr
+	}
 
 	// Build domain groups for edge generation
 	domainMemories := make(map[string][]string)
 	rootAuthors := make(map[string]bool)
+	renderedIDs := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		renderedIDs[record.MemoryID] = struct{}{}
+	}
 	for _, rec := range records {
 		agentLabel := ""
 		agentIsRoot := false
@@ -2612,11 +3389,10 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 
 		// Parent edge
 		if rec.ParentHash != "" {
-			for _, other := range records {
-				if other.MemoryID == rec.ParentHash {
-					edges = append(edges, graphEdge{Source: rec.MemoryID, Target: other.MemoryID, Type: "parent"})
-					break
-				}
+			if _, ok := renderedIDs[rec.ParentHash]; ok {
+				edges = append(edges, graphEdge{
+					Source: rec.MemoryID, Target: rec.ParentHash, Type: "parent",
+				})
 			}
 		}
 	}
@@ -2634,24 +3410,29 @@ func (h *DashboardHandler) computeGraphJSON(ctx context.Context, statusParam, dr
 	// in memIDs (the RBAC-visible set), so the connectome never surfaces a link to
 	// a memory the caller cannot see — and it is a single query, not one per node.
 	seenLink := make(map[string]bool)
-	if typed, lErr := h.store.GetLinksAmong(ctx, memIDs); lErr == nil {
-		for _, l := range typed {
-			key := l.SourceID + "\x00" + l.TargetID + "\x00" + l.LinkType
-			if seenLink[key] {
-				continue
-			}
-			seenLink[key] = true
-			lt := l.LinkType
-			if lt == "" {
-				lt = "related"
-			}
-			edges = append(edges, graphEdge{Source: l.SourceID, Target: l.TargetID, Type: lt})
+	typed, linkErr := h.store.GetLinksAmong(ctx, memIDs)
+	if linkErr != nil {
+		return nil, linkErr
+	}
+	for _, l := range typed {
+		key := l.SourceID + "\x00" + l.TargetID + "\x00" + l.LinkType
+		if seenLink[key] {
+			continue
 		}
+		seenLink[key] = true
+		lt := l.LinkType
+		if lt == "" {
+			lt = "related"
+		}
+		edges = append(edges, graphEdge{Source: l.SourceID, Target: l.TargetID, Type: lt})
 	}
 
 	resp := map[string]any{
 		"nodes": nodes,
 		"edges": edges,
+	}
+	if continuationRequired {
+		resp["continuation_required"] = true
 	}
 	if projection := h.appV23ProjectionResponseForContext(ctx); projection != nil {
 		resp["projection"] = projection
@@ -2679,41 +3460,6 @@ type domainActivityProvider interface {
 	GetDomainLastActivity(ctx context.Context) (map[string]string, error)
 }
 
-// stratifiedSample draws a representative, importance-ranked sample for the
-// overview brain: each domain gets a quota proportional to its share of the
-// total, filled with that domain's highest-confidence memories. Keeps lobe
-// density faithful to reality and surfaces the most significant memories, while
-// never exceeding the cap. One bounded ListMemories call per domain.
-func (h *DashboardHandler) stratifiedSample(ctx context.Context, base store.ListOptions, domainCounts map[string]int, total, cap int) ([]*memory.MemoryRecord, error) {
-	out := make([]*memory.MemoryRecord, 0, cap)
-	for domain, cnt := range domainCounts {
-		if cnt <= 0 {
-			continue
-		}
-		quota := (cap*cnt + total/2) / total // round(cap * cnt/total)
-		if quota < 1 {
-			quota = 1
-		}
-		o := base
-		o.DomainTag = domain
-		o.Sort = "confidence"
-		o.Limit = quota
-		recs, _, err := h.store.ListMemories(ctx, o)
-		if err != nil {
-			return nil, err
-		}
-		recs, err = h.filterAppV23BroadDashboardRecords(recs)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, recs...)
-	}
-	if len(out) > cap {
-		out = out[:cap]
-	}
-	return out, nil
-}
-
 type appV23DashboardStatsResponse struct {
 	*store.StoreStats
 	Projection *appV23ProjectionResponse `json:"projection,omitempty"`
@@ -2721,6 +3467,25 @@ type appV23DashboardStatsResponse struct {
 
 // handleStats returns aggregate statistics.
 func (h *DashboardHandler) handleStats(w http.ResponseWriter, r *http.Request) {
+	agentID := verifiedDashboardAgentID(r.Context())
+	if agentID != "" && !h.isCEREBRUMOperatorRequest(r) {
+		if !h.isEligibleRemoteSignedDashboardAgent(r.Context(), agentID) {
+			writeError(w, http.StatusForbidden, "active ordinary agent identity required")
+			return
+		}
+		// Registration precedes this call in legacy inception and creates the
+		// caller's identity memory. Report only that truthful lower bound. Never
+		// expose node totals, domains, agents, database size, or projection state
+		// through the compatibility route.
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"total_memories": 1,
+			"total_exact":    false,
+			"has_more":       true,
+			"scope":          "caller",
+			"compatibility":  "legacy-mcp-presence-lower-bound",
+		})
+		return
+	}
 	stats, _, projection, err := h.cerebrumVisibleStatsAndActivity(r.Context())
 	if err != nil {
 		if writeAppV23DashboardProjectionFailure(w, err) {
@@ -2731,7 +3496,7 @@ func (h *DashboardHandler) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSONResp(w, http.StatusOK, appV23DashboardStatsResponse{
 		StoreStats: stats,
-		Projection: projection,
+		Projection: h.projectionResponseForRequest(r, projection),
 	})
 }
 
@@ -2749,11 +3514,37 @@ func (h *DashboardHandler) handleDeleteMemory(w http.ResponseWriter, r *http.Req
 	if h.rejectInternalCerebrumMemory(w, r.Context(), id) {
 		return
 	}
+	if h.appV23IsActive() {
+		actor, ok := h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+		forgetTx := &tx.ParsedTx{
+			Type:      tx.TxTypeMemoryChallenge,
+			Timestamp: time.Now(),
+			MemoryChallenge: &tx.MemoryChallenge{
+				MemoryID: id,
+				Reason:   "deprecated by user in CEREBRUM",
+			},
+		}
+		if _, _, _, err := h.signAndBroadcastCommit(forgetTx, actor.Key); err != nil {
+			writeError(w, http.StatusBadGateway,
+				"the network did not confirm this memory change; nothing was changed: "+err.Error())
+			return
+		}
+		if h.SSE != nil {
+			h.SSE.Broadcast(SSEEvent{Type: EventForget, MemoryID: id})
+		}
+		writeJSONResp(w, http.StatusOK, map[string]string{"status": "consensus_submitted"})
+		return
+	}
 	if err := h.store.DeleteMemory(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.SSE.Broadcast(SSEEvent{Type: EventForget, MemoryID: id})
+	if h.SSE != nil {
+		h.SSE.Broadcast(SSEEvent{Type: EventForget, MemoryID: id})
+	}
 	writeJSONResp(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -2787,6 +3578,11 @@ func (h *DashboardHandler) handleUpdateMemory(w http.ResponseWriter, r *http.Req
 	}
 	if isCerebrumInternalMemoryDomain(body.Domain) {
 		writeError(w, http.StatusBadRequest, "domain is reserved for internal federation state")
+		return
+	}
+	if body.Domain != "" && h.appV23IsActive() {
+		writeAppV23AccessError(w, http.StatusConflict, "canonical_domain_immutable",
+			"A committed memory's domain is part of its chain history and cannot be rewritten. Tags can still be changed.")
 		return
 	}
 	if body.Domain != "" {
@@ -2834,6 +3630,11 @@ func (h *DashboardHandler) handleBulkUpdateMemories(w http.ResponseWriter, r *ht
 	}
 	if isCerebrumInternalMemoryDomain(body.Domain) {
 		writeError(w, http.StatusBadRequest, "domain is reserved for internal federation state")
+		return
+	}
+	if body.Domain != "" && h.appV23IsActive() {
+		writeAppV23AccessError(w, http.StatusConflict, "canonical_domain_immutable",
+			"Committed memory domains are part of chain history and cannot be bulk-rewritten. Tags can still be changed.")
 		return
 	}
 
@@ -2898,9 +3699,77 @@ func (h *DashboardHandler) handleBulkUpdateMemories(w http.ResponseWriter, r *ht
 	})
 }
 
-// handleListTags returns all unique tags with counts.
+func (h *DashboardHandler) appV23SafeTagCounts(
+	ctx context.Context,
+	submittingAgent string,
+) ([]store.TagCount, bool, error) {
+	counts := make(map[string]int)
+	rawOffset := 0
+	exhausted := false
+	for rawOffset < store.CandidateFilterScanBudget {
+		limit := appV23DashboardProjectionPageSize
+		if remaining := store.CandidateFilterScanBudget - rawOffset; remaining < limit {
+			limit = remaining
+		}
+		records, rawTotal, err := h.store.ListMemories(
+			ctx,
+			cerebrumListOptions(store.ListOptions{
+				SubmittingAgent: submittingAgent,
+				Sort:            "oldest",
+				StablePaging:    true,
+				Limit:           limit,
+				Offset:          rawOffset,
+			}),
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		safe, err := h.filterAppV23BroadDashboardRecords(records)
+		if err != nil {
+			return nil, false, err
+		}
+		ids := make([]string, len(safe))
+		for i, record := range safe {
+			ids[i] = record.MemoryID
+		}
+		tagMap, err := h.store.GetTagsBatch(ctx, ids)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, tags := range tagMap {
+			for _, tag := range tags {
+				counts[tag]++
+			}
+		}
+		rawOffset += len(records)
+		exhausted = len(records) < limit || rawOffset >= rawTotal
+		if exhausted {
+			break
+		}
+	}
+	tags := make([]store.TagCount, 0, len(counts))
+	for tag, count := range counts {
+		tags = append(tags, store.TagCount{Tag: tag, Count: count})
+	}
+	sort.Slice(tags, func(i, j int) bool {
+		if tags[i].Count != tags[j].Count {
+			return tags[i].Count > tags[j].Count
+		}
+		return tags[i].Tag < tags[j].Tag
+	})
+	return tags, !exhausted, nil
+}
+
+// handleListTags returns a bounded, verified tag aggregate.
 func (h *DashboardHandler) handleListTags(w http.ResponseWriter, r *http.Request) {
-	tags, err := h.store.ListAllTags(r.Context())
+	var tags []store.TagCount
+	partial := false
+	var err error
+	if h.appV23IsActive() {
+		tags, partial, err = h.appV23SafeTagCounts(r.Context(), "")
+	} else {
+		tags, err = h.store.ListAllTags(r.Context())
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2908,7 +3777,9 @@ func (h *DashboardHandler) handleListTags(w http.ResponseWriter, r *http.Request
 	if tags == nil {
 		tags = []store.TagCount{}
 	}
-	writeJSONResp(w, http.StatusOK, map[string]any{"tags": tags})
+	writeJSONResp(w, http.StatusOK, map[string]any{
+		"tags": tags, "partial": partial,
+	})
 }
 
 // handleGetMemoryTags returns tags for a specific memory.
@@ -2970,6 +3841,7 @@ func (h *DashboardHandler) handleSetMemoryTags(w http.ResponseWriter, r *http.Re
 // handleGetTasks returns tasks from the backlog. Use ?all=true for all statuses (Kanban board).
 func (h *DashboardHandler) handleGetTasks(w http.ResponseWriter, r *http.Request) {
 	domain := r.URL.Query().Get("domain")
+	localCandidateValidation := false
 
 	var tasks []*memory.MemoryRecord
 	var err error
@@ -2990,11 +3862,13 @@ func (h *DashboardHandler) handleGetTasks(w http.ResponseWriter, r *http.Request
 			limit = 500
 		}
 		tasks, err = h.store.GetAllTasks(r.Context(), domain, limit)
+		localCandidateValidation = true
 	} else {
 		provider := r.URL.Query().Get("provider")
 		// X-Agent-ID (set by the MCP server on every request) drives ownership: an
 		// agent's backlog excludes tasks claimed by another agent.
 		agentID := verifiedDashboardAgentID(r.Context())
+		localCandidateValidation = agentID == ""
 		if agentID == "" && !h.isCEREBRUMReadRequest(r) {
 			writeError(w, http.StatusForbidden, "the task backlog is available only to signed agents or an authenticated CEREBRUM session")
 			return
@@ -3030,6 +3904,9 @@ func (h *DashboardHandler) handleGetTasks(w http.ResponseWriter, r *http.Request
 			}
 			tasks = filtered
 		}
+	}
+	if err == nil && h.appV23IsActive() && localCandidateValidation {
+		tasks, err = h.filterAppV23BroadDashboardRecords(tasks)
 	}
 
 	if err != nil {
@@ -3634,6 +4511,11 @@ func (h *DashboardHandler) handleCreateTaskDashboard(w http.ResponseWriter, r *h
 		if !ok {
 			return
 		}
+		if strings.TrimSpace(h.CometBFTRPC) == "" {
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "consensus_rpc_unavailable",
+				"CEREBRUM cannot create a durable task while the local consensus service is unavailable. Nothing was added.")
+			return
+		}
 	} else if !h.isCEREBRUMOperatorRequest(r) {
 		writeCEREBRUMOperatorForbidden(w, "Creating tasks from CEREBRUM requires operator authority; agents should use sage_task.")
 		return
@@ -3939,7 +4821,7 @@ func (h *DashboardHandler) handleHealth(w http.ResponseWriter, r *http.Request) 
 	} else {
 		health["memories"] = stats
 		if projection != nil {
-			health["memory_projection"] = projection
+			health["memory_projection"] = publicAppV23ProjectionResponse(projection)
 		}
 	}
 
@@ -4309,6 +5191,11 @@ func (h *DashboardHandler) handleRunCleanup(w http.ResponseWriter, r *http.Reque
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		// Default to dry run for safety
 		body.DryRun = true
+	}
+	if h.appV23IsActive() && !body.DryRun {
+		writeAppV23AccessError(w, http.StatusConflict, "canonical_cleanup_required",
+			"Automatic cleanup cannot rewrite only CEREBRUM's local index. Review the dry run and forget memories through consensus.")
+		return
 	}
 
 	prefs, err := h.prefStore.GetAllPreferences(r.Context())
