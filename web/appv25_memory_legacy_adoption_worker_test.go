@@ -66,6 +66,13 @@ func TestAppV25LegacyAdoptionExplicitWakeResetsParkedRun(t *testing.T) {
 		"the next explicit-wake pass must build a fresh stable snapshot")
 }
 
+func TestAppV25LegacyAdoptionPollsPromptlyUntilStrictForkActivation(t *testing.T) {
+	require.Equal(t, time.Second, appV25LegacyAdoptionPollDelay(false),
+		"the H+1 activation transition must not inherit the normal maintenance cadence")
+	require.Equal(t, appV25LegacyAdoptionPollInterval,
+		appV25LegacyAdoptionPollDelay(true))
+}
+
 type blockingAppV25LegacyProjectionSource struct {
 	*store.SQLiteStore
 	scanStarted chan struct{}

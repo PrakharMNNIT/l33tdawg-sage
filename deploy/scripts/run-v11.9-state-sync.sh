@@ -618,6 +618,38 @@ for key, value in want.items():
 '
 }
 
+# App-v25 becomes mandatory at its strict H+1 boundary.  A state-sync receiver
+# can expose its ordinary REST listener just before it applies that boundary;
+# wait for the final-store maintenance scan as well as the scoped projection,
+# rather than sampling that legitimate short transition as a failure.
+wait_scoped_projection_ready() {
+  local container=$1
+  local deadline=$((SECONDS + TIMEOUT))
+  until rest_json "${container}" /ready | python3 -c '
+import json
+import sys
+
+body = json.load(sys.stdin)
+scoped = body.get("scoped_projection") or {}
+if body.get("status") != "ready":
+    raise SystemExit(1)
+want = {"checked": True, "required": True, "ok": True, "records": 1, "rebuilt": 1}
+for key, value in want.items():
+    if scoped.get(key) != value:
+        raise SystemExit(1)
+' >/dev/null 2>&1; do
+    if [ "$(docker inspect --format '{{.State.Running}}' "${container}" 2>/dev/null || true)" != true ]; then
+      echo "ERROR: ${container} exited before verified scoped projection readiness" >&2
+      return 1
+    fi
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      assert_scoped_projection_ready "${container}"
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 rpc_height() {
   rpc_json "$1" /status | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["sync_info"]["latest_block_height"])'
 }
@@ -1490,7 +1522,7 @@ if docker exec "${RECEIVER}" test -e "${READINESS_VIOLATION}"; then
   echo "ERROR: readiness probe recorded premature serving before pre-publication SIGKILL" >&2
   exit 1
 fi
-assert_scoped_projection_ready "${RECEIVER}"
+wait_scoped_projection_ready "${RECEIVER}"
 docker exec "${RECEIVER}" ./sage-gui-v119-fixture \
   v119-state-sync-fixture verify-scoped-projection "${scoped_memory_id}"
 wait_convergence "${PROVIDER}" "${RECEIVER}"
@@ -1548,7 +1580,7 @@ if [ "$(docker exec "${SUCCESS_RECEIVER}" ./sage-gui-v119-fixture v119-state-syn
   echo "ERROR: successful receiver did not durably disarm its one-shot role" >&2
   exit 1
 fi
-assert_scoped_projection_ready "${SUCCESS_RECEIVER}"
+wait_scoped_projection_ready "${SUCCESS_RECEIVER}"
 docker exec "${SUCCESS_RECEIVER}" ./sage-gui-v119-fixture \
   v119-state-sync-fixture verify-scoped-projection "${scoped_memory_id}"
 if [ "$(rpc_peer_ids "${PROVIDER}")" != "${success_receiver_id}" ]; then

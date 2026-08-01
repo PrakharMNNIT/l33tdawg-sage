@@ -105,6 +105,13 @@ func resetAppV25LegacyAdoptionRun(run *appV25LegacyAdoptionRun) {
 	run.finalScanNeeded = false
 }
 
+func appV25LegacyAdoptionPollDelay(active bool) time.Duration {
+	if !active {
+		return time.Second
+	}
+	return appV25LegacyAdoptionPollInterval
+}
+
 func appV25LegacyAdoptionBatch(
 	root *store.AppV23RootState,
 	entries []tx.MemoryLegacyAdoptionEntry,
@@ -435,9 +442,16 @@ func (h *DashboardHandler) RunAppV25LegacyAdoptionWorker(
 			seenRetry = requested
 			resetAppV25LegacyAdoptionRun(run)
 		}
-		delay := appV25LegacyAdoptionPollInterval
+		// The strict H+1 boundary can become active only after a state-synced
+		// receiver has started serving blocks.  Do not leave that transition in
+		// the ordinary 30-second maintenance cadence: /ready correctly starts
+		// requiring a current-process scan at that boundary, so an inactive
+		// worker must re-check promptly and publish the proof from the final
+		// store before the node is treated as fully ready.
+		activated := active()
+		delay := appV25LegacyAdoptionPollDelay(activated)
 		park := false
-		if active() {
+		if activated {
 			more, err := h.runAppV25LegacyAdoptionPassWithState(ctx, logger, run)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				logger.Warn().Err(err).
