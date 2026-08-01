@@ -306,7 +306,7 @@ func (m *Manager) LocalRouteStatus() map[string]any {
 	hooks := m.joinP2PHooks()
 	candidates := make([]map[string]any, 0, 2)
 	state := "degraded"
-	message := "No route is selected until a valid Direct address is supplied or a secure relay is ready."
+	message := "No route is ready yet. SAGE will use a direct route when available and fall back to a secure relay when needed."
 	if hooks.LocalBundle != nil {
 		if bundle, err := hooks.LocalBundle(); err == nil && validateP2PBundle(m.prepareLocalRouteBundle(bundle)) == nil {
 			hasDirect, hasRelay := false, false
@@ -319,6 +319,8 @@ func (m *Manager) LocalRouteStatus() map[string]any {
 			}
 			if hasDirect {
 				candidates = append(candidates, map[string]any{"kind": RouteKindP2PDirect, "ready": true})
+				state = "ready"
+				message = "A direct route is prepared. SAGE will use it now and add a secure relay fallback when one becomes available."
 			}
 			if hasRelay {
 				candidates = append(candidates, map[string]any{"kind": RouteKindRelay, "ready": true})

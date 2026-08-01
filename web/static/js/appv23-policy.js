@@ -238,3 +238,53 @@ export function appV23GroupDropKind(localAgentID, remoteCandidateKey) {
     if (localAgentID) return 'local_member';
     return '';
 }
+
+// A direct local drop is deliberately a narrow pair relationship. Dropping A
+// onto B must not silently add A to every group B happens to belong to: that
+// could reveal domains belonging to teammates the operator never chose. If
+// the pair already shares a group, use it; otherwise create a deterministic
+// two-member Access Group that the operator may rename or extend afterwards.
+export function appV23DirectLocalGroupPlan(groups, source, target) {
+    const sourceID = String(source?.agent_id || '').trim();
+    const targetID = String(target?.agent_id || '').trim();
+    if (!sourceID || !targetID || sourceID === targetID ||
+        source?.enrollment_active !== true || target?.enrollment_active !== true) {
+        return null;
+    }
+
+    const members = [sourceID, targetID].sort();
+    const existing = (Array.isArray(groups) ? groups : [])
+        .filter(group => Array.isArray(group?.members) &&
+            members.every(id => group.members.includes(id)))
+        .sort((a, b) => String(a.group_id || '').localeCompare(String(b.group_id || '')))[0];
+    if (existing) {
+        return {
+            action: 'existing',
+            group_id: existing.group_id,
+            name: existing.name || existing.group_id,
+            members,
+        };
+    }
+
+    const agentByID = new Map([
+        [sourceID, source],
+        [targetID, target],
+    ]);
+    const labels = members.map(id => {
+        const name = String(agentByID.get(id)?.name || '').trim();
+        return name || `Agent ${id.slice(0, 8)}`;
+    });
+    const base = `pair-${members[0].slice(0, 12)}-${members[1].slice(0, 12)}`;
+    const occupied = new Set((Array.isArray(groups) ? groups : [])
+        .map(group => String(group?.group_id || '').trim())
+        .filter(Boolean));
+    let groupID = base;
+    let suffix = 2;
+    while (occupied.has(groupID)) groupID = `${base.slice(0, 60)}-${suffix++}`;
+    return {
+        action: 'create',
+        group_id: groupID,
+        name: `${labels[0]} + ${labels[1]}`.slice(0, 128),
+        members,
+    };
+}

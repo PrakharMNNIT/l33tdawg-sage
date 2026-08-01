@@ -3527,15 +3527,45 @@ func (h *DashboardHandler) handleDeleteMemory(w http.ResponseWriter, r *http.Req
 				Reason:   "deprecated by user in CEREBRUM",
 			},
 		}
-		if _, _, _, err := h.signAndBroadcastCommit(forgetTx, actor.Key); err != nil {
-			writeError(w, http.StatusBadGateway,
-				"the network did not confirm this memory change; nothing was changed: "+err.Error())
+		_, _, txLog, err := h.signAndBroadcastCommit(forgetTx, actor.Key)
+		if err != nil {
+			// broadcast_tx_commit can lose its response after the validator has
+			// accepted the transaction. Treat transport/RPC uncertainty as pending,
+			// never as proof that "nothing changed": a second click can otherwise
+			// open a duplicate challenge or make a board card appear to resurrect.
+			if isIndeterminateCommitError(err) {
+				if record, getErr := h.store.GetMemory(r.Context(), id); getErr == nil && record != nil && record.Status == memory.StatusDeprecated {
+					if h.SSE != nil {
+						h.SSE.Broadcast(SSEEvent{Type: EventForget, MemoryID: id})
+					}
+					writeJSONResp(w, http.StatusOK, map[string]string{"status": "deprecated"})
+					return
+				}
+				writeJSONResp(w, http.StatusAccepted, map[string]string{
+					"status":  "confirmation_pending",
+					"message": "SAGE is still confirming this change. The board will refresh automatically.",
+				})
+				return
+			}
+			writeError(w, http.StatusConflict,
+				"memory deprecation was rejected: "+err.Error())
 			return
 		}
-		if h.SSE != nil {
-			h.SSE.Broadcast(SSEEvent{Type: EventForget, MemoryID: id})
+		status := "consensus_submitted"
+		// A challenged record deliberately remains visible pending a distinct
+		// eligible confirmer. Expose that truth to CEREBRUM so the UI does not
+		// falsely say that a task was cleared.
+		if strings.Contains(strings.ToLower(txLog), "challenged") && !strings.Contains(strings.ToLower(txLog), "deprecated") {
+			status = "challenge_opened"
 		}
-		writeJSONResp(w, http.StatusOK, map[string]string{"status": "consensus_submitted"})
+		if h.SSE != nil {
+			eventType := EventForget
+			if status == "challenge_opened" {
+				eventType = EventTask
+			}
+			h.SSE.Broadcast(SSEEvent{Type: eventType, MemoryID: id})
+		}
+		writeJSONResp(w, http.StatusOK, map[string]string{"status": status})
 		return
 	}
 	if err := h.store.DeleteMemory(r.Context(), id); err != nil {

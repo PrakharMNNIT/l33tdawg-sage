@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -85,7 +84,6 @@ func validateP2PBundle(bundle JoinP2PBundle) error {
 	if err != nil {
 		return fmt.Errorf("invalid p2p peer id")
 	}
-	hasCircuit := false
 	for _, raw := range bundle.Addrs {
 		if len(raw) == 0 || len(raw) > 512 {
 			return fmt.Errorf("invalid p2p route")
@@ -98,11 +96,10 @@ func validateP2PBundle(bundle JoinP2PBundle) error {
 		if err != nil || info.ID != declared {
 			return fmt.Errorf("p2p route peer mismatch")
 		}
-		hasCircuit = hasCircuit || strings.Contains(raw, "/p2p-circuit/")
 	}
-	if !hasCircuit {
-		return fmt.Errorf("p2p route bundle has no relay fallback")
-	}
+	// A bundle containing an authenticated direct address is useful on its own
+	// (notably for two SAGEs on the same LAN).  Circuit-relay candidates are
+	// optional fallbacks for roaming/NAT traversal, not an admission condition.
 	return validateRouteSnapshotTimes(bundle, time.Now())
 }
 

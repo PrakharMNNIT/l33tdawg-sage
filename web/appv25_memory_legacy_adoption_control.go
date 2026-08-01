@@ -94,7 +94,6 @@ func (h *DashboardHandler) validateAppV25LegacyRecoveryControlSnapshot(
 	ctx context.Context,
 	controller appV25LegacyRecoveryController,
 	request appV25LegacyRecoveryControlRequest,
-	requireCurrentProcessProof bool,
 ) error {
 	progress, err := controller.GetLegacyMemoryAdoptionProgress(ctx)
 	if err != nil {
@@ -105,9 +104,11 @@ func (h *DashboardHandler) validateAppV25LegacyRecoveryControlSnapshot(
 		progress.Recovery != request.ExpectedCount {
 		return store.ErrLegacyMemoryRecoverySnapshotChanged
 	}
-	if requireCurrentProcessProof && !h.appV25CurrentProcessAdoptionTerminal(progress) {
-		return store.ErrLegacyMemoryRecoverySnapshotChanged
-	}
+	// The durable recovery rows, their revision, and the published aggregate
+	// are the exact operator-facing inventory. Do not require the *global*
+	// memory projection revision or a process-local boot receipt here: ordinary
+	// post-upgrade writes advance those independently and used to make an
+	// unchanged recovery queue impossible to resolve forever.
 	return controller.ValidateLegacyMemoryRecoverySnapshot(
 		ctx, request.ProjectionRevision, request.ExpectedCount,
 	)
@@ -136,7 +137,7 @@ func (h *DashboardHandler) handleAppV25LegacyAdoptionRetry(w http.ResponseWriter
 		return
 	}
 	if err := h.validateAppV25LegacyRecoveryControlSnapshot(
-		r.Context(), controller, request, false,
+		r.Context(), controller, request,
 	); err != nil {
 		writeAppV25LegacyRecoveryControlError(w, err)
 		return
@@ -173,7 +174,7 @@ func (h *DashboardHandler) handleAppV25LegacyAdoptionDeprecate(w http.ResponseWr
 		return
 	}
 	if err := h.validateAppV25LegacyRecoveryControlSnapshot(
-		r.Context(), controller, request, true,
+		r.Context(), controller, request,
 	); err != nil {
 		writeAppV25LegacyRecoveryControlError(w, err)
 		return

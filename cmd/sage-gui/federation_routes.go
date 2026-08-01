@@ -48,8 +48,12 @@ func selectFederationRouteAddresses(all []string) ([]string, error) {
 			direct = append(direct, addr)
 		}
 	}
-	if len(relay) == 0 {
-		return nil, errors.New("relay reservation is not ready")
+	// A reachable direct candidate is already a complete route.  Relays make
+	// the connection roam across NATs, but must be an additive fallback rather
+	// than a prerequisite: refusing to advertise direct candidates until a relay
+	// reservation arrives made two SAGEs on the same LAN unreachable.
+	if len(direct) == 0 && len(relay) == 0 {
+		return nil, errors.New("no federation direct or relay addresses are available")
 	}
 	selected := append(direct, relay...)
 	return selected, nil

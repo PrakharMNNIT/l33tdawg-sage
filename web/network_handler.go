@@ -753,6 +753,17 @@ func (h *DashboardHandler) handleRemoveAgent(agentStore store.AgentStore) http.H
 			writeAppV23AccessError(w, http.StatusNotFound, "agent_not_found", "Agent not found.")
 			return
 		}
+		// Deletion is deliberately idempotent. A prior request may already have
+		// committed the on-chain deactivation and updated the local projection
+		// before the browser lost its response; retrying must settle the UI, not
+		// send the operator back into an endless "removing" state.
+		if agent.Status == "removed" {
+			writeJSONResp(w, http.StatusOK, map[string]any{
+				"ok": true, "status": "removed", "already_removed": true,
+				"consensus_active": false, "redeploy_required": false,
+			})
+			return
+		}
 		if agent.MemoryCount > 0 && r.URL.Query().Get("force") != "true" {
 			writeJSONResp(w, http.StatusConflict, map[string]any{
 				"ok": false, "code": "agent_has_memories", "error": "Agent has memories.",
@@ -763,14 +774,37 @@ func (h *DashboardHandler) handleRemoveAgent(agentStore store.AgentStore) http.H
 		}
 		enrollment, err := h.BadgerStore.GetAppV23Enrollment(id)
 		if err != nil || enrollment == nil {
-			writeAppV23AccessError(w, http.StatusConflict, "enrollment_state_missing",
-				"The agent has no consensus enrollment to deactivate.")
+			// Directory-only / historical records have never held an active
+			// app-v23 standing. There is no on-chain authority to revoke, so
+			// finish the local projection removal instead of making an otherwise
+			// empty agent impossible to remove forever.
+			if removeErr := agentStore.RemoveAgent(r.Context(), id); removeErr != nil {
+				writeAppV23AccessError(w, http.StatusInternalServerError, "projection_update_failed",
+					"The agent has no consensus enrollment, but its local dashboard record could not be marked removed.")
+				return
+			}
+			writeJSONResp(w, http.StatusOK, map[string]any{
+				"ok": true, "status": "removed", "consensus_active": false,
+				"local_only": true, "redeploy_required": false,
+			})
 			return
 		}
 		role, err := h.BadgerStore.GetAppV23Role(id)
 		if err != nil || role == nil {
+			if !enrollment.Active {
+				if removeErr := agentStore.RemoveAgent(r.Context(), id); removeErr != nil {
+					writeAppV23AccessError(w, http.StatusInternalServerError, "projection_update_failed",
+						"The agent is already inactive on-chain, but its local dashboard record could not be marked removed.")
+					return
+				}
+				writeJSONResp(w, http.StatusOK, map[string]any{
+					"ok": true, "status": "removed", "consensus_active": false,
+					"already_inactive": true, "redeploy_required": false,
+				})
+				return
+			}
 			writeAppV23AccessError(w, http.StatusConflict, "role_state_missing",
-				"The agent has no consensus role state to deactivate.")
+				"The active consensus enrollment has no role state to deactivate.")
 			return
 		}
 		var hash string

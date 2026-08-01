@@ -302,6 +302,18 @@ func TestHostCreateAutoUsesPreparedRelayBundle(t *testing.T) {
 	assert.Contains(t, create.OTPAuthURI, "x_sage_transport=p2p")
 }
 
+func TestHostCreateAutoUsesPreparedDirectBundle(t *testing.T) {
+	host := newCeremonyNode(t, "host-auto-direct")
+	bundle := testDirectRouteBundle(t, "192.168.1.25")
+	host.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return bundle, nil },
+	})
+	create, err := host.mgr.HostCreateAuto("https://192.168.1.20:8444")
+	require.NoError(t, err)
+	assert.Equal(t, "p2p", create.Transport)
+	assert.Contains(t, create.OTPAuthURI, "x_sage_transport=p2p")
+}
+
 func TestHostCreateAutoFallsBackToLegacyDirectForOldPeers(t *testing.T) {
 	host := newCeremonyNode(t, "host-auto2")
 	host.mgr.SetJoinP2PHooks(JoinP2PHooks{

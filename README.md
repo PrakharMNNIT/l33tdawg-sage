@@ -51,6 +51,38 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.16.3
+
+**CEREBRUM now settles operator actions against the canonical chain instead of
+undoing them in the browser.** Clearing a terminal task column keeps cards out
+of intermediate refreshes while the local projection catches up, then reloads
+the authoritative board. A lost or late commit response is reported as
+confirmation in progress rather than the false claim that nothing changed;
+only a definite consensus rejection is red. A multi-manager deprecation that
+opens a challenge is shown honestly as awaiting its distinct eligible
+confirmation rather than called cleared.
+
+**Access Groups and agent recovery are usable in the flow operators actually
+use.** Dragging one active local agent onto another creates or extends the
+narrowest local group, so members read each other's owned domains by default
+while Managers retain their extra write/modify authority. Dragging a member
+back out revokes only that group relationship. CEREBRUM also settles agent
+removal and first-use domain authority against committed state, rather than
+leaving a stale progress screen or asking a newly-created domain to retry its
+first operation.
+
+**Federation no longer requires a relay reservation to use a working direct
+route.** A trusted pair may connect immediately over its authenticated direct
+candidate—especially useful on the same LAN—and keeps the secure relay as an
+automatic roaming/NAT fallback. Direct-only route bundles now validate on both
+the dashboard and peer transport paths.
+
+This patch does not rewrite memories, domains, historical authors, existing
+groups, or chain history. It keeps consensus application version 25 and the
+existing governed upgrade path unchanged. Existing nodes upgrade in place.
+
+Container: `ghcr.io/l33tdawg/sage:11.16.3`. SDK 11.16.3.
+
 ## What's New in v11.16.2
 
 **One historical record can no longer take CEREBRUM or every agent offline.**
@@ -1009,7 +1041,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.16.2`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.16.3`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

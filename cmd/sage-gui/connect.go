@@ -220,16 +220,29 @@ func mcpIdentityPath(configPath, sageHome, provider string) string {
 // during config self-heal. Older configs without one use the legacy project
 // key when it exists, then new provider-specific paths on fresh installs.
 func configuredJSONMCPIdentityPath(config map[string]any, configPath, sageHome, provider string) string {
+	projectDir := mcpProjectDir(configPath, sageHome, provider)
 	if servers, ok := config["mcpServers"].(map[string]any); ok {
 		if sage, ok := servers["sage"].(map[string]any); ok {
 			if env, ok := sage["env"].(map[string]any); ok {
 				if path, ok := env["SAGE_IDENTITY_PATH"].(string); ok {
-					return existingIdentityOrDefault(path, sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+					// Older project installers wrote the node-wide default here.
+					// That made every checkout sharing an MCP configuration act as
+					// one agent. It was not an operator-selected custom key, so
+					// migrate it to the project identity and keep hooks/MCP aligned.
+					if projectDir != "" && isLegacySharedNodeIdentity(path, sageHome) {
+						return existingIdentityOrDefault("", sageHome, projectDir, provider)
+					}
+					return existingIdentityOrDefault(path, sageHome, projectDir, provider)
 				}
 			}
 		}
 	}
-	return existingIdentityOrDefault("", sageHome, mcpProjectDir(configPath, sageHome, provider), provider)
+	return existingIdentityOrDefault("", sageHome, projectDir, provider)
+}
+
+func isLegacySharedNodeIdentity(path, sageHome string) bool {
+	path = filepath.Clean(expandTilde(strings.TrimSpace(path)))
+	return path == filepath.Join(filepath.Clean(expandTilde(sageHome)), "agent.key")
 }
 
 func mcpConfigIdentityPath(configPath, sageHome, provider string) string {

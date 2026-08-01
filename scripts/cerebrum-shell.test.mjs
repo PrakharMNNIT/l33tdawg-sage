@@ -163,6 +163,8 @@ test('preserved historical records have one explicit repair-resolution flow', ()
     assert.match(resolution, /if \(refreshed\) \{[\s\S]*next = refreshed;[\s\S]*onProgress\(next\)/,
         'the follow-up GET must reconcile progress without reviving a stale local state');
     assert.match(resolution, /const result = await deprecateMemoryAdoption\([\s\S]*await refreshProgress\(result\)/);
+    assert.match(resolution, /CEREBRUM refreshed it; review the current count and try again/,
+        'a genuine inventory race must refresh the operator\'s snapshot instead of leaving a stale modal');
     assert.match(resolution, /remain preserved for audit/);
     assert.match(resolution, /not been deleted or rewritten/);
     assert.match(resolution, /permanently excludes these records from future repair attempts and the available-memory view/);
@@ -252,6 +254,22 @@ test('app-v23 access UI uses named policy choices and visibly separates local gr
         'the JOIN transport/operator key may be Root and must never become a linked-reader target');
     assert.match(access, /Add local agent menu/,
         'drag and drop must keep an accessible non-pointer alternative');
+    assert.match(access, /appV23DirectLocalGroupPlan\(state\?\.groups \|\| \[\], source, target\)/,
+        'dropping one approved local agent onto another must create a real narrow Access Group');
+    assert.match(access, /Drop here to remove this agent from its current Access Group/,
+        'dragging a member back out must revoke that group relationship');
+    assert.match(access, /Members can read one another’s owned domains; write remains with owners and Managers/,
+        'new direct groups must communicate their default read-only sharing boundary');
+    assert.match(appSource, /Memory ownership & recovery/,
+        'the agent review card must expose the affected memory inventory where the operator is making the decision');
+    assert.match(appSource, /fetchMemories\(\{[\s\S]*agent: agent\.agent_id/,
+        'agent recovery must load only the selected agent’s records');
+    assert.match(appSource, /reassignDomainOwnership\(\{[\s\S]*source_agent_id: agent\.agent_id/,
+        'the recovery transfer must reuse the real on-chain domain ownership flow');
+    assert.match(appSource, /deleteMemory\(item\.memory_id\)/,
+        'the recovery card must permit an operator to deprecate an exact checked subset');
+    assert.match(appSource, /Every memory in each listed domain moves under the new owner’s current control, including records not selected here/,
+        'the selected-record entry point must disclose that RBAC transfer is whole-domain, not a false per-record ownership rewrite');
     assert.match(access, /v23-access-legend/);
     assert.match(access, /v23-agent-choice local/);
     assert.match(access, /v23-agent-pill federated/);
@@ -259,11 +277,22 @@ test('app-v23 access UI uses named policy choices and visibly separates local gr
         'same-node identity needs a solid non-color cue');
     assert.match(cssSource, /\.v23-agent-pill\.federated[\s\S]*border-style: dashed;/,
         'federated identity needs a different non-color cue as well as a different accent');
+    assert.match(cssSource, /\.v23-agent-choice\[draggable="true"\]/,
+        'the real local-agent cards must advertise the direct grouping gesture');
     assert.match(access, /selected\.needs_reauthorization/);
     assert.match(access, /Root handover suspended this delegated Admin/);
     assert.match(access, /Admin suspended/);
     assert.match(access, /suspended after Root handover/);
     assert.match(access, /Reauthorize Admin/);
+});
+
+test('agent removal leaves the confirmation usable if the server rejects it', () => {
+    assert.match(appSource, /if \(res\.redeploy_required !== false\)/,
+        'the client must respect app-v23 agent removal without a redeploy');
+    assert.match(appSource, /const completed = await onConfirm\(\);\s*if \(!completed\) setRemoving\(false\);/,
+        'a failed removal must release the confirmation instead of spinning indefinitely');
+    assert.match(appSource, /Confirming its removal and preserving its historical memory attribution/,
+        'the progress copy must not promise a redeployment that app-v23 removal does not perform');
 });
 
 test('MCP setup copy describes the app-v23 restricted identity instead of obsolete Root inheritance', () => {
@@ -1205,6 +1234,21 @@ test('task cards expand fully and planned task edits preserve consensus history'
         'the replacement must commit before the original planned task is retired');
     assert.match(cssSource, /\.kanban-card\.expanded \.kanban-card-content\s*\{[^}]*display:\s*block/s);
     assert.match(cssSource, /white-space:\s*pre-wrap/);
+});
+
+test('clearing a task column reconciles delayed consensus instead of restoring stale cards', () => {
+    const tasksPage = appSource.slice(appSource.indexOf('function TasksPage('), appSource.indexOf('function PipelineView('));
+    const clearColumn = tasksPage.slice(tasksPage.indexOf('async function clearColumn('), tasksPage.indexOf('async function handleAddTask('));
+    assert.match(tasksPage, /const settlingClears = useRef\(new Set\(\)\)/);
+    assert.match(clearColumn, /await Promise\.allSettled\(ids\.map\(id => deleteMemory\(id\)\)\)/,
+        'one delayed task must not fail a whole column clear');
+    assert.match(tasksPage, /async function reconcileClearedTasks\(ids\)/);
+    assert.match(clearColumn, /SAGE is still confirming/,
+        'an indeterminate consensus response must be treated as a pending reconciliation');
+    assert.match(clearColumn, /challenge_opened/,
+        'a multi-holder challenge must be explained instead of being called cleared');
+    assert.doesNotMatch(clearColumn, /setTasks\(previousTasks\)/,
+        'a pre-commit React snapshot must never resurrect cards after an uncertain commit');
 });
 
 test('settings does not force a full-page render every 100ms', () => {

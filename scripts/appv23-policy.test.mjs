@@ -11,6 +11,7 @@ import {
     appV23ProfileNeedsReview,
     appV23RoleDefaults,
     appV23ClampLinkedClearance,
+    appV23DirectLocalGroupPlan,
     appV23GroupDropKind,
     appV23LinkedClearanceCeiling,
     APPV23_ROOT_HANDOVER_PHRASE,
@@ -262,6 +263,43 @@ test('Linked-reader classification is capped by the federation agreement', () =>
 test('federated drops remain linked readers instead of local group members', () => {
     assert.equal(appV23GroupDropKind('local-id', 'remote-chain\u0000remote-id'), 'linked_reader');
     assert.equal(appV23GroupDropKind('local-id', ''), 'local_member');
+});
+
+test('dropping an approved local agent onto another creates a narrow deterministic pair group', () => {
+    const alpha = { agent_id: 'a'.repeat(64), name: 'Alpha', enrollment_active: true };
+    const bravo = { agent_id: 'b'.repeat(64), name: 'Bravo', enrollment_active: true };
+    const plan = appV23DirectLocalGroupPlan([], bravo, alpha);
+
+    assert.deepEqual(plan, {
+        action: 'create',
+        group_id: `pair-${'a'.repeat(12)}-${'b'.repeat(12)}`,
+        name: 'Alpha + Bravo',
+        members: ['a'.repeat(64), 'b'.repeat(64)],
+    });
+});
+
+test('direct local drop reuses an existing shared group without widening another relationship', () => {
+    const alpha = { agent_id: 'a'.repeat(64), name: 'Alpha', enrollment_active: true };
+    const bravo = { agent_id: 'b'.repeat(64), name: 'Bravo', enrollment_active: true };
+    const charlie = 'c'.repeat(64);
+    const plan = appV23DirectLocalGroupPlan([
+        { group_id: 'broad-team', name: 'Broad team', members: [alpha.agent_id, charlie] },
+        { group_id: 'alpha-bravo', name: 'Alpha and Bravo', members: [alpha.agent_id, bravo.agent_id] },
+    ], alpha, bravo);
+
+    assert.deepEqual(plan, {
+        action: 'existing',
+        group_id: 'alpha-bravo',
+        name: 'Alpha and Bravo',
+        members: [alpha.agent_id, bravo.agent_id],
+    });
+});
+
+test('direct local drop never creates a group for a pending or identical agent', () => {
+    const alpha = { agent_id: 'a'.repeat(64), name: 'Alpha', enrollment_active: true };
+    const pending = { agent_id: 'b'.repeat(64), name: 'Bravo', enrollment_active: false };
+    assert.equal(appV23DirectLocalGroupPlan([], alpha, pending), null);
+    assert.equal(appV23DirectLocalGroupPlan([], alpha, alpha), null);
 });
 
 test('Root handover final action requires the exact second-stage phrase', () => {

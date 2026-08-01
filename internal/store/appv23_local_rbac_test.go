@@ -859,6 +859,24 @@ func TestAppV23GroupMemberReadManagerWriteAndMultiGroupUnion(t *testing.T) {
 	outsiderRead, err := s.AuthorizeAppV23LocalDomain(outsider, ownerAEnrollment.HomeDomain, AppV23VerbRead, false)
 	require.NoError(t, err)
 	require.False(t, outsiderRead.Allowed)
+
+	// Removing a Member from the committed group must revoke only the derived
+	// shared-domain relationship. The owner keeps its own domain authority; no
+	// browser-side grouping can leave a stale read grant behind.
+	teamA, err := s.GetAppV23AccessGroup("team-a")
+	require.NoError(t, err)
+	require.NotNil(t, teamA)
+	remainingMembers := []string{ownerA, manager}
+	sort.Strings(remainingMembers)
+	require.NoError(t, s.MutateAppV23AccessGroup(
+		root, "team-a", "Team A", remainingMembers, teamA.Revision, false, 13,
+	))
+	memberReadAfterRemoval, err := s.AuthorizeAppV23LocalDomain(member, ownerAEnrollment.HomeDomain, AppV23VerbRead, false)
+	require.NoError(t, err)
+	require.False(t, memberReadAfterRemoval.Allowed)
+	ownerWriteAfterRemoval, err := s.AuthorizeAppV23LocalDomain(ownerA, ownerAEnrollment.HomeDomain, AppV23VerbWrite, false)
+	require.NoError(t, err)
+	require.True(t, ownerWriteAfterRemoval.Allowed)
 }
 
 func TestAppV23AccessGroupMutationPreservesGlobalStateBounds(t *testing.T) {

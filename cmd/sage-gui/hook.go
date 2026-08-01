@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,17 +31,56 @@ import (
 // Claude Code does not surface to the agent); only the context payload goes
 // to stdout (which IS surfaced).
 func runHook() error {
-	if len(os.Args) < 3 {
-		return fmt.Errorf("hook: subcommand required (session-start | session-end)")
+	args := os.Args[2:]
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		printHookUsage()
+		return nil
 	}
-	switch os.Args[2] {
+	switch args[0] {
 	case "session-start":
-		return runHookSessionStart()
+		if len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
+			printHookUsage()
+			return nil
+		}
+		domain, err := hookSessionStartDomain(args[1:])
+		if err != nil {
+			return err
+		}
+		return runHookSessionStartForDomain(domain)
 	case "session-end":
+		if len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
+			printHookUsage()
+			return nil
+		}
 		return runHookSessionEnd()
 	default:
-		return fmt.Errorf("hook: unknown subcommand %q", os.Args[2])
+		return fmt.Errorf("hook: unknown subcommand %q", args[0])
 	}
+}
+
+func printHookUsage() {
+	fmt.Fprintln(os.Stdout, "Usage: sage-gui hook session-start [--domain DOMAIN]")
+	fmt.Fprintln(os.Stdout, "       sage-gui hook session-end")
+}
+
+func hookSessionStartDomain(args []string) (string, error) {
+	domain := strings.TrimSpace(os.Getenv("SAGE_DOMAIN_FILTER"))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h":
+			printHookUsage()
+			return "", nil
+		case "--domain":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", fmt.Errorf("hook session-start: --domain requires a value")
+			}
+			domain = strings.TrimSpace(args[i+1])
+			i++
+		default:
+			return "", fmt.Errorf("hook session-start: unknown option %q", args[i])
+		}
+	}
+	return domain, nil
 }
 
 const (
@@ -52,9 +92,36 @@ const (
 // block on stdout. Claude Code injects stdout from SessionStart hooks into the
 // agent's prompt.
 func runHookSessionStart() error {
-	resp, err := hookSignedRequest(http.MethodGet,
-		fmt.Sprintf("/v1/memory/list?limit=%d&sort=newest&status=committed", hookRecentLimit),
-		nil)
+	return runHookSessionStartForDomain("")
+}
+
+// runHookSessionStartForDomain fetches only caller-scoped recent memory. An
+// empty explicit domain is resolved through the signed self profile; it never
+// falls back to an unscoped list because that could disclose another local
+// agent's memories in a shared-node hook prompt.
+func runHookSessionStartForDomain(domain string) error {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		var self struct {
+			HomeDomain  string `json:"home_domain"`
+			AccessScope string `json:"access_scope"`
+		}
+		if err := hookSignedJSON(http.MethodGet, "/v1/agent/me", nil, &self); err != nil {
+			return fmt.Errorf("resolve caller memory scope: %w", err)
+		}
+		domain = strings.TrimSpace(self.HomeDomain)
+	}
+	if domain == "" {
+		fmt.Println("SAGE: connected, no caller-scoped home domain is available for prefetch.")
+		return nil
+	}
+
+	query := url.Values{}
+	query.Set("limit", fmt.Sprintf("%d", hookRecentLimit))
+	query.Set("sort", "newest")
+	query.Set("status", "committed")
+	query.Set("domain", domain)
+	resp, err := hookSignedRequest(http.MethodGet, "/v1/memory/list?"+query.Encode(), nil)
 	if err != nil {
 		return err
 	}
@@ -115,6 +182,17 @@ func runHookSessionStart() error {
 	}
 	fmt.Println()
 	fmt.Println("Use sage_recall for targeted retrieval; this list is just a warm prefetch.")
+	return nil
+}
+
+func hookSignedJSON(method, path string, body []byte, out any) error {
+	resp, err := hookSignedRequest(method, path, body)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(resp, out); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
 	return nil
 }
 

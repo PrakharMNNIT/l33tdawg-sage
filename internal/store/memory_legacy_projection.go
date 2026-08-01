@@ -482,23 +482,17 @@ func (s *SQLiteStore) ListLegacyMemoryRecoveryDispositionIDs(
 
 // ValidateLegacyMemoryRecoverySnapshot gives a non-mutating preflight that an
 // operator action still targets the exact unresolved inventory shown by
-// CEREBRUM. DeprecateLegacyMemoryRecoverySnapshot repeats these checks inside
-// its write transaction before recording any disposition.
+// CEREBRUM. The recovery queue is its own durable snapshot: ordinary current
+// memory writes must not invalidate it just because they advance the global
+// projection revision. DeprecateLegacyMemoryRecoverySnapshot repeats these
+// exact-queue checks inside its write transaction before recording any
+// disposition.
 func (s *SQLiteStore) ValidateLegacyMemoryRecoverySnapshot(
 	ctx context.Context,
 	expectedRevision uint64,
 	expectedCount int,
 ) error {
 	if expectedRevision == 0 || expectedCount <= 0 {
-		return ErrLegacyMemoryRecoverySnapshotChanged
-	}
-	var revision int64
-	if err := s.conn.QueryRowContext(ctx,
-		`SELECT revision FROM memory_projection_revision WHERE singleton = 1`,
-	).Scan(&revision); err != nil {
-		return fmt.Errorf("read memory projection revision: %w", err)
-	}
-	if revision < 0 || uint64(revision) != expectedRevision {
 		return ErrLegacyMemoryRecoverySnapshotChanged
 	}
 	var count int
@@ -546,15 +540,6 @@ func (s *SQLiteStore) DeprecateLegacyMemoryRecoverySnapshot(
 	defer unlock()
 	defer func() { _ = txn.Rollback() }()
 
-	var revision int64
-	if revisionErr := txn.QueryRowContext(ctx,
-		`SELECT revision FROM memory_projection_revision WHERE singleton = 1`,
-	).Scan(&revision); revisionErr != nil {
-		return 0, fmt.Errorf("read memory projection revision: %w", revisionErr)
-	}
-	if revision < 0 || uint64(revision) != expectedRevision {
-		return 0, ErrLegacyMemoryRecoverySnapshotChanged
-	}
 	rows, queryErr := txn.QueryContext(ctx,
 		`SELECT memory_id, machine_reason FROM legacy_memory_recovery
 		 WHERE resolved_at IS NULL AND projection_revision = ?

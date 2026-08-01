@@ -75,6 +75,21 @@ func TestSelectFederationRouteAddressesKeepsMultipleRelayCandidates(t *testing.T
 	assert.Equal(t, addrs, selected)
 }
 
+func TestSelectFederationRouteAddressesAllowsDirectWithoutRelay(t *testing.T) {
+	addrs := []string{
+		"/ip4/192.168.1.25/tcp/4001/p2p/destination",
+		"/ip6/fe80::1/tcp/4001/p2p/destination",
+	}
+	selected, err := selectFederationRouteAddresses(addrs)
+	require.NoError(t, err)
+	assert.Equal(t, addrs, selected)
+}
+
+func TestSelectFederationRouteAddressesRejectsEmptyCandidateSet(t *testing.T) {
+	_, err := selectFederationRouteAddresses([]string{"", ""})
+	require.ErrorContains(t, err, "no federation direct or relay addresses")
+}
+
 func TestPersistStateSyncReceivingPreservesRawPaths(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("SAGE_HOME", tmp)

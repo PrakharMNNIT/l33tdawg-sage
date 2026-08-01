@@ -194,7 +194,21 @@ func TestLocalRouteStatusDoesNotClaimUnknownDirectRouteReady(t *testing.T) {
 	require.True(t, ok)
 	assert.Empty(t, candidates)
 	assert.NotContains(t, status, "selected")
-	assert.Contains(t, status["message"], "No route is selected")
+	assert.Contains(t, status["message"], "No route is ready")
+}
+
+func TestLocalRouteStatusReportsPreparedDirectRoute(t *testing.T) {
+	m := &Manager{routeStatus: make(map[string]RouteDiagnostics)}
+	m.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return testDirectRouteBundle(t, "192.168.1.25"), nil },
+	})
+	status := m.LocalRouteStatus()
+	assert.Equal(t, "ready", status["state"])
+	candidates, ok := status["candidates"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, RouteKindP2PDirect, candidates[0]["kind"])
+	assert.Contains(t, status["message"], "A direct route is prepared")
 }
 
 func TestPersistRouteSnapshotRejectsStaleAndConflictingRevision(t *testing.T) {

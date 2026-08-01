@@ -85,6 +85,40 @@ func TestAppV23RemoveCommitsDeactivationAndGroupCleanupBeforeSQLProjection(t *te
 	assert.Equal(t, "removed", projected.Status)
 }
 
+func TestAppV23RemoveDirectoryOnlyAgentSettlesAndIsIdempotent(t *testing.T) {
+	fixture := newAppV23AccessFixture(t)
+	sqlStore, err := store.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "sage.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlStore.Close()) })
+	_, localKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	directoryOnlyID := agentIDForKey(localKey)
+	require.NoError(t, sqlStore.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: directoryOnlyID, Name: "Directory-only", Role: "member", Status: "active", Clearance: 1,
+	}))
+
+	h := appV23AccessTestHandler(fixture, "http://unused.invalid", nil)
+	h.store = sqlStore
+	remove := func() *httptest.ResponseRecorder {
+		req := appV23AccessRequest(t, http.MethodDelete, "/agents/"+directoryOnlyID+"?force=true", "id", directoryOnlyID, nil)
+		req = appV23AccessAs(req, fixture.rootID)
+		rec := httptest.NewRecorder()
+		h.handleRemoveAgent(sqlStore).ServeHTTP(rec, req)
+		return rec
+	}
+
+	first := remove()
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	assert.Contains(t, first.Body.String(), `"local_only":true`)
+	projected, err := sqlStore.GetAgent(context.Background(), directoryOnlyID)
+	require.NoError(t, err)
+	assert.Equal(t, "removed", projected.Status)
+
+	second := remove()
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	assert.Contains(t, second.Body.String(), `"already_removed":true`)
+}
+
 func TestAppV23NonRootKeyRotationFailsClosedWithoutSQLMutation(t *testing.T) {
 	fixture := newAppV23AccessFixture(t)
 	sqlStore, err := store.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "sage.db"))
