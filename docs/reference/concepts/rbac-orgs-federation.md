@@ -2,8 +2,9 @@
 
 # RBAC, Organizations, and Federation
 
-Verified against code at SAGE v11.7.0, with the v11.9 quorum/state-sync section
-updated against the 2026-07 opt-in implementation and open release gates.
+Verified against SAGE v11.16.2. Legacy organization/federation sections retain
+their historical context; app-v23 roles, Root, Access Groups, and app-v25
+historical writer continuity are the current local-control model.
 
 ## Overview
 
@@ -106,6 +107,21 @@ When an agent submits a memory to a domain that has no registered owner and is n
 - Exact names: `general`, `self`, `meta` (`app.go:766-770`)
 - Prefix match: `sage-*` (`app.go:780-782`)
 - Any domain with on-chain `shared_domain:<name>` sentinel (set by `TxTypeDomainReassign` with `OpenToShared=true`)
+
+### App-v25 recovered historical-domain continuity
+
+Historical rows from before the app-v23 local-enrollment model are not blindly
+treated as new claims. App-v25 derives continuity only from complete, exact
+canonical evidence. The earliest verified historical local writer remains the
+operational owner; other verified local writers become members of the exact
+recovered Access Group and retain read/write authority on that domain. This is
+not a federation mechanism and it does not alter memory authorship.
+
+If the earliest writer is unavailable as a safe local principal, CEREBRUM Root
+owns the recovered domain. SAGE never promotes a later writer by inference.
+The recovered writer set is fixed at the app-v25 cutoff, so a new memory cannot
+expand it. Linked federated readers remain read-only and never become group
+members. See [`../app-v25-upgrade-recovery.md`](../app-v25-upgrade-recovery.md).
 
 ### Explicit Grants
 

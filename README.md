@@ -85,30 +85,37 @@ Container: `ghcr.io/l33tdawg/sage:11.16.3`. SDK 11.16.3.
 
 ## What's New in v11.16.2
 
-**One historical record can no longer take CEREBRUM or every agent offline.**
-v11.16.1 still returned a global `503` when it encountered a canonical
-zero-hash record, a deterministic SQL/canonical envelope mismatch, a malformed
-record-local envelope, or a canonical record whose SQL projection was missing.
-v11.16.2 quarantines each affected record individually. Broad list/search,
-graph, timeline, stats, and dashboard-health reads continue with the readable
-set and carry an explicit partial-projection marker. Authenticated broad routes
-used by the local CEREBRUM operator also report only the aggregate hidden
-count. Public health and ordinary signed agents keep the generic warning and
-never receive that count.
+**App-v25 repairs historical continuity without rewriting history.** It is the
+strict H+1 successor to app-v24. New submissions receive an immutable
+canonical envelope: a memory ID can be replayed exactly, but cannot later be
+reused for different content, author, domain, or classification. That closes
+the old projection-overwrite path that could leave an agent able to write a
+domain but unable to read it back.
 
-`/ready` now returns HTTP `200` with status `degraded` after a complete audit
-has localized the unsafe records. It still returns `503` when the audit did not
-complete, the canonical store is unavailable, or a real infrastructure
-dependency is down. This keeps supervisors, MCP bootstrap, `sage_inception`,
-and healthy agent work online while preserving strict handling of actual
-backend failures.
+On upgrade, SAGE scans historical SQL rows against canonical state in the
+background. Complete, content-hash-verified records are adopted through
+bounded Root-authorized, validator-attested governance batches. No memory
+content, author attribution, domain, classification, or earlier block is
+rewritten. For each recovered local domain, the earliest verified historical
+writer is retained as the operational owner; every other verified local writer
+is restored into the exact local Access Group with read/write continuity. If
+the earliest writer is no longer a valid local principal, CEREBRUM Root owns
+the recovered domain rather than promoting a later writer by guesswork.
 
-Exact/detail, related, tags, task-derived views, and portable export remain
-unavailable while any requested result cannot be verified. Hidden records are
-not deleted, rewritten, or silently called verified: CEREBRUM says they remain
-preserved for governed recovery or deprecation. Existing consensus rules,
-AppHash inputs, application version 24, memories, domains, keys, and chain
-history are unchanged.
+**One bad historical row can no longer blank CEREBRUM or take agents offline.**
+v11.16.2 quarantines each unverified record individually. Broad list/search,
+graph, timeline, stats, and dashboard-health reads continue with the verified
+set and disclose a partial-projection state. A completed audit returns
+`/ready` as HTTP `200` / `degraded`; actual backend failures and incomplete
+audits remain unavailable. This keeps supervisors, MCP bootstrap,
+`sage_inception`, and healthy agent work online without pretending incomplete
+data is safe.
+
+Unreadable or conflicting records are preserved byte-for-byte. CEREBRUM Root
+can retry the evidence scan or explicitly deprecate the exact unresolved
+inventory after a typed confirmation; deprecation retires it from automatic
+repair and normal views but does not delete historical data. See
+[App-v25 upgrade and recovery](docs/reference/app-v25-upgrade-recovery.md).
 
 Container: `ghcr.io/l33tdawg/sage:11.16.2`. SDK 11.16.2.
 

@@ -433,3 +433,32 @@ def test_agent_profile_tolerates_old_server_omitting_poe_signals():
     assert profile.corr_count is None
     assert profile.domain_expertise is None
     assert profile.accuracy is None
+
+
+def test_agent_profile_parses_app_v23_caller_standing():
+    # A pending-review identity must be able to learn its own standing without
+    # reading a roster or probing a forbidden memory route. The SDK must retain
+    # this additive app-v23 response surface for callers to act on it.
+    from sage_sdk.models import AgentProfile
+
+    profile = AgentProfile.model_validate({
+        "agent_id": "abc123",
+        "poe_weight": 0.0,
+        "vote_count": 0,
+        "role": "member",
+        "profile": "pending_review",
+        "home_domain": "local-abc123",
+        "enrollment_status": "pending_review",
+        "registration_status": "pending_review",
+        "approval_required": True,
+        "clearance": 0,
+        "capabilities": 30,
+        "can_read": False,
+        "can_write": False,
+        "access_scope": "home_domain",
+    })
+
+    assert profile.enrollment_status == "pending_review"
+    assert profile.approval_required is True
+    assert profile.capabilities == 30
+    assert profile.can_write is False

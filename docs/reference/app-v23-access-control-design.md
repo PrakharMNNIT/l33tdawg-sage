@@ -569,6 +569,32 @@ eligible historical terminal rows from their unchanged canonical content and
 status. Its plan is bounded, generation-bound, atomic, and idempotent; it never
 rewrites memory content, authorship, domain ownership, or prior blocks.
 
+## App-v25 historical recovery and writer continuity
+
+App-v25 is the strict H+1 successor to app-v24. It makes the first accepted
+memory ID an immutable canonical envelope: later submissions may replay that
+exact envelope but cannot reuse the ID for different content, author, domain,
+or classification. It also introduces governed adoption of complete historical
+projection envelopes that were absent from canonical state.
+
+After activation, CEREBRUM automatically scans historical local records. A
+complete hash-verified record is adopted in a bounded Root-bound,
+validator-attested batch without changing its content, authorship, domain,
+classification, or earlier blocks. A conflicting or incomplete row is
+quarantined on its own so it cannot blank the brain or make healthy agent work
+unavailable. Root may retry the exact unresolved snapshot or explicitly retire
+it from automatic repair; neither action deletes its historical evidence.
+
+For each recovered local domain, the earliest verified historical local writer
+is the operational owner. Other verified local historical writers are enrolled
+in the exact local Access Group and receive read/write continuity for that
+domain. The recovery cutoff is immutable: a new app-v25 memory cannot expand
+the historical writer set. If the earliest writer is unavailable, CEREBRUM
+Root owns the recovered domain; a later writer is never silently promoted.
+Federated identities remain linked readers and never enter this local group.
+See [`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md) for the
+operator-facing recovery contract.
+
 ## Mandatory release gates
 
 The v11.16.0 release and app-v24 activation are blocked until all of the

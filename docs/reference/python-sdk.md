@@ -528,7 +528,14 @@ register_agent(
 
 `POST /v1/agent/register`
 
-Registers the identity's public key on-chain. `role`: `"member"` | `"admin"` | `"observer"`.
+Registers the identity's public key on-chain. On an app-v23/app-v25 node,
+registration is discoverability—not self-promotion. A new ordinary identity
+is a Member pending CEREBRUM review unless it is a verified first-party
+bootstrap enrollment. `manager` and `admin` are Root-governed local roles;
+supplying a stronger role in a self-registration request does not grant it.
+Use `get_profile()` immediately after registration to see the caller's own
+`registration_status`, `enrollment_status`, hard capability mask, approved
+home domain, and whether CEREBRUM action is required.
 
 Returns `AgentRegistration(agent_id, name, registered_name, role, provider, status, on_chain_height, tx_hash)`.
 
@@ -560,8 +567,19 @@ Optional fields (present when the server provides them): `display_name`,
 `domains`, `accuracy` (global verdict-correctness EWMA), and — since v8.6.0 —
 `corr_count` (lifetime corroboration) and `domain_expertise`
 (`dict[str, float]`, per-domain expertise keyed by domain tag), plus
-`on_chain_height`. The new fields are `Optional` with `None` defaults, so the
-model still validates against an older server that omits them.
+`on_chain_height`. The SDK v11.16.2 also preserves the additive app-v23
+caller-standing fields: `role`, `profile`, `home_domain`,
+`enrollment_status`, `registration_status`, `approval_required`, `clearance`,
+`capabilities`, `can_read`, `can_write`, and `access_scope`. All are optional
+for compatibility with older SAGE servers. The `can_*` fields describe the
+caller on its approved home domain; they do not claim authority over every
+domain.
+
+App-v25 historical repair is deliberately not an SDK mutation API. SAGE
+repairs sound historical evidence automatically in governed batches; local
+CEREBRUM Root alone can retry or explicitly deprecate an unresolved snapshot
+through the loopback recovery screen. SDK clients should surface standing and
+normal write/read errors, never fabricate or re-submit a repair envelope.
 
 ---
 
@@ -585,7 +603,7 @@ list_agents() -> dict
 
 `GET /v1/agents`
 
-The SDK signs this request. Since v11.16/app-v24, the server returns only the
+The SDK signs this request. Since v11.16/app-v23, the server returns only the
 active ordinary local roster visible through the pipeline identity boundary;
 the endpoint is no longer an unsigned full-directory read.
 
@@ -606,7 +624,11 @@ set_agent_permission(
 
 `PUT /v1/agent/{agent_id}/permission`
 
-Admin only. All kwargs are optional — only supplied fields are sent.
+Compatibility method for pre-app-v23 nodes only. Once app-v23 is active, the
+server returns HTTP `410 app_v23_atomic_policy_required`: role, profile,
+clearance, hard restrictions, and home domain must be approved together through
+the loopback CEREBRUM policy control. Keep this SDK method only when supporting
+an older chain; do not use it to attempt self-promotion.
 
 ---
 
