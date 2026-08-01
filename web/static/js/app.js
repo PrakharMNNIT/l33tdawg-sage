@@ -2895,6 +2895,10 @@ function TasksPage({ sse }) {
     const draggingRef = useRef(false);
     const reloadTimer = useRef(null);
     const movedThisSession = useRef(new Set()); // keeps just-completed old cards visible (see isRecentDone)
+    // A committed transaction can reach the chain shortly before its local
+    // projection updates. Keep those cards out of every intervening SSE/poll
+    // refresh, then reconcile from the canonical task list below.
+    const settlingClears = useRef(new Set());
     const agentName = (id) => { const a = agentList.find(x => x.agent_id === id); return a ? a.name : (id ? id.slice(0, 8) : ''); };
 	const taskSummary = (task) => task.content.replace(/^\[TASK\]\s*/i, '').trim().slice(0, 80) || 'Untitled task';
 	const taskContent = (task) => task.content.replace(/^\[TASK\]\s*/i, '');
@@ -3021,14 +3025,48 @@ function TasksPage({ sse }) {
         try {
             const data = await fetchTasks({ all: true, limit: 500 });
             const items = data.tasks || [];
-            setTasks(items);
+            const settling = settlingClears.current;
+            setTasks(settling.size
+                ? items.filter(task => !settling.has(task.memory_id))
+                : items);
             const ds = [...new Set(items.map(t => t.domain_tag).filter(Boolean))].sort();
             setDomains(ds);
+			return items;
         } catch (e) {
 			console.error('Task board load failed:', e);
 			setError('SAGE could not load your task list. Your tasks are still safe; try again.');
 		}
-        setLoading(false);
+		setLoading(false);
+    }
+
+    const pause = ms => new Promise(resolve => window.setTimeout(resolve, ms));
+
+    // Give the canonical projection a short, bounded chance to catch up after
+    // a commit. We do not restore an old React snapshot: it may predate a
+    // successful transaction and was the source of cards "coming back".
+    async function reconcileClearedTasks(ids) {
+        const pending = new Set(ids);
+        let latest = [];
+        try {
+            for (let attempt = 0; attempt < 4; attempt++) {
+                const items = await loadTasks();
+                if (Array.isArray(items)) latest = items;
+                const remaining = latest.filter(task => pending.has(task.memory_id));
+                if (!remaining.length) return remaining;
+                if (attempt < 3) await pause(750);
+            }
+            return latest.filter(task => pending.has(task.memory_id));
+        } finally {
+            ids.forEach(id => settlingClears.current.delete(id));
+            // The final refresh above intentionally hid settling cards. Render
+            // the canonical outcome once the bounded wait has finished.
+            if (latest.length) {
+                setTasks(latest);
+                setDomains([...new Set(latest.map(task => task.domain_tag).filter(Boolean))].sort());
+            } else {
+                loadTasks();
+            }
+        }
     }
 
     async function moveTask(taskId, newStatus) {
@@ -3085,22 +3123,35 @@ function TasksPage({ sse }) {
 
         setClearingColumn(col.key);
         const ids = colTasks.map(t => t.memory_id);
-        const previousTasks = tasks;
         try {
             if (terminal) {
+                ids.forEach(id => settlingClears.current.add(id));
                 setTasks(prev => prev.filter(t => !ids.includes(t.memory_id)));
-                await Promise.all(ids.map(id => deleteMemory(id)));
-                showToast(`Cleared ${count} ${col.label} task${count !== 1 ? 's' : ''}`, 'success');
+                const results = await Promise.allSettled(ids.map(id => deleteMemory(id)));
+                const rejected = results.filter(result => result.status === 'rejected');
+                const challenges = results.filter(result =>
+                    result.status === 'fulfilled' && result.value && result.value.status === 'challenge_opened');
+                const remaining = await reconcileClearedTasks(ids);
+                const resolved = count - remaining.length;
+                if (rejected.length) {
+                    const detail = rejected[0].reason?.message || 'a request was rejected';
+                    showToast(`${resolved} task${resolved === 1 ? '' : 's'} cleared; ${rejected.length} need${rejected.length === 1 ? 's' : ''} attention: ${detail}`, 'error');
+                } else if (challenges.length) {
+                    showToast(`${challenges.length} task${challenges.length === 1 ? ' needs' : 's need'} confirmation from another eligible domain manager before removal.`, 'warning');
+                } else if (remaining.length) {
+                    showToast(`SAGE is still confirming ${remaining.length} task${remaining.length === 1 ? '' : 's'}; the board will keep them visible until confirmation finishes.`, 'warning');
+                } else {
+                    showToast(`Cleared ${count} ${col.label} task${count !== 1 ? 's' : ''}`, 'success');
+                }
             } else {
                 ids.forEach(id => movedThisSession.current.add(id));
                 setTasks(prev => prev.map(t => ids.includes(t.memory_id) ? { ...t, task_status: 'dropped' } : t));
                 await Promise.all(ids.map(id => updateTaskStatus(id, 'dropped')));
                 showToast(`Moved ${count} ${col.label} task${count !== 1 ? 's' : ''} to Dropped`, 'success');
             }
-            loadTasks();
         } catch (e) {
-            setTasks(previousTasks);
             showToast('Could not clear column: ' + (e.message || 'network error'), 'error');
+			loadTasks();
         }
         setClearingColumn('');
     }

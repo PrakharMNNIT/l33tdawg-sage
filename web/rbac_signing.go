@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/l33tdawg/sage/internal/tx"
@@ -127,6 +128,20 @@ func (h *DashboardHandler) signAndBroadcastCommit(ptx *tx.ParsedTx, key ed25519.
 		return "", 0, "", fmt.Errorf("encode tx: %w", encErr)
 	}
 	return broadcastTxCommitWeb(h.CometBFTRPC, encoded)
+}
+
+// isIndeterminateCommitError reports whether a commit-confirmed request could
+// have reached consensus but did not yield a trustworthy response to this
+// process. CheckTx/FinalizeBlock failures are definitive rejections and must
+// remain errors; transport and RPC response faults are not proof of no change.
+func isIndeterminateCommitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.HasPrefix(message, "broadcast tx commit:") ||
+		strings.HasPrefix(message, "decode broadcast commit response:") ||
+		strings.HasPrefix(message, "broadcast error:")
 }
 
 // agentIDForKey returns the on-chain agent id (hex(pubkey)) for an Ed25519 key,

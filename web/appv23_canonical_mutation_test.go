@@ -78,6 +78,57 @@ func TestAppV23CerebrumForgetBroadcastsConsensusWithoutMutatingSQLite(t *testing
 		"CEREBRUM must wait for canonical lifecycle projection instead of editing SQLite")
 }
 
+func TestAppV23CerebrumForgetKeepsIndeterminateCommitPending(t *testing.T) {
+	fixture := newAppV23DashboardRouteFixture(t)
+	insertTestMemory(t, fixture.sql, "forget-pending-confirmation", "member.home")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "forget-pending-confirmation",
+		uint8(store.ClearanceInternal), true,
+	)
+
+	// A response can be lost after CometBFT accepted the transaction. The
+	// dashboard must not lie that nothing changed or invite a duplicate click.
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporary upstream failure", http.StatusBadGateway)
+	}))
+	t.Cleanup(rpc.Close)
+	fixture.handler.CometBFTRPC = rpc.URL
+
+	rec := appV23CanonicalMutationRequest(
+		t, fixture, http.MethodDelete,
+		"/v1/dashboard/memory/forget-pending-confirmation", nil,
+	)
+	require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "confirmation_pending")
+	require.NotContains(t, rec.Body.String(), "nothing was changed")
+}
+
+func TestAppV23CerebrumForgetKeepsRejectedCommitAnError(t *testing.T) {
+	fixture := newAppV23DashboardRouteFixture(t)
+	insertTestMemory(t, fixture.sql, "forget-rejected", "member.home")
+	publishAppV23DashboardRecord(
+		t, fixture.sql, fixture.badger, "forget-rejected",
+		uint8(store.ClearanceInternal), true,
+	)
+
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{
+				"check_tx":  map[string]any{"code": 92, "log": "authorization rejected"},
+				"tx_result": map[string]any{"code": 0, "log": ""},
+			},
+		}))
+	}))
+	t.Cleanup(rpc.Close)
+	fixture.handler.CometBFTRPC = rpc.URL
+
+	rec := appV23CanonicalMutationRequest(
+		t, fixture, http.MethodDelete, "/v1/dashboard/memory/forget-rejected", nil,
+	)
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "memory deprecation was rejected")
+}
+
 func TestAppV23CerebrumRejectsSQLOnlyDomainRewrites(t *testing.T) {
 	fixture := newAppV23DashboardRouteFixture(t)
 	insertTestMemory(t, fixture.sql, "immutable-domain", "member.home")

@@ -1236,6 +1236,21 @@ test('task cards expand fully and planned task edits preserve consensus history'
     assert.match(cssSource, /white-space:\s*pre-wrap/);
 });
 
+test('clearing a task column reconciles delayed consensus instead of restoring stale cards', () => {
+    const tasksPage = appSource.slice(appSource.indexOf('function TasksPage('), appSource.indexOf('function PipelineView('));
+    const clearColumn = tasksPage.slice(tasksPage.indexOf('async function clearColumn('), tasksPage.indexOf('async function handleAddTask('));
+    assert.match(tasksPage, /const settlingClears = useRef\(new Set\(\)\)/);
+    assert.match(clearColumn, /await Promise\.allSettled\(ids\.map\(id => deleteMemory\(id\)\)\)/,
+        'one delayed task must not fail a whole column clear');
+    assert.match(tasksPage, /async function reconcileClearedTasks\(ids\)/);
+    assert.match(clearColumn, /SAGE is still confirming/,
+        'an indeterminate consensus response must be treated as a pending reconciliation');
+    assert.match(clearColumn, /challenge_opened/,
+        'a multi-holder challenge must be explained instead of being called cleared');
+    assert.doesNotMatch(clearColumn, /setTasks\(previousTasks\)/,
+        'a pre-commit React snapshot must never resurrect cards after an uncertain commit');
+});
+
 test('settings does not force a full-page render every 100ms', () => {
     assert.doesNotMatch(appSource, /setInterval\(\(\) => setTick\([^\n]+, 100\)/);
     assert.match(appSource, /function ChainCountdown\(\{ blockTime \}\)/);
