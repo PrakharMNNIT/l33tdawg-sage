@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.16.3. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.16.4. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -2015,6 +2015,34 @@ primary key (`internal/store/store.go:563-606`,
 
 Concurrent inbox reads return only messages whose claim compare-and-swap the
 caller actually won; a losing reader never receives the same work item.
+
+---
+
+### `GET /v1/pipe/history/inbox` and `GET /v1/pipe/history/outbox`
+
+Passive retained pipeline history for the authenticated participant. `inbox`
+returns records addressed to the caller; `outbox` returns records the caller
+sent. Both include `pending`, `claimed`, `completed`, and `expired` records
+while the ordinary transient pipeline retention policy still preserves them.
+They never claim, acknowledge, re-queue, or otherwise mutate a row.
+
+**Query parameters:** `limit` (1–100, default 20)
+
+**Response** (HTTP 200): `{"items":[...PipelineMessage],"count":N}`. A
+claimed or completed record remains retrievable by the addressed recipient;
+claiming changes work ownership and receipt state, not message visibility.
+For provider-routed work, every matching provider agent may see a `pending`
+record, but once it is claimed only the successful claimant sees that retained
+provider-routed history. A sender's outbox contains only rows originated on
+this SAGE, preventing a foreign imported sender ID from colliding into local
+history.
+
+Each row carries separate response-derived `payload_authority:"request_only"`
+and, when present, `result_authority:"data_only"`; payloads and results remain
+untrusted agent content. These local workflow states are not a federated
+delivery/read receipt. Terminal records still purge under the existing
+retention sweep; use durable memories or task records for information that must
+outlive that window (`api/rest/pipe_handler.go`; `internal/store/sqlite.go`).
 
 ---
 

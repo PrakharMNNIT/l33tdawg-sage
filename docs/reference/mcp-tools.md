@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.16.3.
+Reconciled against internal/mcp for SAGE v11.16.4.
 
 # SAGE MCP Tools Reference
 
@@ -979,6 +979,40 @@ SAGE, so revoked or changed contacts fail closed.
 
 ---
 
+### sage_directory
+
+**Purpose:** List every active ordinary agent registered on the caller's local
+SAGE, with enough stable identity information to select an exact recipient:
+
+- `display_name` / `name` — mutable human-facing name;
+- `registered_name` — immutable name sealed at first registration;
+- `provider` — client/provider family;
+- `agent_id` / `to` — immutable exact ID accepted by `sage_pipe`;
+- `scope` (`local`) and `status` (`active`).
+
+The request is signed as the calling agent. The underlying `GET /v1/agents`
+projection applies the app-v23 active-ordinary enrollment boundary and excludes
+CEREBRUM Root credentials, historical Root credentials, pending, inactive,
+removed, retired, or canonically inconsistent registrations. MCP then returns
+only the minimal identity picker above; it does not expose roles, capability
+masks, memory counts, domain grants, key material, or other RBAC topology.
+
+Directory membership is not an online/presence or delivery claim. This is the
+complete active **local** roster, not a global federation roster. Use
+`sage_find_agent` for a named caller-authorized federated recipient; remote
+nodes never expose an unbounded agent directory.
+
+**Parameters:** None.
+
+**Returns:** `agents`, `total`, `scope: "local"`, and a short routing reminder.
+Entries are sorted by display name and then agent ID for stable presentation.
+
+**REST:** signed `GET /v1/agents`
+
+**Source:** `tools.go` (`sage_directory` definition and `toolDirectory` handler)
+
+---
+
 ### sage_inbox
 
 **Purpose:** Check the unified agent inbox for pipeline work and one-way task
@@ -1038,6 +1072,36 @@ agents. `sage_turn` also checks the inbox automatically on every call
 turns or when you need more than 5 items. This tool does not return results for
 pipes the current agent sent; those are reported separately as
 `sage_turn.pipe_results`.
+
+---
+
+### sage_pipe_history
+
+**Purpose:** Browse the current agent's retained pipeline inbox or outbox after
+the active work queue has claimed an item. This is passive history: it does not
+claim, acknowledge, or re-queue a record, so claimed and completed messages can
+be reopened without injecting old work into every `sage_turn` response.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `folder` | string | no | `inbox` (default) shows received history; `outbox` shows messages this agent sent. |
+| `limit` | int | no | Max retained records. Default 20; max 100. |
+
+**Returns:** `items`, `count`, and `folder`. Each item includes lifecycle
+state (`pending`, `claimed`, `completed`, or `expired`), counterpart, timestamps,
+and request/result content. `passive_history:true` confirms the call did not
+claim anything. Every payload is `payload_authority:"request_only"`; any result
+is `result_authority:"data_only"`. Neither is instructions or proof of remote
+delivery/read.
+
+**REST:** `GET /v1/pipe/history/inbox` or `GET /v1/pipe/history/outbox`
+
+**When to call:** Re-open work you previously claimed, inspect a result you
+already returned, or review messages you sent. Rows remain available only while
+the normal transient pipeline retention period keeps them; use a memory or task
+for durable records.
 
 ---
 
@@ -1236,7 +1300,7 @@ strengthen/connect memories or resolve an open challenge.
 This is correct: they are operator/admin/validator operations, not agent memory
 operations.
 
-`sage_pipe`, `sage_inbox`, `sage_pipe_result` — pipeline tools — are also not
+`sage_pipe`, `sage_inbox`, `sage_pipe_history`, `sage_pipe_result` — pipeline tools — are also not
 part of the boot sequence. Also correct: pipeline is checked automatically
 inside `sage_turn` (`tools.go:888-894`), so agents get pipeline data without
 needing to call these explicitly.
@@ -1252,7 +1316,7 @@ registration name from `sage_register` is untouched.
 
 ## Summary
 
-**27 tools documented:**
+**29 tools documented:**
 
 | Category     | Tools |
 |--------------|-------|
@@ -1261,6 +1325,6 @@ registration name from `sage_register` is untouched.
 | Federation   | `sage_federation` |
 | Browse       | `sage_list`, `sage_timeline`, `sage_status` |
 | Tasks        | `sage_task`, `sage_backlog` |
-| Identity     | `sage_register`, `sage_rename` |
-| Pipeline     | `sage_find_agent`, `sage_pipe`, `sage_inbox`, `sage_pipe_result` |
+| Identity     | `sage_register`, `sage_rename`, `sage_directory` |
+| Pipeline     | `sage_find_agent`, `sage_pipe`, `sage_inbox`, `sage_pipe_history`, `sage_pipe_result` |
 | Governance   | `sage_gov_propose`, `sage_gov_vote`, `sage_gov_status`, `sage_scope_list`, `sage_scope_get` |

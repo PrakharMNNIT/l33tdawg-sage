@@ -2,7 +2,7 @@
 
 Python client for the SAGE (Sovereign Agent Governed Experience) protocol -- a governed, verifiable institutional memory layer for multi-agent systems.
 
-**Requires Python 3.10+** | **SAGE v11.16.3 SDK** | **TLS, app-v23 roles and Access Groups, app-v24 memory integrity, app-v25 immutable envelopes and automatic historical continuity recovery, read-only federation, domain recovery, scoped governance, and per-record `classification` supported**
+**Requires Python 3.10+** | **SAGE v11.16.4 SDK** | **TLS, app-v23 roles and Access Groups, app-v24 memory integrity, app-v25 immutable envelopes and automatic historical continuity recovery, read-only federation, domain recovery, scoped governance, and per-record `classification` supported**
 
 ## Installation
 
@@ -342,6 +342,12 @@ status = client.pipe_status(msg.pipe_id)
 
 # List completed results
 results = client.pipe_results(limit=5)
+
+# Reopen retained messages without claiming or re-queueing them. History keeps
+# claimed/completed rows while the normal transient pipeline retention window
+# still retains them; it is not a federated delivery/read receipt.
+received_history = client.pipe_inbox_history(limit=20)
+sent_history = client.pipe_outbox(limit=20)
 ```
 
 ### Embeddings
@@ -877,6 +883,8 @@ def hash_embed(text: str, dim: int = 768) -> list[float]:
 |--------|----------|------------|
 | `POST` | `/v1/pipe/send` | `pipe_send()` |
 | `GET` | `/v1/pipe/inbox` | `pipe_inbox()` |
+| `GET` | `/v1/pipe/history/inbox` | `pipe_inbox_history()` |
+| `GET` | `/v1/pipe/history/outbox` | `pipe_outbox()` |
 | `PUT` | `/v1/pipe/{id}/claim` | `pipe_claim()` |
 | `PUT` | `/v1/pipe/{id}/result` | `pipe_result()` |
 | `GET` | `/v1/pipe/{id}` | `pipe_status()` |
