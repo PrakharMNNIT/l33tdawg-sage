@@ -97,6 +97,51 @@ func TestAppV26ConstructorAllowsOnlyPreActivationCompatibilityThenBootsStrictRep
 	require.NoError(t, postActivation.Close())
 }
 
+func TestAppV26PreActivationServingProjectionDoesNotBlockDeterministicHomeRepair(t *testing.T) {
+	rootDir := t.TempDir()
+	badgerPath := filepath.Join(rootDir, "badger")
+	bs, agentID := seedDirectAppV25HomeRepairFixture(t, badgerPath)
+	enrollment, err := bs.GetAppV23Enrollment(agentID)
+	require.NoError(t, err)
+	require.NoError(t, bs.SetState("shared_domain:"+enrollment.HomeDomain, []byte{1}))
+	require.ErrorContains(t, bs.ValidateAppV23State(), "shared_home")
+	require.NoError(t, bs.ValidateAppV23StateForPreV26Recovery())
+	saveAppV26RepairTestState(t, bs, 3)
+
+	projection, err := store.NewSQLiteStore(
+		context.Background(), filepath.Join(rootDir, "projection.db"),
+	)
+	require.NoError(t, err)
+	app, err := NewSageAppWithStores(bs, projection, zerolog.Nop())
+	require.NoError(t, err)
+	require.Equal(t, uint64(25), app.currentAppVersion())
+	require.NoError(t, MigrateAgentsOnChain(
+		context.Background(), projection, bs, "", nil, true, zerolog.Nop(),
+	), "startup serving projection must not preempt app-v26 consensus repair")
+	projected, err := projection.GetAgent(context.Background(), agentID)
+	require.NoError(t, err)
+	require.NotNil(t, projected)
+	require.Equal(t, "active", projected.Status)
+
+	require.NoError(t, bs.MigrateAppV26AccessGroupAuthorities(4))
+	require.NoError(t, bs.MarkUpgradeApplied(appV26UpgradeName, 26, 4))
+	require.NoError(t, bs.ValidateAppV23State())
+	require.NoError(t, app.Close())
+
+	reopened, err := store.NewBadgerStore(badgerPath)
+	require.NoError(t, err)
+	strictProjection, err := store.NewSQLiteStore(
+		context.Background(), filepath.Join(rootDir, "strict-projection.db"),
+	)
+	require.NoError(t, err)
+	require.NoError(t, MigrateAgentsOnChain(
+		context.Background(), strictProjection, reopened, "", nil, true, zerolog.Nop(),
+	))
+	require.NoError(t, reopened.ValidateAppV23State())
+	require.NoError(t, strictProjection.Close())
+	require.NoError(t, reopened.CloseBadger())
+}
+
 func TestAppV26AppliedConstructorRejectsAReintroducedHomeDefect(t *testing.T) {
 	rootDir := t.TempDir()
 	badgerPath := filepath.Join(rootDir, "badger")
@@ -116,6 +161,32 @@ func TestAppV26AppliedConstructorRejectsAReintroducedHomeDefect(t *testing.T) {
 	)
 	require.ErrorContains(t, err, "shared_home")
 	require.NoError(t, reopened.CloseBadger())
+}
+
+func TestAppV26AppliedServingProjectionRejectsAReintroducedHomeDefect(t *testing.T) {
+	rootDir := t.TempDir()
+	bs, agentID := seedDirectAppV25HomeRepairFixture(
+		t, filepath.Join(rootDir, "badger"),
+	)
+	require.NoError(t, bs.MigrateAppV26AccessGroupAuthorities(4))
+	require.NoError(t, bs.MarkUpgradeApplied(appV26UpgradeName, 26, 4))
+	enrollment, err := bs.GetAppV23Enrollment(agentID)
+	require.NoError(t, err)
+	require.NoError(t, bs.SetState("shared_domain:"+enrollment.HomeDomain, []byte{1}))
+	projection, err := store.NewSQLiteStore(
+		context.Background(), filepath.Join(rootDir, "projection.db"),
+	)
+	require.NoError(t, err)
+
+	_, err = store.ReconcileAppV23AgentProjectionsForPreV26Recovery(
+		context.Background(), projection, bs,
+	)
+	require.ErrorContains(t, err, "forbidden after app-v26")
+	require.ErrorContains(t, MigrateAgentsOnChain(
+		context.Background(), projection, bs, "", nil, true, zerolog.Nop(),
+	), "shared_home")
+	require.NoError(t, projection.Close())
+	require.NoError(t, bs.CloseBadger())
 }
 
 func TestAppV26MarkedActivationCrashWindowReopensAndReplaysIdempotently(t *testing.T) {

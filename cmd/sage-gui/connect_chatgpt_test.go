@@ -280,7 +280,7 @@ args = ["mcp"]
 
 [mcp_servers.sage.env]
 SAGE_HOME = "` + filepath.Join(home, ".sage") + `"
-SAGE_API_URL = "http://localhost:8080"
+SAGE_API_URL = "http://127.0.0.1:8080"
 `)
 	require.NoError(t, os.WriteFile(globalConfig, original, 0600))
 
@@ -310,5 +310,5 @@ args = ["mcp"]
 	after, err := os.ReadFile(globalConfig)
 	require.NoError(t, err)
 	assert.Contains(t, string(after), `command = "/Applications/SAGE.app/Contents/MacOS/sage-gui"`)
-	assert.Contains(t, string(after), `SAGE_API_URL = "http://localhost:8080"`)
+	assert.Contains(t, string(after), `SAGE_API_URL = "http://127.0.0.1:8080"`)
 }

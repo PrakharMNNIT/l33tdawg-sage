@@ -10,6 +10,7 @@ import (
 	"time"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
 	"github.com/l33tdawg/sage/internal/authzdenial"
@@ -252,6 +253,12 @@ func TestAppV26ActivationMigratesGroupsAndCrashReplayIsDeterministic(t *testing.
 	app.appV24AppliedHeight = 40
 	app.appV25AppliedHeight = 50
 	require.NoError(t, app.badgerStore.MarkUpgradeApplied(appV25UpgradeName, 25, 50))
+	projection, ok := app.offchainStore.(store.AgentStore)
+	require.True(t, ok)
+	require.NoError(t, MigrateAgentsOnChain(
+		context.Background(), projection, app.badgerStore,
+		"", nil, true, zerolog.Nop(),
+	), "the real startup serving projection must stay alive until app-v26 activation")
 	require.NoError(t, app.badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
 		Name: appV26UpgradeName, TargetAppVersion: 26,
 		ActivationHeight: 60, ProposedAt: 59,

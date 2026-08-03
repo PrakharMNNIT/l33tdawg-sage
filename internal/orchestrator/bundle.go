@@ -51,9 +51,9 @@ quorum:
 	}
 
 	// .mcp.json — use HTTPS if CA cert is included (quorum mode with TLS).
-	apiURL := "http://localhost:8080"
+	apiURL := "http://127.0.0.1:8080"
 	if len(caCertPEM) > 0 && caCertPEM[0] != "" {
-		apiURL = "https://localhost:8443"
+		apiURL = "https://127.0.0.1:8443"
 	}
 	mcpJSON := fmt.Sprintf(`{
   "mcpServers": {

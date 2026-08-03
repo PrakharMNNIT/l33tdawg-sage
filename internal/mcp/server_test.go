@@ -39,9 +39,9 @@ func TestDefaultBaseURLHonorsCustomTLSListener(t *testing.T) {
 	assert.Equal(t, "https://127.0.0.1:18443", DefaultBaseURL())
 
 	for bind, want := range map[string]string{
-		"0.0.0.0:19443": "https://localhost:19443",
-		":20443":        "https://localhost:20443",
-		"[::]:21443":    "https://localhost:21443",
+		"0.0.0.0:19443": "https://127.0.0.1:19443",
+		":20443":        "https://127.0.0.1:20443",
+		"[::]:21443":    "https://127.0.0.1:21443",
 	} {
 		t.Setenv("SAGE_TLS_ADDR", bind)
 		assert.Equal(t, want, DefaultBaseURL())
@@ -130,12 +130,20 @@ func TestHandleToolsList(t *testing.T) {
 	// Collect tool names
 	names := make(map[string]bool)
 	var findAgent map[string]any
+	var sageFederation map[string]any
+	var sageDirectory map[string]any
 	var sageTask map[string]any
 	var sageTimeline map[string]any
 	for _, tool := range tools {
 		names[tool["name"].(string)] = true
 		if tool["name"] == "sage_find_agent" {
 			findAgent = tool
+		}
+		if tool["name"] == "sage_federation" {
+			sageFederation = tool
+		}
+		if tool["name"] == "sage_directory" {
+			sageDirectory = tool
 		}
 		if tool["name"] == "sage_task" {
 			sageTask = tool
@@ -197,6 +205,20 @@ func TestHandleToolsList(t *testing.T) {
 	assert.Contains(t, nameSchema["description"], "provider substring")
 	assert.Contains(t, nameSchema["description"], "non-ASCII code points require registered casing")
 	assert.Contains(t, nameSchema["description"], "exact field matches rank first")
+	findCursor := findProperties["peer_cursor"].(map[string]any)
+	assert.Contains(t, findCursor["description"], "Bounded federated continuation")
+
+	require.NotNil(t, sageFederation)
+	federationSchema := sageFederation["inputSchema"].(map[string]any)
+	federationProperties := federationSchema["properties"].(map[string]any)
+	federationCursor := federationProperties["peer_cursor"].(map[string]any)
+	assert.Contains(t, federationCursor["description"], "never auto-walks federation pages")
+
+	require.NotNil(t, sageDirectory)
+	directorySchema := sageDirectory["inputSchema"].(map[string]any)
+	directoryProperties := directorySchema["properties"].(map[string]any)
+	directoryCursor := directoryProperties["peer_cursor"].(map[string]any)
+	assert.Contains(t, directoryCursor["description"], "Ignored for local scope")
 
 	require.NotNil(t, sageTask)
 	assert.Contains(t, sageTask["description"], "permanently idempotent")
@@ -247,10 +269,15 @@ func TestAdvertisedToolsExactlyMatchReferenceHeadings(t *testing.T) {
 	docPath := filepath.Join(filepath.Dir(source), "..", "..", "docs", "reference", "mcp-tools.md")
 	doc, err := os.ReadFile(docPath)
 	require.NoError(t, err)
-	assert.Contains(t, string(doc), "SAGE exposes exactly 34 registered and callable MCP tools",
+	docText := string(doc)
+	assert.Contains(t, docText, "SAGE exposes exactly 34 registered and callable MCP tools",
 		"the human-readable inventory count must match tools/list")
+	assert.Contains(t, docText, "One call consumes at most one bounded peer page",
+		"sage_find_agent must document its advertised peer_cursor contract")
+	assert.Contains(t, docText, "It is not a node\nhealth check, a global store-size endpoint",
+		"sage_status must not be documented as global node health or store fullness")
 	re := regexp.MustCompile(`(?m)^### (sage_[a-z_]+)$`)
-	matches := re.FindAllStringSubmatch(string(doc), -1)
+	matches := re.FindAllStringSubmatch(docText, -1)
 	documented := make([]string, 0, len(matches))
 	for _, match := range matches {
 		documented = append(documented, match[1])

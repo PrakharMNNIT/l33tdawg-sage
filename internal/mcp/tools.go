@@ -2052,11 +2052,13 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 			})
 		}
 		return map[string]any{
-			"matches":   matches,
-			"total":     len(localMatches),
-			"searched":  searched,
-			"truncated": len(localMatches) > len(matches),
-			"message":   "Found local agent matches. Pass a match's to value directly to sage_pipe.",
+			"matches":          matches,
+			"total":            len(localMatches),
+			"searched":         searched,
+			"truncated":        len(localMatches) > len(matches),
+			"complete":         true,
+			"next_peer_cursor": "",
+			"message":          "Found local agent matches. Pass a match's to value directly to sage_pipe.",
 		}
 	}
 	localPartialResult := func(err error) map[string]any {
@@ -2135,7 +2137,13 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 		}
 	}
 	if len(federatedExact) == 0 && len(localPartial) > 0 {
-		return localResult(localPartial, []string{"local", "federated"}), nil
+		result := localResult(localPartial, []string{"local", "federated"})
+		result["complete"] = federatedComplete
+		result["next_peer_cursor"] = nextPeerCursor
+		if !federatedComplete {
+			result["message"] = "Local partial matches are shown, but more bounded federated peer pages remain. Pass next_peer_cursor as peer_cursor to check one more page for an exact remote recipient before choosing a fuzzy local match."
+		}
+		return result, nil
 	}
 	federatedMatches := federatedExact
 	if len(federatedMatches) == 0 {

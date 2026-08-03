@@ -1,8 +1,8 @@
-Verified against SDK source for SAGE v11.17.1. Package: sage-agent-sdk.
+Verified against SDK source for SAGE v11.17.2. Package: sage-agent-sdk.
 
 # SAGE Python SDK Reference
 
-**Package:** `sage-agent-sdk` **Version:** 11.17.1
+**Package:** `sage-agent-sdk` **Version:** 11.17.2
 **Requires:** Python 3.10+ | httpx ≥ 0.25 | pydantic ≥ 2.0 | PyNaCl ≥ 1.5
 
 ```bash
@@ -45,6 +45,15 @@ results = client.query(
 for mem in results.results:
     print(mem.memory_id, mem.confidence_score, mem.content[:80])
 ```
+
+The shipped desktop REST listener binds IPv4 loopback at
+`127.0.0.1:8080`. `http://localhost:8080` above is only a client-side loopback
+hostname alias; it does not expose SAGE to the LAN, and the SDK preserves the
+URL rather than rewriting it. If a host resolves `localhost` only to an
+unbound IPv6 `::1`, use `http://127.0.0.1:8080` explicitly. Pointing
+`base_url` at a LAN address does not confer CEREBRUM authority: operator routes
+still require a direct loopback peer and loopback `Host` (plus the unlocked
+local session where required).
 
 ---
 

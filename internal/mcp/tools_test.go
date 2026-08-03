@@ -732,11 +732,76 @@ func TestSageFindAgentPrefersLocalActiveMatches(t *testing.T) {
 	out := result.(map[string]any)
 	assert.Equal(t, []string{"local"}, out["searched"])
 	assert.Equal(t, 1, out["total"])
+	assert.Equal(t, true, out["complete"])
+	assert.Empty(t, out["next_peer_cursor"])
 	matches := out["matches"].([]map[string]any)
 	require.Len(t, matches, 1)
 	assert.Equal(t, "local", matches[0]["scope"])
 	assert.Equal(t, "local-innovium", matches[0]["agent_id"])
 	assert.Equal(t, "local-innovium", matches[0]["to"])
+}
+
+func TestSageFindAgentPreservesPeerCursorUntilLaterExactBeatsLocalSubstring(t *testing.T) {
+	var federationCursors []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agents/lookup", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agents": []map[string]any{{
+				"agent_id": "local-voice-notes", "name": "Voice notes helper",
+				"registered_name": "agent/voice-notes-helper",
+				"provider":        "local", "match_kind": "substring",
+			}},
+		})
+	})
+	mux.HandleFunc("/v1/federation/available", func(w http.ResponseWriter, r *http.Request) {
+		cursor := r.URL.Query().Get("peer_cursor")
+		federationCursors = append(federationCursors, cursor)
+		if cursor == "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"connections": []any{}, "complete": false, "next_peer_cursor": "peer-page-2",
+			})
+			return
+		}
+		require.Equal(t, "peer-page-2", cursor)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"connections": []map[string]any{{
+				"remote_chain_id": "remote-chain", "network_name": "Remote SAGE",
+				"remote_agents": []map[string]any{{
+					"agent_id": "remote-voice", "display_name": "voice",
+					"registered_name": "agent/remote-voice", "provider": "mynah",
+					"address": "remote-voice@remote-chain", "authorization_mode": "linked-v23",
+				}},
+			}},
+			"complete": true,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	first, err := s.toolFindAgent(context.Background(), map[string]any{"name": "voice"})
+	require.NoError(t, err)
+	firstOut := first.(map[string]any)
+	require.Equal(t, false, firstOut["complete"])
+	require.Equal(t, "peer-page-2", firstOut["next_peer_cursor"])
+	firstMatches := firstOut["matches"].([]map[string]any)
+	require.Len(t, firstMatches, 1)
+	require.Equal(t, "local-voice-notes", firstMatches[0]["to"])
+	require.Contains(t, firstOut["message"], "exact remote recipient")
+
+	second, err := s.toolFindAgent(context.Background(), map[string]any{
+		"name": "voice", "peer_cursor": firstOut["next_peer_cursor"],
+	})
+	require.NoError(t, err)
+	secondOut := second.(map[string]any)
+	require.Equal(t, true, secondOut["complete"])
+	require.Empty(t, secondOut["next_peer_cursor"])
+	secondMatches := secondOut["matches"].([]map[string]any)
+	require.Len(t, secondMatches, 1)
+	require.Equal(t, "remote-voice@remote-chain", secondMatches[0]["to"])
+	require.Equal(t, []string{"", "peer-page-2"}, federationCursors,
+		"each call must consume exactly one bounded federation page")
 }
 
 func TestSageFindAgentKeepsLocalPartialsWhenFederationIsUnavailable(t *testing.T) {

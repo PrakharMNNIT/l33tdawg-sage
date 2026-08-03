@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/dgraph-io/badger/v4"
 )
 
 // ReconcileAppV23AgentProjections repairs the node-local agent directory from
@@ -19,7 +21,45 @@ func ReconcileAppV23AgentProjections(
 	agentStore AgentStore,
 	badgerStore *BadgerStore,
 ) (int, error) {
-	return reconcileAppV23AgentProjections(ctx, agentStore, badgerStore, "", nil)
+	return reconcileAppV23AgentProjections(ctx, agentStore, badgerStore, "", nil, false)
+}
+
+// ReconcileAppV23AgentProjectionsForPreV26Recovery rebuilds the node-local
+// serving directory while admitting only the narrow historical home-domain
+// defects accepted by ValidateAppV23StateForPreV26Recovery. The helper itself
+// proves that app-v25 is validly applied and app-v26 is absent. It deliberately
+// performs no consensus mutation and exists only so a node can reach the
+// deterministic app-v26 activation repair.
+func ReconcileAppV23AgentProjectionsForPreV26Recovery(
+	ctx context.Context,
+	agentStore AgentStore,
+	badgerStore *BadgerStore,
+) (int, error) {
+	return reconcileAppV23AgentProjections(ctx, agentStore, badgerStore, "", nil, true)
+}
+
+// ValidateAppV23StateForPreV26ProjectionRecovery proves the upgrade boundary
+// and recovery-compatible RBAC image in one Badger snapshot. The scoped clone
+// makes the existing validator reuse that exact read transaction instead of
+// opening a second snapshot in which app-v26 could already be applied.
+func (s *BadgerStore) ValidateAppV23StateForPreV26ProjectionRecovery() error {
+	return s.view(func(txn *badger.Txn) error {
+		var v25 AppliedUpgradeRecord
+		if err := appV23ReadJSON(txn, upgradeAppliedKey("app-v25"), &v25); err != nil {
+			return errors.New("pre-app-v26 agent projection requires valid applied app-v25")
+		}
+		if v25.Name != "app-v25" || v25.TargetAppVersion != 25 || v25.AppliedHeight <= 0 {
+			return errors.New("pre-app-v26 agent projection requires valid applied app-v25")
+		}
+		if _, err := txn.Get(upgradeAppliedKey("app-v26")); err == nil {
+			return errors.New("pre-app-v26 agent projection is forbidden after app-v26 is applied")
+		} else if !errors.Is(err, badger.ErrKeyNotFound) {
+			return fmt.Errorf("read app-v26 recovery boundary: %w", err)
+		}
+		scoped := *s
+		scoped.txn = txn
+		return scoped.validateAppV23State(true)
+	})
 }
 
 // EnsureAppV23AgentProjection repairs one already-committed active ordinary
@@ -38,7 +78,7 @@ func EnsureAppV23AgentProjection(
 		return nil, errors.New("app-v23 projection agent ID must be canonical lowercase 64-hex")
 	}
 	_, err := reconcileAppV23AgentProjections(
-		ctx, agentStore, badgerStore, agentID, metadata,
+		ctx, agentStore, badgerStore, agentID, metadata, false,
 	)
 	if err != nil {
 		return nil, err
@@ -59,6 +99,7 @@ func reconcileAppV23AgentProjections(
 	badgerStore *BadgerStore,
 	onlyAgentID string,
 	metadata *AgentEntry,
+	allowPreV26Recovery bool,
 ) (int, error) {
 	if agentStore == nil || badgerStore == nil {
 		return 0, errors.New("app-v23 agent projection stores are unavailable")
@@ -70,7 +111,13 @@ func reconcileAppV23AgentProjections(
 	if root == nil {
 		return 0, nil
 	}
-	if validationErr := badgerStore.ValidateAppV23State(); validationErr != nil {
+	var validationErr error
+	if allowPreV26Recovery {
+		validationErr = badgerStore.ValidateAppV23StateForPreV26ProjectionRecovery()
+	} else {
+		validationErr = badgerStore.ValidateAppV23State()
+	}
+	if validationErr != nil {
 		return 0, fmt.Errorf("validate app-v23 state before agent projection: %w", validationErr)
 	}
 

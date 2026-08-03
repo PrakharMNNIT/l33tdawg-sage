@@ -13,6 +13,7 @@ import (
 	rpccore "github.com/cometbft/cometbft/rpc/core"
 	rpctypes "github.com/cometbft/cometbft/rpc/jsonrpc/types"
 	cmttypes "github.com/cometbft/cometbft/types"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
 	sageabci "github.com/l33tdawg/sage/internal/abci"
@@ -178,6 +179,26 @@ func TestVendoredAgentRealCometAppV25ToV26Restart(t *testing.T) {
 		t, app, badgerStore, firstRPC, rootKey, 25,
 	)
 	require.Equal(t, activation24+1, activation25)
+	// Commit the legacy group while app-v25 is healthy, then persist the exact
+	// shared-home defect emitted by the historical app-v25 continuity path.
+	// The next process must survive constructor + serving projection long enough
+	// for real Comet FinalizeBlock to execute app-v26's deterministic repair.
+	companionKey, ok := parseKeyFile(bootstrap.AgentKeyFile)
+	require.True(t, ok)
+	companionID := appV23AgentIDForKey(companionKey)
+	broadcastVendoredAccessGroup(t, firstRPC, vendoredAccessGroupRaw(
+		t, rootKey, "real-comet-team", []string{companionID}, "", 0,
+	))
+	legacyGroup, err := badgerStore.GetAppV23AccessGroup("real-comet-team")
+	require.NoError(t, err)
+	require.Empty(t, legacyGroup.MemberAuthority)
+	companionBeforeRepair, err := badgerStore.GetAppV23Enrollment(companionID)
+	require.NoError(t, err)
+	require.NoError(t, badgerStore.SetState(
+		"shared_domain:"+companionBeforeRepair.HomeDomain, []byte{1},
+	))
+	require.ErrorContains(t, badgerStore.ValidateAppV23State(), "shared_home")
+	require.NoError(t, badgerStore.ValidateAppV23StateForPreV26ProjectionRecovery())
 	require.NoError(t, firstController.StopChain())
 	require.NoError(t, projection.Close())
 	require.NoError(t, badgerStore.CloseBadger())
@@ -203,20 +224,11 @@ func TestVendoredAgentRealCometAppV25ToV26Restart(t *testing.T) {
 	secondStatus, err := secondRPC.Status(nil)
 	require.NoError(t, err)
 	require.Equal(t, uint64(25), secondStatus.NodeInfo.ProtocolVersion.App)
-	require.Equal(t, activation25, secondStatus.SyncInfo.LatestBlockHeight)
-
-	// Create the historical wire form through real Comet while app-v25 is the
-	// committed protocol. Its empty authority is the exact state app-v26 must
-	// migrate deterministically at activation H.
-	companionKey, ok := parseKeyFile(bootstrap.AgentKeyFile)
-	require.True(t, ok)
-	companionID := appV23AgentIDForKey(companionKey)
-	broadcastVendoredAccessGroup(t, secondRPC, vendoredAccessGroupRaw(
-		t, rootKey, "real-comet-team", []string{companionID}, "", 0,
-	))
-	legacyGroup, err := badgerStore.GetAppV23AccessGroup("real-comet-team")
-	require.NoError(t, err)
-	require.Empty(t, legacyGroup.MemberAuthority)
+	require.Equal(t, activation25+1, secondStatus.SyncInfo.LatestBlockHeight)
+	require.NoError(t, migrateAgentsOnChainAtStartup(
+		context.Background(), projection, badgerStore,
+		"", rootKey, false, zerolog.Nop(),
+	), "startup serving projection must not preempt app-v26 FinalizeBlock repair")
 	require.Equal(t, uint64(1), legacyGroup.Revision)
 
 	activation26 := activateVendoredUpgradeAtNextHeight(
@@ -230,6 +242,10 @@ func TestVendoredAgentRealCometAppV25ToV26Restart(t *testing.T) {
 	require.Equal(t, store.AppV26GroupAuthorityRead, migratedGroup.MemberAuthority)
 	require.Equal(t, legacyGroup.Revision, migratedGroup.Revision,
 		"fork migration is not an operator-authored revision")
+	companionAfterRepair, err := badgerStore.GetAppV23Enrollment(companionID)
+	require.NoError(t, err)
+	require.NotEqual(t, companionBeforeRepair.HomeDomain, companionAfterRepair.HomeDomain)
+	require.NoError(t, badgerStore.ValidateAppV23State())
 
 	// The first H+1 transaction uses the extended wire field through both
 	// CheckTx and FinalizeBlock, proving this is not merely an Info-version test.
@@ -272,6 +288,10 @@ func TestVendoredAgentRealCometAppV25ToV26Restart(t *testing.T) {
 	require.Equal(t, uint64(26), thirdStatus.NodeInfo.ProtocolVersion.App)
 	require.Equal(t, activation26+1, thirdStatus.SyncInfo.LatestBlockHeight)
 	require.True(t, app.IsAppV26ActiveForNextTx())
+	require.NoError(t, migrateAgentsOnChainAtStartup(
+		context.Background(), projection, badgerStore,
+		"", rootKey, false, zerolog.Nop(),
+	), "a clean app-v26 restart must use strict projection validation")
 	restartedGroup, err := badgerStore.GetAppV23AccessGroup("real-comet-team")
 	require.NoError(t, err)
 	require.Equal(t, store.AppV26GroupAuthorityReadWrite, restartedGroup.MemberAuthority)

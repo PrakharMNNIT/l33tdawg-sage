@@ -2,7 +2,7 @@
 
 Python client for the SAGE (Sovereign Agent Governed Experience) protocol -- a governed, verifiable institutional memory layer for multi-agent systems.
 
-**Requires Python 3.10+** | **SAGE v11.17.1 SDK** | **TLS, app-v26 explicit Access Group authority, app-v24 memory integrity, app-v25 immutable envelopes and historical continuity recovery, canonical local Messages and read receipts, read-only federation, scoped governance, and per-record `classification` supported**
+**Requires Python 3.10+** | **SAGE v11.17.2 SDK** | **TLS, app-v26 explicit Access Group authority, app-v24 memory integrity, app-v25 immutable envelopes and historical continuity recovery, canonical local Messages and read receipts, read-only federation, scoped governance, and per-record `classification` supported**
 
 ## Installation
 
@@ -154,6 +154,13 @@ sample = client.domain_access_sample()
 # grants are governed in the local CEREBRUM Access Controls screen; the SDK
 # deliberately exposes no legacy per-agent permission mutation shortcut.
 ```
+
+The desktop app listens on IPv4 loopback at `127.0.0.1:8080` by default.
+`localhost` in the example is a client-side loopback alias, not a LAN bind, and
+the SDK does not rewrite it. If `localhost` resolves only to an unbound IPv6
+`::1`, use `http://127.0.0.1:8080`. A LAN `base_url` can reach only routes the
+node deliberately exposes there; it cannot satisfy the direct-loopback peer
+and `Host` checks protecting CEREBRUM operator actions.
 
 ### Memory Operations
 

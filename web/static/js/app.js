@@ -52,7 +52,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.1';
+const SAGE_VERSION = 'v11.17.2';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -15925,6 +15925,18 @@ function fedCatalogMap(result) {
     return out;
 }
 
+// The federation catalog can contain hundreds or thousands of domains. Polls
+// return a newly allocated payload even when the operator-visible projection
+// is unchanged, so compare only the fields this panel renders before asking
+// Preact to reconcile the permission table again.
+function fedCatalogMapsEqual(a, b) {
+    const snapshot = value => Object.keys(value || {}).sort((left, right) => left.localeCompare(right)).map(domain => {
+        const item = value[domain] || {};
+        return [domain, Number(item.memory_count || 0), String(item.authority || ''), item.can_share !== false];
+    });
+    return JSON.stringify(snapshot(a)) === JSON.stringify(snapshot(b));
+}
+
 function normalizeFedPermissionList(items) {
     const out = {};
     for (const item of (Array.isArray(items) ? items : [])) {
@@ -16012,6 +16024,7 @@ function mergeFedPipeContactGrant(base, targeted = []) {
 }
 
 const maxPinnedFedPipeContacts = 4;
+const fedPermissionRenderBatch = 75;
 
 function fedFriendlyLocalAgentLabel(agent) {
     const name = String(agent && (agent.name || agent.registered_name) || 'Unnamed agent').trim();
@@ -16059,6 +16072,8 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     const [syncKnown, setSyncKnown] = useState(false);
     const [syncStatus, setSyncStatus] = useState(null);
     const [filter, setFilter] = useState('');
+    const [localRowLimit, setLocalRowLimit] = useState(fedPermissionRenderBatch);
+    const [remoteRowLimit, setRemoteRowLimit] = useState(fedPermissionRenderBatch);
     const [busy, setBusy] = useState(false);
     const [syncBusy, setSyncBusy] = useState(false);
     const [syncErr, setSyncErr] = useState('');
@@ -16083,7 +16098,10 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
             ]);
             if (!live) return;
             const errors = [];
-            if (catalogResult.status === 'fulfilled') setCatalog(fedCatalogMap(catalogResult.value));
+            if (catalogResult.status === 'fulfilled') {
+                const nextCatalog = fedCatalogMap(catalogResult.value);
+                setCatalog(current => current !== null && fedCatalogMapsEqual(current, nextCatalog) ? current : nextCatalog);
+            }
             else { setCatalog({}); errors.push(`domains: ${catalogResult.reason && catalogResult.reason.message ? catalogResult.reason.message : catalogResult.reason}`); }
             if (permissionsResult.status === 'fulfilled') {
                 const p = permissionsResult.value || {};
@@ -16139,19 +16157,24 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
         return () => { live = false; };
     }, [chain, reloadToken]);
 
+    useEffect(() => { setLocalRowLimit(fedPermissionRenderBatch); }, [chain]);
+    useEffect(() => { setRemoteRowLimit(fedPermissionRenderBatch); }, [chain]);
+
     // The parent runs the one live reachability probe for this connection.
     // Consume that authenticated response here so opening the panel never
     // starts duplicate 25-second peer calls merely to reveal local controls.
     useEffect(() => {
         if (!connectionStatus || connectionStatus.reachable !== true) return;
         if (connectionStatus.peer_rbac_grant) {
-            setRemote(normalizeFedPermissionList(connectionStatus.peer_rbac_grant.domains));
+            const nextRemote = normalizeFedPermissionList(connectionStatus.peer_rbac_grant.domains);
+            setRemote(current => fedPermissionMapsEqual(current, nextRemote) ? current : nextRemote);
             setRemoteKnown(true);
             setRemotePaused(connectionStatus.peer_rbac_grant.paused === true);
         } else if (connectionStatus.sharing_grant) {
-            setRemote(normalizeFedPermissionList(
+            const nextRemote = normalizeFedPermissionList(
                 (connectionStatus.sharing_grant.allowed_domains || []).map(domain => ({ domain, read: true }))
-            ));
+            );
+            setRemote(current => fedPermissionMapsEqual(current, nextRemote) ? current : nextRemote);
             setRemoteKnown(true);
             setRemotePaused(false);
         }
@@ -16180,11 +16203,15 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
             const [catalogResult, permissionsResult, pipeContactsResult] = results;
             const targetedResults = results.slice(3);
             if (!live) return;
-            if (catalogResult.status === 'fulfilled') setCatalog(fedCatalogMap(catalogResult.value));
+            if (catalogResult.status === 'fulfilled') {
+                const nextCatalog = fedCatalogMap(catalogResult.value);
+                setCatalog(current => current !== null && fedCatalogMapsEqual(current, nextCatalog) ? current : nextCatalog);
+            }
             if (permissionsResult.status === 'fulfilled') {
                 const p = permissionsResult.value || {};
                 if (p.remote_known === true) {
-                    setRemote(normalizeFedPermissionList(p.remote_permissions));
+                    const nextRemote = normalizeFedPermissionList(p.remote_permissions);
+                    setRemote(current => fedPermissionMapsEqual(current, nextRemote) ? current : nextRemote);
                     setRemoteKnown(true);
                     setRemotePaused(p.remote_paused === true);
                 }
@@ -16248,6 +16275,15 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     // moves after Save confirms the new sharing state.
     const visibleSharedRows = visibleRows.filter(row => fedPermissionIsEnabled(saved[row.domain]));
     const visibleUnsharedRows = visibleRows.filter(row => !fedPermissionIsEnabled(saved[row.domain]));
+    // Render a bounded prefix while retaining the complete filtered set for
+    // bulk actions. Already-shared (including stale/revoke-only) rows stay
+    // ahead of unshared rows so an existing grant is never hidden merely by a
+    // large local inventory.
+    const renderedSharedRows = visibleSharedRows.slice(0, localRowLimit);
+    const remainingLocalSlots = Math.max(0, localRowLimit - renderedSharedRows.length);
+    const renderedUnsharedRows = visibleUnsharedRows.slice(0, remainingLocalSlots);
+    const renderedLocalCount = renderedSharedRows.length + renderedUnsharedRows.length;
+    const hiddenLocalRowCount = Math.max(0, visibleRows.length - renderedLocalCount);
     // Keep stale subscriptions visible so the receiver can always turn them
     // off even after the source withdraws its Copy grant.
     const remoteRows = Array.from(new Set([
@@ -16257,6 +16293,14 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
         domain,
         remote[domain] || { read: false, write: false, copy: false },
     ]);
+    // A retained subscription remains actionable even if the source withdrew
+    // Copy, so selected rows lead the bounded remote window.
+    const orderedRemoteRows = [
+        ...remoteRows.filter(([domain]) => subscribeDraft.includes(domain)),
+        ...remoteRows.filter(([domain]) => !subscribeDraft.includes(domain)),
+    ];
+    const renderedRemoteRows = orderedRemoteRows.slice(0, remoteRowLimit);
+    const hiddenRemoteRowCount = Math.max(0, orderedRemoteRows.length - renderedRemoteRows.length);
     const dirty = !fedPermissionMapsEqual(saved, draft);
     const subscribeDirty = JSON.stringify(subscribeSaved) !== JSON.stringify(subscribeDraft);
 
@@ -16728,7 +16772,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                 <input class="fed-share-input fed-perm-search" value=${filter}
                     placeholder="Filter existing domains (try tii*)"
                     aria-label="Filter existing domains"
-                    onInput=${e => setFilter(e.target.value)} />
+                    onInput=${e => { setLocalRowLimit(fedPermissionRenderBatch); setFilter(e.target.value); }} />
                 <div class="fed-perm-bulk" aria-label="Apply permission to visible domains">
                     <button class="btn" disabled=${visibleRows.every(row => !row.canShare)} onClick=${() => allowVisible('read')}>Allow read</button>
                     <button class="btn" disabled title="Requires a consensus-bound federation ingress capability">Write unavailable</button>
@@ -16736,25 +16780,29 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                     <button class="btn" disabled=${visibleRows.length === 0} onClick=${clearVisible}>Clear visible</button>
                 </div>
             </div>
-            <div class="fed-perm-count muted">${visibleRows.length} of ${localRows.length} domains shown. Bulk actions affect only these visible rows.</div>
+            <div class="fed-perm-count muted">${renderedLocalCount} of ${visibleRows.length} matching domains shown (${localRows.length} total). Bulk actions affect all ${visibleRows.length} matching domains.</div>
             <div class="fed-perm-table" role="table" aria-label=${`Domains this computer shares with ${peerName}`}>
             <div class="fed-perm-grid fed-perm-grid-head" role="row">
                 <span role="columnheader">Existing domain</span><span role="columnheader">Read</span><span role="columnheader">Write (not yet)</span><span role="columnheader">Copy offer</span>
             </div>
             ${visibleRows.length === 0 && html`<div class="fed-perm-empty muted">${localRows.length ? 'No existing domains match this filter.' : 'This SAGE has no domains available to share yet.'}</div>`}
-            ${visibleSharedRows.length > 0 && html`<div class="fed-perm-rowgroup" role="rowgroup" aria-label=${`Already shared with ${peerName}`}>
+            ${renderedSharedRows.length > 0 && html`<div class="fed-perm-rowgroup" role="rowgroup" aria-label=${`Already shared with ${peerName}`}>
                 <div class="fed-perm-grid fed-perm-group-head shared" role="row">
                     <span role="columnheader" aria-colspan="4"><strong>Already shared with ${peerName}</strong><span>${visibleSharedRows.length} ${visibleSharedRows.length === 1 ? 'domain' : 'domains'}</span></span>
                 </div>
-                ${visibleSharedRows.map(renderLocalPermissionRow)}
+                ${renderedSharedRows.map(renderLocalPermissionRow)}
             </div>`}
-            ${visibleUnsharedRows.length > 0 && html`<div class="fed-perm-rowgroup" role="rowgroup" aria-label="Not shared">
+            ${renderedUnsharedRows.length > 0 && html`<div class="fed-perm-rowgroup" role="rowgroup" aria-label="Not shared">
                 <div class="fed-perm-grid fed-perm-group-head" role="row">
                     <span role="columnheader" aria-colspan="4"><strong>Not shared</strong><span>${visibleUnsharedRows.length} ${visibleUnsharedRows.length === 1 ? 'domain' : 'domains'}</span></span>
                 </div>
-                ${visibleUnsharedRows.map(renderLocalPermissionRow)}
+                ${renderedUnsharedRows.map(renderLocalPermissionRow)}
             </div>`}
             </div>
+            ${hiddenLocalRowCount > 0 && html`<div class="fed-perm-more">
+                <button class="btn" onClick=${() => setLocalRowLimit(limit => limit + fedPermissionRenderBatch)}>Show ${Math.min(fedPermissionRenderBatch, hiddenLocalRowCount)} more domains</button>
+                <span class="muted">${hiddenLocalRowCount} matching domains not rendered yet. Search narrows the complete catalog.</span>
+            </div>`}
             ${err && html`<div class="fed-err fed-perm-error" role="alert">${err}</div>`}
             <div class="fed-perm-actions">
                 <button class="btn btn-primary" disabled=${(!dirty && !alignmentPending) || busy || !!pipeContactBusy || pipeContactLookupBusy} onClick=${save}>${busy ? 'Saving…' : (!dirty && alignmentPending ? 'Retry copy alignment' : 'Save what I share')}</button>
@@ -16792,7 +16840,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                 <div class="fed-perm-grid fed-perm-grid-copy-choice fed-perm-grid-head" role="row">
                     <span role="columnheader">Their domain</span><span role="columnheader">Read</span><span role="columnheader">Write (not yet)</span><span role="columnheader">Copy offered</span><span role="columnheader">Save here</span>
                 </div>
-                ${remoteRows.map(([domain, permission]) => {
+                ${renderedRemoteRows.map(([domain, permission]) => {
                     const subscribed = subscribeDraft.includes(domain);
                     return html`<div class="fed-perm-grid fed-perm-grid-copy-choice fed-perm-row fed-perm-remote-row" role="row" key=${domain}>
                     <div class="fed-perm-domain" role="rowheader">
@@ -16811,6 +16859,10 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                     </label>
                 </div>`;})}
                 </div>
+                ${hiddenRemoteRowCount > 0 && html`<div class="fed-perm-more">
+                    <button class="btn" onClick=${() => setRemoteRowLimit(limit => limit + fedPermissionRenderBatch)}>Show ${Math.min(fedPermissionRenderBatch, hiddenRemoteRowCount)} more offered domains</button>
+                    <span class="muted">${hiddenRemoteRowCount} offered domains not rendered yet. Saved choices remain first.</span>
+                </div>`}
                 <div class="fed-perm-actions">
                     <button class="btn btn-primary" disabled=${!syncKnown || !subscribeDirty || syncBusy} onClick=${saveSubscriptions}>${syncBusy ? 'Saving…' : 'Save copy choices'}</button>
                     <span class="muted">${!syncKnown ? 'Copy controls unavailable' : (subscribeDirty ? 'Unsaved copy choices' : 'Saved')}</span>

@@ -254,7 +254,7 @@ Commands:
 
 Environment (common — full list: docs/reference/environment-variables.md):
   SAGE_HOME           Data directory (default: ~/.sage)
-  SAGE_API_URL        REST API base URL (default: http://localhost:8080)
+  SAGE_API_URL        REST API base URL (default: http://127.0.0.1:8080)
   SAGE_AGENT_KEY      Explicit agent key path (overrides per-project derivation)
   SAGE_IDENTITY_PATH  Identity key path (takes precedence over SAGE_AGENT_KEY)
   SAGE_PASSPHRASE     Vault passphrase (else prompted on a TTY)
