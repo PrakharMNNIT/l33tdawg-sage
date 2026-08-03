@@ -135,12 +135,12 @@ func (h *DashboardHandler) handleCheckUpdate(w http.ResponseWriter, r *http.Requ
 		"download_size":            assetSize,
 		"checksum":                 expectedChecksum,
 		"platform":                 runtime.GOOS + "/" + runtime.GOARCH,
-		"in_app_update_supported":  runtime.GOOS == "linux" || runtime.GOOS == "darwin",
-		"in_app_restart_supported": runtime.GOOS != "windows",
+		"in_app_update_supported":  inAppUpdateSupported(runtime.GOOS),
+		"in_app_restart_supported": inAppUpdateSupported(runtime.GOOS),
 		"update_instructions": func() string {
 			switch runtime.GOOS {
 			case "darwin":
-				return "SAGE can download, verify, and install the signed app update in the background."
+				return "Download the signed DMG, fully quit SAGE, drag SAGE.app to Applications, then reopen it. Your node data is unchanged."
 			case "windows":
 				return "Download the signed installer, fully quit SAGE, install it, then open SAGE again."
 			default:
@@ -161,6 +161,14 @@ func (h *DashboardHandler) handleCheckUpdate(w http.ResponseWriter, r *http.Requ
 	writeJSONResp(w, http.StatusOK, result)
 }
 
+func inAppUpdateSupported(goos string) bool {
+	// macOS app replacement needs a recovery process outside SAGE.app. Without
+	// one, a crash or launch-validation failure after swap can leave no binary
+	// capable of restoring the preserved bundle. Keep the signed-DMG path until
+	// such an independently signed helper exists.
+	return goos == "linux"
+}
+
 func assetSHA256Digest(digest string) string {
 	const prefix = "sha256:"
 	digest = strings.TrimSpace(digest)
@@ -175,6 +183,59 @@ func assetSHA256Digest(digest string) string {
 		return ""
 	}
 	return strings.ToLower(sum)
+}
+
+// releaseAssetVersion binds an updater request to the immutable release tag
+// carried by GitHub's canonical asset URL. A signed SAGE bundle from a
+// different release is still authentic, but it is not the update the operator
+// selected and must never be activated under that release's pending marker.
+func releaseAssetVersion(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host != "github.com" {
+		return "", errors.New("update URL is not a canonical GitHub release asset")
+	}
+	parts := strings.Split(strings.Trim(parsed.EscapedPath(), "/"), "/")
+	if len(parts) != 6 || parts[0] != githubOwner || parts[1] != githubRepo ||
+		parts[2] != "releases" || parts[3] != "download" || parts[4] == "" || parts[5] == "" {
+		return "", errors.New("update URL does not identify an exact GitHub release")
+	}
+	tag, unescapeErr := url.PathUnescape(parts[4])
+	if unescapeErr != nil || strings.ContainsAny(tag, "/\\\r\n\x00") {
+		return "", errors.New("update URL contains an invalid release tag")
+	}
+	version := strings.TrimPrefix(tag, "v")
+	fields := strings.Split(version, ".")
+	if len(fields) != 3 {
+		return "", errors.New("update URL release tag is not a semantic version")
+	}
+	for _, field := range fields {
+		if field == "" {
+			return "", errors.New("update URL release tag is not a semantic version")
+		}
+		for _, char := range field {
+			if char < '0' || char > '9' {
+				return "", errors.New("update URL release tag is not a semantic version")
+			}
+		}
+	}
+	return "v" + version, nil
+}
+
+func releaseAssetMatchesPlatform(rawURL, version string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	assetName, err := url.PathUnescape(filepath.Base(parsed.EscapedPath()))
+	if err != nil {
+		return false
+	}
+	return assetName == findUpdateAssetName(strings.TrimPrefix(version, "v"), runtime.GOOS, runtime.GOARCH)
+}
+
+func sameReleaseVersion(actual, expected string) bool {
+	return strings.TrimPrefix(strings.TrimSpace(actual), "v") ==
+		strings.TrimPrefix(strings.TrimSpace(expected), "v")
 }
 
 // runningBinaryDiskVersion returns the version reported by the binary currently
@@ -193,9 +254,14 @@ func runningBinaryDiskVersion(ctx context.Context) string {
 // diskBinaryVersion runs binPath with the "version" arg and parses the version
 // from its output. Returns "" on any failure — callers treat that as "unknown".
 func diskBinaryVersion(ctx context.Context, binPath string) string {
+	if _, err := requireUpdateBinaryFile(binPath, "version probe binary"); err != nil {
+		return ""
+	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, binPath, "version").Output() // #nosec G204 -- binPath is this process's own executable
+	// G702: the executable is intentionally selected by the updater and was
+	// just proven to be a non-symlink, bounded, executable regular file.
+	out, err := exec.CommandContext(ctx, binPath, "version").Output() //nolint:gosec
 	if err != nil {
 		return ""
 	}
@@ -234,8 +300,12 @@ func (h *DashboardHandler) handleApplyUpdate(w http.ResponseWriter, r *http.Requ
 		writeCEREBRUMOperatorForbidden(w, "Installing updates requires operator authority.")
 		return
 	}
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		writeError(w, http.StatusBadRequest, "This platform uses the signed release installer. Fully quit SAGE, install the release, then reopen it.")
+	if !inAppUpdateSupported(runtime.GOOS) {
+		message := "This platform uses the signed release installer. Fully quit SAGE, install the release, then reopen it."
+		if runtime.GOOS == "darwin" {
+			message = "macOS in-app replacement is disabled because no external recovery owner can restore SAGE.app if launch validation fails after the atomic swap. Download the signed DMG, fully quit SAGE, drag SAGE.app to Applications, then reopen it. Your node data is unchanged."
+		}
+		writeError(w, http.StatusBadRequest, message)
 		return
 	}
 	var body struct {
@@ -255,15 +325,12 @@ func (h *DashboardHandler) handleApplyUpdate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Reject path traversal in URL
-	if strings.Contains(body.DownloadURL, "..") {
-		writeError(w, http.StatusBadRequest, "invalid download URL")
-		return
-	}
-
-	// Validate the URL is from GitHub releases
-	if !strings.HasPrefix(body.DownloadURL, "https://github.com/"+githubOwner+"/"+githubRepo+"/releases/") {
-		writeError(w, http.StatusBadRequest, "invalid download URL — must be a GitHub release")
+	// Bind the request to one exact canonical GitHub release tag. The download
+	// checksum proves bytes; this tag is separately matched against the version
+	// reported by the signed executable before activation.
+	requestedVersion, versionErr := releaseAssetVersion(body.DownloadURL)
+	if versionErr != nil || !releaseAssetMatchesPlatform(body.DownloadURL, requestedVersion) {
+		writeError(w, http.StatusBadRequest, "invalid download URL — must identify an exact GitHub release asset")
 		return
 	}
 
@@ -362,6 +429,11 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 		h.sendUpdateProgress("download", "error", "Download URL host not allowed")
 		return
 	}
+	expectedVersion, versionErr := releaseAssetVersion(downloadURL)
+	if versionErr != nil || !releaseAssetMatchesPlatform(downloadURL, expectedVersion) {
+		h.sendUpdateProgress("download", "error", "Download URL does not identify an exact SAGE release")
+		return
+	}
 
 	client := &http.Client{
 		Timeout: 5 * time.Minute,
@@ -402,10 +474,15 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 	defer os.Remove(archiveTmp.Name())
 
 	hasher := sha256.New()
-	written, copyErr := io.Copy(archiveTmp, io.TeeReader(io.LimitReader(resp.Body, 500<<20), hasher))
+	written, copyErr := io.Copy(archiveTmp, io.TeeReader(io.LimitReader(resp.Body, maxUpdateBinarySize+1), hasher))
 	if copyErr != nil {
 		_ = archiveTmp.Close()
 		h.sendUpdateProgress("download", "error", "Download interrupted: "+copyErr.Error())
+		return
+	}
+	if written > maxUpdateBinarySize {
+		_ = archiveTmp.Close()
+		h.sendUpdateProgress("download", "error", "Release archive exceeds the updater size limit")
 		return
 	}
 
@@ -421,6 +498,36 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 	}
 	h.sendUpdateProgress("verify", "done", "Checksum verified")
 
+	// A verified release archive is not enough to authorize mutation of the
+	// installed executable. First prove that the exact current chain state and
+	// running binary form a coherent, restorable rollback bundle. This runs
+	// before the vault backup and before either platform installer touches the
+	// app/binary. Missing production wiring fails closed.
+	h.sendUpdateProgress("snapshot", "active", "Creating and verifying a complete pre-update recovery snapshot...")
+	if h.PrepareVersionTransition == nil || h.PrepareRestartDrain == nil {
+		h.sendUpdateProgress("snapshot", "error", "Update safety snapshot is unavailable; the installed app was not changed")
+		return
+	}
+	drainCtx, cancelDrain := context.WithTimeout(ctx, 15*time.Second)
+	_, abortDrain, drainErr := h.PrepareRestartDrain(drainCtx)
+	cancelDrain()
+	if drainErr != nil {
+		h.sendUpdateProgress("snapshot", "error", "A current snapshot is still finishing; retry the update without interrupting SAGE: "+drainErr.Error())
+		return
+	}
+	defer abortDrain()
+	transitionRelease, snapshotErr := h.PrepareVersionTransition(ctx, expectedVersion)
+	if snapshotErr != nil {
+		h.sendUpdateProgress("snapshot", "error", "Could not verify the pre-update recovery snapshot; the installed app was not changed: "+snapshotErr.Error())
+		return
+	}
+	if transitionRelease == nil {
+		h.sendUpdateProgress("snapshot", "error", "Could not hold the verified recovery boundary; the installed app was not changed")
+		return
+	}
+	defer transitionRelease()
+	h.sendUpdateProgress("snapshot", "done", "Complete recovery snapshot verified")
+
 	// Protect the irreplaceable vault key before either the app-bundle or
 	// standalone-binary installer touches the current installation.
 	if h.VaultKeyPath != "" {
@@ -435,7 +542,7 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 	if runtime.GOOS == "darwin" {
 		_ = archiveTmp.Close()
 		h.sendUpdateProgress("extract", "active", "Opening signed SAGE app update...")
-		stagedVersion, installErr := installDarwinAppUpdate(ctx, archiveTmp.Name(), execPath)
+		stagedVersion, installErr := installDarwinAppUpdate(ctx, archiveTmp.Name(), execPath, expectedVersion)
 		if installErr != nil {
 			h.sendUpdateProgress("install", "error", installErrorMessage("Failed to install signed app update", installErr, downloadURL))
 			return
@@ -468,6 +575,12 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 		h.sendUpdateProgress("extract", "error", "The verified archive did not contain a runnable release build. Use the signed release installer instead.")
 		return
 	}
+	if !sameReleaseVersion(stagedVersion, expectedVersion) {
+		h.sendUpdateProgress("extract", "error", fmt.Sprintf(
+			"Verified archive reports %s but the selected release is %s", stagedVersion, expectedVersion,
+		))
+		return
+	}
 
 	// Step 4: Install
 	h.sendUpdateProgress("install", "active", "Installing new binary...")
@@ -481,43 +594,52 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 	h.sendUpdateProgress("complete", "done", "ready_to_restart")
 }
 
-const pendingUpdateSuffix = ".update-pending"
+const (
+	pendingUpdateSuffix = ".update-pending"
+	maxUpdateBinarySize = int64(500 << 20)
+)
 
 // installPendingBinary stages the verified executable in the destination
 // directory, durably snapshots the current executable, then atomically replaces
 // it. The backup remains until the replacement process proves its own boot ID
-// healthy; early exec/startup failure can therefore roll back automatically.
+// healthy. Automatic binary downgrades are intentionally disabled after the
+// chain-compatibility safety floor; the retained evidence is for prepared-state
+// reconciliation and explicit operator recovery only.
 func installPendingBinary(execPath, extractedPath, version string) error {
-	if pending := PendingUpdateVersion(execPath); pending != "" {
+	if markerPath, exists, err := existingPendingUpdateMarker(execPath); err != nil {
+		return fmt.Errorf("inspect pending update state: %w", err)
+	} else if exists {
+		pending := PendingUpdateVersion(execPath)
+		if pending == "" {
+			pending = "with an unreadable marker at " + markerPath
+		}
 		return fmt.Errorf("update %s is still pending boot confirmation", pending)
 	}
-	dir := filepath.Dir(execPath)
-	mode := os.FileMode(0755)
-	if info, err := os.Stat(execPath); err == nil {
-		mode = info.Mode()
+	version = strings.TrimSpace(version)
+	installedInfo, err := requireUpdateBinaryFile(execPath, "installed binary")
+	if err != nil {
+		return err
 	}
+	extractedInfo, err := requireUpdateBinaryFile(extractedPath, "verified update binary")
+	if err != nil {
+		return err
+	}
+	rollbackVersion := diskBinaryVersion(context.Background(), execPath)
+	if version == "" || version == "dev" || rollbackVersion == "" || rollbackVersion == "dev" {
+		return fmt.Errorf("binary update requires exact pending and rollback release versions")
+	}
+	if stagedVersion := diskBinaryVersion(context.Background(), extractedPath); !sameReleaseVersion(stagedVersion, version) {
+		return fmt.Errorf("verified update binary reports %s, expected %s", stagedVersion, version)
+	}
+	dir := filepath.Dir(execPath)
+	mode := installedInfo.Mode().Perm()
 	staged, err := os.CreateTemp(dir, ".sage-gui-staged-*")
 	if err != nil {
 		return fmt.Errorf("stage beside installed binary: %w", err)
 	}
 	stagedPath := staged.Name()
 	defer func() { _ = os.Remove(stagedPath) }()
-	src, err := os.Open(extractedPath) //nolint:gosec // verified updater temp path
-	if err != nil {
-		_ = staged.Close()
-		return fmt.Errorf("open verified binary: %w", err)
-	}
-	_, copyErr := io.Copy(staged, io.LimitReader(src, 500<<20))
-	closeSrcErr := src.Close()
-	if copyErr == nil {
-		copyErr = closeSrcErr
-	}
-	if copyErr == nil {
-		copyErr = staged.Chmod(mode)
-	}
-	if copyErr == nil {
-		copyErr = staged.Sync()
-	}
+	copyErr := copyUpdateBinaryContents(extractedPath, extractedInfo, staged, mode)
 	closeStageErr := staged.Close()
 	if copyErr == nil {
 		copyErr = closeStageErr
@@ -525,43 +647,248 @@ func installPendingBinary(execPath, extractedPath, version string) error {
 	if copyErr != nil {
 		return fmt.Errorf("stage verified binary: %w", copyErr)
 	}
+	if stagedVersion := diskBinaryVersion(context.Background(), stagedPath); !sameReleaseVersion(stagedVersion, version) {
+		return fmt.Errorf("staged update binary reports %s, expected %s", stagedVersion, version)
+	}
 
 	backupPath := execPath + ".old"
 	markerPath := platformPendingUpdateMarker(execPath)
-	_ = os.Remove(backupPath)
+	if backupInfo, statErr := os.Lstat(backupPath); statErr == nil {
+		if backupInfo.Mode()&os.ModeSymlink != 0 || !backupInfo.Mode().IsRegular() {
+			return fmt.Errorf("existing rollback binary must be a real regular file")
+		}
+		if removeErr := removeFileDurable(backupPath); removeErr != nil {
+			return fmt.Errorf("remove previous rollback binary: %w", removeErr)
+		}
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("inspect previous rollback binary: %w", statErr)
+	}
 	if err = copyFileDurable(execPath, backupPath, mode); err != nil {
 		return fmt.Errorf("preserve rollback binary: %w", err)
 	}
-	markerData := []byte(strings.TrimSpace(version) + "\n")
+	if backupVersion := diskBinaryVersion(context.Background(), backupPath); !sameReleaseVersion(backupVersion, rollbackVersion) {
+		// G703: backupPath is a fixed sibling of the already validated executable.
+		cleanupErr := removeFileDurable(backupPath) //nolint:gosec
+		return errors.Join(
+			fmt.Errorf("preserved rollback binary reports %s, expected %s", backupVersion, rollbackVersion),
+			cleanupErr,
+		)
+	}
+	markerData, err := json.Marshal(pendingUpdateRecord{
+		Version:         version,
+		RollbackVersion: rollbackVersion,
+	})
+	if err != nil {
+		cleanupErr := removeFileDurable(backupPath)
+		return errors.Join(fmt.Errorf("encode pending update: %w", err), cleanupErr)
+	}
+	markerData = append(markerData, '\n')
 	if err = writeFileAtomicDurable(markerPath, markerData, 0600); err != nil {
-		_ = os.Remove(backupPath)
-		return fmt.Errorf("record pending update: %w", err)
+		cleanupErr := cleanupPreparedBinaryUpdate(markerPath, backupPath)
+		return errors.Join(fmt.Errorf("record pending update: %w", err), cleanupErr)
 	}
 	if err = os.Rename(stagedPath, execPath); err != nil {
-		_ = os.Remove(markerPath)
-		_ = os.Remove(backupPath)
-		return fmt.Errorf("atomically replace installed binary: %w", err)
+		cleanupErr := cleanupPreparedBinaryUpdate(markerPath, backupPath)
+		return errors.Join(fmt.Errorf("atomically replace installed binary: %w", err), cleanupErr)
 	}
 	return syncDirectory(dir)
 }
 
-func copyFileDurable(srcPath, dstPath string, mode os.FileMode) error {
-	src, err := os.Open(srcPath) //nolint:gosec // trusted installed executable
+func requireUpdateBinaryFile(path, label string) (os.FileInfo, error) {
+	// G703: callers constrain path to os.Executable-derived update paths or a
+	// private os.CreateTemp result; Lstat is also a non-mutating validation step.
+	info, err := os.Lstat(path) //nolint:gosec
+	if err != nil {
+		return nil, fmt.Errorf("%s is unavailable: %w", label, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s must be a real regular file, not a link", label)
+	}
+	if info.Size() <= 0 || info.Size() > maxUpdateBinarySize {
+		return nil, fmt.Errorf("%s has an invalid size", label)
+	}
+	if info.Mode().Perm()&0111 == 0 {
+		return nil, fmt.Errorf("%s is not executable", label)
+	}
+	return info, nil
+}
+
+func copyUpdateBinaryContents(srcPath string, expectedInfo os.FileInfo, dst *os.File, mode os.FileMode) error {
+	src, err := os.Open(srcPath) //nolint:gosec // G703: caller passes the path whose exact FileInfo was just Lstat-verified.
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	openedInfo, statErr := src.Stat()
+	if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(expectedInfo, openedInfo) ||
+		openedInfo.Size() != expectedInfo.Size() {
+		_ = src.Close()
+		if statErr != nil {
+			return statErr
+		}
+		return fmt.Errorf("source binary changed while it was being opened")
+	}
+	written, copyErr := io.Copy(dst, io.LimitReader(src, maxUpdateBinarySize+1))
+	closeSrcErr := src.Close()
+	if copyErr == nil {
+		copyErr = closeSrcErr
+	}
+	if copyErr == nil && written != expectedInfo.Size() {
+		copyErr = fmt.Errorf("copied %d bytes, expected %d", written, expectedInfo.Size())
+	}
+	if copyErr == nil {
+		copyErr = dst.Chmod(mode.Perm())
+	}
+	if copyErr == nil {
+		copyErr = dst.Sync()
+	}
+	return copyErr
+}
+
+func removeFileDurable(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
+}
+
+// The marker is the recovery key. Make its removal durable before discarding
+// the backup so a power loss can leave, at worst, an unreferenced old binary --
+// never a resurrected marker whose only rollback artifact is gone.
+func cleanupPreparedBinaryUpdate(markerPath, backupPath string) error {
+	if err := removeFileDurable(markerPath); err != nil {
+		return fmt.Errorf("clear pending update marker: %w", err)
+	}
+	if err := removeFileDurable(backupPath); err != nil {
+		return fmt.Errorf("remove prepared rollback binary: %w", err)
+	}
+	return nil
+}
+
+func existingPendingUpdateMarker(execPath string) (string, bool, error) {
+	paths := []string{platformPendingUpdateMarker(execPath), execPath + pendingUpdateSuffix}
+	for i, path := range paths {
+		if i > 0 && path == paths[0] {
+			continue
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return path, false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return path, true, fmt.Errorf("pending update marker must be a real regular file")
+		}
+		if info.Size() <= 0 || info.Size() > 4096 {
+			return path, true, fmt.Errorf("pending update marker has an invalid size")
+		}
+		return path, true, nil
+	}
+	return "", false, nil
+}
+
+// ReconcilePreparedPendingBinaryUpdate handles the only crash window in which
+// the durable marker exists but the atomic executable rename did not happen.
+// It never rolls a binary backward. Exact pending/rollback versions plus the
+// preserved sibling prove that the executable at the launch path is still the
+// captured old release; clearing the marker lets that intact release boot.
+// App-bundle markers are handled by the macOS recovery path instead.
+func ReconcilePreparedPendingBinaryUpdate(execPath string) (bool, error) {
+	markerPath := platformPendingUpdateMarker(execPath)
+	if markerPath != execPath+pendingUpdateSuffix {
+		return false, nil
+	}
+	_, exists, err := existingPendingUpdateMarker(execPath)
+	if err != nil || !exists {
+		return false, err
+	}
+	data, err := os.ReadFile(markerPath) //nolint:gosec // Lstat-verified executable sibling.
+	if err != nil {
+		return false, fmt.Errorf("read pending update marker: %w", err)
+	}
+	record := decodePendingUpdateRecord(data)
+	if record.Version == "" {
+		return false, fmt.Errorf("pending update marker is unreadable")
+	}
+	// Legacy one-line markers do not contain enough evidence to distinguish a
+	// prepared install from an unrelated on-disk replacement. Leave them alone.
+	if record.RollbackVersion == "" {
+		return false, nil
+	}
+	if _, err := requireUpdateBinaryFile(execPath, "installed binary"); err != nil {
+		return false, err
+	}
+	installedVersion := diskBinaryVersion(context.Background(), execPath)
+	if sameReleaseVersion(installedVersion, record.Version) {
+		return false, nil
+	}
+	if !sameReleaseVersion(installedVersion, record.RollbackVersion) {
+		return false, fmt.Errorf(
+			"installed binary reports %s; pending update expected either %s or rollback %s",
+			installedVersion, record.Version, record.RollbackVersion,
+		)
+	}
+	backupPath := execPath + ".old"
+	if _, err := requireUpdateBinaryFile(backupPath, "prepared rollback binary"); err != nil {
+		return false, err
+	}
+	if backupVersion := diskBinaryVersion(context.Background(), backupPath); !sameReleaseVersion(backupVersion, record.RollbackVersion) {
+		return false, fmt.Errorf("prepared rollback binary reports %s, expected %s", backupVersion, record.RollbackVersion)
+	}
+	if err := os.Remove(markerPath); err != nil {
+		return false, fmt.Errorf("clear prepared update marker: %w", err)
+	}
+	if err := syncDirectory(filepath.Dir(execPath)); err != nil {
+		return true, fmt.Errorf("prepared update cleared but directory sync failed: %w", err)
+	}
+	return true, nil
+}
+
+func copyUpdateBinaryToTemp(srcPath, dir, pattern string, mode os.FileMode) (string, error) {
+	srcInfo, err := requireUpdateBinaryFile(srcPath, "source binary")
+	if err != nil {
+		return "", err
+	}
+	dst, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+	path := dst.Name()
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
+	if err = copyUpdateBinaryContents(srcPath, srcInfo, dst, mode); err != nil {
+		_ = dst.Close()
+		return "", err
+	}
+	if err = dst.Close(); err != nil {
+		return "", err
+	}
+	keep = true
+	return path, nil
+}
+
+func copyFileDurable(srcPath, dstPath string, mode os.FileMode) error {
+	srcInfo, err := requireUpdateBinaryFile(srcPath, "source binary")
+	if err != nil {
+		return err
+	}
 	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode) //nolint:gosec // sibling rollback path
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(dst, io.LimitReader(src, 500<<20))
-	if err == nil {
-		err = dst.Sync()
-	}
+	err = copyUpdateBinaryContents(srcPath, srcInfo, dst, mode)
 	closeErr := dst.Close()
 	if err == nil {
 		err = closeErr
+	}
+	if err != nil {
+		cleanupErr := removeFileDurable(dstPath)
+		return errors.Join(err, cleanupErr)
 	}
 	return err
 }
@@ -608,22 +935,54 @@ func PendingUpdateVersion(execPath string) string {
 		if i > 0 && path == paths[0] {
 			continue
 		}
-		data, err := os.ReadFile(path) //nolint:gosec // trusted executable/app sibling
-		if err == nil {
-			return strings.TrimSpace(string(data))
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() ||
+			info.Size() <= 0 || info.Size() > 4096 {
+			continue
+		}
+		data, readErr := os.ReadFile(path) //nolint:gosec // Lstat-verified executable/app sibling.
+		if readErr == nil {
+			if version := decodePendingUpdateRecord(data).Version; version != "" {
+				return version
+			}
 		}
 	}
 	return ""
 }
 
+type pendingUpdateRecord struct {
+	Version         string `json:"version"`
+	RollbackVersion string `json:"rollback_version,omitempty"`
+}
+
+func decodePendingUpdateRecord(data []byte) pendingUpdateRecord {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return pendingUpdateRecord{}
+	}
+	var record pendingUpdateRecord
+	if strings.HasPrefix(trimmed, "{") {
+		if json.Unmarshal([]byte(trimmed), &record) != nil {
+			return pendingUpdateRecord{}
+		}
+		record.Version = strings.TrimSpace(record.Version)
+		record.RollbackVersion = strings.TrimSpace(record.RollbackVersion)
+		return record
+	}
+	// Binary updates and app-bundle markers written before the structured
+	// format contain only the pending version. Keep them readable, but they do
+	// not gain an invented rollback identity.
+	return pendingUpdateRecord{Version: trimmed}
+}
+
 // ConfirmPendingUpdate removes rollback state only after the replacement node
 // has served a new, matching boot identity and version.
 func ConfirmPendingUpdate(execPath string) error {
-	if PendingUpdateVersion(execPath) == "" {
-		return nil
-	}
 	if handled, err := confirmPendingAppBundle(execPath); handled {
 		return err
+	}
+	if PendingUpdateVersion(execPath) == "" {
+		return nil
 	}
 	// Make the installed executable + rollback copy durable before committing.
 	// Keep .old as a one-generation recovery artifact; the next update replaces
@@ -645,25 +1004,87 @@ func ConfirmPendingUpdate(execPath string) error {
 // RollbackPendingUpdate atomically restores the previous executable after an
 // exec or early-boot failure. It returns false when no update is pending.
 func RollbackPendingUpdate(execPath string) (bool, error) {
-	if PendingUpdateVersion(execPath) == "" {
-		return false, nil
-	}
+	// App-bundle recovery must inspect the marker itself before the generic
+	// PendingUpdateVersion fast path. A malformed or unreadable external marker
+	// otherwise looks like "no update" and silently strands the rollback bundle.
 	if handled, rolledBack, err := rollbackPendingAppBundle(execPath); handled {
 		return rolledBack, err
 	}
-	backupPath := execPath + ".old"
-	if _, err := os.Stat(backupPath); err != nil {
-		return false, fmt.Errorf("pending update has no rollback binary: %w", err)
+	markerPath, markerExists, markerInspectErr := existingPendingUpdateMarker(execPath)
+	if markerInspectErr != nil {
+		return false, fmt.Errorf("inspect pending update marker before rollback: %w", markerInspectErr)
 	}
-	if err := os.Rename(backupPath, execPath); err != nil {
+	if !markerExists {
+		return false, nil
+	}
+	markerData, err := os.ReadFile(markerPath) //nolint:gosec // Marker was Lstat-verified above.
+	if err != nil {
+		return false, fmt.Errorf("read pending update marker before rollback: %w", err)
+	}
+	record := decodePendingUpdateRecord(markerData)
+	if record.Version == "" {
+		return false, fmt.Errorf("pending update marker is empty or unreadable")
+	}
+	backupPath := execPath + ".old"
+	backupInfo, err := requireUpdateBinaryFile(backupPath, "pending update rollback binary")
+	if err != nil {
 		return false, err
 	}
-	_ = os.Remove(platformPendingUpdateMarker(execPath))
-	_ = os.Remove(execPath + pendingUpdateSuffix)
-	if err := syncDirectory(filepath.Dir(execPath)); err != nil {
-		// The atomic rename already restored the old executable. Tell the caller
-		// to relaunch it even if the durability barrier could not be confirmed.
+	if record.RollbackVersion != "" {
+		if backupVersion := diskBinaryVersion(context.Background(), backupPath); !sameReleaseVersion(backupVersion, record.RollbackVersion) {
+			return false, fmt.Errorf("rollback binary reports %s, expected %s", backupVersion, record.RollbackVersion)
+		}
+		installedVersion := diskBinaryVersion(context.Background(), execPath)
+		if installedVersion != "" && !sameReleaseVersion(installedVersion, record.Version) {
+			return false, fmt.Errorf(
+				"installed binary reports %s; pending update expected %s before rollback",
+				installedVersion, record.Version,
+			)
+		}
+	}
+	dir := filepath.Dir(execPath)
+	restorePath, err := copyUpdateBinaryToTemp(backupPath, dir, ".sage-gui-rollback-*", backupInfo.Mode().Perm())
+	if err != nil {
+		return false, fmt.Errorf("prepare rollback binary: %w", err)
+	}
+	defer func() { _ = os.Remove(restorePath) }()
+	if record.RollbackVersion != "" {
+		if stagedVersion := diskBinaryVersion(context.Background(), restorePath); !sameReleaseVersion(stagedVersion, record.RollbackVersion) {
+			return false, fmt.Errorf("staged rollback binary reports %s, expected %s", stagedVersion, record.RollbackVersion)
+		}
+	}
+	if err := os.Rename(restorePath, execPath); err != nil {
+		return false, fmt.Errorf("atomically restore rollback binary: %w", err)
+	}
+	// Make the restored executable durable and validate the exact launch path
+	// before removing either the recovery marker or its source bundle.
+	if err := syncDirectory(dir); err != nil {
 		return true, fmt.Errorf("rollback binary restored but directory sync failed: %w", err)
+	}
+	if record.RollbackVersion != "" {
+		if restoredVersion := diskBinaryVersion(context.Background(), execPath); !sameReleaseVersion(restoredVersion, record.RollbackVersion) {
+			return true, fmt.Errorf("restored binary reports %s, expected %s", restoredVersion, record.RollbackVersion)
+		}
+	}
+	var markerCleanupErr error
+	for _, path := range []string{platformPendingUpdateMarker(execPath), execPath + pendingUpdateSuffix} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && markerCleanupErr == nil {
+			markerCleanupErr = err
+		}
+	}
+	markerSyncErr := syncDirectory(dir)
+	if markerCleanupErr != nil || markerSyncErr != nil {
+		var cleanupErr error
+		if markerCleanupErr != nil {
+			cleanupErr = fmt.Errorf("rollback binary restored but pending marker cleanup failed: %w", markerCleanupErr)
+		}
+		if markerSyncErr != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("sync pending marker cleanup: %w", markerSyncErr))
+		}
+		return true, cleanupErr
+	}
+	if err := removeFileDurable(backupPath); err != nil {
+		return true, fmt.Errorf("rollback binary restored but rollback artifact cleanup failed: %w", err)
 	}
 	return true, nil
 }
@@ -687,10 +1108,71 @@ func (h *DashboardHandler) handleRestart(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	if err := h.RequestRestart(); err != nil {
+	// Manual app replacement can change os.Executable()'s pathname while this
+	// process still runs the previous inode. Before crossing that version
+	// boundary, create a synchronous verified snapshot whose binary is pinned to
+	// the current process. Ordinary same-version setting restarts remain cheap.
+	diskVersion := ""
+	if h.ExecPath != "" {
+		diskVersion = diskBinaryVersion(r.Context(), h.ExecPath)
+	} else {
+		diskVersion = runningBinaryDiskVersion(r.Context())
+	}
+	if diskVersion == "" {
+		writeError(w, http.StatusServiceUnavailable, "SAGE could not verify the installed binary version; restart was not requested")
+		return
+	}
+	if h.PrepareRestartDrain == nil || h.RequestRestartPrepared == nil {
+		writeError(w, http.StatusServiceUnavailable, "SAGE cannot prepare a reversible restart drain; restart was not requested")
+		return
+	}
+	drainCtx, cancelDrain := context.WithTimeout(r.Context(), 15*time.Second)
+	commitDrain, abortDrain, drainErr := h.PrepareRestartDrain(drainCtx)
+	cancelDrain()
+	if drainErr != nil {
+		writeError(w, http.StatusServiceUnavailable, "A safety snapshot is still finishing; SAGE remains online. Retry restart: "+drainErr.Error())
+		return
+	}
+	preparedOwned := true
+	defer func() {
+		if preparedOwned {
+			abortDrain()
+		}
+	}()
+	if restartRequired(h.Version, diskVersion) {
+		if h.PrepareVersionTransition == nil {
+			writeError(w, http.StatusServiceUnavailable, "SAGE cannot verify a pre-update recovery snapshot; restart was not requested")
+			return
+		}
+		release, err := h.PrepareVersionTransition(r.Context(), diskVersion)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "SAGE could not verify a pre-update recovery snapshot; restart was not requested: "+err.Error())
+			return
+		}
+		if release == nil {
+			if release != nil {
+				release()
+			}
+			writeError(w, http.StatusServiceUnavailable, "SAGE cannot preserve the recovery boundary through restart; restart was not requested")
+			return
+		}
+		if err := h.RequestRestartPrepared(release, commitDrain, abortDrain); err != nil {
+			release()
+			writeError(w, http.StatusServiceUnavailable, "SAGE could not begin a clean restart: "+err.Error())
+			return
+		}
+		preparedOwned = false
+		writeJSONResp(w, http.StatusAccepted, map[string]any{
+			"ok": true, "status": "draining", "boot_id": h.BootID,
+			"message": "SAGE is closing cleanly, then restarting…",
+		})
+		return
+	}
+	if err := h.RequestRestartPrepared(nil, commitDrain, abortDrain); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "SAGE could not begin a clean restart: "+err.Error())
 		return
 	}
+	preparedOwned = false
 	writeJSONResp(w, http.StatusAccepted, map[string]any{
 		"ok": true, "status": "draining", "boot_id": h.BootID,
 		"message": "SAGE is closing cleanly, then restarting…",
@@ -735,19 +1217,19 @@ func releasePageURL(downloadURL string) string {
 }
 
 // findUpdateAssetName returns the release asset for a target platform.
-func findUpdateAssetName(version, goos, goarch string) string {
-	if goos == "darwin" {
-		archLabel := goarch
-		if goarch == "amd64" {
+func findUpdateAssetName(releaseVersion, targetOS, targetArch string) string {
+	switch targetOS {
+	case "darwin":
+		archLabel := targetArch
+		if targetArch == "amd64" {
 			archLabel = "x86_64"
 		}
-		return fmt.Sprintf("SAGE-v%s-macOS-%s.dmg", version, archLabel)
+		return fmt.Sprintf("SAGE-v%s-macOS-%s.dmg", releaseVersion, archLabel)
+	case "windows":
+		return fmt.Sprintf("sage-gui_%s_%s_%s.zip", releaseVersion, targetOS, targetArch)
+	default:
+		return fmt.Sprintf("sage-gui_%s_%s_%s.tar.gz", releaseVersion, targetOS, targetArch)
 	}
-	ext := "tar.gz"
-	if goos == "windows" {
-		ext = "zip"
-	}
-	return fmt.Sprintf("sage-gui_%s_%s_%s.%s", version, goos, goarch, ext)
 }
 
 // extractBinaryFromTarGz extracts a named binary from a .tar.gz stream to a temp file.
@@ -771,17 +1253,31 @@ func extractBinaryFromTarGz(reader io.Reader, binaryName string) (string, error)
 		// Match the binary name (could be in a subdirectory)
 		base := filepath.Base(header.Name)
 		if base == binaryName && header.Typeflag == tar.TypeReg {
+			if header.Size <= 0 || header.Size > maxUpdateBinarySize {
+				return "", fmt.Errorf("binary %q has an invalid size", binaryName)
+			}
 			tmpFile, err := os.CreateTemp("", "sage-update-*")
 			if err != nil {
 				return "", err
 			}
-			if _, err := io.Copy(tmpFile, io.LimitReader(tr, 500<<20)); err != nil { // 500MB max
+			if _, copyErr := io.CopyN(tmpFile, tr, header.Size); copyErr != nil {
 				_ = tmpFile.Close()
+				_ = os.Remove(tmpFile.Name())
+				return "", copyErr
+			}
+			if chmodErr := tmpFile.Chmod(0755); chmodErr != nil {
+				err = chmodErr
+			} else if syncErr := tmpFile.Sync(); syncErr != nil {
+				err = syncErr
+			}
+			closeErr := tmpFile.Close()
+			if err == nil {
+				err = closeErr
+			}
+			if err != nil {
 				_ = os.Remove(tmpFile.Name())
 				return "", err
 			}
-			_ = tmpFile.Close()
-			_ = os.Chmod(tmpFile.Name(), 0755)
 			return tmpFile.Name(), nil
 		}
 	}

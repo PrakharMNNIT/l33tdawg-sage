@@ -9,6 +9,10 @@ const codeqlWorkflow = readFileSync(
   new URL('../.github/workflows/codeql.yml', import.meta.url),
   'utf8',
 );
+const nativeShellWorkflow = readFileSync(
+  new URL('../.github/workflows/native-shell.yml', import.meta.url),
+  'utf8',
+);
 const codeqlBaseline = JSON.parse(
   readFileSync(new URL('./codeql-cometbft-baseline.json', import.meta.url), 'utf8'),
 );
@@ -164,6 +168,22 @@ test('metadata, source, race, frontend, and fault checks converge before packagi
   }
 });
 
+test('superseded checks stop spending runner minutes without weakening the newest commit', () => {
+  const cancellable = /concurrency:\n  group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}\n  cancel-in-progress: true/;
+  assert.match(ciWorkflow, cancellable);
+  assert.match(codeqlWorkflow, cancellable);
+  assert.match(nativeShellWorkflow, cancellable);
+});
+
+test('CI builds Docker once and keeps CometBFT hardening in the mandatory fault gate', () => {
+  assert.doesNotMatch(ciWorkflow, /^  docker:\n/m);
+  assert.match(ciJob('byzantine'), /docker compose -f deploy\/docker-compose\.yml up -d --build/);
+  assert.doesNotMatch(ciJob('test'), /make test-cometbft-patch/);
+  assert.doesNotMatch(job('test'), /make test-cometbft-patch/);
+  assert.match(faultWorkflow, /make test-cometbft-patch/);
+  assert.doesNotMatch(job('v119-fault-gates'), /needs: test/);
+});
+
 test('native shell evidence is version-locked, private, and cannot promote an unsigned standalone release', () => {
   const metadata = job('release-metadata');
   const evidence = job('native-shell-release-evidence');
@@ -200,8 +220,8 @@ test('native shell evidence is version-locked, private, and cannot promote an un
   assert.match(evidence, /SAGE_DAEMON_VERSION/);
   assert.match(
     daemonStager,
-    /SEMVER_PATTERN='\^11\\\.\(10\|11\|12\|13\|14\|15\|16\)\\\./,
-    'the tagged daemon stager must accept the current v11.16 release series',
+    /SEMVER_PATTERN='\^11\\\.\(10\|11\|12\|13\|14\|15\|16\|17\)\\\./,
+    'the tagged daemon stager must accept the current v11.17 release series',
   );
   assert.match(evidence, /Repair v11\.12\.0 native staging helper for immutable-tag recovery/);
   assert.match(evidence, /github\.event_name == 'workflow_dispatch'.*RELEASE_TAG == 'v11\.12\.0'/);
@@ -337,8 +357,25 @@ test('wheel smoke installs declared runtime dependencies before importing the SD
 test('PR and main CI require the same v11.9 composite proofs as release', () => {
   assert.match(ciJob('v119-fault-gates'), /require_scoped_reconfiguration: true/);
   assert.match(ciJob('v119-fault-gates'), /require_authorized_state_sync: true/);
-  assert.match(ciJob('test'), /go test \.\/\.\.\. -v -count=1 -race -timeout 30m/);
-  assert.match(job('test'), /go test \.\/\.\.\. -count=1 -race -timeout 30m/);
+  for (const testJob of [ciJob('test'), job('test')]) {
+    assert.match(testJob, /go test \.\/\.\.\.(?: -v)? -count=1 -timeout 20m/);
+    assert.match(testJob, /go test -race -count=1 -timeout 25m/);
+    for (const sharedStatePackage of [
+      './api/rest',
+      './internal/store',
+      './internal/federation',
+      './internal/mcp',
+      './internal/p2p',
+      './internal/snapshot',
+      './internal/statesync',
+      './internal/tx',
+    ]) {
+      assert.match(testJob, new RegExp(sharedStatePackage.replaceAll('/', '\\/')));
+    }
+    assert.match(testJob, /go test -race -count=1 -timeout 5m/);
+    assert.match(testJob, /-run 'Race\|Concurrent\|TOCTOU\|Linear'/);
+    assert.match(testJob, /\.\/internal\/abci \.\/web/);
+  }
 });
 
 test('the composite fault gate rechecks frozen source after every companion', () => {
@@ -369,12 +406,12 @@ test('the Linux cold gate proves the closed placeholder through the real Comet d
   assert.doesNotMatch(v119StateSync, /busybox nslookup provider-p2p/);
 });
 
-test('the mandatory cold gate transfers one exact app-v25 session', () => {
+test('the mandatory cold gate transfers one exact app-v26 session', () => {
   assert.match(
     faultWorkflow,
-    /name: App-v25 real Comet\/ABCI crash, partition, and state-sync gate/,
+    /name: App-v26 real Comet\/ABCI crash, partition, and state-sync gate/,
   );
-  assert.match(v119StateSync, /^TARGET_APP_VERSION=25$/m);
+  assert.match(v119StateSync, /^TARGET_APP_VERSION=26$/m);
   assert.match(v119StateSync, /"app_version": \$\{TARGET_APP_VERSION\}/);
   assert.doesNotMatch(v119StateSync, /"app_version": (?:20|21|22|23)/);
   assert.match(
@@ -538,12 +575,12 @@ test('the mandatory cold gate fails closed unless every seed reports its exact s
   assert.match(seedMemories, /lines\[-1\] != summary/);
   assert.match(seedMemories, /matches\[0\] != summary/);
   assert.doesNotMatch(seedMemories, />\/dev\/null/);
-  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v25\.txt 1/);
+  assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/post-v26\.txt 1/);
   assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/advance\.txt 2/);
   assert.match(v119StateSync, /seed_memories "\$\{PROVIDER\}" \/sage\/restart\.txt 1/);
   assert.match(
     v119StateSync,
-    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v25\.txt 1\nwait_height_at_least/,
+    /seed_memories "\$\{PROVIDER\}" \/sage\/post-v26\.txt 1\nwait_height_at_least/,
   );
   assert.match(
     v119StateSync,
@@ -585,6 +622,7 @@ test('Dependabot ignores only incompatible post-v0 go-libp2p versions', () => {
 
 test('macOS release artifacts must be signed, notarized, stapled, and assessed', () => {
   const body = job('macos-dmg');
+  const stagedBody = job('verify-staged-macos-release');
   assert.match(body, /APPLE_CERTIFICATE_BASE64/);
   assert.match(body, /APPLE_CERTIFICATE_PASSWORD/);
   assert.match(body, /NOTARIZE: '1'/);
@@ -608,8 +646,66 @@ test('macOS release artifacts must be signed, notarized, stapled, and assessed',
   assert.match(body, /grep -q 'hdiutil create -size 1024m -volname'/);
   assert.match(macosBuild, /hdiutil create -size 1024m -volname/);
   assert.match(body, /codesign --verify --deep --strict/);
+  assert.doesNotMatch(
+    macosBuild,
+    /codesign --force[^\n]*--deep/,
+    'nested executables must be signed leaf-first; signing-time --deep can invalidate the outer seal',
+  );
+  assert.match(macosBuild, /hdiutil attach -readonly -nobrowse -mountpoint/);
+  assert.match(macosBuild, /codesign --verify --deep --strict --verbose=2 "\$VERIFY_MOUNT\/SAGE\.app"/);
+  assert.match(macosBuild, /Contents\/MacOS\/sage-gui:sage-gui/);
+  assert.match(macosBuild, /Contents\/MacOS\/sage-tray:com\.sage\.brain/);
+  assert.match(macosBuild, /codesign --verify --strict --verbose=2 "\$leaf"/);
+  assert.match(macosBuild, /grep -Fx "TeamIdentifier=\$\{APPLE_TEAM_ID\}"/);
+  assert.match(macosBuild, /bundle_byte_manifest/);
+  assert.match(macosBuild, /\/usr\/bin\/ditto "\$VERIFY_MOUNT\/SAGE\.app" "\$COPY_VERIFY_APP"/);
+  assert.match(macosBuild, /diff -u "\$\{COPY_VERIFY_ROOT\}\/mounted\.manifest" "\$\{COPY_VERIFY_ROOT\}\/copied\.manifest"/);
+  assert.match(macosBuild, /verify_app_release_metadata "\$COPY_VERIFY_APP" "\$\{VERSION\}"/);
+  assert.match(macosBuild, /stat -f '%Lp' "\$leaf"/);
+  assert.match(macosBuild, /require_writable_apfs_path "\$COPY_VERIFY_ROOT"/);
+  assert.match(macosBuild, /Print :CFBundleShortVersionString/);
+  assert.match(body, /\/usr\/bin\/ditto "\$\{MOUNT_POINT\}\/SAGE\.app" "\$\{COPY_VERIFY_APP\}"/);
+  assert.match(stagedBody, /\/usr\/bin\/ditto "\$\{mount_point\}\/SAGE\.app" "\$\{copy_verify_app\}"/);
+  assert.match(body, /bundle_byte_manifest/);
+  assert.match(body, /diff -u "\$\{COPY_VERIFY_ROOT\}\/mounted\.manifest" "\$\{COPY_VERIFY_ROOT\}\/copied\.manifest"/);
+  assert.match(body, /version_output=\$\("\$\{COPY_VERIFY_APP\}\/Contents\/MacOS\/sage-gui" version\)/);
+  assert.match(body, /awk 'NR == 1 \{ print \$2 \}'\)" = "\$\{SAGE_VERSION#v\}"/);
+  assert.match(stagedBody, /version_output=\$\("\$\{copy_verify_app\}\/Contents\/MacOS\/sage-gui" version\)/);
+  assert.match(stagedBody, /awk 'NR == 1 \{ print \$2 \}'\)" = "\$\{RELEASE_TAG#v\}"/);
+  assert.match(body, /Contents\/MacOS\/sage-gui:sage-gui/);
+  assert.match(body, /Contents\/MacOS\/sage-tray:com\.sage\.brain/);
+  assert.match(body, /test -f "\$\{leaf\}" && test ! -L "\$\{leaf\}" && test -x "\$\{leaf\}"/);
+  assert.match(body, /stat -f '%Lp' "\$\{leaf\}"/);
+  assert.match(body, /codesign --verify --strict --verbose=2 "\$\{leaf\}"/);
+  assert.match(body, /grep -Fx "TeamIdentifier=\$\{APPLE_TEAM_ID\}"/);
+  assert.match(body, /grep -Fx "Identifier=com\.sage\.brain"/);
+  assert.match(stagedBody, /grep -Fx "TeamIdentifier=2N7GKZ8D8Z"/);
+  assert.match(stagedBody, /"SAGE-macOS-\$\{arch\}\.dmg"/);
+  assert.match(stagedBody, /test "\$\{published_name\}" = "\$\(basename "\$\{dmg\}"\)"/);
+  assert.match(stagedBody, /File System Personality:\[\[:space:\]\]\+APFS/);
+  assert.match(stagedBody, /spctl --assess --type execute --verbose=4 "\$\{copy_verify_app\}"/);
+  assert.match(stagedBody, /Print :CFBundleShortVersionString/);
   assert.match(body, /stapler validate/);
   assert.match(body, /spctl --assess --type execute/);
+});
+
+test('the exact GoReleaser Linux archive crosses extraction and atomic updater swap', () => {
+  const body = job('goreleaser-prepare');
+  assert.match(body, /SAGE_PACKAGED_UPDATE_ARCHIVE:/);
+  assert.match(body, /sage-gui_\$\{\{ needs\.release-metadata\.outputs\.version \}\}_linux_amd64\.tar\.gz/);
+  assert.match(body, /go test \.\/web -run '\^TestLinuxPackagedBinarySwapEndToEnd\$' -count=1/);
+});
+
+test('public package publication waits for the exact staged macOS assets', () => {
+  const approval = job('manual-publication-approval');
+  assert.match(
+    approval,
+    /needs:\s*\[stage-github-release, verify-staged-macos-release, release-metadata\]/,
+  );
+  assert.match(
+    job('publish-docker-version'),
+    /needs:\s*\[manual-publication-approval, release-metadata\]/,
+  );
 });
 
 test('desktop release metadata strips the tag prefix without renaming versioned assets', () => {
@@ -935,7 +1031,24 @@ test('public mutations are serial, resumable, and downstream of the gate', () =>
   );
   assert.doesNotMatch(job('verify-staged-macos-release'), /gh release download/);
 
-  assertNeeds('publish-docker-version', ['stage-github-release', 'release-metadata']);
+  assertNeeds('manual-publication-approval', [
+    'stage-github-release',
+    'verify-staged-macos-release',
+    'release-metadata',
+  ]);
+  assert.match(
+    job('manual-publication-approval'),
+    /environment:\s*\n\s+name: release-two-mac-acceptance/,
+  );
+  assert.doesNotMatch(job('manual-publication-approval'), /workflow_dispatch|inputs\./);
+  assert.match(job('manual-publication-approval'), /actions: read/);
+  assert.match(job('manual-publication-approval'), /deployments: read/);
+  assert.match(
+    job('manual-publication-approval'),
+    /environments\/release-two-mac-acceptance/,
+  );
+  assert.match(job('manual-publication-approval'), /required_reviewers/);
+  assertNeeds('publish-docker-version', ['manual-publication-approval', 'release-metadata']);
   assertNeeds('publish-mcp', ['publish-docker-version', 'release-metadata']);
   assertNeeds('publish-pypi', ['publish-mcp', 'release-metadata']);
   assertNeeds('publish-docker-latest', ['publish-pypi', 'release-metadata']);

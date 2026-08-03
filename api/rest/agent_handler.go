@@ -88,6 +88,18 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 					status = "pending_review"
 				}
 			}
+			retryRemovedPending := false
+			if approvalRequired && s.agentStore != nil {
+				// Root may reject a zero-authority pending registration from
+				// CEREBRUM. The immutable identity record remains in chain
+				// history, while its node-local projection is marked removed.
+				// A later signed register call is the agent's explicit new
+				// request: let the idempotent consensus transaction run again so
+				// Commit can restore the pending projection for another review.
+				local, localErr := s.agentStore.GetAgent(r.Context(), agentID)
+				retryRemovedPending = localErr == nil && local != nil &&
+					(local.Status == "removed" || local.RemovedAt != nil)
+			}
 
 			if s.agentStore != nil && s.isPostV23ForNextTx() && !approvalRequired {
 				// Direct app-v23 genesis and state sync commit the ordinary-agent
@@ -133,19 +145,21 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			writeJSON(w, http.StatusOK, map[string]any{
-				"agent_id":          existing.AgentID,
-				"name":              name,
-				"registered_name":   registeredName,
-				"role":              existing.Role,
-				"provider":          provider,
-				"clearance":         existing.Clearance,
-				"capabilities":      existing.Capabilities,
-				"status":            status,
-				"approval_required": approvalRequired,
-				"on_chain_height":   existing.RegisteredAt,
-			})
-			return
+			if !retryRemovedPending {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"agent_id":          existing.AgentID,
+					"name":              name,
+					"registered_name":   registeredName,
+					"role":              existing.Role,
+					"provider":          provider,
+					"clearance":         existing.Clearance,
+					"capabilities":      existing.Capabilities,
+					"status":            status,
+					"approval_required": approvalRequired,
+					"on_chain_height":   existing.RegisteredAt,
+				})
+				return
+			}
 		}
 	}
 
@@ -320,8 +334,8 @@ func (s *Server) registerMintedAgentIdentity(ctx context.Context, tokenPub ed255
 // Self-update only — agent can only update its own metadata.
 func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name    string `json:"name"`
-		BootBio string `json:"boot_bio"`
+		Name    *string `json:"name"`
+		BootBio *string `json:"boot_bio"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
@@ -340,6 +354,35 @@ func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 			"CEREBRUM Root metadata cannot be edited through the agent API.")
 		return
 	}
+	if s.badgerStore == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Agent state unavailable",
+			"The current agent metadata could not be read.")
+		return
+	}
+	if !s.badgerStore.IsAgentRegistered(agentID) {
+		writeProblem(w, http.StatusNotFound, "Agent not found",
+			"The authenticated agent is not registered.")
+		return
+	}
+	current, currentErr := s.badgerStore.GetRegisteredAgent(agentID)
+	if currentErr != nil || current == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Agent state unavailable",
+			"The current agent metadata could not be read.")
+		return
+	}
+
+	// AgentUpdate is a replacement transaction on-chain, while this REST
+	// endpoint exposes optional fields. Resolve omitted fields from canonical
+	// state before constructing the transaction so a name-only update cannot
+	// erase the boot bio (and a bio-only update cannot erase the display name).
+	name := current.Name
+	bootBio := current.BootBio
+	if req.Name != nil {
+		name = *req.Name
+	}
+	if req.BootBio != nil {
+		bootBio = *req.BootBio
+	}
 
 	updateTx := &tx.ParsedTx{
 		Type:      tx.TxTypeAgentUpdate,
@@ -347,8 +390,8 @@ func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now(),
 		AgentUpdateTx: &tx.AgentUpdate{
 			AgentID: agentID,
-			Name:    req.Name,
-			BootBio: req.BootBio,
+			Name:    name,
+			BootBio: bootBio,
 		},
 	}
 
@@ -375,7 +418,7 @@ func (s *Server) handleAgentUpdate(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agent_id": agentID,
-		"name":     req.Name,
+		"name":     name,
 		"status":   "updated",
 		"tx_hash":  txHash,
 	})
@@ -874,14 +917,94 @@ type agentNameFinder interface {
 	FindAgentsByName(ctx context.Context, name string, limit int) ([]*store.AgentEntry, error)
 }
 
+type agentDirectoryLister interface {
+	ListAgentDirectory(ctx context.Context, limit int) ([]*store.AgentEntry, error)
+}
+
+type agentDirectoryEntry struct {
+	AgentID        string `json:"agent_id"`
+	Name           string `json:"name"`
+	RegisteredName string `json:"registered_name"`
+	Provider       string `json:"provider,omitempty"`
+	Status         string `json:"status"`
+}
+
+// handleListAgentDirectory returns only exact recipient identity metadata. It
+// avoids ListAgents' derived memory-count query because sage_directory never
+// exposes administrative records or per-agent memory totals.
+func (s *Server) handleListAgentDirectory(w http.ResponseWriter, r *http.Request) {
+	const maxLocalDirectoryEntries = 100
+	if s.agentStore == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Agent store unavailable", "Agent store not configured.")
+		return
+	}
+	lister, ok := s.agentStore.(agentDirectoryLister)
+	if !ok {
+		writeProblem(w, http.StatusNotImplemented, "Agent directory unavailable",
+			"The configured agent store does not support metadata-only directory reads.")
+		return
+	}
+	// Fetch one sentinel row beyond the public cap so callers learn that the
+	// projection is incomplete without a second count query or an unbounded
+	// roster scan. Named discovery remains available through /v1/agents/find.
+	agents, err := lister.ListAgentDirectory(r.Context(), maxLocalDirectoryEntries+1)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "Directory error", "The agent directory could not be read.")
+		return
+	}
+	directory := make([]agentDirectoryEntry, 0, min(len(agents), maxLocalDirectoryEntries))
+	// The sentinel is evaluated before canonical filtering. Some SQL-visible
+	// rows may be pending/inactive on chain, so the bounded page can contain
+	// fewer than 100 returned recipients and still be incomplete.
+	truncated := len(agents) > maxLocalDirectoryEntries
+	for _, agent := range agents {
+		if agent == nil || agent.AgentID == "" {
+			continue
+		}
+		active, activeErr := s.appV23ActiveOrdinaryAgent(agent.AgentID)
+		if activeErr != nil {
+			writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable",
+				"Current local enrollment state is unavailable.")
+			return
+		}
+		if !active {
+			continue
+		}
+		if len(directory) == maxLocalDirectoryEntries {
+			break
+		}
+		directory = append(directory, agentDirectoryEntry{
+			AgentID: agent.AgentID, Name: agent.Name,
+			RegisteredName: agent.RegisteredName, Provider: agent.Provider,
+			Status: "active",
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"agents": directory, "total": len(directory), "truncated": truncated,
+	})
+}
+
 type agentNamePageFinder interface {
 	FindAgentsByNamePage(ctx context.Context, name string, limit, offset int) ([]*store.AgentEntry, error)
+}
+
+type agentLookupCandidateFinder interface {
+	FindAgentLookupCandidates(ctx context.Context, name string, limit int) ([]*store.AgentEntry, error)
 }
 
 type agentLookupResult struct {
 	*store.AgentEntry
 	MatchKind string `json:"match_kind"`
 }
+
+const (
+	agentLookupCandidatePageSize  = 20
+	agentLookupCandidateBatchSize = 160
+	// Candidate enrollment is rechecked against consensus one row at a time.
+	// Bound a hostile pending-registration prefix so one friendly-name lookup
+	// cannot amplify into thousands of SQL pages and Badger reads.
+	maxAgentLookupCandidatePages = 8
+)
 
 // equalAgentLookupField applies the lookup endpoint's documented comparison:
 // ASCII letters are case-insensitive while every non-ASCII byte retains its
@@ -907,7 +1030,8 @@ func equalAgentLookupField(left, right string) bool {
 
 func agentLookupMatchKind(query string, agent *store.AgentEntry) string {
 	if agent != nil &&
-		(equalAgentLookupField(query, agent.Name) ||
+		(equalAgentLookupField(query, agent.AgentID) ||
+			equalAgentLookupField(query, agent.Name) ||
 			equalAgentLookupField(query, agent.RegisteredName) ||
 			equalAgentLookupField(query, agent.Provider)) {
 		return "exact"
@@ -948,24 +1072,26 @@ func (s *Server) handleFindRegisteredAgents(w http.ResponseWriter, r *http.Reque
 	// requested number of canonical recipients is found or the query is
 	// exhausted. Applying the public limit before this filter lets 20 pending
 	// self-registrations hide every later active match.
-	const (
-		candidatePageSize = 20
-		maxCandidatePages = 256
-	)
 	pager, paged := s.agentStore.(agentNamePageFinder)
+	candidateFinder, hasCandidateFinder := s.agentStore.(agentLookupCandidateFinder)
 	sanitized := make([]agentLookupResult, 0, limit)
 	seen := make(map[string]struct{}, limit)
+	foundExact := false
 	for offset := 0; len(sanitized) < limit; {
-		if paged && offset/candidatePageSize >= maxCandidatePages {
+		if !hasCandidateFinder && paged && offset/agentLookupCandidatePageSize >= maxAgentLookupCandidatePages {
 			writeProblem(w, http.StatusServiceUnavailable, "Lookup incomplete",
 				"The bounded agent candidate scan was exhausted; narrow the name query.")
 			return
 		}
 		var agents []*store.AgentEntry
 		var err error
-		if paged {
+		if hasCandidateFinder {
+			agents, err = candidateFinder.FindAgentLookupCandidates(
+				r.Context(), name, agentLookupCandidateBatchSize,
+			)
+		} else if paged {
 			agents, err = pager.FindAgentsByNamePage(
-				r.Context(), name, candidatePageSize, offset,
+				r.Context(), name, agentLookupCandidatePageSize, offset,
 			)
 		} else {
 			// Compatibility for tests and third-party stores that implement the
@@ -994,15 +1120,22 @@ func (s *Server) handleFindRegisteredAgents(w http.ResponseWriter, r *http.Reque
 			if !active {
 				continue
 			}
+			matchKind := agentLookupMatchKind(name, agent)
+			foundExact = foundExact || matchKind == "exact"
 			sanitized = append(sanitized, agentLookupResult{
 				AgentEntry: sanitizeAgentForRead(agent, false),
-				MatchKind:  agentLookupMatchKind(name, agent),
+				MatchKind:  matchKind,
 			})
 			if len(sanitized) == limit {
 				break
 			}
 		}
-		if !paged || len(agents) < candidatePageSize {
+		if hasCandidateFinder && len(agents) == agentLookupCandidateBatchSize && len(sanitized) < limit && !foundExact {
+			writeProblem(w, http.StatusServiceUnavailable, "Lookup incomplete",
+				"The bounded agent candidate scan was exhausted; narrow the name query.")
+			return
+		}
+		if hasCandidateFinder || !paged || len(agents) < agentLookupCandidatePageSize {
 			break
 		}
 		offset += len(agents)

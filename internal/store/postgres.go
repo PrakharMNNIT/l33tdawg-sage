@@ -1440,10 +1440,30 @@ func (s *PostgresStore) InsertAccessGrant(ctx context.Context, grant *AccessGran
 
 // GetActiveGrants retrieves all non-revoked grants for an agent.
 func (s *PostgresStore) GetActiveGrants(ctx context.Context, agentID string) ([]*AccessGrantEntry, error) {
+	return s.getActiveGrants(ctx, agentID, 0, false)
+}
+
+func (s *PostgresStore) GetActiveGrantsBounded(ctx context.Context, agentID string, limit int) ([]*AccessGrantEntry, error) {
+	return s.getActiveGrants(ctx, agentID, limit, true)
+}
+
+func (s *PostgresStore) getActiveGrants(ctx context.Context, agentID string, limit int, filterExpired bool) ([]*AccessGrantEntry, error) {
+	query := `SELECT domain, grantee_id, granter_id, access_level, expires_at, created_height, created_at
+		FROM access_grants
+		WHERE grantee_id = $1 AND revoked_at IS NULL`
+	args := []any{agentID}
+	if filterExpired {
+		query += ` AND (expires_at IS NULL OR expires_at > $2)`
+		args = append(args, time.Now().UTC())
+	}
+	query += `
+		ORDER BY created_at`
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d", len(args)+1)
+		args = append(args, limit)
+	}
 	rows, err := s.db.Query(ctx,
-		`SELECT domain, grantee_id, granter_id, access_level, expires_at, created_height, created_at
-		FROM access_grants WHERE grantee_id = $1 AND revoked_at IS NULL
-		ORDER BY created_at`, agentID)
+		query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get active grants: %w", err)
 	}
@@ -3076,12 +3096,14 @@ const postgresFindAgentsByNameSQL = `
 	FROM agents a
 	WHERE a.status = 'active' AND a.removed_at IS NULL
 	  AND (
-	    a.name COLLATE "C" ILIKE $1 ESCAPE '\'
+	    a.agent_id COLLATE "C" ILIKE $1 ESCAPE '\'
+	    OR a.name COLLATE "C" ILIKE $1 ESCAPE '\'
 	    OR COALESCE(a.registered_name, '') COLLATE "C" ILIKE $1 ESCAPE '\'
 	    OR COALESCE(a.provider, '') COLLATE "C" ILIKE $1 ESCAPE '\'
 	  )
 	ORDER BY CASE
-		  WHEN a.name COLLATE "C" ILIKE $2 ESCAPE '\'
+		  WHEN a.agent_id COLLATE "C" ILIKE $2 ESCAPE '\'
+		    OR a.name COLLATE "C" ILIKE $2 ESCAPE '\'
 		    OR COALESCE(a.registered_name, '') COLLATE "C" ILIKE $2 ESCAPE '\'
 		    OR COALESCE(a.provider, '') COLLATE "C" ILIKE $2 ESCAPE '\' THEN 0
 		  ELSE 1
@@ -3132,6 +3154,42 @@ func (s *PostgresStore) ListAgents(ctx context.Context) ([]*AgentEntry, error) {
 	return agents, rows.Err()
 }
 
+// ListAgentDirectory is the metadata-only local recipient projection. It
+// deliberately avoids agentColumns because that projection derives a memory
+// count for every agent and sage_directory discards those counts.
+func (s *PostgresStore) ListAgentDirectory(ctx context.Context, limit int) ([]*AgentEntry, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT a.agent_id, a.name, COALESCE(a.registered_name, ''),
+			COALESCE(a.provider, ''), a.status, a.removed_at
+		FROM agents a
+		WHERE a.status != 'removed'
+		ORDER BY a.created_at ASC, a.agent_id
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list agent directory: %w", err)
+	}
+	defer rows.Close()
+
+	agents := make([]*AgentEntry, 0)
+	for rows.Next() {
+		agent := &AgentEntry{}
+		if scanErr := rows.Scan(
+			&agent.AgentID, &agent.Name, &agent.RegisteredName,
+			&agent.Provider, &agent.Status, &agent.RemovedAt,
+		); scanErr != nil {
+			return nil, fmt.Errorf("scan agent directory: %w", scanErr)
+		}
+		if agent.RegisteredName == "" {
+			agent.RegisteredName = agent.Name
+		}
+		agents = append(agents, agent)
+	}
+	return agents, rows.Err()
+}
+
 func (s *PostgresStore) GetAgent(ctx context.Context, agentID string) (*AgentEntry, error) {
 	a, err := scanAgent(s.db.QueryRow(ctx, `SELECT `+agentColumns+`
 		FROM agents a WHERE a.agent_id = $1`, agentID))
@@ -3161,7 +3219,20 @@ func (s *PostgresStore) GetAgentByName(ctx context.Context, name string) (*Agent
 // non-ASCII casing; escaped metacharacters remain literal, and exact field
 // matches sort before partials just as they do in SQLite.
 func (s *PostgresStore) FindAgentsByName(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	if limit > maxAgentNameLookupResults {
+		limit = maxAgentNameLookupResults
+	}
 	return s.FindAgentsByNamePage(ctx, query, limit, 0)
+}
+
+// FindAgentLookupCandidates returns one bounded metadata-only candidate batch
+// for the signed REST recipient lookup. Canonical enrollment authorization is
+// applied by the REST layer after this single SQL query.
+func (s *PostgresStore) FindAgentLookupCandidates(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	if limit > maxAgentNameLookupCandidates {
+		limit = maxAgentNameLookupCandidates
+	}
+	return s.findAgentsByNamePage(ctx, query, limit, 0, maxAgentNameLookupCandidates)
 }
 
 // FindAgentsByNamePage is the Postgres parity path for paged canonical
@@ -3172,10 +3243,18 @@ func (s *PostgresStore) FindAgentsByNamePage(
 	query string,
 	limit, offset int,
 ) ([]*AgentEntry, error) {
+	return s.findAgentsByNamePage(ctx, query, limit, offset, maxAgentNameLookupResults)
+}
+
+func (s *PostgresStore) findAgentsByNamePage(
+	ctx context.Context,
+	query string,
+	limit, offset, maxLimit int,
+) ([]*AgentEntry, error) {
 	if offset < 0 {
 		return nil, nil
 	}
-	exact, pattern, limit, ok := normalizeAgentNameLookup(query, limit, maxAgentNameLookupResults)
+	exact, pattern, limit, ok := normalizeAgentNameLookup(query, limit, maxLimit)
 	if !ok {
 		return nil, nil
 	}
@@ -3389,11 +3468,21 @@ func (s *PostgresStore) ListAgentTags(_ context.Context, _ string) ([]TagCount, 
 }
 
 func (s *PostgresStore) ListAgentDomains(ctx context.Context, agentID string) ([]string, error) {
-	rows, err := s.db.Query(ctx, `
+	return s.ListAgentDomainsBounded(ctx, agentID, 0)
+}
+
+func (s *PostgresStore) ListAgentDomainsBounded(ctx context.Context, agentID string, limit int) ([]string, error) {
+	query := `
 		SELECT domain_tag FROM memories
 		WHERE submitting_agent = $1 AND domain_tag != ''
 		GROUP BY domain_tag
-		ORDER BY COUNT(*) DESC, domain_tag ASC`, agentID)
+		ORDER BY COUNT(*) DESC, domain_tag ASC`
+	args := []any{agentID}
+	if limit > 0 {
+		query += ` LIMIT $2`
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list agent domains: %w", err)
 	}

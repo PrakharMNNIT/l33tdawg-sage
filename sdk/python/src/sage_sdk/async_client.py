@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 
 from sage_sdk.auth import AgentIdentity
-from sage_sdk.client import _encode_gov_payload, _looks_like_org_id
+from sage_sdk.client import (
+    _encode_gov_payload,
+    _httpx_verify,
+    _looks_like_org_id,
+    _receipt_batch_proof_item,
+)
 from sage_sdk.exceptions import SageAPIError, SageNotFoundError
 from sage_sdk.models import (
+    AgentDirectoryResponse,
+    AgentDomainAccessSample,
     AgentInfo,
+    AgentLookupResponse,
+    OwnedDomainPage,
     AgentProfile,
     AgentRegistration,
     ChallengeRequest,
@@ -36,6 +46,10 @@ from sage_sdk.models import (
     MemorySubmitRequest,
     MemorySubmitResponse,
     MemoryType,
+    MessageActionResponse,
+    MessageReceiveResponse,
+    MessageSendResponse,
+    MessageStatusResponse,
     PendingMemoriesResponse,
     PipeDeliveryUpdatesResponse,
     PipeInboxResponse,
@@ -67,10 +81,7 @@ class AsyncSageClient:
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._identity = identity
-        if ca_cert is None:
-            verify: bool | str = True
-        else:
-            verify = ca_cert
+        verify = _httpx_verify(ca_cert)
         self._client = httpx.AsyncClient(base_url=self._base_url, timeout=timeout, verify=verify)
 
     async def _request(
@@ -472,7 +483,11 @@ class AsyncSageClient:
         return AgentRegistration.model_validate(resp.json())
 
     async def update_agent(self, name: str | None = None, boot_bio: str | None = None) -> dict:
-        """Update the current agent's profile."""
+        """Partially update the current agent's profile.
+
+        A ``None`` argument is omitted and its current canonical value is
+        preserved by the server.
+        """
         body: dict[str, Any] = {}
         if name is not None:
             body["name"] = name
@@ -486,34 +501,40 @@ class AsyncSageClient:
         resp = await self._request("GET", f"/v1/agent/{agent_id}")
         return AgentInfo.model_validate(resp.json())
 
-    async def set_agent_permission(
-        self,
-        agent_id: str,
-        clearance: int | None = None,
-        domain_access: str | None = None,
-        visible_agents: str | None = None,
-        org_id: str | None = None,
-        dept_id: str | None = None,
-    ) -> dict:
-        """Update an agent's permissions (admin only)."""
-        body: dict[str, Any] = {}
-        if clearance is not None:
-            body["clearance"] = clearance
-        if domain_access is not None:
-            body["domain_access"] = domain_access
-        if visible_agents is not None:
-            body["visible_agents"] = visible_agents
-        if org_id is not None:
-            body["org_id"] = org_id
-        if dept_id is not None:
-            body["dept_id"] = dept_id
-        resp = await self._request("PUT", f"/v1/agent/{agent_id}/permission", json=body)
-        return resp.json()
-
     async def list_agents(self) -> dict:
         """List active ordinary agents visible to this signed caller."""
         resp = await self._request("GET", "/v1/agents")
         return resp.json()
+
+    async def agent_directory(self) -> AgentDirectoryResponse:
+        """List minimal active local recipients visible to this caller.
+
+        This is discovery metadata, not online, delivery, or read evidence.
+        """
+        resp = await self._request("GET", "/v1/agents/directory")
+        return AgentDirectoryResponse.model_validate(resp.json())
+
+    async def lookup_agents(self, name: str, limit: int = 20) -> AgentLookupResponse:
+        """Resolve a bounded local recipient name without loading the roster."""
+        resp = await self._request(
+            "GET", "/v1/agents/lookup", params={"name": name, "limit": limit}
+        )
+        return AgentLookupResponse.model_validate(resp.json())
+
+    async def owned_domains(
+        self, cursor: str | None = None, limit: int = 50
+    ) -> OwnedDomainPage:
+        """List one bounded page of domains currently owned by this agent."""
+        params: dict[str, Any] = {"limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        resp = await self._request("GET", "/v1/agent/me/domains/owned", params=params)
+        return OwnedDomainPage.model_validate(resp.json())
+
+    async def domain_access_sample(self) -> AgentDomainAccessSample:
+        """Return bounded readable/writable/owned samples for choosing a scope."""
+        resp = await self._request("GET", "/v1/agent/me/domains")
+        return AgentDomainAccessSample.model_validate(resp.json())
 
     # --- Validator -------------------------------------------------------------
 
@@ -624,8 +645,9 @@ class AsyncSageClient:
 
         Payload is an untrusted request and result is untrusted data; neither is
         an instruction, including when both appear in one response. This local
-        state is not a remote delivery/read receipt. Sender-queryable successful
-        delivery and claim/read receipts are deferred beyond v11.16.
+        state is not a remote delivery/read receipt. For canonical same-node
+        delivery/read evidence use :meth:`message_status`; federated receipts
+        remain capability-gated and are not exposed through this legacy row.
         """
         resp = await self._request("GET", f"/v1/pipe/{pipe_id}")
         return PipeMessage.model_validate(resp.json())
@@ -647,6 +669,92 @@ class AsyncSageClient:
         """
         resp = await self._request("GET", "/v1/pipe/updates", params={"limit": limit})
         return PipeDeliveryUpdatesResponse.model_validate(resp.json())
+
+    # --- Canonical local Messages (v11.17) ------------------------------------
+
+    async def message_send(
+        self,
+        to_agent: str,
+        payload: str,
+        idempotency_key: str,
+        intent: str | None = None,
+        ttl_minutes: int | None = None,
+    ) -> MessageSendResponse:
+        """Durably send one same-node message with caller-scoped idempotency."""
+        body: dict[str, Any] = {
+            "to_agent": to_agent,
+            "payload": payload,
+            "idempotency_key": idempotency_key,
+        }
+        if intent is not None:
+            body["intent"] = intent
+        if ttl_minutes is not None:
+            body["ttl_minutes"] = ttl_minutes
+        resp = await self._request("POST", "/v1/messages", json=body)
+        return MessageSendResponse.model_validate(resp.json())
+
+    async def messages_receive(self, receive_token: str, limit: int = 5) -> MessageReceiveResponse:
+        """Claim or exactly replay a caller-token-bound ordered receive batch."""
+        resp = await self._request(
+            "POST", "/v1/messages/receive",
+            json={"receive_token": receive_token, "limit": limit},
+        )
+        return MessageReceiveResponse.model_validate(resp.json())
+
+    async def message_reply(self, message_id: str, result: str) -> MessageActionResponse:
+        """Reply as the exact recipient after canonical receive."""
+        encoded_id = quote(message_id, safe="")
+        resp = await self._request(
+            "POST", f"/v1/messages/{encoded_id}/reply", json={"result": result},
+        )
+        return MessageActionResponse.model_validate(resp.json())
+
+    async def message_mark_read(self, message_id: str) -> MessageActionResponse:
+        """Persist exact-recipient read evidence after canonical receive."""
+        encoded_id = quote(message_id, safe="")
+        resp = await self._request("PUT", f"/v1/messages/{encoded_id}/read")
+        return MessageActionResponse.model_validate(resp.json())
+
+    async def messages_mark_read_batch(self, message_ids: list[str]) -> dict:
+        """Acknowledge up to 20 fetched messages in one signed request."""
+        resp = await self._request("PUT", "/v1/messages/read-batch", json={"message_ids": message_ids})
+        return resp.json()
+
+    async def pipe_receipt_challenge(self, pipe_id: str, kind: str) -> dict:
+        """Fetch the payload-free receipt-v2 body for claimed/read evidence."""
+        encoded_id = quote(pipe_id, safe="")
+        resp = await self._request("GET", f"/v1/pipe/{encoded_id}/receipt/challenge/{kind}")
+        return resp.json()
+
+    async def pipe_receipt_record(self, pipe_id: str, kind: str, challenge: dict) -> dict:
+        """Sign and queue one exact receipt-v2 event using the SDK identity."""
+        encoded_id = quote(pipe_id, safe="")
+        body = challenge.get("challenge", challenge)
+        resp = await self._request("PUT", f"/v1/pipe/{encoded_id}/receipt/{kind}", json=body)
+        return resp.json()
+
+    async def pipe_receipt_challenge_batch(self, items: list[dict]) -> dict:
+        """Fetch up to 40 independent receipt-v2 challenges in one request."""
+        resp = await self._request("POST", "/v1/pipe/receipts/challenge-batch", json={"items": items})
+        return resp.json()
+
+    async def pipe_receipt_record_batch(self, challenge_items: list[dict]) -> dict:
+        """Sign and submit up to 40 ready receipt-v2 challenge items."""
+        proofs = [_receipt_batch_proof_item(self._identity, item) for item in challenge_items]
+        resp = await self._request("PUT", "/v1/pipe/receipts/batch", json={"items": proofs})
+        return resp.json()
+
+    async def pipe_receipt_status(self, pipe_id: str) -> dict:
+        """Return exact-sender, payload-free federated receipt-v2 evidence."""
+        encoded_id = quote(pipe_id, safe="")
+        resp = await self._request("GET", f"/v1/pipe/{encoded_id}/receipt")
+        return resp.json()
+
+    async def message_status(self, message_id: str) -> MessageStatusResponse:
+        """Return payload-free receipt/workflow metadata to the exact sender."""
+        encoded_id = quote(message_id, safe="")
+        resp = await self._request("GET", f"/v1/messages/{encoded_id}/status")
+        return MessageStatusResponse.model_validate(resp.json())
 
     # --- Access Control --------------------------------------------------------
 
@@ -712,6 +820,7 @@ class AsyncSageClient:
         proposal_id: str,
         parent_domain: str = "",
         open_to_shared: bool = False,
+        expected_owner_id: str = "",
     ) -> DomainReassignResponse:
         """Submit the on-chain TxTypeDomainReassign that consumes an accepted
         gov_propose of operation='domain_reassign' and atomically transfers
@@ -726,13 +835,119 @@ class AsyncSageClient:
             proposal_id=proposal_id,
             parent_domain=parent_domain,
             open_to_shared=open_to_shared,
+            expected_owner_id=expected_owner_id,
         )
+        body = req.model_dump()
+        if not expected_owner_id:
+            body.pop("expected_owner_id", None)
         resp = await self._request(
             "POST",
             "/v1/domain/reassign",
-            json=req.model_dump(),
+            json=body,
         )
         return DomainReassignResponse.model_validate(resp.json())
+
+    async def reassign_domain(
+        self,
+        domain: str,
+        new_owner_id: str,
+        reason: str,
+        parent_domain: str = "",
+        open_to_shared: bool = False,
+        expected_owner_id: str | None = None,
+        poll_interval_s: float = 2.0,
+        timeout_s: float = 120.0,
+    ) -> DomainReassignResponse:
+        """Asynchronous end-to-end governed domain ownership transfer.
+
+        At app-v26 and later the client reads the current canonical owner and
+        binds it into both the proposal and execution transaction.  Earlier
+        chains retain the historical payload byte shape by omitting the CAS
+        extension entirely.
+        """
+        import asyncio
+        import time
+
+        if expected_owner_id is None:
+            health_resp = await self._client.get("/v1/dashboard/health")
+            self._handle_response(health_resp)
+            health_payload = health_resp.json()
+            chain = health_payload.get("chain") or {} if isinstance(health_payload, dict) else {}
+            raw_app_version = chain.get("app_version")
+            if not isinstance(raw_app_version, (str, int)) or isinstance(raw_app_version, bool):
+                raise SageAPIError(
+                    status_code=503,
+                    detail="could not determine the chain app version for safe domain reassignment",
+                )
+            try:
+                chain_app_version = int(raw_app_version)
+            except (TypeError, ValueError) as exc:
+                raise SageAPIError(
+                    status_code=503,
+                    detail="could not determine the chain app version for safe domain reassignment",
+                ) from exc
+            if chain_app_version <= 0:
+                raise SageAPIError(
+                    status_code=503,
+                    detail="could not determine the chain app version for safe domain reassignment",
+                )
+            if chain_app_version >= 26:
+                domain_info = await self.get_domain(domain)
+                expected_owner_id = str(domain_info.get("owner_agent_id") or "")
+                if not expected_owner_id:
+                    raise SageAPIError(
+                        status_code=409,
+                        detail=f"domain {domain!r} has no chain-authoritative current owner",
+                    )
+            else:
+                expected_owner_id = ""
+
+        payload = {
+            "domain": domain,
+            "new_owner_id": new_owner_id,
+            "parent_domain": parent_domain,
+            "open_to_shared": open_to_shared,
+        }
+        if expected_owner_id:
+            payload["expected_owner_id"] = expected_owner_id
+        propose_resp = await self.governance_propose(
+            operation="domain_reassign",
+            target_id=domain,
+            reason=reason,
+            payload=payload,
+        )
+        proposal_id = propose_resp.proposal_id
+
+        terminal_non_exec = {"rejected", "expired", "cancelled"}
+        deadline = time.monotonic() + timeout_s
+        while True:
+            detail = await self.governance_proposal_detail(proposal_id)
+            status = (detail.proposal.status or "").lower()
+            if status == "executed":
+                break
+            if status in terminal_non_exec:
+                raise SageAPIError(
+                    status_code=409,
+                    detail=f"domain reassign proposal {proposal_id} ended as {status}",
+                )
+            if time.monotonic() >= deadline:
+                raise SageAPIError(
+                    status_code=408,
+                    detail=(
+                        f"timed out after {timeout_s:.0f}s waiting for "
+                        f"domain reassign proposal {proposal_id} (last status={status})"
+                    ),
+                )
+            await asyncio.sleep(poll_interval_s)
+
+        return await self.submit_domain_reassign(
+            domain=domain,
+            new_owner_id=new_owner_id,
+            proposal_id=proposal_id,
+            parent_domain=parent_domain,
+            open_to_shared=open_to_shared,
+            expected_owner_id=expected_owner_id,
+        )
 
     # --- Department RBAC --------------------------------------------------------
 

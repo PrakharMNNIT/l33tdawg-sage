@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
@@ -664,6 +665,10 @@ type SageApp struct {
 	// projection envelopes absent from canonical state. The activation block
 	// remains under app-v24 rules and v25 semantics start strictly at H+1.
 	appV25AppliedHeight int64 // 0 => fork dormant
+	// appV26AppliedHeight gates consensus-backed per-group member authority.
+	// The activation block migrates historical groups to explicit read access;
+	// v26 mutation/authorization semantics begin strictly at H+1.
+	appV26AppliedHeight int64 // 0 => fork dormant
 	// appV23GenesisActive is loaded only from the dedicated, AppHash-covered
 	// dual-signed genesis activation marker. It is separate from applied-height
 	// upgrades because a v23-born chain has no historical activation block.
@@ -844,6 +849,7 @@ const appV22UpgradeName = "app-v22"
 const appV23UpgradeName = "app-v23"
 const appV24UpgradeName = "app-v24"
 const appV25UpgradeName = "app-v25"
+const appV26UpgradeName = "app-v26"
 
 // governanceDelegationDomainStateKey holds the stable, consensus-derived
 // domain that post-app-v20 governance authorizations must sign. It is approved
@@ -2387,6 +2393,16 @@ func NewSageApp(badgerPath string, postgresURL string, logger zerolog.Logger) (*
 		_ = bs.CloseBadger()
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV26Fork(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV26Prerequisite(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	// Reload persisted validators from BadgerDB (survives restart)
@@ -2483,6 +2499,12 @@ func NewSageAppWithStores(bs *store.BadgerStore, offchain store.OffchainStore, l
 	if invariantErr := app.validateAppV25Prerequisite(); invariantErr != nil {
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV26Fork(); invariantErr != nil {
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV26Prerequisite(); invariantErr != nil {
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	persistedVals, err := bs.LoadValidators()
@@ -2561,6 +2583,8 @@ func restoredValidatorInfo(id string, power int64) *validator.ValidatorInfo {
 // 6 <= 7, so the watchdog stops without re-proposing.
 func (app *SageApp) currentAppVersion() uint64 {
 	switch {
+	case app.appV26AppliedHeight > 0:
+		return 26 // app-v26 (consensus-backed Access Group authority) — highest gate
 	case app.appV25AppliedHeight > 0:
 		return 25 // app-v25 (governed legacy-memory adoption) — highest gate
 	case app.appV24AppliedHeight > 0:
@@ -2617,13 +2641,13 @@ func (app *SageApp) currentAppVersion() uint64 {
 }
 
 // maxSupportedAppVersion is the highest app version this binary has a compiled
-// fork gate for (currently app-v25). It is the readiness ceiling for upgrade
+// fork gate for (currently app-v26). It is the readiness ceiling for upgrade
 // auto-voting: a validator must never vote to activate an upgrade it cannot
 // execute — doing so would commit consensus version.app=N while the binary
 // still runs at N-1, halting the chain on the next CometBFT handshake (the
 // maxSupportedAppVersion footgun). Bump this in lockstep with every new
 // appV<N>UpgradeName fork gate added above.
-const maxSupportedAppVersion uint64 = 25
+const maxSupportedAppVersion uint64 = 26
 
 // MaxSupportedAppVersion returns the highest app version this binary has a
 // compiled fork gate for. Operator tooling (cmd/sage-gui `upgrade propose`)
@@ -2893,6 +2917,19 @@ func (app *SageApp) ActiveUpgradeVote() (proposalID string, targetVersion uint64
 			supported = false
 		}
 	}
+	if payload.Name == appV26UpgradeName && payload.TargetAppVersion == 26 {
+		if app.currentAppVersion() != 25 {
+			app.logger.Warn().
+				Str("proposal_id", prop.ProposalID).
+				Uint64("current_app_version", app.currentAppVersion()).
+				Msg("app-v26 upgrade requires app-v25 as its immediate predecessor; skipping auto-vote")
+			supported = false
+		} else if _, predecessorErr := app.validateAppV26Predecessor(); predecessorErr != nil {
+			app.logger.Warn().Err(predecessorErr).Str("proposal_id", prop.ProposalID).
+				Msg("app-v26 predecessor is invalid; skipping auto-vote")
+			supported = false
+		}
+	}
 	return prop.ProposalID, payload.TargetAppVersion, supported, true
 }
 
@@ -2956,6 +2993,21 @@ func (app *SageApp) Info(_ context.Context, req *abcitypes.RequestInfo) (*abcity
 		LastBlockHeight:  app.state.Height,
 		LastBlockAppHash: app.state.AppHash,
 	}, nil
+}
+
+// AcquireSnapshotStateFence pins the committed application tuple and prevents
+// a subsequent Commit from publishing a newer tuple until release is called.
+// The updater holds this fence through candidate verification and executable
+// mutation; CometBFT provenance is verified independently from the captured
+// state/block stores before the candidate is published.
+func (app *SageApp) AcquireSnapshotStateFence() (height int64, appHash []byte, release func()) {
+	app.runtimeViewMu.RLock()
+	var once sync.Once
+	release = func() { once.Do(app.runtimeViewMu.RUnlock) }
+	if app.state == nil {
+		return 0, nil, release
+	}
+	return app.state.Height, append([]byte(nil), app.state.AppHash...), release
 }
 
 // InitChain initializes the chain with genesis validators.
@@ -3464,6 +3516,38 @@ func (app *SageApp) CheckTx(_ context.Context, req *abcitypes.RequestCheckTx) (*
 		!app.isAppV23ActiveForNextTx() {
 		return &abcitypes.ResponseCheckTx{Code: 10, Log: "unknown tx type"}, nil
 	}
+	// app-v26 extends the existing AccessGroupMutate wire payload rather than
+	// allocating a new tx type. Before activation, a v26 binary can decode the
+	// appended member_authority bytes but a still-rolling v25 binary rejects
+	// them as trailing data. Never admit that mixed interpretation into a
+	// pre-v26 block: it would produce different ExecTxResult codes and diverge
+	// LastResultsHash. At and before activation height only the historical empty
+	// field is admissible; once H+1 is active, mirror the consensus handler's
+	// required-tier/delete validation as mempool hygiene.
+	if parsedTx.Type == tx.TxTypeAccessGroupMutate && parsedTx.AccessGroupMutate != nil {
+		mutation := parsedTx.AccessGroupMutate
+		if !app.IsAppV26ActiveForNextTx() {
+			if mutation.MemberAuthority != "" {
+				return &abcitypes.ResponseCheckTx{Code: 10, Log: "unknown app-v26 access group authority"}, nil
+			}
+		} else if mutation.Delete {
+			if mutation.MemberAuthority != "" {
+				return &abcitypes.ResponseCheckTx{Code: 110, Log: "access denied"}, nil
+			}
+		} else if err := store.ValidateAppV26GroupAuthority(mutation.MemberAuthority); err != nil {
+			return &abcitypes.ResponseCheckTx{Code: 110, Log: "access denied"}, nil
+		}
+	}
+	// app-v26 also appends the expected-owner CAS binding to the existing
+	// DomainReassign wire payload. A v25 validator re-encodes the historical
+	// body without that trailing field while verifying the outer signature, so
+	// admitting the extended form before H+1 would create a mixed-version
+	// interpretation. Keep it out of the mempool through activation height H;
+	// the consensus handler independently requires it once app-v26 is active.
+	if parsedTx.Type == tx.TxTypeDomainReassign && parsedTx.DomainReassign != nil &&
+		!app.IsAppV26ActiveForNextTx() && parsedTx.DomainReassign.ExpectedOwnerID != "" {
+		return &abcitypes.ResponseCheckTx{Code: 10, Log: "unknown app-v26 domain owner binding"}, nil
+	}
 	if parsedTx.LocalElevation != nil && !app.isAppV23ActiveForNextTx() {
 		return &abcitypes.ResponseCheckTx{Code: 10, Log: "unknown app-v23 elevation envelope"}, nil
 	}
@@ -3555,6 +3639,7 @@ func (app *SageApp) cloneForAppV20Finalize(scopedStore *store.BadgerStore) *Sage
 		appV23AppliedHeight:      app.appV23AppliedHeight,
 		appV24AppliedHeight:      app.appV24AppliedHeight,
 		appV25AppliedHeight:      app.appV25AppliedHeight,
+		appV26AppliedHeight:      app.appV26AppliedHeight,
 		appV23GenesisActive:      app.appV23GenesisActive,
 		retainBlocks:             app.retainBlocks,
 		expectedGovernanceDomain: app.expectedGovernanceDelegationDomain(),
@@ -3600,6 +3685,7 @@ func (app *SageApp) publishAppV20FinalizeLocked(clone *SageApp) {
 	app.appV23AppliedHeight = clone.appV23AppliedHeight
 	app.appV24AppliedHeight = clone.appV24AppliedHeight
 	app.appV25AppliedHeight = clone.appV25AppliedHeight
+	app.appV26AppliedHeight = clone.appV26AppliedHeight
 	app.appV23GenesisActive = clone.appV23GenesisActive
 }
 
@@ -4205,6 +4291,38 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				)
 			}
 		}
+		if plan.Name == appV26UpgradeName {
+			if plan.TargetAppVersion != 26 {
+				return nil, fmt.Errorf(
+					"sage: refuse malformed app-v26 activation at height %d: target_app_version=%d",
+					req.Height, plan.TargetAppVersion,
+				)
+			}
+			if current := app.currentAppVersion(); current != 25 {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v26 activation at height %d: current committed app version is %d, want 25",
+					req.Height, current,
+				)
+			}
+			if _, predecessorErr := app.validateAppV26Predecessor(); predecessorErr != nil {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v26 activation at height %d: invalid predecessor: %w",
+					req.Height, predecessorErr,
+				)
+			}
+			if migrateErr := app.badgerStore.MigrateAppV26AccessGroupAuthorities(req.Height); migrateErr != nil {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v26 activation with invalid Access Group state: %w",
+					migrateErr,
+				)
+			}
+			if stateErr := app.badgerStore.ValidateAppV23State(); stateErr != nil {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v26 activation after local RBAC repair: %w",
+					stateErr,
+				)
+			}
+		}
 		// Version-non-regression floor (deterministic on every replica): never
 		// commit a consensus version.app lower than the chain's current app
 		// version. app-v7 (content-validation) is an INDEPENDENT gate that can be
@@ -4304,6 +4422,9 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		}
 		if plan.Name == appV25UpgradeName {
 			app.appV25AppliedHeight = req.Height
+		}
+		if plan.Name == appV26UpgradeName {
+			app.appV26AppliedHeight = req.Height
 		}
 		if plan.Name == appV12UpgradeName {
 			app.appV12AppliedHeight = req.Height
@@ -8910,13 +9031,14 @@ func (app *SageApp) processAgentUpdate(parsedTx *tx.ParsedTx, height int64, bloc
 		return &abcitypes.ExecTxResult{Code: 62, Log: "missing agent update payload"}
 	}
 
-	// Verify agent identity — only the agent itself can update its own metadata.
+	// Verify agent identity. Ordinary agents may still update only themselves.
+	// Starting at app-v26 H+1, current CEREBRUM Root or an active delegated
+	// Admin may change another local agent's mutable display name. That narrow
+	// operator path must preserve the target's boot bio byte-for-byte; generic
+	// AgentUpdate must never become an operator metadata rewrite primitive.
 	senderCredentialID, err := app.verifyCurrentAgentIdentity(parsedTx, height)
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 62, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
-	}
-	if isRoot, rootErr := app.appV23IsRootIdentity(senderCredentialID, height); rootErr != nil || isRoot {
-		return appV23ControlDenied()
 	}
 	senderID, err := app.appV23PrincipalIDForCredential(senderCredentialID, height)
 	if err != nil {
@@ -8931,20 +9053,40 @@ func (app *SageApp) processAgentUpdate(parsedTx *tx.ParsedTx, height int64, bloc
 		targetID = senderID
 	}
 
-	// Self-update only
-	if senderID != targetID {
-		return &abcitypes.ExecTxResult{Code: 63, Log: fmt.Sprintf("access denied: %s cannot update agent %s", shortConsensusID(senderID), shortConsensusID(targetID))}
-	}
-
 	// Agent must be registered
 	if !app.badgerStore.IsAgentRegistered(targetID) {
 		return &abcitypes.ExecTxResult{Code: 64, Log: fmt.Sprintf("agent %s not registered", shortConsensusID(targetID))}
 	}
-	if app.appV20StrictFinalize {
-		current, getErr := app.badgerStore.GetRegisteredAgent(targetID)
-		if getErr != nil {
-			return &abcitypes.ExecTxResult{Code: 65, Log: fmt.Sprintf("agent record lookup failed: %v", getErr)}
+	current, getErr := app.badgerStore.GetRegisteredAgent(targetID)
+	if getErr != nil {
+		return &abcitypes.ExecTxResult{Code: 65, Log: fmt.Sprintf("agent record lookup failed: %v", getErr)}
+	}
+
+	operatorRename := senderID != targetID
+	if operatorRename {
+		if !app.postAppV26Rules(height) {
+			return &abcitypes.ExecTxResult{Code: 63, Log: fmt.Sprintf("access denied: %s cannot update agent %s", shortConsensusID(senderID), shortConsensusID(targetID))}
 		}
+		isRootTarget, rootTargetErr := app.appV23IsRootIdentity(targetID, height)
+		if rootTargetErr != nil || isRootTarget {
+			return appV23ControlDenied()
+		}
+		root, _, role, actorErr := app.appV23Actor(senderCredentialID)
+		if actorErr != nil || root == nil || role == nil ||
+			(senderCredentialID != root.CredentialID && role.Role != store.AppV23RoleAdmin) {
+			return appV23ControlDenied()
+		}
+		if !utf8.ValidString(upd.Name) || strings.TrimSpace(upd.Name) != upd.Name || upd.Name == "" || len(upd.Name) > 128 {
+			return &abcitypes.ExecTxResult{Code: 63, Log: "access denied: operator display name must be 1-128 trimmed UTF-8 bytes"}
+		}
+		if upd.BootBio != current.BootBio {
+			return &abcitypes.ExecTxResult{Code: 63, Log: "access denied: operator display-name update must preserve the agent boot bio"}
+		}
+	} else if isRoot, rootErr := app.appV23IsRootIdentity(senderCredentialID, height); rootErr != nil || isRoot {
+		// Root is sovereign authority, never an editable ordinary agent.
+		return appV23ControlDenied()
+	}
+	if app.appV20StrictFinalize {
 		candidate := *current
 		candidate.Name = upd.Name
 		candidate.BootBio = upd.BootBio
@@ -10157,6 +10299,16 @@ func (app *SageApp) flushPendingWrites(ctx context.Context, s store.OffchainStor
 						err = createErr
 					default:
 						err = s.UpdateAgent(ctx, agent)
+						if err == nil && agent.Status != "" {
+							// A signed idempotent registration is also the explicit
+							// retry path for a Root-rejected pending identity. UpdateAgent
+							// intentionally preserves lifecycle columns, so restore the
+							// projected status separately in this same transaction. Both
+							// SQLite and PostgreSQL clear removed_at when status becomes
+							// active, making the identity visible for a fresh review without
+							// rewriting its immutable on-chain registration.
+							err = s.UpdateAgentStatus(ctx, agent.AgentID, agent.Status)
+						}
 					}
 				}
 			}
@@ -10370,6 +10522,34 @@ func (app *SageApp) PrepareProposal(_ context.Context, req *abcitypes.RequestPre
 // proposer cannot defer an oversized-block failure to FinalizeBlock. Invalid or
 // forged raw target-20 transactions retain legacy mixed-block behavior.
 func (app *SageApp) ProcessProposal(_ context.Context, req *abcitypes.RequestProcessProposal) (*abcitypes.ResponseProcessProposal, error) {
+	// app-v26 extends AccessGroupMutate in place. A v25 validator rejects the
+	// appended member_authority bytes as trailing data while a v26 validator can
+	// decode them. CheckTx keeps the extended form out of an honest proposer's
+	// mempool, but proposal validation is the consensus boundary: a stale or
+	// Byzantine proposer can supply arbitrary raw transactions without passing
+	// this node's CheckTx. Reject that mixed interpretation through activation
+	// height H; H+1 is the first height where every validator may interpret the
+	// appended field under app-v26 rules.
+	if !app.postAppV26Fork(req.Height) {
+		for _, rawTx := range req.Txs {
+			parsedTx, decodeErr := tx.DecodeTx(rawTx)
+			if decodeErr == nil {
+				switch parsedTx.Type {
+				case tx.TxTypeAccessGroupMutate:
+					if parsedTx.AccessGroupMutate != nil &&
+						parsedTx.AccessGroupMutate.MemberAuthority != "" {
+						return &abcitypes.ResponseProcessProposal{Status: abcitypes.ResponseProcessProposal_REJECT}, nil
+					}
+				case tx.TxTypeDomainReassign:
+					if parsedTx.DomainReassign != nil &&
+						parsedTx.DomainReassign.ExpectedOwnerID != "" {
+						return &abcitypes.ResponseProcessProposal{Status: abcitypes.ResponseProcessProposal_REJECT}, nil
+					}
+				}
+			}
+		}
+	}
+
 	strictV20Rules := app.requiresAppV20StrictRulesAt(req.Height)
 	if !strictV20Rules && len(req.Txs) > 1 {
 		for _, rawTx := range req.Txs {
@@ -11107,6 +11287,17 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 			return fmt.Errorf("app-v25 upgrade has invalid predecessor: %w", predecessorErr)
 		}
 	}
+	if p.Name == appV26UpgradeName {
+		if p.TargetAppVersion != 26 {
+			return fmt.Errorf("app-v26 upgrade has target version %d, want 26", p.TargetAppVersion)
+		}
+		if current := app.currentAppVersion(); current != 25 {
+			return fmt.Errorf("app-v26 upgrade requires current app version 25, got %d", current)
+		}
+		if _, predecessorErr := app.validateAppV26Predecessor(); predecessorErr != nil {
+			return fmt.Errorf("app-v26 upgrade has invalid predecessor: %w", predecessorErr)
+		}
+	}
 
 	// Execution-height regression re-guard: the chain's committed app version
 	// may have advanced (another upgrade activated) between propose and quorum.
@@ -11277,6 +11468,20 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 		if _, predecessorErr := app.validateAppV25Predecessor(); predecessorErr != nil {
 			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
 				"upgrade propose: app-v25 predecessor is invalid: %v", predecessorErr)}
+		}
+	}
+	if prop.Name == appV26UpgradeName {
+		if prop.TargetAppVersion != 26 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v26 requires target_app_version 26 (got %d)", prop.TargetAppVersion)}
+		}
+		if current := app.currentAppVersion(); current != 25 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v26 requires current committed app version 25 (got %d)", current)}
+		}
+		if _, predecessorErr := app.validateAppV26Predecessor(); predecessorErr != nil {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v26 predecessor is invalid: %v", predecessorErr)}
 		}
 	}
 
@@ -11729,6 +11934,10 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 	if payload.Domain != req.Domain || payload.NewOwnerID != req.NewOwnerID || payload.OpenToShared != req.OpenToShared {
 		return &abcitypes.ExecTxResult{Code: 83, Log: "proposal body mismatch (domain/new_owner/open_to_shared)"}
 	}
+	if app.postAppV26Rules(height) &&
+		(payload.ParentDomain != req.ParentDomain || payload.ExpectedOwnerID != req.ExpectedOwnerID) {
+		return &abcitypes.ExecTxResult{Code: 83, Log: "proposal body mismatch (parent_domain/expected_owner)"}
+	}
 	if app.postAppV22Rules(height) {
 		if isRoot, rootErr := app.appV23IsRootIdentity(req.NewOwnerID, height); rootErr != nil || isRoot {
 			return appV23ControlDenied()
@@ -11765,9 +11974,20 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 	}
 
 	// Existence + parent consistency.
-	existingOwner, existingParent, _, domErr := app.badgerStore.GetDomainOwnerAndMeta(req.Domain)
+	existingOwner, existingParent, existingCreatedHeight, domErr := app.badgerStore.GetDomainOwnerAndMeta(req.Domain)
 	if domErr != nil {
 		return &abcitypes.ExecTxResult{Code: 86, Log: fmt.Sprintf("domain not found: %s", req.Domain)}
+	}
+	if app.postAppV26Rules(height) {
+		if req.ExpectedOwnerID == "" {
+			return &abcitypes.ExecTxResult{Code: 87, Log: "domain reassign: expected owner is required under app-v26"}
+		}
+		if req.ExpectedOwnerID != existingOwner {
+			return &abcitypes.ExecTxResult{Code: 87, Log: fmt.Sprintf(
+				"domain owner changed: expected=%s current=%s",
+				shortConsensusID(req.ExpectedOwnerID), shortConsensusID(existingOwner),
+			)}
+		}
 	}
 	if req.ParentDomain != "" && req.ParentDomain != existingParent {
 		return &abcitypes.ExecTxResult{Code: 87, Log: fmt.Sprintf(
@@ -11777,7 +11997,7 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 	if parent == "" {
 		parent = existingParent
 	}
-	if app.postAppV20Fork(height) {
+	if app.postAppV20Fork(height) && !app.postAppV26Rules(height) {
 		grantCount, exceeded, countErr := app.badgerStore.CountGrantsByDomainUpTo(req.Domain, maxAppV20DomainReassignGrantPurge)
 		if countErr != nil {
 			return &abcitypes.ExecTxResult{Code: 89, Log: fmt.Sprintf("grant invalidation preflight failed: %v", countErr)}
@@ -11794,7 +12014,14 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 	// active local principal's required home-domain invariant atomically and
 	// folds dynamic shared-domain promotion into the same guarded write.
 	var transferErr error
-	if app.postAppV23Rules(height) {
+	purged := 0
+	if app.postAppV26Rules(height) {
+		purged, transferErr = app.badgerStore.TransferDomainAppV26CAS(
+			req.Domain, req.NewOwnerID, parent, req.ExpectedOwnerID,
+			req.ProposalID, height, req.OpenToShared,
+			maxAppV20DomainReassignGrantPurge,
+		)
+	} else if app.postAppV23Rules(height) {
 		transferErr = app.badgerStore.TransferDomainAppV23(
 			req.Domain, req.NewOwnerID, parent, height, req.OpenToShared,
 		)
@@ -11802,18 +12029,34 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 		transferErr = app.badgerStore.TransferDomain(req.Domain, req.NewOwnerID, parent, height)
 	}
 	if transferErr != nil {
+		if errors.Is(transferErr, store.ErrAppV26DomainOwnerChanged) {
+			return &abcitypes.ExecTxResult{Code: 87, Log: "domain owner changed during transfer"}
+		}
+		if errors.Is(transferErr, store.ErrAppV26DomainOwnerUnchanged) {
+			return &abcitypes.ExecTxResult{Code: 87, Log: "current owner and target agent cannot be the same"}
+		}
+		if errors.Is(transferErr, store.ErrAppV26GrantLimitExceeded) {
+			return &abcitypes.ExecTxResult{Code: 89, Log: fmt.Sprintf(
+				"domain has more than %d grants; app-v20 reassignment limit is %d — revoke grants before retrying",
+				maxAppV20DomainReassignGrantPurge, maxAppV20DomainReassignGrantPurge,
+			)}
+		}
 		return &abcitypes.ExecTxResult{Code: 88, Log: fmt.Sprintf("transfer failed: %v", transferErr)}
 	}
 
 	// Invalidate ALL grants on the domain — the previous owner's
 	// chain-of-trust does not survive the reassignment. The new owner
-	// must re-grant explicitly.
-	purged, purgeErr := app.badgerStore.DeleteGrantsByDomain(req.Domain)
-	if purgeErr != nil {
-		app.logger.Error().Err(purgeErr).Str("domain", req.Domain).Msg("failed to purge grants on domain reassignment")
-		// Continue — chain ownership has already flipped; the purge is
-		// best-effort cleanup. A future reassign or revoke can complete
-		// the cleanup; we don't roll back the transfer.
+	// must re-grant explicitly. App-v26 performs this in the same transaction
+	// as the owner CAS/history/shared-state change; historical replay retains
+	// the old two-step behavior.
+	if !app.postAppV26Rules(height) {
+		var purgeErr error
+		purged, purgeErr = app.badgerStore.DeleteGrantsByDomain(req.Domain)
+		if purgeErr != nil {
+			app.logger.Error().Err(purgeErr).Str("domain", req.Domain).Msg("failed to purge grants on domain reassignment")
+			// Historical behavior: transfer already committed and grant cleanup
+			// remains best-effort. App-v26 never enters this branch.
+		}
 	}
 
 	// Optionally promote the domain to shared via the on-chain sentinel.
@@ -11826,8 +12069,10 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 	}
 
 	// Mark proposal consumed — one-shot semantics.
-	if cErr := app.badgerStore.SetState(consumedKey, []byte{1}); cErr != nil {
-		app.logger.Error().Err(cErr).Str("proposal_id", req.ProposalID).Msg("failed to mark proposal consumed")
+	if !app.postAppV26Rules(height) {
+		if cErr := app.badgerStore.SetState(consumedKey, []byte{1}); cErr != nil {
+			app.logger.Error().Err(cErr).Str("proposal_id", req.ProposalID).Msg("failed to mark proposal consumed")
+		}
 	}
 
 	// Mirror the new ownership to the offchain store. The chain is
@@ -11836,13 +12081,17 @@ func (app *SageApp) processDomainReassign(parsedTx *tx.ParsedTx, height int64, b
 	// today, so the mirror's owner column will lag — that's acceptable
 	// for v8.0; a follow-up commit can add an UpsertDomain path if
 	// dashboards need eventual consistency.
+	pendingCreatedHeight := height
+	if app.postAppV26Rules(height) {
+		pendingCreatedHeight = existingCreatedHeight
+	}
 	app.pendingWrites = append(app.pendingWrites, pendingWrite{
 		writeType: "domain_register",
 		data: &store.DomainEntry{
 			DomainName:    req.Domain,
 			OwnerAgentID:  req.NewOwnerID,
 			ParentDomain:  parent,
-			CreatedHeight: height,
+			CreatedHeight: pendingCreatedHeight,
 			CreatedAt:     blockTime,
 		},
 	})

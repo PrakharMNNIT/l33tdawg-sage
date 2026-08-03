@@ -479,6 +479,33 @@ func (s *Server) checkDomainAccess(ctx context.Context, agentID, domain, action 
 	)
 }
 
+const domainReadDeniedProblemType = "https://sage.dev/errors/domain-read-denied"
+
+// writeDomainReadAccessError keeps a policy denial machine-distinguishable
+// from every other 403. The MCP turn path uses this exact problem type only to
+// defer the harmless first-read denial for a domain that does not exist until
+// the same turn's first write commits. A broken policy backend must remain a
+// retryable service failure; otherwise a successful later write could hide a
+// genuine authorization-state outage behind the first-use compatibility path.
+func writeDomainReadAccessError(w http.ResponseWriter, accessErr error) {
+	detail := "Current domain read authority could not be resolved."
+	if accessErr != nil {
+		detail = accessErr.Error()
+	}
+	if strings.Contains(detail, "access-control state is invalid") ||
+		strings.Contains(detail, "access-control state is unavailable") {
+		writeProblem(w, http.StatusServiceUnavailable, "Access control unavailable", detail)
+		return
+	}
+	writeProblemTyped(
+		w,
+		http.StatusForbidden,
+		domainReadDeniedProblemType,
+		"Access denied",
+		detail,
+	)
+}
+
 // appV23PolicyPrincipal maps only the current Root credential to its immutable
 // policy principal and rejects the retired Root credential. Callers still
 // retain the original authenticated credential for signature provenance and
@@ -1717,7 +1744,7 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	if req.DomainTag != "" {
 		agentID := middleware.ContextAgentID(r.Context())
 		if accessErr := s.checkDomainAccess(r.Context(), agentID, req.DomainTag, "read"); accessErr != nil {
-			writeProblem(w, http.StatusForbidden, "Access denied", accessErr.Error())
+			writeDomainReadAccessError(w, accessErr)
 			return
 		}
 		domainAccessApproved = true
@@ -2420,7 +2447,7 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	if req.DomainTag != "" {
 		agentID := middleware.ContextAgentID(r.Context())
 		if accessErr := s.checkDomainAccess(r.Context(), agentID, req.DomainTag, "read"); accessErr != nil {
-			writeProblem(w, http.StatusForbidden, "Access denied", accessErr.Error())
+			writeDomainReadAccessError(w, accessErr)
 			return
 		}
 		domainAccessApproved = true
@@ -2746,7 +2773,7 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	if req.DomainTag != "" {
 		agentID := middleware.ContextAgentID(r.Context())
 		if accessErr := s.checkDomainAccess(r.Context(), agentID, req.DomainTag, "read"); accessErr != nil {
-			writeProblem(w, http.StatusForbidden, "Access denied", accessErr.Error())
+			writeDomainReadAccessError(w, accessErr)
 			return
 		}
 		domainAccessApproved = true
@@ -3882,7 +3909,13 @@ func (s *Server) listAppV23VisibleMemories(
 	if hasMore {
 		visible = visible[:requestedLimit]
 	}
-	return visible, totalVisibleLowerBound, hasMore, exhausted, nil
+	// Breaking after the look-ahead row can happen inside the store's final
+	// batch. In that case the backing stream is exhausted, but the authorized
+	// stream has not been counted to completion because unvisited rows remain
+	// in that batch. A page with has_more=true is therefore always a lower
+	// bound, never an exact total.
+	totalExact := exhausted && !hasMore
+	return visible, totalVisibleLowerBound, hasMore, totalExact, nil
 }
 
 // handleListMemoriesAuth handles GET /v1/memory/list (authenticated, agent-isolated).

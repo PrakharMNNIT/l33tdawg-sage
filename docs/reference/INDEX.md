@@ -1,4 +1,4 @@
-<!-- Reference index reconciled for SAGE v11.16.4. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
+<!-- Reference index reconciled for SAGE v11.17.0. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
 
 
 # SAGE Reference — Agent Integration Index
@@ -8,7 +8,8 @@ If you are an agent (or building one) and you have a question about how SAGE beh
 the answer is here or in a linked file — **read this before reverse-engineering the source.**
 
 Every document in this directory was verified against the actual code and cites
-`file:line` for non-obvious behavior. Where this reference disagrees with `docs/ARCHITECTURE.md`
+stable source files and symbols (and exact lines where useful) for non-obvious
+behavior. Where this reference disagrees with `docs/ARCHITECTURE.md`
 or `api/openapi.yaml`, **trust this reference** — those two have known drift (see *Known-stale sources* below).
 
 ---
@@ -23,7 +24,8 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | [`environment-variables.md`](environment-variables.md) | Every env var SAGE reads (`SAGE_HOME`, embeddings, hybrid recall, TLS, snapshots, …), with defaults and the `file:line` that consumes each. |
 | [`concepts/memory-lifecycle.md`](concepts/memory-lifecycle.md) | submit → proposed → committed/deprecated; node-local vs on-chain data; confidence decay; corroboration. |
 | [`concepts/clearance-classification.md`](concepts/clearance-classification.md) | Per-record classification (0–4), the REST-vs-wire default gotcha, and the per-record query gate. |
-| [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) | Orgs, departments, agent clearance, cross-org federation, cross-chain peer Read/Copy RBAC, why peer Write is reserved but unavailable in v11.9, the five-gate query pipeline, and the app-v20 one-chain quorum-scope boundary. |
+| [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) | Orgs, departments, agent clearance, cross-org federation, current fail-closed cross-chain Read/Copy policy, the five-gate query pipeline, and the app-v20 one-chain quorum-scope boundary. |
+| [`concepts/app-v26-access-groups.md`](concepts/app-v26-access-groups.md) | The current local Access Group contract: explicit Read / Read+Write / Read+Write+Modify member authority, ownership-preserving join/leave semantics, CAS revisions, hard-deny intersections, and the app-v25 → app-v26 migration boundary. |
 | [`app-v23-access-control-design.md`](app-v23-access-control-design.md) | The v11.16.0 contract for Root, Member/Manager/Admin roles, named security profiles, Access Groups, atomic enrollment, linked federated readers, app-v24 readiness and memory integrity, migration, replay, and state sync. |
 | [`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md) | The v11.16.2 strict App-v25 upgrade: immutable new-memory envelopes, automatic historical repair, local writer continuity, record-local quarantine, Root retry/deprecation controls, and readiness semantics. |
 | [`concepts/consensus-confidence-decay.md`](concepts/consensus-confidence-decay.md) | CometBFT BFT path, "CometBFT-committed" vs "SAGE-committed", quorum, PoE weights, epochs. |
@@ -51,7 +53,8 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | Send agent work to a visible shared-domain recipient on another federated SAGE | [`mcp-tools.md`](mcp-tools.md) — `sage_find_agent`, then `sage_pipe`; [`federation-and-brain-api.md`](federation-and-brain-api.md) — `POST /fed/v1/pipe/event` |
 | Discover connected SAGEs and live-read a domain they share | [`mcp-tools.md`](mcp-tools.md) — `sage_federation`, then `sage_recall` with `federated=true` |
 | Distinguish internet federation, app-v20 quorum replication, and local-vs-network snapshot recovery | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) — “v11.9 quorum scopes are not cross-chain federation” |
-| Understand Root handover, local Access Groups, or why a federated agent is read-only | [`app-v23-access-control-design.md`](app-v23-access-control-design.md) + [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) |
+| Understand Root handover or why a federated agent is read-only | [`app-v23-access-control-design.md`](app-v23-access-control-design.md) + [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) |
+| Create a local Access Group, choose its authority, or understand join/leave behavior | [`concepts/app-v26-access-groups.md`](concepts/app-v26-access-groups.md) |
 | Understand why an upgrade is repairing, partially displaying, or preserving historical memories | [`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md) |
 | Configure SAGE via environment variables | [`environment-variables.md`](environment-variables.md) |
 
@@ -60,11 +63,12 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 ## Critical facts (the ones agents get wrong)
 
 ### Boot sequence (MCP)
-1. `sage_inception` (deprecated alias `sage_red_pill`) — **very first action every conversation.** Loads your stored memory context.
+1. `sage_inception` — **very first action every conversation.** Loads your stored memory context. The superseded `sage_red_pill` alias is no longer registered or callable.
 2. `sage_turn` — **every turn.** Atomically recalls committed memories for the topic *and* stores your observation. Also auto-checks the pipeline inbox.
 3. `sage_reflect` — after tasks. Store dos and don'ts.
 
-The server enforces this: it blocks after ~7 non-SAGE tool calls or ~5 minutes without a `sage_turn`. See [`mcp-tools.md`](mcp-tools.md).
+This is advisory. The server never blocks or pads unrelated work merely because
+`sage_turn` has not been called recently. See [`mcp-tools.md`](mcp-tools.md).
 
 ### App-v23 access control: role, scope, clearance, and Root are separate
 
@@ -145,7 +149,7 @@ app-v23, do not infer Member/Manager/Admin from this number. See
 - The INTERNAL default you may have heard about applies only to the **wire codec when replaying old on-chain txs** that predate the classification byte — it does *not* affect new submissions.
 
 ### Request signing
-All authenticated REST endpoints use an Ed25519 signed-request scheme. The signed message includes the **method, path, body, timestamp, and an 8-byte nonce**, with the nonce sent in the `X-Nonce` header. The SDK does this for you. If you sign by hand, **include the nonce** — the server still accepts the legacy nonce-less form for backward compatibility, but new integrations should send it. After app-v17 activation, consensus also binds delegated proofs to that exact signed action, block-time freshness, and a single-use on-chain marker; the REST process is not trusted to attest the action. See [`python-sdk.md`](python-sdk.md) (`auth.py`) and [`rest-api.md`](rest-api.md).
+All authenticated REST endpoints use an Ed25519 signed-request scheme. The signed message includes the **method, path, body, timestamp, and a fresh 8-byte nonce**, with the nonce sent in the `X-Nonce` header. The SDK does this for you. Hand-written current clients must also include it: although the generic verifier temporarily recognizes the historical nonce-less shape, exact message, acknowledgement, receipt, and delegated-governance actions reject it. After app-v17 activation, consensus also binds delegated proofs to that exact signed action, block-time freshness, and a single-use on-chain marker; the REST process is not trusted to attest the action. See [`python-sdk.md`](python-sdk.md) (`auth.py`) and [`rest-api.md`](rest-api.md).
 
 After app-v20, governance adds a validator-and-chain session binding: the
 configured operator first signs `GET /v1/governance/context`, then includes its
@@ -159,11 +163,11 @@ CometBFT without treating the consensus RPC as proof of application storage.
 
 ---
 
-## Related docs (reconciled through v11.16.4)
+## Related docs (reconciled through v11.17.0)
 
 These were stale earlier in v8 and have now been reconciled against the code. Where any of them still disagrees with this reference, this reference wins.
 
-- **`api/openapi.yaml`** — the machine-readable spec, reconciled to the core REST surface (including the v11.5 `reinstateMemory` operation; `classification` on `MemorySubmitRequest`; `task` in `MemoryType`; `tx_hash` on vote responses; clearance-0 labeled PUBLIC; `/v1/agent/register` documents 201-new / 200-idempotent). [`rest-api.md`](rest-api.md) remains the human-readable narrative. *(A few org/federation/dept GET responses are typed as generic objects — their store models live outside the REST package; fill in later if needed.)*
+- **`api/openapi.yaml`** — the machine-readable **network/agent REST** spec, reconciled to the core remotely callable surface (including the v11.5 `reinstateMemory` operation; `classification` on `MemorySubmitRequest`; `task` in `MemoryType`; `tx_hash` on vote responses; clearance-0 labeled PUBLIC; `/v1/agent/register` documents 201-new / 200-idempotent). It intentionally excludes the same-machine, loopback-only human CEREBRUM control plane under `/v1/dashboard/**`; those operator routes are documented in [`rest-api.md`](rest-api.md), the app-v23 design, and the app-v26 Access Group reference. This exclusion is a trust boundary, not missing SDK coverage. *(A few org/federation/dept GET responses are typed as generic objects — their store models live outside the REST package; fill in later if needed.)*
 - **`docs/ARCHITECTURE.md`** — accurate: it documents *both* the operational and data-classification meanings of the 0–4 integer, and treats BadgerDB as authoritative with SQLite as legacy fallback. Documents PoE-weighted quorum (Phase 2, live since v8.2/`app-v3` and complete through v8.4/`app-v5`): post-fork blocks weight each vote by the validator's demonstrated PoE track record; the equal-weight (1.0) branch is retained only for pre-fork byte-identical replay. For precise per-record gate logic with file:line, prefer [`concepts/`](concepts/).
 - **`sdk/python/README.md`** — reconciled: signing docs now include the nonce/`X-Nonce`, `propose()` documents `classification`, and `hybrid()`/`forget()`/`list_orgs_by_name()` are in the tables. [`python-sdk.md`](python-sdk.md) is the fuller reference.
 

@@ -82,6 +82,15 @@ export async function fetchMemoryAdoptionProgress() {
     return res.json();
 }
 
+export async function fetchMemoryAdoptionInventory({ after = '', limit = 50 } = {}) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (after) query.set('after', after);
+    const res = await fetch(`${API_BASE}/v1/dashboard/memory/adoption-inventory?${query}`);
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.error || 'historical memory inventory is temporarily unavailable');
+    return payload;
+}
+
 async function postMemoryAdoptionResolution(path, body) {
     const res = await fetch(`${API_BASE}/v1/dashboard/memory/${path}`, {
         method: 'POST',
@@ -102,11 +111,21 @@ export async function retryMemoryAdoption({ projectionRevision, expectedCount })
     });
 }
 
-export async function deprecateMemoryAdoption({ projectionRevision, expectedCount, confirmation }) {
+export async function assignMemoryAdoption({ projectionRevision, expectedCount, memoryIDs, targetAgentID }) {
+    return postMemoryAdoptionResolution('adoption-assign', {
+        projection_revision: projectionRevision,
+        expected_count: expectedCount,
+        memory_ids: memoryIDs,
+        target_agent_id: targetAgentID,
+    });
+}
+
+export async function deprecateMemoryAdoption({ projectionRevision, expectedCount, confirmation, memoryIDs = [] }) {
     return postMemoryAdoptionResolution('adoption-deprecate', {
         projection_revision: projectionRevision,
         expected_count: expectedCount,
         confirmation,
+        memory_ids: memoryIDs,
     });
 }
 
@@ -321,7 +340,41 @@ export async function fetchAgents() {
 }
 
 async function appV23AccessRequest(path, options = {}) {
-    const res = await fetch(`${API_BASE}${path}`, options);
+    const method = String(options.method || 'GET').toUpperCase();
+    const timeoutMs = method === 'GET' ? 15_000 : 70_000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let res;
+    try {
+        res = await fetch(`${API_BASE}${path}`, { ...options, signal: controller.signal });
+    } catch (cause) {
+        if (cause?.name === 'AbortError') {
+            const error = new Error(
+                method === 'GET'
+                    ? 'Access controls did not refresh in time. The controls are available again; reload to retry.'
+                    : 'Consensus did not answer in time. The change may already be committed; reload before trying it again.',
+            );
+            error.code = 'access_control_timeout';
+            error.status = 0;
+            throw error;
+        }
+        if (method !== 'GET') {
+            // A transport failure after the request left the browser does not
+            // prove that consensus rejected it. Classify mutation-side
+            // network failures as indeterminate so CEREBRUM refreshes and
+            // blocks duplicate authority changes until state is verified.
+            const error = new Error(
+                'The connection ended before consensus confirmation. The change may already be committed; reload and verify before trying it again.',
+                { cause },
+            );
+            error.code = 'access_control_transport_uncertain';
+            error.status = 0;
+            throw error;
+        }
+        throw cause;
+    } finally {
+        clearTimeout(timeout);
+    }
     let data = {};
     try { data = await res.json(); } catch (_) {}
     if (!res.ok) {
@@ -334,7 +387,7 @@ async function appV23AccessRequest(path, options = {}) {
 }
 
 export async function fetchAppV23Access() {
-    return appV23AccessRequest('/v1/dashboard/network/access');
+    return appV23AccessRequest('/v1/dashboard/network/access', { cache: 'no-store' });
 }
 
 export async function updateAppV23AgentPolicy(id, policy) {
@@ -342,6 +395,14 @@ export async function updateAppV23AgentPolicy(id, policy) {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(policy),
+    });
+}
+
+export async function updateAppV26AgentDisplayName(id, name) {
+    return appV23AccessRequest(`/v1/dashboard/network/access/agents/${encodeURIComponent(id)}/name`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
     });
 }
 
@@ -682,7 +743,9 @@ export async function updateTaskStatus(id, taskStatus) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ task_status: taskStatus }),
     });
-    return res.json();
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.error || res.statusText || 'task status update failed');
+    return payload;
 }
 
 export async function reorderTasks(taskStatus, taskIds) {

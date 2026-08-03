@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -62,11 +63,17 @@ func newLinkedMessagingPair(t *testing.T) *linkedMessagingPair {
 	guestID := enrollV23OrdinaryAgent(t, peer, "peer-guest", guestKey, 4)
 	require.NoError(t, pipeSQLite(t, host).CreateAgent(
 		context.Background(),
-		&store.AgentEntry{AgentID: memberID, Name: "host-member", Status: "active"},
+		&store.AgentEntry{
+			AgentID: memberID, Name: "Host Member", Status: "active",
+			RegisteredName: "claude/host-member", Provider: "claude-code",
+		},
 	))
 	require.NoError(t, pipeSQLite(t, peer).CreateAgent(
 		context.Background(),
-		&store.AgentEntry{AgentID: guestID, Name: "peer-guest", Status: "active"},
+		&store.AgentEntry{
+			AgentID: guestID, Name: "Peer Guest", Status: "active",
+			RegisteredName: "mynah/peer-guest", Provider: "mynah",
+		},
 	))
 
 	hostRoot := hex.EncodeToString(host.agentPub)
@@ -94,6 +101,530 @@ func newLinkedMessagingPair(t *testing.T) *linkedMessagingPair {
 		host: host, peer: peer, memberID: memberID, guestID: guestID,
 		memberKey: memberKey, guestKey: guestKey, guest: guest,
 	}
+}
+
+func TestCallerMayHaveLinkedMessagePeerUsesCurrentLocalAuthorityOnly(t *testing.T) {
+	ctx := context.Background()
+	t.Run("host and guest current", func(t *testing.T) {
+		pair := newLinkedMessagingPair(t)
+		hostMay, err := pair.host.mgr.CallerMayHaveLinkedMessagePeer(
+			ctx, pair.peer.chainID, pair.memberID,
+		)
+		require.NoError(t, err)
+		require.True(t, hostMay,
+			"host can prove its current local member-to-guest edge")
+	})
+
+	t.Run("guest defers exact edge to remote host", func(t *testing.T) {
+		m, ss, bs := newDrainTestManager(t)
+		m.postV23ForNextTx = func() bool { return true }
+		m.federatedGuestStore = ss
+		m.queryChallengeStore = ss
+		m.localGroupResolver = v23GroupResolverFake{"linked-guest": {}}
+		callerPub, _, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		callerID := hex.EncodeToString(callerPub)
+		require.NoError(t, bs.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+			RootID: hex.EncodeToString(m.agentPub), Scope: "linked-guest-hint",
+			AgentID: callerID, Profile: store.AppV23ProfileStandard,
+			HomeDomain: "local-linked-guest", Clearance: 1, Capabilities: 0,
+			Height: 1, BootstrapDigest: strings.Repeat("91", 32),
+		}))
+		peerID := newPeerOperatorID(t)
+		agreement := configurePeerRBACConnection(
+			t, m, ss, bs, "chain-host", peerID, "guest", []string{"shared"}, 4,
+		)
+		seed := bytes.Repeat([]byte{0x31}, 32)
+		commitSeed, rollbackSeed, seedErr := m.stageSeed(
+			agreement.RemoteChainID, seed, seed, time.Now().Unix(),
+		)
+		require.NoError(t, seedErr)
+		t.Cleanup(rollbackSeed)
+		require.NoError(t, commitSeed())
+		control, err := ss.GetSyncControl(ctx, agreement.RemoteChainID)
+		require.NoError(t, err)
+		_, replaceErr := ss.ReplaceBoundPeerRBACPolicy(ctx, store.PeerRBACPolicy{
+			RemoteChainID: agreement.RemoteChainID, PeerAgentID: peerID,
+			PolicyEpoch: control.PolicyEpoch, RemoteCAPin: control.RemoteCAPin,
+			PolicyVersion: store.CurrentPeerRBACPolicyVersion,
+			Domains:       []store.PeerRBACDomainPermission{},
+		})
+		require.NoError(t, replaceErr)
+		eligible, eligibilityErr := m.localFederatedGuestAgentEligible(callerID)
+		require.NoError(t, eligibilityErr)
+		require.True(t, eligible)
+		resolvedPeer, resolveErr := m.ResolvePeerOperatorAgentID(ctx, agreement.RemoteChainID)
+		require.NoError(t, resolveErr)
+		require.Equal(t, peerID, resolvedPeer)
+		policy, _, policyErr := m.currentLinkedMessagePolicy(ctx, agreement, peerID)
+		require.NoError(t, policyErr)
+		require.NotNil(t, policy)
+		require.True(t, m.syncControlPeerBound(control, &peerIdentity{
+			ChainID: agreement.RemoteChainID, AgentID: peerID, Agreement: agreement,
+		}))
+
+		guestMay, err := m.CallerMayHaveLinkedMessagePeer(
+			ctx, agreement.RemoteChainID, callerID,
+		)
+		require.NoError(t, err)
+		require.True(t, guestMay,
+			"guest must not false-negative an edge only the remote host can prove")
+	})
+
+	t.Run("host has no active guest row", func(t *testing.T) {
+		pair := newLinkedMessagingPair(t)
+		paused := pair.guest
+		paused.Revision++
+		paused.State = store.FederatedGuestStatePaused
+		require.NoError(t, store.SignFederatedGroupGuest(&paused, pair.host.agentKey))
+		require.NoError(t, pipeSQLite(t, pair.host).PutFederatedGroupGuest(ctx, paused))
+
+		may, err := pair.host.mgr.CallerMayHaveLinkedMessagePeer(
+			ctx, pair.peer.chainID, pair.memberID,
+		)
+		require.NoError(t, err)
+		require.False(t, may)
+	})
+
+	t.Run("host member removed", func(t *testing.T) {
+		pair := newLinkedMessagingPair(t)
+		group, err := pair.host.badger.GetAppV23AccessGroup("linked-team")
+		require.NoError(t, err)
+		require.NoError(t, pair.host.badger.MutateAppV23AccessGroup(
+			hex.EncodeToString(pair.host.agentPub), group.GroupID, group.Name,
+			[]string{}, group.Revision, false, 20,
+		))
+
+		may, err := pair.host.mgr.CallerMayHaveLinkedMessagePeer(
+			ctx, pair.peer.chainID, pair.memberID,
+		)
+		require.NoError(t, err)
+		require.False(t, may)
+	})
+
+	t.Run("stale agreement generation", func(t *testing.T) {
+		pair := newLinkedMessagingPair(t)
+		agreement, err := pair.host.mgr.ActiveAgreement(pair.peer.chainID)
+		require.NoError(t, err)
+		stalePin := bytes.Repeat([]byte{0x7f}, ed25519.PublicKeySize)
+		require.NoError(t, pair.host.badger.SetCrossFed(
+			pair.peer.chainID, agreement.Endpoint, stalePin,
+			agreement.MaxClearance, agreement.ExpiresAt, agreement.AllowedDomains,
+			agreement.AllowedDepts, agreement.Status,
+		))
+
+		may, err := pair.host.mgr.CallerMayHaveLinkedMessagePeer(
+			ctx, pair.peer.chainID, pair.memberID,
+		)
+		require.NoError(t, err)
+		require.False(t, may)
+	})
+
+	t.Run("revoked agreement", func(t *testing.T) {
+		pair := newLinkedMessagingPair(t)
+		require.NoError(t, pair.host.badger.UpdateCrossFedStatus(
+			pair.peer.chainID, "revoked",
+		))
+		may, err := pair.host.mgr.CallerMayHaveLinkedMessagePeer(
+			ctx, pair.peer.chainID, pair.memberID,
+		)
+		require.NoError(t, err)
+		require.False(t, may)
+	})
+
+	t.Run("ineligible caller", func(t *testing.T) {
+		pair := newLinkedMessagingPair(t)
+		setLinkedTestAgentReadOnly(t, pair.host, pair.memberID, 50)
+		may, err := pair.host.mgr.CallerMayHaveLinkedMessagePeer(
+			ctx, pair.peer.chainID, pair.memberID,
+		)
+		require.NoError(t, err)
+		require.False(t, may)
+	})
+}
+
+func TestLinkedMessageDirectoryBidirectionalDiscoveryAndExactSend(t *testing.T) {
+	pair := newLinkedMessagingPair(t)
+	pair.enableBothDirections(t)
+	ctx := context.Background()
+
+	hosted, err := pair.host.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.peer.chainID, pair.memberID, "peer guest", 20,
+	)
+	require.NoError(t, err)
+	require.Len(t, hosted.Contacts, 1)
+	require.Equal(t, pair.guestID, hosted.Contacts[0].AgentID)
+	require.Equal(t, "Peer Guest", hosted.Contacts[0].DisplayName)
+	require.Equal(t, "mynah/peer-guest", hosted.Contacts[0].RegisteredName)
+	require.Equal(t, "mynah", hosted.Contacts[0].Provider)
+	require.Equal(t, pair.guestID+"@"+pair.peer.chainID, hosted.Contacts[0].Address)
+	require.Empty(t, hosted.Contacts[0].Domains)
+	require.Empty(t, hosted.Contacts[0].ContactID)
+	require.Equal(t, LinkedMessageAuthorizationMode,
+		hosted.Contacts[0].AuthorizationMode)
+	require.False(t, hosted.Contacts[0].Available,
+		"linked discovery must not claim online presence")
+	require.False(t, hosted.Contacts[0].Accepting,
+		"exact tuple consent must not be presented as live acceptance status")
+	hostedDirectory, err := pair.host.mgr.ListRemoteLinkedMessageContacts(
+		ctx, pair.peer.chainID, pair.memberID,
+	)
+	require.NoError(t, err)
+	require.Len(t, hostedDirectory.Contacts, 1)
+	require.Equal(t, hosted.Contacts[0], hostedDirectory.Contacts[0])
+
+	remoteHosted, err := pair.peer.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.host.chainID, pair.guestID, "claude/host", 20,
+	)
+	require.NoError(t, err)
+	require.Len(t, remoteHosted.Contacts, 1)
+	require.Equal(t, pair.memberID, remoteHosted.Contacts[0].AgentID)
+	require.Equal(t, "Host Member", remoteHosted.Contacts[0].DisplayName)
+	require.Equal(t, "claude/host-member", remoteHosted.Contacts[0].RegisteredName)
+	require.Equal(t, "claude-code", remoteHosted.Contacts[0].Provider)
+	require.Equal(t, pair.memberID+"@"+pair.host.chainID, remoteHosted.Contacts[0].Address)
+	remoteDirectory, err := pair.peer.mgr.ListRemoteLinkedMessageContacts(
+		ctx, pair.host.chainID, pair.guestID,
+	)
+	require.NoError(t, err)
+	require.Len(t, remoteDirectory.Contacts, 1)
+	require.Equal(t, remoteHosted.Contacts[0], remoteDirectory.Contacts[0])
+
+	target, err := pair.host.mgr.ResolveRemoteLinkedPipeTarget(
+		ctx, pair.memberID, hosted.Contacts[0].Address,
+	)
+	require.NoError(t, err)
+	_, outbox := enqueueLinkedSend(
+		t, pair.host, pair.peer, pair.memberID, pair.memberKey,
+		target, "directory-exact-send",
+	)
+	deliverLinkedSend(t, pair.host, pair.peer, outbox)
+}
+
+func TestLinkedMessageDirectoryEnumerationNeverSilentlyTruncates(t *testing.T) {
+	for _, direction := range []string{
+		LinkedMessageGuestToMember,
+		LinkedMessageMemberToGuest,
+	} {
+		t.Run(direction, func(t *testing.T) {
+			req := LinkedMessageDirectoryRequest{
+				Direction: direction, Enumerate: true,
+				Limit: maxLinkedMessageDirectoryInventory,
+			}
+			entries := make([]LinkedMessageDirectoryEntry, 0, req.Limit)
+			for i := 0; i < req.Limit; i++ {
+				require.True(t, appendLinkedDirectoryEntry(
+					&entries, req, LinkedMessageDirectoryEntry{AgentID: strings.Repeat("a", 64)},
+				))
+			}
+			require.False(t, appendLinkedDirectoryEntry(
+				&entries, req, LinkedMessageDirectoryEntry{AgentID: strings.Repeat("b", 64)},
+			))
+			require.Len(t, entries, req.Limit)
+		})
+	}
+
+	contacts := make([]PipeContact, maxLinkedMessageDirectoryInventory+1)
+	_, err := boundLinkedDirectoryContacts(
+		contacts, maxLinkedMessageDirectoryInventory, true,
+	)
+	require.ErrorIs(t, err, ErrFederatedPipeInvalid,
+		"a two-direction union over the inventory limit must fail, not slice")
+	bounded, err := boundLinkedDirectoryContacts(contacts, 20, false)
+	require.NoError(t, err)
+	require.Len(t, bounded, 20, "bounded human-name lookup keeps top-N semantics")
+}
+
+func TestLinkedMessageDirectoryAmbiguityUnicodeAndUnrelatedHidden(t *testing.T) {
+	pair := newLinkedMessagingPair(t)
+	pair.enableBothDirections(t)
+	ctx := context.Background()
+
+	_, secondKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	secondID := enrollV23OrdinaryAgent(t, pair.host, "resume-member", secondKey, 4)
+	require.NoError(t, pipeSQLite(t, pair.host).CreateAgent(ctx, &store.AgentEntry{
+		AgentID: secondID, Name: "Résumé Member", Status: "active",
+		RegisteredName: "claude/resume-member", Provider: "claude-code",
+	}))
+	group, err := pair.host.badger.GetAppV23AccessGroup("linked-team")
+	require.NoError(t, err)
+	members := []string{pair.memberID, secondID}
+	sort.Strings(members)
+	require.NoError(t, pair.host.badger.MutateAppV23AccessGroup(
+		hex.EncodeToString(pair.host.agentPub), group.GroupID, group.Name,
+		members, group.Revision, false, 20,
+	))
+	_, err = pair.host.mgr.SetLinkedMessageConsentCAS(
+		ctx, pair.peer.chainID, pair.guestID, secondID, 0, true,
+	)
+	require.NoError(t, err)
+
+	_, unrelatedKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	unrelatedID := enrollV23OrdinaryAgent(
+		t, pair.host, "host-unrelated", unrelatedKey, 4,
+	)
+	require.NoError(t, pipeSQLite(t, pair.host).CreateAgent(ctx, &store.AgentEntry{
+		AgentID: unrelatedID, Name: "Host Unrelated", Status: "active",
+		RegisteredName: "claude/host-unrelated", Provider: "claude-code",
+	}))
+
+	ambiguous, err := pair.peer.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.host.chainID, pair.guestID, "member", 20,
+	)
+	require.NoError(t, err)
+	require.Len(t, ambiguous.Contacts, 2)
+	ids := []string{ambiguous.Contacts[0].AgentID, ambiguous.Contacts[1].AgentID}
+	require.ElementsMatch(t, []string{pair.memberID, secondID}, ids)
+	require.NotContains(t, ids, unrelatedID)
+
+	unicode, err := pair.peer.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.host.chainID, pair.guestID, "Résumé", 20,
+	)
+	require.NoError(t, err)
+	require.Len(t, unicode.Contacts, 1)
+	require.Equal(t, secondID, unicode.Contacts[0].AgentID)
+
+	hidden, err := pair.peer.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.host.chainID, pair.guestID, "unrelated", 20,
+	)
+	require.NoError(t, err)
+	require.Empty(t, hidden.Contacts)
+}
+
+func TestLinkedMessageDirectoryRevocationImmediatelyHidesLookup(t *testing.T) {
+	pair := newLinkedMessagingPair(t)
+	pair.enableBothDirections(t)
+	ctx := context.Background()
+
+	visible, err := pair.host.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.peer.chainID, pair.memberID, "peer guest", 20,
+	)
+	require.NoError(t, err)
+	require.Len(t, visible.Contacts, 1)
+	target, err := pair.host.mgr.ResolveRemoteLinkedPipeTarget(
+		ctx, pair.memberID, visible.Contacts[0].Address,
+	)
+	require.NoError(t, err)
+	_, queued := enqueueLinkedSend(
+		t, pair.host, pair.peer, pair.memberID, pair.memberKey,
+		target, "directory-revocation",
+	)
+
+	paused := pair.guest
+	paused.Revision++
+	paused.State = store.FederatedGuestStatePaused
+	require.NoError(t, store.SignFederatedGroupGuest(&paused, pair.host.agentKey))
+	require.NoError(t, pipeSQLite(t, pair.host).PutFederatedGroupGuest(ctx, paused))
+
+	hidden, err := pair.host.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.peer.chainID, pair.memberID, "peer guest", 20,
+	)
+	require.NoError(t, err)
+	require.Empty(t, hidden.Contacts)
+	_, terminal, err := pair.host.mgr.buildPipelineEvent(
+		ctx, pipeSQLite(t, pair.host), queued,
+	)
+	require.Error(t, err)
+	require.True(t, terminal)
+}
+
+func TestLinkedMessageDirectoryRevocationMatrixHidesImmediately(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *linkedMessagingPair)
+	}{
+		{
+			name: "group membership removed",
+			mutate: func(t *testing.T, pair *linkedMessagingPair) {
+				group, err := pair.host.badger.GetAppV23AccessGroup("linked-team")
+				require.NoError(t, err)
+				require.NoError(t, pair.host.badger.MutateAppV23AccessGroup(
+					hex.EncodeToString(pair.host.agentPub), group.GroupID, group.Name,
+					nil, group.Revision, false, 40,
+				))
+			},
+		},
+		{
+			name: "receiver consent disabled",
+			mutate: func(t *testing.T, pair *linkedMessagingPair) {
+				ctx := context.Background()
+				consent, err := pair.peer.mgr.GetLinkedMessageConsent(
+					ctx, pair.host.chainID, pair.memberID, pair.guestID,
+				)
+				require.NoError(t, err)
+				_, err = pair.peer.mgr.SetLinkedMessageConsentCAS(
+					ctx, pair.host.chainID, pair.memberID, pair.guestID,
+					consent.Revision, false,
+				)
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "host policy paused",
+			mutate: func(t *testing.T, pair *linkedMessagingPair) {
+				_, err := pair.host.mgr.SetPeerRBACPaused(
+					context.Background(), pair.peer.chainID, true,
+				)
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "agreement revoked",
+			mutate: func(t *testing.T, pair *linkedMessagingPair) {
+				require.NoError(t, pair.host.badger.UpdateCrossFedStatus(
+					pair.peer.chainID, "revoked",
+				))
+			},
+		},
+		{
+			name: "local source becomes read-only",
+			mutate: func(t *testing.T, pair *linkedMessagingPair) {
+				setLinkedTestAgentReadOnly(t, pair.host, pair.memberID, 50)
+			},
+		},
+		{
+			name: "remote receiver becomes read-only",
+			mutate: func(t *testing.T, pair *linkedMessagingPair) {
+				setLinkedTestAgentReadOnly(t, pair.peer, pair.guestID, 50)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pair := newLinkedMessagingPair(t)
+			pair.enableBothDirections(t)
+			ctx := context.Background()
+			before, err := pair.host.mgr.FindRemoteLinkedMessageContacts(
+				ctx, pair.peer.chainID, pair.memberID, "peer guest", 20,
+			)
+			require.NoError(t, err)
+			require.Len(t, before.Contacts, 1)
+			tc.mutate(t, pair)
+			after, err := pair.host.mgr.FindRemoteLinkedMessageContacts(
+				ctx, pair.peer.chainID, pair.memberID, "peer guest", 20,
+			)
+			require.NoError(t, err)
+			require.Empty(t, after.Contacts)
+		})
+	}
+}
+
+func setLinkedTestAgentReadOnly(
+	t *testing.T,
+	node *testChain,
+	agentID string,
+	height int64,
+) {
+	t.Helper()
+	enrollment, err := node.badger.GetAppV23Enrollment(agentID)
+	require.NoError(t, err)
+	require.NotNil(t, enrollment)
+	role, err := node.badger.GetAppV23Role(agentID)
+	require.NoError(t, err)
+	require.NotNil(t, role)
+	require.NoError(t, node.badger.SetAppV23Policy(
+		hex.EncodeToString(node.agentPub), agentID, store.AppV23RoleMember,
+		enrollment.Profile, store.AppV23ProfileReadOnly, enrollment.Clearance,
+		store.AgentCapabilityReadAllDomains, role.Revision, enrollment.Revision,
+		height,
+	))
+}
+
+func TestLinkedMessageDirectoryUsesAuthenticatedRelayRoute(t *testing.T) {
+	pair := newLinkedMessagingPair(t)
+	pair.enableBothDirections(t)
+	ctx := context.Background()
+
+	var relayRequests atomic.Int32
+	relay := startCountedFederationServer(t, pair.host, &relayRequests)
+	agreement, err := pair.peer.mgr.ActiveAgreement(pair.host.chainID)
+	require.NoError(t, err)
+	require.NoError(t, pair.peer.badger.SetCrossFed(
+		pair.host.chainID, "https://192.0.2.1:44444", agreement.PeerPubKey,
+		agreement.MaxClearance, agreement.ExpiresAt, agreement.AllowedDomains,
+		agreement.AllowedDepts, agreement.Status,
+	))
+	var relayDials atomic.Int32
+	pair.peer.mgr.SetPeerRouteDialFunc(func(
+		dialCtx context.Context,
+		chain string,
+		authenticate PeerRouteAuthenticator,
+	) (PeerRouteDialResult, bool, error) {
+		relayDials.Add(1)
+		conn, dialErr := dialTestServer(dialCtx, relay.URL)
+		result, authErr := authenticate(dialCtx, PeerRouteDialResult{
+			Conn: conn, Kind: RouteKindRelay, Target: "linked-directory-relay",
+		}, dialErr)
+		return result, true, authErr
+	})
+
+	result, err := pair.peer.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.host.chainID, pair.guestID, "host member", 20,
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Contacts, 1)
+	require.Equal(t, pair.memberID, result.Contacts[0].AgentID)
+	require.Positive(t, relayDials.Load())
+	require.Positive(t, relayRequests.Load())
+	require.Equal(t, RouteKindRelay,
+		pair.peer.mgr.RouteDiagnostics(pair.host.chainID).State)
+}
+
+func TestLinkedMessageDirectoryRejectsMalformedRemoteMetadata(t *testing.T) {
+	pair := newLinkedMessagingPair(t)
+	pair.enableBothDirections(t)
+	ctx := context.Background()
+
+	hostAgreement, err := pair.host.mgr.ActiveAgreement(pair.peer.chainID)
+	require.NoError(t, err)
+	relation, _, err := pair.host.mgr.buildHostedLinkedRelation(
+		ctx,
+		&peerIdentity{
+			ChainID:   pair.peer.chainID,
+			AgentID:   hex.EncodeToString(pair.peer.agentPub),
+			Agreement: hostAgreement,
+		},
+		hostAgreement, LinkedMessageGuestToMember,
+		pair.guestID, pair.memberID,
+	)
+	require.NoError(t, err)
+	malformed := LinkedMessageDirectoryResponse{
+		Version: linkedMessageDirectoryVersion, ChainID: pair.host.chainID,
+		Direction: LinkedMessageGuestToMember, SourceAgentID: pair.guestID,
+		Entries: []LinkedMessageDirectoryEntry{{
+			AgentID: pair.memberID, DisplayName: "Host Member",
+			RegisteredName: "claude/host-member", Provider: "claude-code",
+			Address: "wrong-address", ConsentRevision: relation.ReceiverConsentRevision,
+			Relation: relation,
+		}},
+	}
+	tlsConfig, err := pair.host.mgr.ServerTLSConfig()
+	require.NoError(t, err)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(
+		w http.ResponseWriter, _ *http.Request,
+	) {
+		writeJSON(w, http.StatusOK, malformed)
+	}))
+	server.TLS = tlsConfig
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	peerAgreement, err := pair.peer.mgr.ActiveAgreement(pair.host.chainID)
+	require.NoError(t, err)
+	require.NoError(t, pair.peer.badger.SetCrossFed(
+		pair.host.chainID, server.URL, peerAgreement.PeerPubKey,
+		peerAgreement.MaxClearance, peerAgreement.ExpiresAt,
+		peerAgreement.AllowedDomains, peerAgreement.AllowedDepts,
+		peerAgreement.Status,
+	))
+
+	result, err := pair.peer.mgr.FindRemoteLinkedMessageContacts(
+		ctx, pair.host.chainID, pair.guestID, "host member", 20,
+	)
+	require.ErrorIs(t, err, ErrFederatedPipeInvalid)
+	require.Nil(t, result)
 }
 
 func (p *linkedMessagingPair) enableBothDirections(t *testing.T) {
@@ -1082,6 +1613,18 @@ func TestLinkedMessagePrivateRoutesAreBoundedAndDoNotEnumerateFailures(t *testin
 			SourceAgentID: pair.guestID, TargetAgentID: unknownIDs[1],
 		},
 	)
+
+	oversizedDirectoryLimit := callLinkedMessageHandler(
+		t, pair.host.mgr.handleLinkedMessageDirectory,
+		"/fed/v1/pipe/linked/directory", authenticatedPeer,
+		LinkedMessageDirectoryRequest{
+			Version: linkedMessageDirectoryVersion, Direction: LinkedMessageGuestToMember,
+			SourceAgentID: pair.guestID, Name: "member",
+			Limit: maxLinkedMessageDirectoryResults + 1,
+		},
+	)
+	require.Equal(t, http.StatusNotFound, oversizedDirectoryLimit.Code,
+		"an attacker-controlled limit must be rejected before allocation")
 	assertSameUnavailable(
 		t, pair.host.mgr.handleLinkedMessageConsentOffer,
 		"/fed/v1/pipe/linked/consent-offer",

@@ -2,7 +2,7 @@
 
 Python client for the SAGE (Sovereign Agent Governed Experience) protocol -- a governed, verifiable institutional memory layer for multi-agent systems.
 
-**Requires Python 3.10+** | **SAGE v11.16.4 SDK** | **TLS, app-v23 roles and Access Groups, app-v24 memory integrity, app-v25 immutable envelopes and automatic historical continuity recovery, read-only federation, domain recovery, scoped governance, and per-record `classification` supported**
+**Requires Python 3.10+** | **SAGE v11.17.0 SDK** | **TLS, app-v26 explicit Access Group authority, app-v24 memory integrity, app-v25 immutable envelopes and historical continuity recovery, canonical local Messages and read receipts, read-only federation, scoped governance, and per-record `classification` supported**
 
 ## Installation
 
@@ -92,9 +92,17 @@ Request signing is handled automatically by the client. Each request includes fo
 | `X-Timestamp` | Unix timestamp (seconds) |
 | `X-Nonce` | 8 random bytes (hex), prevents signature collisions for identical method+path+body within the same second |
 
-> If you sign requests by hand instead of using the SDK, **include the nonce** (`auth.py`). The server still accepts the legacy nonce-less form for backward compatibility, but new integrations should send `X-Nonce`.
+> If you sign requests by hand instead of using the SDK, **always include a fresh
+> 8-byte nonce** (`auth.py`). The generic authentication middleware can still
+> verify the old nonce-less signature shape during the compatibility window,
+> but exact message, acknowledgement, receipt, and delegated-governance actions
+> reject it. Current integrations must not rely on nonce-less signing.
 
 ## Complete API Reference
+
+`SageClient` exposes 84 public operations. `AsyncSageClient` exposes those
+same 84 operations as coroutines plus the async-only `close()` lifecycle
+method, for 85 public methods total.
 
 ### Health & Status
 
@@ -132,9 +140,19 @@ agent = client.get_agent("a1b2c3...")  # GET /v1/agent/{id}
 # List active ordinary agents visible to this signed caller
 agents = client.list_agents()        # GET /v1/agents → {"agents": [...], "total": N}
 
-# On app-v23/app-v25, role/profile/group changes happen through the local
-# CEREBRUM Root/Admin controls. Do not call the legacy set_agent_permission()
-# endpoint: the server retires it with HTTP 410 after activation.
+# Lightweight local recipient directory and bounded human-name resolution.
+# Neither response is evidence that a recipient is online or has read a message.
+directory = client.agent_directory()
+matches = client.lookup_agents("mynah", limit=10)
+
+# Page the caller's authoritative owned-domain inventory without loading a
+# roster or scanning memories.
+owned = client.owned_domains(limit=50)
+sample = client.domain_access_sample()
+
+# Agent roles, operating modes, app-v26 Access Group membership/authority, and
+# grants are governed in the local CEREBRUM Access Controls screen; the SDK
+# deliberately exposes no legacy per-agent permission mutation shortcut.
 ```
 
 ### Memory Operations
@@ -337,7 +355,7 @@ result = client.pipe_result(msg.pipe_id, result="Analysis complete: CVE is criti
 # Returns: PipeResultResponse(status, journal_id) — auto-journaled to memory
 
 # Inspect this node's local workflow row (not a delivery/read receipt;
-# sender-queryable successful delivery/read receipts are deferred beyond v11.16)
+# negotiated federated receipt-v2 evidence uses separate signed routes)
 status = client.pipe_status(msg.pipe_id)
 
 # List completed results
@@ -349,6 +367,47 @@ results = client.pipe_results(limit=5)
 received_history = client.pipe_inbox_history(limit=20)
 sent_history = client.pipe_outbox(limit=20)
 ```
+
+For same-node work that needs retry-safe delivery and read receipts, use the
+v11.17 canonical Messages service. It uses the same retained inbox rows, not a
+second queue:
+
+```python
+sent = client.message_send(
+    to_agent="target-agent-id",
+    payload="Please review the incident notes",
+    intent="review",
+    idempotency_key="incident-42-review-v1",
+)
+
+# The token makes a lost HTTP response safe: an exact retry returns the same
+# ordered claimed batch rather than consuming later messages.
+batch = client.messages_receive("session-2026-08-02-turn-1", limit=5)
+for item in batch.items:
+    pass
+client.messages_mark_read_batch([item.message_id for item in batch.items])
+for item in batch.items:
+    client.message_reply(item.message_id, "Reviewed")
+
+# Exact sender only; no payload or reply content is exposed here.
+receipt = client.message_status(sent.message_id)
+print(receipt.transport_status, receipt.read_status, receipt.workflow_status)
+```
+
+`idempotency_key` and `receive_token` are 1–256 bytes. `ttl_minutes` is strictly
+1–1440 (default 60). Receive-token replay metadata is retained for 48 hours and
+bounded to 4096 tokens per agent; a purged/incomplete exact batch fails instead
+of claiming newer messages.
+
+The asynchronous client exposes the same methods as coroutines. Federated
+sends continue to use the pipeline contact/revalidation path. When both peers
+negotiate `federated-pipeline-receipts-v2`, the exact sender can query the
+separate payload-free receipt projection through the REST/MCP receipt-status
+surface; a locally queued pipe still must never be described as remotely read.
+Receipt recipients pass the complete singular challenge response directly to
+`pipe_receipt_record()`, or the ready batch items to
+`pipe_receipt_record_batch()`; the SDK constructs every exact-event agent ID,
+nonce, signature, and canonical-request proof.
 
 ### Embeddings
 
@@ -540,8 +599,9 @@ def validate_submission(agent_name: str, domain_tag: str) -> bool:
 
 SAGE includes an access-control recovery primitive: a chain admin can take over
 a domain whose owner is unavailable or compromised. The flow is governance-gated:
-a `domain_reassign` proposal carries the new owner, optional parent, and an
-`open_to_shared` flag as its `payload`; validators vote; once accepted,
+a `domain_reassign` proposal carries the new owner, optional parent, an
+`open_to_shared` flag, and (on app-v26) the exact observed current owner as its
+compare-and-swap binding; validators vote; once accepted,
 `TxTypeDomainReassign` consumes the proposal, transfers ownership, **purges all
 existing grants on the domain**, and optionally promotes the domain to shared.
 
@@ -557,7 +617,9 @@ client = SageClient(base_url="http://localhost:8080", identity=admin)
 # operator. The node's live validator key remains the on-chain actor.
 
 # One-shot: propose -> poll -> submit. Raises SageAPIError on
-# reject/expire/cancel/timeout.
+# owner change/reject/expire/cancel/timeout. On app-v26 the helper reads and
+# binds the chain-authoritative current owner automatically; older chains keep
+# the historical payload.
 result = client.reassign_domain(
     domain="acme.engineering",
     new_owner_id="b" * 64,
@@ -595,6 +657,7 @@ propose = client.governance_propose(
         "new_owner_id": "b" * 64,
         "parent_domain": "",
         "open_to_shared": False,
+        "expected_owner_id": "a" * 64,
     },
 )
 # ... validators vote, proposal hits status="executed" ...
@@ -603,6 +666,7 @@ result = client.submit_domain_reassign(
     new_owner_id="b" * 64,
     proposal_id=propose.proposal_id,
     open_to_shared=False,
+    expected_owner_id="a" * 64,
 )
 ```
 
@@ -746,9 +810,9 @@ except SageAPIError as e:
 `remedy`, and `retryable`. For
 `https://sage.dev/errors/domain-write-denied`, branch on the structured
 `reason_code` and `retryable=False`, never by matching `detail`. In v11.15.0 a
-`missing_write_grant` remedy uses the owned-domain or Root/Admin-approved
-Manager Access Group flow; it does not imply that CEREBRUM ships a direct
-level-2 grant editor.
+`missing_write_grant` remedy uses the owned-domain or a Root/Admin-approved
+Access Group whose explicit tier is Read + write or Read + write + modify; it
+does not imply that CEREBRUM ships a direct level-2 grant editor.
 
 ## Configuration
 
@@ -874,13 +938,17 @@ def hash_embed(text: str, dim: int = 768) -> list[float]:
 | `PUT` | `/v1/agent/update` | `update_agent()` |
 | `GET` | `/v1/agent/me` | `get_profile()` |
 | `GET` | `/v1/agent/{id}` | `get_agent()` |
-| `PUT` | `/v1/agent/{id}/permission` | `set_agent_permission()` — pre-app-v23 compatibility only; v11.16 returns HTTP 410 and directs policy changes to local CEREBRUM. |
 | `GET` | `/v1/agents` | `list_agents()` |
+| `GET` | `/v1/agents/directory` | `agent_directory()` |
+| `GET` | `/v1/agents/lookup` | `lookup_agents()` |
+| `GET` | `/v1/agent/me/domains/owned` | `owned_domains()` |
+| `GET` | `/v1/agent/me/domains` | `domain_access_sample()` |
 
 ### Pipeline
 
 | Method | Endpoint | SDK Method |
 |--------|----------|------------|
+| `POST` | `/v1/pipe/resolve` | `pipe_resolve()` |
 | `POST` | `/v1/pipe/send` | `pipe_send()` |
 | `GET` | `/v1/pipe/inbox` | `pipe_inbox()` |
 | `GET` | `/v1/pipe/history/inbox` | `pipe_inbox_history()` |
@@ -889,6 +957,23 @@ def hash_embed(text: str, dim: int = 768) -> list[float]:
 | `PUT` | `/v1/pipe/{id}/result` | `pipe_result()` |
 | `GET` | `/v1/pipe/{id}` | `pipe_status()` |
 | `GET` | `/v1/pipe/results` | `pipe_results()` |
+| `GET` | `/v1/pipe/updates` | `pipe_updates()` |
+| `GET` | `/v1/pipe/{id}/receipt/challenge/{kind}` | `pipe_receipt_challenge()` |
+| `PUT` | `/v1/pipe/{id}/receipt/{kind}` | `pipe_receipt_record()` |
+| `POST` | `/v1/pipe/receipts/challenge-batch` | `pipe_receipt_challenge_batch()` |
+| `PUT` | `/v1/pipe/receipts/batch` | `pipe_receipt_record_batch()` |
+| `GET` | `/v1/pipe/{id}/receipt` | `pipe_receipt_status()` / MCP `sage_pipe_receipt_status` |
+
+### Canonical local Messages
+
+| Method | Endpoint | SDK Method |
+|--------|----------|------------|
+| `POST` | `/v1/messages` | `message_send()` |
+| `POST` | `/v1/messages/receive` | `messages_receive()` |
+| `POST` | `/v1/messages/{message_id}/reply` | `message_reply()` |
+| `PUT` | `/v1/messages/{message_id}/read` | `message_mark_read()` |
+| `PUT` | `/v1/messages/read-batch` | `messages_mark_read_batch()` |
+| `GET` | `/v1/messages/{message_id}/status` | `message_status()` |
 
 ### Validator
 
@@ -932,6 +1017,7 @@ def hash_embed(text: str, dim: int = 768) -> list[float]:
 |--------|----------|------------|
 | `POST` | `/v1/domain/register` | `register_domain()` |
 | `GET` | `/v1/domain/{name}` | `get_domain()` |
+| `POST` | `/v1/domain/reassign` | `submit_domain_reassign()`; final step of `reassign_domain()` |
 | `POST` | `/v1/access/request` | `request_access()` |
 | `POST` | `/v1/access/grant` | `grant_access()` |
 | `POST` | `/v1/access/revoke` | `revoke_access()` |
@@ -946,6 +1032,18 @@ def hash_embed(text: str, dim: int = 768) -> list[float]:
 | `POST` | `/v1/federation/{id}/revoke` | `revoke_federation()` |
 | `GET` | `/v1/federation/{id}` | `get_federation()` |
 | `GET` | `/v1/federation/active/{org_id}` | `list_federations()` |
+
+### Governance
+
+| Method | Endpoint | SDK Method |
+|--------|----------|------------|
+| `POST` | `/v1/governance/propose` | `governance_propose()` / `governance_propose_scope()` |
+| `POST` | `/v1/governance/vote` | `governance_vote()` |
+| `POST` | `/v1/governance/cancel` | `governance_cancel()` |
+| `GET` | `/v1/scopes` | `list_scopes()` |
+| `GET` | `/v1/scopes/{scope_id}` | `get_scope()` |
+| `GET` | `/v1/dashboard/governance/proposals` | `governance_proposals()` |
+| `GET` | `/v1/dashboard/governance/proposals/{proposal_id}` | `governance_proposal_detail()` |
 
 ### Health
 

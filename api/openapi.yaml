@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.16.4
+  version: 11.17.0
   description: |-
     (Sovereign) Agent Governed Experience — network REST API for memory
     submission, validation, and query.
@@ -943,33 +943,10 @@ components:
       properties:
         name:
           type: string
-          description: Updated agent name.
+          description: Updated agent name. Omit to preserve the current name.
         boot_bio:
           type: string
-          description: Updated agent bio.
-
-    AgentSetPermissionRequest:
-      type: object
-      properties:
-        clearance:
-          type: integer
-          minimum: 0
-          maximum: 4
-          description: >-
-            Clearance tier (0=PUBLIC, 1=INTERNAL, 2=CONFIDENTIAL, 3=SECRET,
-            4=TOPSECRET). Preserved if omitted (PATCH semantics).
-        domain_access:
-          type: string
-          description: JSON-encoded domain access map.
-        visible_agents:
-          type: string
-          description: JSON array of agent IDs this agent can see, or "*" for all.
-        org_id:
-          type: string
-          description: Organization ID.
-        dept_id:
-          type: string
-          description: Department ID.
+          description: Updated agent bio. Omit to preserve the current bio.
 
     RegisteredAgent:
       type: object
@@ -1001,6 +978,36 @@ components:
         updated_at:
           type: string
           format: date-time
+
+    AgentDirectoryEntry:
+      type: object
+      required: [agent_id, name, registered_name, status]
+      description: Minimal signed local recipient identity; contains no RBAC or memory totals.
+      properties:
+        agent_id:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        name:
+          type: string
+          description: Mutable display name.
+        registered_name:
+          type: string
+          description: Immutable name sealed at first registration.
+        provider:
+          type: string
+        status:
+          type: string
+          enum: [active]
+
+    AgentLookupEntry:
+      allOf:
+        - $ref: "#/components/schemas/AgentDirectoryEntry"
+        - type: object
+          required: [match_kind]
+          properties:
+            match_kind:
+              type: string
+              enum: [exact, substring]
 
     ValidatorScore:
       type: object
@@ -1522,6 +1529,15 @@ components:
             When true, also writes the on-chain `shared_domain:<name>`
             sentinel so post-fork access checks treat the domain as
             catch-all-writable.
+        expected_owner_id:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+          description: >-
+            App-v26 ownership compare-and-swap binding. Must be the exact
+            Hex(64) current owner observed before the governance proposal was
+            created; the proposal and execution transaction bind the same
+            value, and consensus rejects a stale transfer if ownership changed
+            before execution. Omit this field on pre-app-v26 chains.
 
     DomainReassignResponse:
       type: object
@@ -1775,6 +1791,291 @@ components:
         federation_contact_revision:
           type: string
           description: Target-specific federation authorization revision; unrelated contact changes do not invalidate exact-address queued work.
+        receipt_protocol_version:
+          type: integer
+          enum: [2]
+          description: >-
+            Present only on an imported federated inbox item when both peers
+            negotiated federated-pipeline-receipts-v2.
+
+    MessageSendRequest:
+      type: object
+      required: [to_agent, payload, idempotency_key]
+      properties:
+        to_agent:
+          type: string
+          minLength: 1
+          description: Exact active local ordinary-agent ID. Provider aliases and federated addresses are not accepted.
+        payload:
+          type: string
+          minLength: 1
+          description: Message request content, subject to the pipeline content-size limit.
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Caller-scoped retry key. Reuse with a different exact request returns 409.
+        intent:
+          type: string
+          description: Optional human-readable purpose, subject to the pipeline intent-size limit.
+        ttl_minutes:
+          type: integer
+          minimum: 1
+          maximum: 1440
+          default: 60
+
+    MessageSendResponse:
+      type: object
+      required: [message_id, status, expires_at, idempotent_replay]
+      properties:
+        message_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, claimed, completed, expired, failed]
+        expires_at:
+          type: string
+          format: date-time
+        idempotent_replay:
+          type: boolean
+
+    MessageReceiveRequest:
+      type: object
+      required: [receive_token]
+      properties:
+        receive_token:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Caller-scoped token binding one exact ordered claimed batch for response-loss replay.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 5
+
+    MessageItem:
+      type: object
+      required: [message_id, from_agent, payload, status, created_at, expires_at, authority, trust, security_notice]
+      properties:
+        message_id:
+          type: string
+        from_agent:
+          type: string
+        from_provider:
+          type: string
+        intent:
+          type: string
+        payload:
+          type: string
+          description: Untrusted request data. It never conveys tool or instruction authority.
+        status:
+          type: string
+          const: claimed
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        authority:
+          type: string
+          const: request_only
+        trust:
+          type: string
+          const: agent_untrusted
+        security_notice:
+          type: string
+
+    MessageReceiveResponse:
+      type: object
+      required: [items, count, idempotent_replay]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageItem"
+        count:
+          type: integer
+          minimum: 0
+        idempotent_replay:
+          type: boolean
+
+    MessageReplyRequest:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: string
+          minLength: 1
+          description: Exact reply content. The same second reply is idempotent; a different reply returns 409.
+
+    MessageActionResponse:
+      type: object
+      required: [message_id, idempotent_replay]
+      properties:
+        message_id:
+          type: string
+        status:
+          type: string
+          enum: [completed]
+        read_status:
+          type: string
+          enum: [confirmed]
+        idempotent_replay:
+          type: boolean
+
+    MessageStatusResponse:
+      type: object
+      required: [message_id, scope, transport_status, read_status, workflow_status, sent_at, expires_at]
+      description: Payload-free metadata returned only to the exact signed sender.
+      properties:
+        message_id:
+          type: string
+        scope:
+          type: string
+          const: local
+        transport_status:
+          type: string
+          const: delivered
+          description: Durable same-node inbox insertion, not evidence of presence or comprehension.
+        read_status:
+          type: string
+          enum: [not_confirmed, confirmed]
+        read_evidence:
+          type: string
+          const: local_exact_ack
+        workflow_status:
+          type: string
+          enum: [pending, claimed, completed, expired, failed]
+        sent_at:
+          type: string
+          format: date-time
+        delivered_at:
+          type: string
+          format: date-time
+        read_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        terminal_at:
+          type: string
+          format: date-time
+        terminal_reason:
+          type: string
+          enum: [completed, expired, failed]
+
+    FederatedPipeReceiptChallenge:
+      type: object
+      required:
+        - version
+        - message_id
+        - sender_chain_id
+        - recipient_chain_id
+        - sender_agent_id
+        - recipient_agent_id
+        - content_digest
+        - event_kind
+        - policy_epoch
+        - agreement_id
+        - contact_id
+        - contact_revision
+      description: >-
+        Payload-free immutable challenge returned only to the exact recipient
+        of a negotiated receipt-v2 import. Submit it unchanged to the matching
+        receipt/{kind} route so the exact recipient signs every binding.
+      properties:
+        version:
+          type: integer
+          const: 2
+        message_id:
+          type: string
+        sender_chain_id:
+          type: string
+        recipient_chain_id:
+          type: string
+        sender_agent_id:
+          type: string
+        recipient_agent_id:
+          type: string
+        content_digest:
+          type: string
+        event_kind:
+          type: string
+          enum: [claimed, read]
+        policy_epoch:
+          type: string
+        agreement_id:
+          type: string
+        contact_id:
+          type: string
+        contact_revision:
+          type: string
+        authorization_mode:
+          type: string
+        relation_digest:
+          type: string
+
+    FederatedPipeReceiptActionResponse:
+      type: object
+      required: [pipe_id, event_kind, receipt_status, idempotent_replay]
+      properties:
+        pipe_id:
+          type: string
+        event_kind:
+          type: string
+          enum: [claimed, read]
+        receipt_status:
+          type: string
+          const: queued
+        idempotent_replay:
+          type: boolean
+
+    FederatedPipeReceiptStatus:
+      type: object
+      required: [pipe_id, protocol, transport_status, claim_status, read_status]
+      description: >-
+        Payload-free exact-sender projection. Delivery, recipient claim/read,
+        and terminal outcome are independent monotonic dimensions; timestamps
+        are evidence metadata and never order authority.
+      properties:
+        pipe_id:
+          type: string
+        protocol:
+          type: string
+          enum: [unsupported, receipt-v2]
+        transport_status:
+          type: string
+          enum: [pending, delivered, failed]
+        delivery_evidence:
+          type: string
+          enum: [peer_operator_durable_admission]
+        delivered_at:
+          type: string
+          format: date-time
+        claim_status:
+          type: string
+          enum: [unconfirmed, confirmed]
+        claimed_at:
+          type: string
+          format: date-time
+        read_status:
+          type: string
+          enum: [unconfirmed, confirmed]
+        read_at:
+          type: string
+          format: date-time
+        terminal_kind:
+          type: string
+          enum: [failed, expired, revoked]
+        terminal_at:
+          type: string
+          format: date-time
 
     PipelineDeliveryUpdate:
       type: object
@@ -2054,6 +2355,12 @@ components:
             $ref: "#/components/schemas/ProblemDetails"
     ServiceUnavailable:
       description: Required node runtime capability or configuration is unavailable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    NotImplemented:
+      description: The active node runtime does not implement this optional capability.
       content:
         application/problem+json:
           schema:
@@ -2533,6 +2840,8 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
         "500":
           $ref: "#/components/responses/InternalError"
+        "500":
+          $ref: "#/components/responses/InternalError"
 
   /v1/memory/link:
     post:
@@ -2869,6 +3178,104 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/agents/directory:
+    get:
+      operationId: listAgentDirectory
+      summary: List minimal local recipient identities.
+      description: >-
+        Signed active-ordinary local directory used by sage_directory. Root,
+        historical Root, pending, inactive, removed, retired, and canonically
+        inconsistent identities are omitted. This endpoint provides no online,
+        reachability, delivery, or read evidence and never returns RBAC or
+        memory-count fields. The database projection is capped at 100 returned
+        active recipients; truncated=true directs callers to the bounded name
+        lookup for recipients outside that picker window.
+      tags: [Agent]
+      responses:
+        "200":
+          description: Minimal active local recipient directory.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agents, total, truncated]
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AgentDirectoryEntry"
+                  total:
+                    type: integer
+                    minimum: 0
+                  truncated:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/agents/lookup:
+    get:
+      operationId: lookupAgentsByName
+      summary: Resolve a bounded local recipient name.
+      description: >-
+        Signed literal substring lookup across active ordinary agents' display
+        name, immutable registered name, and provider. Exact field matches rank
+        before substring matches. It is recipient discovery, not presence.
+      tags: [Agent]
+      parameters:
+        - in: query
+          name: name
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 20
+      responses:
+        "200":
+          description: Ranked bounded local recipient matches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agents, total]
+                properties:
+                  agents:
+                    type: array
+                    maxItems: 20
+                    items:
+                      $ref: "#/components/schemas/AgentLookupEntry"
+                  total:
+                    type: integer
+                    minimum: 0
+                    maximum: 20
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/InternalError"
+
   /v1/agent/me:
     get:
       operationId: getAgentProfile
@@ -2881,6 +3288,14 @@ paths:
         signed agent roster. CEREBRUM Root has no ordinary agent profile.
       tags:
         - Agent
+      parameters:
+        - in: query
+          name: view
+          required: false
+          schema:
+            type: string
+            enum: [standing]
+          description: Return only authenticated consensus standing, skipping optional SQL domain-history and PoE projections.
       responses:
         "200":
           description: Agent profile.
@@ -2902,8 +3317,101 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
-        "500":
+
+  /v1/agent/me/domains:
+    get:
+      operationId: getAgentReadableDomains
+      summary: Retrieve bounded readable domains for the authenticated agent.
+      description: >-
+        Returns only current caller-authorized domain identifiers derived from
+        the caller's own home/provenance, direct grants, and local Access
+        Groups. Candidates are re-authorized against live policy. The result is
+        bounded and may be truncated; it is not a global domain roster or a
+        complete expansion of read-all/ancestor authority.
+      tags:
+        - Agent
+      responses:
+        "200":
+          description: Bounded caller-readable domain sample.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [domains, owned_domains, readable_domains, writable_domains, truncated, scope]
+                properties:
+                  domains:
+                    type: array
+                    maxItems: 64
+                    items:
+                      type: string
+                  owned_domains:
+                    description: Bounded ownership sample. Use /v1/agent/me/domains/owned for the authoritative paged set.
+                    type: array
+                    maxItems: 64
+                    items: {type: string}
+                  readable_domains:
+                    description: Bounded current-policy sample suitable for choosing an exact recall scope.
+                    type: array
+                    maxItems: 64
+                    items: {type: string}
+                  writable_domains:
+                    description: Bounded current-policy sample suitable for choosing an exact write scope.
+                    type: array
+                    maxItems: 64
+                    items: {type: string}
+                  truncated:
+                    type: boolean
+                  scope:
+                    type: string
+                    enum: [bounded_policy_and_provenance]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
           $ref: "#/components/responses/InternalError"
+
+  /v1/agent/me/domains/owned:
+    get:
+      operationId: getAgentOwnedDomains
+      summary: Page through domains currently owned by the authenticated agent.
+      description: >-
+        Caller-only authoritative ownership projection backed by the
+        consensus-maintained app-v26 owner index. It does not scan memories or
+        enumerate a global domain roster. Pass next_cursor back as cursor until
+        has_more is false.
+      tags: [Agent]
+      parameters:
+        - in: query
+          name: cursor
+          required: false
+          schema: {type: string, maxLength: 512}
+        - in: query
+          name: limit
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+      responses:
+        "200":
+          description: One stable lexicographic page of currently owned domains.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [domains, has_more, scope]
+                properties:
+                  domains:
+                    type: array
+                    maxItems: 100
+                    items: {type: string}
+                  next_cursor: {type: string}
+                  has_more: {type: boolean}
+                  scope:
+                    type: string
+                    enum: [authoritative_current_owner]
+        "400": {description: Invalid cursor or limit.}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "503": {$ref: "#/components/responses/InternalError"}
 
   /v1/agent/register:
     post:
@@ -2944,7 +3452,9 @@ paths:
     put:
       operationId: updateAgent
       summary: Update the authenticated agent's name and bio.
-      description: Self-update only — agents can only modify their own metadata.
+      description: >-
+        Self-update only — agents can only modify their own metadata. Omitted
+        name or boot_bio fields preserve their current canonical values.
       tags:
         - Agent
       requestBody:
@@ -2999,51 +3509,6 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-  /v1/agent/{id}/permission:
-    put:
-      operationId: setAgentPermission
-      summary: >-
-        Set an agent's clearance, domain access, and visibility. Self-set OR
-        global admin OR org admin in any org the target belongs to.
-      description: >-
-        PATCH semantics — omitted fields preserve their on-chain value.
-      tags:
-        - Agent
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-          description: Target agent's hex-encoded Ed25519 public key.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AgentSetPermissionRequest"
-      responses:
-        "200":
-          description: Permissions updated.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  agent_id:
-                    type: string
-                  status:
-                    type: string
-                    example: permissions_updated
-                  tx_hash:
-                    type: string
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -4342,6 +4807,240 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  # -- Canonical local Messages ------------------------------------------
+  /v1/messages:
+    post:
+      operationId: messageSend
+      summary: Send one idempotent same-node message to an exact local agent.
+      description: >-
+        Uses the existing encrypted pipeline inbox. A new durable insert is
+        locally delivered; an exact caller/key/request retry returns the
+        original message. This route never accepts federated targets and
+        requires a fresh nonce-bound signature from the exact sender.
+      tags: [Messages]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageSendRequest"
+      responses:
+        "201":
+          description: New local message durably inserted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageSendResponse"
+        "200":
+          description: Exact idempotent replay of the original send.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageSendResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          description: Message payload or intent exceeds the pipeline size limit.
+        "429":
+          description: Per-agent or node-wide open-message quota reached; response includes Retry-After.
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/messages/receive:
+    post:
+      operationId: messagesReceive
+      summary: Claim or exactly replay one recipient-bound ordered message batch.
+      description: >-
+        Requires a fresh nonce-bound signature from the exact recipient. The
+        receive token persists the ordered batch, so retry after a lost
+        response never consumes later messages. Replay metadata is retained
+        for 48 hours and capped at 4096 tokens per agent.
+      tags: [Messages]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageReceiveRequest"
+      responses:
+        "200":
+          description: Claimed batch or exact idempotent replay.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageReceiveResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "410":
+          description: The exact replay batch was purged or is incomplete; no later work was claimed.
+        "429":
+          description: The per-agent receive-token metadata quota is full.
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/messages/{message_id}/reply:
+    post:
+      operationId: messageReply
+      summary: Complete a fetched local message as its exact recipient.
+      description: >-
+        Requires a fresh nonce-bound signature. Only the recipient to which a
+        canonical receive batch returned this message may reply.
+      tags: [Messages]
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageReplyRequest"
+      responses:
+        "200":
+          description: Reply persisted; an exact repeat is idempotent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageActionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          description: Reply exceeds the pipeline result-size limit.
+
+  /v1/messages/{message_id}/read:
+    put:
+      operationId: messageMarkRead
+      summary: Persist exact-recipient read evidence after canonical receive.
+      description: >-
+        Requires a fresh nonce-bound signature. Read means only that the exact
+        recipient fetched and acknowledged this row; it is not evidence of
+        comprehension or action.
+      tags: [Messages]
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Read acknowledgement persisted or replayed idempotently.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageActionResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/messages/read-batch:
+    put:
+      operationId: messagesMarkReadBatch
+      summary: Persist exact-recipient read evidence for up to 20 fetched local messages.
+      description: >-
+        Transport aggregation for canonical read acknowledgements. The fresh
+        nonce-bound outer request is signed by the exact recipient; each item
+        is authorized independently and returns confirmed or a generic
+        per-item failure. One failure never rolls back or hides independent
+        successes. Repeating the exact batch is idempotent.
+      tags: [Messages]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message_ids]
+              properties:
+                message_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  items: {type: string, minLength: 1}
+      responses:
+        "200":
+          description: Per-message acknowledgement outcomes in request order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, count]
+                properties:
+                  count: {type: integer, minimum: 1, maximum: 20}
+                  items:
+                    type: array
+                    minItems: 1
+                    maxItems: 20
+                    items:
+                      type: object
+                      required: [message_id, read_status]
+                      properties:
+                        message_id: {type: string}
+                        read_status: {type: string, enum: [confirmed, not_confirmed]}
+                        idempotent_replay: {type: boolean}
+                        error: {type: string, enum: [invalid_message_id, duplicate_message_id, not_found]}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /v1/messages/{message_id}/status:
+    get:
+      operationId: messageStatus
+      summary: Read payload-free local receipt/workflow metadata as the exact sender.
+      description: >-
+        Requires a fresh nonce-bound signature from the exact sender. Unrelated
+        callers and absent IDs share the same generic 404 response. This response
+        never includes request payload, reply content, or proof bytes.
+      tags: [Messages]
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Exact sender-only metadata projection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   # -- Pipeline -----------------------------------------------------------
   /v1/pipe/resolve:
     post:
@@ -4587,8 +5286,9 @@ paths:
       summary: Inspect the current local workflow row for a pipeline message.
       description: >-
         This is local queue/workflow state, not proof of remote delivery or
-        reading. Sender-queryable successful-delivery and receiver claim/read
-        receipts are explicitly deferred beyond v11.16.
+        reading. Canonical same-node sender/read evidence is available through
+        /v1/messages. App-v26 peers may separately negotiate generation-bound
+        receipt v2; this workflow route never substitutes for that evidence.
       tags:
         - Pipeline
       parameters:
@@ -4610,6 +5310,240 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /v1/pipe/receipts/challenge-batch:
+    post:
+      operationId: pipeReceiptChallengeBatch
+      summary: Fetch up to 40 exact receipt-v2 challenge bodies in one local request.
+      description: >-
+        Accepts at most 20 imported messages with claimed/read events. Every
+        challenge remains an independent immutable exact-event body and each
+        item returns ready or a generic rejection. This route does not claim,
+        read, or expose message content.
+      tags: [Pipeline]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 40
+                  items:
+                    type: object
+                    required: [pipe_id, kind]
+                    properties:
+                      pipe_id: {type: string, minLength: 1}
+                      kind: {type: string, enum: [claimed, read]}
+      responses:
+        "200":
+          description: Per-event challenge outcomes in request order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, count]
+                properties:
+                  count: {type: integer, minimum: 1, maximum: 40}
+                  items:
+                    type: array
+                    minItems: 1
+                    maxItems: 40
+                    items:
+                      type: object
+                      required: [pipe_id, event_kind, status]
+                      properties:
+                        pipe_id: {type: string}
+                        event_kind: {type: string, enum: [claimed, read]}
+                        status: {type: string, enum: [ready, rejected]}
+                        challenge: {$ref: "#/components/schemas/FederatedPipeReceiptChallenge"}
+                        error: {type: string, enum: [invalid_receipt_event, duplicate_receipt_event, not_found]}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /v1/pipe/{pipe_id}/receipt/challenge/{kind}:
+    get:
+      operationId: pipeReceiptChallenge
+      summary: Fetch the exact immutable receipt-v2 body an imported-message recipient must sign.
+      description: >-
+        The challenge contains no message content. It is available only for a
+        negotiated v2 import, the exact addressed recipient, an allowed kind,
+        and a currently valid federation generation.
+      tags: [Pipeline]
+      parameters:
+        - name: pipe_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: kind
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [claimed, read]
+      responses:
+        "200":
+          description: Exact payload-free challenge.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pipe_id, event_kind, challenge]
+                properties:
+                  pipe_id: {type: string}
+                  event_kind: {type: string, enum: [claimed, read]}
+                  challenge:
+                    $ref: "#/components/schemas/FederatedPipeReceiptChallenge"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /v1/pipe/receipts/batch:
+    put:
+      operationId: pipeReceiptRecordBatch
+      summary: Record up to 40 independently signed exact receipt-v2 events.
+      description: >-
+        Transport aggregation only: every item carries its own nonce-bound
+        signature over the exact single-event receipt path and challenge body,
+        so peers verify the same proof as the non-batch route. Items are
+        processed in request order; a failed claimed event suppresses the
+        matching read event, while unrelated items retain independent partial
+        success. Exact replay is idempotent.
+      tags: [Pipeline]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 40
+                  items:
+                    type: object
+                    required: [pipe_id, kind, proof]
+                    properties:
+                      pipe_id: {type: string, minLength: 1}
+                      kind: {type: string, enum: [claimed, read]}
+                      proof:
+                        type: object
+                        required: [agent_id, signature, timestamp, nonce, canonical_request]
+                        properties:
+                          agent_id: {type: string}
+                          signature: {type: string, format: byte}
+                          timestamp: {type: integer, format: int64}
+                          nonce: {type: string, format: byte}
+                          canonical_request: {type: string, format: byte}
+      responses:
+        "200":
+          description: Per-event durable queue/rejection outcomes in request order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, count]
+                properties:
+                  count: {type: integer, minimum: 1, maximum: 40}
+                  items:
+                    type: array
+                    minItems: 1
+                    maxItems: 40
+                    items:
+                      type: object
+                      required: [pipe_id, event_kind, receipt_status]
+                      properties:
+                        pipe_id: {type: string}
+                        event_kind: {type: string, enum: [claimed, read]}
+                        receipt_status: {type: string, enum: [queued, unconfirmed]}
+                        idempotent_replay: {type: boolean}
+                        error: {type: string, enum: [invalid_receipt_proof, duplicate_receipt_event, claim_not_confirmed, rejected]}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /v1/pipe/{pipe_id}/receipt/{kind}:
+    put:
+      operationId: pipeReceiptRecord
+      summary: Sign and queue exact-recipient claim/read evidence.
+      description: >-
+        Submit the challenge body unchanged with a fresh nonce-bound signature
+        from the exact recipient. Claim/read and receipt outbox insertion are
+        atomic. `queued` is local durable receipt transport state, not yet
+        sender-visible confirmation.
+      tags: [Pipeline]
+      parameters:
+        - name: pipe_id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: kind
+          in: path
+          required: true
+          schema: {type: string, enum: [claimed, read]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FederatedPipeReceiptChallenge"
+      responses:
+        "200":
+          description: Exact transition and receipt outbox entry persisted or replayed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FederatedPipeReceiptActionResponse"
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /v1/pipe/{pipe_id}/receipt:
+    get:
+      operationId: pipeReceiptStatus
+      summary: Read payload-free federated receipt evidence as the exact sender.
+      description: >-
+        Unrelated callers, recipients, operators, Admin, Root, and absent IDs
+        share the same generic 404 behavior. Peer durable admission is distinct
+        from exact-recipient signed claim/read evidence. A v1 or historical
+        ungeneration-bound row is explicitly unsupported/unconfirmed.
+      tags: [Pipeline]
+      parameters:
+        - name: pipe_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Exact sender-only, payload-free independent receipt dimensions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FederatedPipeReceiptStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /v1/pipe/{pipe_id}/claim:
     put:
@@ -4853,6 +5787,101 @@ paths:
                     example: 0
         "400":
           $ref: "#/components/responses/BadRequest"
+
+  /v1/federation/available:
+    get:
+      operationId: getCallerFederationAvailability
+      summary: Discover bounded caller-authorized federation domains and recipients.
+      description: >-
+        Signed active-ordinary caller projection. Each call performs one
+        bounded caller-authorized page inside a public scan horizon. agent_name
+        performs targeted lookup with agent_limit 1-20. peer_cursor is the
+        short-lived signed-caller/query-bound continuation returned by an
+        incomplete page; it contains no peer ID or hidden agreement count.
+        Results are authorization metadata, not presence or delivery evidence.
+        Distinct lookups consume fixed per-caller and process-wide outbound-call
+        budgets; 429 includes Retry-After. Exact saved recipient addresses do
+        not require discovery, and clients must not auto-walk every page.
+      tags: [Federation]
+      parameters:
+        - in: query
+          name: agent_name
+          schema: {type: string, maxLength: 512}
+        - in: query
+          name: agent_limit
+          schema: {type: integer, minimum: 1, maximum: 20, default: 20}
+        - in: query
+          name: peer_cursor
+          description: Continuation returned by the preceding exact signed lookup.
+          schema: {type: string, maxLength: 128}
+      responses:
+        "200":
+          description: Bounded caller-filtered connections.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [connections, total, complete, message]
+                properties:
+                  connections: {type: array, maxItems: 24, items: {type: object}}
+                  total: {type: integer, minimum: 0, maximum: 24}
+                  complete: {type: boolean}
+                  next_peer_cursor: {type: string}
+                  message: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "429":
+          description: Caller or process outbound discovery budget exhausted; retry after Retry-After.
+          content: {application/problem+json: {schema: {$ref: "#/components/schemas/ProblemDetails"}}}
+
+  /v1/federation/contacts/authorize:
+    post:
+      operationId: authorizeCachedFederatedContacts
+      summary: Revalidate cached federated contact scopes against current local policy.
+      description: >-
+        Local-only signed policy check used by MCP before reusing its short-lived
+        contact cache. It performs no peer request and returns only the subset
+        still authorized for this exact caller.
+      tags: [Federation]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contacts]
+              properties:
+                contacts:
+                  type: array
+                  maxItems: 512
+                  items:
+                    type: object
+                    required: [remote_chain_id, domain]
+                    properties:
+                      remote_chain_id: {type: string}
+                      domain: {type: string, minLength: 1, maxLength: 256}
+      responses:
+        "200":
+          description: Currently authorized contact scopes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [allowed_contacts]
+                properties:
+                  allowed_contacts:
+                    type: array
+                    maxItems: 512
+                    items:
+                      type: object
+                      required: [remote_chain_id, domain]
+                      properties:
+                        remote_chain_id: {type: string}
+                        domain: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
 
   # -- Operational ---------------------------------------------------------
   /health:

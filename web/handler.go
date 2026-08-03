@@ -106,6 +106,24 @@ type DashboardHandler struct {
 	// consensus and close stores before the process image is replaced. nil means
 	// this embedding cannot restart safely in-process.
 	RequestRestart func() error
+	// RequestRestartWithFence transfers ownership of a committed-state fence to
+	// the node lifecycle. Production uses it for cross-version restarts so the
+	// fence remains held until CometBFT has stopped, not merely until the HTTP
+	// request is acknowledged.
+	RequestRestartWithFence func(func()) error
+	// PrepareRestartDrain reversibly blocks new scheduled snapshots and waits
+	// for the current one before any listener is drained. commit permanently
+	// quiesces after lifecycle acceptance; abort restores normal cadence.
+	PrepareRestartDrain func(context.Context) (commit func(), abort func(), err error)
+	// RequestRestartPrepared transfers the complete prepared-drain ownership to
+	// the serve lifecycle. Production restart paths use this instead of the
+	// legacy callbacks above.
+	RequestRestartPrepared func(release, commit, abort func()) error
+	// PrepareVersionTransition creates and fully verifies a coherent rollback
+	// snapshot for the exact currently committed state before an updater may
+	// replace the executable or a coordinated restart may enter a newer binary.
+	// Production wiring is mandatory; nil fails closed for version transitions.
+	PrepareVersionTransition func(context.Context, string) (func(), error)
 	// RunBackground binds operator-triggered jobs to the node lifecycle. The
 	// production node cancels and joins these before closing stores; nil keeps
 	// the lightweight test/embed behavior.
@@ -291,6 +309,10 @@ type DashboardHandler struct {
 	// under app-v24's hash-safe lifecycle. Memory-hash repair planning and
 	// governance remain unavailable until this strict H+1 boundary.
 	AppV24ActiveFn func() bool
+	// AppV26ActiveFn reports whether consensus Access Groups carry an explicit
+	// read, read+write, or read+write+modify member authority. Before activation
+	// historical role-derived group semantics remain byte-identical.
+	AppV26ActiveFn func() bool
 	// GovernanceDomainFn returns the committed app-v20 chain authorization
 	// domain. Post-v20 dashboard governance fails closed when it is unavailable.
 	GovernanceDomainFn func() string
@@ -1297,7 +1319,9 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
 				Get("/v1/dashboard/memory/graph", h.handleGraph)
 			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/adoption-progress", h.handleAppV25LegacyAdoptionProgress)
+			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/adoption-inventory", h.handleAppV26LegacyRecoveryInventory)
 			r.With(h.cerebrumOperatorGate).Post("/v1/dashboard/memory/adoption-retry", h.handleAppV25LegacyAdoptionRetry)
+			r.With(h.cerebrumOperatorGate).Post("/v1/dashboard/memory/adoption-assign", h.handleAppV26LegacyAdoptionAssign)
 			r.With(h.cerebrumOperatorGate).Post("/v1/dashboard/memory/adoption-deprecate", h.handleAppV25LegacyAdoptionDeprecate)
 			// Pre-v11.16.2 MCP bridges still call this dashboard-shaped read during
 			// inception. The handler returns eligible ordinary agents only a

@@ -51,6 +51,57 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.17.0
+
+**App-v26 makes Access Group authority explicit and reviewable.** Every local
+group now stores one deterministic member authority: `read`, `read_write`, or
+`read_write_modify`. Existing groups migrate to the safe `read` baseline at
+the strict H+1 fork boundary. A domain owner always retains full control of its
+own domain; group membership is additive, the strongest applicable group wins,
+and removing an agent revokes only that cross-member relationship without
+touching the agent's own domains. Linked federated agents remain read-only
+guests and can never acquire local Write, Modify, ownership, or governance.
+
+**Local agent messaging now has one canonical, durable receipt contract.** An
+idempotent send, exact receive-batch replay, recipient-only reply/read
+acknowledgement, and sender-only payload-free status projection use the existing
+encrypted pipeline inbox rather than a second queue. Connected HTTP MCP SSE
+sessions for the exact recipient may receive a metadata-only wake-up; this is a
+best-effort hint, never presence, delivery, comprehension, or read evidence.
+The enforced `sage_turn` reminder/checkpoint nags are removed.
+
+**CEREBRUM helps Root finish historical recovery instead of leaving a warning.**
+Unresolved preserved records can be inspected through bounded safe previews,
+selected, assigned to an active local ordinary agent when exact verified
+evidence permits it, or deprecated. Already-deprecated rows are excluded.
+Authorship, content, domains, and chain history remain immutable; assignment
+changes only current operational ownership. Conflicting or unverifiable rows
+remain deprecate-only.
+
+**Linked SAGE discovery closes over the relationship agents can actually use.**
+Caller-scoped directory results include only consented linked peers and expose
+their exact address plus registered/display name metadata. The same authority
+is enforced for direct and secure-relay paths; discovery grants no remote
+memory write or local group membership.
+
+**Operator mutations and signed updates fail safely without lying.** CEREBRUM
+reconciles uncertain consensus responses against canonical state and repairs
+the local agent projection after a committed approval. Access Controls can
+also commit a new agent display label without changing its immutable
+registered name, agent ID, boot purpose, domains, or authorship; the rare Root
+handover card now sits below everyday agent and group controls. The macOS release gate
+mounts the signed DMG, copies the app to a fresh writable APFS location, verifies
+the exact leaf identities and version before and after first execution, and
+publishes only that verified immutable asset. CEREBRUM downloads the signed DMG
+instead of trying to replace its own running app; Linux keeps its verified
+in-place updater.
+
+This is a governed consensus upgrade from app-v25 to app-v26. Existing chains
+advance in place; memories, historical authors, domains, and prior blocks are
+not rewritten.
+
+Container: `ghcr.io/l33tdawg/sage:11.17.0`. SDK 11.17.0.
+
 ## What's New in v11.16.4
 
 **Existing nodes recover from stale app-v23 serving projections at startup.** A
@@ -87,8 +138,10 @@ confirmation rather than called cleared.
 **Access Groups and agent recovery are usable in the flow operators actually
 use.** Dragging one active local agent onto another creates or extends the
 narrowest local group, so members read each other's owned domains by default
-while Managers retain their extra write/modify authority. Dragging a member
-back out revokes only that group relationship. CEREBRUM also settles agent
+until the operator explicitly selects Read + write or Read + write + modify
+for that group. Global Manager labels never silently widen the selected group
+permission. Dragging a member back out revokes only that group relationship.
+CEREBRUM also settles agent
 removal and first-use domain authority against committed state, rather than
 leaving a stale progress screen or asking a newly-created domain to retry its
 first operation.
@@ -219,10 +272,12 @@ byte-identical. Existing nodes upgrade in place. Container:
 
 ## What's New in v11.15.0
 
-**App-v23 replaces capability-bit administration with roles, security profiles,
+**App-v23 replaced capability-bit administration with roles, security profiles,
 and Access Groups that match how people actually share a SAGE.** Members can
 read the domains owned by other active local members of their groups. Managers
-can also write and modify within those same group boundaries. Admins have
+could also write and modify within those same group boundaries under the
+original app-v23 rule; app-v26 supersedes that derivation with each group's
+explicit authority tier. Admins have
 sudo-equivalent authority over normal local data, policy, governance,
 federation, and CEREBRUM operations. Clearance remains the maximum
 classification an agent may read, and hard security-profile restrictions still
@@ -923,7 +978,7 @@ SDK 11.3.1.
 
 **Transferring a domain to another agent, and setting who can read and write it, are now real on-chain RBAC operations from CEREBRUM - and the access matrix finally enforces what it shows.** v11.3.0 changes **no consensus rule, AppHash, transaction type, key-encoding, or fork**: `app-v15` stays the active v11 consensus fork and `app-v16` stays shipped-dormant, unchanged from v11.2.x. The RBAC domain-ownership transfer is built entirely from **existing** on-chain transactions - `DomainReassign` (tx-30), `AccessGrant` (tx-6), and `AccessRevoke` (tx-7), gated by an existing `gov_propose` (`operation=domain_reassign`) - so there is no new transaction and no new fork. There is exactly **one consensus-path code change** (`applyGovernanceProposal` now returns early for `OpDomainReassign` instead of falling through to validator-pubkey derivation, which logged a spurious error on every reassign), and it is proven **AppHash-neutral**: the caller appends a validator update only when the result is non-nil, so both the old error path and the new clean return append nothing - identical validator updates and state writes, so historical replay stays byte-identical, with only the error log gone. Memory **authorship (`submitting_agent`) is never rewritten** by any v11.3 path.
 
-- **RBAC domain-ownership transfer, on-chain from CEREBRUM.** A new Search-page action "Transfer domain ownership" lets you pick a source agent, pick one of its domains, and hand it to a target agent. The orchestration is all commit-confirmed: a governance proposal (`domain_reassign`) is accepted by the sole validator, `DomainReassign` flips the owner and purges the domain's stale grants, and `AccessGrant` gives the new owner level-3 access. Each step's result is surfaced honestly; if the new owner's key is not on this node, the grant is deferred to the owner's own node (reported, not silently dropped). This transfers **ownership plus read/write access, not authorship** - every memory stays authored by whoever wrote it (`submitting_agent` is immutable and auditable), and the new owner gains access through ownership rather than by rewriting history. The old label-based "Transfer by Tag" paths, which rewrote authorship off-chain, are retired.
+- **RBAC domain-ownership transfer, on-chain from CEREBRUM.** A new Search-page action "Transfer domain ownership" lets you pick a source agent, pick one of its domains, and hand it to a target agent. The historical v11.3 orchestration was all commit-confirmed: a governance proposal (`domain_reassign`) was accepted by the sole validator, `DomainReassign` flipped the owner and purged the domain's stale grants, and a redundant `AccessGrant` mirrored the new owner's access. App-v26 retires that trailing self-grant: canonical ownership itself gives immediate policy-limited authority, so transfer no longer depends on CEREBRUM holding the target private key. This transfers **ownership and current authority, not authorship** - every memory stays authored by whoever wrote it (`submitting_agent` is immutable and auditable), and the new owner gains access through ownership rather than by rewriting history. The old label-based "Transfer by Tag" paths, which rewrote authorship off-chain, are retired.
 - **The access matrix now enforces what it shows.** The per-agent read/write Domain Access matrix previously wrote only a cosmetic JSON blob that the consensus access checks never read, while the tooltip claimed "enforced on every request." On Save it now issues real on-chain `AccessGrant` / `AccessRevoke` transactions (signed as the domain owner), diffed against the actual on-chain grant state so it is idempotent and self-healing. Per-domain results are reported honestly (including "you do not hold this domain owner's key" skips), and the misleading copy is corrected. No admin-bypass was added to the consensus grant/revoke handlers.
 - **CEREBRUM light theme plus MRI redesign.** A full light-mode theme lands for the dashboard (persisted, with a sun/moon toggle), including a light-mode render of the 3D MRI memory brain. The MRI layout now places memories by recency - recent at the surface, older deeper - with a draggable, width-auto-fitting "Domain tags" side panel.
 - **Search date filters plus `sage_rename`.** The Search page gains a created-at date-range filter and a "Last hour" preset. A new `sage_rename` MCP tool renames an agent's display name and boot bio on-chain (via `AgentUpdate`), failing closed to preserve the existing bio - an agent rename, not a memory or domain rename.
@@ -1070,7 +1125,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.16.4`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.0`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

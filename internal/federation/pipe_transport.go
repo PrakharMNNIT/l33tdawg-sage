@@ -35,27 +35,29 @@ var (
 // OriginEventID links a result to the original send proof without exposing or
 // trusting either node's private local pipe id.
 type PipeEvent struct {
-	Version            int                      `json:"version"`
-	EventID            string                   `json:"event_id"`
-	Kind               string                   `json:"kind"`
-	OriginEventID      string                   `json:"origin_event_id,omitempty"`
-	SourcePipeID       string                   `json:"source_pipe_id,omitempty"`
-	SourceChainID      string                   `json:"source_chain_id"`
-	DestinationChainID string                   `json:"destination_chain_id"`
-	SourceAgentID      string                   `json:"source_agent_id"`
-	TargetAgentID      string                   `json:"target_agent_id"`
-	Intent             string                   `json:"intent,omitempty"`
-	Payload            string                   `json:"payload,omitempty"`
-	Result             string                   `json:"result,omitempty"`
-	CreatedAt          time.Time                `json:"created_at"`
-	ExpiresAt          time.Time                `json:"expires_at"`
-	PolicyEpoch        string                   `json:"policy_epoch"`
-	AgreementID        string                   `json:"agreement_id"`
-	ContactID          string                   `json:"contact_id"`
-	ContactRevision    string                   `json:"contact_revision"`
-	AuthorizationMode  string                   `json:"authorization_mode,omitempty"`
-	LinkedRelation     *LinkedMessageRelation   `json:"linked_relation,omitempty"`
-	Proof              store.PipelineAgentProof `json:"proof"`
+	Version                int                      `json:"version"`
+	EventID                string                   `json:"event_id"`
+	Kind                   string                   `json:"kind"`
+	OriginEventID          string                   `json:"origin_event_id,omitempty"`
+	SourcePipeID           string                   `json:"source_pipe_id,omitempty"`
+	SourceChainID          string                   `json:"source_chain_id"`
+	DestinationChainID     string                   `json:"destination_chain_id"`
+	SourceAgentID          string                   `json:"source_agent_id"`
+	TargetAgentID          string                   `json:"target_agent_id"`
+	Intent                 string                   `json:"intent,omitempty"`
+	Payload                string                   `json:"payload,omitempty"`
+	Result                 string                   `json:"result,omitempty"`
+	CreatedAt              time.Time                `json:"created_at"`
+	ExpiresAt              time.Time                `json:"expires_at"`
+	PolicyEpoch            string                   `json:"policy_epoch"`
+	AgreementID            string                   `json:"agreement_id"`
+	ContactID              string                   `json:"contact_id"`
+	ContactRevision        string                   `json:"contact_revision"`
+	AuthorizationMode      string                   `json:"authorization_mode,omitempty"`
+	LinkedRelation         *LinkedMessageRelation   `json:"linked_relation,omitempty"`
+	ReceiptProtocolVersion int                      `json:"receipt_protocol_version,omitempty"`
+	ReceiptContentDigest   string                   `json:"receipt_content_digest,omitempty"`
+	Proof                  store.PipelineAgentProof `json:"proof"`
 }
 
 type PipeEventResponse struct {
@@ -483,15 +485,25 @@ func (m *Manager) handlePipeEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	unlock := ss.LockSyncPolicyRead()
-	defer unlock()
+	locksHeld := true
+	var ownerUnlock, contactUnlock func()
+	defer func() {
+		if locksHeld {
+			if contactUnlock != nil {
+				contactUnlock()
+			}
+			if ownerUnlock != nil {
+				ownerUnlock()
+			}
+			unlock()
+		}
+	}()
 	if m.badger == nil {
 		httpError(w, http.StatusNotImplemented, "consensus domain state is unavailable")
 		return
 	}
-	ownerUnlock := m.badger.LockDomainOwnershipRead()
-	defer ownerUnlock()
-	contactUnlock := ss.LockAgentContactRead()
-	defer contactUnlock()
+	ownerUnlock = m.badger.LockDomainOwnershipRead()
+	contactUnlock = ss.LockAgentContactRead()
 	if _, err := m.currentRequestAgreementBound(r.Context(), peer); err != nil {
 		httpError(w, http.StatusForbidden, "federation agreement is no longer active for this operator")
 		return
@@ -532,12 +544,35 @@ func (m *Manager) handlePipeEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// The durable admission is complete. Release policy/ownership/contact read
+	// leases before calling an optional embedding hook; wake-up transport must
+	// never participate in federation authorization lock ordering.
+	contactUnlock()
+	ownerUnlock()
+	unlock()
+	locksHeld = false
+	if event.Kind == "send" && !duplicate {
+		m.notifyAdmittedMessage(event.TargetAgentID, AgentMessageNotification{
+			MessageID: localPipeID, FromAgent: event.SourceAgentID, CreatedAt: event.CreatedAt,
+		})
+	}
 	status := "accepted"
 	if duplicate {
 		status = "duplicate"
 	}
-	_ = localPipeID // node-local id is deliberately never disclosed to the peer
 	writeJSON(w, http.StatusOK, &PipeEventResponse{Status: status})
+}
+
+func (m *Manager) notifyAdmittedMessage(targetAgentID string, notification AgentMessageNotification) {
+	if m == nil || m.messageNotifier == nil || targetAgentID == "" {
+		return
+	}
+	// Best effort and panic-safe: SSE backpressure or an embedding bug cannot
+	// roll back or reinterpret the already durable federated admission.
+	func() {
+		defer func() { _ = recover() }()
+		m.messageNotifier(targetAgentID, notification)
+	}()
 }
 
 func (m *Manager) admitPipeSend(ctx context.Context, ss *store.SQLiteStore, peer *peerIdentity, event *PipeEvent) (string, bool, error) {
@@ -589,13 +624,31 @@ func (m *Manager) admitPipeSend(ctx context.Context, ss *store.SQLiteStore, peer
 		SourceChainID: event.SourceChainID, SourcePipeID: event.EventID,
 		FederationPolicyEpoch: event.PolicyEpoch, FederationAgreementID: event.AgreementID,
 		FederationContactID: event.ContactID, FederationContactRevision: event.ContactRevision,
-		FederationAuthorizationMode: event.AuthorizationMode,
+		FederationAuthorizationMode:       event.AuthorizationMode,
+		FederationReceiptProtocolVersion:  event.ReceiptProtocolVersion,
+		FederationReceiptContentDigest:    event.ReceiptContentDigest,
+		FederationReceiptRecipientChainID: event.DestinationChainID,
 	}
 	if event.LinkedRelation != nil {
 		msg.FederationLinkedRelation, err = json.Marshal(event.LinkedRelation)
 		if err != nil {
 			return "", false, ErrFederatedPipeInvalid
 		}
+	}
+	switch event.ReceiptProtocolVersion {
+	case 0:
+		if event.ReceiptContentDigest != "" {
+			return "", false, fmt.Errorf("legacy send cannot carry receipt-v2 evidence")
+		}
+	case PipeReceiptVersion:
+		if m.postV26ForNextTx == nil || !m.postV26ForNextTx() ||
+			event.ReceiptContentDigest != pipeReceiptContentDigest(
+				event.EventID, event.SourceChainID, event.DestinationChainID, msg,
+			) {
+			return "", false, fmt.Errorf("receipt-v2 negotiation or content binding is invalid")
+		}
+	default:
+		return "", false, fmt.Errorf("unsupported receipt protocol version")
 	}
 	proofHash := PipelineProofHash(event.SourceChainID, event.Kind, event.Proof)
 	contentHash := pipeEventContentHash(event)

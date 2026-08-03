@@ -86,7 +86,7 @@ func (app *SageApp) refreshAppV23Fork() error {
 			!bytes.Equal(domain, decodedScope) {
 			return errors.New("app-v23 genesis activation governance domain is invalid")
 		}
-		if err := app.badgerStore.ValidateAppV23State(); err != nil {
+		if err := app.validateAppV23StateForCurrentUpgrade(); err != nil {
 			return fmt.Errorf("app-v23 genesis activation has invalid local RBAC state: %w", err)
 		}
 		app.appV23GenesisActive = true
@@ -111,6 +111,35 @@ func (app *SageApp) refreshAppV23Fork() error {
 		return fmt.Errorf("applied %s height %d is ahead of persisted app height %d", appV23UpgradeName, rec.AppliedHeight, app.state.Height)
 	}
 	app.appV23AppliedHeight = rec.AppliedHeight
+	return nil
+}
+
+// validateAppV23StateForCurrentUpgrade permits only the historical home-domain
+// defects produced by app-v25 batch continuity, and only while app-v25 is
+// applied and app-v26 is not. It performs no mutation; its sole purpose is to
+// let the node reach the deterministic app-v26 repair transaction.
+func (app *SageApp) validateAppV23StateForCurrentUpgrade() error {
+	strictErr := app.badgerStore.ValidateAppV23State()
+	if strictErr == nil {
+		return nil
+	}
+	v26, err := app.badgerStore.GetAppliedUpgrade(appV26UpgradeName)
+	if err != nil {
+		return err
+	}
+	if v26 != nil {
+		return strictErr
+	}
+	v25, err := app.badgerStore.GetAppliedUpgrade(appV25UpgradeName)
+	if err != nil || v25 == nil || v25.TargetAppVersion != 25 {
+		return strictErr
+	}
+	if err := app.badgerStore.ValidateAppV23StateForPreV26Recovery(); err != nil {
+		return strictErr
+	}
+	app.logger.Warn().Err(strictErr).Msg(
+		"pre-app-v26 local RBAC home defect will be repaired by app-v26 activation",
+	)
 	return nil
 }
 
@@ -156,7 +185,7 @@ func (app *SageApp) validateAppV23Prerequisite() error {
 	if migration == nil {
 		return fmt.Errorf("applied %s is missing migration state", appV23UpgradeName)
 	}
-	if err := app.badgerStore.ValidateAppV23State(); err != nil {
+	if err := app.validateAppV23StateForCurrentUpgrade(); err != nil {
 		return fmt.Errorf("applied %s has invalid local RBAC state: %w", appV23UpgradeName, err)
 	}
 	return nil
@@ -237,13 +266,14 @@ func (app *SageApp) enforceAppV23ControlElevation(parsedTx *tx.ParsedTx, height 
 		if parsedTx.LocalElevation != nil {
 			return errors.New("unapproved principal supplied local elevation")
 		}
-		// The only unaffiliated credential allowed through this central gate is
-		// a brand-new key performing its first self-registration. Every
-		// credential already known to the chain has an app-v23 policy
-		// disposition after migration. Failing open here would let a rotated
-		// Root credential, a stale-generation delegated Admin, or a pending
-		// principal fall through to legacy role checks that still project
-		// Role=="admin".
+		// Registration is the one control-plane operation a pending ordinary
+		// principal may repeat. The transaction is self-signed and the
+		// consensus handler is idempotent: it preserves the immutable canonical
+		// identity and cannot grant a role, enrollment, domain, or capability.
+		// This is what lets an operator reject a review request locally while
+		// allowing the same key to request review again later. Root and legacy
+		// Admin identities remain excluded so they cannot fall through legacy
+		// role checks that still project Role=="admin".
 		if errors.Is(actorErr, store.ErrAppV23NeedsApproval) &&
 			parsedTx.Type == tx.TxTypeAgentRegister {
 			registered, registrationErr := app.badgerStore.GetRegisteredAgent(actorID)
@@ -253,7 +283,7 @@ func (app *SageApp) enforceAppV23ControlElevation(parsedTx *tx.ParsedTx, height 
 			if registrationErr != nil {
 				return fmt.Errorf("read app-v23 registration state: %w", registrationErr)
 			}
-			if registered == nil {
+			if registered == nil || registered.Role != store.AppV23RoleAdmin {
 				return nil
 			}
 		}
@@ -744,9 +774,10 @@ func (app *SageApp) processLocalAgentApprove(parsedTx *tx.ParsedTx, height int64
 	enrollment := store.AppV23LocalEnrollment{
 		AgentID: approval.AgentID, ApprovedBy: actorID, RootGeneration: root.Generation,
 		Profile: approval.Profile, HomeDomain: approval.HomeDomain,
-		ExpectedHomeDomainOwner: approval.ExpectedHomeDomainOwner,
-		TransferHomeDomain:      approval.TransferHomeDomain,
-		Clearance:               approval.Clearance, Capabilities: capabilities,
+		ExpectedHomeDomainOwner:  approval.ExpectedHomeDomainOwner,
+		TransferHomeDomain:       approval.TransferHomeDomain,
+		RetireOwnedDomainsToRoot: !approval.Active && app.postAppV26Rules(height),
+		Clearance:                approval.Clearance, Capabilities: capabilities,
 		Active: approval.Active, UpdatedHeight: height,
 	}
 	elevation, err := app.appV23ElevationUse(
@@ -841,6 +872,18 @@ func (app *SageApp) processAccessGroupMutateV23(parsedTx *tx.ParsedTx, height in
 	if !sort.StringsAreSorted(mutation.Members) {
 		return &abcitypes.ExecTxResult{Code: 112, Log: "access group members must be canonical sorted"}
 	}
+	if app.postAppV26Rules(height) {
+		if mutation.Delete {
+			if mutation.MemberAuthority != "" {
+				return appV23ControlDenied()
+			}
+		} else if authorityErr := store.ValidateAppV26GroupAuthority(mutation.MemberAuthority); authorityErr != nil {
+			return appV23ControlDenied()
+		}
+	} else if mutation.MemberAuthority != "" {
+		// Historical forks neither accept nor persist the appended field.
+		return appV23ControlDenied()
+	}
 	elevation, err := app.appV23ElevationUse(
 		actorID, root, parsedTx.LocalElevation, tx.TxTypeAccessGroupMutate,
 		tx.AccessGroupMutateActionBytes(mutation), height,
@@ -848,11 +891,20 @@ func (app *SageApp) processAccessGroupMutateV23(parsedTx *tx.ParsedTx, height in
 	if err != nil {
 		return appV23ControlDenied()
 	}
-	if err := app.badgerStore.MutateAppV23AccessGroup(
-		actorID, mutation.GroupID, mutation.Name, mutation.Members,
-		mutation.ExpectedRevision, mutation.Delete, height,
-		elevation,
-	); err != nil {
+	var mutateErr error
+	if app.postAppV26Rules(height) {
+		mutateErr = app.badgerStore.MutateAppV26AccessGroup(
+			actorID, mutation.GroupID, mutation.Name, mutation.Members,
+			mutation.MemberAuthority, mutation.ExpectedRevision,
+			mutation.Delete, height, elevation,
+		)
+	} else {
+		mutateErr = app.badgerStore.MutateAppV23AccessGroup(
+			actorID, mutation.GroupID, mutation.Name, mutation.Members,
+			mutation.ExpectedRevision, mutation.Delete, height, elevation,
+		)
+	}
+	if mutateErr != nil {
 		return appV23ControlDenied()
 	}
 	return &abcitypes.ExecTxResult{Code: 0, Log: "access group updated"}

@@ -141,7 +141,8 @@ func runMCP() error {
 	// 1. SAGE_IDENTITY_PATH (matches SDK AgentIdentity.default())
 	// 2. SAGE_AGENT_KEY (kept for backward compatibility)
 	// 3. Per-project key (~/.sage/agents/<name>-<hash>/agent.key)
-	// 4. Default ~/.sage/agent.key
+	// Never fall back to the node operator/CEREBRUM Root key. An unpinned MCP
+	// session is always resolved to a project/workspace identity.
 	keyPath, _ := configuredMCPIdentityEnv()
 
 	projectName := strings.TrimSpace(os.Getenv("SAGE_PROJECT"))
@@ -284,10 +285,11 @@ func existingIdentityOrDefault(explicitPath, sageHome, projectDir, provider stri
 		}
 		return filepath.Join(providerProjectAgentDir(sageHome, projectDir, provider), "agent.key")
 	}
-	legacy := filepath.Join(sageHome, "agent.key")
-	if _, err := os.Stat(legacy); err == nil { //nolint:gosec // SageHome-derived legacy identity path
-		return legacy
-	}
+	// An app-scoped MCP registration has no trustworthy workspace boundary.
+	// Its implicit identity must still be an ordinary provider-specific agent,
+	// never the stable node transport/CEREBRUM Root key merely because
+	// ~/.sage/agent.key exists. Operators may deliberately pin a custom key via
+	// explicitPath, which returned above; absence is not consent to borrow Root.
 	return filepath.Join(sageHome, "agents", "global-"+sanitizeDirName(provider), "agent.key")
 }
 
@@ -590,7 +592,10 @@ func healHooks(projectDir, hookDir, identityPath string) error {
 	}
 
 	if !needsRewrite && hasBinRef && !legacyDetected {
-		return nil
+		// Hook bytes can already be current while the generated permissions
+		// still advertise a retired/hidden tool from an older installer. Keep
+		// settings synchronized independently of whether scripts need repair.
+		return syncClaudeSettings(projectDir)
 	}
 
 	for name, tpl := range expected {
@@ -601,19 +606,8 @@ func healHooks(projectDir, hookDir, identityPath string) error {
 		}
 	}
 
-	settingsPath := filepath.Join(projectDir, ".claude", "settings.json")
-	settings := make(map[string]any)
-	if existing, readErr := os.ReadFile(settingsPath); readErr == nil {
-		_ = json.Unmarshal(existing, &settings)
-	}
-	settings["hooks"] = sageHooksConfig("${CLAUDE_PROJECT_DIR}/.claude/hooks")
-	settings["permissions"] = sagePermissionsConfig(settings)
-	data, marshalErr := json.MarshalIndent(settings, "", "  ")
-	if marshalErr != nil {
-		return fmt.Errorf("marshal settings: %w", marshalErr)
-	}
-	if writeErr := os.WriteFile(settingsPath, append(data, '\n'), 0600); writeErr != nil {
-		return fmt.Errorf("write settings: %w", writeErr)
+	if err := syncClaudeSettings(projectDir); err != nil {
+		return err
 	}
 
 	switch {
@@ -623,6 +617,32 @@ func healHooks(projectDir, hookDir, identityPath string) error {
 		fmt.Fprintf(os.Stderr, "SAGE: installed Claude Code hooks (first-time on this project)\n")
 	default:
 		fmt.Fprintf(os.Stderr, "SAGE: refreshed Claude Code hook scripts\n")
+	}
+	return nil
+}
+
+// syncClaudeSettings keeps the installer-owned hooks and safe SAGE tool
+// permissions current even when the hook scripts themselves need no rewrite.
+// Existing non-SAGE permissions and settings are preserved.
+func syncClaudeSettings(projectDir string) error {
+	settingsPath := filepath.Join(projectDir, ".claude", "settings.json")
+	settings := make(map[string]any)
+	existing, readErr := os.ReadFile(settingsPath)
+	if readErr == nil {
+		_ = json.Unmarshal(existing, &settings)
+	}
+	settings["hooks"] = sageHooksConfig("${CLAUDE_PROJECT_DIR}/.claude/hooks")
+	settings["permissions"] = sagePermissionsConfig(settings)
+	data, marshalErr := json.MarshalIndent(settings, "", "  ")
+	if marshalErr != nil {
+		return fmt.Errorf("marshal settings: %w", marshalErr)
+	}
+	data = append(data, '\n')
+	if readErr == nil && bytes.Equal(existing, data) {
+		return nil
+	}
+	if writeErr := os.WriteFile(settingsPath, data, 0600); writeErr != nil {
+		return fmt.Errorf("write settings: %w", writeErr)
 	}
 	return nil
 }
@@ -788,7 +808,6 @@ func sageHooksConfig(hookDirExpr string) map[string]any {
 func sagePermissionsConfig(settings map[string]any) map[string]any {
 	sageTools := []string{
 		"mcp__sage__sage_inception",
-		"mcp__sage__sage_red_pill",
 		"mcp__sage__sage_turn",
 		"mcp__sage__sage_remember",
 		"mcp__sage__sage_recall",
@@ -816,6 +835,11 @@ func sagePermissionsConfig(settings map[string]any) map[string]any {
 	if existing, ok := perms["allow"].([]any); ok {
 		for _, v := range existing {
 			if s, ok := v.(string); ok {
+				// Remove the retired alias from generated permissions during
+				// self-heal. Current MCP servers expose only sage_inception.
+				if s == "mcp__sage__sage_red_pill" {
+					continue
+				}
 				allowList = append(allowList, s)
 			}
 		}
@@ -841,7 +865,7 @@ func claimAgentIdentity(sageHome, token, keyPath string) error {
 	keyPath = filepath.Clean(keyPath)
 	baseURL := os.Getenv("SAGE_API_URL")
 	if baseURL == "" {
-		baseURL = "http://localhost:8080"
+		baseURL = mcp.DefaultBaseURL()
 	}
 
 	body, _ := json.Marshal(map[string]string{"token": token})

@@ -475,6 +475,14 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 		authorized_by TEXT NOT NULL,
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	);
+	CREATE TABLE IF NOT EXISTS legacy_memory_recovery_assignment (
+		memory_id TEXT PRIMARY KEY,
+		target_agent_id TEXT NOT NULL,
+		machine_reason TEXT NOT NULL,
+		projection_revision INTEGER NOT NULL,
+		authorized_by TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+	);
 
 	CREATE TABLE IF NOT EXISTS knowledge_triples (
 		id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -831,9 +839,18 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 
 	// Migration: add pipeline_messages table.
 	s.migratePipeline(ctx)
+	if err := s.migratePipelineTerminalRetention(ctx); err != nil {
+		return fmt.Errorf("migrate pipeline terminal retention: %w", err)
+	}
+	if err := s.migrateMessages(ctx); err != nil {
+		return fmt.Errorf("migrate canonical messages: %w", err)
+	}
 	s.migratePipelineTransport(ctx)
 	if err := s.migratePipelineV23SecurityColumns(ctx); err != nil {
 		return fmt.Errorf("migrate pipeline v23 authorization columns: %w", err)
+	}
+	if err := s.migrateFederatedPipelineReceiptsV2(ctx); err != nil {
+		return fmt.Errorf("migrate federated pipeline receipts v2: %w", err)
 	}
 
 	// Migration: add mcp_tokens table for HTTP MCP transport bearer auth.
@@ -3369,10 +3386,33 @@ func (s *SQLiteStore) InsertAccessGrant(ctx context.Context, grant *AccessGrantE
 }
 
 func (s *SQLiteStore) GetActiveGrants(ctx context.Context, agentID string) ([]*AccessGrantEntry, error) {
+	return s.getActiveGrants(ctx, agentID, 0, false)
+}
+
+func (s *SQLiteStore) GetActiveGrantsBounded(ctx context.Context, agentID string, limit int) ([]*AccessGrantEntry, error) {
+	return s.getActiveGrants(ctx, agentID, limit, true)
+}
+
+func (s *SQLiteStore) getActiveGrants(ctx context.Context, agentID string, limit int, filterExpired bool) ([]*AccessGrantEntry, error) {
+	query := `SELECT domain, grantee_id, granter_id, access_level, expires_at, created_height, created_at
+		FROM access_grants
+		WHERE grantee_id = ? AND revoked_at IS NULL`
+	args := []any{agentID}
+	if filterExpired {
+		// RFC3339Nano strings are not safely orderable within the same second
+		// when one value omits the fractional component ('.' sorts before 'Z').
+		// Parse both sides as instants before applying the candidate LIMIT.
+		query += ` AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))`
+		args = append(args, formatTime(time.Now().UTC()))
+	}
+	query += `
+		ORDER BY created_at`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
 	rows, err := s.conn.QueryContext(ctx,
-		`SELECT domain, grantee_id, granter_id, access_level, expires_at, created_height, created_at
-		FROM access_grants WHERE grantee_id = ? AND revoked_at IS NULL
-		ORDER BY created_at`, agentID)
+		query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get active grants: %w", err)
 	}
@@ -3876,6 +3916,27 @@ func (s *SQLiteStore) ListAgents(ctx context.Context) ([]*AgentEntry, error) {
 	return agents, nil
 }
 
+// ListAgentDirectory returns the local recipient identity projection without
+// computing roster-wide derived memory counts. Canonical enrollment filtering
+// remains the REST layer's responsibility because SQL status is only a cache
+// after app-v23.
+func (s *SQLiteStore) ListAgentDirectory(ctx context.Context, limit int) ([]*AgentEntry, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.conn.QueryContext(ctx, `
+		SELECT agent_id, name, COALESCE(registered_name,''), COALESCE(provider,''), status, removed_at
+		FROM network_agents
+		WHERE status != 'removed'
+		ORDER BY created_at ASC, agent_id
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list agent directory: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanPipeContactLookupAgents(rows)
+}
+
 // FindPipeContactLookupCandidates returns a deliberately small agent metadata
 // projection for federated human-name discovery. The SQL result is capped
 // before live Badger RBAC checks and exact field matches sort ahead of substring
@@ -3903,19 +3964,21 @@ func (s *SQLiteStore) findPipeContactLookupCandidatePage(
 		FROM network_agents
 		WHERE status = 'active' AND removed_at IS NULL
 		  AND (
-		    LOWER(name) LIKE ? ESCAPE '\'
+		    LOWER(agent_id) LIKE ? ESCAPE '\'
+		    OR LOWER(name) LIKE ? ESCAPE '\'
 		    OR LOWER(COALESCE(registered_name,'')) LIKE ? ESCAPE '\'
 		    OR LOWER(COALESCE(provider,'')) LIKE ? ESCAPE '\'
 		  )
 			ORDER BY CASE
-			  WHEN LOWER(name) LIKE ? ESCAPE '\'
+			  WHEN LOWER(agent_id) LIKE ? ESCAPE '\'
+			    OR LOWER(name) LIKE ? ESCAPE '\'
 			    OR LOWER(COALESCE(registered_name,'')) LIKE ? ESCAPE '\'
 			    OR LOWER(COALESCE(provider,'')) LIKE ? ESCAPE '\' THEN 0
 			  ELSE 1
 			END, LOWER(name), agent_id
 			LIMIT ? OFFSET ?`,
-		pattern, pattern, pattern,
-		exact, exact, exact,
+		pattern, pattern, pattern, pattern,
+		exact, exact, exact, exact,
 		limit, offset,
 	)
 	if err != nil {
@@ -3931,7 +3994,20 @@ func (s *SQLiteStore) findPipeContactLookupCandidatePage(
 // metadata-only and capped; it never invokes ListAgents' roster-wide derived
 // memory-count query.
 func (s *SQLiteStore) FindAgentsByName(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	if limit > maxAgentNameLookupResults {
+		limit = maxAgentNameLookupResults
+	}
 	return s.FindAgentsByNamePage(ctx, query, limit, 0)
+}
+
+// FindAgentLookupCandidates returns one bounded metadata-only candidate batch
+// for the signed REST recipient lookup. Canonical enrollment authorization is
+// applied by the REST layer after this single SQL query.
+func (s *SQLiteStore) FindAgentLookupCandidates(ctx context.Context, query string, limit int) ([]*AgentEntry, error) {
+	if limit > maxAgentNameLookupCandidates {
+		limit = maxAgentNameLookupCandidates
+	}
+	return s.findPipeContactLookupCandidatePage(ctx, query, limit, 0)
 }
 
 // FindAgentsByNamePage exposes one stable, bounded SQL candidate page. The
@@ -4446,12 +4522,22 @@ func (s *SQLiteStore) ListAgentTags(ctx context.Context, agentID string) ([]TagC
 }
 
 func (s *SQLiteStore) ListAgentDomains(ctx context.Context, agentID string) ([]string, error) {
-	rows, err := s.conn.QueryContext(ctx, `
+	return s.ListAgentDomainsBounded(ctx, agentID, 0)
+}
+
+func (s *SQLiteStore) ListAgentDomainsBounded(ctx context.Context, agentID string, limit int) ([]string, error) {
+	query := `
 		SELECT domain_tag, COUNT(*) as cnt
 		FROM memories
 		WHERE submitting_agent = ? AND domain_tag != ''
 		GROUP BY domain_tag
-		ORDER BY cnt DESC, domain_tag ASC`, agentID)
+		ORDER BY cnt DESC, domain_tag ASC`
+	args := []any{agentID}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list agent domains: %w", err)
 	}
@@ -6018,6 +6104,7 @@ func (s *SQLiteStore) migratePipeline(ctx context.Context) {
 		claimed_by    TEXT NOT NULL DEFAULT '',
 		claimed_at    TEXT,
 		completed_at  TEXT,
+		terminal_at   TEXT,
 		expires_at    TEXT NOT NULL,
 		journal_id    TEXT,
 		source_chain_id         TEXT NOT NULL DEFAULT '',
@@ -6054,6 +6141,51 @@ func (s *SQLiteStore) migratePipeline(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_destination ON pipeline_messages(destination_chain_id, status)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_source ON pipeline_messages(source_chain_id, source_pipe_id)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_source_status ON pipeline_messages(source_chain_id, status)`)
+}
+
+// migratePipelineTerminalRetention makes the terminal-state transition, rather
+// than the original send time, authoritative for bounded message retention.
+// The triggers keep every status transition on the same invariant, including
+// federation failure/revocation paths that do not flow through CompletePipeline.
+func (s *SQLiteStore) migratePipelineTerminalRetention(ctx context.Context) error {
+	if err := s.addSQLiteColumnIfMissing(ctx, "pipeline_messages", "terminal_at",
+		`ALTER TABLE pipeline_messages ADD COLUMN terminal_at TEXT`); err != nil {
+		return err
+	}
+	if _, err := s.writeExecContext(ctx, `UPDATE pipeline_messages
+		SET terminal_at=CASE
+			WHEN status='completed' AND completed_at IS NOT NULL THEN completed_at
+			WHEN status='expired' AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now') THEN expires_at
+			ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		END
+		WHERE status IN ('completed','expired','failed') AND terminal_at IS NULL`); err != nil {
+		return fmt.Errorf("backfill pipeline terminal timestamps: %w", err)
+	}
+	for _, statement := range []string{
+		`CREATE TRIGGER IF NOT EXISTS stamp_pipeline_terminal_after_update
+		AFTER UPDATE OF status ON pipeline_messages
+		WHEN NEW.status IN ('completed','expired','failed')
+		 AND OLD.status NOT IN ('completed','expired','failed')
+		 AND NEW.terminal_at IS NULL
+		BEGIN
+			UPDATE pipeline_messages SET terminal_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			WHERE pipe_id=NEW.pipe_id;
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS stamp_pipeline_terminal_after_insert
+		AFTER INSERT ON pipeline_messages
+		WHEN NEW.status IN ('completed','expired','failed') AND NEW.terminal_at IS NULL
+		BEGIN
+			UPDATE pipeline_messages SET terminal_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			WHERE pipe_id=NEW.pipe_id;
+		END`,
+		`CREATE INDEX IF NOT EXISTS idx_pipe_terminal_retention
+			ON pipeline_messages(status, terminal_at)`,
+	} {
+		if _, err := s.writeExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("install pipeline terminal retention invariant: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) decryptPipelineFields(m *PipelineMessage) error {
@@ -6491,17 +6623,31 @@ func (s *SQLiteStore) PurgePipelines(ctx context.Context, olderThan time.Time) (
 		tx := txStore.(*SQLiteStore)
 		if _, err := tx.writeExecContext(ctx, `DELETE FROM pipeline_transport_outbox
 			WHERE pipe_id IN (SELECT p.pipe_id FROM pipeline_messages p
-				WHERE p.status IN ('completed','expired','failed') AND p.created_at < ?
+				WHERE p.status IN ('completed','expired','failed')
+				AND COALESCE(p.terminal_at,p.completed_at,p.created_at) < ?
+				AND NOT EXISTS (SELECT 1 FROM message_read_receipts receipt
+					WHERE receipt.message_id=p.pipe_id AND receipt.read_at >= ?)
 				AND NOT EXISTS (SELECT 1 FROM pipeline_transport_outbox keep
 					WHERE keep.pipe_id=p.pipe_id AND (keep.state='pending'
-						OR (keep.state='failed' AND keep.reported_at IS NULL))))`, formatTime(olderThan)); err != nil {
+						OR (keep.state='failed' AND keep.reported_at IS NULL)))
+				AND NOT EXISTS (SELECT 1 FROM pipeline_receipt_v2_outbox receipt_v2
+					WHERE receipt_v2.local_pipe_id=p.pipe_id AND receipt_v2.state='pending'
+					AND julianday(receipt_v2.expires_at)>julianday('now')))`,
+			formatTime(olderThan), formatTime(olderThan)); err != nil {
 			return err
 		}
 		res, err := tx.writeExecContext(ctx, `DELETE FROM pipeline_messages
-			WHERE status IN ('completed', 'expired', 'failed') AND created_at < ?
+			WHERE status IN ('completed', 'expired', 'failed')
+			AND COALESCE(terminal_at,completed_at,created_at) < ?
+			AND NOT EXISTS (SELECT 1 FROM message_read_receipts receipt
+				WHERE receipt.message_id=pipeline_messages.pipe_id AND receipt.read_at >= ?)
 			AND NOT EXISTS (SELECT 1 FROM pipeline_transport_outbox keep
 				WHERE keep.pipe_id=pipeline_messages.pipe_id AND (keep.state='pending'
-					OR (keep.state='failed' AND keep.reported_at IS NULL)))`, formatTime(olderThan))
+					OR (keep.state='failed' AND keep.reported_at IS NULL)))
+			AND NOT EXISTS (SELECT 1 FROM pipeline_receipt_v2_outbox receipt_v2
+				WHERE receipt_v2.local_pipe_id=pipeline_messages.pipe_id AND receipt_v2.state='pending'
+				AND julianday(receipt_v2.expires_at)>julianday('now'))`,
+			formatTime(olderThan), formatTime(olderThan))
 		if err != nil {
 			return err
 		}

@@ -7,9 +7,12 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +30,22 @@ func TestEffectiveAgentIDUsesBearerPrincipal(t *testing.T) {
 	legacy := authmw.WithAgentID(context.Background(), strings.Repeat("b", 64))
 	require.Equal(t, s.agentID, s.effectiveAgentID(legacy))
 	require.Equal(t, s.agentID, s.effectiveAgentID(context.Background()))
+}
+
+func TestDefaultBaseURLHonorsCustomTLSListener(t *testing.T) {
+	t.Setenv("SAGE_HOME", t.TempDir())
+
+	t.Setenv("SAGE_TLS_ADDR", "127.0.0.1:18443")
+	assert.Equal(t, "https://127.0.0.1:18443", DefaultBaseURL())
+
+	for bind, want := range map[string]string{
+		"0.0.0.0:19443": "https://localhost:19443",
+		":20443":        "https://localhost:20443",
+		"[::]:21443":    "https://localhost:21443",
+	} {
+		t.Setenv("SAGE_TLS_ADDR", bind)
+		assert.Equal(t, want, DefaultBaseURL())
+	}
 }
 
 func TestReadMCPFrameOversizeDoesNotPoisonFollowingRequest(t *testing.T) {
@@ -57,28 +76,14 @@ func TestConversationStateIsIsolatedAndReleased(t *testing.T) {
 	require.NotSame(t, stateA, stateB)
 
 	s.conversationMu.Lock()
-	stateA.callsSinceTurn = 7
 	stateA.inceptionChecked = true
 	s.conversationMu.Unlock()
-	assert.Equal(t, 0, stateB.callsSinceTurn)
 	assert.False(t, stateB.inceptionChecked)
-	assert.True(t, shouldBlockForTurn("external_tool", stateA))
-	assert.False(t, shouldBlockForTurn("external_tool", stateB))
 
 	s.ForgetConversation("sse:A")
 	replacementA := s.conversation(ctxA)
 	require.NotSame(t, stateA, replacementA)
-	assert.Equal(t, 0, replacementA.callsSinceTurn)
-}
-
-func TestTurnDeadlineNeverBlocksMemoryCorrectionPrimitives(t *testing.T) {
-	state := &conversationState{
-		lastTurnTime:   time.Now().Add(-6 * time.Minute),
-		callsSinceTurn: 7,
-	}
-	assert.True(t, shouldBlockForTurn("external_tool", state))
-	assert.False(t, shouldBlockForTurn("sage_remember", state))
-	assert.False(t, shouldBlockForTurn("sage_forget", state))
+	assert.False(t, replacementA.inceptionChecked)
 }
 
 func TestHandleInitialize(t *testing.T) {
@@ -120,12 +125,13 @@ func TestHandleToolsList(t *testing.T) {
 
 	result := resp.Result.(map[string]any)
 	tools := result["tools"].([]map[string]any)
-	assert.Len(t, tools, 29)
+	assert.Len(t, tools, 34)
 
 	// Collect tool names
 	names := make(map[string]bool)
 	var findAgent map[string]any
 	var sageTask map[string]any
+	var sageTimeline map[string]any
 	for _, tool := range tools {
 		names[tool["name"].(string)] = true
 		if tool["name"] == "sage_find_agent" {
@@ -134,10 +140,34 @@ func TestHandleToolsList(t *testing.T) {
 		if tool["name"] == "sage_task" {
 			sageTask = tool
 		}
+		if tool["name"] == "sage_timeline" {
+			sageTimeline = tool
+		}
 	}
+	expected := []string{
+		"sage_backlog", "sage_corroborate", "sage_directory", "sage_domains",
+		"sage_federation", "sage_find_agent", "sage_forget", "sage_gov_propose",
+		"sage_gov_status", "sage_gov_vote", "sage_inbox", "sage_inception",
+		"sage_link", "sage_list", "sage_message_reply", "sage_message_send",
+		"sage_message_status", "sage_messages_receive", "sage_pipe",
+		"sage_pipe_history", "sage_pipe_receipt_status", "sage_pipe_result",
+		"sage_recall", "sage_reflect", "sage_register", "sage_reinstate",
+		"sage_remember", "sage_rename", "sage_scope_get", "sage_scope_list",
+		"sage_status", "sage_task", "sage_timeline", "sage_turn",
+	}
+	actual := make([]string, 0, len(names))
+	for name := range names {
+		actual = append(actual, name)
+	}
+	assert.ElementsMatch(t, expected, actual)
+	assert.False(t, names["sage_red_pill"], "retired aliases must not be registered")
 	assert.True(t, names["sage_remember"])
 	assert.True(t, names["sage_recall"])
 	assert.True(t, names["sage_pipe_history"])
+	assert.True(t, names["sage_message_send"])
+	assert.True(t, names["sage_messages_receive"])
+	assert.True(t, names["sage_message_reply"])
+	assert.True(t, names["sage_message_status"])
 	assert.True(t, names["sage_federation"])
 	assert.True(t, names["sage_directory"])
 	assert.True(t, names["sage_find_agent"])
@@ -146,6 +176,8 @@ func TestHandleToolsList(t *testing.T) {
 	assert.True(t, names["sage_list"])
 	assert.True(t, names["sage_timeline"])
 	assert.True(t, names["sage_status"])
+	assert.True(t, names["sage_domains"])
+	assert.True(t, names["sage_pipe_receipt_status"])
 	assert.True(t, names["sage_gov_propose"])
 	assert.True(t, names["sage_gov_vote"])
 	assert.True(t, names["sage_gov_status"])
@@ -175,6 +207,56 @@ func TestHandleToolsList(t *testing.T) {
 	idempotencySchema := taskProperties["idempotency_key"].(map[string]any)
 	assert.Contains(t, idempotencySchema["description"], "permanent creation identity")
 	assert.Contains(t, idempotencySchema["description"], "every later identical call returns that existing task")
+
+	require.NotNil(t, sageTimeline)
+	timelineSchema := sageTimeline["inputSchema"].(map[string]any)
+	timelineProperties := timelineSchema["properties"].(map[string]any)
+	for _, name := range []string{"from", "to"} {
+		bound := timelineProperties[name].(map[string]any)
+		assert.Equal(t, "date-time", bound["format"])
+		assert.Contains(t, bound["description"], "RFC3339")
+	}
+}
+
+func TestToolRegistrySchemasAreSelfContained(t *testing.T) {
+	s, _ := testServer(t)
+	for key, tool := range s.tools {
+		require.Equal(t, key, tool.Name, "registry key and advertised tool name must match")
+		require.NotNil(t, tool.Handler, "%s must have a callable handler", key)
+		require.Equal(t, "object", tool.InputSchema["type"], "%s must expose an object schema", key)
+		properties, ok := tool.InputSchema["properties"].(map[string]any)
+		require.True(t, ok, "%s must define its complete argument properties", key)
+		if required, ok := tool.InputSchema["required"].([]string); ok {
+			for _, name := range required {
+				require.Contains(t, properties, name,
+					"%s requires %s but does not document it in the tool schema", key, name)
+			}
+		}
+	}
+	require.NotContains(t, s.tools, "sage_red_pill")
+}
+
+func TestAdvertisedToolsExactlyMatchReferenceHeadings(t *testing.T) {
+	s, _ := testServer(t)
+	registered := make([]string, 0, len(s.tools))
+	for _, tool := range s.tools {
+		registered = append(registered, tool.Name)
+	}
+	_, source, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	docPath := filepath.Join(filepath.Dir(source), "..", "..", "docs", "reference", "mcp-tools.md")
+	doc, err := os.ReadFile(docPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(doc), "SAGE exposes exactly 34 registered and callable MCP tools",
+		"the human-readable inventory count must match tools/list")
+	re := regexp.MustCompile(`(?m)^### (sage_[a-z_]+)$`)
+	matches := re.FindAllStringSubmatch(string(doc), -1)
+	documented := make([]string, 0, len(matches))
+	for _, match := range matches {
+		documented = append(documented, match[1])
+	}
+	assert.ElementsMatch(t, registered, documented,
+		"every callable MCP tool must have exactly one reference heading, and retired aliases must stay absent")
 }
 
 func TestHandleToolsCall_UnknownTool(t *testing.T) {
@@ -192,6 +274,25 @@ func TestHandleToolsCall_UnknownTool(t *testing.T) {
 	resp := s.handleRequest(context.Background(), req)
 	require.NotNil(t, resp)
 	assert.NotNil(t, resp.Error)
+	assert.Equal(t, -32602, resp.Error.Code)
+	assert.Contains(t, resp.Error.Message, "Unknown tool")
+}
+
+func TestHandleToolsCall_RetiredRedPillAliasIsUnknown(t *testing.T) {
+	s, _ := testServer(t)
+	params, _ := json.Marshal(map[string]any{
+		"name":      "sage_red_pill",
+		"arguments": map[string]any{},
+	})
+	req := &jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      float64(31),
+		Method:  "tools/call",
+		Params:  params,
+	}
+	resp := s.handleRequest(context.Background(), req)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Error)
 	assert.Equal(t, -32602, resp.Error.Code)
 	assert.Contains(t, resp.Error.Message, "Unknown tool")
 }

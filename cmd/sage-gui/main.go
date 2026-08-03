@@ -20,6 +20,10 @@ var (
 	// fixtures may register a private command surface without teaching release
 	// binaries any fixture command or environment-variable names.
 	optionalCommandHandler func([]string) (bool, error)
+	// restartExecOverride is set only after a stopped-state safety-gate failure
+	// chooses the exact pinned executable preserved before drain. It is never a
+	// directory scan or a version guess.
+	restartExecOverride string
 )
 
 // nativeShellAlreadyRunningExitCode is the only sidecar exit result that
@@ -52,6 +56,17 @@ func main() {
 		lock, err = acquireInstanceLock(SageHome())
 		if err == nil {
 			defer func() { _ = lock.Close() }()
+			if execPath, pathErr := os.Executable(); pathErr == nil {
+				if resolved, resolveErr := filepath.EvalSymlinks(execPath); resolveErr == nil {
+					execPath = resolved
+				}
+				if _, reconcileErr := web.ReconcilePreparedPendingBinaryUpdate(execPath); reconcileErr != nil {
+					// Update metadata must never brick an otherwise runnable node. Keep
+					// the evidence in place, boot the installed binary, and surface an
+					// actionable warning for the operator.
+					fmt.Fprintln(os.Stderr, "SAGE could not reconcile a prepared update; continuing with the installed binary:", reconcileErr)
+				}
+			}
 			var startupProof string
 			startupProof, err = shellStartupProofFromEnvironment()
 			if err == nil {
@@ -60,6 +75,10 @@ func main() {
 		}
 		if errors.Is(err, errCoordinatedRestart) {
 			execPath, pathErr := os.Executable()
+			if restartExecOverride != "" {
+				execPath, pathErr = restartExecOverride, nil
+				restartExecOverride = ""
+			}
 			if pathErr != nil {
 				err = fmt.Errorf("restart: determine executable: %w", pathErr)
 			} else if prepErr := lock.PrepareExec(); prepErr != nil {
@@ -240,6 +259,7 @@ Environment (common — full list: docs/reference/environment-variables.md):
   SAGE_IDENTITY_PATH  Identity key path (takes precedence over SAGE_AGENT_KEY)
   SAGE_PASSPHRASE     Vault passphrase (else prompted on a TTY)
   REST_ADDR           REST listen address (default: 127.0.0.1:8080)
+  SAGE_TLS_ADDR       HTTPS/MCP listen address (default: 127.0.0.1:8443)
   SAGE_SNAPSHOT_KEEP  Snapshots to retain (newest N + per-version anchors; default 5)
   SAGE_EMBEDDING_*    Embedding provider/model/dimension (see reference)
 

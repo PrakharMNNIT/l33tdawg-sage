@@ -728,6 +728,25 @@ func TestAccessStore(t *testing.T) {
 	assert.Equal(t, "security", grants[0].Domain)
 	assert.Equal(t, uint8(2), grants[0].Level)
 
+	// The bounded candidate reader filters expiry before LIMIT. Otherwise old
+	// expired rows can permanently crowd a later live grant out of status.
+	expiredAt := now.Add(-time.Minute)
+	for i := 0; i < 3; i++ {
+		require.NoError(t, s.InsertAccessGrant(ctx, &AccessGrantEntry{
+			Domain: fmt.Sprintf("expired-%d", i), GranteeID: "bounded-agent",
+			GranterID: "admin", Level: 1, ExpiresAt: &expiredAt,
+			CreatedHeight: int64(i + 1), CreatedAt: now.Add(time.Duration(i-10) * time.Hour),
+		}))
+	}
+	require.NoError(t, s.InsertAccessGrant(ctx, &AccessGrantEntry{
+		Domain: "live-bounded", GranteeID: "bounded-agent", GranterID: "admin", Level: 1,
+		CreatedHeight: 10, CreatedAt: now,
+	}))
+	bounded, err := s.GetActiveGrantsBounded(ctx, "bounded-agent", 1)
+	require.NoError(t, err)
+	require.Len(t, bounded, 1)
+	require.Equal(t, "live-bounded", bounded[0].Domain)
+
 	// RevokeGrant
 	require.NoError(t, s.RevokeGrant(ctx, "security", "agent1", 200))
 	grants, err = s.GetActiveGrants(ctx, "agent1")
@@ -1094,6 +1113,11 @@ func TestFindAgentsByNameSupportsBoundedLocalSubstringLookup(t *testing.T) {
 	require.Len(t, provider, 1)
 	assert.Equal(t, voice.AgentID, provider[0].AgentID)
 
+	byID, err := s.FindAgentsByName(ctx, voice.AgentID, 20)
+	require.NoError(t, err)
+	require.Len(t, byID, 1)
+	assert.Equal(t, voice.AgentID, byID[0].AgentID)
+
 	literalWildcard, err := s.FindAgentsByName(ctx, "%", 20)
 	require.NoError(t, err)
 	assert.Empty(t, literalWildcard, "LIKE metacharacters in a human query must not widen the roster scan")
@@ -1137,6 +1161,11 @@ func TestFindAgentsByNamePageUsesStableBoundedOffset(t *testing.T) {
 	require.Len(t, second, 5)
 	assert.Equal(t, "agent-page-20", second[0].AgentID)
 	assert.Equal(t, "agent-page-24", second[4].AgentID)
+
+	candidates, err := s.FindAgentLookupCandidates(ctx, "claude", maxAgentNameLookupCandidates)
+	require.NoError(t, err)
+	require.Len(t, candidates, 25,
+		"the REST lookup candidate batch must be one query, not repeated public pages")
 }
 
 func TestUpdateAgent(t *testing.T) {

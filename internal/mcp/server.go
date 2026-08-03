@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -90,16 +91,14 @@ type Server struct {
 }
 
 type conversationState struct {
-	callsSinceTurn   int
-	lastTurnTime     time.Time
 	inceptionChecked bool
 	lastUsed         time.Time
 }
 
 type conversationIDContextKey struct{}
 
-// WithConversationID scopes turn discipline and auto-inception to one MCP
-// client/session. Stdio callers naturally use the empty/default conversation.
+// WithConversationID scopes auto-inception to one MCP client/session. Stdio
+// callers naturally use the empty/default conversation.
 func WithConversationID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, conversationIDContextKey{}, id)
 }
@@ -374,33 +373,13 @@ func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *json
 	s.conversationMu.Lock()
 	if !conversation.inceptionChecked {
 		conversation.inceptionChecked = true
-		if params.Name != "sage_inception" && params.Name != "sage_red_pill" {
+		if params.Name != "sage_inception" {
 			doAutoInception = true
 		}
 	}
-	blocked := shouldBlockForTurn(params.Name, conversation)
-	blockedCount := conversation.callsSinceTurn
 	s.conversationMu.Unlock()
 	if doAutoInception {
 		autoInceptionMsg = s.maybeAutoInception(ctx)
-	}
-
-	// Enforce turn discipline: block non-SAGE tools after threshold.
-	// This guarantees memories are saved — agents can't just ignore the nudge.
-	if blocked {
-		return &jsonRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result: map[string]any{
-				"content": []map[string]any{
-					{"type": "text", "text": "[SAGE] ⛔ Turn checkpoint — call sage_turn before continuing. " +
-						"You have " + fmt.Sprintf("%d", blockedCount) + " unrecorded tool calls. " +
-						"Summarize what's happened so far (topic + observation), then retry this operation. " +
-						"This protects your work from being lost if the conversation ends unexpectedly."},
-				},
-				"isError": true,
-			},
-		}
 	}
 
 	result, err := tool.Handler(ctx, params.Arguments)
@@ -417,14 +396,9 @@ func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *json
 		}
 	}
 
-	// Track turn discipline: reset counter on sage_turn, increment on everything else.
+	// Session state is advisory only. MCP operations must never be blocked or
+	// padded merely because a client has not called sage_turn recently.
 	s.conversationMu.Lock()
-	if params.Name == "sage_turn" {
-		conversation.callsSinceTurn = 0
-		conversation.lastTurnTime = time.Now()
-	} else if params.Name != "sage_inception" && params.Name != "sage_red_pill" && params.Name != "sage_register" {
-		conversation.callsSinceTurn++
-	}
 	conversation.lastUsed = time.Now()
 	s.conversationMu.Unlock()
 
@@ -458,32 +432,6 @@ func (s *Server) writeError(id any, code int, message string) {
 		ID:      id,
 		Error:   &rpcError{Code: code, Message: message},
 	})
-}
-
-// shouldBlockForTurn returns true if the agent should be forced to call sage_turn
-// before any more non-SAGE tool calls. This is the hard enforcement — after 7 calls
-// or 5 minutes, we block until sage_turn is called.
-func shouldBlockForTurn(toolName string, state *conversationState) bool {
-	// Never block SAGE tools themselves.
-	switch toolName {
-	case "sage_turn", "sage_inception", "sage_red_pill", "sage_reflect", "sage_recall",
-		"sage_remember", "sage_forget", "sage_reinstate", "sage_corroborate", "sage_link", "sage_list", "sage_status", "sage_timeline",
-		"sage_task", "sage_backlog", "sage_register", "sage_directory", "sage_find_agent",
-		"sage_pipe", "sage_inbox", "sage_pipe_history", "sage_pipe_result":
-		return false
-	}
-
-	// Block after 7 non-SAGE calls.
-	if state.callsSinceTurn >= 7 {
-		return true
-	}
-
-	// Block after 5 minutes without sage_turn (but only if we've had at least one turn).
-	if !state.lastTurnTime.IsZero() && time.Since(state.lastTurnTime).Minutes() > 5 && state.callsSinceTurn >= 2 {
-		return true
-	}
-
-	return false
 }
 
 // maybeAutoInception checks if the brain has memories. If empty, runs inception
@@ -554,9 +502,12 @@ func (s *Server) autoRegister(ctx context.Context) {
 	_ = s.doSignedJSON(ctx, "POST", "/v1/agent/register", body, nil)
 }
 
-// signedRequest makes an authenticated HTTP request to the SAGE REST API.
-// Signs method + path + body + timestamp as per auth protocol v2.
-func (s *Server) signedRequest(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+type preparedSignedRequest struct {
+	method, path, agentID, signature, timestamp, nonce string
+	body                                               []byte
+}
+
+func (s *Server) prepareSignedRequest(ctx context.Context, method, path string, body []byte) (*preparedSignedRequest, error) {
 	// A bearer-authed HTTP MCP request may carry a per-token signing identity
 	// (installed by MCPBearerAuthMiddleware). When present, sign AS that identity
 	// so on-chain RBAC/audit is honest instead of collapsing every token to the
@@ -597,17 +548,38 @@ func (s *Server) signedRequest(ctx context.Context, method, path string, body []
 	}
 	sig := auth.SignRequestWithNonce(signKey, method, path, body, timestamp, nonce)
 
-	req, err := http.NewRequestWithContext(ctx, method, s.baseURL+path, bytes.NewReader(body))
+	return &preparedSignedRequest{
+		method: method, path: path, agentID: signID, signature: hex.EncodeToString(sig),
+		timestamp: fmt.Sprintf("%d", timestamp), nonce: hex.EncodeToString(nonce),
+		body: append([]byte(nil), body...),
+	}, nil
+}
+
+func (s *Server) sendPreparedSignedRequest(ctx context.Context, prepared *preparedSignedRequest) (*http.Response, error) {
+	if prepared == nil {
+		return nil, fmt.Errorf("prepared signed request is nil")
+	}
+	req, err := http.NewRequestWithContext(ctx, prepared.method, s.baseURL+prepared.path, bytes.NewReader(prepared.body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Agent-ID", signID)
-	req.Header.Set("X-Signature", hex.EncodeToString(sig))
-	req.Header.Set("X-Timestamp", fmt.Sprintf("%d", timestamp))
-	req.Header.Set("X-Nonce", hex.EncodeToString(nonce))
+	req.Header.Set("X-Agent-ID", prepared.agentID)
+	req.Header.Set("X-Signature", prepared.signature)
+	req.Header.Set("X-Timestamp", prepared.timestamp)
+	req.Header.Set("X-Nonce", prepared.nonce)
 
 	return s.httpClient.Do(req)
+}
+
+// signedRequest makes an authenticated HTTP request to the SAGE REST API.
+// Signs method + path + body + timestamp as per auth protocol v2.
+func (s *Server) signedRequest(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	prepared, err := s.prepareSignedRequest(ctx, method, path, body)
+	if err != nil {
+		return nil, err
+	}
+	return s.sendPreparedSignedRequest(ctx, prepared)
 }
 
 type signedRequestReplaySafety uint8
@@ -671,6 +643,15 @@ func matchesSinglePathSegment(path, prefix string) bool {
 	return ok && suffix != "" && !strings.Contains(suffix, "/")
 }
 
+func matchesSinglePathSegmentWithSuffix(path, prefix, suffix string) bool {
+	middle, ok := strings.CutPrefix(path, prefix)
+	if !ok {
+		return false
+	}
+	middle, ok = strings.CutSuffix(middle, suffix)
+	return ok && middle != "" && !strings.Contains(middle, "/")
+}
+
 func classifySignedRequestReplay(method, path string) signedRequestReplaySafety {
 	path = strings.TrimSuffix(path, "?")
 	path, _, _ = strings.Cut(path, "?")
@@ -694,8 +675,36 @@ func classifySignedRequestReplay(method, path string) signedRequestReplaySafety 
 		if matchesSinglePathSegment(path, "/v1/pipe/") {
 			return signedRequestReplaySafe
 		}
+		if matchesSinglePathSegmentWithSuffix(path, "/v1/messages/", "/status") {
+			return signedRequestReplaySafe
+		}
+		if matchesSinglePathSegmentWithSuffix(path, "/v1/pipe/", "/receipt") {
+			return signedRequestReplaySafe
+		}
+		if matchesSinglePathSegmentWithSuffix(path, "/v1/pipe/", "/receipt/challenge/claimed") ||
+			matchesSinglePathSegmentWithSuffix(path, "/v1/pipe/", "/receipt/challenge/read") {
+			return signedRequestReplaySafe
+		}
 	case http.MethodPost:
 		if retryableIdempotentPOSTPaths[path] {
+			return signedRequestReplaySafe
+		}
+		if path == "/v1/pipe/receipts/challenge-batch" {
+			return signedRequestReplaySafe
+		}
+		if path == "/v1/messages" || path == "/v1/messages/receive" ||
+			matchesSinglePathSegmentWithSuffix(path, "/v1/messages/", "/reply") {
+			return signedRequestReplaySafe
+		}
+	case http.MethodPut:
+		if path == "/v1/messages/read-batch" || path == "/v1/pipe/receipts/batch" {
+			return signedRequestReplaySafe
+		}
+		if matchesSinglePathSegmentWithSuffix(path, "/v1/messages/", "/read") {
+			return signedRequestReplaySafe
+		}
+		if matchesSinglePathSegmentWithSuffix(path, "/v1/pipe/", "/receipt/claimed") ||
+			matchesSinglePathSegmentWithSuffix(path, "/v1/pipe/", "/receipt/read") {
 			return signedRequestReplaySafe
 		}
 	}
@@ -704,15 +713,29 @@ func classifySignedRequestReplay(method, path string) signedRequestReplaySafety 
 
 // doSignedJSON makes a signed request and decodes the JSON response.
 func (s *Server) doSignedJSON(ctx context.Context, method, path string, body []byte, out any) error {
+	replaySafety := classifySignedRequestReplay(method, path)
 	attempts := 1
-	if classifySignedRequestReplay(method, path) == signedRequestReplaySafe {
+	if replaySafety == signedRequestReplaySafe {
 		attempts = 4
 	}
 	var resp *http.Response
+	var respBody []byte
 	var err error
 	for attempt := 0; attempt < attempts; attempt++ {
 		resp, err = s.signedRequest(ctx, method, path, body)
-		retryStatus := err == nil && (resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable)
+		retryStatus := false
+		if err == nil {
+			respBody, err = io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10 MB max
+			_ = resp.Body.Close()
+			if err != nil {
+				err = fmt.Errorf("read response: %w", err)
+			} else {
+				retryStatus = resp.StatusCode == http.StatusBadGateway ||
+					resp.StatusCode == http.StatusServiceUnavailable
+			}
+		} else if resp != nil {
+			_ = resp.Body.Close()
+		}
 		if err == nil && !retryStatus {
 			break
 		}
@@ -721,9 +744,6 @@ func (s *Server) doSignedJSON(ctx context.Context, method, path string, body []b
 				return err
 			}
 			break
-		}
-		if resp != nil {
-			_ = resp.Body.Close()
 		}
 		if err != nil && !isTransientMCPTransportErr(err) {
 			return err
@@ -739,11 +759,12 @@ func (s *Server) doSignedJSON(ctx context.Context, method, path string, body []b
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	return decodeSignedJSONResponse(resp, respBody, out)
+}
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10 MB max
-	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+func decodeSignedJSONResponse(resp *http.Response, respBody []byte, out any) error {
+	if resp == nil {
+		return fmt.Errorf("signed request returned no response")
 	}
 
 	if resp.StatusCode >= 400 {
@@ -967,6 +988,15 @@ func (s *Server) submitMemoryResilient(ctx context.Context, submitReq []byte, ou
 // Quorum mode (certs present) → https://localhost:8443
 // Personal mode (no certs) → http://localhost:8080
 func defaultBaseURL() string {
+	if tlsAddr := strings.TrimSpace(os.Getenv("SAGE_TLS_ADDR")); tlsAddr != "" {
+		if host, port, err := net.SplitHostPort(tlsAddr); err == nil && port != "" {
+			switch host {
+			case "", "0.0.0.0", "::":
+				host = "localhost"
+			}
+			return "https://" + net.JoinHostPort(host, port)
+		}
+	}
 	home := os.Getenv("SAGE_HOME")
 	if home == "" {
 		if userHome, err := os.UserHomeDir(); err == nil {

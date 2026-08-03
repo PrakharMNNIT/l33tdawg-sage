@@ -99,6 +99,107 @@ func scopedProjectionReadinessStatus(records int, vaultLocked bool) metrics.Scop
 
 var errCoordinatedRestart = errors.New("coordinated restart requested")
 
+type preparedRestartRequest struct {
+	release      func()
+	commit       func()
+	abort        func()
+	fallbackExec string
+}
+
+type snapshotDrainPreparer interface {
+	PrepareQuiesce(context.Context) (commit func(), abort func(), err error)
+}
+
+type runningBinaryPreserver interface {
+	PreserveRunningBinary() (string, error)
+}
+
+func prepareAndQueueRestart(ctx context.Context, scheduler snapshotDrainPreparer, requests chan<- preparedRestartRequest, release func()) error {
+	if scheduler == nil {
+		return fmt.Errorf("snapshot scheduler is unavailable")
+	}
+	prepareCtx, cancelPrepare := context.WithTimeout(ctx, 15*time.Second)
+	commit, abort, prepareErr := scheduler.PrepareQuiesce(prepareCtx)
+	cancelPrepare()
+	if prepareErr != nil {
+		return prepareErr
+	}
+	fallbackExec := ""
+	if preserver, ok := scheduler.(runningBinaryPreserver); ok {
+		fallbackExec, prepareErr = preserver.PreserveRunningBinary()
+		if prepareErr != nil {
+			abort()
+			return fmt.Errorf("preserve exact running executable before drain: %w", prepareErr)
+		}
+	}
+	select {
+	case requests <- preparedRestartRequest{release: release, commit: commit, abort: abort, fallbackExec: fallbackExec}:
+		return nil
+	default:
+		abort()
+		return fmt.Errorf("restart already in progress")
+	}
+}
+
+func verifyPreparedRestartFallback(preserver runningBinaryPreserver, request preparedRestartRequest) (string, error) {
+	if preserver == nil || request.fallbackExec == "" {
+		return "", errors.New("pre-drain executable recovery is unavailable")
+	}
+	verified, err := preserver.PreserveRunningBinary()
+	if err != nil {
+		return "", fmt.Errorf("verify exact pre-drain executable: %w", err)
+	}
+	if verified != request.fallbackExec {
+		return "", errors.New("pre-drain executable recovery identity changed")
+	}
+	return verified, nil
+}
+
+func releaseRestartFence(release *func()) {
+	if release == nil || *release == nil {
+		return
+	}
+	(*release)()
+	*release = nil
+}
+
+func releaseQueuedRestartFences(requests <-chan preparedRestartRequest) {
+	for {
+		select {
+		case request := <-requests:
+			if request.abort != nil {
+				request.abort()
+			}
+			if request.release != nil {
+				request.release()
+			}
+		default:
+			return
+		}
+	}
+}
+
+func adoptQueuedRestartRequests(requests <-chan preparedRestartRequest, adopted *preparedRestartRequest, restarting *bool) {
+	for {
+		select {
+		case request := <-requests:
+			if adopted.commit == nil && adopted.abort == nil && adopted.release == nil {
+				*adopted = request
+			} else {
+				if request.abort != nil {
+					request.abort()
+				}
+				if request.release != nil {
+					request.release()
+				}
+			}
+			*restarting = true
+		default:
+			return
+		}
+	}
+}
+
 // Authenticated federation operations may include bounded consensus waits.
 // Keep the peer listener above one ordinary 60-second broadcast ceiling. The
 // browser-facing final confirmation spans two sequential commits (guest then
@@ -663,7 +764,18 @@ func runServe(startupProof string) (rerr error) {
 	if err := nodeCtrl.StartChain(); err != nil {
 		return fmt.Errorf("start CometBFT: %w", err)
 	}
+	var restartFenceRelease func()
+	var preparedRestart preparedRestartRequest
+	var restartRequested chan preparedRestartRequest
 	defer func() {
+		// A fenced request transfers ownership when it is queued. Reclaim any
+		// adopted or still-buffered callback before StopChain: holding the app
+		// read fence while Comet waits for an already-entered Commit deadlocks.
+		releaseRestartFence(&restartFenceRelease)
+		if preparedRestart.abort != nil {
+			preparedRestart.abort()
+		}
+		releaseQueuedRestartFences(restartRequested)
 		stopWorkers()
 		if stopErr := nodeCtrl.StopChain(); stopErr != nil {
 			logger.Error().Err(stopErr).Msg("error stopping CometBFT")
@@ -938,6 +1050,7 @@ func runServe(startupProof string) (rerr error) {
 			logger.Warn().Str("value", v).Int("using", snapKeep).Msg("ignoring invalid SAGE_SNAPSHOT_KEEP (want integer >= 1)")
 		}
 	}
+	var snapshotScheduler *sageabci.SnapshotScheduler
 	if sched := sageabci.NewSnapshotScheduler(sageabci.SnapshotSchedulerConfig{
 		DataDir:         cfg.DataDir,
 		BinaryVersion:   version,
@@ -948,7 +1061,9 @@ func runServe(startupProof string) (rerr error) {
 		TimeInterval:    6 * time.Hour,
 		KeepLast:        snapKeep,
 		LiveBadger:      badgerStore.DB(),
+		CometDBBackend:  cometCfg.DBBackend,
 	}, logger); sched != nil {
+		snapshotScheduler = sched
 		app.SetSnapshotScheduler(sched)
 		logger.Info().Msg("v7.5 snapshot scheduler armed")
 	}
@@ -1047,12 +1162,12 @@ func runServe(startupProof string) (rerr error) {
 		// v10.5.1 auto-advance: personal nodes walk the fork ladder to the
 		// binary ceiling automatically (issue #40 follow-up — updating the
 		// binary now brings the chain up to date too). Quorum clusters keep
-		// governed multi-validator activation. v11.16.2 requires app-v25 and
+		// governed multi-validator activation. v11.17.0 requires app-v26 and
 		// never lets disable_auto_upgrade suppress personal-node consensus
 		// migrations: binary/chain-rule divergence is not a supported state.
 		PersonalMode:       !cfg.Quorum.Enabled,
 		AutoAdvance:        true,
-		RequiredAppVersion: 25,
+		RequiredAppVersion: 26,
 		// v10.5.2 (issue #41): in-process pending-plan accessor for the
 		// always-on pump and the auto-advance pre-check. GetUpgradePlan's
 		// ErrNoUpgradePlan is flattened to nil by readPendingPlan.
@@ -1127,11 +1242,11 @@ func runServe(startupProof string) (rerr error) {
 		})
 	}
 
-	// v7.1: tell the REST layer which ed25519 public key identifies the local
-	// node operator. Requests signed with this key bypass the cross-agent
-	// visibility filter so the v7.0 SessionStart-hook prefetch returns
-	// useful context on nodes where the LLM agent is registered separately.
-	// Skip if agent.key is unreadable; the bypass simply stays off.
+	// Tell the REST layer which ed25519 public key identifies the local node
+	// operator. This preserves the explicit operator scope for legacy direct
+	// REST administration; project lifecycle hooks use their ordinary-agent
+	// workspace key and never inherit this identity. Skip if agent.key is
+	// unreadable; the separate operator compatibility scope simply stays off.
 	operatorAgentID, operatorIDErr := readNodeOperatorKey(cfg.AgentKey)
 	if operatorIDErr == nil && operatorAgentID != "" {
 		restServer.SetNodeOperatorID(operatorAgentID)
@@ -1154,14 +1269,14 @@ func runServe(startupProof string) (rerr error) {
 				logger.Info().Int("count", confirmed).Msg("reconciled pending MCP token identities")
 			}
 		})
-		logger.Info().Str("operator_id", operatorAgentID[:16]+"...").Msg("node operator key registered for hook read-scope bypass")
+		logger.Info().Str("operator_id", operatorAgentID[:16]+"...").Msg("node operator key registered for direct REST compatibility scope")
 	} else if operatorIDErr != nil {
 		logger.Warn().Err(operatorIDErr).Msg("node operator key unavailable")
 	}
 
 	// Create dashboard handler. Restart requests are routed back to this main
 	// lifecycle so every listener/store/consensus component drains before exec.
-	restartRequested := make(chan struct{}, 1)
+	restartRequested = make(chan preparedRestartRequest, 1)
 	dashboard := web.NewDashboardHandler(sqliteStore, version)
 	dashboard.NodeOperatorAgentID = operatorAgentID
 	dashboard.RunBackground = func(fn func(context.Context)) {
@@ -1177,12 +1292,69 @@ func runServe(startupProof string) (rerr error) {
 		}
 	}
 	dashboard.RequestRestart = func() error {
+		return prepareAndQueueRestart(context.Background(), snapshotScheduler, restartRequested, nil)
+	}
+	dashboard.RequestRestartWithFence = func(release func()) error {
+		if release == nil {
+			return fmt.Errorf("restart state fence is unavailable")
+		}
+		return prepareAndQueueRestart(context.Background(), snapshotScheduler, restartRequested, release)
+	}
+	dashboard.PrepareRestartDrain = func(prepareCtx context.Context) (func(), func(), error) {
+		if snapshotScheduler == nil {
+			return nil, nil, fmt.Errorf("snapshot scheduler is unavailable")
+		}
+		return snapshotScheduler.PrepareQuiesce(prepareCtx)
+	}
+	dashboard.RequestRestartPrepared = func(release, commit, abort func()) error {
+		if commit == nil || abort == nil {
+			return fmt.Errorf("prepared restart ownership is incomplete")
+		}
+		fallbackExec, preserveErr := snapshotScheduler.PreserveRunningBinary()
+		if preserveErr != nil {
+			abort()
+			return fmt.Errorf("preserve exact running executable before drain: %w", preserveErr)
+		}
 		select {
-		case restartRequested <- struct{}{}:
+		case restartRequested <- preparedRestartRequest{
+			release: release, commit: commit, abort: abort, fallbackExec: fallbackExec,
+		}:
 			return nil
 		default:
 			return fmt.Errorf("restart already in progress")
 		}
+	}
+	dashboard.PrepareVersionTransition = func(snapshotCtx context.Context, targetVersion string) (_ func(), retErr error) {
+		if snapshotScheduler == nil {
+			return nil, fmt.Errorf("snapshot scheduler is unavailable")
+		}
+		height, appHash, release := app.AcquireSnapshotStateFence()
+		handedOff := false
+		defer func() {
+			if !handedOff {
+				release()
+			}
+		}()
+		if height <= 0 || len(appHash) == 0 {
+			return nil, fmt.Errorf("read committed state for pre-update snapshot: no committed application state")
+		}
+		_, snapshotErr := snapshotScheduler.TakeVerified(
+			snapshotCtx,
+			height,
+			appHash,
+			"pre-upgrade-"+strings.TrimPrefix(targetVersion, "v"),
+			func(manifest *snapshot.Manifest) error {
+				if manifest == nil || manifest.Height != height || !bytes.Equal(manifest.AppHash, appHash) {
+					return fmt.Errorf("committed state changed while proving the pre-update snapshot")
+				}
+				return nil
+			},
+		)
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		handedOff = true
+		return release, nil
 	}
 	dashboard.Rerankd = rerankdMgr            // managed reranker sidecar (guided setup)
 	dashboard.Ollamad = ollamaMgr             // managed Ollama runtime for smart memory setup
@@ -1296,6 +1468,7 @@ func runServe(startupProof string) (rerr error) {
 	dashboard.AppV22ActiveFn = app.IsAppV22ActiveForNextTx
 	dashboard.AppV23ActiveFn = app.IsAppV23ActiveForNextTx
 	dashboard.AppV24ActiveFn = app.IsAppV24ActiveForNextTx
+	dashboard.AppV26ActiveFn = app.IsAppV26ActiveForNextTx
 	if projectionBaselineRequired {
 		dashboard.CanonicalProjectionMissingAllowedFn = func(memoryID string) bool {
 			projectionBaselineMu.RLock()
@@ -1510,6 +1683,15 @@ func runServe(startupProof string) (rerr error) {
 	// Auth: bearer token in Authorization header, validated against the
 	// mcp_tokens table. Tokens are SHA-256-hashed before storage.
 	mcpHTTPTransport := mountMCPHTTPTransport(r, sqliteStore, cfg, logger)
+	if mcpHTTPTransport != nil {
+		restServer.SetMessageNotifier(func(notification rest.AgentMessageNotification) {
+			mcpHTTPTransport.NotifyAgent(notification.RecipientAgentID, mcp.AgentMessageNotification{
+				MessageID: notification.MessageID,
+				FromAgent: notification.FromAgent,
+				SentAt:    notification.SentAt,
+			})
+		})
+	}
 
 	// OAuth 2.0 + PKCE wrapper around bearer auth (v6.7.2). ChatGPT's MCP
 	// connector requires Auth URL + Token URL form fields; static-bearer
@@ -1630,8 +1812,19 @@ func runServe(startupProof string) (rerr error) {
 			PostV20ForNextTx:    app.IsAppV20ActiveForNextTx,
 			PostV22ForNextTx:    app.IsAppV22ActiveForNextTx,
 			PostV23ForNextTx:    app.IsAppV23ActiveForNextTx,
+			PostV26ForNextTx:    app.IsAppV26ActiveForNextTx,
 			PostV8ForAccess:     app.IsPostV8Fork,
-			Logger:              logger,
+			MessageNotifier: func(targetAgentID string, notification federation.AgentMessageNotification) {
+				if mcpHTTPTransport == nil {
+					return
+				}
+				mcpHTTPTransport.NotifyAgent(targetAgentID, mcp.AgentMessageNotification{
+					MessageID: notification.MessageID,
+					FromAgent: notification.FromAgent,
+					SentAt:    notification.CreatedAt,
+				})
+			},
+			Logger: logger,
 		})
 		restServer.SetFederation(fedMgr)
 		// The dashboard drives the guided JOIN wizards (cookie-authed) by calling
@@ -2044,7 +2237,7 @@ func runServe(startupProof string) (rerr error) {
 		// stale rows immediately instead of waiting a full interval.
 		const (
 			pipeSweepInterval   = 5 * time.Minute
-			pipeRetentionWindow = 24 * time.Hour // terminal rows deleted this long after creation
+			pipeRetentionWindow = 24 * time.Hour // terminal metadata retained this long after terminal/read transition
 			pipeStalenessWindow = 48 * time.Hour // non-terminal rows force-expired past this age
 		)
 		// Boot one-shot pipeline reconciliation — mirror the ResolveChallengedMemories
@@ -2099,14 +2292,26 @@ func runServe(startupProof string) (rerr error) {
 	}
 
 	// A replacement binary keeps its rollback copy until this exact process has
-	// answered health with its own boot ID and expected version. Failure enters
-	// the same full cleanup path below; main then atomically restores .old.
+	// answered health with its own boot ID and expected version. A failed proof
+	// exits without downgrading the executable: an older binary may be unable to
+	// read chain state that the replacement has already advanced.
 	if startupErr == nil {
 		if execPath, pathErr := os.Executable(); pathErr == nil {
 			if resolved, resolveErr := filepath.EvalSymlinks(execPath); resolveErr == nil {
 				execPath = resolved
 			}
-			if web.PendingUpdateVersion(execPath) == "" {
+			pendingVersion := web.PendingUpdateVersion(execPath)
+			if pendingVersion == "" {
+				execPath = ""
+			} else if !pendingUpdateMatchesRunningVersion(pendingVersion, version) {
+				// A legacy one-line marker can survive a crash before executable
+				// activation, but it has no captured rollback version with which to
+				// prove that state. Preserve the evidence without turning a runnable
+				// old release into a readiness-failure restart loop.
+				logger.Warn().
+					Str("pending_version", pendingVersion).
+					Str("running_version", version).
+					Msg("pending update does not match running binary — preserving recovery state without confirmation")
 				execPath = ""
 			}
 			if execPath != "" {
@@ -2130,7 +2335,7 @@ func runServe(startupProof string) (rerr error) {
 					}
 				}
 				if startupErr != nil {
-					logger.Error().Err(startupErr).Msg("updated process failed readiness proof — preparing rollback")
+					logger.Error().Err(startupErr).Msg("updated process failed readiness proof — pending update remains for operator recovery")
 				}
 			}
 		}
@@ -2144,7 +2349,9 @@ func runServe(startupProof string) (rerr error) {
 		select {
 		case sig := <-quit:
 			logger.Info().Str("signal", sig.String()).Msg("shutting down")
-		case <-restartRequested:
+		case preparedRestart = <-restartRequested:
+			restartFenceRelease = preparedRestart.release
+			preparedRestart.commit()
 			restarting = true
 			logger.Info().Msg("coordinated restart requested — draining node")
 		case serveErr := <-serveErrors:
@@ -2219,10 +2426,107 @@ func runServe(startupProof string) (rerr error) {
 		}
 	}
 	listenerWG.Wait()
+	// The first select can race a signal/serve error with a queued update
+	// restart. All HTTP handlers have now returned, so the channel is stable:
+	// adopt that request before teardown. Release duplicate fenced requests.
+	adoptQueuedRestartRequests(restartRequested, &preparedRestart, &restarting)
+	if restartFenceRelease == nil && preparedRestart.release != nil {
+		restartFenceRelease = preparedRestart.release
+	}
+	if restarting && preparedRestart.commit != nil {
+		preparedRestart.commit()
+	}
 	// With every HTTP admission point closed and active handler gone, no new
 	// dashboard job can Add to the worker group while it is being joined.
 	stopWorkers()
+	// Snapshot workers hold the live Badger handle. Cancel cadence work and
+	// give its context-aware backup stream a short bounded drain before any
+	// shutdown path closes the store underneath it.
+	var quiesceErr error
+	if snapshotScheduler != nil {
+		quiesceCtx, cancelQuiesce := context.WithTimeout(context.Background(), 15*time.Second)
+		quiesceErr = snapshotScheduler.Quiesce(quiesceCtx)
+		cancelQuiesce()
+		if quiesceErr != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("quiesce snapshot scheduler: %w", quiesceErr))
+			// A timed-out reversible preparation restores scheduler admission by
+			// design. Ordinary shutdown is no longer reversible, so close cadence
+			// permanently before joining the existing worker. Stores must never be
+			// closed beneath a slow Badger backup; preserving data is more important
+			// than forcing a fast process exit.
+			snapshotScheduler.Close()
+			snapshotScheduler.WaitIdle()
+		}
+	}
+	versionTransitionRestart := restarting && restartFenceRelease != nil
+	if versionTransitionRestart {
+		// Every external transaction admission point and background producer is
+		// now drained. Release the preflight fence so any ABCI Commit that already
+		// entered can finish, then stop Comet and wait for that final durable
+		// commit. The second snapshot below is the authoritative zero-loss gate.
+		restartFenceRelease()
+		restartFenceRelease = nil
+		stopErr := nodeCtrl.StopChain()
+		if stopErr != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("stop CometBFT before restart snapshot: %w", stopErr))
+		} else if quiesceErr == nil {
+			height, appHash, release := app.AcquireSnapshotStateFence()
+			if height <= 0 || len(appHash) == 0 {
+				shutdownErrs = append(shutdownErrs, errors.New("final restart snapshot has no committed application state"))
+			} else if _, snapshotErr := snapshotScheduler.TakeVerified(
+				context.Background(),
+				height,
+				appHash,
+				"final-pre-restart",
+				func(manifest *snapshot.Manifest) error {
+					if manifest == nil || manifest.Height != height || !bytes.Equal(manifest.AppHash, appHash) {
+						return errors.New("final restart snapshot does not match stopped application state")
+					}
+					return nil
+				},
+			); snapshotErr != nil {
+				shutdownErrs = append(shutdownErrs, fmt.Errorf("final restart snapshot: %w", snapshotErr))
+			}
+			release()
+		}
+	}
 	if err := errors.Join(shutdownErrs...); err != nil {
+		if versionTransitionRestart {
+			managedRollbackSucceeded := false
+			if execPath, pathErr := os.Executable(); pathErr == nil {
+				if resolved, resolveErr := filepath.EvalSymlinks(execPath); resolveErr == nil {
+					execPath = resolved
+				}
+				rolledBack, rollbackErr := web.RollbackPendingUpdate(execPath)
+				if rolledBack && rollbackErr == nil {
+					logger.Error().Err(err).Msg("final restart safety gate failed — restored previous binary and restarting it")
+					managedRollbackSucceeded = true
+				}
+				if rollbackErr != nil {
+					err = errors.Join(err, fmt.Errorf("restore previous binary after final gate failure: %w", rollbackErr))
+				}
+			}
+			if managedRollbackSucceeded {
+				preservePIDForExec = true
+				return errCoordinatedRestart
+			}
+			// Finder replacement has no managed update marker or old app bundle.
+			// Re-verify the exact executable pinned before drain and hand it to the
+			// outer exec loop. The replacement app remains untouched for operator
+			// recovery, while the known running binary resumes against unchanged
+			// chain state instead of leaving the node offline.
+			if preparedRestart.fallbackExec != "" && snapshotScheduler != nil {
+				verifiedFallback, verifyErr := verifyPreparedRestartFallback(snapshotScheduler, preparedRestart)
+				if verifyErr == nil {
+					restartExecOverride = verifiedFallback
+					preservePIDForExec = true
+					logger.Error().Err(err).Str("recovery_binary", verifiedFallback).
+						Msg("final restart safety gate failed — restarting exact pre-drain executable")
+					return errCoordinatedRestart
+				}
+				err = errors.Join(err, verifyErr)
+			}
+		}
 		return fmt.Errorf("clean shutdown failed: %w", err)
 	}
 	if startupErr != nil {
@@ -2233,6 +2537,12 @@ func runServe(startupProof string) (rerr error) {
 		return errCoordinatedRestart
 	}
 	return nil
+}
+
+func pendingUpdateMatchesRunningVersion(pending, running string) bool {
+	pending = strings.TrimPrefix(strings.TrimSpace(pending), "v")
+	running = strings.TrimPrefix(strings.TrimSpace(running), "v")
+	return pending != "" && running != "" && pending != "dev" && running != "dev" && pending == running
 }
 
 func stateSyncRecoveryActionName(action statesync.RecoveryAction) string {
@@ -3642,7 +3952,7 @@ func mcpBearerSignerLookup(
 // the configured agent_key_file, accepting either the 32-byte seed or the 64-byte expanded
 // private-key form (matches mountMCPHTTPTransport's existing parse). Empty
 // string + nil error means the file isn't present — the caller treats that as
-// "no operator key, hook bypass stays off."
+// "no operator compatibility identity; ordinary agent hooks are unaffected."
 func readNodeOperatorKey(path string) (string, error) {
 	path = filepath.Clean(expandTilde(path))
 	data, err := os.ReadFile(path) //nolint:gosec // path under operator's own home dir

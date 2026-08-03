@@ -158,6 +158,22 @@ func TestSageClaudeMDBlock_ContainsEssentials(t *testing.T) {
 	assert.Contains(t, sageClaudeMDBlock, ".mcp.json")
 }
 
+func TestSagePermissionsConfigRemovesRetiredAliases(t *testing.T) {
+	permissions := sagePermissionsConfig(map[string]any{
+		"permissions": map[string]any{
+			"allow": []any{
+				"mcp__sage__sage_red_pill",
+				"mcp__other__tool",
+			},
+		},
+	})
+	allow, ok := permissions["allow"].([]string)
+	require.True(t, ok)
+	assert.Contains(t, allow, "mcp__sage__sage_inception")
+	assert.NotContains(t, allow, "mcp__sage__sage_red_pill")
+	assert.Contains(t, allow, "mcp__other__tool", "non-SAGE permissions must be preserved")
+}
+
 // ─── Self-Heal Tests ───
 
 func TestSelfHeal_MigratesLegacyTwoScriptInstall(t *testing.T) {
@@ -212,11 +228,21 @@ func TestSelfHeal_DoesNotRewriteCurrentHooks(t *testing.T) {
 	}
 
 	infoBefore, _ := os.Stat(filepath.Join(hookDir, "sage-session-start.sh"))
+	settingsPath := filepath.Join(projectDir, ".claude", "settings.json")
+	require.NoError(t, os.WriteFile(settingsPath, []byte(`{
+  "permissions": {
+    "allow": ["mcp__sage__sage_red_pill", "mcp__other__tool"]
+  }
+}`), 0600))
 
 	selfHealProject(projectDir, sageHome)
 
 	infoAfter, _ := os.Stat(filepath.Join(hookDir, "sage-session-start.sh"))
 	assert.Equal(t, infoBefore.ModTime(), infoAfter.ModTime(), "current hooks should not be re-written")
+	settingsData, err := os.ReadFile(settingsPath)
+	require.NoError(t, err)
+	assert.NotContains(t, string(settingsData), "sage_red_pill", "settings migrate independently of hook bytes")
+	assert.Contains(t, string(settingsData), "mcp__other__tool")
 }
 
 func TestProjectMCPConfigMigratesLegacySharedNodeIdentity(t *testing.T) {
@@ -233,6 +259,27 @@ func TestProjectMCPConfigMigratesLegacySharedNodeIdentity(t *testing.T) {
 	expected := filepath.Join(providerProjectAgentDir(sageHome, projectDir, "claude-code"), "agent.key")
 	assert.Contains(t, string(data), expected)
 	assert.NotContains(t, string(data), sharedNodeKey)
+}
+
+func TestAppScopedMCPConfigNeverFallsBackToNodeRootIdentity(t *testing.T) {
+	sageHome := t.TempDir()
+	rootPath := filepath.Join(sageHome, "agent.key")
+	require.NoError(t, os.WriteFile(rootPath, make([]byte, 32), 0600))
+
+	for _, provider := range []string{"claude-desktop", "windsurf", "cursor"} {
+		t.Run(provider, func(t *testing.T) {
+			got := existingIdentityOrDefault("", sageHome, "", provider)
+			require.Equal(t,
+				filepath.Join(sageHome, "agents", "global-"+sanitizeDirName(provider), "agent.key"),
+				got,
+			)
+			require.NotEqual(t, rootPath, got)
+		})
+	}
+
+	custom := filepath.Join(sageHome, "agents", "reviewed", "agent.key")
+	require.Equal(t, custom, existingIdentityOrDefault(custom, sageHome, "", "claude-desktop"),
+		"an operator-pinned ordinary identity remains authoritative")
 }
 
 func TestSelfHeal_RewritesStaleBinaryPath(t *testing.T) {

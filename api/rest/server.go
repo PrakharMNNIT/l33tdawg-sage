@@ -57,10 +57,23 @@ type Server struct {
 	validatorSigningKeyConfigured bool
 	embedder                      embedding.Provider // Embedding provider (Ollama or hash)
 	OnEvent                       EventCallback      // Optional: called when notable events occur
-	suppCache                     SuppCacheWriter    // Bridges off-chain data (embeddings) to ABCI for consensus-first writes
-	mempool                       *mempoolSampler    // TTL-cached CometBFT mempool depth for backpressure signals
+	messageNotifier               func(AgentMessageNotification)
+	suppCache                     SuppCacheWriter // Bridges off-chain data (embeddings) to ABCI for consensus-first writes
+	mempool                       *mempoolSampler // TTL-cached CometBFT mempool depth for backpressure signals
 	taskIdempotencyMu             sync.Mutex
 	taskIdempotencyLocks          map[string]*taskIdempotencyLock
+	// federationProbeSem is shared by every request served by this node. A
+	// request-local worker pool alone lets several agents multiply outbound
+	// status/directory probes; this process-wide budget keeps peer pressure
+	// bounded even across concurrent MCP clients.
+	federationProbeSem chan struct{}
+	// federationProbeBudget bounds total outbound discovery calls across
+	// distinct queries; the semaphore alone bounds only simultaneous calls.
+	federationProbeBudget *federationProbeRateBudget
+	// federationAvailability coalesces identical caller-scoped discovery calls
+	// and briefly reuses their already-filtered response. The key includes the
+	// signed caller and query, so authorization results never cross principals.
+	federationAvailability *federationAvailabilityCache
 
 	// nodeOperatorID is the hex-encoded ed25519 public key of the local
 	// node operator (~/.sage/agent.key). When a request's X-Agent-ID
@@ -120,6 +133,22 @@ type Server struct {
 	// federation surface — handlers 501 and the recall merge is skipped, so
 	// unwired deployments/tests behave exactly pre-v11.
 	federation FederationService
+}
+
+// AgentMessageNotification is metadata-only best-effort wake-up data for an
+// already connected exact-recipient MCP SSE session. It is not delivery,
+// read, presence, or workflow evidence and deliberately excludes content.
+type AgentMessageNotification struct {
+	RecipientAgentID string    `json:"-"`
+	MessageID        string    `json:"message_id"`
+	FromAgent        string    `json:"from_agent"`
+	SentAt           time.Time `json:"sent_at"`
+}
+
+// SetMessageNotifier attaches the optional local HTTP-MCP SSE wake-up bridge.
+// Streamable HTTP, stdio, and nodes without HTTP MCP leave this unset.
+func (s *Server) SetMessageNotifier(notify func(AgentMessageNotification)) {
+	s.messageNotifier = notify
 }
 
 // FederationService is the slice of the federation.Manager the REST layer
@@ -211,6 +240,9 @@ func NewServer(cometbftRPC string, memStore store.MemoryStore, scoreStore store.
 		validatorSigningKeyConfigured: signingKeyConfigured,
 		embedder:                      embedProvider,
 		mempool:                       newMempoolSampler(cometbftRPC, DefaultMempoolMaxTxs),
+		federationProbeSem:            make(chan struct{}, maxConcurrentFedAvailability),
+		federationProbeBudget:         newFederationProbeRateBudget(),
+		federationAvailability:        newFederationAvailabilityCache(),
 	}
 	s.router = s.setupRouter()
 	return s
@@ -678,6 +710,7 @@ func (s *Server) setupRouter() chi.Router {
 		// pending, inactive, and internally inconsistent principals just like
 		// resolve/send/inbox do.
 		r.With(s.appV23PipelineAgentBoundary).Get("/v1/agents", s.handleListRegisteredAgents)
+		r.With(s.appV23PipelineAgentBoundary).Get("/v1/agents/directory", s.handleListAgentDirectory)
 		r.With(s.appV23PipelineAgentBoundary).Get("/v1/agents/lookup", s.handleFindRegisteredAgents)
 
 		// Memory endpoints
@@ -735,6 +768,8 @@ func (s *Server) setupRouter() chi.Router {
 
 		// Agent endpoints
 		r.Get("/v1/agent/me", s.handleGetAgent)
+		r.Get("/v1/agent/me/domains", s.handleGetAgentReadableDomains)
+		r.Get("/v1/agent/me/domains/owned", s.handleGetAgentOwnedDomainsPage)
 
 		// On-chain agent identity endpoints
 		r.Post("/v1/agent/register", s.handleAgentRegister)
@@ -795,6 +830,12 @@ func (s *Server) setupRouter() chi.Router {
 		// sovereign authority credential, never an inbox/contact identity.
 		r.Group(func(r chi.Router) {
 			r.Use(s.appV23PipelineAgentBoundary)
+			r.Post("/v1/messages", s.handleMessageSend)
+			r.Post("/v1/messages/receive", s.handleMessagesReceive)
+			r.Post("/v1/messages/{message_id}/reply", s.handleMessageReply)
+			r.Put("/v1/messages/{message_id}/read", s.handleMessageRead)
+			r.Put("/v1/messages/read-batch", s.handleMessageReadBatch)
+			r.Get("/v1/messages/{message_id}/status", s.handleMessageStatus)
 			r.Post("/v1/pipe/resolve", s.handlePipeResolve)
 			r.Post("/v1/pipe/send", s.handlePipeSend)
 			r.Get("/v1/pipe/inbox", s.handlePipeInbox)
@@ -802,7 +843,13 @@ func (s *Server) setupRouter() chi.Router {
 			r.Get("/v1/pipe/history/outbox", s.handlePipeOutbox)
 			r.Get("/v1/pipe/updates", s.handlePipeUpdates)
 			r.Put("/v1/pipe/{pipe_id}/claim", s.handlePipeClaim)
+			r.Get("/v1/pipe/{pipe_id}/receipt/challenge/{kind}", s.handlePipeReceiptChallenge)
+			r.Put("/v1/pipe/{pipe_id}/receipt/{kind}", s.handlePipeReceiptRecord)
+			r.Post("/v1/pipe/receipts/challenge-batch", s.handlePipeReceiptChallengeBatch)
+			r.Put("/v1/pipe/receipts/batch", s.handlePipeReceiptRecordBatch)
+			r.Get("/v1/pipe/{pipe_id}/receipt", s.handlePipeReceiptStatus)
 			r.Put("/v1/pipe/{pipe_id}/result", s.handlePipeResult)
+			r.Put("/v1/pipe/{message_id}/read", s.handleMessageRead)
 			r.Get("/v1/pipe/{pipe_id}", s.handlePipeStatus)
 			r.Get("/v1/pipe/results", s.handlePipeResults)
 		})

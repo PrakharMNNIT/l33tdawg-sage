@@ -6,9 +6,11 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -315,4 +317,197 @@ func TestAppV25LegacyRecoveryControlsRejectNonLocalRequests(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	handler.handleAppV25LegacyAdoptionRetry(recorder, request)
 	require.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+}
+
+func appV26RecoverySelectionRequest(
+	t *testing.T, path string, request appV25LegacyRecoveryControlRequest,
+	key ed25519.PrivateKey,
+) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(request)
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://localhost:8080")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Host = "localhost:8080"
+	req.RemoteAddr = "127.0.0.1:54321"
+	signAgentRequest(t, req, key, body)
+	return req
+}
+
+func TestAppV26LegacyRecoveryDecoderAcceptsMaximumBoundedSelection(t *testing.T) {
+	ids := make([]string, store.MaxLegacyMemoryRecoverySelection)
+	for i := range ids {
+		// Keep every ID distinct while exercising the 512-byte adoption wire
+		// bound. The old 4 KiB HTTP cap rejected this valid store-level shape.
+		prefix := fmt.Sprintf("%03d-", i)
+		ids[i] = prefix + strings.Repeat("x", 512-len(prefix))
+	}
+	body, err := json.Marshal(appV25LegacyRecoveryControlRequest{
+		ProjectionRevision: 1, ExpectedCount: len(ids), MemoryIDs: ids,
+		TargetAgentID: strings.Repeat("a", 64),
+	})
+	require.NoError(t, err)
+	require.Greater(t, len(body), 4096)
+	require.Less(t, len(body), appV26LegacyRecoveryRequestMaxBytes)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	decoded, ok := decodeAppV25LegacyRecoveryControlRequest(recorder, request)
+	require.True(t, ok, recorder.Body.String())
+	require.Len(t, decoded.MemoryIDs, store.MaxLegacyMemoryRecoverySelection)
+}
+
+func TestAppV26LegacyRecoveryInventoryAndCompanionAssignment(t *testing.T) {
+	handler, sqlite, fixture, _, _ := appV25RecoveryControlFixture(t)
+	handler.AppV26ActiveFn = func() bool { return true }
+	require.NoError(t, fixture.badger.RegisterDomain(
+		"historical/verified", fixture.agentID, "", 7,
+	))
+	content := "A verified historical memory whose old application label has no current key."
+	digest := sha256.Sum256([]byte(content))
+	require.NoError(t, sqlite.InsertMemory(context.Background(), &memory.MemoryRecord{
+		MemoryID: "legacy-assignable", SubmittingAgent: "retired application label",
+		Content: content, ContentHash: digest[:], MemoryType: memory.TypeFact,
+		DomainTag: "historical/verified", Status: memory.StatusCommitted,
+	}))
+	revision, err := sqlite.MemoryProjectionRevision(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, sqlite.SyncLegacyMemoryRecoveryQueue(
+		context.Background(), revision, []store.LegacyMemoryRecoveryItem{{
+			MemoryID: "legacy-assignable", Reason: "author_identity_unresolved",
+		}},
+	))
+	require.NoError(t, sqlite.PublishLegacyMemoryAdoptionProgress(
+		context.Background(), store.LegacyMemoryAdoptionProgress{
+			State: "recovery", Discovered: 1, Recovery: 1, Revision: revision,
+		},
+	))
+
+	get := httptest.NewRequest(http.MethodGet,
+		"/v1/dashboard/memory/adoption-inventory?limit=50", nil)
+	get.Host = "localhost:8080"
+	get.RemoteAddr = "127.0.0.1:54321"
+	get.Header.Set("Origin", "http://localhost:8080")
+	get.Header.Set("Sec-Fetch-Site", "same-origin")
+	signAgentRequest(t, get, fixture.rootKey, nil)
+	getRecorder := httptest.NewRecorder()
+	handler.handleAppV26LegacyRecoveryInventory(getRecorder, get)
+	require.Equal(t, http.StatusOK, getRecorder.Code, getRecorder.Body.String())
+	var inventory struct {
+		Items  []appV26LegacyRecoveryInventoryView `json:"items"`
+		Agents []struct {
+			AgentID string `json:"agent_id"`
+		} `json:"agents"`
+	}
+	require.NoError(t, json.Unmarshal(getRecorder.Body.Bytes(), &inventory))
+	require.Len(t, inventory.Items, 1)
+	require.True(t, inventory.Items[0].Assignable)
+	require.Contains(t, inventory.Items[0].ContentPreview, "verified historical memory")
+	require.Equal(t, "available", inventory.Items[0].AuthorityStatus)
+	require.Equal(t, fixture.agentID, inventory.Items[0].AuthorityOwnerID)
+	require.Equal(t, "historical/verified", inventory.Items[0].AuthorityOwnedDomain)
+	require.Contains(t, inventory.Agents, struct {
+		AgentID string `json:"agent_id"`
+	}{AgentID: fixture.agentID},
+		"an active Companion is a valid ordinary assignment target")
+
+	assign := appV26RecoverySelectionRequest(t,
+		"/v1/dashboard/memory/adoption-assign",
+		appV25LegacyRecoveryControlRequest{
+			ProjectionRevision: revision, ExpectedCount: 1,
+			MemoryIDs: []string{"legacy-assignable"}, TargetAgentID: fixture.agentID,
+		}, fixture.rootKey,
+	)
+	assignRecorder := httptest.NewRecorder()
+	handler.handleAppV26LegacyAdoptionAssign(assignRecorder, assign)
+	require.Equal(t, http.StatusAccepted, assignRecorder.Code, assignRecorder.Body.String())
+	assignments, err := sqlite.ListLegacyMemoryRecoveryAssignments(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, fixture.agentID, assignments["legacy-assignable"].TargetAgentID)
+	record, err := sqlite.GetMemory(context.Background(), "legacy-assignable")
+	require.NoError(t, err)
+	require.Equal(t, "retired application label", record.SubmittingAgent,
+		"local assignment intent must not rewrite historical authorship")
+}
+
+func TestAppV26LegacyRecoveryAssignableMatchesAtomicLifecycleRules(t *testing.T) {
+	content := "verified"
+	digest := sha256.Sum256([]byte(content))
+	base := store.LegacyMemoryRecoveryInventoryItem{
+		MemoryID: "legacy", Reason: "author_identity_unresolved",
+		SubmittingAgent: "historical", Content: content, ContentHash: digest[:],
+		Domain: "historical/domain", Classification: uint8(store.ClearanceInternal),
+	}
+	base.Status = memory.StatusProposed
+	require.True(t, appV26LegacyRecoveryAssignable(base))
+	base.Status = memory.StatusCommitted
+	require.True(t, appV26LegacyRecoveryAssignable(base))
+	for _, status := range []memory.MemoryStatus{
+		memory.StatusValidated, memory.StatusChallenged, memory.StatusDeprecated,
+	} {
+		base.Status = status
+		require.False(t, appV26LegacyRecoveryAssignable(base), status)
+	}
+}
+
+func TestAppV26LegacyRecoveryAssignmentRejectsReadOnlyAgent(t *testing.T) {
+	handler, sqlite, fixture, revision, _ := appV25RecoveryControlFixture(t)
+	handler.AppV26ActiveFn = func() bool { return true }
+	enrollment, err := fixture.badger.GetAppV23Enrollment(fixture.agentID)
+	require.NoError(t, err)
+	role, err := fixture.badger.GetAppV23Role(fixture.agentID)
+	require.NoError(t, err)
+	require.NoError(t, fixture.badger.SetAppV23Policy(
+		fixture.rootID, fixture.agentID, store.AppV23RoleMember,
+		enrollment.Profile, store.AppV23ProfileReadOnly, 1,
+		store.AgentCapabilityReadAllDomains, role.Revision, enrollment.Revision, 2,
+	))
+	request := appV26RecoverySelectionRequest(t,
+		"/v1/dashboard/memory/adoption-assign",
+		appV25LegacyRecoveryControlRequest{
+			ProjectionRevision: revision, ExpectedCount: 1,
+			MemoryIDs: []string{"legacy-unconvertible"}, TargetAgentID: fixture.agentID,
+		}, fixture.rootKey,
+	)
+	recorder := httptest.NewRecorder()
+	handler.handleAppV26LegacyAdoptionAssign(recorder, request)
+	require.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
+	assignments, err := sqlite.ListLegacyMemoryRecoveryAssignments(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, assignments)
+}
+
+func TestAppV26LegacyRecoveryTargetEligibilityRejectsAbsentInactiveAndRoot(t *testing.T) {
+	handler, _, fixture, _, _ := appV25RecoveryControlFixture(t)
+	handler.AppV26ActiveFn = func() bool { return true }
+
+	eligible, err := handler.appV26LegacyRecoveryTargetEligible(fixture.agentID)
+	require.NoError(t, err)
+	require.True(t, eligible)
+
+	eligible, err = handler.appV26LegacyRecoveryTargetEligible(strings.Repeat("f", 64))
+	require.NoError(t, err)
+	require.False(t, eligible)
+	eligible, err = handler.appV26LegacyRecoveryTargetEligible(fixture.rootID)
+	require.NoError(t, err)
+	require.False(t, eligible)
+
+	root, err := fixture.badger.GetAppV23Root()
+	require.NoError(t, err)
+	enrollment, err := fixture.badger.GetAppV23Enrollment(fixture.agentID)
+	require.NoError(t, err)
+	role, err := fixture.badger.GetAppV23Role(fixture.agentID)
+	require.NoError(t, err)
+	require.NoError(t, fixture.badger.ApproveAppV23LocalAgent(store.AppV23LocalEnrollment{
+		AgentID: fixture.agentID, ApprovedBy: root.CredentialID,
+		RootGeneration: root.Generation, Profile: enrollment.Profile,
+		HomeDomain: enrollment.HomeDomain, Clearance: enrollment.Clearance,
+		Capabilities: enrollment.Capabilities, Active: false, UpdatedHeight: 3,
+		RetireOwnedDomainsToRoot: true,
+	}, role.Role, enrollment.Revision, role.Revision))
+	eligible, err = handler.appV26LegacyRecoveryTargetEligible(fixture.agentID)
+	require.NoError(t, err)
+	require.False(t, eligible)
 }

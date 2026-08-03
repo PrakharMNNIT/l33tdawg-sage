@@ -272,6 +272,11 @@ func (m *Manager) linkedMessageLocalAgentEligible(agentID string) bool {
 	if err != nil || !eligible || m.badger == nil {
 		return false
 	}
+	enrollment, err := m.badger.GetAppV23Enrollment(agentID)
+	if err != nil || enrollment == nil || !enrollment.Active ||
+		enrollment.Profile == store.AppV23ProfileReadOnly {
+		return false
+	}
 	// Linked messaging exists only in app-v23, so the deny bit is always live;
 	// do not rely on an optional legacy app-v22 activation callback.
 	capabilities, registered, err :=
@@ -1037,6 +1042,14 @@ func (m *Manager) ResolveRemoteLinkedPipeTarget(
 	if err != nil {
 		return nil, ErrRemotePipeTargetNotFound
 	}
+	status, err := m.fetchPeerStatusForPipeLookup(ctx, agreement)
+	if err != nil || !hasFederatedPipelineCapability(status) {
+		return nil, ErrRemotePipeTargetNotFound
+	}
+	receiptProtocolVersion := 0
+	if hasFederatedPipelineReceiptV2Capability(status) {
+		receiptProtocolVersion = PipeReceiptVersion
+	}
 	peerAgentID, err := m.ResolvePeerOperatorAgentID(ctx, remoteChainID)
 	if err != nil {
 		return nil, ErrRemotePipeTargetNotFound
@@ -1089,6 +1102,7 @@ func (m *Manager) ResolveRemoteLinkedPipeTarget(
 			!linkedMessageRelationEqual(targetResult.LinkedRelation, relation) {
 			return nil, ErrRemotePipeTargetNotFound
 		}
+		targetResult.ReceiptProtocolVersion = receiptProtocolVersion
 		return targetResult, nil
 	}
 
@@ -1117,6 +1131,7 @@ func (m *Manager) ResolveRemoteLinkedPipeTarget(
 		validateLinkedMessageRelation(relation, peerAgentID) != nil {
 		return nil, ErrRemotePipeTargetNotFound
 	}
+	targetResult.ReceiptProtocolVersion = receiptProtocolVersion
 	return targetResult, nil
 }
 

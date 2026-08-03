@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -30,6 +32,7 @@ const (
 type appV23AgentAccessView struct {
 	AgentID              string `json:"agent_id"`
 	Name                 string `json:"name,omitempty"`
+	RegisteredName       string `json:"registered_name,omitempty"`
 	Avatar               string `json:"avatar,omitempty"`
 	Status               string `json:"status,omitempty"`
 	Provider             string `json:"provider,omitempty"`
@@ -162,6 +165,10 @@ type appV23PolicyRequest struct {
 	Capabilities uint32 `json:"capabilities"`
 }
 
+type appV26AgentDisplayNameRequest struct {
+	Name string `json:"name"`
+}
+
 func appV23PolicyNeedsHomeReapproval(
 	enrollment *store.AppV23LocalEnrollment,
 	nextProfile string,
@@ -173,9 +180,116 @@ func appV23PolicyNeedsHomeReapproval(
 		nextProfile != store.AppV23ProfileReadOnly
 }
 
+// handleAppV26AgentDisplayName gives the local human operator a governed way
+// to change only an agent's mutable display label. The registered name,
+// agent_id, and boot bio are copied from current consensus state and cannot be
+// supplied by the browser. Consensus enforces the same invariant at H+1, so a
+// forged AgentUpdate cannot use this route's authority to rewrite identity or
+// purpose metadata.
+func (h *DashboardHandler) handleAppV26AgentDisplayName() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		actor, ok := h.requireAppV23ControlActor(w, r, true)
+		if !ok {
+			return
+		}
+		if !h.appV26IsActive() {
+			writeAppV23AccessError(w, http.StatusConflict, "app_v26_inactive",
+				"Operator display-name changes require governed app-v26 activation.")
+			return
+		}
+		agentID := strings.TrimSpace(chi.URLParam(r, "id"))
+		if _, err := auth.AgentIDToPublicKey(agentID); err != nil {
+			writeAppV23AccessError(w, http.StatusBadRequest, "invalid_agent_id",
+				"Agent ID must be canonical lowercase Ed25519 hex.")
+			return
+		}
+		if h.appV23IsRootIdentity(agentID) {
+			writeAppV23AccessError(w, http.StatusForbidden, "root_identity_immutable",
+				"CEREBRUM Root is sovereign authority and cannot be renamed as an agent.")
+			return
+		}
+		var req appV26AgentDisplayNameRequest
+		if err := decodeAppV23AccessJSON(w, r, &req); err != nil {
+			writeAppV23AccessError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		req.Name = strings.TrimSpace(req.Name)
+		if !utf8.ValidString(req.Name) || req.Name == "" || len(req.Name) > 128 {
+			writeAppV23AccessError(w, http.StatusBadRequest, "invalid_display_name",
+				"Display name must be 1–128 UTF-8 bytes after trimming.")
+			return
+		}
+		current, err := h.BadgerStore.GetRegisteredAgent(agentID)
+		if err != nil || current == nil {
+			writeAppV23AccessError(w, http.StatusNotFound, "agent_not_registered",
+				"The selected local agent is not registered in consensus state.")
+			return
+		}
+		if req.Name == current.Name {
+			writeJSONResp(w, http.StatusOK, map[string]any{
+				"ok": true, "status": "unchanged", "committed": false,
+				"agent_id": agentID, "name": current.Name,
+				"registered_name": current.RegisteredName,
+			})
+			return
+		}
+		ptx := &tx.ParsedTx{
+			Type: tx.TxTypeAgentUpdate,
+			AgentUpdateTx: &tx.AgentUpdate{
+				AgentID: agentID,
+				Name:    req.Name,
+				BootBio: current.BootBio,
+			},
+		}
+		hash, height, _, broadcastErr := h.signAndBroadcastAppV23ControlContext(r.Context(), ptx, actor)
+		reconciled := false
+		if broadcastErr != nil {
+			if isIndeterminateCommitError(broadcastErr) {
+				reconciled = waitForAppV23CommittedState(func() bool {
+					updated, lookupErr := h.BadgerStore.GetRegisteredAgent(agentID)
+					return lookupErr == nil && updated != nil && updated.Name == req.Name &&
+						updated.BootBio == current.BootBio &&
+						updated.RegisteredName == current.RegisteredName
+				})
+				if !reconciled {
+					writeAppV23CommitUnconfirmed(w, "agent display-name change")
+					return
+				}
+			} else {
+				writeAppV23AccessError(w, http.StatusConflict, "consensus_rejected",
+					"The display-name change was not committed.")
+				return
+			}
+		}
+		projectionReady := false
+		projectionWarning := "The display name committed, but the local Agents view is still catching up. Do not submit the rename again."
+		if agentStore, storeOK := h.store.(store.AgentStore); storeOK {
+			local, localErr := agentStore.GetAgent(r.Context(), agentID)
+			if localErr == nil && local != nil {
+				projected := *local
+				projected.Name = req.Name
+				projected.RegisteredName = current.RegisteredName
+				projected.BootBio = current.BootBio
+				if updateErr := agentStore.UpdateAgent(r.Context(), &projected); updateErr == nil {
+					projectionReady = true
+					projectionWarning = ""
+				}
+			}
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"ok": true, "status": "committed", "committed": true,
+			"agent_id": agentID, "name": req.Name,
+			"registered_name": current.RegisteredName,
+			"tx_hash":         hash, "height": height, "reconciled": reconciled,
+			"projection_ready": projectionReady, "projection_warning": projectionWarning,
+		})
+	}
+}
+
 type appV23GroupRequest struct {
 	Name             string   `json:"name"`
 	Members          []string `json:"members"`
+	MemberAuthority  string   `json:"member_authority"`
 	ExpectedRevision uint64   `json:"expected_revision"`
 }
 
@@ -225,6 +339,10 @@ func decodeAppV23AccessJSON(w http.ResponseWriter, r *http.Request, dst any) err
 
 func (h *DashboardHandler) appV23IsActive() bool {
 	return h.AppV23ActiveFn != nil && h.AppV23ActiveFn()
+}
+
+func (h *DashboardHandler) appV26IsActive() bool {
+	return h.AppV26ActiveFn != nil && h.AppV26ActiveFn()
 }
 
 func (h *DashboardHandler) appV23IsRootIdentity(agentID string) bool {
@@ -520,10 +638,116 @@ func (h *DashboardHandler) signAndBroadcastAppV23Control(
 	ptx *tx.ParsedTx,
 	actor *appV23ControlActor,
 ) (string, int64, string, error) {
+	return h.signAndBroadcastAppV23ControlContext(context.Background(), ptx, actor)
+}
+
+func (h *DashboardHandler) signAndBroadcastAppV23ControlContext(
+	ctx context.Context,
+	ptx *tx.ParsedTx,
+	actor *appV23ControlActor,
+) (string, int64, string, error) {
 	if err := h.appV23AttachElevation(ptx, actor); err != nil {
 		return "", 0, "", err
 	}
-	return h.signAndBroadcastCommit(ptx, actor.Key)
+	return h.signAndBroadcastCommitContext(ctx, ptx, actor.Key)
+}
+
+const appV23CommitReconcileTimeout = 2 * time.Second
+
+func waitForAppV23CommittedState(check func() bool) bool {
+	deadline := time.NewTimer(appV23CommitReconcileTimeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		if check() {
+			return true
+		}
+		select {
+		case <-deadline.C:
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *DashboardHandler) appV23PolicyMatches(ptx *tx.ParsedTx) bool {
+	if h.BadgerStore == nil || ptx == nil {
+		return false
+	}
+	var agentID, role, profile, homeDomain string
+	var clearance uint8
+	var capabilities store.AgentCapabilities
+	var minimumEnrollmentRevision, minimumRoleRevision uint64
+	switch ptx.Type {
+	case tx.TxTypeLocalAgentApprove:
+		approval := ptx.LocalAgentApprove
+		if approval == nil || !approval.Active {
+			return false
+		}
+		agentID, role, profile, homeDomain = approval.AgentID, approval.Role, approval.Profile, approval.HomeDomain
+		clearance = approval.Clearance
+		capabilities = store.AgentCapabilities(approval.Capabilities)
+		minimumEnrollmentRevision = approval.ExpectedRevision + 1
+		minimumRoleRevision = approval.ExpectedRoleRevision + 1
+	case tx.TxTypeAgentRoleChange:
+		change := ptx.AgentRoleChange
+		if change == nil {
+			return false
+		}
+		agentID, role, profile = change.AgentID, change.Role, change.Profile
+		clearance = change.Clearance
+		capabilities = store.AgentCapabilities(change.Capabilities)
+		minimumEnrollmentRevision = change.EnrollmentRevision
+		minimumRoleRevision = change.ExpectedRevision + 1
+	default:
+		return false
+	}
+	enrollment, enrollmentErr := h.BadgerStore.GetAppV23Enrollment(agentID)
+	roleState, roleErr := h.BadgerStore.GetAppV23Role(agentID)
+	if enrollmentErr != nil || roleErr != nil || enrollment == nil || roleState == nil {
+		return false
+	}
+	if !enrollment.Active || enrollment.Profile != profile || enrollment.Clearance != clearance ||
+		enrollment.Capabilities != capabilities || enrollment.Revision < minimumEnrollmentRevision ||
+		roleState.Role != role || roleState.Revision < minimumRoleRevision {
+		return false
+	}
+	return ptx.Type != tx.TxTypeLocalAgentApprove || enrollment.HomeDomain == homeDomain
+}
+
+func (h *DashboardHandler) appV23GroupMatches(mutation *tx.AccessGroupMutate) bool {
+	if h.BadgerStore == nil || mutation == nil {
+		return false
+	}
+	group, err := h.BadgerStore.GetAppV23AccessGroup(mutation.GroupID)
+	if err != nil {
+		return false
+	}
+	if mutation.Delete {
+		return group == nil
+	}
+	if group == nil || group.Name != mutation.Name || group.MemberAuthority != mutation.MemberAuthority ||
+		group.Revision < mutation.ExpectedRevision+1 ||
+		len(group.Members) != len(mutation.Members) {
+		return false
+	}
+	for i := range group.Members {
+		if group.Members[i] != mutation.Members[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func writeAppV23CommitUnconfirmed(w http.ResponseWriter, action string) {
+	writeJSONResp(w, http.StatusAccepted, map[string]any{
+		"ok":        false,
+		"status":    "confirmation_pending",
+		"code":      "consensus_commit_unconfirmed",
+		"retryable": false,
+		"error":     "The " + action + " may already be committed. CEREBRUM will refresh consensus state; do not submit it again until the current state is shown.",
+	})
 }
 
 // handleAppV23AccessState returns the consensus-authoritative Access Group and
@@ -531,6 +755,10 @@ func (h *DashboardHandler) signAndBroadcastAppV23Control(
 // import the browser's historical localStorage groups.
 func (h *DashboardHandler) handleAppV23AccessState(agentStore store.AgentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// This response is live consensus authority state. Browser/proxy caching
+		// can otherwise resurrect a pre-commit roster after rename, approval, or
+		// group changes and tempt the operator into submitting a duplicate.
+		w.Header().Set("Cache-Control", "no-store")
 		if h.BadgerStore == nil {
 			writeAppV23AccessError(w, http.StatusServiceUnavailable, "consensus_state_unavailable",
 				"Consensus access-control state is unavailable.")
@@ -576,13 +804,26 @@ func (h *DashboardHandler) handleAppV23AccessState(agentStore store.AgentStore) 
 				continue
 			}
 			view := appV23AgentAccessView{
-				AgentID:      agent.AgentID,
-				Role:         agent.Role,
-				Clearance:    agent.Clearance,
-				Capabilities: uint32(agent.Capabilities),
+				AgentID:        agent.AgentID,
+				Name:           agent.Name,
+				RegisteredName: agent.RegisteredName,
+				Role:           agent.Role,
+				Clearance:      agent.Clearance,
+				Capabilities:   uint32(agent.Capabilities),
 			}
 			if local := metadata[agent.AgentID]; local != nil {
-				view.Name = local.Name
+				// Consensus is authoritative for a governed display-name once it
+				// exists.  The SQLite row is only a compatibility fallback for
+				// older registrations whose on-chain name is empty.  Letting a
+				// stale local projection override a committed rename makes the
+				// operator think the transaction was lost and invites a duplicate
+				// submission after a projection write/restart failure.
+				if view.Name == "" && local.Name != "" {
+					view.Name = local.Name
+				}
+				if view.RegisteredName == "" {
+					view.RegisteredName = local.RegisteredName
+				}
 				view.Avatar = local.Avatar
 				view.Status = local.Status
 				view.Provider = local.Provider
@@ -598,6 +839,24 @@ func (h *DashboardHandler) handleAppV23AccessState(agentStore store.AgentStore) 
 				writeAppV23AccessError(w, http.StatusInternalServerError, "enrollment_state_unavailable",
 					"Could not load local enrollment state.")
 				return
+			}
+			// A Root-rejected pending identity remains in immutable chain history,
+			// but its removed node-local projection keeps it out of the actionable
+			// review queue. A later signed registration request restores that
+			// projection and makes the identity visible for a fresh review.
+			local := metadata[agent.AgentID]
+			if local == nil && (enrollment == nil || !enrollment.Active) {
+				// ListAgents intentionally excludes removed rows. Consult the exact
+				// identity only for an already non-active consensus principal so a
+				// rejected pending registration does not reappear merely because the
+				// broad local roster correctly hid its removed projection.
+				if exact, exactErr := agentStore.GetAgent(r.Context(), agent.AgentID); exactErr == nil {
+					local = exact
+				}
+			}
+			if local != nil &&
+				local.Status == "removed" && (enrollment == nil || !enrollment.Active) {
+				continue
 			}
 			role, roleErr := h.BadgerStore.GetAppV23Role(agent.AgentID)
 			if roleErr != nil {
@@ -658,12 +917,13 @@ func (h *DashboardHandler) handleAppV23AccessState(agentStore store.AgentStore) 
 			}
 		}
 		writeJSONResp(w, http.StatusOK, map[string]any{
-			"ok":     true,
-			"active": h.appV23IsActive(),
-			"root":   root,
-			"broker": broker,
-			"agents": views,
-			"groups": groups,
+			"ok":                     true,
+			"active":                 h.appV23IsActive(),
+			"group_authority_active": h.appV26IsActive(),
+			"root":                   root,
+			"broker":                 broker,
+			"agents":                 views,
+			"groups":                 groups,
 			"profiles": []string{
 				store.AppV23ProfileStandard,
 				store.AppV23ProfileCompanion,
@@ -837,18 +1097,52 @@ func (h *DashboardHandler) handleAppV23AgentPolicy() http.HandlerFunc {
 				},
 			}
 		}
-		hash, height, _, err := h.signAndBroadcastAppV23Control(ptx, actor)
+		hash, height, _, err := h.signAndBroadcastAppV23ControlContext(r.Context(), ptx, actor)
+		reconciled := false
 		if err != nil {
-			writeAppV23AccessError(w, http.StatusConflict, "consensus_rejected",
-				"The consensus policy update was not committed.")
-			return
+			if isIndeterminateCommitError(err) {
+				reconciled = waitForAppV23CommittedState(func() bool {
+					return h.appV23PolicyMatches(ptx)
+				})
+				if !reconciled {
+					writeAppV23CommitUnconfirmed(w, "agent policy update")
+					return
+				}
+			} else {
+				writeAppV23AccessError(w, http.StatusConflict, "consensus_rejected",
+					"The consensus policy update was not committed.")
+				return
+			}
+		}
+		projectionReady := true
+		projectionWarning := ""
+		if ptx.Type == tx.TxTypeLocalAgentApprove {
+			projectionReady = false
+			agentStore, ok := h.store.(store.AgentStore)
+			if !ok {
+				projectionWarning = "The agent was approved, but its local Agents view projection is not available yet."
+			} else {
+				projectionCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, projectionErr := store.EnsureAppV23AgentProjection(
+					projectionCtx, agentStore, h.BadgerStore, agentID, nil,
+				)
+				cancel()
+				if projectionErr == nil {
+					projectionReady = true
+				} else {
+					projectionWarning = "The agent was approved on-chain, but its local Agents view is still being repaired. Do not approve it again."
+				}
+			}
 		}
 		writeJSONResp(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"mode":    mode,
-			"tx_type": ptx.Type,
-			"tx_hash": hash,
-			"height":  height,
+			"ok":                 true,
+			"mode":               mode,
+			"tx_type":            ptx.Type,
+			"tx_hash":            hash,
+			"height":             height,
+			"reconciled":         reconciled,
+			"projection_ready":   projectionReady,
+			"projection_warning": projectionWarning,
 		})
 	}
 }
@@ -877,6 +1171,14 @@ func canonicalAppV23GroupMembers(
 		enrollment, err := badgerStore.GetAppV23Enrollment(member)
 		if err != nil || enrollment == nil || !enrollment.Active {
 			return nil, fmt.Errorf("member %q does not have active local approval", member)
+		}
+		role, roleErr := badgerStore.GetAppV23Role(member)
+		if roleErr != nil || role == nil {
+			return nil, fmt.Errorf("member %q does not have committed local role state", member)
+		}
+		if root != nil && role.Role == store.AppV23RoleAdmin &&
+			enrollment.RootGeneration != root.Generation {
+			return nil, fmt.Errorf("member %q is suspended until the current CEREBRUM Root reauthorizes it", member)
 		}
 	}
 	return canonical, nil
@@ -915,9 +1217,20 @@ func (h *DashboardHandler) handleAppV23AccessGroupPut() http.HandlerFunc {
 			return
 		}
 		req.Name = strings.TrimSpace(req.Name)
+		req.MemberAuthority = strings.TrimSpace(strings.ToLower(req.MemberAuthority))
 		if req.Name == "" || len(req.Name) > 128 {
 			writeAppV23AccessError(w, http.StatusBadRequest, "invalid_group_name",
 				"Group name must be 1–128 characters.")
+			return
+		}
+		if h.appV26IsActive() {
+			if err := store.ValidateAppV26GroupAuthority(req.MemberAuthority); err != nil {
+				writeAppV23AccessError(w, http.StatusBadRequest, "invalid_group_authority", err.Error())
+				return
+			}
+		} else if req.MemberAuthority != "" {
+			writeAppV23AccessError(w, http.StatusConflict, "app_v26_inactive",
+				"Group member authority becomes editable after governed app-v26 activation.")
 			return
 		}
 		members, err := canonicalAppV23GroupMembers(h.BadgerStore, root, req.Members)
@@ -930,18 +1243,31 @@ func (h *DashboardHandler) handleAppV23AccessGroupPut() http.HandlerFunc {
 			AccessGroupMutate: &tx.AccessGroupMutate{
 				GroupID:          groupID,
 				Name:             req.Name,
+				MemberAuthority:  req.MemberAuthority,
 				ExpectedRevision: req.ExpectedRevision,
 				Members:          members,
 			},
 		}
-		hash, height, _, err := h.signAndBroadcastAppV23Control(ptx, actor)
+		hash, height, _, err := h.signAndBroadcastAppV23ControlContext(r.Context(), ptx, actor)
+		reconciled := false
 		if err != nil {
-			writeAppV23AccessError(w, http.StatusConflict, "consensus_rejected",
-				"The consensus group update was not committed.")
-			return
+			if isIndeterminateCommitError(err) {
+				reconciled = waitForAppV23CommittedState(func() bool {
+					return h.appV23GroupMatches(ptx.AccessGroupMutate)
+				})
+				if !reconciled {
+					writeAppV23CommitUnconfirmed(w, "Access Group update")
+					return
+				}
+			} else {
+				writeAppV23AccessError(w, http.StatusConflict, "consensus_rejected",
+					"The consensus group update was not committed.")
+				return
+			}
 		}
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": true, "tx_type": ptx.Type, "tx_hash": hash, "height": height,
+			"reconciled": reconciled,
 		})
 	}
 }
@@ -971,14 +1297,26 @@ func (h *DashboardHandler) handleAppV23AccessGroupDelete() http.HandlerFunc {
 				Delete:           true,
 			},
 		}
-		hash, height, _, err := h.signAndBroadcastAppV23Control(ptx, actor)
+		hash, height, _, err := h.signAndBroadcastAppV23ControlContext(r.Context(), ptx, actor)
+		reconciled := false
 		if err != nil {
-			writeAppV23AccessError(w, http.StatusConflict, "consensus_rejected",
-				"The consensus group deletion was not committed.")
-			return
+			if isIndeterminateCommitError(err) {
+				reconciled = waitForAppV23CommittedState(func() bool {
+					return h.appV23GroupMatches(ptx.AccessGroupMutate)
+				})
+				if !reconciled {
+					writeAppV23CommitUnconfirmed(w, "Access Group deletion")
+					return
+				}
+			} else {
+				writeAppV23AccessError(w, http.StatusConflict, "consensus_rejected",
+					"The consensus group deletion was not committed.")
+				return
+			}
 		}
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": true, "tx_type": ptx.Type, "tx_hash": hash, "height": height,
+			"reconciled": reconciled,
 		})
 	}
 }
