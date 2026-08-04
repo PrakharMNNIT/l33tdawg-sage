@@ -52,7 +52,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.4';
+const SAGE_VERSION = 'v11.17.5';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -16513,7 +16513,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 					...fedPermissionSnapshot(draft),
 					...ownedDomains.map(domain => ({ domain, read: true })),
 				]);
-				const response = await fedPermissionsSet(chain, nextPermissions);
+				const response = await fedPermissionsSet(chain, fedPermissionSnapshot(nextPermissions));
 				const updatedPermissions = normalizeFedPermissionList(
 					Array.isArray(response && response.local_permissions) ? response.local_permissions : nextPermissions
 				);

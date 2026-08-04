@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.17.4. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.17.5. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -997,8 +997,8 @@ Pre-app-v23 nodes retain their legacy projection behavior.
 | `PUT /v1/dashboard/network/access/linked-messages/consent` | Set `accepting` for one exact tuple using `expected_revision`; never creates a read link, contact, group membership, domain grant, role, or write authority. |
 | `POST /v1/dashboard/network/access/root/handover` | Dedicated current-Root-only credential handover with irreversible confirmation, exact phrase, and expected Root generation. Returns the replacement recovery archive once with `Cache-Control: no-store`. |
 | `GET /v1/dashboard/memory/adoption-progress` | Root/operator aggregate App-v25 historical-recovery progress. It returns counts and state only—never the hidden records' content, domains, authors, or reasons. |
-| `POST /v1/dashboard/memory/adoption-retry` | Current-Root-only request for a fresh scan of the exact unresolved App-v25 snapshot. Requires its `projection_revision` and `expected_count`; it never deletes rows or clears earlier dispositions. |
-| `POST /v1/dashboard/memory/adoption-deprecate` | Current-Root-only retirement of the exact unresolved snapshot. Requires `projection_revision`, `expected_count`, and typed `DEPRECATE <count>` confirmation. Records remain preserved for audit and are skipped by future automatic repair. |
+| `POST /v1/dashboard/memory/adoption-retry` | Current-Root-only request for a fresh scan of the exact unresolved App-v25 snapshot. Requires the `projection_revision` field (zero is valid for a first upgraded snapshot) and a positive `expected_count`; it never deletes rows or clears earlier dispositions. |
+| `POST /v1/dashboard/memory/adoption-deprecate` | Current-Root-only retirement of the exact unresolved snapshot. Requires the `projection_revision` field (including valid zero), positive `expected_count`, and typed `DEPRECATE <count>` confirmation. Records remain preserved for audit and are skipped by future automatic repair. |
 
 Once app-v26 is active, the legacy
 `PATCH /v1/dashboard/network/agents/{id}` metadata route rejects `name` and

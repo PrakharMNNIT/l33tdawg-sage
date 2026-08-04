@@ -1010,6 +1010,10 @@ test('federation agent contacts stay administrative and default-off', () => {
         'raw agent hashes must not be required by the federation UI');
     assert.match(panel, /fedPipeContactsGet\(chain, false, agentID\)/,
         'the friendly selection must still resolve through the exact authorization identity');
+	assert.match(panel, /fedPermissionsSet\(chain, fedPermissionSnapshot\(nextPermissions\)\)/,
+		'auto-sharing an agent-owned domain must send the permissions array required by the API');
+	assert.doesNotMatch(panel, /fedPermissionsSet\(chain, nextPermissions\)/,
+		'the normalized permission map must never be sent as the wire-level permissions array');
     assert.match(appSource, /function mergeFedPipeContactGrant\(base, targeted = \[\]\)/);
     assert.match(appSource, /grant\.agreement_id \|\| grant\.agreementId/,
         'normalized grants must retain their agreement binding');
