@@ -1077,11 +1077,12 @@ test('public mutations are serial, resumable, and downstream of the gate', () =>
   assert.doesNotMatch(workflow, /git push/);
 });
 
-test('write permissions exist only at the publication boundary', () => {
+test('write permissions exist only at the private verification and publication boundary', () => {
   assert.match(workflow, /^permissions:\n  contents: read$/m);
   assert.doesNotMatch(job('goreleaser-prepare'), /contents: write|packages: write|id-token: write/);
   assert.doesNotMatch(job('docker-image'), /contents: write|packages: write|id-token: write/);
   assert.match(job('stage-github-release'), /contents: write/);
+  assert.match(job('verify-staged-macos-release'), /contents: write/);
   assert.match(job('publish-docker-version'), /packages: write/);
   assert.match(job('publish-mcp'), /id-token: write/);
   assert.match(job('publish-docker-latest'), /packages: write/);

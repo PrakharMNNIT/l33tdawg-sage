@@ -1221,7 +1221,10 @@ jobs:
     runs-on: macos-latest
     needs: [stage-github-release, release-metadata]
     permissions:
-      contents: read
+      # Draft releases are visible only to callers with push access. Keep the
+      # broader workflow read-only and elevate only this verifier so it can
+      # resolve and download the exact private assets staged by the prior job.
+      contents: write
     steps:
       # Artifact checks during packaging are necessary but not sufficient: this
       # repeats the verification against the exact DMGs uploaded to the private
@@ -1279,6 +1282,11 @@ jobs:
               download_draft_asset "${dmg_name}.sha256"
             done
           done
+
+          # No GitHub API call is needed below this point. In particular, do
+          # not let a staged executable inherit repository write authority
+          # when the verifier runs its local `version` smoke check.
+          unset GH_TOKEN
 
           for arch in arm64 x86_64; do
             for dmg_name in \
