@@ -105,6 +105,7 @@ func TestHandlePipeEventSendVerifiesProofLifetimeContactAndDeduplicates(t *testi
 	signedBody, err := json.Marshal(map[string]any{
 		"to_agent": contact.AgentID, "source_chain_id": "chain-peer", "destination_chain_id": "chain-local",
 		"intent": "triage", "payload": "review finding", "ttl_minutes": 90,
+		"idempotency_key": "canonical-message-retry-token",
 	})
 	require.NoError(t, err)
 	proof := signedPipeProof(t, sourcePriv, sourceAgent, http.MethodPost, "/v1/pipe/send", signedBody, ts.Unix())

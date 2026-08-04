@@ -1024,6 +1024,9 @@ nothing about whether a pipe this agent sent has received a result.
 
 ### sage_pipe_receipt_status
 
+**Compatibility:** Deprecated alias for `sage_message_status`; retained for
+older clients and historical `pipe-*` identifiers.
+
 **Purpose:** Query the payload-free receipt-v2 projection for one federated
 pipe sent by this exact caller.
 
@@ -1345,6 +1348,9 @@ for durable records.
 ---
 
 ### sage_pipe_result
+
+**Compatibility:** Deprecated alias for `sage_message_reply`; retained for
+older clients and historical `pipe-*` identifiers.
 
 **Purpose:** Return results for a claimed pipeline work item. Local results keep
 their existing metadata-only completion journal; untrusted request, provider,

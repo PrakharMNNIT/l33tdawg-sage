@@ -81,6 +81,10 @@ type signedPipeSendRequest struct {
 	Intent             string `json:"intent"`
 	Payload            string `json:"payload"`
 	TTLMinutes         int    `json:"ttl_minutes"`
+	// IdempotencyKey is sender-local replay control. It is intentionally not
+	// copied into the federated event, but current message clients include it
+	// in the exact signed /v1/pipe/send request that the peer verifies.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 type signedPipeResultRequest struct {
