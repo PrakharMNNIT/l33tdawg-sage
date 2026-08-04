@@ -26,8 +26,20 @@ type federatedPipeTargetResolver interface {
 	ResolveRemotePipeTarget(context.Context, string) (*federation.RemotePipeTarget, error)
 }
 
+type federatedCallerPipeTargetResolver interface {
+	ResolveRemotePipeTargetForCaller(context.Context, string, string) (*federation.RemotePipeTarget, error)
+}
+
 type federatedLinkedPipeTargetResolver interface {
 	ResolveRemoteLinkedPipeTarget(
+		context.Context,
+		string,
+		string,
+	) (*federation.RemotePipeTarget, error)
+}
+
+type federatedCallerLinkedPipeTargetResolver interface {
+	ResolveRemoteLinkedPipeTargetForCaller(
 		context.Context,
 		string,
 		string,
@@ -220,16 +232,32 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 			return nil, false
 		}
 		if isQualifiedFederatedPipeTarget(target) {
-			if linkedResolver, linkedOK := s.federation.(federatedLinkedPipeTargetResolver); linkedOK {
+			callerID := middleware.ContextAgentID(r.Context())
+			if linkedResolver, linkedOK := s.federation.(federatedCallerLinkedPipeTargetResolver); linkedOK {
+				resolved, linkedErr := linkedResolver.ResolveRemoteLinkedPipeTargetForCaller(
+					r.Context(), callerID, target,
+				)
+				if linkedErr == nil && resolved != nil {
+					return resolved, true
+				}
+			} else if linkedResolver, linkedOK := s.federation.(federatedLinkedPipeTargetResolver); linkedOK {
 				resolved, linkedErr := linkedResolver.ResolveRemoteLinkedPipeTarget(
-					r.Context(), middleware.ContextAgentID(r.Context()), target,
+					r.Context(), callerID, target,
 				)
 				if linkedErr == nil && resolved != nil {
 					return resolved, true
 				}
 			}
 		}
-		resolved, err := resolver.ResolveRemotePipeTarget(r.Context(), target)
+		var resolved *federation.RemotePipeTarget
+		var err error
+		if callerResolver, callerOK := s.federation.(federatedCallerPipeTargetResolver); callerOK {
+			resolved, err = callerResolver.ResolveRemotePipeTargetForCaller(
+				r.Context(), middleware.ContextAgentID(r.Context()), target,
+			)
+		} else {
+			resolved, err = resolver.ResolveRemotePipeTarget(r.Context(), target)
+		}
 		if err != nil {
 			if !errors.Is(err, federation.ErrRemotePipeTargetNotFound) || isQualifiedFederatedPipeTarget(target) {
 				s.writeRemotePipeTargetError(w, err)
@@ -410,7 +438,11 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var err error
-		if linkedResolver, linkedOK := s.federation.(federatedLinkedPipeTargetResolver); linkedOK {
+		if linkedResolver, linkedOK := s.federation.(federatedCallerLinkedPipeTargetResolver); linkedOK {
+			remoteTarget, err = linkedResolver.ResolveRemoteLinkedPipeTargetForCaller(
+				r.Context(), agentID, qualifiedTarget,
+			)
+		} else if linkedResolver, linkedOK := s.federation.(federatedLinkedPipeTargetResolver); linkedOK {
 			remoteTarget, err = linkedResolver.ResolveRemoteLinkedPipeTarget(
 				r.Context(), agentID, qualifiedTarget,
 			)
@@ -419,9 +451,15 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			// An exact linked relation is caller-specific. If none exists,
 			// preserve the ordinary contact resolver and its historical error
 			// contract; never accept relation bytes supplied by the client.
-			remoteTarget, err = resolver.ResolveRemotePipeTarget(
-				r.Context(), qualifiedTarget,
-			)
+			if callerResolver, callerOK := s.federation.(federatedCallerPipeTargetResolver); callerOK {
+				remoteTarget, err = callerResolver.ResolveRemotePipeTargetForCaller(
+					r.Context(), agentID, qualifiedTarget,
+				)
+			} else {
+				remoteTarget, err = resolver.ResolveRemotePipeTarget(
+					r.Context(), qualifiedTarget,
+				)
+			}
 			if err != nil {
 				s.writeRemotePipeTargetError(w, err)
 				return
@@ -695,13 +733,18 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 	if idempotentReplay {
 		statusCode = http.StatusOK
 	}
-	writeJSON(w, statusCode, map[string]any{
+	response := map[string]any{
 		"pipe_id":              msg.PipeID,
 		"status":               msg.Status,
 		"expires_at":           msg.ExpiresAt.Format(time.RFC3339),
 		"destination_chain_id": msg.DestinationChainID,
 		"idempotent_replay":    idempotentReplay,
-	})
+	}
+	if remoteTarget != nil {
+		response["transport_status"] = "queued"
+		response["peer_status"] = "unconfirmed"
+	}
+	writeJSON(w, statusCode, response)
 }
 
 func isQualifiedFederatedPipeTarget(target string) bool {

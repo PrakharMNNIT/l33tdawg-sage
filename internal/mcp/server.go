@@ -327,6 +327,9 @@ func (s *Server) handleInitialize(req *jsonRPCRequest) *jsonRPCResponse {
 func (s *Server) handleToolsList(req *jsonRPCRequest) *jsonRPCResponse {
 	toolList := make([]map[string]any, 0, len(s.tools))
 	for _, t := range s.tools {
+		if hiddenCompatibilityTools[t.Name] {
+			continue
+		}
 		toolList = append(toolList, map[string]any{
 			"name":        t.Name,
 			"description": t.Description,
@@ -340,6 +343,15 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) *jsonRPCResponse {
 			"tools": toolList,
 		},
 	}
+}
+
+// Keep one compatibility window for callers that already know the old names,
+// but do not teach models or newly connected clients to start using them.
+var hiddenCompatibilityTools = map[string]bool{
+	"sage_pipe":                true,
+	"sage_pipe_history":        true,
+	"sage_pipe_receipt_status": true,
+	"sage_pipe_result":         true,
 }
 
 func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *jsonRPCResponse {

@@ -765,13 +765,22 @@ func persistFederationRouteSnapshot(chainID string, snapshot federation.RouteSna
 		if err != nil {
 			return err
 		}
+		if !strings.Contains(target, "/p2p-circuit/") && !usableFederationDirectAddress(target) {
+			return fmt.Errorf("unsafe direct p2p route %q", target)
+		}
 		if peerID != "" && peerID != id.String() {
 			return fmt.Errorf("peer routes name different peer ids")
 		}
 		peerID = id.String()
 	}
+	if snapshot.PeerID != "" && snapshot.PeerID != peerID {
+		return fmt.Errorf("p2p route snapshot peer id does not match its addresses")
+	}
 	if snapshot.PeerID == "" {
 		snapshot.PeerID = peerID
+	}
+	if snapshot.Protocol != "" && snapshot.Protocol != string(sagep2p.FederationProtocol) {
+		return fmt.Errorf("unsupported p2p route snapshot protocol %q", snapshot.Protocol)
 	}
 	if snapshot.Protocol == "" && len(snapshot.Addrs) > 0 {
 		snapshot.Protocol = string(sagep2p.FederationProtocol)

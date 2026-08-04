@@ -1135,6 +1135,28 @@ func (m *Manager) ResolveRemoteLinkedPipeTarget(
 	return targetResult, nil
 }
 
+// ResolveRemoteLinkedPipeTargetForCaller admits an exact previously resolved
+// linked recipient from the caller-bound encrypted ticket without waiting for
+// the peer. The durable outbox still calls ResolveRemoteLinkedPipeTarget live
+// before exposing payload bytes to transport.
+func (m *Manager) ResolveRemoteLinkedPipeTargetForCaller(
+	ctx context.Context, sourceAgentID, target string,
+) (*RemotePipeTarget, error) {
+	if known, err := m.knownRemoteMessageTarget(ctx, sourceAgentID, target); err != nil {
+		return nil, err
+	} else if known != nil {
+		return known, nil
+	}
+	resolved, err := m.ResolveRemoteLinkedPipeTarget(ctx, sourceAgentID, target)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.rememberRemoteMessageTarget(ctx, sourceAgentID, resolved); err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
 // SetLinkedMessageConsentCAS is the operator/control-plane primitive. HTTP
 // adapters must apply their normal localhost and CEREBRUM authorization gates.
 func (m *Manager) SetLinkedMessageConsentCAS(

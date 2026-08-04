@@ -1,0 +1,15 @@
+# Persisted-config fixture: v11.17.4 stored only the compatibility peer map.
+# The current binary must retain it and may add a generation-bound p2p_routes
+# snapshot after authenticated route exchange; it must never discard the peer.
+federation:
+  enabled: true
+  listen_addr: 0.0.0.0:8444
+  p2p_enabled: true
+  p2p_listen_addrs:
+    - /ip4/0.0.0.0/tcp/0
+  p2p_relay_addrs:
+    - __RELAY_ADDR__
+  p2p_peers:
+    __REMOTE_CHAIN__:
+      - __REMOTE_ADDR__
+  p2p_force_private: true

@@ -1,0 +1,22 @@
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY third_party/cometbft/go.mod third_party/cometbft/go.sum ./third_party/cometbft/
+RUN go mod download
+COPY . .
+ARG VERSION=v11.17.6-acceptance
+ARG COMMIT=docker-acceptance
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+    -o /sage-gui ./cmd/sage-gui
+RUN CGO_ENABLED=0 go build -trimpath -o /federation-acceptance-client \
+    ./scripts/federation-acceptance-client
+
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /sage-gui /usr/local/bin/sage-gui
+COPY --from=builder /federation-acceptance-client /usr/local/bin/federation-acceptance-client
+ENV SAGE_HOME=/root/.sage REST_ADDR=0.0.0.0:8080
+ENTRYPOINT ["sage-gui"]
+CMD ["serve"]

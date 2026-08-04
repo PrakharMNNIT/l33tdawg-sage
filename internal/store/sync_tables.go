@@ -566,6 +566,10 @@ func (s *SQLiteStore) DeleteSyncControl(ctx context.Context, remoteChainID strin
 			return err
 		}
 		_, err := tx.writeExecContext(ctx, `DELETE FROM fed_pipe_remote_contact_snapshot WHERE remote_chain_id=?`, remoteChainID)
+		if err != nil {
+			return err
+		}
+		_, err = tx.writeExecContext(ctx, `DELETE FROM fed_message_admission_ticket WHERE remote_chain_id=?`, remoteChainID)
 		return err
 	})
 }
@@ -607,6 +611,9 @@ func (s *SQLiteStore) PurgeSyncPeerState(ctx context.Context, remoteChainID stri
 		}
 		if _, err := tx.writeExecContext(ctx, `DELETE FROM fed_pipe_remote_contact_snapshot WHERE remote_chain_id=?`, remoteChainID); err != nil {
 			return fmt.Errorf("purge federated pipe remote contact snapshot: %w", err)
+		}
+		if _, err := tx.writeExecContext(ctx, `DELETE FROM fed_message_admission_ticket WHERE remote_chain_id=?`, remoteChainID); err != nil {
+			return fmt.Errorf("purge federated message admission tickets: %w", err)
 		}
 		// Retiring a peer generation is terminal for every in-flight pipeline in
 		// either direction. Fail the user-visible rows and pending delivery events

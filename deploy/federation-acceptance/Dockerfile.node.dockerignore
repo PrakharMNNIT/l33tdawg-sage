@@ -1,0 +1,15 @@
+**
+!go.mod
+!go.sum
+!api/
+!api/**
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!third_party/
+!third_party/**
+!web/
+!web/**
+!scripts/federation-acceptance-client/
+!scripts/federation-acceptance-client/**

@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 
 	"github.com/l33tdawg/sage/internal/federation"
 	sagep2p "github.com/l33tdawg/sage/internal/p2p"
@@ -49,9 +53,23 @@ func selectFederationRouteAddresses(all []string) ([]string, error) {
 			if len(relay) < maxFederationRelayRoutes {
 				relay = append(relay, addr)
 			}
-		} else if len(direct) < maxFederationDirectRoutes {
+		} else if usableFederationDirectAddress(addr) {
 			direct = append(direct, addr)
 		}
+	}
+	// Host.Addrs ordering is not a product contract. Rank deterministic usable
+	// LAN/global candidates before truncating so loopback and link-local
+	// addresses cannot crowd out the address another machine can actually dial.
+	sort.Slice(direct, func(i, j int) bool {
+		ri, rj := federationDirectAddressRank(direct[i]), federationDirectAddressRank(direct[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return direct[i] < direct[j]
+	})
+	sort.Strings(relay)
+	if len(direct) > maxFederationDirectRoutes {
+		direct = direct[:maxFederationDirectRoutes]
 	}
 	// A reachable direct candidate is already a complete route.  Relays make
 	// the connection roam across NATs, but must be an additive fallback rather
@@ -62,6 +80,37 @@ func selectFederationRouteAddresses(all []string) ([]string, error) {
 	}
 	selected := append(direct, relay...)
 	return selected, nil
+}
+
+func usableFederationDirectAddress(raw string) bool {
+	if ip := federationDirectIP(raw); ip != nil {
+		return !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() &&
+			!ip.IsLinkLocalMulticast() && !ip.IsMulticast()
+	}
+	// DNS routes cannot be made rebinding-safe by filtering only at publication
+	// time. Reject them rather than allowing a peer-controlled name to resolve to
+	// loopback, link-local, unspecified, or multicast space at dial time.
+	return false
+}
+
+func federationDirectAddressRank(raw string) int {
+	if ip := federationDirectIP(raw); ip != nil {
+		if ip.IsPrivate() {
+			return 0
+		}
+		return 1
+	}
+	return 2
+}
+
+func federationDirectIP(raw string) net.IP {
+	parts := strings.Split(raw, "/")
+	for i := 1; i+1 < len(parts); i++ {
+		if parts[i] == "ip4" || parts[i] == "ip6" {
+			return net.ParseIP(parts[i+1])
+		}
+	}
+	return nil
 }
 
 type p2pDialOutcome struct {
@@ -170,35 +219,176 @@ func configuredRouteSnapshot(raw FederationRouteSnapshot) federation.RouteSnapsh
 	}
 }
 
-func configuredFederationRouteTargets(cfg FederationConfig, remoteChainID string, now time.Time) ([]string, error) {
+func configuredFederationRouteTargets(cfg FederationConfig, remoteChainID string) ([]string, error) {
 	legacy := append([]string(nil), cfg.P2PPeers[remoteChainID]...)
 	snapshot, ok := cfg.P2PRoutes[remoteChainID]
 	if !ok {
-		return legacy, nil
+		peerID, err := consistentFederationRoutePeerID(legacy)
+		if err != nil {
+			return nil, fmt.Errorf("configured legacy p2p routes for %s: %w", remoteChainID, err)
+		}
+		legacy = append(legacy, synthesizeFederationRelayTargets(cfg.P2PRelayAddrs, peerID)...)
+		return rankFederationRouteTargets(legacy), nil
+	}
+	peerID, err := consistentFederationRoutePeerID(snapshot.Addrs)
+	if err != nil {
+		return nil, fmt.Errorf("configured p2p route snapshot for %s: %w", remoteChainID, err)
+	}
+	if peerID == "" || snapshot.PeerID != peerID {
+		return nil, errors.New("configured p2p route snapshot peer id does not match its addresses")
+	}
+	if snapshot.Protocol != string(sagep2p.FederationProtocol) {
+		return nil, errors.New("configured p2p route snapshot protocol is unsupported")
 	}
 	if snapshot.Revision == 0 && snapshot.IssuedAt == 0 && snapshot.ExpiresAt == 0 && snapshot.Generation == "" {
-		return legacy, nil
+		targets := append([]string(nil), snapshot.Addrs...)
+		targets = append(targets, synthesizeFederationRelayTargets(cfg.P2PRelayAddrs, peerID)...)
+		return rankFederationRouteTargets(targets), nil
 	}
 	if snapshot.Revision == 0 || snapshot.IssuedAt == 0 || snapshot.ExpiresAt == 0 {
 		return nil, errors.New("configured p2p route snapshot metadata is incomplete")
 	}
-	if snapshot.ExpiresAt <= now.Unix() {
-		return nil, errors.New("configured p2p route snapshot is expired")
-	}
-	return append([]string(nil), snapshot.Addrs...), nil
+	// Expiry means the addresses are stale, not that the active agreement or its
+	// pinned transport identity was revoked. Keep last-known candidates as dial
+	// hints and synthesize circuit routes from the stable peer ID plus our
+	// configured relays. Every winning connection still must pass pinned mTLS.
+	targets := append([]string(nil), snapshot.Addrs...)
+	targets = append(targets, synthesizeFederationRelayTargets(cfg.P2PRelayAddrs, snapshot.PeerID)...)
+	return rankFederationRouteTargets(targets), nil
 }
 
-func pruneExpiredFederationRoutes(cfg *FederationConfig, now time.Time) []string {
-	if cfg == nil {
-		return nil
+func configuredFederationRouteChainIDs(cfg FederationConfig) []string {
+	seen := make(map[string]struct{}, len(cfg.P2PPeers)+len(cfg.P2PRoutes))
+	for chainID := range cfg.P2PPeers {
+		seen[chainID] = struct{}{}
 	}
-	var expired []string
-	for chain, snapshot := range cfg.P2PRoutes {
-		if snapshot.ExpiresAt > 0 && snapshot.ExpiresAt <= now.Unix() {
-			delete(cfg.P2PRoutes, chain)
-			delete(cfg.P2PPeers, chain)
-			expired = append(expired, chain)
+	for chainID := range cfg.P2PRoutes {
+		seen[chainID] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for chainID := range seen {
+		out = append(out, chainID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func consistentFederationRoutePeerID(targets []string) (string, error) {
+	var expected string
+	for _, target := range targets {
+		id, err := sagep2p.PeerIDFromTarget(target)
+		if err != nil {
+			return "", fmt.Errorf("invalid peer route %q: %w", target, err)
+		}
+		if !strings.Contains(target, "/p2p-circuit/") && !usableFederationDirectAddress(target) {
+			return "", fmt.Errorf("unsafe direct peer route %q", target)
+		}
+		if expected == "" {
+			expected = id.String()
+			continue
+		}
+		if expected != id.String() {
+			return "", errors.New("peer routes name different peer ids")
 		}
 	}
-	return expired
+	return expected, nil
+}
+
+func synthesizeFederationRelayTargets(relays []string, remotePeerID string) []string {
+	if _, err := peer.Decode(remotePeerID); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(relays))
+	for _, relay := range relays {
+		if strings.Contains(relay, "/p2p-circuit/") {
+			continue
+		}
+		if _, err := ma.NewMultiaddr(relay); err != nil {
+			continue
+		}
+		target := strings.TrimRight(relay, "/") + "/p2p-circuit/p2p/" + remotePeerID
+		if id, err := sagep2p.PeerIDFromTarget(target); err == nil && id.String() == remotePeerID {
+			out = append(out, target)
+		}
+	}
+	return out
+}
+
+func uniqueFederationRouteTargets(targets []string) []string {
+	seen := make(map[string]struct{}, len(targets))
+	out := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target == "" {
+			continue
+		}
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		out = append(out, target)
+	}
+	return out
+}
+
+func rankFederationRouteTargets(targets []string) []string {
+	out := uniqueFederationRouteTargets(targets)
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := federationRouteTargetRank(out[i]), federationRouteTargetRank(out[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+func federationRouteTargetRank(target string) int {
+	if strings.Contains(target, "/p2p-circuit/") {
+		return 10
+	}
+	if usableFederationDirectAddress(target) {
+		return federationDirectAddressRank(target)
+	}
+	// Invalid targets are rejected before ranking. Keep the terminal rank as a
+	// defensive fallback for callers that construct an in-memory list directly.
+	return 20
+}
+
+func federationRouteBundleFingerprint(bundle federation.JoinP2PBundle) string {
+	return bundle.PeerID + "\x00" + strings.Join(bundle.Addrs, "\x00")
+}
+
+// watchFederationRouteChanges publishes a fresh authenticated snapshot as soon
+// as AutoRelay adds (or replaces) a circuit reservation instead of waiting for
+// the five-minute correctness ticker. Polling the tiny local address set keeps
+// this seam deterministic and easy to exercise without depending on libp2p's
+// internal event-bus delivery semantics.
+func watchFederationRouteChanges(ctx context.Context, interval time.Duration, local func() (federation.JoinP2PBundle, error), refresh func()) {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	current, err := local()
+	last := ""
+	if err == nil {
+		last = federationRouteBundleFingerprint(current)
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			next, nextErr := local()
+			if nextErr != nil {
+				continue
+			}
+			fingerprint := federationRouteBundleFingerprint(next)
+			if fingerprint == last {
+				continue
+			}
+			last = fingerprint
+			refresh()
+		}
+	}
 }

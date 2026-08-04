@@ -115,6 +115,66 @@ func TestFederatedMessageSendIdempotencyCommitsTransportOnce(t *testing.T) {
 	require.ErrorIs(t, err, ErrMessageIdempotencyConflict)
 }
 
+func TestFederatedMessageStatusMergesWorkflowTransportAndExactReadForSender(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	sender := strings.Repeat("a", 64)
+	recipient := strings.Repeat("b", 64)
+	msg := testLocalMessage("fed-status", sender, recipient, "work")
+	msg.CreatedAt, msg.ExpiresAt, msg.DestinationChainID = now, now.Add(time.Hour), "chain-b"
+	msg.FederationPolicyEpoch = strings.Repeat("c", 64)
+	msg.FederationAgreementID = strings.Repeat("d", 64)
+	msg.FederationContactID = strings.Repeat("e", 64)
+	msg.FederationContactRevision = strings.Repeat("f", 64)
+	event := &PipelineTransportOutbox{
+		EventID: "fed-status-event", PipeID: msg.PipeID, RemoteChainID: "chain-b",
+		EventKind: "send", PolicyEpoch: msg.FederationPolicyEpoch,
+		AgreementID: msg.FederationAgreementID, ContactID: msg.FederationContactID,
+		ContactRevision: msg.FederationContactRevision, SourceAgentID: sender,
+		TargetAgentID: recipient, ReceiptProtocolVersion: FederatedPipelineReceiptVersion,
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		Proof: PipelineAgentProof{AgentID: sender, Signature: make([]byte, ed25519.SignatureSize),
+			Timestamp: now.Unix(), Nonce: []byte("12345678"), CanonicalRequest: []byte("POST /v1/pipe/send\n{}")},
+	}
+	_, replayed, err := s.SendFederatedMessage(ctx, "fed-status-key", msg, event)
+	require.NoError(t, err)
+	require.False(t, replayed)
+	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET status='completed',completed_at=?,terminal_at=? WHERE pipe_id=?`,
+		formatTime(now.Add(3*time.Second)), formatTime(now.Add(3*time.Second)), msg.PipeID)
+	require.NoError(t, err)
+	_, err = s.writeExecContext(ctx, `UPDATE pipeline_transport_outbox SET state='delivered',delivered_at=? WHERE pipe_id=?`,
+		formatTime(now.Add(time.Second)), msg.PipeID)
+	require.NoError(t, err)
+	_, err = s.writeExecContext(ctx, `INSERT INTO pipeline_receipt_v2_projection
+		(message_id,local_pipe_id,sender_chain_id,recipient_chain_id,sender_agent_id,recipient_agent_id,
+		content_digest,policy_epoch,agreement_id,contact_id,contact_revision,authorization_mode,
+		relation_digest,delivered_at,delivery_evidence,claimed_at,read_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"remote-event", msg.PipeID, "chain-a", "chain-b", sender, recipient,
+		strings.Repeat("1", 64), msg.FederationPolicyEpoch, msg.FederationAgreementID,
+		msg.FederationContactID, msg.FederationContactRevision, "", "",
+		formatTime(now.Add(time.Second)), "signed_peer_receipt", formatTime(now.Add(2*time.Second)),
+		formatTime(now.Add(2*time.Second)), formatTime(now.Add(3*time.Second)))
+	require.NoError(t, err)
+
+	status, err := s.GetMessageStatusForSender(ctx, sender, msg.PipeID)
+	require.NoError(t, err)
+	require.Equal(t, "federated", status.Scope)
+	require.Equal(t, "delivered", status.TransportStatus)
+	require.Equal(t, "confirmed", status.ReadStatus)
+	require.Equal(t, "federated_receipt_v2", status.ReadEvidence)
+	require.Equal(t, "completed", status.WorkflowStatus)
+	require.Equal(t, "completed", status.TerminalReason)
+	require.NotNil(t, status.DeliveredAt)
+	require.NotNil(t, status.ReadAt)
+
+	for _, caller := range []string{recipient, strings.Repeat("9", 64), "root"} {
+		_, err = s.GetMessageStatusForSender(ctx, caller, msg.PipeID)
+		require.ErrorIs(t, err, ErrMessageNotFound)
+	}
+}
+
 func TestMessageReceiveReplaysExactClaimedBatchAfterLostResponse(t *testing.T) {
 	ctx := context.Background()
 	s := newMessageTestStore(t)

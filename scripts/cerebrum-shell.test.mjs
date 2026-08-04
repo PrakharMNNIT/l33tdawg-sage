@@ -1582,3 +1582,8 @@ test('guide describes token efficiency without promising lower usage', () => {
     assert.match(useCases, /relevant pieces when they are needed/);
     assert.match(useCases, /instead of repeated explanations/);
 });
+
+test('CEREBRUM recommends canonical Messages instead of deprecated pipeline tools', () => {
+    assert.doesNotMatch(appSource, /sage_pipe/);
+    assert.match(appSource, /sends a message through SAGE/);
+});

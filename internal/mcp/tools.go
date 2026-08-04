@@ -89,12 +89,13 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_find_agent": {
 			Name:        "sage_find_agent",
-			Description: "Discover an active agent by a human name before sending a message. Searches active local registrations first with a bounded substring lookup across display name, immutable registered name, and provider; ASCII matching is case-insensitive, non-ASCII code points require registered casing, and exact field matches rank first. Only when no local match exists, searches caller-authorized federated contacts that are active and accepting messages. Returns exact values ready for sage_message_send.to. This is not a global directory or an online/reachability check: an absent match is not proof that a previously known exact agent_id is unreachable.",
+			Description: "Discover an active agent by a human name before sending a message. Searches active local registrations first with a bounded substring lookup across display name, immutable registered name, and provider; ASCII matching is case-insensitive, non-ASCII code points require registered casing, and exact field matches rank first. Set peer_chain to search one exact connected SAGE instead, including when a local agent has the same name. Returns exact values ready for sage_message_send.to. This is not a global directory or an online/reachability check: an absent match is not proof that a previously known exact agent_id is unreachable.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"name":        map[string]any{"type": "string", "description": "Human display-name, registered-name, or provider substring to find (for example, \"mynah\" finds \"MYNAH (SAGE Voice Bridge Agent)\"). ASCII matching is case-insensitive and bounded; non-ASCII code points require registered casing; exact field matches rank first."},
 					"limit":       map[string]any{"type": "integer", "description": "Maximum matches to return (default: 10, max: 20).", "default": 10, "minimum": 1, "maximum": 20},
+					"peer_chain":  map[string]any{"type": "string", "description": "Optional exact connected SAGE chain ID. When set, skips local matches and searches only that peer; useful when both SAGEs have an agent with the same display name."},
 					"peer_cursor": map[string]any{"type": "string", "description": "Bounded federated continuation returned by an incomplete previous lookup. Omit for the first page."},
 				},
 				"required": []string{"name"},
@@ -1525,7 +1526,7 @@ func (s *Server) toolDirectory(ctx context.Context, args map[string]any) (any, e
 		"next_peer_cursor": nextPeerCursor,
 		"warnings":         warnings,
 		"message": "Caller-authorized recipient directory. Pass an agent's exact to value to " +
-			"sage_pipe. Membership proves neither presence nor delivery; use sage_message_status " +
+			"sage_message_send. Membership proves neither presence nor delivery; use sage_message_status " +
 			"for evidence about a message you actually sent.",
 	}, nil
 }
@@ -1840,7 +1841,7 @@ func matchesAgentName(query string, candidates ...string) (exact bool, partial b
 // significant words are mostly present.
 //
 // Deliberately conservative, because the caller is `sage_find_agent` and its
-// answer feeds `sage_pipe` — a wrong match sends the owner's work to the wrong
+// answer feeds `sage_message_send` — a wrong match sends the owner's work to the wrong
 // agent. Two things keep that safe: an exact match always wins outright
 // (`toolFindAgent` only falls back to partials when `localExact` is empty), and
 // every match is returned with its agent_id for the model to choose from rather
@@ -1998,6 +1999,13 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 		limit = 20
 	}
 	peerCursor := strings.TrimSpace(stringParam(params, "peer_cursor", ""))
+	peerChain := strings.TrimSpace(stringParam(params, "peer_chain", ""))
+	if len(peerChain) > 128 {
+		return nil, fmt.Errorf("'peer_chain' must be at most 128 bytes")
+	}
+	if peerChain != "" && peerCursor != "" {
+		return nil, fmt.Errorf("'peer_cursor' cannot be combined with 'peer_chain'")
+	}
 
 	var localResponse struct {
 		Agents []findAgentLocalResult `json:"agents"`
@@ -2007,10 +2015,12 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 		path := "/v1/agents/lookup?name=" + url.QueryEscape(name) + "&limit=20"
 		return s.doSignedJSON(ctx, "GET", path, nil, &localResponse)
 	}
-	if err := lookupLocal(query); err != nil {
-		return nil, fmt.Errorf("find local agents: %w", err)
+	if peerChain == "" {
+		if err := lookupLocal(query); err != nil {
+			return nil, fmt.Errorf("find local agents: %w", err)
+		}
 	}
-	if len(localResponse.Agents) == 0 {
+	if peerChain == "" && len(localResponse.Agents) == 0 {
 		if suffix := localAgentLookupSuffix(query); suffix != "" {
 			if err := lookupLocal(suffix); err != nil {
 				return nil, fmt.Errorf("find local agents by qualified-name suffix: %w", err)
@@ -2071,7 +2081,7 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 			"truncated":        len(localMatches) > len(matches),
 			"complete":         true,
 			"next_peer_cursor": "",
-			"message":          "Found local agent matches. Pass a match's to value directly to sage_pipe.",
+			"message":          "Found local agent matches. Pass a match's to value directly to sage_message_send.",
 		}
 	}
 	localPartialResult := func(err error) map[string]any {
@@ -2086,6 +2096,10 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 	}
 
 	connections, cacheHit := s.cachedFederatedAgentConnections(ctx, query)
+	if peerChain != "" {
+		cacheHit = false
+		connections = nil
+	}
 	if peerCursor != "" {
 		cacheHit = false
 		connections = nil
@@ -2107,6 +2121,9 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 			NextCursor  string                         `json:"next_peer_cursor"`
 		}
 		path := "/v1/federation/available?agent_name=" + url.QueryEscape(query) + "&agent_limit=20"
+		if peerChain != "" {
+			path += "&peer_chain=" + url.QueryEscape(peerChain)
+		}
 		if peerCursor != "" {
 			path += "&peer_cursor=" + url.QueryEscape(peerCursor)
 		}
@@ -2119,7 +2136,7 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 		connections = boundedFederatedAgentConnections(federationResponse.Connections)
 		federatedComplete = federationResponse.Complete == nil || *federationResponse.Complete
 		nextPeerCursor = federationResponse.NextCursor
-		if peerCursor == "" && federatedComplete {
+		if peerCursor == "" && peerChain == "" && federatedComplete {
 			s.cacheFederatedAgentConnections(ctx, query, connections)
 		}
 	}
@@ -2201,15 +2218,21 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 	if hasLinkedFederatedAgentContacts(connections) {
 		cacheState = "live"
 	}
+	searched := []string{"local", "federated"}
+	message := "No local agent matched. Federated results are limited to current caller-authorized recipient relations; pass a match's to value directly to sage_message_send. SAGE always re-checks the target registration, route, and authorization before sending. A directory result is not an online/offline verdict and is not reachable, accepting, delivery, or read evidence."
+	if peerChain != "" {
+		searched = []string{"federated"}
+		message = "Searched only the selected connected SAGE. Results are limited to current caller-authorized recipient relations; pass a match's to value directly to sage_message_send. SAGE always re-checks the target registration, route, and authorization before sending."
+	}
 	return map[string]any{
 		"matches":          matches,
 		"total":            len(federatedMatches),
-		"searched":         []string{"local", "federated"},
+		"searched":         searched,
 		"federated_cache":  cacheState,
 		"truncated":        remoteTruncated || len(federatedMatches) > len(matches),
 		"complete":         federatedComplete,
 		"next_peer_cursor": nextPeerCursor,
-		"message":          "No local agent matched. Federated results are limited to current caller-authorized recipient relations; pass a match's to value directly to sage_message_send. SAGE always re-checks the target registration, route, and authorization before sending. A directory result is not an online/offline verdict and is not reachable, accepting, delivery, or read evidence.",
+		"message":          message,
 	}, nil
 }
 
@@ -4361,6 +4384,8 @@ func (s *Server) toolMessageSend(ctx context.Context, params map[string]any) (an
 		var response struct {
 			PipeID             string `json:"pipe_id"`
 			Status             string `json:"status"`
+			TransportStatus    string `json:"transport_status"`
+			PeerStatus         string `json:"peer_status"`
 			ExpiresAt          string `json:"expires_at"`
 			DestinationChainID string `json:"destination_chain_id"`
 			IdempotentReplay   bool   `json:"idempotent_replay"`
@@ -4368,11 +4393,18 @@ func (s *Server) toolMessageSend(ctx context.Context, params map[string]any) (an
 		if err := s.doSignedJSON(ctx, http.MethodPost, "/v1/pipe/send", body, &response); err != nil {
 			return nil, fmt.Errorf("federated message send: %w", err)
 		}
+		if response.TransportStatus == "" {
+			response.TransportStatus = "queued"
+		}
+		if response.PeerStatus == "" {
+			response.PeerStatus = "unconfirmed"
+		}
 		return map[string]any{
 			"message_id": response.PipeID, "status": response.Status,
+			"transport_status": response.TransportStatus, "peer_status": response.PeerStatus,
 			"expires_at": response.ExpiresAt, "idempotent_replay": response.IdempotentReplay,
 			"scope": "federated", "destination_chain_id": response.DestinationChainID,
-			"message": "Message queued over the trusted connection. Delivery, exact-recipient read, and workflow status remain independently queryable with sage_message_status.",
+			"message": "Message queued durably over the trusted connection. Peer availability is unconfirmed; delivery waits for peer return and fresh authorization, and status remains queryable with sage_message_status.",
 		}, nil
 	}
 	if resolved.ToAgent == "" || resolved.ToProvider != "" {

@@ -62,6 +62,23 @@ type linkedLookupFederation struct {
 	name         string
 	calls        int
 	hintCalls    int
+	primed       []string
+}
+
+func (f *linkedLookupFederation) RememberRemotePipeContactForCaller(
+	context.Context, string, string, *federation.PipeContactGrant,
+	federation.PipeContact, int,
+) error {
+	return nil
+}
+
+func (f *linkedLookupFederation) PrimeRemoteLinkedMessageTarget(
+	_ context.Context, callerID, address string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.primed = append(f.primed, callerID+"\x00"+address)
+	return nil
 }
 
 func (f *linkedLookupFederation) CallerMayHaveLinkedMessagePeer(
@@ -574,6 +591,80 @@ func TestFederationAvailableIsCallerFilteredSubtreeAndParallel(t *testing.T) {
 	assert.Less(t, elapsed, 190*time.Millisecond, "discovery should be one bounded parallel window")
 }
 
+func TestFederationAvailableProbesV3AgreementWithEmptyLegacyDomains(t *testing.T) {
+	srv, _, _ := newTestServer(t, "")
+	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = badger.CloseBadger() })
+	srv.badgerStore = badger
+	require.NoError(t, badger.SetCrossFed(
+		"chain-v3", "https://redacted.invalid", []byte("peer-pin"),
+		3, 0, []string{}, nil, "active",
+	))
+	fed := &parallelStatusFederation{
+		fakeFederation: &fakeFederation{},
+		statuses: map[string]*federation.StatusResponse{
+			"chain-v3": {
+				ChainID: "chain-v3", NetworkName: "V3 peer",
+				PeerRBACGrant: &federation.PeerRBACGrant{Domains: []federation.PeerRBACDomainGrant{{
+					Domain: "research", Read: true,
+				}}},
+			},
+		},
+	}
+	srv.SetFederation(fed)
+
+	req, callerID := signedRequest(t, http.MethodGet, "/v1/federation/available", nil)
+	require.NoError(t, badger.RegisterAgent(callerID, "ordinary", "member", "", "test", "", 1))
+	require.NoError(t, badger.SetAgentPermission(callerID, 1,
+		`[{"domain":"research","read":true}]`, "*", "", ""))
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var response struct {
+		Connections []availableFederationConnection `json:"connections"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+	require.Len(t, response.Connections, 1)
+	assert.Equal(t, "chain-v3", response.Connections[0].RemoteChainID)
+	assert.Equal(t, []string{"research"}, response.Connections[0].SharedReadDomains)
+	assert.Equal(t, 1, fed.calls, "live peer RBAC, not obsolete JOIN domains, controls visibility")
+}
+
+func TestFederationAvailablePeerChainBoundsProbeToExactPeer(t *testing.T) {
+	srv, _, _ := newTestServer(t, "")
+	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = badger.CloseBadger() })
+	srv.badgerStore = badger
+	for _, chain := range []string{"chain-a", "chain-b"} {
+		require.NoError(t, badger.SetCrossFed(
+			chain, "https://redacted.invalid", []byte(chain), 3, 0, []string{}, nil, "active",
+		))
+	}
+	fed := &parallelStatusFederation{
+		fakeFederation: &fakeFederation{},
+		statuses: map[string]*federation.StatusResponse{
+			"chain-a": {ChainID: "chain-a", PeerRBACGrant: &federation.PeerRBACGrant{Domains: []federation.PeerRBACDomainGrant{{Domain: "research", Read: true}}}},
+			"chain-b": {ChainID: "chain-b", PeerRBACGrant: &federation.PeerRBACGrant{Domains: []federation.PeerRBACDomainGrant{{Domain: "research", Read: true}}}},
+		},
+	}
+	srv.SetFederation(fed)
+	req, callerID := signedRequest(t, http.MethodGet, "/v1/federation/available?peer_chain=chain-b", nil)
+	require.NoError(t, badger.RegisterAgent(callerID, "ordinary", "member", "", "test", "", 1))
+	require.NoError(t, badger.SetAgentPermission(callerID, 1, `[{"domain":"research","read":true}]`, "*", "", ""))
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var response struct {
+		Connections []availableFederationConnection `json:"connections"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+	require.Len(t, response.Connections, 1)
+	assert.Equal(t, "chain-b", response.Connections[0].RemoteChainID)
+	assert.Equal(t, 1, fed.calls)
+}
+
 func TestFederationAvailableBoundsNamedDiscoveryWorkersAndPeers(t *testing.T) {
 	srv, _, _ := newTestServer(t, "")
 	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
@@ -955,6 +1046,8 @@ func TestFederationAvailableIncludesOnlyValidatedCallerScopedLinkedContacts(t *t
 		require.Equal(t, callerID, fed.callerID)
 		require.Equal(t, "peer guest", fed.name)
 		require.Equal(t, 1, fed.calls)
+		require.Equal(t, []string{callerID + "\x00" + contact.Address}, fed.primed,
+			"the caller-scoped directory response must persist its exact admission target before returning")
 	})
 
 	t.Run("malformed contact is non-enumerating", func(t *testing.T) {
@@ -1027,11 +1120,9 @@ func TestFederationAvailableUsesLocalLinkedPeerHintWithoutDirectoryWalk(t *testi
 	for _, tc := range []struct {
 		name, query string
 		hint        bool
-		wantPeers   int
-		wantLookups int
 	}{
-		{name: "linked edge admits one bounded peer", query: "linked", hint: true, wantPeers: 1, wantLookups: 1},
-		{name: "absent edge probes no peer", query: "linked", hint: false, wantPeers: 0, wantLookups: 0},
+		{name: "legacy hint true does not change live lookup", query: "linked", hint: true},
+		{name: "legacy hint false does not suppress live lookup", query: "linked", hint: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, badger, fed := newServer(t, tc.hint)
@@ -1050,12 +1141,12 @@ func TestFederationAvailableUsesLocalLinkedPeerHintWithoutDirectoryWalk(t *testi
 				Connections []availableFederationConnection `json:"connections"`
 			}
 			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
-			require.Len(t, response.Connections, tc.wantPeers)
+			require.Len(t, response.Connections, 1)
 			fed.mu.Lock()
 			defer fed.mu.Unlock()
-			require.Equal(t, 1, fed.hintCalls,
-				"one active peer costs one local authority check")
-			require.Equal(t, tc.wantLookups, fed.calls,
+			require.Zero(t, fed.hintCalls,
+				"obsolete local hints must not suppress current v3 peer state")
+			require.Equal(t, 1, fed.calls,
 				"the handler never loops over a remote directory")
 		})
 	}

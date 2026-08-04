@@ -862,6 +862,136 @@ func TestLinkedReaderMessagingBidirectionalExactIDsOverTwoNodes(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestKnownLinkedRecipientQueuesThenDeliversAndReplies(t *testing.T) {
+	pair := newLinkedMessagingPair(t)
+	pair.enableBothDirections(t)
+	ctx := context.Background()
+	address := pair.guestID + "@" + pair.peer.chainID
+	live, err := pair.host.mgr.ResolveRemoteLinkedPipeTarget(
+		ctx, pair.memberID, address,
+	)
+	require.NoError(t, err)
+	require.NoError(t, pair.host.mgr.rememberRemoteMessageTarget(ctx, pair.memberID, live))
+	known, err := pair.host.mgr.knownRemoteMessageTarget(ctx, pair.memberID, address)
+	require.NoError(t, err)
+	require.NotNil(t, known)
+	source, outbox := enqueueLinkedSend(
+		t, pair.host, pair.peer, pair.memberID, pair.memberKey,
+		known, "queued while peer unavailable",
+	)
+	stored, err := pipeSQLite(t, pair.host).GetPipeline(ctx, source.PipeID)
+	require.NoError(t, err)
+	require.Equal(t, "pending", stored.Status)
+	imported := deliverLinkedSend(t, pair.host, pair.peer, outbox)
+	deliverLinkedResult(
+		t, pair.host, pair.peer, imported,
+		pair.guestID, pair.guestKey, "later reply",
+	)
+	completed, err := pipeSQLite(t, pair.host).GetPipeline(ctx, source.PipeID)
+	require.NoError(t, err)
+	require.Equal(t, "completed", completed.Status)
+	require.Equal(t, "later reply", completed.Result)
+}
+
+func TestKnownLinkedRecipientRejectsRevokedLocalAuthorityBeforeQueue(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("locally hosted guest relation", func(t *testing.T) {
+		pair := newLinkedMessagingPair(t)
+		pair.enableBothDirections(t)
+		address := pair.guestID + "@" + pair.peer.chainID
+		live, err := pair.host.mgr.ResolveRemoteLinkedPipeTarget(
+			ctx, pair.memberID, address,
+		)
+		require.NoError(t, err)
+		require.NoError(t, pair.host.mgr.rememberRemoteMessageTarget(
+			ctx, pair.memberID, live,
+		))
+
+		paused := pair.guest
+		paused.Revision++
+		paused.State = store.FederatedGuestStatePaused
+		require.NoError(t, store.SignFederatedGroupGuest(&paused, pair.host.agentKey))
+		require.NoError(t, pipeSQLite(t, pair.host).PutFederatedGroupGuest(ctx, paused))
+
+		known, err := pair.host.mgr.knownRemoteMessageTarget(
+			ctx, pair.memberID, address,
+		)
+		require.ErrorIs(t, err, ErrRemotePipeTargetNotFound)
+		require.Nil(t, known,
+			"a stale ticket must not admit payload after local guest authority is paused")
+	})
+
+	t.Run("remotely hosted relation with locally denied source", func(t *testing.T) {
+		pair := newLinkedMessagingPair(t)
+		pair.enableBothDirections(t)
+		address := pair.memberID + "@" + pair.host.chainID
+		live, err := pair.peer.mgr.ResolveRemoteLinkedPipeTarget(
+			ctx, pair.guestID, address,
+		)
+		require.NoError(t, err)
+		require.Equal(t, pair.host.chainID, live.LinkedRelation.HostChainID)
+		require.NoError(t, pair.peer.mgr.rememberRemoteMessageTarget(
+			ctx, pair.guestID, live,
+		))
+
+		enrollment, err := pair.peer.badger.GetAppV23Enrollment(pair.guestID)
+		require.NoError(t, err)
+		role, err := pair.peer.badger.GetAppV23Role(pair.guestID)
+		require.NoError(t, err)
+		require.NoError(t, pair.peer.badger.SetAppV23Policy(
+			hex.EncodeToString(pair.peer.agentPub), pair.guestID,
+			role.Role, enrollment.Profile, enrollment.Profile,
+			enrollment.Clearance, store.AgentCapabilityDenyFederatedPipe,
+			role.Revision, enrollment.Revision, 70,
+		))
+
+		known, err := pair.peer.mgr.knownRemoteMessageTarget(
+			ctx, pair.guestID, address,
+		)
+		require.ErrorIs(t, err, ErrRemotePipeTargetNotFound)
+		require.Nil(t, known,
+			"a remotely hosted ticket must not bypass the local source capability")
+	})
+}
+
+func TestKnownLinkedRecipientRevokedBeforeDeliveryLeaksNoPayload(t *testing.T) {
+	pair := newLinkedMessagingPair(t)
+	pair.enableBothDirections(t)
+	ctx := context.Background()
+	address := pair.guestID + "@" + pair.peer.chainID
+	live, err := pair.host.mgr.ResolveRemoteLinkedPipeTarget(ctx, pair.memberID, address)
+	require.NoError(t, err)
+	require.NoError(t, pair.host.mgr.rememberRemoteMessageTarget(ctx, pair.memberID, live))
+	known, err := pair.host.mgr.knownRemoteMessageTarget(ctx, pair.memberID, address)
+	require.NoError(t, err)
+	_, outbox := enqueueLinkedSend(
+		t, pair.host, pair.peer, pair.memberID, pair.memberKey,
+		known, "must never cross revoked relation",
+	)
+	consent, err := pair.peer.mgr.GetLinkedMessageConsent(
+		ctx, pair.host.chainID, pair.memberID, pair.guestID,
+	)
+	require.NoError(t, err)
+	_, err = pair.peer.mgr.SetLinkedMessageConsentCAS(
+		ctx, pair.host.chainID, pair.memberID, pair.guestID,
+		consent.Revision, false,
+	)
+	require.NoError(t, err)
+	var pushes int
+	pair.host.mgr.pipeEventPushFn = func(
+		context.Context, string, *PipeEvent,
+	) (*PipeEventResponse, error) {
+		pushes++
+		return &PipeEventResponse{Status: "accepted"}, nil
+	}
+	pair.host.mgr.deliverPipelineEvent(ctx, pipeSQLite(t, pair.host), outbox)
+	require.Zero(t, pushes, "payload push must remain unreachable after revoke")
+	transport, err := pipeSQLite(t, pair.host).GetPipelineTransport(ctx, outbox.EventID)
+	require.NoError(t, err)
+	require.Equal(t, "failed", transport.State)
+}
+
 func TestLinkedReaderMessagingRevocationCutsAdmittedWorkAndQueuedSend(t *testing.T) {
 	pair := newLinkedMessagingPair(t)
 	pair.enableBothDirections(t)

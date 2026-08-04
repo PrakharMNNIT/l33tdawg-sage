@@ -741,6 +741,57 @@ func TestSageFindAgentPrefersLocalActiveMatches(t *testing.T) {
 	assert.Equal(t, "local-innovium", matches[0]["to"])
 }
 
+func TestSageFindAgentPeerChainDisambiguatesSameNamedRemoteAgent(t *testing.T) {
+	var localRequests int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agents/lookup", func(w http.ResponseWriter, _ *http.Request) {
+		localRequests++
+		_ = json.NewEncoder(w).Encode(map[string]any{"agents": []map[string]any{{
+			"agent_id": "local-mynah", "name": "Mynah", "match_kind": "exact",
+		}}})
+	})
+	mux.HandleFunc("/v1/federation/available", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "mynah", r.URL.Query().Get("agent_name"))
+		require.Equal(t, "remote-chain", r.URL.Query().Get("peer_chain"))
+		remoteID := strings.Repeat("a", 64)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"connections": []map[string]any{{
+				"remote_chain_id": "remote-chain", "network_name": "Mac Mini",
+				"remote_agents": []map[string]any{{
+					"agent_id": remoteID, "display_name": "Mynah",
+					"registered_name": "claude/sage-voice-bridge", "provider": "mynah",
+					"address": remoteID + "@remote-chain", "authorization_mode": "linked-v23",
+				}},
+			}},
+			"complete": true,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	result, err := s.toolFindAgent(context.Background(), map[string]any{
+		"name": "mynah", "peer_chain": "remote-chain",
+	})
+	require.NoError(t, err)
+	assert.Zero(t, localRequests, "an exact peer selector must not be shadowed by a same-named local agent")
+	out := result.(map[string]any)
+	assert.Equal(t, []string{"federated"}, out["searched"])
+	matches := out["matches"].([]map[string]any)
+	require.Len(t, matches, 1)
+	assert.Equal(t, strings.Repeat("a", 64)+"@remote-chain", matches[0]["to"])
+}
+
+func TestSageFindAgentRejectsPeerChainWithCursor(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer("http://127.0.0.1:1", priv)
+	_, err := s.toolFindAgent(context.Background(), map[string]any{
+		"name": "mynah", "peer_chain": "remote-chain", "peer_cursor": "next",
+	})
+	require.ErrorContains(t, err, "cannot be combined")
+}
+
 func TestSageFindAgentPreservesPeerCursorUntilLaterExactBeatsLocalSubstring(t *testing.T) {
 	var federationCursors []string
 	mux := http.NewServeMux()

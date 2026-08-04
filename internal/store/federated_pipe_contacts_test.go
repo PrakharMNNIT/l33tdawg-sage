@@ -4,11 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/l33tdawg/sage/internal/vault"
 )
+
+func TestMigrateFederatedPipeContactsReturnsDDLError(t *testing.T) {
+	s := newSyncTestStore(t)
+	require.NoError(t, s.db.Close())
+	err := s.migrateFederatedPipeContacts(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "create federated pipe contact acceptance table")
+}
 
 func TestFederatedPipeContactAcceptanceBindsPolicyAndSurvivesPauseOnly(t *testing.T) {
 	ctx := context.Background()
@@ -264,4 +275,61 @@ func TestFederatedPipeRemoteContactSnapshotBoundDeletePreservesNewerPolicyBindin
 		loaded.ContactRevision != newSnapshot.ContactRevision || string(loaded.Snapshot) != string(newSnapshot.Snapshot) {
 		t.Fatalf("old bound delete changed newer snapshot: got=%+v want=%+v", loaded, newSnapshot)
 	}
+}
+
+func TestFederatedMessageAdmissionTicketIsEncryptedAndSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "message-admission.db")
+	keyPath := filepath.Join(dir, "message-admission.key")
+	require.NoError(t, vault.Init(keyPath, "ticket-passphrase"))
+	unlocked, err := vault.Open(keyPath, "ticket-passphrase")
+	require.NoError(t, err)
+	s, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	s.SetVault(unlocked)
+	epoch, caPin := testPeerRBACBinding()
+	control := testLegacyPeerRBACControl(PeerRBACPolicy{
+		RemoteChainID: "chain-peer", PeerAgentID: testPeerAgentID(t),
+		PolicyEpoch: epoch, RemoteCAPin: caPin,
+	})
+	require.NoError(t, s.PrepareSyncControl(ctx, control))
+	require.NoError(t, s.ActivateSyncControl(ctx, control.RemoteChainID, control.PolicyEpoch))
+	active, err := s.GetSyncControl(ctx, control.RemoteChainID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	ticket := FederatedMessageAdmissionTicket{
+		CallerAgentID: testPeerAgentID(t), RemoteChainID: active.RemoteChainID,
+		TargetAgentID: strings.Repeat("bc", 32), PeerAgentID: active.PeerAgentID,
+		PolicyEpoch: active.PolicyEpoch, RemoteCAPin: active.RemoteCAPin,
+		RemotePolicyVersion:  active.RemotePolicyVersion,
+		RemotePolicyRevision: active.RemoteRevision,
+		RemotePolicyHash:     active.RemotePolicyHash,
+		LocalAgreementID:     strings.Repeat("11", 32),
+		Ticket:               []byte(`{"payload":"relation-secret","target":"known"}`),
+	}
+	require.NoError(t, s.PutFederatedMessageAdmissionTicket(ctx, ticket))
+	var raw string
+	require.NoError(t, s.conn.QueryRowContext(ctx,
+		`SELECT ticket FROM fed_message_admission_ticket WHERE caller_agent_id=?`,
+		ticket.CallerAgentID).Scan(&raw))
+	require.NotContains(t, raw, "relation-secret")
+	require.True(t, strings.HasPrefix(raw, encPrefix))
+	require.NoError(t, s.Close())
+
+	reopened, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	reopenedVault, err := vault.Open(keyPath, "ticket-passphrase")
+	require.NoError(t, err)
+	reopened.SetVault(reopenedVault)
+	active, err = reopened.GetSyncControl(ctx, control.RemoteChainID)
+	require.NoError(t, err)
+	loaded, err := reopened.GetFederatedMessageAdmissionTicket(
+		ctx, ticket.CallerAgentID, ticket.RemoteChainID, ticket.TargetAgentID,
+		*active, ticket.LocalAgreementID,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	require.Equal(t, ticket.Ticket, loaded.Ticket)
 }

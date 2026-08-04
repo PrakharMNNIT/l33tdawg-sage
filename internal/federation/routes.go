@@ -387,15 +387,19 @@ func (m *Manager) triggerRouteRefreshWithContext(parent context.Context, remoteC
 		}
 		local, err := hooks.LocalBundle()
 		if err != nil {
+			m.recordRouteFailure(remoteChainID, fmt.Errorf("prepare local route refresh: %w", err), false)
 			return
 		}
 		ctx, cancel := context.WithTimeout(parent, routeRefreshTimeout)
 		defer cancel()
 		local = m.prepareLocalRouteBundle(local)
 		if m.routeRefreshFn != nil {
-			_ = m.routeRefreshFn(ctx, remoteChainID, local)
+			err = m.routeRefreshFn(ctx, remoteChainID, local)
 		} else {
-			_ = m.ExchangeP2PRoutes(ctx, remoteChainID, local)
+			err = m.ExchangeP2PRoutes(ctx, remoteChainID, local)
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			m.recordRouteFailure(remoteChainID, fmt.Errorf("refresh peer routes: %w", err), isSecurityTransportError(err))
 		}
 	}()
 }
@@ -417,6 +421,19 @@ func (m *Manager) maybeTriggerRouteRefresh(remoteChainID string) {
 	m.routeRefreshLast[remoteChainID] = now
 	m.routeRefreshMu.Unlock()
 	m.triggerRouteRefresh(remoteChainID)
+}
+
+// RefreshPeerRoutes asks every active agreement to exchange the current local
+// route bundle. It is safe to call on address-change notifications: per-peer
+// in-flight work is deduplicated and the exchange revalidates the trust
+// generation before persistence.
+func (m *Manager) RefreshPeerRoutes() {
+	if m == nil || !m.transportIsEnabled() {
+		return
+	}
+	for _, agreement := range m.ActiveAgreements() {
+		m.triggerRouteRefresh(agreement.RemoteChainID)
+	}
 }
 
 // StartRouteRefresher converges routes at startup and periodically. It owns one

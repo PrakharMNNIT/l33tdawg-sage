@@ -114,14 +114,6 @@ type federationSyncPolicyGenerationLeaser interface {
 	BeginSyncPolicyGenerationMutation(remoteChainID string) *federation.SyncPolicyGenerationMutation
 }
 
-// federationLinkedMessagePeerHint answers only whether one active agreement
-// may contain a caller-scoped linked-message edge. It is deliberately a local
-// authority hint, not a contact lookup: the bounded live peer request still
-// performs the exact recipient authorization and reveals no unrelated agent.
-type federationLinkedMessagePeerHint interface {
-	CallerMayHaveLinkedMessagePeer(ctx context.Context, remoteChainID, callerID string) (bool, error)
-}
-
 var _ federationAgreementMutationLeaser = (*federation.Manager)(nil)
 var _ federationSyncPolicyGenerationLeaser = (*federation.Manager)(nil)
 
@@ -577,6 +569,14 @@ type federationLinkedMessageDirectoryLister interface {
 	ListRemoteLinkedMessageContacts(ctx context.Context, remoteChainID, sourceAgentID string) (*federation.LinkedMessageDirectoryResult, error)
 }
 
+type federationMessageAdmissionRecorder interface {
+	RememberRemotePipeContactForCaller(
+		context.Context, string, string, *federation.PipeContactGrant,
+		federation.PipeContact, int,
+	) error
+	PrimeRemoteLinkedMessageTarget(context.Context, string, string) error
+}
+
 const (
 	maxAgentFederationTargets   = 64
 	maxFederationAvailablePeers = 64
@@ -714,6 +714,13 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		writeProblem(w, http.StatusBadRequest, "Invalid agent name", "agent_name must be at most 512 bytes")
 		return
 	}
+	peerChain := strings.TrimSpace(r.URL.Query().Get("peer_chain"))
+	if peerChain != "" {
+		if err := federation.ValidateChainID(peerChain); err != nil {
+			writeProblem(w, http.StatusBadRequest, "Invalid peer chain", err.Error())
+			return
+		}
+	}
 	callerMayPipe := s.callerMayUseFederatedPipe(callerID)
 	if agentName != "" && !callerMayPipe {
 		// Named federation discovery feeds sage_find_agent and therefore is a
@@ -741,9 +748,13 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		writeProblem(w, http.StatusBadRequest, "Invalid peer cursor", "peer_cursor must be the bounded continuation returned by the previous call")
 		return
 	}
+	if peerChain != "" && peerCursor != "" {
+		writeProblem(w, http.StatusBadRequest, "Invalid peer cursor", "peer_cursor cannot be combined with an exact peer_chain")
+		return
+	}
 	if _, bypass := r.Context().Value(federationAvailabilityCacheBypassKey{}).(bool); !bypass &&
 		s.federationAvailability != nil {
-		cacheKey := callerID + "\x00" + agentName + "\x00" + strconv.Itoa(agentLimit) + "\x00" + peerCursor
+		cacheKey := callerID + "\x00" + agentName + "\x00" + peerChain + "\x00" + strconv.Itoa(agentLimit) + "\x00" + peerCursor
 		response, cacheErr := s.federationAvailability.load(
 			r.Context(), cacheKey, func(loadCtx context.Context) federationAvailabilityResponse {
 				recorder := newFederationAvailabilityRecorder()
@@ -773,31 +784,15 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		if record.Status != "active" || (record.ExpiresAt != 0 && now >= record.ExpiresAt) {
 			continue
 		}
-		// Paginate only peers for which this caller has a local messaging/read
-		// edge. That caller-authorized peer inventory is safe to report honestly;
-		// unrelated agreements neither consume probes nor influence cursors or
-		// rate-limit cadence.
-		authorized := false
-		for _, domain := range record.AllowedDomains {
-			if len(s.federationVisibleRemoteScopes(r.Context(), callerID, domain)) != 0 {
-				authorized = true
-				break
-			}
+		if peerChain != "" && record.RemoteChainID != peerChain {
+			continue
 		}
-		if !authorized {
-			if hint, ok := s.federation.(federationLinkedMessagePeerHint); ok {
-				linked, hintErr := hint.CallerMayHaveLinkedMessagePeer(
-					r.Context(), record.RemoteChainID, callerID,
-				)
-				// A hint failure cannot widen visibility. The exact live lookup
-				// remains separately bounded and authoritative when the local
-				// state can prove that this peer may be relevant.
-				authorized = hintErr == nil && linked
-			}
-		}
-		if authorized {
-			active = append(active, record.RemoteChainID)
-		}
+		// A v3 JOIN is trust-only and intentionally commits AllowedDomains=[];
+		// current directional access lives in the authenticated peer-RBAC status
+		// snapshot. Every active agreement is therefore only a bounded probe
+		// candidate. The response below still reveals a peer only after its live
+		// grant/contact projection intersects this exact caller's local policy.
+		active = append(active, record.RemoteChainID)
 	}
 	sort.Strings(active)
 	peerOffset := 0
@@ -1031,6 +1026,39 @@ func (s *Server) availableFederationConnectionForCaller(
 		connection.RemoteAgents = mergeAvailablePipeContacts(
 			connection.RemoteAgents, linked.Contacts,
 		)
+	}
+	if agentName != "" && len(connection.RemoteAgents) != 0 {
+		if recorder, ok := s.federation.(federationMessageAdmissionRecorder); ok {
+			receiptVersion := 0
+			if slices.Contains(status.Capabilities, federation.CapabilityFederatedPipelineReceiptsV2) {
+				receiptVersion = federation.PipeReceiptVersion
+			}
+			ordinary := make(map[string]federation.PipeContact)
+			if contacts != nil {
+				for _, contact := range contacts.Contacts {
+					ordinary[contact.AgentID] = contact
+				}
+			}
+			admitted := connection.RemoteAgents[:0]
+			for _, contact := range connection.RemoteAgents {
+				var rememberErr error
+				if contact.AuthorizationMode == federation.LinkedMessageAuthorizationMode {
+					rememberErr = recorder.PrimeRemoteLinkedMessageTarget(
+						ctx, callerID, contact.Address,
+					)
+				} else if source, found := ordinary[contact.AgentID]; found && contacts != nil {
+					rememberErr = recorder.RememberRemotePipeContactForCaller(
+						ctx, callerID, remoteChainID, contacts, source, receiptVersion,
+					)
+				} else {
+					rememberErr = federation.ErrFederatedPipeInvalid
+				}
+				if rememberErr == nil {
+					admitted = append(admitted, contact)
+				}
+			}
+			connection.RemoteAgents = admitted
+		}
 	}
 	if len(connection.RemotePermissions) == 0 && len(connection.RemoteAgents) == 0 {
 		return nil, false

@@ -1874,16 +1874,9 @@ func runServe(startupProof string) (rerr error) {
 	var fedP2P *sagep2p.Transport
 	var fedP2PRoutesMu sync.RWMutex
 	if cfg.Federation.Enabled && cfg.Federation.P2PEnabled && fedMgr != nil {
-		for _, remoteChainID := range pruneExpiredFederationRoutes(&cfg.Federation, time.Now()) {
-			if err := persistFederationPeer(remoteChainID, nil); err != nil {
-				logger.Warn().Err(err).Str("chain_id", remoteChainID).Msg("could not prune expired federation route from config")
-			} else {
-				logger.Info().Str("chain_id", remoteChainID).Msg("pruned expired federation route")
-			}
-		}
 		allowedPeerAddrs := make([]string, 0)
-		for remoteChainID := range cfg.Federation.P2PPeers {
-			targets, routeErr := configuredFederationRouteTargets(cfg.Federation, remoteChainID, time.Now())
+		for _, remoteChainID := range configuredFederationRouteChainIDs(cfg.Federation) {
+			targets, routeErr := configuredFederationRouteTargets(cfg.Federation, remoteChainID)
 			if routeErr != nil {
 				logger.Warn().Err(routeErr).Str("chain_id", remoteChainID).Msg("ignoring invalid federation route")
 				continue
@@ -1906,7 +1899,7 @@ func runServe(startupProof string) (rerr error) {
 			fedP2P = p2pTransport
 			fedMgr.SetPeerRouteDialFunc(func(dialCtx context.Context, remoteChainID string, authenticate federation.PeerRouteAuthenticator) (federation.PeerRouteDialResult, bool, error) {
 				fedP2PRoutesMu.RLock()
-				targets, routeErr := configuredFederationRouteTargets(cfg.Federation, remoteChainID, time.Now())
+				targets, routeErr := configuredFederationRouteTargets(cfg.Federation, remoteChainID)
 				fedP2PRoutesMu.RUnlock()
 				if routeErr != nil {
 					return federation.PeerRouteDialResult{}, true, routeErr
@@ -2000,6 +1993,10 @@ func runServe(startupProof string) (rerr error) {
 			})
 			fedMgr.StartRouteRefresher(ctx)
 			defer fedMgr.StopRouteRefresher()
+			go watchFederationRouteChanges(ctx, time.Second,
+				func() (federation.JoinP2PBundle, error) { return localFederationRouteBundle(p2pTransport) },
+				fedMgr.RefreshPeerRoutes,
+			)
 			logger.Info().
 				Str("peer_id", fedP2P.Host().ID().String()).
 				Int("addresses", len(fedP2P.Addrs())).

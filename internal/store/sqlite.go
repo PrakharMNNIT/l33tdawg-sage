@@ -885,7 +885,9 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 
 	// Per-contact inbound work-request consent. This stays local/off-consensus,
 	// but every row is bound to one exact peer-RBAC/JOIN generation.
-	s.migrateFederatedPipeContacts(ctx)
+	if err := s.migrateFederatedPipeContacts(ctx); err != nil {
+		return fmt.Errorf("migrate federated pipe contacts: %w", err)
+	}
 	if err := s.migrateFederatedLinkedMessageConsent(ctx); err != nil {
 		return fmt.Errorf("migrate federated linked-message consent: %w", err)
 	}

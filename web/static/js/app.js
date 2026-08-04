@@ -53,7 +53,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.5';
+const SAGE_VERSION = 'v11.17.6';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -14142,7 +14142,7 @@ function PipelineView({ onStats }) {
                     headline=${filter ? `No ${filter} messages` : 'No messages yet'}
                     hint=${filter
                         ? 'Nothing with this status right now. Clear the filter to see the whole feed.'
-                        : 'When an agent hands work to another (sage_pipe) or you send a note from here, it shows up in this feed.'}
+                        : 'When an agent sends a message through SAGE or you send a note from here, it shows up in this feed.'}
                     actionLabel=${agentList.length > 0 ? 'Send a note to an agent' : undefined}
                     onAction=${agentList.length > 0 ? () => setShowCompose(true) : undefined} />
             `}

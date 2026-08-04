@@ -1,0 +1,77 @@
+name: sage-v11176-federation
+
+services:
+  relay:
+    image: sage-v11176-natter:local
+    build:
+      context: ../../natter
+      dockerfile: ../deploy/federation-acceptance/Dockerfile.natter
+    command: ["-config", "/etc/natter/natter.yaml"]
+    volumes:
+      - ./natter.yaml:/etc/natter/natter.yaml:ro
+      - ${FED_ACCEPTANCE_STATE:?set FED_ACCEPTANCE_STATE}/relay:/var/lib/natter
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/healthz"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+    networks:
+      edge_a:
+        aliases: [relay]
+      edge_b:
+        aliases: [relay]
+
+  node-a:
+    image: sage-v11176-node:local
+    build:
+      context: ../..
+      dockerfile: deploy/federation-acceptance/Dockerfile.node
+      args:
+        VERSION: v11.17.6-acceptance
+        COMMIT: docker-acceptance
+    environment:
+      SAGE_HOME: /root/.sage
+      SAGE_EMBEDDING_PROVIDER: hash
+      SAGE_VENDORED_AGENT_KEY_FILE: /root/.sage/agents/mynah/agent.key
+      SAGE_VENDORED_AGENT_HOME_DOMAIN: mynah-a-home
+      SAGE_VENDORED_AGENT_CLEARANCE: "1"
+    ports:
+      - "127.0.0.1:${FED_NODE_A_PORT:-28080}:8080"
+    volumes:
+      - ${FED_ACCEPTANCE_STATE:?set FED_ACCEPTANCE_STATE}/a:/root/.sage
+    networks:
+      edge_a: {}
+      control_a: {}
+
+  node-b:
+    image: sage-v11176-node:local
+    environment:
+      SAGE_HOME: /root/.sage
+      SAGE_EMBEDDING_PROVIDER: hash
+      SAGE_VENDORED_AGENT_KEY_FILE: /root/.sage/agents/mynah/agent.key
+      SAGE_VENDORED_AGENT_HOME_DOMAIN: mynah-b-home
+      SAGE_VENDORED_AGENT_CLEARANCE: "1"
+    ports:
+      - "127.0.0.1:${FED_NODE_B_PORT:-28081}:8080"
+    volumes:
+      - ${FED_ACCEPTANCE_STATE:?set FED_ACCEPTANCE_STATE}/b:/root/.sage
+    networks:
+      edge_b: {}
+      control_b: {}
+
+networks:
+  edge_a:
+    name: sage-v11176-federation-edge-a
+    internal: true
+  edge_b:
+    name: sage-v11176-federation-edge-b
+    internal: true
+  lan:
+    name: sage-v11176-federation-lan
+    internal: true
+  # Separate host-control bridges keep REST observable without giving the two
+  # nodes a shared container network that could bypass the relay assertion.
+  control_a:
+    name: sage-v11176-federation-control-a
+  control_b:
+    name: sage-v11176-federation-control-b

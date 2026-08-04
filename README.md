@@ -51,6 +51,30 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.17.6
+
+**Federation now recovers across LAN changes, internet relays, restarts, and
+roaming addresses.** Signed route snapshots retain the stable peer identity,
+rank safe Direct and Secure relay candidates, republish after relay reservation
+changes, and migrate v11.17.4 `p2p_peers` state without treating stale routes as
+authorization. Unsafe DNS, loopback, link-local, unspecified, multicast, mixed
+peer-ID, and wrong-protocol routes fail closed.
+
+**Federated agent discovery and Messages now work as one durable inbox.** Exact
+`peer_chain` lookup disambiguates same-named agents. A previously authenticated
+exact address can be queued while its node is offline, remains caller- and
+policy-bound across restart, and is revalidated before any payload leaves the
+sender. Canonical status independently reports transport, exact-recipient read,
+and workflow completion to the original sender. Legacy `sage_pipe*` tools stay
+callable for compatibility but are no longer advertised to new MCP clients.
+
+**A reproducible Docker federation acceptance lane covers the real product
+path.** It exercises same-LAN links, relay-only isolated networks, both-sided IP
+churn, relay outage and recovery, expired route snapshots, v11.17.4 migration,
+offline queueing, recipient inbox/read/reply, and final sender confirmation.
+
+Container: `ghcr.io/l33tdawg/sage:11.17.6`. SDK 11.17.6.
+
 ## What's New in v11.17.5
 
 **Federated agent sharing now sends the canonical permission wire shape.**
@@ -1187,7 +1211,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.5`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.6`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

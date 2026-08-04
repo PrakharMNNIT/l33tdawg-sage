@@ -109,6 +109,7 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
 	remoteAgent := strings.Repeat("b", 64)
 	var sent map[string]any
+	statusFallbackCalled := false
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pipe/resolve", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -134,9 +135,14 @@ func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
 	})
 	mux.HandleFunc("/v1/messages/transport-1/status", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "not local", http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"message_id": "transport-1", "scope": "federated",
+			"transport_status": "delivered", "read_status": "confirmed",
+			"workflow_status": "completed",
+		})
 	})
 	mux.HandleFunc("/v1/pipe/transport-1/receipt", func(w http.ResponseWriter, _ *http.Request) {
+		statusFallbackCalled = true
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"pipe_id": "transport-1", "transport_status": "delivered",
 			"read_status": "confirmed", "workflow_status": "pending",
@@ -154,6 +160,8 @@ func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "transport-1", result.(map[string]any)["message_id"])
 	require.NotContains(t, result.(map[string]any), "pipe_id")
+	require.Equal(t, "queued", result.(map[string]any)["transport_status"])
+	require.Equal(t, "unconfirmed", result.(map[string]any)["peer_status"])
 	require.Equal(t, "stable-fed", sent["idempotency_key"])
 	require.Equal(t, "chain-a", sent["source_chain_id"])
 
@@ -167,6 +175,9 @@ func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
 	require.Equal(t, "transport-1", status.(map[string]any)["message_id"])
 	require.NotContains(t, status.(map[string]any), "pipe_id")
 	require.Equal(t, "federated", status.(map[string]any)["scope"])
+	require.Equal(t, "confirmed", status.(map[string]any)["read_status"])
+	require.Equal(t, "completed", status.(map[string]any)["workflow_status"])
+	require.False(t, statusFallbackCalled, "canonical federated status must not lose workflow via the legacy receipt fallback")
 }
 
 func TestPipeReceiptStatusUsesExactSignedSenderProjection(t *testing.T) {

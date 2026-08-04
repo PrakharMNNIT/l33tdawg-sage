@@ -308,6 +308,23 @@ func TestTriggerRouteRefreshRetriesLostExchange(t *testing.T) {
 	assert.Equal(t, int32(2), attempts.Load())
 }
 
+func TestRouteRefreshFailureIsVisibleInDiagnostics(t *testing.T) {
+	m := &Manager{routeStatus: make(map[string]RouteDiagnostics)}
+	m.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) {
+			return JoinP2PBundle{PeerID: "peer", Protocol: "/sage/fed/1.0.0", Addrs: []string{"relay"}}, nil
+		},
+	})
+	m.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error {
+		return errors.New("simulated route outage")
+	}
+	m.triggerRouteRefresh("chain-b")
+	require.Eventually(t, func() bool {
+		return strings.Contains(m.RouteDiagnostics("chain-b").LastError, "simulated route outage")
+	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, RouteStateOffline, m.RouteDiagnostics("chain-b").State)
+}
+
 func TestRouteRefresherStartsOnceAndStopCancelsInflightRefresh(t *testing.T) {
 	a := newTestChain(t, "route-refresh-lifecycle-a")
 	b := newTestChain(t, "route-refresh-lifecycle-b")
