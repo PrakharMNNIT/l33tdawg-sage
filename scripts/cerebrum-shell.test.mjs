@@ -234,6 +234,16 @@ test('Access Controls is a first-class sidebar route', () => {
     assert.match(appSource, /navigate\('access'\)/);
     assert.match(appSource, /page === 'access'.*NetworkPage/s);
     assert.match(appSource, /accessMode \? 'access' : 'overview'/);
+    const access = appSource.slice(
+        appSource.indexOf('function AppV23AccessControl()'),
+        appSource.indexOf('function NetworkPage('),
+    );
+    assert.match(access, /appV23NormalizeAccessState\(await fetchAppV23Access\(\)\)/);
+    assert.ok(
+        access.indexOf('appV23NormalizeAccessState(await fetchAppV23Access())') <
+            access.indexOf('setState(next)'),
+        'nullable historical collections must be normalized before the first full render',
+    );
 });
 
 test('CEREBRUM Root is separate from agents and uses a two-stage one-time handover', () => {
