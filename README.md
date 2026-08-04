@@ -51,7 +51,29 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.17.2
+## What's New in v11.17.4
+
+**Federation enrollment now carries one validated route bundle from JOIN to
+roaming operation.** Direct and secure-relay candidates survive the ceremony,
+the dashboard reports the route that actually carried authenticated traffic,
+and stale host windows fail closed. Canonical agent messaging uses the exact
+linked-reader relationship plus independent receiver-local consent on the same
+direct-or-relay transport.
+
+**Canonical Messages are the public agent-to-agent workflow.**
+`sage_message_send`, `sage_inbox`, `sage_message_reply`,
+`sage_message_status`, and `sage_message_history` cover idempotent send,
+receive, reply, receipts, and restart-persistent history. Legacy `sage_pipe*`
+MCP tools remain compatibility aliases but are explicitly deprecated. The
+federated proof verifier accepts the sender-local idempotency field in the
+exact signed request without exporting that replay token into the peer event.
+
+**CEREBRUM recovery and consensus stay usable on upgraded nodes.** The
+consensus page authenticates its scope request, incompatible historical
+domain-continuity candidates are retired instead of being reproposed every
+block, and recovery deprecation records an honest recovery activity event.
+The recovery authority controls use a responsive grid, so the explanatory
+copy and selectors no longer collapse into a horizontally scrolling row.
 
 **Historical app-v25 home defects no longer prevent app-v26 repair from
 starting.** Nodes with the narrow legacy `shared_home` shape may rebuild their
@@ -113,15 +135,17 @@ registered name, agent ID, boot purpose, domains, or authorship; the rare Root
 handover card now sits below everyday agent and group controls. The macOS release gate
 mounts the signed DMG, copies the app to a fresh writable APFS location, verifies
 the exact leaf identities and version before and after first execution, and
-publishes only that verified immutable asset. CEREBRUM downloads the signed DMG
-instead of trying to replace its own running app; Linux keeps its verified
-in-place updater.
+publishes only that verified immutable asset. CEREBRUM now stages that signed
+DMG, verifies the replacement, swaps the installed application through a
+separate helper, and restarts into the new build with bounded readiness checks
+and rollback. Manual drag-and-drop remains the explicit fallback. Linux keeps
+its verified in-place updater.
 
 This is a governed consensus upgrade from app-v25 to app-v26. Existing chains
 advance in place; memories, historical authors, domains, and prior blocks are
 not rewritten.
 
-Container: `ghcr.io/l33tdawg/sage:11.17.2`. SDK 11.17.2.
+Container: `ghcr.io/l33tdawg/sage:11.17.4`. SDK 11.17.4.
 
 ## What's New in v11.16.4
 
@@ -1146,7 +1170,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.2`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.4`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
