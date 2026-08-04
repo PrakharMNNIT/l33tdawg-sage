@@ -31,6 +31,7 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		require.Equal(t, "stable-send", body["idempotency_key"])
 		require.Equal(t, "agent-bob", body["to_agent"])
+		require.EqualValues(t, 1440, body["ttl_minutes"])
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"message_id": "msg-1", "status": "pending", "expires_at": "2026-08-02T10:00:00Z",

@@ -79,6 +79,8 @@ receive, reply, receipts, and restart-persistent history. Legacy `sage_pipe*`
 MCP tools remain compatibility aliases but are explicitly deprecated. The
 federated proof verifier accepts the sender-local idempotency field in the
 exact signed request without exporting that replay token into the peer event.
+New messages now default to the full supported 24-hour inbox lifetime, rather
+than expiring after one hour while a recipient agent may be offline.
 
 **CEREBRUM recovery and consensus stay usable on upgraded nodes.** The
 consensus page authenticates its scope request, incompatible historical

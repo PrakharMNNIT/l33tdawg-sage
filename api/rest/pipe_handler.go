@@ -551,7 +551,7 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 
 	ttl := req.TTLMinutes
 	if ttl <= 0 {
-		ttl = 60
+		ttl = 1440
 	}
 	if ttl > 1440 {
 		ttl = 1440

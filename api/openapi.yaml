@@ -1822,7 +1822,7 @@ components:
           type: integer
           minimum: 1
           maximum: 1440
-          default: 60
+          default: 1440
 
     MessageSendResponse:
       type: object
