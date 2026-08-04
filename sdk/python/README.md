@@ -2,7 +2,7 @@
 
 Python client for the SAGE (Sovereign Agent Governed Experience) protocol -- a governed, verifiable institutional memory layer for multi-agent systems.
 
-**Requires Python 3.10+** | **SAGE v11.17.4 SDK** | **TLS, app-v26 explicit Access Group authority, app-v24 memory integrity, app-v25 immutable envelopes and historical continuity recovery, canonical local Messages and read receipts, read-only federation, scoped governance, and per-record `classification` supported**
+**Requires Python 3.10+** | **SAGE v11.17.5 SDK** | **TLS, app-v26 explicit Access Group authority, app-v24 memory integrity, app-v25 immutable envelopes and historical continuity recovery, canonical local Messages and read receipts, read-only federation, scoped governance, and per-record `classification` supported**
 
 ## Installation
 
@@ -345,7 +345,7 @@ msg = client.pipe_send(
     to_agent="target-agent-id",  # Route by agent ID
     # OR: to_provider="chatgpt",  # Route by provider name
     intent="analysis",           # Optional: message intent
-    ttl_minutes=60,              # Optional: expiry (default: 60, max: 1440)
+    ttl_minutes=1440,            # Optional: expiry (default/max: 1440 = 24h)
 )
 # Returns: PipeSendResponse(pipe_id, status, expires_at)
 
@@ -402,7 +402,7 @@ print(receipt.transport_status, receipt.read_status, receipt.workflow_status)
 ```
 
 `idempotency_key` and `receive_token` are 1–256 bytes. `ttl_minutes` is strictly
-1–1440 (default 60). Receive-token replay metadata is retained for 48 hours and
+1–1440 (default 1440 / 24 hours). Receive-token replay metadata is retained for 48 hours and
 bounded to 4096 tokens per agent; a purged/incomplete exact batch fails instead
 of claiming newer messages.
 

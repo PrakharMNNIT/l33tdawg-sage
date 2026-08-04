@@ -764,7 +764,7 @@ Introduced in v5.0.1, the pipeline is a direct messaging system between agents. 
 
 ### How It Works
 
-The pipeline provides structured, asynchronous communication between agents without polluting the shared memory pool. Messages are short-lived (default 60-minute TTL) and designed for coordination, not permanent knowledge storage.
+The pipeline provides structured, asynchronous communication between agents without polluting the shared memory pool. Messages default to a 24-hour TTL so an offline agent has a full day to collect inbox work; callers may choose a shorter lifetime. They are designed for coordination, not permanent knowledge storage.
 
 ### Message Lifecycle
 

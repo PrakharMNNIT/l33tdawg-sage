@@ -51,7 +51,19 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.17.4
+## What's New in v11.17.5
+
+**Federated agent sharing now sends the canonical permission wire shape.**
+Choosing a named local agent may add the domains that agent owns to the trusted
+connection. That automatic path now serializes the same `permissions` array as
+the normal domain editor, so the peer can expose the agent contact and the two
+agents can use canonical Messages/Inbox over the existing direct-or-relay link.
+
+**Upgrade recovery accepts the first valid revision-zero snapshot.** Legacy
+databases can legitimately publish their first preserved-record inventory at
+projection revision zero. CEREBRUM can now deprecate an exact selected subset
+of that inventory while still requiring the revision field, positive count,
+typed confirmation, current Root authority, and atomic queue validation.
 
 **Federation enrollment now carries one validated route bundle from JOIN to
 roaming operation.** Direct and secure-relay candidates survive the ceremony,
@@ -67,6 +79,8 @@ receive, reply, receipts, and restart-persistent history. Legacy `sage_pipe*`
 MCP tools remain compatibility aliases but are explicitly deprecated. The
 federated proof verifier accepts the sender-local idempotency field in the
 exact signed request without exporting that replay token into the peer event.
+New messages now default to the full supported 24-hour inbox lifetime, rather
+than expiring after one hour while a recipient agent may be offline.
 
 **CEREBRUM recovery and consensus stay usable on upgraded nodes.** The
 consensus page authenticates its scope request, incompatible historical
@@ -74,6 +88,9 @@ domain-continuity candidates are retired instead of being reproposed every
 block, and recovery deprecation records an honest recovery activity event.
 The recovery authority controls use a responsive grid, so the explanatory
 copy and selectors no longer collapse into a horizontally scrolling row.
+Access Controls also normalizes historical empty groups to `members: []`, so a
+valid empty group cannot throw during the first render and leave the page stuck
+on “Loading consensus access policy…”.
 
 **Historical app-v25 home defects no longer prevent app-v26 repair from
 starting.** Nodes with the narrow legacy `shared_home` shape may rebuild their
@@ -145,7 +162,7 @@ This is a governed consensus upgrade from app-v25 to app-v26. Existing chains
 advance in place; memories, historical authors, domains, and prior blocks are
 not rewritten.
 
-Container: `ghcr.io/l33tdawg/sage:11.17.4`. SDK 11.17.4.
+Container: `ghcr.io/l33tdawg/sage:11.17.5`. SDK 11.17.5.
 
 ## What's New in v11.16.4
 
@@ -1170,7 +1187,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.4`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.5`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
     appV23PolicyDraft,
+    appV23NormalizeAccessState,
     appV23CapabilityIndicators,
     appV23NeedsHomeReapproval,
     appV23PolicyChanged,
@@ -19,6 +20,21 @@ import {
     APPV23_SELECTABLE_PROFILES,
     appV23RootHandoverReady,
 } from '../web/static/js/appv23-policy.js';
+
+test('Access Controls normalizes null members before rendering an empty group', () => {
+    const input = {
+        agents: null,
+        groups: [{ group_id: 'empty-team', name: 'Empty team', members: null }],
+    };
+    const normalized = appV23NormalizeAccessState(input);
+
+    assert.deepEqual(normalized.agents, []);
+    assert.deepEqual(normalized.groups[0].members, []);
+    assert.equal(normalized.groups[0].members.length, 0);
+    assert.deepEqual(normalized.groups[0].members.map(String), []);
+    assert.equal(normalized.groups[0].members.includes('agent-id'), false);
+    assert.equal(input.groups[0].members, null, 'normalization must not mutate the fetched payload');
+});
 
 test('demoting Admin to Member removes hidden read-all capability', () => {
     const admin = { role: 'admin', profile: 'standard', clearance: 4, capabilities: 1 };

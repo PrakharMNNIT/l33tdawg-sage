@@ -770,6 +770,16 @@ func (h *DashboardHandler) handleAppV23AccessState(agentStore store.AgentStore) 
 				"Could not load consensus access groups.")
 			return
 		}
+		// Historical and deliberately empty groups may carry a nil Go slice in
+		// consensus state. Preserve that state exactly while projecting a stable
+		// JSON collection contract for CEREBRUM: `members:null` makes the first
+		// full Access Controls render throw when it reads length/map/includes,
+		// leaving the previous loading placeholder on screen indefinitely.
+		for i := range groups {
+			if groups[i].Members == nil {
+				groups[i].Members = []string{}
+			}
+		}
 		root, _, broker := h.appV23RootBrokerKey()
 		if root == nil && h.appV23IsActive() {
 			writeAppV23AccessError(w, http.StatusServiceUnavailable, "root_state_unavailable",

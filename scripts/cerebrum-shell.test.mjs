@@ -234,6 +234,16 @@ test('Access Controls is a first-class sidebar route', () => {
     assert.match(appSource, /navigate\('access'\)/);
     assert.match(appSource, /page === 'access'.*NetworkPage/s);
     assert.match(appSource, /accessMode \? 'access' : 'overview'/);
+    const access = appSource.slice(
+        appSource.indexOf('function AppV23AccessControl()'),
+        appSource.indexOf('function NetworkPage('),
+    );
+    assert.match(access, /appV23NormalizeAccessState\(await fetchAppV23Access\(\)\)/);
+    assert.ok(
+        access.indexOf('appV23NormalizeAccessState(await fetchAppV23Access())') <
+            access.indexOf('setState(next)'),
+        'nullable historical collections must be normalized before the first full render',
+    );
 });
 
 test('CEREBRUM Root is separate from agents and uses a two-stage one-time handover', () => {
@@ -1010,6 +1020,10 @@ test('federation agent contacts stay administrative and default-off', () => {
         'raw agent hashes must not be required by the federation UI');
     assert.match(panel, /fedPipeContactsGet\(chain, false, agentID\)/,
         'the friendly selection must still resolve through the exact authorization identity');
+	assert.match(panel, /fedPermissionsSet\(chain, fedPermissionSnapshot\(nextPermissions\)\)/,
+		'auto-sharing an agent-owned domain must send the permissions array required by the API');
+	assert.doesNotMatch(panel, /fedPermissionsSet\(chain, nextPermissions\)/,
+		'the normalized permission map must never be sent as the wire-level permissions array');
     assert.match(appSource, /function mergeFedPipeContactGrant\(base, targeted = \[\]\)/);
     assert.match(appSource, /grant\.agreement_id \|\| grant\.agreementId/,
         'normalized grants must retain their agreement binding');

@@ -95,7 +95,10 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 	if sender, senderErr := s.agentStore.GetAgent(r.Context(), senderID); senderErr == nil && sender != nil {
 		fromProvider = sender.Provider
 	}
-	ttl := 60
+	// Agent messages are asynchronous inbox work, so the default must tolerate
+	// recipients that are offline for part of a day. Callers can still request
+	// a shorter bounded lifetime explicitly.
+	ttl := 1440
 	if req.TTLMinutes != nil {
 		ttl = *req.TTLMinutes
 	}

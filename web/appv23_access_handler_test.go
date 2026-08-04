@@ -1149,6 +1149,21 @@ func TestAppV23AccessStateSeparatesRootAndLinkedReaders(t *testing.T) {
 	require.NoError(t, fixture.badger.MutateAppV23AccessGroup(
 		fixture.rootID, "local-team", "Local team", []string{fixture.agentID}, 0, false, 2,
 	))
+	require.NoError(t, fixture.badger.MutateAppV23AccessGroup(
+		fixture.rootID, "empty-team", "Empty team", nil, 0, false, 3,
+	))
+	storedGroups, err := fixture.badger.ListAppV23AccessGroups()
+	require.NoError(t, err)
+	var storedEmpty *store.AppV23AccessGroup
+	for i := range storedGroups {
+		if storedGroups[i].GroupID == "empty-team" {
+			storedEmpty = &storedGroups[i]
+			break
+		}
+	}
+	require.NotNil(t, storedEmpty)
+	assert.Nil(t, storedEmpty.Members,
+		"fixture must retain the historical nil-slice state that used to emit members:null")
 	sqlStore, err := store.NewSQLiteStore(context.Background(), filepath.Join(t.TempDir(), "sage.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sqlStore.Close()) })
@@ -1185,8 +1200,18 @@ func TestAppV23AccessStateSeparatesRootAndLinkedReaders(t *testing.T) {
 		"existing local display metadata remains visible until a governed rename commits")
 	assert.Equal(t, "Mynah", response.Agents[0].RegisteredName,
 		"legacy empty registered names use the projection's immutable registration fallback")
-	require.Len(t, response.Groups, 1)
-	assert.Equal(t, "local-team", response.Groups[0].GroupID)
+	require.Len(t, response.Groups, 2)
+	var emptyGroup *store.AppV23AccessGroup
+	for i := range response.Groups {
+		if response.Groups[i].GroupID == "empty-team" {
+			emptyGroup = &response.Groups[i]
+			break
+		}
+	}
+	require.NotNil(t, emptyGroup)
+	assert.NotNil(t, emptyGroup.Members, "empty groups must project as [] rather than null")
+	assert.Empty(t, emptyGroup.Members)
+	assert.NotContains(t, rec.Body.String(), `"members":null`)
 	assert.Equal(t, []string{
 		store.AppV23ProfileStandard,
 		store.AppV23ProfileCompanion,
