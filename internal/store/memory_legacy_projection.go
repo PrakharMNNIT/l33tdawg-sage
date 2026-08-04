@@ -493,7 +493,7 @@ func (s *SQLiteStore) ValidateLegacyMemoryRecoverySnapshot(
 	expectedRevision uint64,
 	expectedCount int,
 ) error {
-	if expectedRevision == 0 || expectedCount <= 0 {
+	if expectedCount <= 0 {
 		return ErrLegacyMemoryRecoverySnapshotChanged
 	}
 	var count int
@@ -531,7 +531,7 @@ func (s *SQLiteStore) DeprecateLegacyMemoryRecoverySnapshot(
 	expectedCount int,
 	authorizedBy string,
 ) (int, error) {
-	if expectedRevision == 0 || expectedCount <= 0 || strings.TrimSpace(authorizedBy) == "" {
+	if expectedCount <= 0 || strings.TrimSpace(authorizedBy) == "" {
 		return 0, ErrLegacyMemoryRecoverySnapshotChanged
 	}
 	txn, unlock, beginErr := s.beginTxLocked(ctx)

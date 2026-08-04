@@ -70,7 +70,7 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 
 	sendBody := map[string]any{
 		"to_agent": "bob", "intent": "review", "payload": "private request",
-		"ttl_minutes": 60, "idempotency_key": "one-send",
+		"idempotency_key": "one-send",
 	}
 	sent := callMessageJSON(t, messageRouterAs(s, "alice", true), http.MethodPost, "/v1/messages", sendBody)
 	require.Equal(t, http.StatusCreated, sent.Code, sent.Body.String())
@@ -79,6 +79,10 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 	messageID := sendResponse["message_id"].(string)
 	require.NotEmpty(t, messageID)
 	require.True(t, strings.HasPrefix(messageID, "msg-"), messageID)
+	expiresAt, err := time.Parse(time.RFC3339, sendResponse["expires_at"].(string))
+	require.NoError(t, err)
+	require.WithinDuration(t, time.Now().UTC().Add(24*time.Hour), expiresAt, 5*time.Second,
+		"omitted message TTL must keep inbox work for the 24-hour default")
 	require.Len(t, notifications, 1)
 	require.Equal(t, "bob", notifications[0].RecipientAgentID)
 	require.Equal(t, "alice", notifications[0].FromAgent)

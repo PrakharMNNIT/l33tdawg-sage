@@ -194,7 +194,7 @@ func (s *SQLiteStore) AssignLegacyMemoryRecoverySelection(
 	authorizedBy string,
 ) (int, error) {
 	ids, err := canonicalRecoverySelection(memoryIDs, tx.MaxMemoryLegacyAdoptionIDBytes)
-	if err != nil || expectedRevision == 0 || expectedCount <= 0 ||
+	if err != nil || expectedCount <= 0 ||
 		strings.TrimSpace(targetAgentID) == "" || strings.TrimSpace(authorizedBy) == "" {
 		return 0, ErrLegacyMemoryRecoverySnapshotChanged
 	}
@@ -347,7 +347,7 @@ func (s *SQLiteStore) DeprecateLegacyMemoryRecoverySelection(
 	authorizedBy string,
 ) (int, error) {
 	ids, err := canonicalRecoverySelection(memoryIDs, maxLegacyMemoryRecoveryDispositionIDBytes)
-	if err != nil || expectedRevision == 0 || expectedCount <= 0 || strings.TrimSpace(authorizedBy) == "" {
+	if err != nil || expectedCount <= 0 || strings.TrimSpace(authorizedBy) == "" {
 		return 0, ErrLegacyMemoryRecoverySnapshotChanged
 	}
 	if ensureErr := s.ensureLegacyMemoryRecoveryAssignmentTable(ctx); ensureErr != nil {

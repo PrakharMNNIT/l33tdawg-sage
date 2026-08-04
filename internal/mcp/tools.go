@@ -322,7 +322,7 @@ func (s *Server) registerTools() map[string]Tool {
 					"to":          map[string]any{"type": "string", "description": "Target: local provider/name/agent_id, or visible federated #node/agent handle or agent_id@chain address"},
 					"intent":      map[string]any{"type": "string", "description": "What you want done: 'research', 'summarize', 'analyze', 'review', etc."},
 					"payload":     map[string]any{"type": "string", "description": "The work content to send"},
-					"ttl_minutes": map[string]any{"type": "integer", "description": "Time-to-live in minutes (default: 60, max: 1440)", "default": 60},
+					"ttl_minutes": map[string]any{"type": "integer", "description": "Time-to-live in minutes (default: 1440 / 24 hours, max: 1440)", "default": 1440},
 				},
 				"required": []string{"to", "payload"},
 			},
@@ -337,7 +337,7 @@ func (s *Server) registerTools() map[string]Tool {
 					"to":              map[string]any{"type": "string", "description": "Exact local agent_id/name or caller-authorized federated #node/agent or agent_id@chain address"},
 					"intent":          map[string]any{"type": "string", "description": "Short purpose of the message"},
 					"payload":         map[string]any{"type": "string", "description": "Untrusted request content to send"},
-					"ttl_minutes":     map[string]any{"type": "integer", "default": 60, "minimum": 1, "maximum": 1440},
+					"ttl_minutes":     map[string]any{"type": "integer", "description": "Inbox lifetime in minutes (default: 1440 / 24 hours)", "default": 1440, "minimum": 1, "maximum": 1440},
 					"idempotency_key": map[string]any{"type": "string", "minLength": 1, "maxLength": store.MaxMessageTokenBytes, "description": "Caller-generated stable token reused only when retrying this exact send"},
 				},
 				"required": []string{"to", "payload", "idempotency_key"},
@@ -4337,7 +4337,7 @@ func (s *Server) toolMessageSend(ctx context.Context, params map[string]any) (an
 	if len(idempotencyKey) > store.MaxMessageTokenBytes {
 		return nil, fmt.Errorf("'idempotency_key' must be at most %d bytes", store.MaxMessageTokenBytes)
 	}
-	ttl := intParam(params, "ttl_minutes", 60)
+	ttl := intParam(params, "ttl_minutes", 1440)
 	if ttl < 1 || ttl > 1440 {
 		return nil, fmt.Errorf("'ttl_minutes' must be between 1 and 1440")
 	}
@@ -4625,9 +4625,9 @@ func (s *Server) toolPipe(ctx context.Context, params map[string]any) (any, erro
 		return nil, fmt.Errorf("'payload' is required")
 	}
 	intent := stringParam(params, "intent", "")
-	ttlMinutes := intParam(params, "ttl_minutes", 60)
+	ttlMinutes := intParam(params, "ttl_minutes", 1440)
 	if ttlMinutes <= 0 {
-		ttlMinutes = 60
+		ttlMinutes = 1440
 	}
 	if ttlMinutes > 1440 {
 		ttlMinutes = 1440

@@ -247,20 +247,36 @@ func decodeAppV25LegacyRecoveryControlRequest(
 	w http.ResponseWriter,
 	r *http.Request,
 ) (appV25LegacyRecoveryControlRequest, bool) {
-	var request appV25LegacyRecoveryControlRequest
+	// Revision zero is a valid snapshot on databases upgraded from a release
+	// that did not yet maintain the projection-revision trigger. Decode the
+	// wire field as a pointer so "missing" remains distinct from a present 0.
+	var wire struct {
+		ProjectionRevision *uint64  `json:"projection_revision"`
+		ExpectedCount      int      `json:"expected_count"`
+		Confirmation       string   `json:"confirmation,omitempty"`
+		MemoryIDs          []string `json:"memory_ids,omitempty"`
+		TargetAgentID      string   `json:"target_agent_id,omitempty"`
+	}
 	// A selected recovery mutation accepts up to 256 bounded historical IDs.
 	// Four KiB admitted only a fraction of that documented/store-level bound.
 	r.Body = http.MaxBytesReader(w, r.Body, appV26LegacyRecoveryRequestMaxBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
+	if err := decoder.Decode(&wire); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid memory recovery request")
-		return request, false
+		return appV25LegacyRecoveryControlRequest{}, false
 	}
-	if request.ProjectionRevision == 0 || request.ExpectedCount <= 0 {
+	if wire.ProjectionRevision == nil || wire.ExpectedCount <= 0 {
 		writeError(w, http.StatusBadRequest,
 			"projection_revision and a positive expected_count are required")
-		return request, false
+		return appV25LegacyRecoveryControlRequest{}, false
+	}
+	request := appV25LegacyRecoveryControlRequest{
+		ProjectionRevision: *wire.ProjectionRevision,
+		ExpectedCount:      wire.ExpectedCount,
+		Confirmation:       wire.Confirmation,
+		MemoryIDs:          wire.MemoryIDs,
+		TargetAgentID:      wire.TargetAgentID,
 	}
 	return request, true
 }

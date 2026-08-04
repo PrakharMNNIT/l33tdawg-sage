@@ -96,6 +96,66 @@ func appV25RecoveryControlRequest(
 	return request
 }
 
+func TestDecodeAppV25LegacyRecoveryControlAcceptsPresentZeroRevision(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/dashboard/memory/adoption-deprecate",
+		strings.NewReader(`{"projection_revision":0,"expected_count":7,"confirmation":"DEPRECATE 7"}`))
+	recorder := httptest.NewRecorder()
+
+	decoded, ok := decodeAppV25LegacyRecoveryControlRequest(recorder, request)
+
+	require.True(t, ok)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Zero(t, decoded.ProjectionRevision)
+	require.Equal(t, 7, decoded.ExpectedCount)
+	require.Equal(t, "DEPRECATE 7", decoded.Confirmation)
+}
+
+func TestDecodeAppV25LegacyRecoveryControlRejectsMissingRevision(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/dashboard/memory/adoption-deprecate",
+		strings.NewReader(`{"expected_count":7,"confirmation":"DEPRECATE 7"}`))
+	recorder := httptest.NewRecorder()
+
+	_, ok := decodeAppV25LegacyRecoveryControlRequest(recorder, request)
+
+	require.False(t, ok)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "projection_revision and a positive expected_count are required")
+}
+
+func TestAppV25LegacyRecoveryDeprecatesUpgradeSnapshotAtRevisionZero(t *testing.T) {
+	handler, sqlite, _, _, _ := appV25RecoveryControlFixture(t)
+	ctx := context.Background()
+	require.NoError(t, sqlite.SyncLegacyMemoryRecoveryQueue(ctx, 0,
+		[]store.LegacyMemoryRecoveryItem{{
+			MemoryID: "legacy-unconvertible", Reason: "content_hash_mismatch",
+		}}))
+	progress := store.LegacyMemoryAdoptionProgress{
+		State: "recovery", Discovered: 1, Recovery: 1, Revision: 0,
+	}
+	require.NoError(t, sqlite.PublishLegacyMemoryAdoptionProgress(ctx, progress))
+	handler.noteAppV25MaintenanceProgress(progress)
+
+	body, err := json.Marshal(appV25LegacyRecoveryControlRequest{
+		ProjectionRevision: 0, ExpectedCount: 1, Confirmation: "DEPRECATE 1",
+		MemoryIDs: []string{"legacy-unconvertible"},
+	})
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost,
+		"/v1/dashboard/memory/adoption-deprecate", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "http://localhost:8080")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	request.Host = "localhost:8080"
+	request.RemoteAddr = "127.0.0.1:54321"
+	recorder := httptest.NewRecorder()
+	handler.handleAppV25LegacyAdoptionDeprecate(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	dispositions, err := sqlite.ListLegacyMemoryRecoveryDispositions(ctx)
+	require.NoError(t, err)
+	require.Len(t, dispositions, 1)
+}
+
 func TestAppV25LegacyRecoveryControlsRequireCurrentRoot(t *testing.T) {
 	for _, test := range []struct {
 		name         string

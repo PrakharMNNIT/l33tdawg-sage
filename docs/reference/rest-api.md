@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.17.4. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.17.5. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -997,8 +997,8 @@ Pre-app-v23 nodes retain their legacy projection behavior.
 | `PUT /v1/dashboard/network/access/linked-messages/consent` | Set `accepting` for one exact tuple using `expected_revision`; never creates a read link, contact, group membership, domain grant, role, or write authority. |
 | `POST /v1/dashboard/network/access/root/handover` | Dedicated current-Root-only credential handover with irreversible confirmation, exact phrase, and expected Root generation. Returns the replacement recovery archive once with `Cache-Control: no-store`. |
 | `GET /v1/dashboard/memory/adoption-progress` | Root/operator aggregate App-v25 historical-recovery progress. It returns counts and state only—never the hidden records' content, domains, authors, or reasons. |
-| `POST /v1/dashboard/memory/adoption-retry` | Current-Root-only request for a fresh scan of the exact unresolved App-v25 snapshot. Requires its `projection_revision` and `expected_count`; it never deletes rows or clears earlier dispositions. |
-| `POST /v1/dashboard/memory/adoption-deprecate` | Current-Root-only retirement of the exact unresolved snapshot. Requires `projection_revision`, `expected_count`, and typed `DEPRECATE <count>` confirmation. Records remain preserved for audit and are skipped by future automatic repair. |
+| `POST /v1/dashboard/memory/adoption-retry` | Current-Root-only request for a fresh scan of the exact unresolved App-v25 snapshot. Requires the `projection_revision` field (zero is valid for a first upgraded snapshot) and a positive `expected_count`; it never deletes rows or clears earlier dispositions. |
+| `POST /v1/dashboard/memory/adoption-deprecate` | Current-Root-only retirement of the exact unresolved snapshot. Requires the `projection_revision` field (including valid zero), positive `expected_count`, and typed `DEPRECATE <count>` confirmation. Records remain preserved for audit and are skipped by future automatic repair. |
 
 Once app-v26 is active, the legacy
 `PATCH /v1/dashboard/network/agents/{id}` metadata route rejects `name` and
@@ -2013,7 +2013,7 @@ principal.
 
 | Route | Contract |
 |---|---|
-| `POST /v1/messages` | Exact-local-agent send. Requires `to_agent`, `payload`, and a 1–256-byte caller-scoped `idempotency_key`; optional `intent` and strict `ttl_minutes` 1–1440 (default 60). Exact retry returns the original `message_id`; same key/different request is HTTP 409. |
+| `POST /v1/messages` | Exact-local-agent send. Requires `to_agent`, `payload`, and a 1–256-byte caller-scoped `idempotency_key`; optional `intent` and strict `ttl_minutes` 1–1440 (default 1440 / 24 hours). Exact retry returns the original `message_id`; same key/different request is HTTP 409. |
 | `POST /v1/messages/receive` | Requires a 1–256-byte `receive_token`; optional limit 1–20. Claims and persists one exact ordered batch. Same caller/token/limit replays that batch after a lost response; a different limit is HTTP 409. Replay metadata is retained for 48 hours and capped at 4096 tokens per agent: capacity returns HTTP 429, while a purged/incomplete exact batch returns HTTP 410 instead of claiming later work. |
 | `POST /v1/messages/{message_id}/reply` | Exact fetched recipient only. Same result is idempotent; different second result is HTTP 409. Reply and local exact-read evidence commit atomically. |
 | `PUT /v1/messages/{message_id}/read` | Fresh nonce-bound exact-recipient signature. The message must already have been returned to that caller by canonical receive. Same acknowledgement is idempotent. |
@@ -2089,7 +2089,7 @@ Send a pipeline message to another agent or provider.
 | `destination_chain_id` | string | no | For a federated send, the exact chain returned by `/v1/pipe/resolve`; requires exact `to_agent` and empty `to_provider` |
 | `intent` | string | no | Human description of the work |
 | `payload` | string | yes | Arbitrary content |
-| `ttl_minutes` | int | no | 1–1440; defaults to 60 |
+| `ttl_minutes` | int | no | 1–1440; defaults to 1440 (24 hours) |
 
 For a local send, the target must be registered here. For a federated send,
 call `/v1/pipe/resolve` first and sign its exact `source_chain_id`, `to_agent`,

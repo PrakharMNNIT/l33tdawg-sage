@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.17.4.
+Reconciled against internal/mcp for SAGE v11.17.5.
 
 # SAGE MCP Tools Reference
 
@@ -855,7 +855,7 @@ read.
 | `to` | string | yes | Exact local agent ID/name, federated `#node/agent` handle, or `agent_id@chain` address. |
 | `payload` | string | yes | Untrusted agent request content. |
 | `intent` | string | no | Short purpose. |
-| `ttl_minutes` | integer | no | 1–1440; default 60. |
+| `ttl_minutes` | integer | no | 1–1440; default 1440 (24 hours). |
 | `idempotency_key` | string | yes | Stable 1–256-byte caller token reused only to retry this exact send. |
 
 Federated sends retain the mature pipeline wire protocol internally, but the
@@ -963,7 +963,7 @@ cached briefly per caller.
 | `to`          | string | yes      | Local provider/name/agent ID, visible `#node/agent-prefix` handle, or exact `agent@chain` address. |
 | `payload`     | string | yes      | The work content to send. |
 | `intent`      | string | no       | What you want done: `research`, `summarize`, `analyze`, `review`, etc. |
-| `ttl_minutes` | int    | no       | Time-to-live in minutes. Default: 60. Max: 1440 (24h). |
+| `ttl_minutes` | int    | no       | Time-to-live in minutes. Default and maximum: 1440 (24h). |
 
 Before every send, MCP calls the read-only `/v1/pipe/resolve` endpoint. For a
 federated contact it signs the exact returned source chain, agent, and
