@@ -56,9 +56,7 @@ func (s *BadgerStore) ValidateAppV23StateForPreV26ProjectionRecovery() error {
 		} else if !errors.Is(err, badger.ErrKeyNotFound) {
 			return fmt.Errorf("read app-v26 recovery boundary: %w", err)
 		}
-		scoped := *s
-		scoped.txn = txn
-		return scoped.validateAppV23State(true)
+		return s.validateAppV23StateTxn(txn, true)
 	})
 }
 
