@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.17.1.
+Reconciled against internal/mcp for SAGE v11.17.2.
 
 # SAGE MCP Tools Reference
 
@@ -654,8 +654,11 @@ approve. It does not weaken the active-only signed `/v1/agents` roster.
 `GET /v1/memory/list` request for an active caller. The
 operator-only CEREBRUM statistics route is never used by an agent.
 
-**When to call:** Quick health check; understanding how full the memory store is;
-verifying memories were committed after storing.
+**When to call:** To learn the calling identity's registration/access standing
+and obtain bounded exact domain targets before scoped recall. It is not a node
+health check, a global store-size endpoint, or proof that a newly submitted
+memory reached its terminal projection; use the write receipt and exact memory
+read/status surface for that evidence.
 
 ---
 
@@ -1071,6 +1074,7 @@ contacted.
 |---|---|---|---|
 | `name` | string | yes | Display-name, registered-name, or provider substring for local and federated contacts. Federated lookup requires at least two Unicode code points and applies a two-second candidate-query deadline. ASCII matching is case-insensitive and exact matches rank first; non-ASCII federated matching follows the remote SQLite registration casing behavior. |
 | `limit` | int | no | Maximum matches to return. Default 10, max 20. |
+| `peer_cursor` | string | no | Opaque continuation returned as `next_peer_cursor` by an incomplete federated lookup. Omit it for the first page. One call consumes at most one bounded peer page; callers choose whether to continue and must not auto-walk the federation. |
 
 Federated results are restricted to contacts visible to the signing caller
 through `GET /v1/federation/available?agent_name=…`, and only when that contact
@@ -1133,11 +1137,17 @@ remote agent contacts.
 - `matches`: recipient records with `scope` (`local` or `federated`) and a `to`
   field ready to pass to `sage_pipe`. Local `to` is the exact `agent_id`;
   federated `to` is the exact `agent_id@chain` address.
-- `searched`: `["local"]` when a local match exists, otherwise
-  `["local", "federated"]`.
+- `searched`: `["local"]` when an exact local match makes federation
+  unnecessary; a local substring match remains `["local", "federated"]` so an
+  exact authorized remote recipient can still win. If that bounded federated
+  page is incomplete, the local substring results preserve `complete:false`
+  and `next_peer_cursor` rather than pretending the lookup is finished.
 - `federated_cache`: `hit` or `miss` for legacy shared-domain contacts, or
   `live` when a linked-v23 relation deliberately bypasses the cache.
-- `total`, `truncated`, and a next-step `message`.
+- `total`, `truncated`, `complete`, `next_peer_cursor`, and a next-step
+  `message`. `next_peer_cursor` is non-empty only when another bounded peer
+  page may be requested; it is not a hidden-peer count or an instruction to
+  loop.
 
 **When to call:** When a user asks to contact an agent by a human name and the
 exact SAGE address is not already known. Use the returned `to` value directly.

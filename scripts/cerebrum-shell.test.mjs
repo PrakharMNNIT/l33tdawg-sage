@@ -909,10 +909,31 @@ test('federation separates trust from directional per-domain RBAC', () => {
         'already-shared rows must be grouped from the persisted permission snapshot');
     assert.match(panel, /visibleUnsharedRows = visibleRows\.filter\(row => !fedPermissionIsEnabled\(saved\[row\.domain\]\)\)/,
         'unshared rows must be kept in a separate group');
+    assert.match(appSource, /const fedPermissionRenderBatch = 75;/,
+        'agreement detail tables must have a strict initial render bound');
+    assert.match(panel, /renderedSharedRows = visibleSharedRows\.slice\(0, localRowLimit\)/,
+        'existing grants must lead the bounded local window');
+    assert.match(panel, /renderedUnsharedRows = visibleUnsharedRows\.slice\(0, remainingLocalSlots\)/,
+        'unshared rows may only consume the remaining bounded window');
+    assert.match(panel, /orderedRemoteRows = \[[\s\S]*subscribeDraft\.includes\(domain\)[\s\S]*!subscribeDraft\.includes\(domain\)/,
+        'retained remote subscriptions must lead the bounded remote window');
+    assert.match(panel, /renderedRemoteRows = orderedRemoteRows\.slice\(0, remoteRowLimit\)/,
+        'the remote permission table must also remain render-bounded');
+    assert.match(panel, /setLocalRowLimit\(limit => limit \+ fedPermissionRenderBatch\)/);
+    assert.match(panel, /setRemoteRowLimit\(limit => limit \+ fedPermissionRenderBatch\)/);
+    assert.match(panel, /visibleRows\.forEach/,
+        'render windowing must not narrow filtered bulk-action semantics');
+    assert.match(appSource, /function fedCatalogMapsEqual\(a, b\)/);
+    assert.match(panel, /setCatalog\(current => current !== null && fedCatalogMapsEqual\(current, nextCatalog\) \? current : nextCatalog\)/,
+        'unchanged catalog polls must preserve object identity and skip table reconciliation');
+    assert.match(panel, /onInput=\$\{e => \{ setLocalRowLimit\(fedPermissionRenderBatch\); setFilter\(e\.target\.value\); \}\}/,
+        'changing the filter must reset the bound before rendering a broader result set');
+    assert.match(panel, /setRemote\(current => fedPermissionMapsEqual\(current, nextRemote\) \? current : nextRemote\)/,
+        'unchanged remote permission polls must not reconcile the bounded table');
     assert.ok(panel.indexOf('Already shared with') < panel.indexOf('Not shared'),
         'already-shared domains must be rendered before unshared domains');
-    assert.match(panel, /visibleSharedRows\.map\(renderLocalPermissionRow\)/);
-    assert.match(panel, /visibleUnsharedRows\.map\(renderLocalPermissionRow\)/);
+    assert.match(panel, /renderedSharedRows\.map\(renderLocalPermissionRow\)/);
+    assert.match(panel, /renderedUnsharedRows\.map\(renderLocalPermissionRow\)/);
     assert.match(cssSource, /\.fed-perm-rowgroup \+ \.fed-perm-rowgroup/);
     assert.match(cssSource, /\.fed-perm-group-head\.shared > span/,
         'the already-shared group must be visually distinct');

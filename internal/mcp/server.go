@@ -130,8 +130,8 @@ func (s *Server) ForgetConversation(id string) {
 }
 
 // NewServer creates a new MCP server instance.
-// If baseURL is empty, defaults to https://localhost:8443 when TLS certs exist
-// (quorum mode), otherwise http://localhost:8080 (personal mode).
+// If baseURL is empty, defaults to https://127.0.0.1:8443 when TLS certs exist
+// (quorum mode), otherwise http://127.0.0.1:8080 (personal mode).
 func NewServer(baseURL string, agentKey ed25519.PrivateKey) *Server {
 	if baseURL == "" {
 		baseURL = defaultBaseURL()
@@ -985,14 +985,17 @@ func (s *Server) submitMemoryResilient(ctx context.Context, submitReq []byte, ou
 }
 
 // defaultBaseURL returns the default SAGE API URL based on whether TLS certs exist.
-// Quorum mode (certs present) → https://localhost:8443
-// Personal mode (no certs) → http://localhost:8080
+// Quorum mode (certs present) → https://127.0.0.1:8443
+// Personal mode (no certs) → http://127.0.0.1:8080
+//
+// Internal clients use the literal loopback address because localhost may
+// resolve to ::1 first while the personal-node listener is IPv4-only.
 func defaultBaseURL() string {
 	if tlsAddr := strings.TrimSpace(os.Getenv("SAGE_TLS_ADDR")); tlsAddr != "" {
 		if host, port, err := net.SplitHostPort(tlsAddr); err == nil && port != "" {
 			switch host {
 			case "", "0.0.0.0", "::":
-				host = "localhost"
+				host = "127.0.0.1"
 			}
 			return "https://" + net.JoinHostPort(host, port)
 		}
@@ -1005,10 +1008,10 @@ func defaultBaseURL() string {
 	}
 	if home != "" {
 		if tlsca.CertsExist(filepath.Join(home, "certs")) {
-			return "https://localhost:8443"
+			return "https://127.0.0.1:8443"
 		}
 	}
-	return "http://localhost:8080"
+	return "http://127.0.0.1:8080"
 }
 
 // DefaultBaseURL exposes the same TLS-aware fallback used by NewServer for

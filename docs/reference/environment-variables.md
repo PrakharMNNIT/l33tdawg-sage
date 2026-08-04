@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.17.1. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
+<!-- Reconciled through SAGE v11.17.2. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
 
 # SAGE Reference — Environment Variables
 
@@ -19,7 +19,7 @@ notes which.
 | Variable | What it does | Default | Read by | Source |
 |----------|--------------|---------|---------|--------|
 | `SAGE_HOME` | Data directory — holds `config.yaml`, `agent.key`, `certs/`, `data/`, the `memory_mode` flag, etc. Tilde (`~`) is expanded. | `~/.sage` | all | `cmd/sage-gui/config.go:98`, `cmd/sage-gui/mcp.go:38` |
-| `SAGE_API_URL` | REST base URL that the CLI / MCP server / hooks talk to. | `http://localhost:8080`, or `https://localhost:8443` when `$SAGE_HOME/certs/` exists | sage-gui, sage-cli, MCP | `internal/mcp/server.go:591`, `cmd/sage-gui/mcp.go:185`, `cmd/sage-cli/main.go:30` |
+| `SAGE_API_URL` | REST base URL that the CLI / MCP server / hooks talk to. Literal IPv4 loopback avoids an IPv6 `localhost` resolution when the personal listener is IPv4-only. | `http://127.0.0.1:8080`, or `https://127.0.0.1:8443` when `$SAGE_HOME/certs/` exists | sage-gui, sage-cli, MCP | `internal/mcp/server.go`, `cmd/sage-gui/mcp.go`, `cmd/sage-cli/main.go` |
 | `SAGE_IDENTITY_PATH` | Explicit identity-key path. Takes precedence over `SAGE_AGENT_KEY`. Project-local Codex installs pin their derived provider-specific folder key explicitly; the shared user-level Codex config uses workspace mode so `sage-gui mcp` and provider-neutral workspace hooks derive the same stable per-workspace key without inheriting a shell pin. | (per-project derivation) | sage-gui, MCP | `cmd/sage-gui/mcp.go`, `cmd/sage-gui/hook.go:219`, `cmd/sage-gui/connect.go` (`mcpIdentityPath`) |
 | `SAGE_IDENTITY_MODE` | Codex MCP identity selection. `workspace` ignores inherited `SAGE_IDENTITY_PATH`/`SAGE_AGENT_KEY` and derives from the launch working directory; `pinned` honors the explicit configured key. Written by generated Codex config rather than intended as a general user setting. | `pinned` unless configured | sage-gui MCP | `cmd/sage-gui/mcp.go`, `cmd/sage-gui/codex.go` |
 | `SAGE_AGENT_KEY` | Explicit agent-key path; overrides per-project key derivation. Used if `SAGE_IDENTITY_PATH` is unset. An unset MCP identity never falls back to the stable node transport/CEREBRUM Root key: workspace clients derive a per-project key and app-scoped clients derive `agents/global-<provider>/agent.key`. | (per-project or provider-global ordinary-agent derivation) | sage-gui, MCP | `cmd/sage-gui/mcp.go`, `cmd/sage-gui/connect.go` |

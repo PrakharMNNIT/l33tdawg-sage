@@ -11,7 +11,7 @@ import (
 	"github.com/l33tdawg/sage/web"
 )
 
-var mcpConfigAPIURL = "http://localhost:8080"
+var mcpConfigAPIURL = "http://127.0.0.1:8080"
 
 // connectProvider is the same-machine one-click connect dispatcher wired into
 // the dashboard via DashboardHandler.ConnectFunc (see node.go). It resolves the

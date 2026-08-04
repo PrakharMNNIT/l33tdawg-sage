@@ -51,7 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.17.1
+## What's New in v11.17.2
+
+**Historical app-v25 home defects no longer prevent app-v26 repair from
+starting.** Nodes with the narrow legacy `shared_home` shape may rebuild their
+local agent serving projection long enough for the existing deterministic
+app-v26 migration to run. Eligibility and validation share one Badger snapshot,
+completed app-v26 chains stay strict, and a concurrent repair falls back to one
+strict retry. This changes no memory, historical author, ownership history, or
+prior block outside the already-governed app-v26 repair.
+
+**Large federation agreements stay responsive.** CEREBRUM renders bounded
+75-domain windows, keeps existing grants and retained subscriptions first, and
+skips reconciliation when polling returns identical state. Search, bulk
+actions, and Save still operate on the complete filtered permission set and
+full draft rather than only the rendered rows.
+
+**Local MCP clients use the listener SAGE actually binds.** Generated configs,
+hooks, bundles, and internal defaults now use `127.0.0.1` instead of allowing
+`localhost` to resolve to an unbound IPv6 `::1`. `sage_find_agent` also
+preserves its bounded federated continuation cursor when a fuzzy local result
+exists, so a caller can explicitly request the next peer page without any
+automatic federation walk.
 
 **App-v26 makes Access Group authority explicit and reviewable.** Every local
 group now stores one deterministic member authority: `read`, `read_write`, or
@@ -100,7 +121,7 @@ This is a governed consensus upgrade from app-v25 to app-v26. Existing chains
 advance in place; memories, historical authors, domains, and prior blocks are
 not rewritten.
 
-Container: `ghcr.io/l33tdawg/sage:11.17.1`. SDK 11.17.1.
+Container: `ghcr.io/l33tdawg/sage:11.17.2`. SDK 11.17.2.
 
 ## What's New in v11.16.4
 
@@ -1125,7 +1146,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.1`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.2`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

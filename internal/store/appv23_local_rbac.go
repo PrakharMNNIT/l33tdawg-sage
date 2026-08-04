@@ -5027,8 +5027,16 @@ func (s *BadgerStore) ValidateAppV23StateForPreV26Recovery() error {
 }
 
 func (s *BadgerStore) validateAppV23State(allowRecoverableHomes bool) error {
-	root, err := s.GetAppV23Root()
-	if err != nil || root == nil {
+	return s.view(func(txn *badger.Txn) error {
+		return s.validateAppV23StateTxn(txn, allowRecoverableHomes)
+	})
+}
+
+func (s *BadgerStore) validateAppV23StateTxn(
+	txn *badger.Txn, allowRecoverableHomes bool,
+) error {
+	var root AppV23RootState
+	if err := appV23ReadJSON(txn, appV23RootKey(), &root); err != nil {
 		return errors.New("app-v23 state has no root")
 	}
 	if err := validateCanonicalAgentID("root principal", root.PrincipalID); err != nil {
@@ -5041,7 +5049,7 @@ func (s *BadgerStore) validateAppV23State(allowRecoverableHomes bool) error {
 		len(root.HistoryDigest) != sha256.Size*2 {
 		return errors.New("app-v23 root credential state is invalid")
 	}
-	return s.view(func(txn *badger.Txn) error {
+	{
 		roster, rosterErr := s.appV23MigrationAgentsTxn(txn)
 		if rosterErr != nil {
 			return rosterErr
@@ -5672,5 +5680,5 @@ func (s *BadgerStore) validateAppV23State(allowRecoverableHomes bool) error {
 			return err
 		}
 		return nil
-	})
+	}
 }

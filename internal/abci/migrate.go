@@ -34,9 +34,30 @@ func MigrateAgentsOnChain(ctx context.Context, agentStore store.AgentStore, badg
 		return fmt.Errorf("read app-v23 Root for agent projection: %w", rootErr)
 	}
 	if root != nil {
-		projected, projectionErr := store.ReconcileAppV23AgentProjections(
-			ctx, agentStore, badgerStore,
-		)
+		strictErr := badgerStore.ValidateAppV23State()
+		var projected int
+		var projectionErr error
+		if strictErr == nil {
+			projected, projectionErr = store.ReconcileAppV23AgentProjections(
+				ctx, agentStore, badgerStore,
+			)
+		} else {
+			logger.Warn().Err(strictErr).Msg(
+				"app-v23 agent projection checking pre-app-v26 recovery compatibility",
+			)
+			projected, projectionErr = store.ReconcileAppV23AgentProjectionsForPreV26Recovery(
+				ctx, agentStore, badgerStore,
+			)
+			if projectionErr != nil {
+				// App-v26 may have activated and repaired the image after the
+				// first strict snapshot but before the recovery snapshot. Retry
+				// strict projection once: it succeeds only on the now-valid image
+				// and preserves fail-closed behavior for every unrepaired defect.
+				projected, projectionErr = store.ReconcileAppV23AgentProjections(
+					ctx, agentStore, badgerStore,
+				)
+			}
+		}
 		if projectionErr != nil {
 			logger.Error().Err(projectionErr).Msg("app-v23 agent projection reconciliation failed")
 			return fmt.Errorf("reconcile app-v23 agent projection: %w", projectionErr)
