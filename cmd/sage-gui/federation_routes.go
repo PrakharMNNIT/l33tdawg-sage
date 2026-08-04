@@ -112,8 +112,17 @@ func dialFederationP2PRouteTargets(ctx context.Context, targets []string, dial f
 			defer attemptCancel()
 			start := time.Now()
 			conn, err := dial(attemptCtx, target)
+			selectedTarget := target
+			if actualTarget, limited, ok := sagep2p.InspectConnectionRoute(conn); ok {
+				selectedTarget = actualTarget
+				if limited {
+					kind = federation.RouteKindRelay
+				} else {
+					kind = federation.RouteKindP2PDirect
+				}
+			}
 			result := federation.PeerRouteDialResult{
-				Conn: conn, Kind: kind, Target: target, Latency: time.Since(start),
+				Conn: conn, Kind: kind, Target: selectedTarget, Latency: time.Since(start),
 			}
 			if authenticate != nil {
 				result, err = authenticate(attemptCtx, result, err)
