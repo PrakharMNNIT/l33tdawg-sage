@@ -2,6 +2,8 @@ package rest
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -116,6 +118,53 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 	require.NotContains(t, unauthorized.Body.String(), "private request")
 	require.NotContains(t, unauthorized.Body.String(), "alice")
 	require.NotContains(t, unauthorized.Body.String(), "bob")
+}
+
+func TestCanonicalFederatedMessageStatusIsSenderOnly(t *testing.T) {
+	s, sqlite := newPipeServer(t)
+	pub, _, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	sender := hex.EncodeToString(pub)
+	recipient := strings.Repeat("b", 64)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	msg := &store.PipelineMessage{
+		PipeID: "fed-status-rest", FromAgent: sender, ToAgent: recipient,
+		Intent: "request", Payload: "private", Status: "pending",
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour), DestinationChainID: "chain-b",
+		FederationPolicyEpoch:     strings.Repeat("c", 64),
+		FederationAgreementID:     strings.Repeat("d", 64),
+		FederationContactID:       strings.Repeat("e", 64),
+		FederationContactRevision: strings.Repeat("f", 64),
+	}
+	event := &store.PipelineTransportOutbox{
+		EventID: "fed-status-rest-event", PipeID: msg.PipeID, RemoteChainID: "chain-b",
+		EventKind: "send", PolicyEpoch: msg.FederationPolicyEpoch,
+		AgreementID: msg.FederationAgreementID, ContactID: msg.FederationContactID,
+		ContactRevision: msg.FederationContactRevision, SourceAgentID: sender,
+		TargetAgentID: recipient, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		Proof: store.PipelineAgentProof{AgentID: sender, Signature: make([]byte, ed25519.SignatureSize),
+			Timestamp: now.Unix(), Nonce: []byte("12345678"), CanonicalRequest: []byte("POST /v1/pipe/send\n{}")},
+	}
+	_, _, err = sqlite.SendFederatedMessage(t.Context(), "fed-status-rest-key", msg, event)
+	require.NoError(t, err)
+
+	owned := callMessageJSON(t, messageRouterAs(s, sender, true), http.MethodGet,
+		"/v1/messages/"+msg.PipeID+"/status", nil)
+	require.Equal(t, http.StatusOK, owned.Code, owned.Body.String())
+	var status store.MessageStatus
+	require.NoError(t, json.Unmarshal(owned.Body.Bytes(), &status))
+	require.Equal(t, "federated", status.Scope)
+	require.Equal(t, "queued", status.TransportStatus)
+	require.Equal(t, "unsupported", status.ReadStatus)
+	require.Equal(t, "pending", status.WorkflowStatus)
+
+	receiver := callMessageJSON(t, messageRouterAs(s, recipient, true), http.MethodGet,
+		"/v1/messages/"+msg.PipeID+"/status", nil)
+	absent := callMessageJSON(t, messageRouterAs(s, recipient, true), http.MethodGet,
+		"/v1/messages/not-present/status", nil)
+	require.Equal(t, http.StatusNotFound, receiver.Code)
+	require.Equal(t, http.StatusNotFound, absent.Code)
+	require.JSONEq(t, absent.Body.String(), receiver.Body.String())
 }
 
 func TestCanonicalMessageReadAndReplyRequireExactSignedFetchedRecipient(t *testing.T) {

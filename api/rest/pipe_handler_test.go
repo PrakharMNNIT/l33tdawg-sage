@@ -37,6 +37,34 @@ type remotePipeResolver struct {
 	linkedTargetString string
 }
 
+type offlineAdmissionResolver struct {
+	*remotePipeResolver
+	known         *federation.RemotePipeTarget
+	knownCalls    int
+	livePipeCalls int
+}
+
+func (r *offlineAdmissionResolver) ResolveRemoteLinkedPipeTargetForCaller(
+	_ context.Context, _, _ string,
+) (*federation.RemotePipeTarget, error) {
+	r.knownCalls++
+	return r.known, nil
+}
+
+func (r *offlineAdmissionResolver) ResolveRemotePipeTargetForCaller(
+	_ context.Context, _, _ string,
+) (*federation.RemotePipeTarget, error) {
+	r.knownCalls++
+	return r.known, nil
+}
+
+func (r *offlineAdmissionResolver) ResolveRemotePipeTarget(
+	context.Context, string,
+) (*federation.RemotePipeTarget, error) {
+	r.livePipeCalls++
+	return nil, federation.ErrRemotePipeResolutionIncomplete
+}
+
 func (r *remotePipeResolver) ResolveRemotePipeTarget(context.Context, string) (*federation.RemotePipeTarget, error) {
 	return r.target, r.err
 }
@@ -345,6 +373,66 @@ func TestHandlePipeSend_QualifiedRemoteTargetStoresExactProvenance(t *testing.T)
 	inbox, err := memStore.GetInbox(context.Background(), remoteAgentID, "", 5)
 	require.NoError(t, err)
 	assert.Empty(t, inbox, "a queued remote target must never appear in a local inbox")
+}
+
+func TestCanonicalFederatedMessageOfflineAdmissionIsImmediateDurableAndIdempotent(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	remoteAgentID := strings.Repeat("ab", 32)
+	localSender := strings.Repeat("12", 32)
+	target := &federation.RemotePipeTarget{
+		ChainID: "chain-peer", AgentID: remoteAgentID,
+		ContactID: strings.Repeat("cd", 32), ContactRevision: strings.Repeat("de", 32),
+		PolicyEpoch: "epoch-7", AgreementID: strings.Repeat("ef", 32),
+		Address: remoteAgentID + "@chain-peer",
+		Domains: []federation.PipeContactDomain{{Domain: "research"}},
+	}
+	resolver := &offlineAdmissionResolver{
+		remotePipeResolver: &remotePipeResolver{fakeFederation: &fakeFederation{}},
+		known:              target,
+	}
+	s.SetFederation(resolver)
+	s.nodeOperatorID = localSender
+	body, err := json.Marshal(map[string]any{
+		"to_agent": remoteAgentID, "source_chain_id": "chain-local",
+		"destination_chain_id": "chain-peer", "payload": "offline work",
+		"idempotency_key": "offline-send-1", "ttl_minutes": 1440,
+	})
+	require.NoError(t, err)
+	send := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/pipe/send", bytes.NewReader(body))
+		req = req.WithContext(middleware.WithAgentAuth(req.Context(), &middleware.AgentAuthProof{
+			Signature: make([]byte, ed25519.SignatureSize), Timestamp: time.Now().Unix(),
+			Nonce: []byte("12345678"), CanonicalRequest: append([]byte("POST /v1/pipe/send\n"), body...),
+		}))
+		rr := httptest.NewRecorder()
+		pipeRouterAs(s, localSender).ServeHTTP(rr, req)
+		return rr
+	}
+	first := send()
+	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
+	var firstResponse map[string]any
+	require.NoError(t, json.Unmarshal(first.Body.Bytes(), &firstResponse))
+	require.Equal(t, "pending", firstResponse["status"])
+	require.Equal(t, "queued", firstResponse["transport_status"])
+	require.Equal(t, "unconfirmed", firstResponse["peer_status"])
+	second := send()
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	var secondResponse map[string]any
+	require.NoError(t, json.Unmarshal(second.Body.Bytes(), &secondResponse))
+	require.Equal(t, firstResponse["pipe_id"], secondResponse["pipe_id"])
+	require.Equal(t, true, secondResponse["idempotent_replay"])
+	require.Zero(t, resolver.livePipeCalls,
+		"offline admission must not synchronously dial or expose payload to the peer")
+	require.Equal(t, 2, resolver.knownCalls)
+	pending, err := memStore.ListPendingPipelineTransport(
+		context.Background(), time.Now().Add(time.Minute), 10,
+	)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "idempotent retry must retain one durable outbox event")
+	msg, err := memStore.GetPipeline(context.Background(), firstResponse["pipe_id"].(string))
+	require.NoError(t, err)
+	require.Equal(t, "offline work", msg.Payload)
+	require.WithinDuration(t, msg.CreatedAt.Add(24*time.Hour), msg.ExpiresAt, time.Second)
 }
 
 func TestLinkedV23ResolveAndSendPersistCallerBoundRelation(t *testing.T) {

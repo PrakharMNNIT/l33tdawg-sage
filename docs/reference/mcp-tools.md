@@ -1,8 +1,11 @@
-Reconciled against internal/mcp for SAGE v11.17.4.
+Reconciled against internal/mcp for SAGE v11.17.6.
 
 # SAGE MCP Tools Reference
 
-SAGE exposes exactly 34 registered and callable MCP tools over JSON-RPC 2.0. Stdio tools sign REST calls with
+SAGE advertises exactly 31 MCP tools over JSON-RPC 2.0. Four deprecated
+`sage_pipe*` compatibility names remain callable for one migration window but
+are intentionally absent from `tools/list`, so new clients learn the canonical
+Messages API. Stdio tools sign REST calls with
 the local Ed25519 identity; SSE and Streamable-HTTP use the MCP bearer-token/OAuth
 flow. Under app-v23 each HTTP bearer unlocks and signs with its own distinct
 restricted Member identity pending CEREBRUM review; it never inherits the
@@ -933,6 +936,9 @@ result, so it remains usable while the content vault is locked.
 `read_status:confirmed` means the exact addressed credential fetched the
 message and signed an acknowledgement naming that exact ID. It does not prove
 comprehension or action; absence means not confirmed, never unseen.
+For federated sends, the sender-only projection merges the local durable
+workflow row with transport state and receipt-v2 evidence; none of those
+independent facts is inferred from another.
 
 **REST:** `GET /v1/messages/{message_id}/status`.
 
@@ -940,7 +946,8 @@ comprehension or action; absence means not confirmed, never unseen.
 
 ### sage_pipe
 
-**Compatibility:** Deprecated public alias retained for older clients. New
+**Compatibility:** Deprecated hidden alias retained for older clients. It is
+callable by name but absent from `tools/list`. New
 clients use `sage_message_send`, `sage_inbox`, `sage_message_reply`, and
 `sage_message_status`; the pipeline remains the internal federated wire/storage
 implementation.
@@ -1049,13 +1056,15 @@ original sender may query this projection.
 ### sage_find_agent
 
 **Purpose:** Discover an active recipient by a human name before calling
-`sage_pipe`. It searches active local registrations first using a bounded,
+`sage_message_send`. It searches active local registrations first using a bounded,
 literal substring match over display name, immutable registered name, and
 provider. ASCII matching is case-insensitive; non-ASCII code points require
 their registered casing. Thus `mynah` can resolve
-`MYNAH (SAGE Voice Bridge Agent)`. Only when no local match exists does it
-inspect caller-authorized federated contacts; it is not a global agent
-directory.
+`MYNAH (SAGE Voice Bridge Agent)`. A local exact match returns immediately by
+default; local substring matches are combined with caller-authorized federated
+contacts so a stronger remote exact match can win. Set `peer_chain` to skip
+local discovery and search one exact connected SAGE when both nodes use the
+same agent name. It is not a global agent directory.
 
 After app-v23, local discovery uses the same active-ordinary-agent boundary as
 local pipeline resolve/send/inbox for both caller and result: Root and every
@@ -1086,6 +1095,7 @@ contacted.
 |---|---|---|---|
 | `name` | string | yes | Display-name, registered-name, or provider substring for local and federated contacts. Federated lookup requires at least two Unicode code points and applies a two-second candidate-query deadline. ASCII matching is case-insensitive and exact matches rank first; non-ASCII federated matching follows the remote SQLite registration casing behavior. |
 | `limit` | int | no | Maximum matches to return. Default 10, max 20. |
+| `peer_chain` | string | no | Exact connected SAGE chain ID to search exclusively. Skips local matches and all other peers; cannot be combined with `peer_cursor`. |
 | `peer_cursor` | string | no | Opaque continuation returned as `next_peer_cursor` by an incomplete federated lookup. Omit it for the first page. One call consumes at most one bounded peer page; callers choose whether to continue and must not auto-walk the federation. |
 
 Federated results are restricted to contacts visible to the signing caller
@@ -1101,6 +1111,13 @@ write grant therefore also qualifies. No endpoint,
 CA, agreement, contact-ID, or other mutation material is exposed. `sage_pipe`
 repeats the same local domain-scope authorization on both federated resolution
 and direct send.
+
+App-v26 JOIN agreements intentionally persist no domain snapshot. Discovery
+therefore treats every active agreement as a bounded probe candidate and uses
+the peer's current authenticated RBAC/contact projection as the authority.
+Legacy `AllowedDomains` metadata cannot suppress a current v3 grant. The
+response still reveals a peer only after that live projection intersects the
+exact caller's local policy.
 
 App-v26 also permits friendly discovery across an exact linked-reader
 messaging edge when the receiver has separately enabled that exact caller.
@@ -1147,13 +1164,14 @@ remote agent contacts.
 **Returns:**
 
 - `matches`: recipient records with `scope` (`local` or `federated`) and a `to`
-  field ready to pass to `sage_pipe`. Local `to` is the exact `agent_id`;
+  field ready to pass to `sage_message_send`. Local `to` is the exact `agent_id`;
   federated `to` is the exact `agent_id@chain` address.
 - `searched`: `["local"]` when an exact local match makes federation
   unnecessary; a local substring match remains `["local", "federated"]` so an
   exact authorized remote recipient can still win. If that bounded federated
   page is incomplete, the local substring results preserve `complete:false`
   and `next_peer_cursor` rather than pretending the lookup is finished.
+  With `peer_chain`, it is `["federated"]`.
 - `federated_cache`: `hit` or `miss` for legacy shared-domain contacts, or
   `live` when a linked-v23 relation deliberately bypasses the cache.
 - `total`, `truncated`, `complete`, `next_peer_cursor`, and a next-step
@@ -1163,7 +1181,7 @@ remote agent contacts.
 
 **When to call:** When a user asks to contact an agent by a human name and the
 exact SAGE address is not already known. Use the returned `to` value directly.
-`sage_pipe` re-resolves it before queueing; a federated outbox performs the
+`sage_message_send` re-resolves it before queueing; a federated outbox performs the
 required fresh live authorization check before any payload bytes leave this
 SAGE, so revoked or changed contacts fail closed.
 
@@ -1562,7 +1580,7 @@ registration name from `sage_register` is untouched.
 
 ## Summary
 
-**34 tools documented:**
+**31 advertised tools:**
 
 | Category     | Tools |
 |--------------|-------|
@@ -1573,5 +1591,7 @@ registration name from `sage_register` is untouched.
 | Tasks        | `sage_task`, `sage_backlog` |
 | Identity     | `sage_register`, `sage_rename`, `sage_directory` |
 | Messages     | `sage_find_agent`, `sage_message_send`, `sage_messages_receive`, `sage_inbox`, `sage_message_reply`, `sage_message_status`, `sage_message_history` |
-| Pipeline compatibility | `sage_pipe`, `sage_pipe_receipt_status`, `sage_pipe_history`, `sage_pipe_result` |
 | Governance   | `sage_gov_propose`, `sage_gov_vote`, `sage_gov_status`, `sage_scope_list`, `sage_scope_get` |
+
+Hidden compatibility dispatch (not returned by `tools/list`): `sage_pipe`,
+`sage_pipe_receipt_status`, `sage_pipe_history`, and `sage_pipe_result`.

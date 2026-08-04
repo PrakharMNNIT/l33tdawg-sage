@@ -125,7 +125,7 @@ func TestHandleToolsList(t *testing.T) {
 
 	result := resp.Result.(map[string]any)
 	tools := result["tools"].([]map[string]any)
-	assert.Len(t, tools, 35)
+	assert.Len(t, tools, 31)
 
 	// Collect tool names
 	names := make(map[string]bool)
@@ -157,8 +157,7 @@ func TestHandleToolsList(t *testing.T) {
 		"sage_federation", "sage_find_agent", "sage_forget", "sage_gov_propose",
 		"sage_gov_status", "sage_gov_vote", "sage_inbox", "sage_inception",
 		"sage_link", "sage_list", "sage_message_reply", "sage_message_send",
-		"sage_message_history", "sage_message_status", "sage_messages_receive", "sage_pipe",
-		"sage_pipe_history", "sage_pipe_receipt_status", "sage_pipe_result",
+		"sage_message_history", "sage_message_status", "sage_messages_receive",
 		"sage_recall", "sage_reflect", "sage_register", "sage_reinstate",
 		"sage_remember", "sage_rename", "sage_scope_get", "sage_scope_list",
 		"sage_status", "sage_task", "sage_timeline", "sage_turn",
@@ -171,7 +170,7 @@ func TestHandleToolsList(t *testing.T) {
 	assert.False(t, names["sage_red_pill"], "retired aliases must not be registered")
 	assert.True(t, names["sage_remember"])
 	assert.True(t, names["sage_recall"])
-	assert.True(t, names["sage_pipe_history"])
+	assert.False(t, names["sage_pipe_history"], "deprecated compatibility tools must be hidden from discovery")
 	assert.True(t, names["sage_message_send"])
 	assert.True(t, names["sage_message_history"])
 	assert.True(t, names["sage_messages_receive"])
@@ -186,7 +185,7 @@ func TestHandleToolsList(t *testing.T) {
 	assert.True(t, names["sage_timeline"])
 	assert.True(t, names["sage_status"])
 	assert.True(t, names["sage_domains"])
-	assert.True(t, names["sage_pipe_receipt_status"])
+	assert.False(t, names["sage_pipe_receipt_status"], "deprecated compatibility tools must be hidden from discovery")
 	assert.True(t, names["sage_gov_propose"])
 	assert.True(t, names["sage_gov_vote"])
 	assert.True(t, names["sage_gov_status"])
@@ -208,6 +207,12 @@ func TestHandleToolsList(t *testing.T) {
 	assert.Contains(t, nameSchema["description"], "exact field matches rank first")
 	findCursor := findProperties["peer_cursor"].(map[string]any)
 	assert.Contains(t, findCursor["description"], "Bounded federated continuation")
+	findPeerChain := findProperties["peer_chain"].(map[string]any)
+	assert.Contains(t, findPeerChain["description"], "same display name")
+	for _, legacy := range []string{"sage_pipe", "sage_pipe_history", "sage_pipe_receipt_status", "sage_pipe_result"} {
+		assert.False(t, names[legacy])
+		assert.Contains(t, s.tools, legacy, "hidden compatibility dispatch must remain callable")
+	}
 
 	require.NotNil(t, sageFederation)
 	federationSchema := sageFederation["inputSchema"].(map[string]any)
@@ -263,6 +268,9 @@ func TestAdvertisedToolsExactlyMatchReferenceHeadings(t *testing.T) {
 	s, _ := testServer(t)
 	registered := make([]string, 0, len(s.tools))
 	for _, tool := range s.tools {
+		if hiddenCompatibilityTools[tool.Name] {
+			continue
+		}
 		registered = append(registered, tool.Name)
 	}
 	_, source, _, ok := runtime.Caller(0)
@@ -271,7 +279,7 @@ func TestAdvertisedToolsExactlyMatchReferenceHeadings(t *testing.T) {
 	doc, err := os.ReadFile(docPath)
 	require.NoError(t, err)
 	docText := string(doc)
-	assert.Contains(t, docText, "SAGE exposes exactly 34 registered and callable MCP tools",
+	assert.Contains(t, docText, "SAGE advertises exactly 31 MCP tools",
 		"the human-readable inventory count must match tools/list")
 	assert.Contains(t, docText, "One call consumes at most one bounded peer page",
 		"sage_find_agent must document its advertised peer_cursor contract")
@@ -281,6 +289,9 @@ func TestAdvertisedToolsExactlyMatchReferenceHeadings(t *testing.T) {
 	matches := re.FindAllStringSubmatch(docText, -1)
 	documented := make([]string, 0, len(matches))
 	for _, match := range matches {
+		if hiddenCompatibilityTools[match[1]] {
+			continue
+		}
 		documented = append(documented, match[1])
 	}
 	assert.ElementsMatch(t, registered, documented,

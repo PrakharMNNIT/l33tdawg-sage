@@ -161,7 +161,7 @@ func TestDialFederationP2PRouteTargetsReportsReusedLiveRelay(t *testing.T) {
 	require.NoError(t, winner.Conn.Close())
 }
 
-func TestExpiredPersistedFederationRouteIsPrunedAtBoot(t *testing.T) {
+func TestExpiredPersistedFederationRouteRemainsRecoveryHintAndSynthesizesRelay(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("SAGE_HOME", tmp)
 	require.NoError(t, os.WriteFile(filepath.Join(tmp, "config.yaml"),
@@ -170,38 +170,193 @@ func TestExpiredPersistedFederationRouteIsPrunedAtBoot(t *testing.T) {
 	require.NoError(t, err)
 	id, err := peer.IDFromPrivateKey(priv)
 	require.NoError(t, err)
-	target := "/ip4/203.0.113.10/tcp/4001/p2p/" + id.String()
+	staleTarget := "/ip4/203.0.113.10/tcp/4001/p2p/" + id.String()
 	now := time.Now()
 	require.NoError(t, persistFederationRouteSnapshot("expired-chain", federation.RouteSnapshot{
 		PeerID: id.String(), Protocol: string(sagep2p.FederationProtocol),
-		Addrs: []string{target}, Revision: 8, IssuedAt: now.Add(-2 * time.Hour).Unix(),
-		ExpiresAt: now.Add(-time.Hour).Unix(), Generation: "generation",
+		Addrs: []string{staleTarget}, Revision: 8, IssuedAt: now.Add(-48 * time.Hour).Unix(),
+		ExpiresAt: now.Add(-24 * time.Hour).Unix(), Generation: "generation",
 	}))
-	cfg, err := LoadConfig()
+	cfg, err := LoadConfig() // restart-style reload from durable config
 	require.NoError(t, err)
-	_, err = configuredFederationRouteTargets(cfg.Federation, "expired-chain", now)
-	require.ErrorContains(t, err, "expired")
-	expired := pruneExpiredFederationRoutes(&cfg.Federation, now)
-	require.Equal(t, []string{"expired-chain"}, expired)
-	for _, chain := range expired {
-		require.NoError(t, persistFederationPeer(chain, nil))
-	}
-	reloaded, err := LoadConfig()
+	require.NotEmpty(t, cfg.Federation.P2PRelayAddrs)
+	targets, err := configuredFederationRouteTargets(cfg.Federation, "expired-chain")
 	require.NoError(t, err)
-	assert.NotContains(t, reloaded.Federation.P2PPeers, "expired-chain")
-	assert.NotContains(t, reloaded.Federation.P2PRoutes, "expired-chain")
+	require.GreaterOrEqual(t, len(targets), 2)
+	assert.Equal(t, staleTarget, targets[0], "stale direct address remains a non-authorizing recovery hint")
+	assert.Contains(t, targets, cfg.Federation.P2PRelayAddrs[0]+"/p2p-circuit/p2p/"+id.String())
 }
 
 func TestConfiguredFederationRouteTargetsUsesCurrentSnapshotNotLegacyMirror(t *testing.T) {
+	priv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	id, err := peer.IDFromPrivateKey(priv)
+	require.NoError(t, err)
 	now := time.Now()
+	current := "/ip4/10.0.0.8/tcp/4001/p2p/" + id.String()
 	cfg := FederationConfig{
 		P2PPeers: map[string][]string{"peer": {"stale-mirror"}},
 		P2PRoutes: map[string]FederationRouteSnapshot{"peer": {
-			Addrs: []string{"current"}, Revision: 2, IssuedAt: now.Add(-time.Minute).Unix(),
+			PeerID: id.String(), Protocol: string(sagep2p.FederationProtocol),
+			Addrs: []string{current}, Revision: 2, IssuedAt: now.Add(-time.Minute).Unix(),
 			ExpiresAt: now.Add(time.Hour).Unix(), Generation: "generation",
 		}},
 	}
-	targets, err := configuredFederationRouteTargets(cfg, "peer", now)
+	targets, err := configuredFederationRouteTargets(cfg, "peer")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"current"}, targets)
+	assert.Equal(t, []string{current}, targets)
+}
+
+func TestConfiguredFederationRouteChainIDsIncludesVersionedOnlyRoutes(t *testing.T) {
+	cfg := FederationConfig{
+		P2PPeers:  map[string][]string{"legacy-only": nil, "both": nil},
+		P2PRoutes: map[string]FederationRouteSnapshot{"versioned-only": {}, "both": {}},
+	}
+	assert.Equal(t, []string{"both", "legacy-only", "versioned-only"}, configuredFederationRouteChainIDs(cfg))
+}
+
+func TestLegacyFederationRoutesSynthesizeRelayRecovery(t *testing.T) {
+	remotePriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	remoteID, err := peer.IDFromPrivateKey(remotePriv)
+	require.NoError(t, err)
+	relayPriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	relayID, err := peer.IDFromPrivateKey(relayPriv)
+	require.NoError(t, err)
+	direct := "/ip4/192.168.50.250/tcp/49123/p2p/" + remoteID.String()
+	relay := "/ip4/198.51.100.20/tcp/4001/p2p/" + relayID.String()
+	cfg := FederationConfig{
+		P2PPeers:      map[string][]string{"legacy": {direct}},
+		P2PRelayAddrs: []string{relay},
+	}
+	targets, err := configuredFederationRouteTargets(cfg, "legacy")
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		direct,
+		relay + "/p2p-circuit/p2p/" + remoteID.String(),
+	}, targets)
+}
+
+func TestLegacyFederationRoutesRejectConflictingPeerIDs(t *testing.T) {
+	firstPriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	firstID, err := peer.IDFromPrivateKey(firstPriv)
+	require.NoError(t, err)
+	secondPriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	secondID, err := peer.IDFromPrivateKey(secondPriv)
+	require.NoError(t, err)
+	cfg := FederationConfig{P2PPeers: map[string][]string{"legacy": {
+		"/ip4/192.168.50.10/tcp/1/p2p/" + firstID.String(),
+		"/ip4/192.168.50.11/tcp/1/p2p/" + secondID.String(),
+	}}}
+	_, err = configuredFederationRouteTargets(cfg, "legacy")
+	require.ErrorContains(t, err, "different peer ids")
+}
+
+func TestLegacyFederationRoutesRejectInvalidMultiaddr(t *testing.T) {
+	cfg := FederationConfig{P2PPeers: map[string][]string{"legacy": {"not-a-multiaddr"}}}
+	_, err := configuredFederationRouteTargets(cfg, "legacy")
+	require.ErrorContains(t, err, "invalid peer route")
+}
+
+func TestConfiguredFederationRoutesRejectUnsafeDirectTargets(t *testing.T) {
+	priv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	id, err := peer.IDFromPrivateKey(priv)
+	require.NoError(t, err)
+	for _, target := range []string{
+		"/dns4/localhost/tcp/4001/p2p/" + id.String(),
+		"/ip4/127.0.0.1/tcp/4001/p2p/" + id.String(),
+		"/ip6/fe80::1/tcp/4001/p2p/" + id.String(),
+	} {
+		cfg := FederationConfig{P2PPeers: map[string][]string{"legacy": {target}}}
+		_, err = configuredFederationRouteTargets(cfg, "legacy")
+		require.ErrorContains(t, err, "unsafe direct")
+	}
+}
+
+func TestCurrentSnapshotIgnoresInvalidLegacyMirrorAndSynthesizesRelay(t *testing.T) {
+	remotePriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	remoteID, err := peer.IDFromPrivateKey(remotePriv)
+	require.NoError(t, err)
+	relayPriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	relayID, err := peer.IDFromPrivateKey(relayPriv)
+	require.NoError(t, err)
+	now := time.Now()
+	direct := "/ip4/10.0.0.5/tcp/4001/p2p/" + remoteID.String()
+	relay := "/ip4/198.51.100.20/tcp/4001/p2p/" + relayID.String()
+	cfg := FederationConfig{
+		P2PPeers:      map[string][]string{"peer": {"invalid-legacy-mirror"}},
+		P2PRelayAddrs: []string{relay},
+		P2PRoutes: map[string]FederationRouteSnapshot{"peer": {
+			PeerID: remoteID.String(), Protocol: string(sagep2p.FederationProtocol),
+			Addrs: []string{direct}, Revision: 2, IssuedAt: now.Unix(),
+			ExpiresAt: now.Add(time.Hour).Unix(), Generation: "generation",
+		}},
+	}
+	targets, err := configuredFederationRouteTargets(cfg, "peer")
+	require.NoError(t, err)
+	assert.Equal(t, []string{direct, relay + "/p2p-circuit/p2p/" + remoteID.String()}, targets)
+}
+
+func TestConfiguredFederationRouteTargetsRejectsSnapshotPeerAndProtocolConfusion(t *testing.T) {
+	firstPriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	firstID, err := peer.IDFromPrivateKey(firstPriv)
+	require.NoError(t, err)
+	secondPriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	secondID, err := peer.IDFromPrivateKey(secondPriv)
+	require.NoError(t, err)
+	now := time.Now()
+	target := "/ip4/10.0.0.5/tcp/4001/p2p/" + firstID.String()
+	base := FederationRouteSnapshot{
+		PeerID: secondID.String(), Protocol: string(sagep2p.FederationProtocol),
+		Addrs: []string{target}, Revision: 2, IssuedAt: now.Unix(),
+		ExpiresAt: now.Add(time.Hour).Unix(), Generation: "generation",
+	}
+	cfg := FederationConfig{P2PRoutes: map[string]FederationRouteSnapshot{"peer": base}}
+	_, err = configuredFederationRouteTargets(cfg, "peer")
+	require.ErrorContains(t, err, "peer id does not match")
+	base.PeerID = firstID.String()
+	base.Protocol = "/other/protocol/1.0.0"
+	cfg.P2PRoutes["peer"] = base
+	_, err = configuredFederationRouteTargets(cfg, "peer")
+	require.ErrorContains(t, err, "protocol is unsupported")
+}
+
+func TestWatchFederationRouteChangesRefreshesWhenRelayAppears(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var relayReady atomic.Bool
+	started := make(chan struct{})
+	var startedOnce atomic.Bool
+	local := func() (federation.JoinP2PBundle, error) {
+		if startedOnce.CompareAndSwap(false, true) {
+			close(started)
+		}
+		addrs := []string{"/ip4/192.168.1.25/tcp/4001/p2p/peer"}
+		if relayReady.Load() {
+			addrs = append(addrs, "/ip4/198.51.100.2/tcp/4001/p2p/relay/p2p-circuit/p2p/peer")
+		}
+		return federation.JoinP2PBundle{PeerID: "peer", Protocol: "/sage/fed/1.0.0", Addrs: addrs}, nil
+	}
+	refreshed := make(chan struct{}, 1)
+	go watchFederationRouteChanges(ctx, 5*time.Millisecond, local, func() {
+		select {
+		case refreshed <- struct{}{}:
+		default:
+		}
+	})
+	<-started
+	relayReady.Store(true)
+	select {
+	case <-refreshed:
+	case <-time.After(time.Second):
+		t.Fatal("relay-ready address change did not trigger route publication")
+	}
 }

@@ -573,6 +573,9 @@ func (s *SQLiteStore) GetMessageStatusForSender(ctx context.Context, senderID, m
 		 WHERE p.pipe_id=? AND p.from_agent=? AND p.source_chain_id='' AND p.destination_chain_id=''
 		   AND p.to_agent!='' AND p.to_provider=''`,
 		messageID, senderID).Scan(&status.MessageID, &workflow, &sentAt, &completedAt, &terminalAt, &expiresAt, &readAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s.getFederatedMessageStatusForSender(ctx, senderID, messageID)
+	}
 	if err != nil {
 		return nil, ErrMessageNotFound
 	}
@@ -589,6 +592,74 @@ func (s *SQLiteStore) GetMessageStatusForSender(ctx context.Context, senderID, m
 	if status.ReadAt != nil {
 		status.ReadStatus = "confirmed"
 		status.ReadEvidence = "local_exact_ack"
+	}
+	switch workflow {
+	case "completed":
+		if status.TerminalAt == nil {
+			status.TerminalAt = status.CompletedAt
+		}
+		status.TerminalReason = "completed"
+	case "expired", "failed":
+		if status.TerminalAt == nil {
+			status.TerminalAt = &status.ExpiresAt
+		}
+		status.TerminalReason = workflow
+	}
+	return &status, nil
+}
+
+// getFederatedMessageStatusForSender merges the locally authoritative
+// workflow row with its payload-free transport and receipt-v2 projections.
+// The exact sender predicate is repeated here rather than trusting a receipt
+// lookup, so receivers, operators, and unrelated local agents cannot use the
+// canonical status route as a federated message-existence oracle.
+func (s *SQLiteStore) getFederatedMessageStatusForSender(
+	ctx context.Context, senderID, messageID string,
+) (*MessageStatus, error) {
+	var status MessageStatus
+	var workflow, sentAt, expiresAt, transportState string
+	var completedAt, terminalAt, transportDeliveredAt, receiptDeliveredAt, readAt *string
+	var receiptProtocolVersion int
+	err := s.conn.QueryRowContext(ctx, `SELECT p.pipe_id,p.status,p.created_at,p.completed_at,
+		p.terminal_at,p.expires_at,o.state,o.delivered_at,o.receipt_protocol_version,
+		r.delivered_at,r.read_at
+		FROM pipeline_messages p
+		JOIN pipeline_transport_outbox o ON o.pipe_id=p.pipe_id AND o.event_kind='send'
+		LEFT JOIN pipeline_receipt_v2_projection r ON r.local_pipe_id=p.pipe_id
+		WHERE p.pipe_id=? AND p.from_agent=? AND p.source_chain_id=''
+		  AND p.destination_chain_id!='' AND p.to_agent!='' AND p.to_provider=''`,
+		messageID, senderID).Scan(&status.MessageID, &workflow, &sentAt, &completedAt,
+		&terminalAt, &expiresAt, &transportState, &transportDeliveredAt,
+		&receiptProtocolVersion, &receiptDeliveredAt, &readAt)
+	if err != nil {
+		return nil, ErrMessageNotFound
+	}
+	status.Scope = "federated"
+	status.WorkflowStatus = workflow
+	status.SentAt = parseTime(sentAt)
+	status.ExpiresAt = parseTime(expiresAt)
+	status.CompletedAt = parseTimePtr(completedAt)
+	status.TerminalAt = parseTimePtr(terminalAt)
+	status.DeliveredAt = parseTimePtr(receiptDeliveredAt)
+	if status.DeliveredAt == nil {
+		status.DeliveredAt = parseTimePtr(transportDeliveredAt)
+	}
+	switch transportState {
+	case "pending":
+		status.TransportStatus = "queued"
+	case "delivered", "failed":
+		status.TransportStatus = transportState
+	default:
+		return nil, ErrMessageNotFound
+	}
+	status.ReadStatus = "unsupported"
+	if receiptProtocolVersion == FederatedPipelineReceiptVersion {
+		status.ReadStatus = "not_confirmed"
+		status.ReadAt = parseTimePtr(readAt)
+		if status.ReadAt != nil {
+			status.ReadStatus = "confirmed"
+			status.ReadEvidence = "federated_receipt_v2"
+		}
 	}
 	switch workflow {
 	case "completed":

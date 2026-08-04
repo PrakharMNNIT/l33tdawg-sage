@@ -202,3 +202,32 @@ func TestCompactLookupStatusPreservesLegacyExactCache(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, loaded, "a compact lookup preflight must not erase a separately authenticated legacy route hint")
 }
+
+func TestKnownMessageTargetAdmissionIsCallerBoundAndBindingBound(t *testing.T) {
+	ctx := context.Background()
+	m, ss, agreement, control := newRemotePipeCacheTestBinding(t)
+	caller := strings.Repeat("cd", 32)
+	targetAgent := strings.Repeat("ef", 32)
+	target := &RemotePipeTarget{
+		ChainID: agreement.RemoteChainID, AgentID: targetAgent,
+		ContactID: strings.Repeat("12", 32), ContactRevision: strings.Repeat("13", 32),
+		PolicyEpoch: control.PolicyEpoch, AgreementID: strings.Repeat("14", 32),
+		Address: targetAgent + "@" + agreement.RemoteChainID,
+		Domains: []PipeContactDomain{{Domain: "research", OwningDomain: "research"}},
+	}
+	require.NoError(t, m.rememberRemoteMessageTarget(ctx, caller, target))
+	known, err := m.knownRemoteMessageTarget(ctx, caller, target.Address)
+	require.NoError(t, err)
+	require.Equal(t, target.Address, known.Address)
+	require.Equal(t, target.Domains, known.Domains)
+	other, err := m.knownRemoteMessageTarget(ctx, strings.Repeat("aa", 32), target.Address)
+	require.NoError(t, err)
+	require.Nil(t, other, "another caller must not inherit the known-recipient ticket")
+
+	_, err = ss.ApplyRemoteDirectionalSyncPolicy(ctx, control.RemoteChainID, control.PolicyEpoch,
+		SyncPolicyVersionPeerRBAC, 1, strings.Repeat("44", 32), nil, nil)
+	require.NoError(t, err)
+	stale, err := m.knownRemoteMessageTarget(ctx, caller, target.Address)
+	require.NoError(t, err)
+	require.Nil(t, stale, "a policy-generation change must make the ticket invisible")
+}

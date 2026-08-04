@@ -14141,7 +14141,7 @@ function PipelineView({ onStats }) {
                     headline=${filter ? `No ${filter} messages` : 'No messages yet'}
                     hint=${filter
                         ? 'Nothing with this status right now. Clear the filter to see the whole feed.'
-                        : 'When an agent hands work to another (sage_pipe) or you send a note from here, it shows up in this feed.'}
+                        : 'When an agent sends a message through SAGE or you send a note from here, it shows up in this feed.'}
                     actionLabel=${agentList.length > 0 ? 'Send a note to an agent' : undefined}
                     onAction=${agentList.length > 0 ? () => setShowCompose(true) : undefined} />
             `}

@@ -1,0 +1,28 @@
+embedding:
+  provider: hash
+  dimension: 64
+encryption:
+  enabled: false
+quorum:
+  enabled: false
+rbac:
+  strict: false
+federation:
+  enabled: true
+  listen_addr: 0.0.0.0:8444
+  p2p_enabled: true
+  p2p_listen_addrs:
+    - /ip4/0.0.0.0/tcp/0
+    - /ip4/0.0.0.0/udp/0/quic-v1
+  p2p_relay_addrs:
+    - __RELAY_ADDR__
+  p2p_force_private: true
+voter:
+  enabled: true
+  poll_interval: 500ms
+  required: true
+data_dir: /root/.sage/data
+rest_addr: 0.0.0.0:8080
+agent_key_file: /root/.sage/agent.key
+block_time: 500ms
+network_name: __NETWORK_NAME__

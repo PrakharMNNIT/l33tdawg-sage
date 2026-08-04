@@ -258,7 +258,10 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 		securityFailure := isSecurityTransportError(err)
 		m.recordRouteFailure(agreement.RemoteChainID, err, securityFailure)
 		if !securityFailure && path != "/fed/v1/p2p/routes" {
-			m.triggerRouteRefresh(agreement.RemoteChainID)
+			// UI/status polling must not create a refresh storm while a peer is
+			// offline. One bounded refresh per minute is enough; the lifecycle
+			// ticker and address-change publisher remain correctness backstops.
+			m.maybeTriggerRouteRefresh(agreement.RemoteChainID)
 		}
 		if isPeerOfflineDialError(err) {
 			return nil, 0, fmt.Errorf("%w: peer %s: %v", ErrPeerOffline, agreement.RemoteChainID, err)

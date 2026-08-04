@@ -11,14 +11,15 @@ import (
 )
 
 const maxFederatedPipeRemoteContactSnapshotBytes = 4 << 20
+const maxFederatedMessageAdmissionTicketBytes = 256 << 10
 
 // migrateFederatedPipeContacts creates the local operator-consent ledger for
 // inbound work requests. A row is deliberately bound to the exact JOIN
 // generation and peer-RBAC revision that exposed the contact. It is not a
 // transport queue and does not authorize delivery by itself.
-func (s *SQLiteStore) migrateFederatedPipeContacts(ctx context.Context) {
-	_, _ = s.writeExecContext(ctx, `
-	CREATE TABLE IF NOT EXISTS fed_pipe_contact_acceptance (
+func (s *SQLiteStore) migrateFederatedPipeContacts(ctx context.Context) error {
+	if _, err := s.writeExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS fed_pipe_contact_acceptance (
 		remote_chain_id TEXT NOT NULL,
 		peer_agent_id   TEXT NOT NULL,
 		policy_epoch    TEXT NOT NULL,
@@ -28,9 +29,11 @@ func (s *SQLiteStore) migrateFederatedPipeContacts(ctx context.Context) {
 		contact_id      TEXT NOT NULL,
 		updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 		PRIMARY KEY (remote_chain_id, local_agent_id)
-	)`)
-	_, _ = s.writeExecContext(ctx, `
-	CREATE TABLE IF NOT EXISTS fed_pipe_remote_contact_snapshot (
+		)`); err != nil {
+		return fmt.Errorf("create federated pipe contact acceptance table: %w", err)
+	}
+	if _, err := s.writeExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS fed_pipe_remote_contact_snapshot (
 		remote_chain_id       TEXT PRIMARY KEY,
 		peer_agent_id         TEXT NOT NULL,
 		policy_epoch          TEXT NOT NULL,
@@ -43,7 +46,157 @@ func (s *SQLiteStore) migrateFederatedPipeContacts(ctx context.Context) {
 		contact_revision      TEXT NOT NULL,
 		snapshot              TEXT NOT NULL,
 		updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-	)`)
+		)`); err != nil {
+		return fmt.Errorf("create federated pipe remote contact snapshot table: %w", err)
+	}
+	if _, err := s.writeExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS fed_message_admission_ticket (
+		caller_agent_id       TEXT NOT NULL,
+		remote_chain_id       TEXT NOT NULL,
+		target_agent_id       TEXT NOT NULL,
+		peer_agent_id         TEXT NOT NULL,
+		policy_epoch          TEXT NOT NULL,
+		remote_ca_pin         TEXT NOT NULL,
+		remote_policy_version INTEGER NOT NULL,
+		remote_policy_revision INTEGER NOT NULL,
+		remote_policy_hash    TEXT NOT NULL,
+		local_agreement_id    TEXT NOT NULL,
+		ticket                TEXT NOT NULL,
+		updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+		PRIMARY KEY (caller_agent_id, remote_chain_id, target_agent_id)
+		)`); err != nil {
+		return fmt.Errorf("create federated message admission ticket table: %w", err)
+	}
+	return nil
+}
+
+// FederatedMessageAdmissionTicket is an encrypted, caller-bound routing ticket
+// learned from a successful authenticated discovery/resolve. It authorizes
+// only local durable queue admission while the peer is offline. Delivery must
+// still obtain and exactly match a fresh live peer projection before content is
+// attached to an outbound event.
+type FederatedMessageAdmissionTicket struct {
+	CallerAgentID        string
+	RemoteChainID        string
+	TargetAgentID        string
+	PeerAgentID          string
+	PolicyEpoch          string
+	RemoteCAPin          string
+	RemotePolicyVersion  int
+	RemotePolicyRevision int64
+	RemotePolicyHash     string
+	LocalAgreementID     string
+	Ticket               []byte
+}
+
+func validateFederatedMessageAdmissionTicket(ticket FederatedMessageAdmissionTicket) error {
+	for label, id := range map[string]string{
+		"caller": ticket.CallerAgentID, "target": ticket.TargetAgentID,
+		"peer": ticket.PeerAgentID,
+	} {
+		if err := validateFederatedPipeAgentID(id); err != nil {
+			return fmt.Errorf("message admission %s id: %w", label, err)
+		}
+	}
+	if ticket.RemoteChainID == "" || strings.TrimSpace(ticket.RemoteChainID) != ticket.RemoteChainID ||
+		ticket.PolicyEpoch == "" || ticket.LocalAgreementID == "" ||
+		len(ticket.Ticket) == 0 || len(ticket.Ticket) > maxFederatedMessageAdmissionTicketBytes {
+		return fmt.Errorf("message admission ticket binding is incomplete")
+	}
+	if err := validateFederatedPipeContactID(ticket.RemoteCAPin); err != nil {
+		return fmt.Errorf("message admission CA pin: %w", err)
+	}
+	if err := validateFederatedPipeContactID(ticket.LocalAgreementID); err != nil {
+		return fmt.Errorf("message admission agreement: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) PutFederatedMessageAdmissionTicket(ctx context.Context, ticket FederatedMessageAdmissionTicket) error {
+	if err := validateFederatedMessageAdmissionTicket(ticket); err != nil {
+		return err
+	}
+	encrypted, err := s.encryptContent(string(ticket.Ticket))
+	if err != nil {
+		return fmt.Errorf("encrypt message admission ticket: %w", err)
+	}
+	result, err := s.writeExecContext(ctx, `
+		INSERT INTO fed_message_admission_ticket
+			(caller_agent_id,remote_chain_id,target_agent_id,peer_agent_id,
+			 policy_epoch,remote_ca_pin,remote_policy_version,remote_policy_revision,
+			 remote_policy_hash,local_agreement_id,ticket)
+		SELECT ?,c.remote_chain_id,?,c.peer_agent_id,c.policy_epoch,c.remote_ca_pin,
+			c.remote_policy_version,c.remote_revision,c.remote_policy_hash,?,?
+		FROM sync_control c
+		WHERE c.remote_chain_id=? AND c.peer_agent_id=? AND c.policy_epoch=?
+			AND c.remote_ca_pin=? AND c.binding_state='active'
+			AND c.remote_policy_version=? AND c.remote_revision=? AND c.remote_policy_hash=?
+		ON CONFLICT(caller_agent_id,remote_chain_id,target_agent_id) DO UPDATE SET
+			peer_agent_id=excluded.peer_agent_id,policy_epoch=excluded.policy_epoch,
+			remote_ca_pin=excluded.remote_ca_pin,
+			remote_policy_version=excluded.remote_policy_version,
+			remote_policy_revision=excluded.remote_policy_revision,
+			remote_policy_hash=excluded.remote_policy_hash,
+			local_agreement_id=excluded.local_agreement_id,ticket=excluded.ticket,
+			updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+		ticket.CallerAgentID, ticket.TargetAgentID, ticket.LocalAgreementID, encrypted,
+		ticket.RemoteChainID, ticket.PeerAgentID, ticket.PolicyEpoch, ticket.RemoteCAPin,
+		ticket.RemotePolicyVersion, ticket.RemotePolicyRevision, ticket.RemotePolicyHash)
+	if err != nil {
+		return fmt.Errorf("store message admission ticket: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return fmt.Errorf("%w: active sync binding changed while storing message admission ticket", ErrPeerRBACBindingMismatch)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetFederatedMessageAdmissionTicket(
+	ctx context.Context, callerAgentID, remoteChainID, targetAgentID string,
+	control SyncControl, localAgreementID string,
+) (*FederatedMessageAdmissionTicket, error) {
+	if control.BindingState != "active" || localAgreementID == "" {
+		return nil, nil
+	}
+	var out FederatedMessageAdmissionTicket
+	var encrypted string
+	err := s.conn.QueryRowContext(ctx, `
+		SELECT t.caller_agent_id,t.remote_chain_id,t.target_agent_id,t.peer_agent_id,
+			t.policy_epoch,t.remote_ca_pin,t.remote_policy_version,
+			t.remote_policy_revision,t.remote_policy_hash,t.local_agreement_id,t.ticket
+		FROM fed_message_admission_ticket t
+		JOIN sync_control c ON c.remote_chain_id=t.remote_chain_id
+			AND c.peer_agent_id=t.peer_agent_id AND c.policy_epoch=t.policy_epoch
+			AND c.remote_ca_pin=t.remote_ca_pin AND c.binding_state='active'
+			AND c.remote_policy_version=t.remote_policy_version
+			AND c.remote_revision=t.remote_policy_revision
+			AND c.remote_policy_hash=t.remote_policy_hash
+		WHERE t.caller_agent_id=? AND t.remote_chain_id=? AND t.target_agent_id=?
+			AND t.peer_agent_id=? AND t.policy_epoch=? AND t.remote_ca_pin=?
+			AND t.remote_policy_version=? AND t.remote_policy_revision=?
+			AND t.remote_policy_hash=? AND t.local_agreement_id=?`,
+		callerAgentID, remoteChainID, targetAgentID, control.PeerAgentID,
+		control.PolicyEpoch, control.RemoteCAPin, control.RemotePolicyVersion,
+		control.RemoteRevision, control.RemotePolicyHash, localAgreementID).
+		Scan(&out.CallerAgentID, &out.RemoteChainID, &out.TargetAgentID, &out.PeerAgentID,
+			&out.PolicyEpoch, &out.RemoteCAPin, &out.RemotePolicyVersion,
+			&out.RemotePolicyRevision, &out.RemotePolicyHash, &out.LocalAgreementID, &encrypted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read message admission ticket: %w", err)
+	}
+	plaintext, err := s.decryptContent(encrypted)
+	if err != nil || plaintext == VaultLockedPlaceholder {
+		return nil, fmt.Errorf("%w: message admission ticket is encrypted", ErrPipeContentUnavailable)
+	}
+	out.Ticket = []byte(plaintext)
+	if err := validateFederatedMessageAdmissionTicket(out); err != nil {
+		return nil, fmt.Errorf("stored message admission ticket is invalid: %w", err)
+	}
+	return &out, nil
 }
 
 // FederatedPipeRemoteContactSnapshot is an encrypted, authenticated routing

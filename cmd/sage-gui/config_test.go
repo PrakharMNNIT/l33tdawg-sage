@@ -68,6 +68,34 @@ func TestPersistFederationRouteSnapshotRoundTripsVersionAndGeneration(t *testing
 		"route persistence must not turn an omitted key path into SAGE_HOME itself")
 }
 
+func TestPersistFederationRouteSnapshotRejectsPeerIDMismatchAndProtocol(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("SAGE_HOME", tmp)
+	firstKey, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	firstID, err := peer.IDFromPrivateKey(firstKey)
+	require.NoError(t, err)
+	secondKey, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	secondID, err := peer.IDFromPrivateKey(secondKey)
+	require.NoError(t, err)
+	target := "/ip4/203.0.113.10/tcp/4001/p2p/" + firstID.String()
+
+	err = persistFederationRouteSnapshot("remote-chain", federation.RouteSnapshot{
+		PeerID: secondID.String(), Protocol: string(sagep2p.FederationProtocol), Addrs: []string{target},
+	})
+	require.ErrorContains(t, err, "peer id does not match")
+	err = persistFederationRouteSnapshot("remote-chain", federation.RouteSnapshot{
+		PeerID: firstID.String(), Protocol: "/other/protocol/1.0.0", Addrs: []string{target},
+	})
+	require.ErrorContains(t, err, "unsupported")
+	err = persistFederationRouteSnapshot("remote-chain", federation.RouteSnapshot{
+		PeerID: firstID.String(), Protocol: string(sagep2p.FederationProtocol),
+		Addrs: []string{"/dns4/localhost/tcp/4001/p2p/" + firstID.String()},
+	})
+	require.ErrorContains(t, err, "unsafe direct")
+}
+
 func TestSelectFederationRouteAddressesKeepsMultipleRelayCandidates(t *testing.T) {
 	addrs := []string{
 		"/ip4/10.0.0.2/tcp/1/p2p/destination",
@@ -101,7 +129,31 @@ func TestSelectFederationRouteAddressesAllowsDirectWithoutRelay(t *testing.T) {
 	}
 	selected, err := selectFederationRouteAddresses(addrs)
 	require.NoError(t, err)
-	assert.Equal(t, addrs, selected)
+	assert.Equal(t, addrs[:1], selected)
+}
+
+func TestSelectFederationRouteAddressesFiltersLoopbackAndRanksLANBeforePublic(t *testing.T) {
+	selected, err := selectFederationRouteAddresses([]string{
+		"/ip4/127.0.0.1/tcp/1/p2p/destination",
+		"/ip4/203.0.113.25/tcp/1/p2p/destination",
+		"/ip4/192.168.50.250/tcp/1/p2p/destination",
+		"/ip4/0.0.0.0/tcp/1/p2p/destination",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"/ip4/192.168.50.250/tcp/1/p2p/destination",
+		"/ip4/203.0.113.25/tcp/1/p2p/destination",
+	}, selected)
+}
+
+func TestSelectFederationRouteAddressesRejectsDNSDirectRoutes(t *testing.T) {
+	selected, err := selectFederationRouteAddresses([]string{
+		"/dns4/localhost/tcp/4001/p2p/destination",
+		"/dns6/peer.example/tcp/4001/p2p/destination",
+		"/ip4/192.168.50.250/tcp/4001/p2p/destination",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/ip4/192.168.50.250/tcp/4001/p2p/destination"}, selected)
 }
 
 func TestSelectFederationRouteAddressesRejectsEmptyCandidateSet(t *testing.T) {

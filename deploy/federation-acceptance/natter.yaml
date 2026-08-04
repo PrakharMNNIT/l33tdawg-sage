@@ -1,0 +1,18 @@
+listen_addrs:
+  - /ip4/0.0.0.0/tcp/4001
+  - /ip4/0.0.0.0/udp/4001/quic-v1
+announce_addrs:
+  - /dns4/relay/tcp/4001
+  - /dns4/relay/udp/4001/quic-v1
+identity_key_path: /var/lib/natter/natter.key
+health_addr: 0.0.0.0:8090
+force_reachability_public: true
+relay:
+  max_reservations: 32
+  max_circuits: 8
+  reservation_ttl: 10m
+  circuit_duration: 2m
+  circuit_data_bytes: 16777216
+  buffer_size: 2048
+  max_reservations_per_ip: 16
+  max_reservations_per_asn: 32

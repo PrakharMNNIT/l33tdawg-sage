@@ -31,6 +31,11 @@ type remotePipeCandidate struct {
 	receiptProtocolVersion int
 }
 
+type federatedMessageAdmissionPayload struct {
+	Target  RemotePipeTarget    `json:"target"`
+	Domains []PipeContactDomain `json:"domains,omitempty"`
+}
+
 func pipeRoutingAgreementID(agreement *store.CrossFedRecord) string {
 	if agreement == nil {
 		return ""
@@ -305,6 +310,235 @@ func (m *Manager) cachedRemotePipeContacts(ctx context.Context, agreement *store
 // remote agents and never falls through to local provider/name resolution.
 func (m *Manager) ResolveRemotePipeTarget(ctx context.Context, target string) (*RemotePipeTarget, error) {
 	return m.resolveRemotePipeTarget(ctx, target, true)
+}
+
+// ResolveRemotePipeTargetForCaller gives an exact caller a fast durable-admit
+// path for an address it previously resolved. A stored ticket is never network
+// or delivery authority; buildPipelineEvent always uses the live-only resolver
+// before copying intent/payload into the outbound event.
+func (m *Manager) ResolveRemotePipeTargetForCaller(
+	ctx context.Context, callerAgentID, target string,
+) (*RemotePipeTarget, error) {
+	if known, err := m.knownRemoteMessageTarget(ctx, callerAgentID, target); err != nil {
+		return nil, err
+	} else if known != nil && known.AuthorizationMode == "" {
+		return known, nil
+	}
+	resolved, err := m.resolveRemotePipeTarget(ctx, target, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.rememberRemoteMessageTarget(ctx, callerAgentID, resolved); err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
+// RememberRemotePipeContactForCaller converts the already authenticated,
+// caller-filtered directory contact into a durable local-admission ticket.
+// No peer request is made here; the directory request that supplied grant was
+// the live authentication boundary.
+func (m *Manager) RememberRemotePipeContactForCaller(
+	ctx context.Context, callerAgentID, remoteChainID string,
+	grant *PipeContactGrant, contact PipeContact, receiptProtocolVersion int,
+) error {
+	if validateRemotePipeContactGrant(remoteChainID, grant) != nil {
+		return ErrFederatedPipeInvalid
+	}
+	found := false
+	for _, granted := range grant.Contacts {
+		if granted.AgentID == contact.AgentID && granted.ContactID == contact.ContactID &&
+			granted.Address == contact.Address {
+			contact = granted
+			found = true
+			break
+		}
+	}
+	if !found || contact.AgentID == "" ||
+		contact.Address != contact.AgentID+"@"+remoteChainID ||
+		!contact.Available || !contact.Accepting || contact.ContactID == "" {
+		return ErrFederatedPipeInvalid
+	}
+	agreement, err := m.ActiveAgreement(remoteChainID)
+	if err != nil {
+		return ErrFederatedPipeInvalid
+	}
+	ss := m.syncStore()
+	if ss == nil {
+		return ErrFederatedPipeInvalid
+	}
+	control, err := ss.GetSyncControl(ctx, remoteChainID)
+	if err != nil || control == nil {
+		return ErrFederatedPipeInvalid
+	}
+	target := &RemotePipeTarget{
+		ChainID: remoteChainID, AgentID: contact.AgentID,
+		ContactID:       contact.ContactID,
+		ContactRevision: pipeContactAuthorizationRevision(grant, &contact),
+		PolicyEpoch:     control.PolicyEpoch, AgreementID: grant.AgreementID,
+		Address: contact.Address, Handle: contact.Handle, DisplayName: contact.DisplayName,
+		ReceiptProtocolVersion: receiptProtocolVersion,
+		Domains:                append([]PipeContactDomain(nil), contact.Domains...),
+	}
+	if control.RemoteCAPin != hex.EncodeToString(agreement.PeerPubKey) {
+		return ErrFederatedPipeInvalid
+	}
+	return m.rememberRemoteMessageTarget(ctx, callerAgentID, target)
+}
+
+// PrimeRemoteLinkedMessageTarget completes the exact authenticated linked
+// binding before a successful caller-scoped directory response is emitted.
+// This is metadata-only and bounded by the directory request context.
+func (m *Manager) PrimeRemoteLinkedMessageTarget(
+	ctx context.Context, callerAgentID, address string,
+) error {
+	resolved, err := m.ResolveRemoteLinkedPipeTarget(ctx, callerAgentID, address)
+	if err != nil {
+		return err
+	}
+	return m.rememberRemoteMessageTarget(ctx, callerAgentID, resolved)
+}
+
+func (m *Manager) rememberRemoteMessageTarget(
+	ctx context.Context, callerAgentID string, target *RemotePipeTarget,
+) error {
+	if target == nil || !isCanonicalAgentID(callerAgentID) ||
+		!isCanonicalAgentID(target.AgentID) || target.ChainID == "" ||
+		target.Address != target.AgentID+"@"+target.ChainID ||
+		!isPipeDigest(target.ContactID) || !isPipeDigest(target.ContactRevision) ||
+		target.PolicyEpoch == "" || !isPipeDigest(target.AgreementID) ||
+		(target.ReceiptProtocolVersion != 0 && target.ReceiptProtocolVersion != PipeReceiptVersion) {
+		return ErrFederatedPipeInvalid
+	}
+	if target.AuthorizationMode == LinkedMessageAuthorizationMode {
+		if target.LinkedRelation == nil ||
+			target.LinkedRelation.SourceAgentID != callerAgentID ||
+			target.LinkedRelation.TargetAgentID != target.AgentID ||
+			linkedMessageContactID(target.LinkedRelation) != target.ContactID ||
+			linkedMessageContactRevision(target.LinkedRelation) != target.ContactRevision {
+			return ErrFederatedPipeInvalid
+		}
+	} else if target.AuthorizationMode != "" || target.LinkedRelation != nil || len(target.Domains) == 0 {
+		return ErrFederatedPipeInvalid
+	}
+	agreement, err := m.ActiveAgreement(target.ChainID)
+	if err != nil {
+		return ErrFederatedPipeInvalid
+	}
+	ss := m.syncStore()
+	if ss == nil {
+		return ErrFederatedPipeInvalid
+	}
+	control, err := ss.GetSyncControl(ctx, target.ChainID)
+	if err != nil || control == nil || control.BindingState != "active" ||
+		control.PolicyEpoch != target.PolicyEpoch ||
+		control.RemoteCAPin != hex.EncodeToString(agreement.PeerPubKey) ||
+		!isCanonicalAgentID(control.PeerAgentID) {
+		return ErrFederatedPipeInvalid
+	}
+	payload, err := json.Marshal(federatedMessageAdmissionPayload{
+		Target: *target, Domains: append([]PipeContactDomain(nil), target.Domains...),
+	})
+	if err != nil {
+		return ErrFederatedPipeInvalid
+	}
+	return ss.PutFederatedMessageAdmissionTicket(ctx, store.FederatedMessageAdmissionTicket{
+		CallerAgentID: callerAgentID, RemoteChainID: target.ChainID,
+		TargetAgentID: target.AgentID, PeerAgentID: control.PeerAgentID,
+		PolicyEpoch: control.PolicyEpoch, RemoteCAPin: control.RemoteCAPin,
+		RemotePolicyVersion:  control.RemotePolicyVersion,
+		RemotePolicyRevision: control.RemoteRevision,
+		RemotePolicyHash:     control.RemotePolicyHash,
+		LocalAgreementID:     pipeRoutingAgreementID(agreement), Ticket: payload,
+	})
+}
+
+func (m *Manager) knownRemoteMessageTarget(
+	ctx context.Context, callerAgentID, address string,
+) (*RemotePipeTarget, error) {
+	address = strings.TrimSpace(address)
+	targetAgentID, remoteChainID := splitPipeAddress(address)
+	if !isCanonicalAgentID(callerAgentID) || targetAgentID == "" || remoteChainID == "" {
+		return nil, nil
+	}
+	agreement, err := m.ActiveAgreement(remoteChainID)
+	if err != nil {
+		return nil, nil
+	}
+	ss := m.syncStore()
+	if ss == nil {
+		return nil, nil
+	}
+	control, err := ss.GetSyncControl(ctx, remoteChainID)
+	if err != nil || control == nil || control.BindingState != "active" ||
+		control.RemoteCAPin != hex.EncodeToString(agreement.PeerPubKey) {
+		return nil, nil
+	}
+	ticket, err := ss.GetFederatedMessageAdmissionTicket(
+		ctx, callerAgentID, remoteChainID, targetAgentID, *control,
+		pipeRoutingAgreementID(agreement),
+	)
+	if err != nil || ticket == nil {
+		return nil, err
+	}
+	var payload federatedMessageAdmissionPayload
+	if json.Unmarshal(ticket.Ticket, &payload) != nil {
+		return nil, ErrFederatedPipeInvalid
+	}
+	target := payload.Target
+	target.Domains = append([]PipeContactDomain(nil), payload.Domains...)
+	if target.ChainID != remoteChainID || target.AgentID != targetAgentID ||
+		target.Address != address || target.PolicyEpoch != control.PolicyEpoch ||
+		!isPipeDigest(target.ContactID) || !isPipeDigest(target.ContactRevision) ||
+		!isPipeDigest(target.AgreementID) ||
+		(target.ReceiptProtocolVersion != 0 && target.ReceiptProtocolVersion != PipeReceiptVersion) {
+		return nil, ErrFederatedPipeInvalid
+	}
+	if target.AuthorizationMode == LinkedMessageAuthorizationMode {
+		if target.LinkedRelation == nil || target.LinkedRelation.SourceAgentID != callerAgentID ||
+			target.LinkedRelation.TargetAgentID != targetAgentID ||
+			linkedMessageContactID(target.LinkedRelation) != target.ContactID ||
+			linkedMessageContactRevision(target.LinkedRelation) != target.ContactRevision {
+			return nil, ErrFederatedPipeInvalid
+		}
+		relation := target.LinkedRelation
+		peer := &peerIdentity{
+			ChainID: remoteChainID, AgentID: control.PeerAgentID, Agreement: agreement,
+		}
+		if relation.HostChainID == m.localChainID {
+			// The ticket freezes the last peer-confirmed receiver revision, but local
+			// group membership, guest authority, and agent eligibility remain live.
+			// Revalidate those locally authoritative facts before accepting any new
+			// payload into the durable queue while the peer is unavailable.
+			if m.revalidateHostedLinkedRelation(ctx, peer, agreement, relation) != nil {
+				return nil, ErrRemotePipeTargetNotFound
+			}
+			if relation.Direction == LinkedMessageGuestToMember {
+				policy, _, policyErr := m.currentLinkedMessagePolicy(ctx, agreement, control.PeerAgentID)
+				if policyErr != nil {
+					return nil, ErrRemotePipeTargetNotFound
+				}
+				consent, consentErr := m.receiverLinkedMessageConsent(
+					ctx, policy, relation.SourceAgentID, relation.TargetAgentID,
+				)
+				if consentErr != nil || consent.Revision != relation.ReceiverConsentRevision {
+					return nil, ErrRemotePipeTargetNotFound
+				}
+			}
+		} else {
+			// A remotely hosted relation cannot be refreshed while that host is
+			// offline. Its signed bytes remain a routing hint only; the local source
+			// identity and its federated-pipe capability are still local authority.
+			if relation.HostChainID != remoteChainID || relation.PeerChainID != m.localChainID ||
+				validateLinkedMessageRelation(relation, control.PeerAgentID) != nil ||
+				!m.linkedMessageLocalAgentEligible(callerAgentID) {
+				return nil, ErrRemotePipeTargetNotFound
+			}
+		}
+	} else if target.AuthorizationMode != "" || target.LinkedRelation != nil || len(target.Domains) == 0 {
+		return nil, ErrFederatedPipeInvalid
+	}
+	return &target, nil
 }
 
 // resolveRemotePipeTargetLive is used by the outbox immediately before a send.
