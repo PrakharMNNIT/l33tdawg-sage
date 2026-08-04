@@ -220,7 +220,6 @@ func ParseEnrollment(uri string, allowPinOnly bool) (*Enrollment, error) {
 		if len(addrs) == 0 || len(addrs) > MaxEnrollmentRouteCount {
 			return nil, fmt.Errorf("this isn't a SAGE connection code (bad route count)")
 		}
-		hasCircuit := false
 		total := 0
 		for _, raw := range addrs {
 			total += len(raw)
@@ -235,12 +234,6 @@ func ParseEnrollment(uri string, allowPinOnly bool) (*Enrollment, error) {
 			if infoErr != nil || info.ID != declared {
 				return nil, fmt.Errorf("this isn't a SAGE connection code (route peer mismatch)")
 			}
-			if strings.Contains(raw, "/p2p-circuit/") {
-				hasCircuit = true
-			}
-		}
-		if !hasCircuit {
-			return nil, fmt.Errorf("this isn't a SAGE connection code (no relay route)")
 		}
 		e.Transport = transport
 		e.Protocol = q.Get("x_sage_proto")

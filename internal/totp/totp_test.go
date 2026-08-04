@@ -121,12 +121,27 @@ func TestProvisioningP2PAcceptsLiveSixRouteBundleAndRejectsOverLimit(t *testing.
 	for i := range overLimit {
 		overLimit[i] = fmt.Sprintf("/ip4/192.0.2.%d/tcp/4001%s", i+1, destination)
 	}
-	// Preserve the relay requirement so this exercises only the count bound.
+	// Keep one live relay-shaped candidate while exercising only the count bound.
 	overLimit[len(overLimit)-1] = addrs[len(addrs)-1]
 	tooManyURI := ProvisioningURIWithP2P(seed, "too-many-routes", "SAGE", pin[:], "https://host:8444", sid,
 		"host", "/sage/fed/1.0.0", id.String(), overLimit)
 	if _, err := ParseEnrollment(tooManyURI, false); err == nil || !strings.Contains(err.Error(), "bad route count") {
 		t.Fatalf("over-limit route bundle error = %v, want bad route count", err)
+	}
+
+	longHost := strings.TrimSuffix(strings.Repeat("abcdefghij.", 18), ".") + ".example"
+	longRoute := "/dns4/" + longHost + "/tcp/4001" + destination
+	if len(longRoute) > MaxEnrollmentRouteLength {
+		t.Fatalf("test route length = %d, want <= %d", len(longRoute), MaxEnrollmentRouteLength)
+	}
+	overBytes := make([]string, MaxEnrollmentRouteCount)
+	for i := range overBytes {
+		overBytes[i] = longRoute
+	}
+	overBytesURI := ProvisioningURIWithP2P(seed, "too-many-route-bytes", "SAGE", pin[:], "https://host:8444", sid,
+		"host", "/sage/fed/1.0.0", id.String(), overBytes)
+	if _, err := ParseEnrollment(overBytesURI, false); err == nil || !strings.Contains(err.Error(), "route too large") {
+		t.Fatalf("over-byte route bundle error = %v, want route too large", err)
 	}
 }
 

@@ -681,7 +681,7 @@ type HostCreateResult struct {
 // HostCreate opens a join session, generates the shared seed, and returns the
 // enrollment QR string (rendered client-side).
 func (m *Manager) HostCreate(hostEndpoint string) (*HostCreateResult, error) {
-	return m.HostCreateMode(hostEndpoint, false)
+	return m.hostCreateWithBundle(hostEndpoint, nil)
 }
 
 // HostCreateAuto is the single product intent. When a direct or relay-backed
@@ -692,9 +692,10 @@ func (m *Manager) HostCreateAuto(hostEndpoint string) (*HostCreateResult, error)
 	hooks := m.joinP2PHooks()
 	if hooks.LocalBundle != nil {
 		if bundle, err := hooks.LocalBundle(); err == nil {
+			bundle.Addrs = append([]string(nil), bundle.Addrs...)
 			bundle = m.prepareLocalRouteBundle(bundle)
 			if validateP2PBundle(bundle) == nil {
-				return m.HostCreateMode(hostEndpoint, true)
+				return m.hostCreateWithBundle(hostEndpoint, &bundle)
 			}
 		}
 	}
@@ -709,10 +710,33 @@ func (m *Manager) HostCreateAuto(hostEndpoint string) (*HostCreateResult, error)
 // exchange roaming routes over authenticated mTLS only after the agreement is
 // active.
 func (m *Manager) HostCreateMode(hostEndpoint string, requireP2P bool) (*HostCreateResult, error) {
+	if !requireP2P {
+		return m.hostCreateWithBundle(hostEndpoint, nil)
+	}
+	hooks := m.joinP2PHooks()
+	if hooks.LocalBundle == nil {
+		return nil, fmt.Errorf("internet connection is not ready: enable P2P and wait for a direct or relay route")
+	}
+	bundle, err := hooks.LocalBundle()
+	if err != nil {
+		return nil, fmt.Errorf("internet connection is not ready: enable P2P and wait for a direct or relay route")
+	}
+	bundle.Addrs = append([]string(nil), bundle.Addrs...)
+	bundle = m.prepareLocalRouteBundle(bundle)
+	if err := validateP2PBundle(bundle); err != nil {
+		return nil, fmt.Errorf("internet connection is not ready: enable P2P and wait for a direct or relay route")
+	}
+	return m.hostCreateWithBundle(hostEndpoint, &bundle)
+}
+
+// hostCreateWithBundle emits exactly the prepared bundle the caller validated.
+// Re-reading live transport addresses here can produce a different QR payload
+// from the one that passed validation a moment earlier.
+func (m *Manager) hostCreateWithBundle(hostEndpoint string, p2pBundle *JoinP2PBundle) (*HostCreateResult, error) {
 	if !m.transportIsEnabled() {
 		return nil, fmt.Errorf("federation transport is disabled")
 	}
-	if requireP2P && hostEndpoint == "" {
+	if p2pBundle != nil && hostEndpoint == "" {
 		hostEndpoint = joinP2POnlyEndpoint
 	}
 	if err := validateJoinEndpoint(hostEndpoint); err != nil {
@@ -734,23 +758,16 @@ func (m *Manager) HostCreateMode(hostEndpoint string, requireP2P bool) (*HostCre
 	uri := totp.ProvisioningURI(seed, m.localChainID, "SAGE", ownPin, hostEndpoint, sidForQR(js.ID), "host")
 	transport := ""
 	hooks := m.joinP2PHooks()
-	if requireP2P && hooks.LocalBundle != nil {
-		if bundle, bundleErr := hooks.LocalBundle(); bundleErr == nil && bundle.PeerID != "" && len(bundle.Addrs) > 0 {
-			bundle = m.prepareLocalRouteBundle(bundle)
-			if setErr := m.joins.SetHostP2P(js.ID, bundle.PeerID, bundle.Addrs); setErr != nil {
-				return nil, setErr
-			}
-			uri = totp.ProvisioningURIWithP2P(seed, m.localChainID, "SAGE", ownPin, hostEndpoint,
-				sidForQR(js.ID), "host", bundle.Protocol, bundle.PeerID, bundle.Addrs)
-			transport = "p2p"
-			if hooks.Begin != nil {
-				hooks.Begin(js.ID, js.ExpiresAt)
-			}
+	if p2pBundle != nil {
+		if setErr := m.joins.SetHostP2P(js.ID, p2pBundle.PeerID, p2pBundle.Addrs); setErr != nil {
+			return nil, setErr
 		}
-	}
-	if requireP2P && transport != "p2p" {
-		_ = m.joins.Abort(js.ID)
-		return nil, fmt.Errorf("internet connection is not ready: enable P2P and wait for a direct or relay route")
+		uri = totp.ProvisioningURIWithP2P(seed, m.localChainID, "SAGE", ownPin, hostEndpoint,
+			sidForQR(js.ID), "host", p2pBundle.Protocol, p2pBundle.PeerID, p2pBundle.Addrs)
+		transport = "p2p"
+		if hooks.Begin != nil {
+			hooks.Begin(js.ID, js.ExpiresAt)
+		}
 	}
 	return &HostCreateResult{
 		SessionID:  js.ID,
