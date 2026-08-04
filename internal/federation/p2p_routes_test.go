@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/l33tdawg/sage/internal/store"
+	"github.com/l33tdawg/sage/internal/totp"
 )
 
 func testRouteBundle(t *testing.T, ip string) JoinP2PBundle {
@@ -50,6 +51,32 @@ func testDirectRouteBundle(t *testing.T, ip string) JoinP2PBundle {
 
 func TestValidateP2PBundleAllowsDirectOnlyRoute(t *testing.T) {
 	require.NoError(t, validateP2PBundle(testDirectRouteBundle(t, "192.168.1.25")))
+}
+
+func TestValidateP2PBundleMatchesEnrollmentBounds(t *testing.T) {
+	bundle := testRouteBundle(t, "203.0.113.90")
+	relayRoute := bundle.Addrs[0]
+
+	bundle.Addrs = make([]string, totp.MaxEnrollmentRouteCount)
+	for i := range bundle.Addrs {
+		bundle.Addrs[i] = relayRoute
+	}
+	require.NoError(t, validateP2PBundle(bundle), "the enrollment route-count ceiling must be accepted")
+
+	bundle.Addrs = append(bundle.Addrs, relayRoute)
+	require.ErrorContains(t, validateP2PBundle(bundle), "invalid p2p route bundle")
+
+	longHost := strings.TrimSuffix(strings.Repeat("abcdefghij.", 18), ".") + ".example"
+	longRoute := strings.Replace(relayRoute, "/ip4/203.0.113.90", "/dns4/"+longHost, 1)
+	require.LessOrEqual(t, len(longRoute), totp.MaxEnrollmentRouteLength)
+	bundle.Addrs = make([]string, 0, totp.MaxEnrollmentRouteCount)
+	total := 0
+	for total <= totp.MaxEnrollmentRouteBytes {
+		bundle.Addrs = append(bundle.Addrs, longRoute)
+		total += len(longRoute)
+	}
+	require.LessOrEqual(t, len(bundle.Addrs), totp.MaxEnrollmentRouteCount)
+	require.ErrorContains(t, validateP2PBundle(bundle), "invalid p2p route")
 }
 
 func bindP2PRouteControl(t *testing.T, m *Manager, remoteChainID, peerAgentID, epoch string) *store.CrossFedRecord {
