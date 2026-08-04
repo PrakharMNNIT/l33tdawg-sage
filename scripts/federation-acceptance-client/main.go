@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -49,9 +50,11 @@ func main() {
 	}
 	ts := time.Now().Unix()
 	sig := auth.SignRequestWithNonce(key, method, path, body, ts, nonce)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
 	// #nosec G704 -- the destination authority is a literal loopback address;
 	// the only caller-supplied component is a validated /v1/ request target.
-	req, err := http.NewRequest(method, "http://127.0.0.1:8080"+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, "http://127.0.0.1:8080"+path, bytes.NewReader(body))
 	if err != nil {
 		panic(err)
 	}
