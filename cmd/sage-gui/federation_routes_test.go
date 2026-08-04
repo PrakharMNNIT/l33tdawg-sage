@@ -30,6 +30,14 @@ func (c *trackedRouteConn) Close() error {
 	return c.Conn.Close()
 }
 
+type routedTestConn struct {
+	*trackedRouteConn
+	target  string
+	limited bool
+}
+
+func (c *routedTestConn) P2PRoute() (string, bool) { return c.target, c.limited }
+
 func TestDialFederationP2PRouteTargetsClosesConcurrentLoser(t *testing.T) {
 	first, firstPeer := net.Pipe()
 	second, secondPeer := net.Pipe()
@@ -128,6 +136,28 @@ func TestDialFederationP2PRouteTargetsAuthenticatesBeforeChoosingWinner(t *testi
 	assert.Same(t, goodTracked, winner.Conn)
 	assert.True(t, winner.Authenticated)
 	require.Eventually(t, badTracked.closed.Load, time.Second, 5*time.Millisecond)
+	require.NoError(t, winner.Conn.Close())
+}
+
+func TestDialFederationP2PRouteTargetsReportsReusedLiveRelay(t *testing.T) {
+	raw, peerConn := net.Pipe()
+	t.Cleanup(func() { _ = peerConn.Close() })
+	tracked := &trackedRouteConn{Conn: raw}
+	conn := &routedTestConn{
+		trackedRouteConn: tracked,
+		target:           "/ip4/192.0.2.9/tcp/4001/p2p/relay/p2p-circuit/p2p/peer",
+		limited:          true,
+	}
+	winner, handled, err := dialFederationP2PRouteTargets(
+		context.Background(),
+		[]string{"/ip4/127.0.0.1/tcp/4002/p2p/peer"},
+		func(context.Context, string) (net.Conn, error) { return conn, nil },
+		nil,
+	)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, federation.RouteKindRelay, winner.Kind)
+	assert.Equal(t, conn.target, winner.Target)
 	require.NoError(t, winner.Conn.Close())
 }
 

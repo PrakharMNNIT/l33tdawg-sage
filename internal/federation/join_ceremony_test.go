@@ -302,16 +302,66 @@ func TestHostCreateAutoUsesPreparedRelayBundle(t *testing.T) {
 	assert.Contains(t, create.OTPAuthURI, "x_sage_transport=p2p")
 }
 
+// TestAutoHostJoinWindowAcceptsDirectCAFetchFromLegacyGuest covers the mixed
+// route shape used by the dashboard compatibility path: a current host opens
+// one auto/P2P-capable ceremony, while an older/direct-only guest consumes the
+// same code without the optional P2P fields and fetches the host CA over the
+// advertised LAN listener. The host TLS verifier must consult the same live
+// JoinStore populated by HostCreateAuto; otherwise the bootstrap handshake is
+// rejected as "remote error: tls: bad certificate" before HTTP sees the
+// session id.
+func TestAutoHostJoinWindowAcceptsDirectCAFetchFromLegacyGuest(t *testing.T) {
+	host := newCeremonyNode(t, "host-auto-direct")
+	guest := newCeremonyNode(t, "guest-auto-direct")
+	bundle := testRouteBundle(t, "203.0.113.82")
+	host.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return bundle, nil },
+	})
+
+	hostTLS, err := host.mgr.ServerTLSConfig()
+	require.NoError(t, err)
+	srv := httptest.NewUnstartedServer(host.mgr.Router())
+	srv.TLS = hostTLS
+	srv.StartTLS()
+	defer srv.Close()
+
+	create, err := host.mgr.HostCreateAuto(srv.URL)
+	require.NoError(t, err)
+	require.Equal(t, "p2p", create.Transport)
+
+	legacyURL, err := url.Parse(create.OTPAuthURI)
+	require.NoError(t, err)
+	query := legacyURL.Query()
+	for _, key := range []string{"x_sage_transport", "x_sage_proto", "x_sage_peer", "x_sage_addr"} {
+		query.Del(key)
+	}
+	legacyURL.RawQuery = query.Encode()
+
+	_, err = guest.mgr.GuestScan(context.Background(), legacyURL.String(), "https://127.0.0.1:19444")
+	require.NoError(t, err)
+}
+
 func TestHostCreateAutoUsesPreparedDirectBundle(t *testing.T) {
 	host := newCeremonyNode(t, "host-auto-direct")
 	bundle := testDirectRouteBundle(t, "192.168.1.25")
+	calls := 0
 	host.mgr.SetJoinP2PHooks(JoinP2PHooks{
-		LocalBundle: func() (JoinP2PBundle, error) { return bundle, nil },
+		LocalBundle: func() (JoinP2PBundle, error) {
+			calls++
+			if calls > 1 {
+				return JoinP2PBundle{}, errors.New("live route snapshot changed")
+			}
+			return bundle, nil
+		},
 	})
 	create, err := host.mgr.HostCreateAuto("https://192.168.1.20:8444")
 	require.NoError(t, err)
 	assert.Equal(t, "p2p", create.Transport)
 	assert.Contains(t, create.OTPAuthURI, "x_sage_transport=p2p")
+	assert.Equal(t, 1, calls, "HostCreateAuto must emit the exact bundle it validated")
+	enrollment, err := totp.ParseEnrollment(create.OTPAuthURI, false)
+	require.NoError(t, err, "a generated direct-only QR must be accepted by the current parser")
+	assert.Equal(t, bundle.Addrs, enrollment.P2PAddrs)
 }
 
 func TestHostCreateAutoFallsBackToLegacyDirectForOldPeers(t *testing.T) {

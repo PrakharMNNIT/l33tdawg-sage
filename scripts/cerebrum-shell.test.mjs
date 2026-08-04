@@ -811,6 +811,8 @@ test('federation endpoint discovery uses the node listener as the signed source 
 
 test('federation ceremony presents one clear two-way scan flow without dropping the safety check', () => {
     const hostWizard = appSource.slice(appSource.indexOf('function HostJoinWizard('), appSource.indexOf('function fedCatalogMap('));
+    assert.match(hostWizard, /\['showqr', 'waiting', 'compare', 'readback'\]\.includes\(step\)/,
+        'the visible host QR must keep polling so an expired backend join window cannot look open');
     assert.match(hostWizard, /fed-wizard-wide/);
     assert.match(hostWizard, /class="fed-exchange"/);
     assert.match(hostWizard, /They scan this SAGE/);

@@ -1678,6 +1678,13 @@ scope and every ballot whose pinned roster contains it is terminal.
 
 **Response** (HTTP 200): `{"scopes": [...], "count": 1}`
 
+The local CEREBRUM UI reads the same canonical projection through
+`GET /v1/dashboard/chain/scopes`. That dashboard route requires an
+authenticated same-machine operator session; it is not a replacement signed
+agents can use remotely. Browser code must not call `/v1/scopes` directly,
+because a dashboard session cannot manufacture the Ed25519 request signature
+required by the agent REST surface.
+
 ---
 
 ### `GET /v1/scopes/{scope_id}`

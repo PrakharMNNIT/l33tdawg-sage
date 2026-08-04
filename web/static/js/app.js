@@ -15760,10 +15760,12 @@ function HostJoinWizard({ onExit }) {
         setStep('aborted');
     };
 
-    // Poll every in-flight host screen so a guest-side Stop, expiry, or network
-    // failure always becomes visible instead of leaving a dead spinner/card.
+    // Poll every in-flight host screen, including the initial QR. Without the
+    // showqr state here an expired/aborted backend session kept looking usable
+    // indefinitely while the mTLS listener correctly closed its join window;
+    // the guest then saw only a misleading "bad certificate" handshake error.
     useEffect(() => {
-        if (!session || !['waiting', 'compare', 'readback'].includes(step)) return;
+        if (!session || !['showqr', 'waiting', 'compare', 'readback'].includes(step)) return;
         let live = true;
         let misses = 0;
         const tick = async () => {

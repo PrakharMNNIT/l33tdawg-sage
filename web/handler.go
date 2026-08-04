@@ -1313,6 +1313,8 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 
 			r.With(h.cerebrumOperatorGate).
 				Get("/v1/dashboard/memory/list", h.handleListMemories)
+			r.With(h.cerebrumOperatorGate).
+				Get("/v1/dashboard/chain/scopes", h.handleChainScopes)
 			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/export", h.handleExport)
 			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
 				Get("/v1/dashboard/memory/timeline", h.handleTimeline)

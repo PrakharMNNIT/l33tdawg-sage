@@ -10,9 +10,14 @@ import (
 
 	"github.com/l33tdawg/sage/internal/federation"
 	sagep2p "github.com/l33tdawg/sage/internal/p2p"
+	"github.com/l33tdawg/sage/internal/totp"
 )
 
-const federationP2PCandidateTimeout = 2 * time.Second
+const (
+	federationP2PCandidateTimeout = 2 * time.Second
+	maxFederationDirectRoutes     = 4
+	maxFederationRelayRoutes      = totp.MaxEnrollmentRouteCount - maxFederationDirectRoutes
+)
 
 func localFederationRouteBundle(transport *sagep2p.Transport) (federation.JoinP2PBundle, error) {
 	if transport == nil {
@@ -29,8 +34,8 @@ func localFederationRouteBundle(transport *sagep2p.Transport) (federation.JoinP2
 }
 
 func selectFederationRouteAddresses(all []string) ([]string, error) {
-	direct := make([]string, 0, 4)
-	relay := make([]string, 0, 4)
+	direct := make([]string, 0, maxFederationDirectRoutes)
+	relay := make([]string, 0, maxFederationRelayRoutes)
 	seen := make(map[string]struct{})
 	for _, addr := range all {
 		if addr == "" {
@@ -41,10 +46,10 @@ func selectFederationRouteAddresses(all []string) ([]string, error) {
 		}
 		seen[addr] = struct{}{}
 		if strings.Contains(addr, "/p2p-circuit/") {
-			if len(relay) < 4 {
+			if len(relay) < maxFederationRelayRoutes {
 				relay = append(relay, addr)
 			}
-		} else if len(direct) < 4 {
+		} else if len(direct) < maxFederationDirectRoutes {
 			direct = append(direct, addr)
 		}
 	}
@@ -107,8 +112,17 @@ func dialFederationP2PRouteTargets(ctx context.Context, targets []string, dial f
 			defer attemptCancel()
 			start := time.Now()
 			conn, err := dial(attemptCtx, target)
+			selectedTarget := target
+			if actualTarget, limited, ok := sagep2p.InspectConnectionRoute(conn); ok {
+				selectedTarget = actualTarget
+				if limited {
+					kind = federation.RouteKindRelay
+				} else {
+					kind = federation.RouteKindP2PDirect
+				}
+			}
 			result := federation.PeerRouteDialResult{
-				Conn: conn, Kind: kind, Target: target, Latency: time.Since(start),
+				Conn: conn, Kind: kind, Target: selectedTarget, Latency: time.Since(start),
 			}
 			if authenticate != nil {
 				result, err = authenticate(attemptCtx, result, err)

@@ -509,3 +509,39 @@ func TestAppV25ExecutedRepairWithPreexistingStaleGrantsIsReplayed(t *testing.T) 
 	require.Empty(t, run.plan.Entries,
 		"executed repair is complete only after exact grant authorization succeeds")
 }
+
+func TestAppV25ContinuityWorkerDoesNotProposeOverUnrelatedCurrentOwner(t *testing.T) {
+	ctx := context.Background()
+	fixture := newAppV23AccessFixture(t)
+	sqlite, err := store.NewSQLiteStore(ctx, filepath.Join(t.TempDir(), "memories.db"))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, sqlite.Close()) }()
+	progress := store.LegacyMemoryAdoptionProgress{State: "complete"}
+	require.NoError(t, sqlite.PublishLegacyMemoryAdoptionProgress(ctx, progress))
+	_, signingKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	handler := NewDashboardHandler(sqlite, "test")
+	handler.BadgerStore = fixture.badger
+	handler.SigningKey = signingKey
+	handler.AdminSigningKey = fixture.rootKey
+	handler.CometBFTRPC = "http://unused.invalid"
+	handler.ConfigureAppV25Maintenance(true)
+	handler.noteAppV25MaintenanceProgress(progress)
+
+	run := &appV25DomainContinuityRun{plan: &appV25DomainContinuityPlan{
+		Entries: []appV25DomainContinuityEntry{{
+			Domain: "companion-home", Owner: "historical-writer",
+			Writers: []string{"historical-writer"},
+		}},
+	}}
+	more, err := handler.runAppV25DomainContinuityPassWithRun(
+		ctx, zerolog.Nop(), run,
+	)
+	require.NoError(t, err)
+	require.False(t, more)
+	require.Empty(t, run.plan.Entries,
+		"historical recovery must never propose displacement of current policy ownership")
+	owner, err := fixture.badger.GetDomainOwner("companion-home")
+	require.NoError(t, err)
+	require.Equal(t, fixture.agentID, owner)
+}

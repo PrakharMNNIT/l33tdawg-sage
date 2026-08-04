@@ -49,6 +49,28 @@ func (c *streamConn) RemoteAddr() net.Addr {
 	return streamAddr{value: withPeer(conn.RemoteMultiaddr(), conn.RemotePeer().String())}
 }
 
+// P2PRoute reports the connection libp2p actually selected for this stream.
+// The requested candidate is not authoritative: Host.Connect may reuse an
+// already-open direct or limited relay connection to the same peer.
+func (c *streamConn) P2PRoute() (target string, limited bool) {
+	conn := c.Conn()
+	return withPeer(conn.RemoteMultiaddr(), conn.RemotePeer().String()), conn.Stat().Limited
+}
+
+// InspectConnectionRoute returns the live libp2p route behind a net.Conn.
+// Non-libp2p connections deliberately return ok=false so generic dial seams
+// retain their caller-supplied route metadata.
+func InspectConnectionRoute(conn net.Conn) (target string, limited bool, ok bool) {
+	routed, ok := conn.(interface {
+		P2PRoute() (string, bool)
+	})
+	if !ok {
+		return "", false, false
+	}
+	target, limited = routed.P2PRoute()
+	return target, limited, target != ""
+}
+
 func (c *streamConn) SetDeadline(deadline time.Time) error {
 	return c.Stream.SetDeadline(deadline)
 }

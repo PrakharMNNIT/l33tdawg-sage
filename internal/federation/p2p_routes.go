@@ -12,6 +12,7 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 
 	"github.com/l33tdawg/sage/internal/store"
+	"github.com/l33tdawg/sage/internal/totp"
 )
 
 // p2pRouteBinding is the immutable JOIN generation that authenticated a route
@@ -77,15 +78,17 @@ func (m *Manager) currentP2PRouteBinding(ctx context.Context, remoteChainID stri
 }
 
 func validateP2PBundle(bundle JoinP2PBundle) error {
-	if bundle.Protocol != "/sage/fed/1.0.0" || len(bundle.Addrs) == 0 || len(bundle.Addrs) > 8 {
+	if bundle.Protocol != "/sage/fed/1.0.0" || len(bundle.Addrs) == 0 || len(bundle.Addrs) > totp.MaxEnrollmentRouteCount {
 		return fmt.Errorf("invalid p2p route bundle")
 	}
 	declared, err := peer.Decode(bundle.PeerID)
 	if err != nil {
 		return fmt.Errorf("invalid p2p peer id")
 	}
+	total := 0
 	for _, raw := range bundle.Addrs {
-		if len(raw) == 0 || len(raw) > 512 {
+		total += len(raw)
+		if len(raw) == 0 || len(raw) > totp.MaxEnrollmentRouteLength || total > totp.MaxEnrollmentRouteBytes {
 			return fmt.Errorf("invalid p2p route")
 		}
 		addr, err := ma.NewMultiaddr(raw)

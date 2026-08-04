@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -76,6 +77,21 @@ func TestSelectFederationRouteAddressesKeepsMultipleRelayCandidates(t *testing.T
 	selected, err := selectFederationRouteAddresses(addrs)
 	require.NoError(t, err)
 	assert.Equal(t, addrs, selected)
+}
+
+func TestSelectFederationRouteAddressesNeverExceedsEnrollmentLimit(t *testing.T) {
+	addrs := make([]string, 0, 10)
+	for i := 0; i < 5; i++ {
+		addrs = append(addrs, fmt.Sprintf("/ip4/10.0.0.%d/tcp/1/p2p/destination", i+1))
+	}
+	for i := 0; i < 5; i++ {
+		addrs = append(addrs, fmt.Sprintf("/ip4/198.51.100.%d/tcp/2/p2p/relay-%d/p2p-circuit/p2p/destination", i+1, i+1))
+	}
+	selected, err := selectFederationRouteAddresses(addrs)
+	require.NoError(t, err)
+	assert.Len(t, selected, maxFederationDirectRoutes+maxFederationRelayRoutes)
+	assert.Equal(t, addrs[:maxFederationDirectRoutes], selected[:maxFederationDirectRoutes])
+	assert.Equal(t, addrs[5:5+maxFederationRelayRoutes], selected[maxFederationDirectRoutes:])
 }
 
 func TestSelectFederationRouteAddressesAllowsDirectWithoutRelay(t *testing.T) {

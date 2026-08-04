@@ -42,6 +42,14 @@ const (
 	PinLen = 32
 	// MinSessionIDBits is the RT-3 entropy floor for the join session id.
 	MinSessionIDBits = 40
+	// MaxEnrollmentRouteCount matches the live federation bundle: at most four
+	// direct candidates plus four relay fallbacks. The byte limits below remain
+	// the primary bound on QR size and parser work.
+	MaxEnrollmentRouteCount = 8
+	// MaxEnrollmentRouteLength bounds any single encoded multiaddr.
+	MaxEnrollmentRouteLength = 512
+	// MaxEnrollmentRouteBytes bounds all encoded multiaddrs in one bundle.
+	MaxEnrollmentRouteBytes = 1536
 )
 
 // b32 is the RFC-4648 base32 (no padding) codec used for otpauth secret + ids,
@@ -209,14 +217,13 @@ func ParseEnrollment(uri string, allowPinOnly bool) (*Enrollment, error) {
 			return nil, fmt.Errorf("this isn't a SAGE connection code (bad peer id)")
 		}
 		addrs := q["x_sage_addr"]
-		if len(addrs) == 0 || len(addrs) > 4 {
+		if len(addrs) == 0 || len(addrs) > MaxEnrollmentRouteCount {
 			return nil, fmt.Errorf("this isn't a SAGE connection code (bad route count)")
 		}
-		hasCircuit := false
 		total := 0
 		for _, raw := range addrs {
 			total += len(raw)
-			if len(raw) == 0 || len(raw) > 512 || total > 1536 {
+			if len(raw) == 0 || len(raw) > MaxEnrollmentRouteLength || total > MaxEnrollmentRouteBytes {
 				return nil, fmt.Errorf("this isn't a SAGE connection code (route too large)")
 			}
 			addr, addrErr := ma.NewMultiaddr(raw)
@@ -227,12 +234,6 @@ func ParseEnrollment(uri string, allowPinOnly bool) (*Enrollment, error) {
 			if infoErr != nil || info.ID != declared {
 				return nil, fmt.Errorf("this isn't a SAGE connection code (route peer mismatch)")
 			}
-			if strings.Contains(raw, "/p2p-circuit/") {
-				hasCircuit = true
-			}
-		}
-		if !hasCircuit {
-			return nil, fmt.Errorf("this isn't a SAGE connection code (no relay route)")
 		}
 		e.Transport = transport
 		e.Protocol = q.Get("x_sage_proto")

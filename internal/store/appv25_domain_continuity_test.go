@@ -490,6 +490,16 @@ func TestAppV25DomainContinuityRejectsConflictingOwnerBeforeMutation(t *testing.
 	ownerID := appV23Register(t, s, "continuity-conflict-owner", AppV23RoleMember, 3, 0)
 	require.NoError(t, s.RegisterDomain("continuity-owned-elsewhere", ownerID, "", 4))
 	require.NoError(t, s.EnsureAppV23Root("continuity-conflict", 100))
+	wouldDisplace, err := s.AppV25DomainContinuityWouldDisplaceOwner(
+		"continuity-owned-elsewhere", []string{writerID},
+	)
+	require.NoError(t, err)
+	require.True(t, wouldDisplace)
+	wouldDisplace, err = s.AppV25DomainContinuityWouldDisplaceOwner(
+		"continuity-owned-elsewhere", []string{ownerID, writerID},
+	)
+	require.NoError(t, err)
+	require.False(t, wouldDisplace)
 
 	plan := sha256.Sum256([]byte("conflicting-owner-plan"))
 	before, err := s.ComputeAppHash()

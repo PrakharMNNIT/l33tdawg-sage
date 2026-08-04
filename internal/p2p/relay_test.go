@@ -143,6 +143,10 @@ func TestDialContextOverRelayLimitedConnection(t *testing.T) {
 		t.Fatalf("DialContext through relay: %v", err)
 	}
 	defer conn.Close()
+	actualTarget, limitedRoute, ok := InspectConnectionRoute(conn)
+	if !ok || !limitedRoute || !strings.Contains(actualTarget, "/p2p-circuit/") {
+		t.Fatalf("InspectConnectionRoute = target %q limited=%v ok=%v, want live relay circuit", actualTarget, limitedRoute, ok)
+	}
 
 	var limited bool
 	for _, networkConn := range source.Host().Network().ConnsToPeer(destination.Host().ID()) {

@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
+	"strings"
 	"testing"
 
 	libcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -70,6 +72,76 @@ func TestProvisioningP2PRoundTripAndPeerBinding(t *testing.T) {
 		"host", "/sage/fed/1.0.0", otherID.String(), []string{relay})
 	if _, err := ParseEnrollment(bad, false); err == nil {
 		t.Fatal("accepted route whose terminal peer differs from x_sage_peer")
+	}
+}
+
+func TestProvisioningP2PAcceptsLiveSixRouteBundleAndRejectsOverLimit(t *testing.T) {
+	priv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayPriv, _, err := libcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayID, err := peer.IDFromPrivateKey(relayPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := "/p2p/" + id.String()
+	addrs := []string{
+		"/ip4/127.0.0.1/tcp/4001" + destination,
+		"/ip4/127.0.0.1/udp/4001/quic-v1" + destination,
+		"/ip4/192.0.2.10/tcp/4001" + destination,
+		"/ip4/192.0.2.10/udp/4001/quic-v1" + destination,
+		"/ip4/198.51.100.10/tcp/4001/p2p/" + relayID.String() + "/p2p-circuit" + destination,
+		"/ip4/198.51.100.10/udp/4001/quic-v1/p2p/" + relayID.String() + "/p2p-circuit" + destination,
+	}
+	seed, err := NewSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := sha256.Sum256([]byte("host-ca-spki-six-routes"))
+	sid := b32.EncodeToString([]byte{1, 2, 3, 4, 5, 6})
+	uri := ProvisioningURIWithP2P(seed, "six-route-chain", "SAGE", pin[:], "https://host:8444", sid,
+		"host", "/sage/fed/1.0.0", id.String(), addrs)
+	enrollment, err := ParseEnrollment(uri, false)
+	if err != nil {
+		t.Fatalf("live six-route bundle must parse: %v", err)
+	}
+	if len(enrollment.P2PAddrs) != len(addrs) {
+		t.Fatalf("parsed %d routes, want %d", len(enrollment.P2PAddrs), len(addrs))
+	}
+
+	overLimit := make([]string, MaxEnrollmentRouteCount+1)
+	for i := range overLimit {
+		overLimit[i] = fmt.Sprintf("/ip4/192.0.2.%d/tcp/4001%s", i+1, destination)
+	}
+	// Keep one live relay-shaped candidate while exercising only the count bound.
+	overLimit[len(overLimit)-1] = addrs[len(addrs)-1]
+	tooManyURI := ProvisioningURIWithP2P(seed, "too-many-routes", "SAGE", pin[:], "https://host:8444", sid,
+		"host", "/sage/fed/1.0.0", id.String(), overLimit)
+	if _, err := ParseEnrollment(tooManyURI, false); err == nil || !strings.Contains(err.Error(), "bad route count") {
+		t.Fatalf("over-limit route bundle error = %v, want bad route count", err)
+	}
+
+	longHost := strings.TrimSuffix(strings.Repeat("abcdefghij.", 18), ".") + ".example"
+	longRoute := "/dns4/" + longHost + "/tcp/4001" + destination
+	if len(longRoute) > MaxEnrollmentRouteLength {
+		t.Fatalf("test route length = %d, want <= %d", len(longRoute), MaxEnrollmentRouteLength)
+	}
+	overBytes := make([]string, MaxEnrollmentRouteCount)
+	for i := range overBytes {
+		overBytes[i] = longRoute
+	}
+	overBytesURI := ProvisioningURIWithP2P(seed, "too-many-route-bytes", "SAGE", pin[:], "https://host:8444", sid,
+		"host", "/sage/fed/1.0.0", id.String(), overBytes)
+	if _, err := ParseEnrollment(overBytesURI, false); err == nil || !strings.Contains(err.Error(), "route too large") {
+		t.Fatalf("over-byte route bundle error = %v, want route too large", err)
 	}
 }
 
