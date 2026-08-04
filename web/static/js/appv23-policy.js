@@ -11,6 +11,21 @@ export const APPV23_SELECTABLE_PROFILES = Object.freeze([
 ]);
 const APPV23_DENY_FEDERATED_PIPE = 16;
 
+// Keep the Access Controls render boundary total even when an older node or a
+// historical consensus row represents an empty Go slice as JSON null.
+export function appV23NormalizeAccessState(state) {
+    const source = state && typeof state === 'object' ? state : {};
+    const groups = Array.isArray(source.groups) ? source.groups : [];
+    return {
+        ...source,
+        agents: Array.isArray(source.agents) ? source.agents : [],
+        groups: groups.map(group => ({
+            ...(group && typeof group === 'object' ? group : {}),
+            members: Array.isArray(group?.members) ? group.members : [],
+        })),
+    };
+}
+
 function appV23FederatedPipeRestriction(capabilities) {
     const recorded = Number(capabilities ?? 0);
     return Number.isFinite(recorded) &&

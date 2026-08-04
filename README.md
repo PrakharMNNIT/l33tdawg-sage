@@ -88,6 +88,9 @@ domain-continuity candidates are retired instead of being reproposed every
 block, and recovery deprecation records an honest recovery activity event.
 The recovery authority controls use a responsive grid, so the explanatory
 copy and selectors no longer collapse into a horizontally scrolling row.
+Access Controls also normalizes historical empty groups to `members: []`, so a
+valid empty group cannot throw during the first render and leave the page stuck
+on “Loading consensus access policy…”.
 
 **Historical app-v25 home defects no longer prevent app-v26 repair from
 starting.** Nodes with the narrow legacy `shared_home` shape may rebuild their

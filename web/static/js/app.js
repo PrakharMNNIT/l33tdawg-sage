@@ -17,6 +17,7 @@ import { normalizeFederationJoinState } from './federation-flow.js';
 import { buildBrainDomainInventory } from './domain-inventory.js';
 import {
     appV23PolicyDraft,
+    appV23NormalizeAccessState,
     appV23CapabilityIndicators,
     appV23NeedsHomeReapproval,
     appV23PolicyChanged,
@@ -8901,7 +8902,7 @@ function AppV23AccessControl() {
 
     const load = useCallback(async () => {
         try {
-            const next = await fetchAppV23Access();
+            const next = appV23NormalizeAccessState(await fetchAppV23Access());
             setState(next);
             setError('');
             const editable = (next.agents || [])[0];
