@@ -1283,6 +1283,11 @@ jobs:
             done
           done
 
+          # No GitHub API call is needed below this point. In particular, do
+          # not let a staged executable inherit repository write authority
+          # when the verifier runs its local `version` smoke check.
+          unset GH_TOKEN
+
           for arch in arm64 x86_64; do
             for dmg_name in \
               "SAGE-${RELEASE_TAG}-macOS-${arch}.dmg" \
