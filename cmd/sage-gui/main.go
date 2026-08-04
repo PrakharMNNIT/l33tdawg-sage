@@ -60,15 +60,22 @@ func main() {
 				if resolved, resolveErr := filepath.EvalSymlinks(execPath); resolveErr == nil {
 					execPath = resolved
 				}
-				if _, reconcileErr := web.ReconcilePreparedPendingBinaryUpdate(execPath); reconcileErr != nil {
-					// Update metadata must never brick an otherwise runnable node. Keep
-					// the evidence in place, boot the installed binary, and surface an
-					// actionable warning for the operator.
-					fmt.Fprintln(os.Stderr, "SAGE could not reconcile a prepared update; continuing with the installed binary:", reconcileErr)
+				if startupMarkErr := web.MarkPendingUpdateStartup(execPath); startupMarkErr != nil {
+					err = fmt.Errorf("record replacement startup boundary: %w", startupMarkErr)
+				}
+				if err == nil {
+					if _, reconcileErr := web.ReconcilePreparedPendingBinaryUpdate(execPath); reconcileErr != nil {
+						// Update metadata must never brick an otherwise runnable node. Keep
+						// the evidence in place, boot the installed binary, and surface an
+						// actionable warning for the operator.
+						fmt.Fprintln(os.Stderr, "SAGE could not reconcile a prepared update; continuing with the installed binary:", reconcileErr)
+					}
 				}
 			}
 			var startupProof string
-			startupProof, err = shellStartupProofFromEnvironment()
+			if err == nil {
+				startupProof, err = shellStartupProofFromEnvironment()
+			}
 			if err == nil {
 				err = runServe(startupProof)
 			}

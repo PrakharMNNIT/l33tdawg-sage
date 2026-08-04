@@ -321,7 +321,10 @@ func newImportedPipeID() (string, error) {
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return "pipe-fed-" + hex.EncodeToString(b), nil
+	// This receiver-local ID is exposed by the canonical Inbox facade. Keep
+	// accepting historical pipe-fed-* values, but do not leak pipeline naming in
+	// newly delivered messages.
+	return "msg-fed-" + hex.EncodeToString(b), nil
 }
 
 func pipeEventContentHash(event *PipeEvent) [32]byte {

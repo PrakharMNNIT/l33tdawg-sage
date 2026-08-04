@@ -177,6 +177,11 @@ test('preserved historical records have one explicit repair-resolution flow', ()
     assert.match(resolution, /role="status"/);
     assert.match(resolution, /Retrying repair…/);
     assert.match(resolution, /Deprecating records…/);
+    assert.match(resolution, /Recovery Decision \(local\)|local recovery decision/);
+    assert.match(cssSource, /\.cerebrum-recovery-assignment\s*>\s*div\s*\{[^}]*grid-column:\s*1\s*\/\s*-1/s,
+        'recovery authority guidance must span the panel instead of being squeezed beside selectors');
+    assert.match(cssSource, /\.cerebrum-repair-choice\.danger\s*>\s*div:first-child\s*\{[^}]*grid-column:\s*1\s*\/\s*-1/s,
+        'deprecation explanation must span the full card above confirmation controls');
     assert.match(resolution, /const deprecationCount = selectedIDs\.length \|\| recoveryCount/);
     assert.match(resolution, /DEPRECATE \$\{deprecationCount\}/);
     assert.match(resolution, /<strong>\$\{requiredConfirmation\}<\/strong>/);

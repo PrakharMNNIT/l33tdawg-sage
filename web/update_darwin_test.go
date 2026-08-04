@@ -181,9 +181,14 @@ func TestConfirmPendingAppUpdateRemovesExternalMarker(t *testing.T) {
 	writeFakeAppBundle(t, stagedBundle, "v11.7.2")
 
 	require.NoError(t, installPendingAppBundleWithVerifier(execPath, stagedBundle, "v11.7.2", "v11.7.1", nil, nil))
+	require.NoError(t, os.WriteFile(pendingAppExternalHelper(execPath), []byte("helper"), 0755))
+	require.NoError(t, MarkPendingUpdateStartup(execPath))
 	require.NoError(t, ConfirmPendingUpdate(execPath))
 	require.Empty(t, PendingUpdateVersion(execPath))
 	require.NoDirExists(t, destination+".update-old")
+	require.FileExists(t, pendingAppStartupMarker(execPath),
+		"the startup proof must outlive confirmation so the detached helper cannot miss it")
+	require.NoFileExists(t, pendingAppExternalHelper(execPath))
 }
 
 func TestConfirmPendingAppUpdateRetainsRollbackUntilMarkerIsCleared(t *testing.T) {

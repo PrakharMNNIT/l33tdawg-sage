@@ -401,6 +401,20 @@ func (h *DashboardHandler) handleAppV25LegacyAdoptionDeprecate(w http.ResponseWr
 	}
 	epoch := h.requestAppV25LegacyAdoptionRetry()
 	progress, _ := controller.GetLegacyMemoryAdoptionProgress(r.Context())
+	if h.SSE != nil && deprecated > 0 {
+		memoryID := ""
+		if len(request.MemoryIDs) == 1 {
+			memoryID = request.MemoryIDs[0]
+		}
+		h.SSE.Broadcast(SSEEvent{
+			Type: EventRecovery, MemoryID: memoryID,
+			Content: fmt.Sprintf("%d preserved historical record(s) retired from local recovery", deprecated),
+			Data: map[string]any{
+				"action": "legacy_recovery_retired", "count": deprecated,
+				"chain_transaction": false, "history_preserved": true,
+			},
+		})
+	}
 	writeJSONResp(w, http.StatusOK, map[string]any{
 		"status":              "explicitly_deprecated",
 		"deprecated":          deprecated,
@@ -408,6 +422,6 @@ func (h *DashboardHandler) handleAppV25LegacyAdoptionDeprecate(w http.ResponseWr
 		"retry_epoch":         epoch,
 		"history_preserved":   true,
 		"progress":            progress,
-		"message":             "The preserved records remain stored for audit but are retired from automatic repair and normal memory views.",
+		"message":             "The preserved records remain stored for audit but are retired from automatic repair and normal memory views. This local recovery decision is visible in Activity; it is not a new chain transaction and does not rewrite history.",
 	})
 }

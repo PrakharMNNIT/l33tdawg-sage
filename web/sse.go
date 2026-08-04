@@ -25,6 +25,10 @@ const (
 	EventUpdate     EventType = "update"
 	EventGovernance EventType = "governance"
 	EventTask       EventType = "task"
+	// EventRecovery is a local, Root-authorized recovery decision. It is shown
+	// in activity for operator visibility but must never be presented as a
+	// consensus commit or a rewrite of historical chain state.
+	EventRecovery EventType = "recovery"
 	// EventAccess is emitted only after an RBAC transaction commits. It keeps
 	// Chain Activity an auditable view of enforced permissions, not merely a
 	// memory-operation feed.

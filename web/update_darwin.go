@@ -20,6 +20,7 @@ const (
 	sageBundleIdentifier = "com.sage.brain"
 	sageSigningTeamID    = "2N7GKZ8D8Z"
 	sageGUIIdentifier    = "sage-gui"
+	sageHelperIdentifier = "sage-update-helper"
 )
 
 func macOSAppBundleForExecutable(execPath string) string {
@@ -71,6 +72,9 @@ func installDarwinAppUpdate(ctx context.Context, dmgPath, execPath, expectedVers
 	if err = verifySignedSAGEApp(ctx, sourceBundle); err != nil {
 		return "", err
 	}
+	if err = verifySignedSAGELeaf(ctx, filepath.Join(sourceBundle, "Contents", "MacOS", sageUpdateHelperName), sageHelperIdentifier); err != nil {
+		return "", fmt.Errorf("signed app recovery helper: %w", err)
+	}
 	stagedVersion := diskBinaryVersion(ctx, filepath.Join(sourceBundle, "Contents", "MacOS", "sage-gui"))
 	if stagedVersion == "" || stagedVersion == "dev" {
 		return "", fmt.Errorf("signed app does not contain a runnable release binary")
@@ -104,6 +108,9 @@ func installDarwinAppUpdate(ctx context.Context, dmgPath, execPath, expectedVers
 	}
 	if err = verifySignedSAGEApp(ctx, stagedBundle); err != nil {
 		return "", fmt.Errorf("verify staged app: %w", err)
+	}
+	if err = verifySignedSAGELeaf(ctx, filepath.Join(stagedBundle, "Contents", "MacOS", sageUpdateHelperName), sageHelperIdentifier); err != nil {
+		return "", fmt.Errorf("verify staged app recovery helper: %w", err)
 	}
 	if copiedVersion := diskBinaryVersion(ctx, filepath.Join(stagedBundle, "Contents", "MacOS", "sage-gui")); !sameReleaseVersion(copiedVersion, expectedVersion) {
 		return "", fmt.Errorf("staged app reports %s but selected release is %s", copiedVersion, expectedVersion)
@@ -164,6 +171,14 @@ func verifySignedSAGEAppCryptographic(ctx context.Context, appPath string) error
 	}
 	if err := verifySignedSAGELeaf(ctx, filepath.Join(appPath, "Contents", "MacOS", "sage-tray"), sageBundleIdentifier); err != nil {
 		return err
+	}
+	helperPath := filepath.Join(appPath, "Contents", "MacOS", sageUpdateHelperName)
+	if _, statErr := os.Lstat(helperPath); statErr == nil {
+		if err := verifySignedSAGELeaf(ctx, helperPath, sageHelperIdentifier); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("inspect SAGE update recovery helper: %w", statErr)
 	}
 	return nil
 }
@@ -237,7 +252,12 @@ func installPendingAppBundle(ctx context.Context, execPath, stagedBundle, versio
 		}
 		return nil
 	}
-	return installPendingAppBundleWithVerifier(
+	helperSource := filepath.Join(stagedBundle, "Contents", "MacOS", sageUpdateHelperName)
+	helperDestination := pendingAppExternalHelper(execPath)
+	if err := copyFileDurable(helperSource, helperDestination, 0755); err != nil {
+		return fmt.Errorf("install external update recovery helper: %w", err)
+	}
+	err := installPendingAppBundleWithVerifier(
 		execPath,
 		stagedBundle,
 		version,
@@ -245,6 +265,10 @@ func installPendingAppBundle(ctx context.Context, execPath, stagedBundle, versio
 		func(appPath string) error { return verifyVersion(appPath, version) },
 		func(appPath string) error { return verifyVersion(appPath, rollbackVersion) },
 	)
+	if err != nil {
+		_ = removeFileDurable(helperDestination)
+	}
+	return err
 }
 
 // installPendingAppBundleWithVerifier atomically activates a bundle that was
@@ -359,6 +383,12 @@ func cleanupPendingAppRecovery(markerPath, backupPath string) error {
 	}
 	if err := removeAppBundleDurable(backupPath); err != nil {
 		return fmt.Errorf("remove pending app rollback bundle: %w", err)
+	}
+	bundlePath := strings.TrimSuffix(markerPath, pendingUpdateSuffix)
+	for _, path := range []string{bundlePath + ".update-started", bundlePath + ".update-helper"} {
+		if err := removeFileDurable(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove pending app recovery helper state: %w", err)
+		}
 	}
 	return nil
 }
@@ -601,6 +631,13 @@ func confirmPendingAppBundle(execPath string) (bool, error) {
 	}
 	if err := removeAppBundleDurable(destination + ".update-old"); err != nil {
 		return true, fmt.Errorf("remove confirmed app rollback: %w", err)
+	}
+	// Keep the startup marker until the next update attempt clears it. The
+	// external helper may still be between polls while this process confirms the
+	// swap; deleting both signals here could make it miss the successful startup
+	// and restore the old app after the new process is already running.
+	if err := removeFileDurable(pendingAppExternalHelper(execPath)); err != nil && !os.IsNotExist(err) {
+		return true, fmt.Errorf("remove confirmed app recovery helper: %w", err)
 	}
 	return true, nil
 }

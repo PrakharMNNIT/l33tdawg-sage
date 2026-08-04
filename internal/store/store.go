@@ -878,6 +878,7 @@ type MessageStatus struct {
 // not a second queue.
 type MessageStore interface {
 	SendLocalMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage) (*PipelineMessage, bool, error)
+	SendFederatedMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage, event *PipelineTransportOutbox) (*PipelineMessage, bool, error)
 	ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int) ([]*PipelineMessage, bool, error)
 	ReplyLocalMessage(ctx context.Context, receiverID, messageID, result string) (bool, error)
 	AcknowledgeLocalMessageRead(ctx context.Context, receiverID, messageID string) (bool, error)

@@ -664,6 +664,7 @@ jobs:
           printf '%s\n' "${app_identity}" | grep -Fx "TeamIdentifier=${APPLE_TEAM_ID}"
           for leaf_spec in \
             "${APP_PATH}/Contents/MacOS/sage-gui:sage-gui" \
+            "${APP_PATH}/Contents/MacOS/sage-update-helper:sage-update-helper" \
             "${APP_PATH}/Contents/MacOS/sage-tray:com.sage.brain"; do
             leaf=${leaf_spec%:*}
             expected_identifier=${leaf_spec##*:}
@@ -693,6 +694,7 @@ jobs:
           printf '%s\n' "${app_identity}" | grep -Fx "TeamIdentifier=${APPLE_TEAM_ID}"
           for leaf_spec in \
             "${MOUNT_POINT}/SAGE.app/Contents/MacOS/sage-gui:sage-gui" \
+            "${MOUNT_POINT}/SAGE.app/Contents/MacOS/sage-update-helper:sage-update-helper" \
             "${MOUNT_POINT}/SAGE.app/Contents/MacOS/sage-tray:com.sage.brain"; do
             leaf=${leaf_spec%:*}
             expected_identifier=${leaf_spec##*:}
@@ -739,6 +741,7 @@ jobs:
           printf '%s\n' "${app_identity}" | grep -Fx "TeamIdentifier=${APPLE_TEAM_ID}"
           for leaf_spec in \
             "${COPY_VERIFY_APP}/Contents/MacOS/sage-gui:sage-gui" \
+            "${COPY_VERIFY_APP}/Contents/MacOS/sage-update-helper:sage-update-helper" \
             "${COPY_VERIFY_APP}/Contents/MacOS/sage-tray:com.sage.brain"; do
             leaf=${leaf_spec%:*}
             expected_identifier=${leaf_spec##*:}
@@ -759,6 +762,7 @@ jobs:
           spctl --assess --type execute --verbose=4 "${COPY_VERIFY_APP}"
           codesign --verify --deep --strict --verbose=2 "${COPY_VERIFY_APP}"
           codesign --verify --strict --verbose=2 "${COPY_VERIFY_APP}/Contents/MacOS/sage-gui"
+          codesign --verify --strict --verbose=2 "${COPY_VERIFY_APP}/Contents/MacOS/sage-update-helper"
           codesign --verify --strict --verbose=2 "${COPY_VERIFY_APP}/Contents/MacOS/sage-tray"
           rm -rf "${COPY_VERIFY_ROOT}"
           cleanup_mount
@@ -1314,6 +1318,7 @@ jobs:
             printf '%s\n' "${app_identity}" | grep -Fx "TeamIdentifier=2N7GKZ8D8Z"
             for leaf_spec in \
               "${mount_point}/SAGE.app/Contents/MacOS/sage-gui:sage-gui" \
+              "${mount_point}/SAGE.app/Contents/MacOS/sage-update-helper:sage-update-helper" \
               "${mount_point}/SAGE.app/Contents/MacOS/sage-tray:com.sage.brain"; do
               leaf=${leaf_spec%:*}
               expected_identifier=${leaf_spec##*:}
@@ -1362,6 +1367,7 @@ jobs:
             printf '%s\n' "${app_identity}" | grep -Fx "TeamIdentifier=2N7GKZ8D8Z"
             for leaf_spec in \
               "${copy_verify_app}/Contents/MacOS/sage-gui:sage-gui" \
+              "${copy_verify_app}/Contents/MacOS/sage-update-helper:sage-update-helper" \
               "${copy_verify_app}/Contents/MacOS/sage-tray:com.sage.brain"; do
               leaf=${leaf_spec%:*}
               expected_identifier=${leaf_spec##*:}
@@ -1382,6 +1388,7 @@ jobs:
             spctl --assess --type execute --verbose=4 "${copy_verify_app}"
             codesign --verify --deep --strict --verbose=2 "${copy_verify_app}"
             codesign --verify --strict --verbose=2 "${copy_verify_app}/Contents/MacOS/sage-gui"
+            codesign --verify --strict --verbose=2 "${copy_verify_app}/Contents/MacOS/sage-update-helper"
             codesign --verify --strict --verbose=2 "${copy_verify_app}/Contents/MacOS/sage-tray"
             rm -rf "${copy_verify_root}"
             xcrun stapler validate "${dmg}"

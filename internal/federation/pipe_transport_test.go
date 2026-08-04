@@ -20,6 +20,12 @@ import (
 	"github.com/l33tdawg/sage/internal/store"
 )
 
+func TestImportedMessageIDsUseCanonicalVocabulary(t *testing.T) {
+	id, err := newImportedPipeID()
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(id, "msg-fed-"), id)
+}
+
 func signedPipeProof(t *testing.T, priv ed25519.PrivateKey, agentID, method, path string, body []byte, ts int64) store.PipelineAgentProof {
 	t.Helper()
 	nonce := []byte("pipe-nonce-12345")

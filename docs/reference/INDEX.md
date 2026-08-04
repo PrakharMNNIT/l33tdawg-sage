@@ -50,7 +50,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | Understand why your chain's block height isn't moving | [`concepts/block-production-and-idle.md`](concepts/block-production-and-idle.md) |
 | Make sure submitted memories actually get committed (not stuck at `proposed`) | [`concepts/voter-operations.md`](concepts/voter-operations.md) |
 | Pair two SAGE nodes, then change which existing domains they share without re-pairing | [`federation-and-brain-api.md`](federation-and-brain-api.md) — “Trust and directional peer RBAC” |
-| Send agent work to a visible shared-domain recipient on another federated SAGE | [`mcp-tools.md`](mcp-tools.md) — `sage_find_agent`, then `sage_pipe`; [`federation-and-brain-api.md`](federation-and-brain-api.md) — `POST /fed/v1/pipe/event` |
+| Send agent work to a visible shared-domain recipient on another federated SAGE | [`mcp-tools.md`](mcp-tools.md) — `sage_find_agent`, then `sage_message_send`; [`federation-and-brain-api.md`](federation-and-brain-api.md) — internal compatibility transport `POST /fed/v1/pipe/event` |
 | Discover connected SAGEs and live-read a domain they share | [`mcp-tools.md`](mcp-tools.md) — `sage_federation`, then `sage_recall` with `federated=true` |
 | Distinguish internet federation, app-v20 quorum replication, and local-vs-network snapshot recovery | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) — “v11.9 quorum scopes are not cross-chain federation” |
 | Understand Root handover or why a federated agent is read-only | [`app-v23-access-control-design.md`](app-v23-access-control-design.md) + [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) |
@@ -64,7 +64,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 
 ### Boot sequence (MCP)
 1. `sage_inception` — **very first action every conversation.** Loads your stored memory context. The superseded `sage_red_pill` alias is no longer registered or callable.
-2. `sage_turn` — **every turn.** Atomically recalls committed memories for the topic *and* stores your observation. Also auto-checks the pipeline inbox.
+2. `sage_turn` — **every turn.** Atomically recalls committed memories for the topic *and* stores your observation. Also auto-checks the unified message inbox.
 3. `sage_reflect` — after tasks. Store dos and don'ts.
 
 This is advisory. The server never blocks or pads unrelated work merely because

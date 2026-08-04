@@ -105,6 +105,69 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 	require.Contains(t, status.(map[string]any)["message"], "does not prove comprehension")
 }
 
+func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
+	remoteAgent := strings.Repeat("b", 64)
+	var sent map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pipe/resolve", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"to_agent": remoteAgent, "source_chain_id": "chain-a", "destination_chain_id": "chain-b",
+		})
+	})
+	mux.HandleFunc("/v1/pipe/send", func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&sent))
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"pipe_id": "transport-1", "status": "pending", "destination_chain_id": "chain-b",
+		})
+	})
+	mux.HandleFunc("/v1/messages/remote-local/reply", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not local", http.StatusNotFound)
+	})
+	mux.HandleFunc("/v1/pipe/remote-local", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"source_pipe_id": "transport-1", "reply_source_chain_id": "chain-b",
+		})
+	})
+	mux.HandleFunc("/v1/pipe/remote-local/result", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+	})
+	mux.HandleFunc("/v1/messages/transport-1/status", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not local", http.StatusNotFound)
+	})
+	mux.HandleFunc("/v1/pipe/transport-1/receipt", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"pipe_id": "transport-1", "transport_status": "delivered",
+			"read_status": "confirmed", "workflow_status": "pending",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, privateKey)
+
+	result, err := s.toolMessageSend(context.Background(), map[string]any{
+		"to": remoteAgent + "@chain-b", "payload": "hello", "idempotency_key": "stable-fed",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "transport-1", result.(map[string]any)["message_id"])
+	require.NotContains(t, result.(map[string]any), "pipe_id")
+	require.Equal(t, "stable-fed", sent["idempotency_key"])
+	require.Equal(t, "chain-a", sent["source_chain_id"])
+
+	reply, err := s.toolMessageReply(context.Background(), map[string]any{"message_id": "remote-local", "result": "done"})
+	require.NoError(t, err)
+	require.Equal(t, "remote-local", reply.(map[string]any)["message_id"])
+	require.Equal(t, "federated", reply.(map[string]any)["scope"])
+
+	status, err := s.toolMessageStatus(context.Background(), map[string]any{"message_id": "transport-1"})
+	require.NoError(t, err)
+	require.Equal(t, "transport-1", status.(map[string]any)["message_id"])
+	require.NotContains(t, status.(map[string]any), "pipe_id")
+	require.Equal(t, "federated", status.(map[string]any)["scope"])
+}
+
 func TestPipeReceiptStatusUsesExactSignedSenderProjection(t *testing.T) {
 	_, privateKey, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
@@ -332,15 +395,18 @@ func TestUnifiedInboxKeepsFederatedWorkVisibleWhenCanonicalMessagesExist(t *test
 	require.NoError(t, err)
 	items := result.(map[string]any)["items"].([]map[string]any)
 	require.Len(t, items, 2)
-	require.Equal(t, "local-message", items[0]["pipe_id"])
+	require.Equal(t, "local-message", items[0]["message_id"])
+	require.NotContains(t, items[0], "pipe_id")
 	require.Equal(t, "confirmed", items[0]["read_status"])
-	require.Equal(t, "foreign-message", items[1]["pipe_id"])
+	require.Equal(t, "foreign-message", items[1]["message_id"])
+	require.NotContains(t, items[1], "pipe_id")
 	require.Equal(t, true, items[1]["foreign"])
 
 	turn := s.checkPipelineInbox(context.Background())
-	turnItems := turn["pipe_inbox"].([]map[string]any)
+	turnItems := turn["message_inbox"].([]map[string]any)
 	require.Len(t, turnItems, 2)
-	require.Equal(t, "foreign-message", turnItems[1]["pipe_id"])
+	require.Equal(t, "foreign-message", turnItems[1]["message_id"])
+	require.NotContains(t, turnItems[1], "pipe_id")
 	mu.Lock()
 	require.Equal(t, []string{"2", "4"}, legacyLimits,
 		"canonical-local work must consume capacity before legacy/federated claim")
@@ -396,7 +462,8 @@ func TestUnifiedInboxAtomicallyClaimsAndReadsNegotiatedFederatedReceiptV2(t *tes
 	require.NoError(t, err)
 	items := result.(map[string]any)["items"].([]map[string]any)
 	require.Len(t, items, 1)
-	require.Equal(t, "foreign-v2", items[0]["pipe_id"])
+	require.Equal(t, "foreign-v2", items[0]["message_id"])
+	require.NotContains(t, items[0], "pipe_id")
 	require.Equal(t, "queued", items[0]["claim_status"])
 	require.Equal(t, "queued", items[0]["read_status"])
 	mu.Lock()
@@ -640,19 +707,19 @@ func TestUnifiedInboxReturnsClaimedCanonicalWorkWhenLegacyClaimFailsThenRecovers
 	firstInbox := first.(map[string]any)
 	firstItems := firstInbox["items"].([]map[string]any)
 	require.Len(t, firstItems, 1)
-	require.Equal(t, "claimed-canonical", firstItems[0]["pipe_id"])
+	require.Equal(t, "claimed-canonical", firstItems[0]["message_id"])
 	require.Equal(t, "do not lose me", firstItems[0]["payload"])
 	require.Equal(t, "confirmed", firstItems[0]["read_status"])
-	require.Contains(t, firstInbox["pipeline_inbox_warning"], "legacy transport unavailable")
+	require.Contains(t, firstInbox["message_inbox_warning"], "legacy transport unavailable")
 
 	second, err := s.toolInbox(context.Background(), map[string]any{"limit": 2})
 	require.NoError(t, err)
 	secondInbox := second.(map[string]any)
 	secondItems := secondInbox["items"].([]map[string]any)
 	require.Len(t, secondItems, 1)
-	require.Equal(t, "recovered-legacy", secondItems[0]["pipe_id"])
+	require.Equal(t, "recovered-legacy", secondItems[0]["message_id"])
 	require.Equal(t, "federated work survived", secondItems[0]["payload"])
-	require.NotContains(t, secondInbox, "pipeline_inbox_warning")
+	require.NotContains(t, secondInbox, "message_inbox_warning")
 
 	mu.Lock()
 	require.Equal(t, 2, canonicalReceives, "claimed canonical work must not be delivered twice")
@@ -723,6 +790,13 @@ func TestClaimedCanonicalWorkRemainsRecoverableFromPassiveInboxHistory(t *testin
 	require.Equal(t, "recover this claimed payload", historyItems[0]["payload"])
 	require.Equal(t, true, historyItems[0]["passive_history"])
 	require.Equal(t, "claimed", historyItems[0]["status"])
+
+	messageHistory, err := s.toolMessageHistory(context.Background(), map[string]any{"folder": "inbox", "limit": 20})
+	require.NoError(t, err)
+	messageHistoryItems := messageHistory.(map[string]any)["items"].([]map[string]any)
+	require.Len(t, messageHistoryItems, 1)
+	require.Equal(t, "history-recovery", messageHistoryItems[0]["message_id"])
+	require.NotContains(t, messageHistoryItems[0], "pipe_id")
 }
 
 func TestCanonicalMessageToolsRejectOutOfContractBoundsBeforeHTTP(t *testing.T) {

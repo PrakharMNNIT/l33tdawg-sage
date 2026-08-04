@@ -64,7 +64,7 @@ func TestAssetSHA256Digest(t *testing.T) {
 
 func TestInAppUpdateSupportRequiresExternalRecoveryOwner(t *testing.T) {
 	assert.True(t, inAppUpdateSupported("linux"))
-	assert.False(t, inAppUpdateSupported("darwin"), "macOS must use the signed DMG until an external rollback helper exists")
+	assert.True(t, inAppUpdateSupported("darwin"), "macOS uses the separately signed external rollback helper")
 	assert.False(t, inAppUpdateSupported("windows"))
 }
 
@@ -278,8 +278,6 @@ func TestHandleApplyUpdateRequiresTrustedChecksum(t *testing.T) {
 	h.handleApplyUpdate(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	switch runtime.GOOS {
-	case "darwin":
-		assert.Contains(t, w.Body.String(), "signed DMG")
 	case "windows":
 		assert.Contains(t, w.Body.String(), "signed release installer")
 	default:
@@ -326,8 +324,6 @@ func TestUnencryptedLoopbackCEREBRUMReachesUpdaterThroughRouter(t *testing.T) {
 
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	switch runtime.GOOS {
-	case "darwin":
-		assert.Contains(t, w.Body.String(), "signed DMG")
 	case "windows":
 		assert.Contains(t, w.Body.String(), "signed release installer")
 	default:

@@ -78,6 +78,7 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 	require.NoError(t, json.Unmarshal(sent.Body.Bytes(), &sendResponse))
 	messageID := sendResponse["message_id"].(string)
 	require.NotEmpty(t, messageID)
+	require.True(t, strings.HasPrefix(messageID, "msg-"), messageID)
 	require.Len(t, notifications, 1)
 	require.Equal(t, "bob", notifications[0].RecipientAgentID)
 	require.Equal(t, "alice", notifications[0].FromAgent)

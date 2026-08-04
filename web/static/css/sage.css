@@ -5655,11 +5655,14 @@ input[type="range"]::-moz-range-thumb {
 }
 .cerebrum-recovery-inventory-head,
 .cerebrum-recovery-assignment {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     align-items: center;
-    justify-content: space-between;
     gap: 14px;
 }
+.cerebrum-recovery-inventory-head { grid-template-columns: minmax(0, 1fr) auto; }
+.cerebrum-recovery-assignment > div { grid-column: 1 / -1; min-width: 0; }
+.cerebrum-recovery-assignment > button { justify-self: start; }
 .cerebrum-recovery-inventory h3 { margin: 0 0 4px; color: var(--text); font-size: 14px; }
 .cerebrum-recovery-inventory p { margin: 0; color: var(--text-dim); font-size: 11px; line-height: 1.5; }
 .cerebrum-recovery-inventory-head > span {
@@ -5689,12 +5692,12 @@ input[type="range"]::-moz-range-thumb {
 .cerebrum-recovery-record-copy > span { color: var(--text-dim); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
 .cerebrum-recovery-record-copy small { color: var(--muted); font: 600 9px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-transform: uppercase; }
 .cerebrum-recovery-record.deprecate-only small { color: color-mix(in srgb, var(--danger) 75%, var(--muted)); }
-.cerebrum-recovery-assignment label { display: grid; gap: 5px; min-width: min(100%, 360px); color: var(--text-dim); font-size: 10px; }
+.cerebrum-recovery-assignment label { display: grid; gap: 5px; min-width: 0; color: var(--text-dim); font-size: 10px; }
 .cerebrum-recovery-assignment select { width: 100%; }
 .cerebrum-recovery-note { color: #f5bd55 !important; }
 .cerebrum-repair-choice {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(240px, 1fr) auto;
     align-items: center;
     gap: 14px 20px;
     padding: 18px;
@@ -5702,9 +5705,11 @@ input[type="range"]::-moz-range-thumb {
     border-radius: var(--radius);
     background: color-mix(in srgb, var(--bg-elevated) 72%, transparent);
 }
+.cerebrum-repair-choice:not(.danger) { grid-template-columns: minmax(0, 1fr) auto; }
 .cerebrum-repair-choice.danger {
     border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
 }
+.cerebrum-repair-choice.danger > div:first-child { grid-column: 1 / -1; min-width: 0; }
 .cerebrum-repair-choice h3 {
     margin: 0 0 5px;
     color: var(--text);
@@ -5718,7 +5723,7 @@ input[type="range"]::-moz-range-thumb {
 }
 .cerebrum-repair-confirmation {
     display: grid;
-    grid-column: 1 / -1;
+    grid-column: auto;
     gap: 7px;
     color: var(--text-dim);
     font-size: 11px;
@@ -5742,7 +5747,7 @@ input[type="range"]::-moz-range-thumb {
     outline-offset: 1px;
 }
 .cerebrum-repair-choice.danger > .btn {
-    grid-column: 2;
+    grid-column: auto;
 }
 .cerebrum-repair-feedback {
     padding: 11px 13px;
@@ -5772,6 +5777,9 @@ input[type="range"]::-moz-range-thumb {
     .cerebrum-repair-header,
     .cerebrum-repair-body { padding-left: 18px; padding-right: 18px; }
     .cerebrum-repair-choice { grid-template-columns: 1fr; }
+    .cerebrum-recovery-inventory-head,
+    .cerebrum-recovery-assignment { grid-template-columns: 1fr; align-items: stretch; }
+    .cerebrum-recovery-inventory-head > span { justify-self: start; }
     .cerebrum-repair-choice > .btn,
     .cerebrum-repair-choice.danger > .btn { grid-column: 1; width: 100%; }
     .cerebrum-repair-footer { padding-left: 18px; padding-right: 18px; }
