@@ -1477,6 +1477,48 @@ func (s *BadgerStore) GetAppV25DomainContinuity(
 	return &record, nil
 }
 
+// AppV25DomainContinuityWouldDisplaceOwner reports the narrow permanent
+// conflict that the continuity worker can safely omit before broadcasting a
+// proposal: current canonical policy assigns the domain to neither Root nor
+// any historically proven writer. It is a read-only mirror of the consensus
+// apply guard; returning true never changes or transfers ownership.
+func (s *BadgerStore) AppV25DomainContinuityWouldDisplaceOwner(
+	domain string,
+	writers []string,
+) (bool, error) {
+	if err := ValidateAppV23DomainName(domain); err != nil {
+		return false, err
+	}
+	if len(writers) == 0 {
+		return false, errors.New("domain continuity requires at least one writer")
+	}
+	writers = append([]string(nil), writers...)
+	sort.Strings(writers)
+	conflicted := false
+	err := s.view(func(txn *badger.Txn) error {
+		var root AppV23RootState
+		if readErr := appV23ReadJSON(txn, appV23RootKey(), &root); readErr != nil {
+			return readErr
+		}
+		value, readErr := s.appV23ReadEffectiveValueTxn(txn, domainKey(domain))
+		if errors.Is(readErr, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+		currentOwner, _, decodeErr := decodeString(value, 0)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		index := sort.SearchStrings(writers, currentOwner)
+		writerOwns := index < len(writers) && writers[index] == currentOwner
+		conflicted = currentOwner != "" && currentOwner != root.PrincipalID && !writerOwns
+		return nil
+	})
+	return conflicted, err
+}
+
 func (s *BadgerStore) appV25ContinuityActivationMatchesTxn(
 	txn *badger.Txn,
 	enrollment AppV23LocalEnrollment,

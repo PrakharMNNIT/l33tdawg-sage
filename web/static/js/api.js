@@ -142,7 +142,7 @@ export async function fetchValidators() {
 }
 
 export async function fetchScopes() {
-	const res = await fetch(`${API_BASE}/v1/scopes`);
+	const res = await fetch(`${API_BASE}/v1/dashboard/chain/scopes`);
 	if (!res.ok) throw new Error('scopes fetch failed');
 	return res.json();
 }

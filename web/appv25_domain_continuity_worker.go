@@ -382,6 +382,27 @@ func (h *DashboardHandler) runAppV25DomainContinuityPassWithRun(
 	if !broker.Available || root == nil || len(rootKey) != ed25519.PrivateKeySize {
 		return false, fmt.Errorf("current Root signing path is unavailable: %s", broker.ReasonCode)
 	}
+	eligible := make([]appV25DomainContinuityEntry, 0, len(run.plan.Entries))
+	for _, entry := range run.plan.Entries {
+		conflicted, conflictErr := h.BadgerStore.AppV25DomainContinuityWouldDisplaceOwner(
+			entry.Domain, entry.Writers,
+		)
+		if conflictErr != nil {
+			return false, conflictErr
+		}
+		if conflicted {
+			domainDigest := sha256.Sum256([]byte(entry.Domain))
+			logger.Warn().
+				Str("domain_digest", fmt.Sprintf("%x", domainDigest[:8])).
+				Msg("app-v25 domain-continuity evidence skipped because current policy has an unrelated owner")
+			continue
+		}
+		eligible = append(eligible, entry)
+	}
+	run.plan.Entries = eligible
+	if len(run.plan.Entries) == 0 {
+		return false, nil
+	}
 	if !h.canAutomaticallyProposeAppV25Maintenance() {
 		return false, nil
 	}
