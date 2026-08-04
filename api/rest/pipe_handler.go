@@ -359,6 +359,7 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 		Intent             string `json:"intent"`
 		Payload            string `json:"payload"`
 		TTLMinutes         int    `json:"ttl_minutes"`
+		IdempotencyKey     string `json:"idempotency_key"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
@@ -620,6 +621,7 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var insertErr error
+	var idempotentReplay bool
 	if remoteTarget != nil {
 		transportStore, ok := pipeStore.(store.FederatedPipelineStore)
 		if !ok {
@@ -638,12 +640,27 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			Proof:                  transportProof,
 			CreatedAt:              msg.CreatedAt, ExpiresAt: msg.ExpiresAt,
 		}
-		insertErr = transportStore.InsertPipelineWithTransport(r.Context(), msg, event)
+		if req.IdempotencyKey != "" {
+			if len(req.IdempotencyKey) > store.MaxMessageTokenBytes {
+				writeProblem(w, http.StatusBadRequest, "Invalid idempotency key", "idempotency_key is too long")
+				return
+			}
+			messageStore, messageOK := s.store.(store.MessageStore)
+			if !messageOK {
+				writeProblem(w, http.StatusNotImplemented, "Messages unavailable", "The active store does not support canonical messages.")
+				return
+			}
+			msg, idempotentReplay, insertErr = messageStore.SendFederatedMessage(r.Context(), req.IdempotencyKey, msg, event)
+		} else {
+			insertErr = transportStore.InsertPipelineWithTransport(r.Context(), msg, event)
+		}
 	} else {
 		insertErr = pipeStore.InsertPipeline(r.Context(), msg)
 	}
 	if insertErr != nil {
 		switch {
+		case errors.Is(insertErr, store.ErrMessageIdempotencyConflict):
+			writeProblem(w, http.StatusConflict, "Idempotency key conflict", "That idempotency key was already used for a different message.")
 		case errors.Is(insertErr, store.ErrPipePayloadTooLarge), errors.Is(insertErr, store.ErrPipeIntentTooLarge):
 			writeProblemTyped(w, http.StatusRequestEntityTooLarge, pipeTooLargeProblemType, "Pipeline content too large", insertErr.Error())
 		case errors.Is(insertErr, store.ErrPipeQuotaPerAgent), errors.Is(insertErr, store.ErrPipeQuotaGlobal):
@@ -656,7 +673,7 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if remoteTarget != nil {
+	if remoteTarget != nil && !idempotentReplay {
 		if nudger, ok := s.federation.(federatedPipeTransportNudger); ok {
 			nudger.NudgePipelineTransport()
 		}
@@ -674,11 +691,16 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("%s piped work to %s (intent: %s)", fromProvider, target, req.Intent), nil)
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{
+	statusCode := http.StatusCreated
+	if idempotentReplay {
+		statusCode = http.StatusOK
+	}
+	writeJSON(w, statusCode, map[string]any{
 		"pipe_id":              msg.PipeID,
 		"status":               msg.Status,
 		"expires_at":           msg.ExpiresAt.Format(time.RFC3339),
 		"destination_chain_id": msg.DestinationChainID,
+		"idempotent_replay":    idempotentReplay,
 	})
 }
 
@@ -1492,12 +1514,14 @@ func (s *Server) autoJournalPipeline(ctx context.Context, summary string) string
 	return memoryID
 }
 
-// generatePipeID creates a random pipe ID with a "pipe-" prefix.
+// generatePipeID creates the durable identifier shared by the canonical
+// Messages facade and the deprecated pipeline compatibility routes. New IDs
+// use message terminology; readers continue to accept historical pipe-* IDs.
 func generatePipeID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("pipe-%08x-%04x-%04x-%04x-%012x",
+	return fmt.Sprintf("msg-%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

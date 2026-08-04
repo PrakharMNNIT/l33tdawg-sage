@@ -657,6 +657,7 @@ test('macOS release artifacts must be signed, notarized, stapled, and assessed',
   assert.match(macosBuild, /hdiutil attach -readonly -nobrowse -mountpoint/);
   assert.match(macosBuild, /codesign --verify --deep --strict --verbose=2 "\$VERIFY_MOUNT\/SAGE\.app"/);
   assert.match(macosBuild, /Contents\/MacOS\/sage-gui:sage-gui/);
+  assert.match(macosBuild, /Contents\/MacOS\/sage-update-helper:sage-update-helper/);
   assert.match(macosBuild, /Contents\/MacOS\/sage-tray:com\.sage\.brain/);
   assert.match(macosBuild, /codesign --verify --strict --verbose=2 "\$leaf"/);
   assert.match(macosBuild, /grep -Fx "TeamIdentifier=\$\{APPLE_TEAM_ID\}"/);
@@ -676,6 +677,7 @@ test('macOS release artifacts must be signed, notarized, stapled, and assessed',
   assert.match(stagedBody, /version_output=\$\("\$\{copy_verify_app\}\/Contents\/MacOS\/sage-gui" version\)/);
   assert.match(stagedBody, /awk 'NR == 1 \{ print \$2 \}'\)" = "\$\{RELEASE_TAG#v\}"/);
   assert.match(body, /Contents\/MacOS\/sage-gui:sage-gui/);
+  assert.match(body, /Contents\/MacOS\/sage-update-helper:sage-update-helper/);
   assert.match(body, /Contents\/MacOS\/sage-tray:com\.sage\.brain/);
   assert.match(body, /test -f "\$\{leaf\}" && test ! -L "\$\{leaf\}" && test -x "\$\{leaf\}"/);
   assert.match(body, /stat -f '%Lp' "\$\{leaf\}"/);
@@ -683,6 +685,7 @@ test('macOS release artifacts must be signed, notarized, stapled, and assessed',
   assert.match(body, /grep -Fx "TeamIdentifier=\$\{APPLE_TEAM_ID\}"/);
   assert.match(body, /grep -Fx "Identifier=com\.sage\.brain"/);
   assert.match(stagedBody, /grep -Fx "TeamIdentifier=2N7GKZ8D8Z"/);
+  assert.match(stagedBody, /Contents\/MacOS\/sage-update-helper:sage-update-helper/);
   assert.match(stagedBody, /"SAGE-macOS-\$\{arch\}\.dmg"/);
   assert.match(stagedBody, /test "\$\{published_name\}" = "\$\(basename "\$\{dmg\}"\)"/);
   assert.match(stagedBody, /File System Personality:\[\[:space:\]\]\+APFS/);

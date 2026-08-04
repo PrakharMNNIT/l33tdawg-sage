@@ -20,6 +20,12 @@ import (
 	"github.com/l33tdawg/sage/internal/store"
 )
 
+func TestImportedMessageIDsUseCanonicalVocabulary(t *testing.T) {
+	id, err := newImportedPipeID()
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(id, "msg-fed-"), id)
+}
+
 func signedPipeProof(t *testing.T, priv ed25519.PrivateKey, agentID, method, path string, body []byte, ts int64) store.PipelineAgentProof {
 	t.Helper()
 	nonce := []byte("pipe-nonce-12345")
@@ -99,6 +105,7 @@ func TestHandlePipeEventSendVerifiesProofLifetimeContactAndDeduplicates(t *testi
 	signedBody, err := json.Marshal(map[string]any{
 		"to_agent": contact.AgentID, "source_chain_id": "chain-peer", "destination_chain_id": "chain-local",
 		"intent": "triage", "payload": "review finding", "ttl_minutes": 90,
+		"idempotency_key": "canonical-message-retry-token",
 	})
 	require.NoError(t, err)
 	proof := signedPipeProof(t, sourcePriv, sourceAgent, http.MethodPost, "/v1/pipe/send", signedBody, ts.Unix())

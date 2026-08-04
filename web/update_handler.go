@@ -140,7 +140,7 @@ func (h *DashboardHandler) handleCheckUpdate(w http.ResponseWriter, r *http.Requ
 		"update_instructions": func() string {
 			switch runtime.GOOS {
 			case "darwin":
-				return "Download the signed DMG, fully quit SAGE, drag SAGE.app to Applications, then reopen it. Your node data is unchanged."
+				return "SAGE can download and verify the signed DMG, install the app in place, then restart through its external recovery helper."
 			case "windows":
 				return "Download the signed installer, fully quit SAGE, install it, then open SAGE again."
 			default:
@@ -166,7 +166,7 @@ func inAppUpdateSupported(goos string) bool {
 	// one, a crash or launch-validation failure after swap can leave no binary
 	// capable of restoring the preserved bundle. Keep the signed-DMG path until
 	// such an independently signed helper exists.
-	return goos == "linux"
+	return goos == "linux" || goos == "darwin"
 }
 
 func assetSHA256Digest(digest string) string {
@@ -1156,11 +1156,19 @@ func (h *DashboardHandler) handleRestart(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusServiceUnavailable, "SAGE cannot preserve the recovery boundary through restart; restart was not requested")
 			return
 		}
+		commitHelper, abortHelper, helperErr := startPendingUpdateRecovery(h.ExecPath)
+		if helperErr != nil {
+			release()
+			writeError(w, http.StatusServiceUnavailable, "SAGE could not start the external update recovery helper; restart was not requested: "+helperErr.Error())
+			return
+		}
 		if err := h.RequestRestartPrepared(release, commitDrain, abortDrain); err != nil {
+			abortHelper()
 			release()
 			writeError(w, http.StatusServiceUnavailable, "SAGE could not begin a clean restart: "+err.Error())
 			return
 		}
+		commitHelper()
 		preparedOwned = false
 		writeJSONResp(w, http.StatusAccepted, map[string]any{
 			"ok": true, "status": "draining", "boot_id": h.BootID,

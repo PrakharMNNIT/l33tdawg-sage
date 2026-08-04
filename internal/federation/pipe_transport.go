@@ -81,6 +81,10 @@ type signedPipeSendRequest struct {
 	Intent             string `json:"intent"`
 	Payload            string `json:"payload"`
 	TTLMinutes         int    `json:"ttl_minutes"`
+	// IdempotencyKey is sender-local replay control. It is intentionally not
+	// copied into the federated event, but current message clients include it
+	// in the exact signed /v1/pipe/send request that the peer verifies.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 type signedPipeResultRequest struct {
@@ -321,7 +325,10 @@ func newImportedPipeID() (string, error) {
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return "pipe-fed-" + hex.EncodeToString(b), nil
+	// This receiver-local ID is exposed by the canonical Inbox facade. Keep
+	// accepting historical pipe-fed-* values, but do not leak pipeline naming in
+	// newly delivered messages.
+	return "msg-fed-" + hex.EncodeToString(b), nil
 }
 
 func pipeEventContentHash(event *PipeEvent) [32]byte {

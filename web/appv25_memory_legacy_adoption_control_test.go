@@ -187,9 +187,20 @@ func TestAppV25LegacyAdoptionDeprecatePreservesRowsAndSkipsFuturePlans(t *testin
 	request := appV25RecoveryControlRequest(t,
 		"/v1/dashboard/memory/adoption-deprecate", revision, 1,
 		"DEPRECATE 1")
+	recoveryEvents := handler.SSE.Subscribe()
+	require.NotNil(t, recoveryEvents)
+	t.Cleanup(func() { handler.SSE.Unsubscribe(recoveryEvents) })
 	recorder := httptest.NewRecorder()
 	handler.handleAppV25LegacyAdoptionDeprecate(recorder, request)
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	select {
+	case event := <-recoveryEvents:
+		require.Contains(t, string(event), "event: recovery")
+		require.Contains(t, string(event), `"chain_transaction":false`)
+		require.Contains(t, string(event), "retired from local recovery")
+	default:
+		t.Fatal("successful recovery retirement did not publish operator activity")
+	}
 
 	record, err := sqlite.GetMemory(context.Background(), "legacy-unconvertible")
 	require.NoError(t, err)

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -118,7 +119,7 @@ func localMessageRequestHash(msg *PipelineMessage) string {
 		// send. It is not part of the caller's idempotent request. Including it
 		// would make an exact retry conflict merely because the sender profile was
 		// edited between attempts.
-		msg.FromAgent, msg.ToAgent, msg.ToProvider,
+		msg.FromAgent, msg.ToAgent, msg.ToProvider, msg.DestinationChainID,
 		msg.Intent, msg.Payload, strconv.FormatInt(msg.ExpiresAt.Sub(msg.CreatedAt).Nanoseconds(), 10),
 	} {
 		_, _ = h.Write([]byte(strconv.Itoa(len(value))))
@@ -127,6 +128,72 @@ func localMessageRequestHash(msg *PipelineMessage) string {
 		_, _ = h.Write([]byte{0xff})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// SendFederatedMessage gives the canonical Messages surface the same durable,
+// caller-bound retry contract as a local send while retaining the existing
+// federation transport and wire protocol. The message row, transport event,
+// and idempotency binding commit in one SQLite transaction.
+func (s *SQLiteStore) SendFederatedMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage, event *PipelineTransportOutbox) (*PipelineMessage, bool, error) {
+	if msg == nil || event == nil || strings.TrimSpace(msg.FromAgent) == "" ||
+		strings.TrimSpace(msg.ToAgent) == "" || msg.DestinationChainID == "" ||
+		msg.SourceChainID != "" || msg.ToProvider != "" || event.PipeID != msg.PipeID ||
+		event.RemoteChainID != msg.DestinationChainID || event.SourceAgentID != msg.FromAgent ||
+		event.TargetAgentID != msg.ToAgent || event.ContactID != msg.FederationContactID ||
+		event.ContactRevision != msg.FederationContactRevision || event.PolicyEpoch != msg.FederationPolicyEpoch ||
+		event.AgreementID != msg.FederationAgreementID || event.AuthorizationMode != msg.FederationAuthorizationMode ||
+		!bytes.Equal(event.LinkedRelation, msg.FederationLinkedRelation) {
+		return nil, false, fmt.Errorf("canonical federated message binding is invalid")
+	}
+	if idempotencyKey == "" || len(idempotencyKey) > MaxMessageTokenBytes {
+		return nil, false, fmt.Errorf("idempotency key must be between 1 and %d bytes", MaxMessageTokenBytes)
+	}
+	keyHash := messageKeyHash(idempotencyKey)
+	requestHash := localMessageRequestHash(msg)
+	var result *PipelineMessage
+	var replayed bool
+	err := s.RunInTx(ctx, func(txStore OffchainStore) error {
+		tx := txStore.(*SQLiteStore)
+		var priorHash, messageID string
+		err := tx.conn.QueryRowContext(ctx,
+			`SELECT request_hash, message_id FROM message_send_idempotency
+			 WHERE sender_agent_id=? AND key_hash=?`, msg.FromAgent, keyHash).Scan(&priorHash, &messageID)
+		switch {
+		case err == nil:
+			openedHash, openErr := tx.openMessageFingerprint(priorHash)
+			if openErr != nil {
+				return openErr
+			}
+			if openedHash != requestHash {
+				return ErrMessageIdempotencyConflict
+			}
+			var getErr error
+			result, getErr = tx.GetPipeline(ctx, messageID)
+			replayed = true
+			return getErr
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+		if insertErr := tx.InsertPipeline(ctx, msg); insertErr != nil {
+			return insertErr
+		}
+		if insertErr := tx.insertPipelineTransport(ctx, event); insertErr != nil {
+			return insertErr
+		}
+		sealedHash, sealErr := tx.sealMessageFingerprint(requestHash)
+		if sealErr != nil {
+			return sealErr
+		}
+		if _, writeErr := tx.writeExecContext(ctx,
+			`INSERT INTO message_send_idempotency(sender_agent_id,key_hash,request_hash,message_id)
+			 VALUES(?,?,?,?)`, msg.FromAgent, keyHash, sealedHash, msg.PipeID); writeErr != nil {
+			return writeErr
+		}
+		copy := *msg
+		result = &copy
+		return nil
+	})
+	return result, replayed, err
 }
 
 // sealMessageFingerprint prevents the deterministic content fingerprints used

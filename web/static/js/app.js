@@ -52,7 +52,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.2';
+const SAGE_VERSION = 'v11.17.4';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -470,7 +470,7 @@ function MemoryAdoptionResolutionModal({ progress, onProgress, onClose }) {
             setConfirmation('');
             setSelectedIDs([]);
             if (Number(refreshed?.recovery || 0) > 0) await loadInventory();
-            setSuccess(`${deprecationCount.toLocaleString()} historical record${deprecationCount === 1 ? '' : 's'} deprecated. They remain preserved for audit and were not deleted or rewritten.`);
+            setSuccess(`${deprecationCount.toLocaleString()} historical record${deprecationCount === 1 ? '' : 's'} retired from local recovery. They remain preserved for audit and were not deleted or rewritten. This is shown in Activity, but it is not a new chain transaction.`);
         } catch (err) {
             if (String(err?.message || '').includes('historical memory recovery inventory changed')) {
                 await refreshProgress();
@@ -619,7 +619,7 @@ function MemoryAdoptionResolutionModal({ progress, onProgress, onClose }) {
                     <section class="cerebrum-repair-choice danger" aria-labelledby="memory-repair-deprecate-title">
                         <div>
                             <h3 id="memory-repair-deprecate-title">${selectedIDs.length ? 'Deprecate selected records' : 'Deprecate all remaining records'}</h3>
-                            <p>This permanently excludes ${selectedIDs.length ? 'the selected records' : 'all remaining records'} from future repair attempts and the available-memory view. They remain preserved for audit; their content and history are not deleted or rewritten.</p>
+                            <p>This permanently excludes ${selectedIDs.length ? 'the selected records' : 'all remaining records'} from future repair attempts and the available-memory view. They remain preserved for audit; their content and history are not deleted or rewritten. This is a local recovery decision, shown in Activity, not a new chain transaction.</p>
                         </div>
                         <label class="cerebrum-repair-confirmation">
                             <span>Type <strong>${requiredConfirmation}</strong> to confirm</span>
@@ -7576,6 +7576,7 @@ function ChainActivityLog({ sse }) {
             sse.on('consensus', (data) => addEvent('consensus', data)),
             sse.on('agent', (data) => addEvent('agent', data)),
             sse.on('access', (data) => addEvent('access', data)),
+            sse.on('recovery', (data) => addEvent('recovery', data)),
             sse.on('connection', (data) => {
                 // Track connection state internally but don't show in chain activity
                 if (data.connected) {
@@ -7603,6 +7604,7 @@ function ChainActivityLog({ sse }) {
         consensus: { icon: 'C', color: '#a78bfa', label: 'Consensus Reached' },
         agent: { icon: 'A', color: '#f472b6', label: 'Agent Activity' },
         access: { icon: '⊕', color: '#22c55e', label: 'Access Updated' },
+        recovery: { icon: 'R', color: '#f5bd55', label: 'Recovery Decision (local)' },
         connection: { icon: '*', color: '#8b5cf6', label: 'Connection' },
     };
 

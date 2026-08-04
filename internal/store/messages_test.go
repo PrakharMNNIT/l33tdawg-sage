@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -68,6 +69,50 @@ func TestMessageSendReplayIgnoresMutableProviderMetadata(t *testing.T) {
 	require.True(t, replayed)
 	require.Equal(t, "msg-provider", got.PipeID)
 	require.Equal(t, "old-display", got.FromProvider, "replay returns the immutable original row")
+}
+
+func TestFederatedMessageSendIdempotencyCommitsTransportOnce(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	pub, _, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	sender := fmt.Sprintf("%x", pub)
+	makePair := func(messageID, payload, chain string) (*PipelineMessage, *PipelineTransportOutbox) {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		msg := testLocalMessage(messageID, sender, strings.Repeat("b", 64), payload)
+		msg.CreatedAt, msg.ExpiresAt, msg.DestinationChainID = now, now.Add(time.Hour), chain
+		msg.FederationPolicyEpoch = "epoch-1"
+		msg.FederationAgreementID = strings.Repeat("c", 64)
+		msg.FederationContactID = strings.Repeat("d", 64)
+		msg.FederationContactRevision = strings.Repeat("e", 64)
+		event := &PipelineTransportOutbox{
+			EventID: "event-" + messageID, PipeID: messageID, RemoteChainID: chain,
+			EventKind: "send", PolicyEpoch: msg.FederationPolicyEpoch,
+			AgreementID: msg.FederationAgreementID, ContactID: msg.FederationContactID,
+			ContactRevision: msg.FederationContactRevision, SourceAgentID: sender,
+			TargetAgentID: msg.ToAgent, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+			Proof: PipelineAgentProof{AgentID: sender, Signature: make([]byte, ed25519.SignatureSize),
+				Timestamp: now.Unix(), Nonce: []byte("12345678"), CanonicalRequest: []byte("POST /v1/pipe/send\n{}")},
+		}
+		return msg, event
+	}
+	firstMsg, firstEvent := makePair("fed-1", "one", "chain-b")
+	first, replayed, err := s.SendFederatedMessage(ctx, "fed-key", firstMsg, firstEvent)
+	require.NoError(t, err)
+	require.False(t, replayed)
+	require.Equal(t, "fed-1", first.PipeID)
+
+	retryMsg, retryEvent := makePair("discarded", "one", "chain-b")
+	replay, replayed, err := s.SendFederatedMessage(ctx, "fed-key", retryMsg, retryEvent)
+	require.NoError(t, err)
+	require.True(t, replayed)
+	require.Equal(t, "fed-1", replay.PipeID)
+	_, err = s.GetPipelineTransport(ctx, retryEvent.EventID)
+	require.Error(t, err, "an idempotent replay must not create a second transport event")
+
+	conflictMsg, conflictEvent := makePair("fed-2", "one", "chain-c")
+	_, _, err = s.SendFederatedMessage(ctx, "fed-key", conflictMsg, conflictEvent)
+	require.ErrorIs(t, err, ErrMessageIdempotencyConflict)
 }
 
 func TestMessageReceiveReplaysExactClaimedBatchAfterLostResponse(t *testing.T) {

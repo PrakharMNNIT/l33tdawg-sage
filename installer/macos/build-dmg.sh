@@ -97,6 +97,12 @@ CGO_ENABLED=0 GOOS=darwin GOARCH="$GOARCH" go build \
     -o "${BUILD_DIR}/sage-gui" \
     "${PROJECT_ROOT}/cmd/sage-gui"
 
+echo "==> Compiling external update recovery helper..."
+CGO_ENABLED=0 GOOS=darwin GOARCH="$GOARCH" go build \
+    -ldflags "-s -w" \
+    -o "${BUILD_DIR}/sage-update-helper" \
+    "${PROJECT_ROOT}/cmd/sage-update-helper"
+
 # Create .app bundle structure
 echo "==> Creating app bundle..."
 mkdir -p "${APP_DIR}/Contents/MacOS"
@@ -104,6 +110,7 @@ mkdir -p "${APP_DIR}/Contents/Resources"
 
 # Copy sage-gui binary
 cp "${BUILD_DIR}/sage-gui" "${APP_DIR}/Contents/MacOS/sage-gui"
+cp "${BUILD_DIR}/sage-update-helper" "${APP_DIR}/Contents/MacOS/sage-update-helper"
 
 # Compile native Swift dock app (sage-tray)
 echo "==> Compiling native dock app (sage-tray)..."
@@ -173,6 +180,10 @@ if [ -n "${SIGN_IDENTITY:-}" ]; then
         --sign "$SIGN_IDENTITY" \
         --timestamp \
         "${APP_DIR}/Contents/MacOS/sage-gui"
+    codesign --force --options runtime \
+        --sign "$SIGN_IDENTITY" \
+        --timestamp \
+        "${APP_DIR}/Contents/MacOS/sage-update-helper"
     if [ -f "${APP_DIR}/Contents/MacOS/sage-tray" ]; then
         codesign --force --options runtime \
             --sign "$SIGN_IDENTITY" \
@@ -192,6 +203,7 @@ if [ -n "${SIGN_IDENTITY:-}" ]; then
     fi
     for leaf_spec in \
         "${APP_DIR}/Contents/MacOS/sage-gui:sage-gui" \
+        "${APP_DIR}/Contents/MacOS/sage-update-helper:sage-update-helper" \
         "${APP_DIR}/Contents/MacOS/sage-tray:com.sage.brain"; do
         leaf=${leaf_spec%:*}
         expected_identifier=${leaf_spec##*:}
@@ -279,6 +291,7 @@ if [ -n "${SIGN_IDENTITY:-}" ]; then
     fi
     for leaf_spec in \
         "$VERIFY_MOUNT/SAGE.app/Contents/MacOS/sage-gui:sage-gui" \
+        "$VERIFY_MOUNT/SAGE.app/Contents/MacOS/sage-update-helper:sage-update-helper" \
         "$VERIFY_MOUNT/SAGE.app/Contents/MacOS/sage-tray:com.sage.brain"; do
         leaf=${leaf_spec%:*}
         expected_identifier=${leaf_spec##*:}
@@ -312,6 +325,7 @@ if [ -n "${SIGN_IDENTITY:-}" ]; then
     fi
     for leaf_spec in \
         "$COPY_VERIFY_APP/Contents/MacOS/sage-gui:sage-gui" \
+        "$COPY_VERIFY_APP/Contents/MacOS/sage-update-helper:sage-update-helper" \
         "$COPY_VERIFY_APP/Contents/MacOS/sage-tray:com.sage.brain"; do
         leaf=${leaf_spec%:*}
         expected_identifier=${leaf_spec##*:}
@@ -327,6 +341,7 @@ if [ -n "${SIGN_IDENTITY:-}" ]; then
     verify_app_release_metadata "$COPY_VERIFY_APP" "${VERSION}"
     codesign --verify --deep --strict --verbose=2 "$COPY_VERIFY_APP"
     codesign --verify --strict --verbose=2 "$COPY_VERIFY_APP/Contents/MacOS/sage-gui"
+    codesign --verify --strict --verbose=2 "$COPY_VERIFY_APP/Contents/MacOS/sage-update-helper"
     codesign --verify --strict --verbose=2 "$COPY_VERIFY_APP/Contents/MacOS/sage-tray"
     rm -rf "$COPY_VERIFY_ROOT"
     COPY_VERIFY_ROOT=
