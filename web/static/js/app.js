@@ -16721,6 +16721,12 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
         : {};
     const syncPending = Number(outboxCounts.pending || 0);
     const syncFailed = Number(outboxCounts.failed || 0) + Number(outboxCounts.rejected || 0);
+    const outgoingSaveDisabled = (!dirty && !alignmentPending) || busy || !!pipeContactBusy || pipeContactLookupBusy;
+    const outgoingSaveLabel = busy ? 'Saving…' : (!dirty && alignmentPending ? 'Retry copy alignment' : 'Save what I share');
+    const outgoingSaveStatus = dirty ? 'Unsaved permission changes' : (alignmentPending ? 'Copy delivery needs retry' : 'Saved');
+    const copySaveDisabled = !syncKnown || !subscribeDirty || syncBusy;
+    const copySaveLabel = syncBusy ? 'Saving…' : 'Save copy choices';
+    const copySaveStatus = !syncKnown ? 'Copy controls unavailable' : (subscribeDirty ? 'Unsaved copy choices' : 'Saved');
     const renderLocalPermissionRow = row => {
         const permission = draft[row.domain] || { read: false, write: false, copy: false };
         const count = row.meta && Number.isFinite(Number(row.meta.memory_count)) ? Number(row.meta.memory_count) : null;
@@ -16753,6 +16759,11 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
         ${conn.sharing_paused && html`<div class="fed-perm-pause-note">
             <strong>Sharing from this SAGE is paused.</strong> The saved domain choices below are preserved and take effect again when you resume.
         </div>`}
+
+        <div class="fed-perm-top-actions" aria-label="Connection actions">
+            <span><strong>Connection actions</strong><span class="muted">Permanent revocation requires the JOIN ceremony to reconnect.</span></span>
+            <button class="btn btn-danger" disabled=${revokeBusy} onClick=${onRevoke}>${revokeBusy ? 'Revoking…' : 'Revoke trust…'}</button>
+        </div>
 
 		${roleKnown && html`<section class="fed-perm-section fed-agent-section">
 			<div class="fed-perm-section-head">
@@ -16846,6 +16857,10 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                     <p>Choose which local domains ${peerName} can consume; they receive nothing unless you enable it here. Read allows live lookup. Copy offers synchronized local copies that the receiver independently chooses to keep.</p>
                 </div>
             </div>
+            <div class="fed-perm-actions fed-perm-actions-top">
+                <button class="btn btn-primary" disabled=${outgoingSaveDisabled} onClick=${save}>${outgoingSaveLabel}</button>
+                <span class="muted">${outgoingSaveStatus}</span>
+            </div>
             <div class="fed-perm-toolbar">
                 <input class="fed-share-input fed-perm-search" value=${filter}
                     placeholder="Filter existing domains (try tii*)"
@@ -16883,8 +16898,8 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
             </div>`}
             ${err && html`<div class="fed-err fed-perm-error" role="alert">${err}</div>`}
             <div class="fed-perm-actions">
-                <button class="btn btn-primary" disabled=${(!dirty && !alignmentPending) || busy || !!pipeContactBusy || pipeContactLookupBusy} onClick=${save}>${busy ? 'Saving…' : (!dirty && alignmentPending ? 'Retry copy alignment' : 'Save what I share')}</button>
-                <span class="muted">${dirty ? 'Unsaved permission changes' : (alignmentPending ? 'Copy delivery needs retry' : 'Saved')}</span>
+                <button class="btn btn-primary" disabled=${outgoingSaveDisabled} onClick=${save}>${outgoingSaveLabel}</button>
+                <span class="muted">${outgoingSaveStatus}</span>
             </div>
         </section>` : html`<section class="fed-perm-section fed-guest-share-back">
             <h4>Sharing controls unavailable for this older pairing</h4>
@@ -16898,6 +16913,10 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                     <p>${peerName} independently controls what this SAGE may consume. When Copy is offered, choose whether to retain synchronized local memories here.</p>
                 </div>
                 <button class="btn" disabled=${refreshing || busy || !!pipeContactBusy || pipeContactLookupBusy} onClick=${refresh}>${refreshing ? 'Refreshing…' : 'Refresh'}</button>
+            </div>
+            <div class="fed-perm-actions fed-perm-actions-top">
+                <button class="btn btn-primary" disabled=${copySaveDisabled} onClick=${saveSubscriptions}>${copySaveLabel}</button>
+                <span class="muted">${copySaveStatus}</span>
             </div>
             ${syncErr && html`<div class="fed-err fed-perm-error" role="alert">${syncErr}</div>`}
             <div class="fed-copy-provenance">
@@ -16942,8 +16961,8 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
                     <span class="muted">${hiddenRemoteRowCount} offered domains not rendered yet. Saved choices remain first.</span>
                 </div>`}
                 <div class="fed-perm-actions">
-                    <button class="btn btn-primary" disabled=${!syncKnown || !subscribeDirty || syncBusy} onClick=${saveSubscriptions}>${syncBusy ? 'Saving…' : 'Save copy choices'}</button>
-                    <span class="muted">${!syncKnown ? 'Copy controls unavailable' : (subscribeDirty ? 'Unsaved copy choices' : 'Saved')}</span>
+                    <button class="btn btn-primary" disabled=${copySaveDisabled} onClick=${saveSubscriptions}>${copySaveLabel}</button>
+                    <span class="muted">${copySaveStatus}</span>
                 </div>
                 ${syncSaveErr && html`<div class="fed-err fed-perm-error" role="alert">${syncSaveErr}</div>`}
             </div>`}

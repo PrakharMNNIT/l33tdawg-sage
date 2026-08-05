@@ -1110,7 +1110,7 @@ test('federation agent contacts stay administrative and default-off', () => {
 		'cleanup warnings must stay beside the local Save controls and suppress the green success toast');
 	assert.match(panel, /copy_alignment_pending === true/,
 		'permission loads must surface a durable Copy/RBAC alignment retry');
-	assert.match(panel, /disabled=\$\{\(!dirty && !alignmentPending\) \|\| busy \|\| !!pipeContactBusy \|\| pipeContactLookupBusy\}[\s\S]*Retry copy alignment/,
+	assert.match(panel, /const outgoingSaveDisabled = \(!dirty && !alignmentPending\) \|\| busy \|\| !!pipeContactBusy \|\| pipeContactLookupBusy;[\s\S]*const outgoingSaveLabel = [^;]*Retry copy alignment/,
 		'a pure alignment retry must remain actionable after reload');
 	assert.match(panel, /response\.policy_replaced !== false/,
 		'a pure alignment retry must not reset unchanged agent acceptance switches');
@@ -1244,6 +1244,16 @@ test('federation keeps temporary pause separate from permanent revocation and ma
         'connection controls must identify the SAGE they affect');
     assert.match(page, /pairing preserved/);
     assert.match(panel, /Revoke trust permanently/);
+    assert.equal((panel.match(/onClick=\$\{onRevoke\}/g) || []).length, 2,
+        'permanent revocation must be available at both the top and bottom of long connection details');
+    assert.ok(panel.indexOf('fed-perm-top-actions') < panel.indexOf('fed-agent-section'),
+        'the upper revocation action must precede the long agent and domain controls');
+    assert.equal((panel.match(/onClick=\$\{save\}>\$\{outgoingSaveLabel\}/g) || []).length, 2,
+        'outgoing permission changes must be saveable above and below the long domain table');
+    assert.equal((panel.match(/onClick=\$\{saveSubscriptions\}>\$\{copySaveLabel\}/g) || []).length, 2,
+        'incoming copy choices must be saveable above and below the long domain table');
+    assert.match(cssSource, /\.fed-perm-top-actions\s*\{/,
+        'the upper permanent action needs a distinct compact treatment');
     assert.match(page, /Previous connections \(\$\{visiblePastConns\.length\}\)/);
     assert.match(page, /if \(!dismissed && lastRemoteRevokeKey\.current !== key\) setShowPast\(true\)/,
         'a newly received peer revocation must expose its audit record instead of hiding the recovery path');
