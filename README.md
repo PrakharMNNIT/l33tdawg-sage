@@ -51,6 +51,30 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.17.11
+
+**CPU-only embeddings are faster, bounded, and observable.** Native Ollama and
+OpenAI-compatible batches replace per-record request loops, concurrent identical
+work is coalesced without retaining a cross-agent plaintext cache, imports embed
+in bounded windows after authorization, and MCP clients let current SAGE nodes
+authoritatively queue their own vectors. Provider, model, dimension, timeout,
+managed-Ollama, and amid configuration now describe one coherent vector space.
+A reproducible `sage-embedding-bench` command and CPU deployment guide cover
+measurement and tuning.
+
+**Idle nodes can transfer domains again.** Newly signed dashboard governance
+proofs use the fresher safe clock when the latest committed block is old, while
+the consensus proof window remains unchanged and future-skewed clocks still fail
+closed. Federation connection details also expose Save and Revoke controls both
+above and below long permission catalogs, avoiding a full-page scroll.
+
+This patch changes no consensus rule, AppHash input, transaction type, key
+encoding, fork target, or application version. Existing v11.17 chains upgrade
+in place without rewriting trust, domain grants, agent acceptance, memories, or
+history.
+
+Container: `ghcr.io/l33tdawg/sage:11.17.11`. SDK 11.17.11.
+
 ## What's New in v11.17.10
 
 **Federation visibility is symmetric again.** CEREBRUM's single authenticated
@@ -1276,7 +1300,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.10`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.11`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

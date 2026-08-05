@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.10 is the current release line.** This hotfix preserves authenticated peer domain grants and shared-agent contacts through CEREBRUM's single live federation status probe, restoring symmetric two-SAGE visibility without changing consensus or persisted trust/RBAC state. Governed app-v26 adds explicit per-group `read`, `read_write`, and `read_write_modify` authority without weakening owner control or federated read-only isolation. App-v24 binds exact memory hashes; app-v25 preserves immutable envelopes and repairs historical continuity; CEREBRUM Root can now inspect and resolve the remaining safe-to-assign or deprecate-only historical records. Canonical Messages add idempotent local and federated delivery, exact receive replay, receiver-local linked consent, recipient read evidence, sender status, reply/history persistence, and metadata-only HTTP SSE wake-up hints. CEREBRUM Root remains the hidden singleton ultimate authority, while linked agents remain read-only guests and never become local group members. Existing chains upgrade in place without rewriting memories, historical authors, domains, or prior blocks. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 through app-v26 replay and state-sync checks, and the native-shell productization bridge now spans v11.11–v11.17.
+**Status (2026-08):** **v11.17.11 is the current release.** This release completes the CPU-only embedding work in #117 with native batching, bounded authorized imports, safe concurrent coalescing, coherent provider configuration, server-authoritative MCP submission, and a reproducible benchmark. It also restores domain transfers after an idle chain without weakening the consensus proof window, duplicates Federation Save/Revoke controls around long catalogs, and retains v11.17.10's symmetric peer-domain and shared-agent visibility fix. Governed app-v26 adds explicit per-group `read`, `read_write`, and `read_write_modify` authority without weakening owner control or federated read-only isolation. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 through app-v26 replay and state-sync checks, and the native-shell productization bridge spans v11.11–v11.17.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -22,6 +22,13 @@ retries, and host-versus-consensus clock skew. The Federation page also splits
 outgoing and incoming domain permissions into direction tabs so only one large
 matrix is mounted and scrolled at a time.
 
+v11.17.11 completes [#117](https://github.com/l33tdawg/sage/issues/117): CPU-only
+embedding providers batch natively, imports stay authorization-first and memory
+bounded, current MCP clients avoid redundant vector generation, and operators
+gain a real benchmark plus configuration guidance. It also fixes stale proof
+creation on idle single-validator chains and places Federation Save/Revoke
+actions at both ends of long permission catalogs.
+
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:
 
@@ -34,8 +41,6 @@ code merge; they are not implied complete by Docker or CI evidence:
   signed-browser evidence for Home, Tasks reload, and Access Controls.
 - [#134](https://github.com/l33tdawg/sage/issues/134): close native-shell
   packaging retry/cache and Windows normal-close lifecycle evidence.
-- [#117](https://github.com/l33tdawg/sage/issues/117): benchmark and improve the
-  CPU-only embedding path.
 - Complete product acceptance for the signed macOS in-place updater, verify unscoped
   `sage_list`/bounded-domain projection semantics, and reproduce or close the
   historical broad authorization-scan budget report.

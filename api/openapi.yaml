@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.17.10
+  version: 11.17.11
   description: |-
     (Sovereign) Agent Governed Experience — network REST API for memory
     submission, validation, and query.
@@ -2146,6 +2146,13 @@ components:
           type: integer
         ready:
           type: boolean
+        submit_embedding_authoritative:
+          type: boolean
+          description: >-
+            True when POST /v1/memory/submit always generates the authoritative
+            vector with the node's active provider. Current MCP clients use this
+            capability to omit a redundant compatibility embedding; older nodes
+            omit the field and continue receiving the client-generated vector.
 
     # -- MCP Tokens ----------------------------------------------------------
     MCPTokenIssueRequest:

@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.17.10. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
+<!-- Reconciled through SAGE v11.17.11. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
 
 # SAGE Reference — Environment Variables
 
@@ -113,10 +113,20 @@ These override `config.yaml`'s embedding block. Provider values: `hash` (built-i
 | `SAGE_EMBEDDING_MODEL` | Embedding model name. | (provider-specific) | `cmd/sage-gui/config.go:173` |
 | `SAGE_EMBEDDING_API_KEY` | API key for the embedding endpoint. | (none) | `cmd/sage-gui/config.go:176` |
 | `SAGE_EMBEDDING_DIMENSION` | Embedding vector dimension (int > 0). | `768` | `cmd/sage-gui/config.go:179` |
+| `SAGE_EMBEDDING_TIMEOUT` | HTTP deadline for each Ollama or OpenAI-compatible embedding request. Accepts a positive Go duration such as `60s` or `2m`; invalid, zero, and negative values fall back to 30 seconds. This can be raised for CPU-only inference queues. The REST server adds 15 seconds of response headroom so its outer writer does not cut off the embed request; that outer deadline is capped at 10 minutes. | `30s` | `internal/embedding/http_config.go:13`; `api/rest/server.go:1120` |
+| `SAGE_EMBED_TIMEOUT` | Legacy alias for `SAGE_EMBEDDING_TIMEOUT`. The canonical variable wins when both are set, including when its value is invalid (which falls back safely rather than consulting the alias). | (none) | `internal/embedding/http_config.go:16` |
 | `OLLAMA_URL` | **Legacy** alias for the base URL. `SAGE_EMBEDDING_BASE_URL` wins when both are set. | (none) | `cmd/sage-gui/config.go:166` |
 | `OLLAMA_MODEL` | **Legacy** alias for the model. `SAGE_EMBEDDING_MODEL` wins when both are set. | (none) | `cmd/sage-gui/config.go:169` |
 | `OLLAMA_KEEP_ALIVE` | How long Ollama keeps the embed model resident, sent as `keep_alive` on every embed request so it isn't unloaded between turns (the fix for intermittent embed failures). Accepts a duration (`24h`) or integer seconds (`-1` pins in memory, `0` unloads); an integer is sent to Ollama as a JSON number, an unparseable value falls back to the default. | `30m` | `internal/embedding/ollama.go:81` |
 | `SAGE_PROVIDER` | Provider label the MCP server reports for itself. | (empty) | `internal/mcp/server.go:95` |
+
+`sage-gui` defaults to the built-in `hash` provider. The standalone `amid`
+daemon preserves its historical default of Ollama + `nomic-embed-text` + 768
+dimensions, but now consumes the same provider-agnostic `SAGE_EMBEDDING_*`
+model, base URL, API key, dimension, and timeout variables. An explicit invalid
+dimension, unsupported provider, or incomplete OpenAI-compatible configuration
+makes `amid` fail before opening its REST listener; it never silently stamps the
+legacy Ollama vector space over a requested custom one (`cmd/amid/main.go`).
 
 ---
 

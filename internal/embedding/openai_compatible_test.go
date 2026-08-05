@@ -187,3 +187,23 @@ func TestOpenAICompatible_RespectsContextCancellation(t *testing.T) {
 	_, err := c.Embed(ctx, "x")
 	require.Error(t, err)
 }
+
+func TestOpenAICompatible_BatchRestoresIndexOrder(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/embeddings", r.URL.Path)
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		assert.Equal(t, []any{"first", "second"}, body["input"])
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+			{"embedding": []float64{2, 2}, "index": 1},
+			{"embedding": []float64{1, 1}, "index": 0},
+		}})
+	}))
+	defer srv.Close()
+
+	vectors, err := NewOpenAICompatibleClient(srv.URL, "m", "", 2).
+		EmbedBatch(context.Background(), []string{"first", "second"})
+	require.NoError(t, err)
+	assert.Equal(t, []float32{1, 1}, vectors[0])
+	assert.Equal(t, []float32{2, 2}, vectors[1])
+}

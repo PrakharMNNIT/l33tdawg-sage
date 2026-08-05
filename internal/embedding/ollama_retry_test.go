@@ -142,3 +142,47 @@ func TestOllamaEmbed_PersistentTransientExhaustsRetries(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, int32(3), atomic.LoadInt32(&calls), "1 initial + 2 retries, then give up")
 }
+
+func TestOllamaEmbed_ConfigurableDimensionAndBatch(t *testing.T) {
+	const dimension = 3
+	var input []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		input = req.Input
+		_ = json.NewEncoder(w).Encode(embedResponse{Embeddings: [][]float64{
+			{1, 2, 3}, {4, 5, 6},
+		}})
+	}))
+	defer srv.Close()
+
+	client := NewClientWithDimension(srv.URL, "all-minilm:l6-v2", dimension)
+	vectors, err := client.EmbedBatch(context.Background(), []string{"one", "two"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"one", "two"}, input)
+	assert.Len(t, vectors, 2)
+	assert.Len(t, vectors[0], dimension)
+	assert.Equal(t, dimension, client.Dimension())
+	assert.Equal(t, "ollama:all-minilm:l6-v2:3", SpaceID(client))
+}
+
+func TestOllamaEmbed_RejectsConfiguredDimensionMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(embedResponse{Embeddings: [][]float64{{1, 2}}})
+	}))
+	defer srv.Close()
+
+	_, err := NewClientWithDimension(srv.URL, "small", 3).Embed(context.Background(), "x")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dimension mismatch")
+}
+
+func TestEmbeddingHTTPTimeoutConfiguration(t *testing.T) {
+	t.Setenv("SAGE_EMBEDDING_TIMEOUT", "75s")
+	ollama := NewClient("http://localhost", "")
+	openAI := NewOpenAICompatibleClient("http://localhost", "m", "", 3)
+	assert.Equal(t, 75*time.Second, ollama.httpClient.Timeout)
+	assert.Equal(t, 75*time.Second, openAI.httpClient.Timeout)
+}

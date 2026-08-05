@@ -27,7 +27,7 @@ sudo mv sage-gui /usr/local/bin/  # or add to your PATH
 
 ```bash
 sage-gui version
-# sage-gui v11.17.10
+# sage-gui v11.17.11
 ```
 
 ---
@@ -197,7 +197,7 @@ sage-gui setup
 
 ### 3. Start using it
 
-Just chat normally. SAGE v11.17.10 advertises 31 MCP tools. The core workflow is:
+Just chat normally. SAGE v11.17.11 advertises 31 MCP tools. The core workflow is:
 
 | Tool | What it does |
 |------|-------------|

@@ -705,14 +705,31 @@ func (h *DashboardHandler) runReembed(ctx context.Context) {
 		if len(mems) == 0 {
 			return // no more work — converged
 		}
-		for _, m := range mems {
+		readableIndexes := make([]int, 0, len(mems))
+		texts := make([]string, 0, len(mems))
+		for i, m := range mems {
 			var tagErr error
 			// Unreadable: undecryptable (vault-key mismatch) or empty content.
 			if !m.Decryptable || strings.TrimSpace(m.Content) == "" {
 				tagErr = markUnreadable(m.MemoryID)
-			} else if emb, embErr := provider.Embed(ctx, m.Content); embErr != nil {
-				tagErr = markErrored(m.MemoryID) // readable but embed failed — retryable
-			} else if upErr := h.store.UpdateMemoryEmbedding(ctx, m.MemoryID, emb, target); upErr != nil {
+			} else {
+				readableIndexes = append(readableIndexes, i)
+				texts = append(texts, m.Content)
+			}
+			if tagErr != nil {
+				// A tag write failed — the row stays untagged and would be re-fetched
+				// forever. Stop with a visible error instead of spinning.
+				fail("tag write failed: " + tagErr.Error())
+				return
+			}
+		}
+		vectors, embedErrs := embedBestEffort(ctx, provider, texts)
+		for i, memoryIndex := range readableIndexes {
+			m := mems[memoryIndex]
+			var tagErr error
+			if embedErrs[i] != nil {
+				tagErr = markErrored(m.MemoryID)
+			} else if upErr := h.store.UpdateMemoryEmbedding(ctx, m.MemoryID, vectors[i], target); upErr != nil {
 				tagErr = markErrored(m.MemoryID)
 			} else {
 				h.reembed.mu.Lock()
@@ -720,8 +737,6 @@ func (h *DashboardHandler) runReembed(ctx context.Context) {
 				h.reembed.mu.Unlock()
 			}
 			if tagErr != nil {
-				// A tag write failed — the row stays untagged and would be re-fetched
-				// forever. Stop with a visible error instead of spinning.
 				fail("tag write failed: " + tagErr.Error())
 				return
 			}

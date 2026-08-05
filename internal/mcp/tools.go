@@ -771,14 +771,15 @@ func (s *Server) toolRemember(ctx context.Context, params map[string]any) (any, 
 		}, nil
 	}
 
-	// Get embedding from SAGE endpoint.
-	embedReq, _ := json.Marshal(map[string]string{"text": content})
 	var embedResp struct {
 		Embedding         []float32 `json:"embedding"`
 		EmbeddingProvider string    `json:"embedding_provider"`
 	}
-	if err := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); err != nil {
-		return nil, fmt.Errorf("get embedding: %w", err)
+	if !s.serverEmbedsSubmissions(ctx) {
+		embedReq, _ := json.Marshal(map[string]string{"text": content})
+		if err := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); err != nil {
+			return nil, fmt.Errorf("get embedding: %w", err)
+		}
 	}
 
 	// Collect optional user-defined tags from the MCP call args.
@@ -836,6 +837,7 @@ func (s *Server) toolRemember(ctx context.Context, params map[string]any) (any, 
 		TxHash          string `json:"tx_hash"`
 		Committed       *bool  `json:"committed"`
 		CommittedHeight int64  `json:"committed_height"`
+		EmbeddingQueued bool   `json:"embedding_queued"`
 	}
 	if err := s.submitMemoryResilient(ctx, submitReq, &submitResp); err != nil {
 		return nil, fmt.Errorf("submit memory: %w", err)
@@ -864,6 +866,7 @@ func (s *Server) toolRemember(ctx context.Context, params map[string]any) (any, 
 	if len(tags) > 0 {
 		result["tags"] = tags
 	}
+	markEmbeddingQueuedResult(result, submitResp.EmbeddingQueued)
 	if correctionSource == nil {
 		return result, nil
 	}
@@ -3322,6 +3325,7 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 		seedHome = selfPolicy.HomeDomain
 	}
 	seeded := 0
+	embeddingsQueued := 0
 	for _, mem := range seedMemories {
 		domain := mem.domain
 		if seedAppV23 {
@@ -3330,12 +3334,14 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 			}
 			domain = seedHome
 		}
-		embedReq, _ := json.Marshal(map[string]string{"text": mem.content})
 		var embedResp struct {
 			Embedding []float32 `json:"embedding"`
 		}
-		if err := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); err != nil {
-			continue
+		if !s.serverEmbedsSubmissions(ctx) {
+			embedReq, _ := json.Marshal(map[string]string{"text": mem.content})
+			if err := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); err != nil {
+				continue
+			}
 		}
 
 		submitReq, _ := json.Marshal(map[string]any{
@@ -3346,10 +3352,16 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 			"confidence_score": mem.confidence,
 			"embedding":        embedResp.Embedding,
 		})
-		if err := s.doSignedJSON(ctx, "POST", "/v1/memory/submit", submitReq, nil); err != nil {
+		var submitResp struct {
+			EmbeddingQueued bool `json:"embedding_queued"`
+		}
+		if err := s.doSignedJSON(ctx, "POST", "/v1/memory/submit", submitReq, &submitResp); err != nil {
 			continue
 		}
 		seeded++
+		if submitResp.EmbeddingQueued {
+			embeddingsQueued++
+		}
 	}
 
 	inceptionMsg := "SAGE memory initialized.\n\n" +
@@ -3373,7 +3385,7 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 		"Before acting on a notice, confirm the task is still assigned to you in sage_backlog.\n\n" +
 		inboxSecurityBoundaryInstruction
 
-	return map[string]any{
+	result := map[string]any{
 		"status":          "inception_complete",
 		"memories_seeded": seeded,
 		"agent_id":        s.effectiveAgentID(ctx),
@@ -3381,7 +3393,14 @@ func (s *Server) toolInception(ctx context.Context, _ map[string]any) (any, erro
 		"registered_name": regResp.RegisteredName,
 		"registration":    registrationStatus,
 		"message":         inceptionMsg,
-	}, nil
+	}
+	if embeddingsQueued > 0 {
+		result["embeddings_queued"] = embeddingsQueued
+		result["semantic_degraded"] = true
+		result["degraded_reason"] = embeddingQueuedDegradedReason
+		result["embedding_notice"] = "Foundational memories were committed without vectors and queued for automatic re-embedding."
+	}
+	return result, nil
 }
 
 func (s *Server) toolReflect(ctx context.Context, params map[string]any) (any, error) {
@@ -3527,6 +3546,7 @@ type taskSubmitResponse struct {
 	Message             string `json:"message"`
 	IdempotencyKey      string `json:"idempotency_key"`
 	IdempotentReplay    bool   `json:"idempotent_replay"`
+	EmbeddingQueued     bool   `json:"embedding_queued"`
 }
 
 // assignedTasks uses the ordinary-agent endpoint. The dashboard task API is a
@@ -3634,12 +3654,14 @@ func (s *Server) toolTask(ctx context.Context, params map[string]any) (any, erro
 			result["idempotency_key_source"] = "explicit"
 			result["idempotency_contract"] = "permanent_explicit_key"
 		}
-		embedReq, _ := json.Marshal(map[string]string{"text": taskContent})
 		var embedResp struct {
 			Embedding []float32 `json:"embedding"`
 		}
-		if err := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); err != nil {
-			return nil, fmt.Errorf("get embedding: %w", err)
+		if !s.serverEmbedsSubmissions(ctx) {
+			embedReq, _ := json.Marshal(map[string]string{"text": taskContent})
+			if err := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); err != nil {
+				return nil, fmt.Errorf("get embedding: %w", err)
+			}
 		}
 
 		submitPayload := map[string]any{
@@ -3691,6 +3713,7 @@ func (s *Server) toolTask(ctx context.Context, params map[string]any) (any, erro
 			return nil, fmt.Errorf("submit task: node did not confirm the task transaction was committed")
 		}
 		memoryID = submitResp.MemoryID
+		markEmbeddingQueuedResult(result, submitResp.EmbeddingQueued)
 		if submitResp.ProjectionConfirmed != nil && !*submitResp.ProjectionConfirmed {
 			result["memory_id"] = memoryID
 			result["tx_hash"] = submitResp.TxHash
@@ -4069,6 +4092,18 @@ func isLowValueObservation(obs string) bool {
 // WITHOUT a vector because the embedder was unavailable — the caller should surface
 // that so the user knows the memory is not semantically recallable until a re-embed
 // backfills the vector.
+const embeddingQueuedDegradedReason = "embedder unavailable at store time — re-embed to backfill the vector"
+
+func markEmbeddingQueuedResult(result map[string]any, queued bool) {
+	if !queued {
+		return
+	}
+	result["embedding_queued"] = true
+	result["store_mode"] = "no_vector"
+	result["semantic_degraded"] = true
+	result["degraded_reason"] = embeddingQueuedDegradedReason
+}
+
 func (s *Server) storeMemory(ctx context.Context, content, domain, memType string, confidence float64) (degraded bool, err error) {
 	// Step 1: Pre-validate against app validators (if endpoint exists).
 	preValidateReq, _ := json.Marshal(map[string]any{
@@ -4098,18 +4133,19 @@ func (s *Server) storeMemory(ctx context.Context, content, domain, memType strin
 		return false, fmt.Errorf("memory rejected by validators: %s", strings.Join(reasons, "; "))
 	}
 
-	// Step 2: Mint a client vector for backward compatibility with pre-v11.7.4
-	// nodes. Current nodes regenerate it with their active provider (so this can
-	// never override the server's vector-space authority), while older nodes need
-	// the attached vector to avoid silently storing an unsearchable observation.
-	embedReq, _ := json.Marshal(map[string]string{"text": content})
+	// Step 2: Current nodes advertise that submit mints the authoritative vector,
+	// avoiding an otherwise redundant client embed. Older nodes omit the feature
+	// bit and still receive the compatibility vector they require.
 	var embedResp struct {
 		Embedding []float32 `json:"embedding"`
 	}
 	degraded = false
-	if embErr := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); embErr != nil {
-		embedResp.Embedding = nil
-		degraded = true
+	if !s.serverEmbedsSubmissions(ctx) {
+		embedReq, _ := json.Marshal(map[string]string{"text": content})
+		if embErr := s.doSignedJSON(ctx, "POST", "/v1/embed", embedReq, &embedResp); embErr != nil {
+			embedResp.Embedding = nil
+			degraded = true
+		}
 	}
 
 	// Step 3: Current nodes report whether their authoritative embedding attempt
@@ -4191,6 +4227,38 @@ func (s *Server) invalidateSemanticMode() {
 	s.semanticMode = nil
 	s.semanticCacheAge = time.Time{}
 	s.semanticMu.Unlock()
+}
+
+// serverEmbedsSubmissions feature-detects current nodes, which always mint the
+// authoritative vector during POST /v1/memory/submit. Older nodes omit this
+// field and still need the MCP client to attach a legacy vector. A negative
+// result is safe to cache because it only causes redundant compatibility work.
+// A positive result is deliberately re-probed for every write: if the local
+// node is replaced by an older binary while this MCP process remains alive, a
+// stale positive would omit the only vector that older node knows how to store.
+func (s *Server) serverEmbedsSubmissions(ctx context.Context) bool {
+	s.semanticMu.Lock()
+	if s.submitEmbeddingAuthoritative != nil &&
+		!*s.submitEmbeddingAuthoritative &&
+		time.Since(s.submitEmbeddingCacheAge) < semanticCacheTTL {
+		s.semanticMu.Unlock()
+		return false
+	}
+	s.semanticMu.Unlock()
+
+	var infoResp struct {
+		Authoritative bool `json:"submit_embedding_authoritative"`
+	}
+	if err := s.doSignedJSON(ctx, "GET", "/v1/embed/info", nil, &infoResp); err != nil {
+		return false
+	}
+	if !infoResp.Authoritative {
+		s.semanticMu.Lock()
+		s.submitEmbeddingAuthoritative = &infoResp.Authoritative
+		s.submitEmbeddingCacheAge = time.Now()
+		s.semanticMu.Unlock()
+	}
+	return infoResp.Authoritative
 }
 
 // isSemanticMode returns true if the embedding provider produces semantically

@@ -30,10 +30,36 @@ func TestLatestConsensusTimeWeb(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
-func TestConsensusTimedGovernanceProofUsesCommittedBlockClock(t *testing.T) {
-	want := time.Date(2026, 8, 5, 6, 14, 18, 0, time.UTC)
+func TestFreshGovernanceProofTimeUsesWallClockAfterIdle(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 30, 0, 0, time.UTC)
+	latest := now.Add(-6 * time.Minute)
+
+	got, err := freshGovernanceProofTime(now, latest)
+	require.NoError(t, err)
+	assert.Equal(t, now, got,
+		"a newly signed transfer proof must not inherit an idle chain's stale block time")
+}
+
+func TestFreshGovernanceProofTimeUsesNewerCommittedClockWithinWindow(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 30, 0, 0, time.UTC)
+	latest := now.Add(4 * time.Minute)
+
+	got, err := freshGovernanceProofTime(now, latest)
+	require.NoError(t, err)
+	assert.Equal(t, latest, got)
+}
+
+func TestFreshGovernanceProofTimeRejectsCommittedClockTooFarAhead(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 30, 0, 0, time.UTC)
+
+	_, err := freshGovernanceProofTime(now, now.Add(governanceProofClockSkew+time.Second))
+	require.ErrorContains(t, err, "ahead of host time")
+}
+
+func TestConsensusTimedGovernanceProofAfterIdleUsesFreshProof(t *testing.T) {
+	idleBlockTime := time.Now().Add(-6 * time.Minute)
 	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"result":{"sync_info":{"latest_block_time":%q}}}`, want.Format(time.RFC3339Nano))
+		_, _ = fmt.Fprintf(w, `{"result":{"sync_info":{"latest_block_time":%q}}}`, idleBlockTime.Format(time.RFC3339Nano))
 	}))
 	t.Cleanup(rpc.Close)
 	_, operatorKey, err := ed25519.GenerateKey(nil)
@@ -41,10 +67,14 @@ func TestConsensusTimedGovernanceProofUsesCommittedBlockClock(t *testing.T) {
 	ptx := &tx.ParsedTx{Type: tx.TxTypeGovPropose, GovPropose: &tx.GovPropose{}}
 
 	h := &DashboardHandler{CometBFTRPC: rpc.URL, ConsensusGovernanceClock: true}
+	before := time.Now().Unix()
 	require.NoError(t, h.embedConsensusTimedGovernanceProof(
 		ptx, operatorKey, http.MethodPost, "/v1/governance/propose", []byte(`{}`),
 	))
-	assert.Equal(t, want.Unix(), ptx.AgentTimestamp)
+	after := time.Now().Unix()
+	assert.GreaterOrEqual(t, ptx.AgentTimestamp, before)
+	assert.LessOrEqual(t, ptx.AgentTimestamp, after)
+	assert.NotEqual(t, idleBlockTime.Unix(), ptx.AgentTimestamp)
 }
 
 func TestConsensusTimedGovernanceProofFailsClosedWithoutCommittedClock(t *testing.T) {

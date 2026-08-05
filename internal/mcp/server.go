@@ -83,9 +83,11 @@ type Server struct {
 	// Cached embedding mode — nil means not yet checked.
 	// Concurrent HTTP MCP requests may both write to this cache; the mutex
 	// keeps the cached pointer race-free.
-	semanticMu       sync.Mutex
-	semanticMode     *bool
-	semanticCacheAge time.Time
+	semanticMu                   sync.Mutex
+	semanticMode                 *bool
+	semanticCacheAge             time.Time
+	submitEmbeddingAuthoritative *bool
+	submitEmbeddingCacheAge      time.Time
 
 	version string
 }

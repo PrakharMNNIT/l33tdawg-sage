@@ -5274,6 +5274,15 @@ input[type="range"]::-moz-range-thumb {
 .fed-perm-empty { padding: 16px 6px; text-align: center; font-size: 12px; }
 .fed-perm-error { margin: 12px 0 0; }
 .fed-perm-actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 11.5px; }
+.fed-perm-actions-top { margin: 10px 0 2px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.fed-perm-top-actions {
+    display: flex; align-items: center; justify-content: space-between; gap: 18px;
+    margin: 12px 0 14px; padding: 10px 12px; border: 1px solid rgba(239, 68, 68, 0.22);
+    border-radius: var(--radius); background: var(--danger-tint, rgba(239,68,68,0.04));
+}
+.fed-perm-top-actions > span { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 11px; }
+.fed-perm-top-actions > span > strong { color: var(--text); font-size: 12px; }
+.fed-perm-top-actions .btn { flex: none; }
 .fed-perm-remote { background: var(--surface-inset, rgba(127,127,127,0.04)); }
 .fed-perm-remote .fed-perm-section-head { margin-bottom: 10px; }
 .fed-copy-provenance {
@@ -5300,6 +5309,7 @@ input[type="range"]::-moz-range-thumb {
     .fed-permissions-panel { padding: 8px; }
     .fed-perm-section { padding: 10px; }
     .fed-perm-section-head { flex-direction: column; }
+	.fed-perm-top-actions { align-items: flex-start; flex-direction: column; }
 	.fed-agent-columns { grid-template-columns: 1fr; }
 	.fed-agent-column > p { min-height: 0; }
     .fed-agent-row { align-items: stretch; flex-direction: column; gap: 8px; }

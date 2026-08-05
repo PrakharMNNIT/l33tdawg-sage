@@ -527,7 +527,21 @@ func runServe(startupProof string) (rerr error) {
 	rerankdMgr := rerankd.New(SageHome())
 	// Manager for the local Ollama runtime used by smart memory setup. It
 	// follows the same adopt-or-spawn model as rerankd.
-	ollamaMgr := ollamad.New(SageHome())
+	managedOllamaModel, managedOllamaDimension := ollamad.ModelName, ollamad.ModelDimension
+	if cfg.Embedding.Provider == "ollama" {
+		if model := strings.TrimSpace(cfg.Embedding.Model); model != "" {
+			managedOllamaModel = model
+		}
+		if cfg.Embedding.Dimension > 0 {
+			managedOllamaDimension = cfg.Embedding.Dimension
+		}
+	}
+	ollamaMgr, ollamaConfigErr := ollamad.NewConfigured(
+		SageHome(), managedOllamaModel, managedOllamaDimension,
+	)
+	if ollamaConfigErr != nil {
+		logger.Fatal().Err(ollamaConfigErr).Msg("invalid managed Ollama vector space")
+	}
 	// Manager for OpenAI's tunnel-client sidecar used by the ChatGPT setup
 	// flow. The runtime key remains process-env only; profiles contain no key.
 	tunnelClientMgr := tunnelclientd.New(SageHome())
@@ -1541,18 +1555,10 @@ func runServe(startupProof string) (rerr error) {
 		)
 	})
 	dashboard.StrictRBAC = cfg.RBAC.Strict // opt-out of the app-v19 default-read flip
-	// Embeddings setup: flip the config to the bundled Ollama + nomic-embed-text
-	// provider (the node re-reads it on restart). The embedder is locked to this.
+	// Embeddings setup: persist the selected provider for the next restart. A
+	// preconfigured Ollama CPU profile retains its exact model and dimension.
 	dashboard.SetEmbeddingProvider = func(provider string) error {
-		cfg.Embedding.Provider = provider
-		cfg.Embedding.Dimension = 768
-		if provider == "ollama" {
-			cfg.Embedding.BaseURL = "http://localhost:11434"
-			cfg.Embedding.Model = "nomic-embed-text"
-		} else {
-			cfg.Embedding.BaseURL = ""
-			cfg.Embedding.Model = ""
-		}
+		applyEmbeddingProviderSelection(cfg, provider)
 		return SaveConfig(cfg)
 	}
 	dashboard.SetNetworkMode = func(enabled bool) error {
@@ -3573,12 +3579,48 @@ func truncateString(s string, max int) string {
 	return string(r[:max]) + "…"
 }
 
+// applyEmbeddingProviderSelection persists the guided provider choice without
+// erasing an already-configured Ollama vector space. Selecting managed Ollama
+// from another provider intentionally chooses the bundled legacy profile;
+// re-selecting Ollama keeps a custom CPU model/dimension exact.
+func applyEmbeddingProviderSelection(cfg *Config, provider string) {
+	wasOllama := cfg.Embedding.Provider == "ollama"
+	cfg.Embedding.Provider = provider
+	if provider == "ollama" {
+		if !wasOllama {
+			cfg.Embedding.BaseURL = "http://localhost:11434"
+			cfg.Embedding.Model = ollamad.ModelName
+			cfg.Embedding.Dimension = ollamad.ModelDimension
+			return
+		}
+		if strings.TrimSpace(cfg.Embedding.BaseURL) == "" {
+			cfg.Embedding.BaseURL = "http://localhost:11434"
+		}
+		if strings.TrimSpace(cfg.Embedding.Model) == "" {
+			cfg.Embedding.Model = ollamad.ModelName
+		}
+		if cfg.Embedding.Dimension <= 0 {
+			cfg.Embedding.Dimension = ollamad.ModelDimension
+		}
+		return
+	}
+	cfg.Embedding.BaseURL = ""
+	cfg.Embedding.Model = ""
+	cfg.Embedding.Dimension = embedding.Dimension
+}
+
 // createEmbeddingProvider creates the configured embedding provider.
 func createEmbeddingProvider(cfg *Config, logger zerolog.Logger) embedding.Provider {
 	switch cfg.Embedding.Provider {
 	case "ollama":
-		logger.Info().Str("url", cfg.Embedding.BaseURL).Msg("using Ollama embeddings")
-		return embedding.NewClient(cfg.Embedding.BaseURL, cfg.Embedding.Model)
+		dim := cfg.Embedding.Dimension
+		if dim <= 0 {
+			dim = embedding.Dimension
+		}
+		logger.Info().Str("url", cfg.Embedding.BaseURL).Int("dimension", dim).Msg("using Ollama embeddings")
+		return embedding.NewDefaultCachedProvider(
+			embedding.NewClientWithDimension(cfg.Embedding.BaseURL, cfg.Embedding.Model, dim),
+		)
 	case "openai-compatible":
 		dim := cfg.Embedding.Dimension
 		if dim <= 0 {
@@ -3590,12 +3632,12 @@ func createEmbeddingProvider(cfg *Config, logger zerolog.Logger) embedding.Provi
 			Int("dimension", dim).
 			Bool("authenticated", cfg.Embedding.APIKey != "").
 			Msg("using OpenAI-compatible embeddings")
-		return embedding.NewOpenAICompatibleClient(
+		return embedding.NewDefaultCachedProvider(embedding.NewOpenAICompatibleClient(
 			cfg.Embedding.BaseURL,
 			cfg.Embedding.Model,
 			cfg.Embedding.APIKey,
 			dim,
-		)
+		))
 	default:
 		dim := cfg.Embedding.Dimension
 		if dim <= 0 {

@@ -53,6 +53,28 @@ func latestConsensusTimeWeb(cometRPC string) (time.Time, error) {
 	return result.Result.SyncInfo.LatestBlockTime, nil
 }
 
+const governanceProofClockSkew = 5 * time.Minute
+
+// freshGovernanceProofTime chooses a timestamp that is fresh at the CheckTx
+// boundary without moving behind the chain's last committed clock. An idle
+// SAGE intentionally produces no heartbeat blocks, so latestBlockTime may be
+// hours old even though the next block created by this transaction will use a
+// current time. Reusing that old timestamp made a newly signed proof stale on
+// arrival. A committed clock more than one proof window ahead of the host is a
+// real clock-safety failure and remains fail-closed.
+func freshGovernanceProofTime(now, latestBlockTime time.Time) (time.Time, error) {
+	if latestBlockTime.After(now.Add(governanceProofClockSkew)) {
+		return time.Time{}, fmt.Errorf(
+			"committed consensus time is more than %s ahead of host time",
+			governanceProofClockSkew,
+		)
+	}
+	if latestBlockTime.After(now) {
+		return latestBlockTime, nil
+	}
+	return now, nil
+}
+
 func (h *DashboardHandler) embedConsensusTimedGovernanceProof(ptx *tx.ParsedTx, operatorKey ed25519.PrivateKey, method, path string, body []byte) error {
 	proofTime := time.Now()
 	if h.ConsensusGovernanceClock {
@@ -60,7 +82,10 @@ func (h *DashboardHandler) embedConsensusTimedGovernanceProof(ptx *tx.ParsedTx, 
 		if err != nil {
 			return fmt.Errorf("read committed consensus time: %w", err)
 		}
-		proofTime = consensusTime
+		proofTime, err = freshGovernanceProofTime(proofTime, consensusTime)
+		if err != nil {
+			return fmt.Errorf("select governance proof time: %w", err)
+		}
 	}
 	return embedDashboardGovernanceProofAt(ptx, operatorKey, method, path, body, proofTime)
 }
