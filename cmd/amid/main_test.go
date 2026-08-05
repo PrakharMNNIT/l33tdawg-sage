@@ -12,7 +12,93 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/l33tdawg/sage/internal/embedding"
 )
+
+func clearAMIDEmbeddingEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"SAGE_EMBEDDING_PROVIDER", "SAGE_EMBEDDING_BASE_URL",
+		"SAGE_EMBEDDING_MODEL", "SAGE_EMBEDDING_API_KEY",
+		"SAGE_EMBEDDING_DIMENSION", "OLLAMA_URL", "OLLAMA_MODEL",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func TestAMIDEmbeddingProviderPreservesLegacyDefaultSpace(t *testing.T) {
+	clearAMIDEmbeddingEnv(t)
+
+	provider, err := newAMIDEmbeddingProviderFromEnv()
+
+	require.NoError(t, err)
+	assert.Equal(t, "ollama", embedding.SpaceID(provider))
+	assert.Equal(t, embedding.Dimension, provider.Dimension())
+}
+
+func TestAMIDEmbeddingProviderPropagatesCanonicalOllamaModelAndDimension(t *testing.T) {
+	clearAMIDEmbeddingEnv(t)
+	t.Setenv("OLLAMA_URL", "http://legacy.invalid")
+	t.Setenv("OLLAMA_MODEL", "legacy-model")
+	t.Setenv("SAGE_EMBEDDING_BASE_URL", "http://canonical.invalid")
+	t.Setenv("SAGE_EMBEDDING_MODEL", "snowflake-arctic-embed:xs")
+	t.Setenv("SAGE_EMBEDDING_DIMENSION", "384")
+
+	provider, err := newAMIDEmbeddingProviderFromEnv()
+
+	require.NoError(t, err)
+	assert.Equal(t, 384, provider.Dimension())
+	assert.Equal(t, "ollama:snowflake-arctic-embed:xs:384", embedding.SpaceID(provider))
+}
+
+func TestAMIDEmbeddingProviderRejectsSilentFallbacks(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "invalid dimension",
+			env:  map[string]string{"SAGE_EMBEDDING_DIMENSION": "three-eighty-four"},
+			want: "positive integer",
+		},
+		{
+			name: "unknown provider",
+			env:  map[string]string{"SAGE_EMBEDDING_PROVIDER": "mystery"},
+			want: "unsupported",
+		},
+		{
+			name: "openai-compatible missing endpoint",
+			env: map[string]string{
+				"SAGE_EMBEDDING_PROVIDER": "openai-compatible",
+				"SAGE_EMBEDDING_MODEL":    "small",
+			},
+			want: "BASE_URL is required",
+		},
+		{
+			name: "openai-compatible missing model",
+			env: map[string]string{
+				"SAGE_EMBEDDING_PROVIDER": "openai-compatible",
+				"SAGE_EMBEDDING_BASE_URL": "http://embedding.invalid",
+			},
+			want: "MODEL is required",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearAMIDEmbeddingEnv(t)
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+
+			_, err := newAMIDEmbeddingProviderFromEnv()
+
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
+}
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

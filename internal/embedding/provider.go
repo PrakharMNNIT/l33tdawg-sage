@@ -19,6 +19,40 @@ type Provider interface {
 	Semantic() bool
 }
 
+// BatchProvider is an optional extension implemented by providers whose wire
+// protocol can embed several texts in one request. Call EmbedBatch through
+// EmbedMany so providers without native batching retain the Provider contract.
+type BatchProvider interface {
+	EmbedBatch(ctx context.Context, texts []string) ([][]float32, error)
+}
+
+// EmbedMany uses native provider batching when available and otherwise falls
+// back to the scalar Provider method. An empty input returns an empty result.
+func EmbedMany(ctx context.Context, p Provider, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return [][]float32{}, nil
+	}
+	if batch, ok := p.(BatchProvider); ok {
+		results, err := batch.EmbedBatch(ctx, texts)
+		if err != nil {
+			return nil, err
+		}
+		if len(results) != len(texts) {
+			return nil, fmt.Errorf("embed batch returned %d vectors for %d inputs", len(results), len(texts))
+		}
+		return results, nil
+	}
+	results := make([][]float32, len(texts))
+	for i, input := range texts {
+		vector, err := p.Embed(ctx, input)
+		if err != nil {
+			return nil, fmt.Errorf("embed item %d: %w", i, err)
+		}
+		results[i] = vector
+	}
+	return results, nil
+}
+
 // Named is an optional interface a Provider can implement to expose its
 // canonical name. Operator-facing surfaces (e.g. /v1/embed/info) prefer this
 // over inferring "ollama" vs "hash" from Semantic() alone, so providers other

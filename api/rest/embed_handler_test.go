@@ -155,6 +155,7 @@ func TestHandleEmbedInfo_NamedProviderOverridesOllama(t *testing.T) {
 
 	assert.True(t, resp.Semantic)
 	assert.Equal(t, "openai-compatible", resp.Provider)
+	assert.True(t, resp.SubmitEmbeddingAuthoritative)
 	assert.Equal(t, 1536, resp.Dimension)
 }
 

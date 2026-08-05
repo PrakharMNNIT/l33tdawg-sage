@@ -116,7 +116,11 @@ func handleTestProvider(w http.ResponseWriter, r *http.Request) {
 	var provider embedding.Provider
 	switch req.Provider {
 	case "ollama":
-		provider = embedding.NewClient(req.BaseURL, "")
+		dim := req.Dimension
+		if dim <= 0 {
+			dim = embedding.Dimension
+		}
+		provider = embedding.NewClientWithDimension(req.BaseURL, req.Model, dim)
 	case "hash":
 		provider = embedding.NewHashProvider(768)
 	case "openai-compatible":

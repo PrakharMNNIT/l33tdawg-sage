@@ -1212,7 +1212,7 @@ Execute a domain ownership transfer that was authorized by an accepted governanc
 
 **Error behavior:** Unlike other endpoints, FinalizeBlock rejection messages are surfaced verbatim (not sanitized) so operators can diagnose `proposal not found`, `body mismatch`, `already consumed`, etc. (`domain_reassign_handler.go:162-195`)
 
-**CEREBRUM orchestration (v11.3; app-v26 CAS; v11.17.9 safe retry):** The dashboard drives this whole agent-to-agent transfer from the Search page via `POST /v1/dashboard/network/reassign-domain-ownership`, commit-confirmed in strict order: `gov_propose(domain_reassign)` -> the sole validator's accept vote drives the proposal to `Executed` in-band -> this `DomainReassign` atomically flips the owner, records ownership history, purges unrelated grants, applies any shared marker, and consumes the proposal. The new owner's access follows directly from canonical ownership, so no target-key lookup or self-grant is required. At app-v26 the dashboard reads the canonical current owner, includes it as `expected_owner_id` in both the approved proposal payload and execution transaction, and consensus compares it immediately before transfer. A concurrent handover therefore fails instead of applying a stale operator confirmation. In v11.17.9 the dashboard distinguishes immutable memory authorship from canonical ownership, resolves current ownership from BadgerDB, and returns `{status:"ok", already_owned:true}` when a retry targets the owner that already controls the domain. Internally generated app-v20 governance proofs use the latest committed CometBFT time rather than host wall time, avoiding false five-minute-ahead rejections during recovery. The optional trailing wire field is admitted only from H+1; activation height H retains the historical encoding. It requires a single-validator node; a multi-validator chain returns HTTP 409 because the other validators must vote on the proposal. This is off-consensus orchestration only - each underlying step is the same on-chain tx documented here, and memory authorship (`submitting_agent`) is never rewritten (`web/reassign_handler.go`; `web/rbac_signing.go`; `internal/abci/app.go`).
+**CEREBRUM orchestration (v11.3; app-v26 CAS; v11.17.9 safe retry; v11.17.11 idle-clock fix):** The dashboard drives this whole agent-to-agent transfer from the Search page via `POST /v1/dashboard/network/reassign-domain-ownership`, commit-confirmed in strict order: `gov_propose(domain_reassign)` -> the sole validator's accept vote drives the proposal to `Executed` in-band -> this `DomainReassign` atomically flips the owner, records ownership history, purges unrelated grants, applies any shared marker, and consumes the proposal. The new owner's access follows directly from canonical ownership, so no target-key lookup or self-grant is required. At app-v26 the dashboard reads the canonical current owner, includes it as `expected_owner_id` in both the approved proposal payload and execution transaction, and consensus compares it immediately before transfer. A concurrent handover therefore fails instead of applying a stale operator confirmation. In v11.17.9 the dashboard distinguishes immutable memory authorship from canonical ownership, resolves current ownership from BadgerDB, and returns `{status:"ok", already_owned:true}` when a retry targets the owner that already controls the domain. Internally generated app-v20 governance proofs use the fresher of host wall time and the latest committed CometBFT time, preventing an idle chain's old block timestamp from making a newly signed proof stale; proof creation still fails closed if committed time is more than five minutes ahead of the host, and consensus retains its unchanged ±5-minute validation window. The optional trailing wire field is admitted only from H+1; activation height H retains the historical encoding. It requires a single-validator node; a multi-validator chain returns HTTP 409 because the other validators must vote on the proposal. This is off-consensus orchestration only - each underlying step is the same on-chain tx documented here, and memory authorship (`submitting_agent`) is never rewritten (`web/reassign_handler.go`; `web/rbac_signing.go`; `internal/abci/app.go`).
 
 ---
 
@@ -1773,10 +1773,17 @@ vault-derived routing state.
 **Response** (HTTP 200):
 
 ```json
-{"semantic": true, "provider": "ollama", "dimension": 768, "ready": true}
+{"semantic": true, "provider": "ollama", "dimension": 768, "ready": true, "submit_embedding_authoritative": true}
 ```
 
 When vault (at-rest encryption) is active, `semantic` is forced `true` even if no embedder is configured — FTS5 cannot index encrypted content, so callers must not route to `/v1/memory/search`.
+
+`submit_embedding_authoritative: true` means `POST /v1/memory/submit` always
+generates the stored vector with the node's active provider. Current MCP clients
+therefore omit the older client-generated compatibility vector and avoid
+embedding the same stored content twice. Older nodes omit this capability field;
+clients preserve backward compatibility by generating and attaching a vector for
+those nodes.
 
 ---
 

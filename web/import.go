@@ -247,7 +247,28 @@ func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.R
 	total := len(records)
 	imported := 0
 	skipped := 0
-
+	// Authorization must precede embedding. A remote embedding provider is an
+	// external data boundary, so content for a domain the current actor cannot
+	// write must never be sent there merely because it appeared in an import.
+	importAuthErrors := make([]string, total)
+	if controlActor != nil {
+		for i, rec := range records {
+			if rec.Content == "" {
+				continue
+			}
+			shared, sharedErr := h.BadgerStore.IsAppV23SharedDomain(rec.DomainTag)
+			if sharedErr != nil {
+				importAuthErrors[i] = fmt.Sprintf("memory %s: target domain policy is unavailable", rec.MemoryID)
+				continue
+			}
+			decision, authErr := h.BadgerStore.AuthorizeAppV23LocalDomain(
+				controlActor.ID, rec.DomainTag, store.AppV23VerbWrite, shared,
+			)
+			if authErr != nil || decision.ExplicitDeny || !decision.Allowed {
+				importAuthErrors[i] = fmt.Sprintf("memory %s: current actor cannot write the target domain", rec.MemoryID)
+			}
+		}
+	}
 	// Broadcast initial progress
 	if h.SSE != nil {
 		h.SSE.Broadcast(SSEEvent{
@@ -256,16 +277,29 @@ func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.R
 		})
 	}
 
+	var importVectors [][]float32
+	batchStart := -1
 	for i, rec := range records {
+		if h.embedder != nil && (batchStart < 0 || i >= batchStart+len(importVectors)) {
+			batchStart = i
+			importVectors = embedImportRecordBatch(
+				r.Context(), h.embedder, records, importAuthErrors, batchStart,
+			)
+		}
 		rec.SubmittingAgent = targetAgent
 		if rec.Content == "" {
+			skipped++
+			continue
+		}
+		if importAuthErrors[i] != "" {
+			parseErrors = append(parseErrors, importAuthErrors[i])
 			skipped++
 			continue
 		}
 		// Generate embedding if provider is available
 		var embeddingHash []byte
 		if h.embedder != nil {
-			if emb, embErr := h.embedder.Embed(r.Context(), rec.Content); embErr == nil {
+			if emb := importVectors[i-batchStart]; len(emb) > 0 {
 				rec.Embedding = emb
 				rec.EmbeddingProvider = embeddingProviderStamp(h.embedder, emb)
 				eh := sha256.New()
@@ -280,23 +314,6 @@ func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.R
 		// App-v23 imports execute as the exact current Root/Admin request actor,
 		// wait for commit, and trust only the consensus-materialized projection.
 		if controlActor != nil {
-			shared, sharedErr := h.BadgerStore.IsAppV23SharedDomain(rec.DomainTag)
-			if sharedErr != nil {
-				parseErrors = append(parseErrors,
-					fmt.Sprintf("memory %s: target domain policy is unavailable", rec.MemoryID))
-				skipped++
-				continue
-			}
-			decision, authErr := h.BadgerStore.AuthorizeAppV23LocalDomain(
-				controlActor.ID, rec.DomainTag, store.AppV23VerbWrite,
-				shared,
-			)
-			if authErr != nil || decision.ExplicitDeny || !decision.Allowed {
-				parseErrors = append(parseErrors,
-					fmt.Sprintf("memory %s: current actor cannot write the target domain", rec.MemoryID))
-				skipped++
-				continue
-			}
 			submitTx := &tx.ParsedTx{
 				Type:      tx.TxTypeMemorySubmit,
 				Timestamp: time.Now(),

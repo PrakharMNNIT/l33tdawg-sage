@@ -389,7 +389,7 @@ func TestReassignDomainOwnershipAlreadyOwnedIsIdempotent(t *testing.T) {
 	assert.Zero(t, broadcasts.Load())
 }
 
-func TestReassignDomainOwnershipPostAppV20UsesChainBoundOperatorProof(t *testing.T) {
+func TestReassignDomainOwnershipPostAppV20AfterIdleUsesFreshChainBoundOperatorProof(t *testing.T) {
 	h, agentStore := newTestHandler(t)
 	badgerStore := newGrantTestBadger(t)
 	_, adminKey, err := ed25519.GenerateKey(nil)
@@ -409,8 +409,13 @@ func TestReassignDomainOwnershipPostAppV20UsesChainBoundOperatorProof(t *testing
 		Status:  "active",
 	}))
 
+	idleBlockTime := time.Now().Add(-6 * time.Minute)
 	var captured []*tx.ParsedTx
 	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/status" {
+			_, _ = fmt.Fprintf(w, `{"result":{"sync_info":{"latest_block_time":%q}}}`, idleBlockTime.Format(time.RFC3339Nano))
+			return
+		}
 		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
 		encoded, decodeErr := hex.DecodeString(raw)
 		require.NoError(t, decodeErr)
@@ -425,6 +430,7 @@ func TestReassignDomainOwnershipPostAppV20UsesChainBoundOperatorProof(t *testing
 	h.CometBFTRPC = rpc.URL
 	h.AdminSigningKey = adminKey
 	h.SigningKey = validatorKey
+	h.ConsensusGovernanceClock = true
 	h.AppV20ActiveFn = func() bool { return true }
 	h.GovernanceDomainFn = func() string { return dashboardTestGovernanceDomain }
 	h.ValidatorCountFn = func() int { return 1 }
@@ -462,6 +468,8 @@ func TestReassignDomainOwnershipPostAppV20UsesChainBoundOperatorProof(t *testing
 	assert.Equal(t, []byte(validatorKey.Public().(ed25519.PublicKey)), []byte(propose.PublicKey))
 	assert.Equal(t, []byte(adminKey.Public().(ed25519.PublicKey)), []byte(propose.AgentPubKey))
 	assert.Len(t, propose.AgentNonce, 8)
+	assert.Greater(t, propose.AgentTimestamp, idleBlockTime.Add(governanceProofClockSkew).Unix(),
+		"a transfer after an idle period must sign a newly fresh proof")
 	assert.True(t, bytes.HasPrefix(propose.AgentRequest, []byte("POST /v1/governance/propose\n")))
 	var proofBody map[string]any
 	require.NoError(t, json.Unmarshal(

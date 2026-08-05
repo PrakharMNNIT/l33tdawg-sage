@@ -99,6 +99,10 @@ before any other action in every new conversation.
   memories. App-v23 agents store them in their approved owned home domain;
   legacy nodes retain the historical `self`/`meta` domains. It auto-registers
   the agent on-chain and returns full boot instructions.
+  If the active embedder is unavailable, the memories still commit and the
+  result reports `embeddings_queued`, `semantic_degraded: true`,
+  `degraded_reason`, and `embedding_notice`; automatic provider repair backfills
+  those vectors later.
 - Subsequent calls (brain has memories): `status: "awakened"`, returns
   `instructions` (adapts to configured memory mode), `stats`, `agent_id`,
   `agent_name`, `registration` status. If vault is locked, returns
@@ -276,6 +280,9 @@ replacement first, old-memory challenge second.
 
 **Returns:**
 - `memory_id`, `status`, `tx_hash`, `domain`, `type`, `provider`, `tags`.
+- A vectorless but committed write reports `embedding_queued: true`,
+  `store_mode: "no_vector"`, `semantic_degraded: true`, and `degraded_reason`.
+  The memory remains durable and is queued for automatic re-embedding.
 - `status: "skipped"` if a similar memory already exists in the domain (>60%
   word overlap with an existing committed memory).
 - `status: "rejected"` with `votes` array if pre-validators reject the content.
@@ -706,6 +713,10 @@ returns an error before any API request is sent.
 
 **Returns:**
 - Confirmed create/replay: `{memory_id, task_status, domain, assignee, action, committed, committed_height, tx_hash, idempotency_key, idempotency_key_source, idempotency_contract, idempotent_replay?, deduplicated?, linked, message}`. A fresh task has `action: "created"`. Every replay has `action: "existing"`, `idempotent_replay: true`, and `deduplicated: true`; its message says that no new task was created. A replay still in `planned` may perform a requested `planned`→`in_progress` transition and exact-assignee readback without pretending the task was newly created. `idempotency_key_source` is `derived` or `explicit`, and the corresponding contract is `permanent_semantic` or `permanent_explicit_key`. Fresh success is returned only after the submit commit and an immediate exact-assignee backlog readback.
+- A newly committed task whose vector could not be generated additionally
+  reports `embedding_queued: true`, `store_mode: "no_vector"`,
+  `semantic_degraded: true`, and `degraded_reason`; task durability and workflow
+  assignment are unaffected while automatic repair backfills the vector.
 - Committed but unconfirmed: `{memory_id, action: "reconcile", status: "committed_unconfirmed", committed: true, committed_height, tx_hash, projection_confirmed: false, retryable: false, idempotency_key, idempotency_key_source, idempotency_contract, message}`. This is a normal tool result because the transaction is already on-chain, but no start transition or link request is attempted. Reconcile that exact `memory_id`; never resubmit it. An unconfirmed replay also preserves the same receipt rather than creating another task.
 - Status update: `{memory_id, status, action: "updated", linked, message}`.
 - Link-only update: `{memory_id, action: "linked", linked, message}`.

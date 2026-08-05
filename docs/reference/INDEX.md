@@ -22,6 +22,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | [`python-sdk.md`](python-sdk.md) | Every `SageClient` / `AsyncSageClient` method, signatures, and the REST endpoint each maps to. Package: `sage-agent-sdk`. |
 | [`mcp-tools.md`](mcp-tools.md) | Every `sage_*` MCP tool, parameters, and *when* to call it. Start here if you are an LLM agent with SAGE wired in. |
 | [`environment-variables.md`](environment-variables.md) | Every env var SAGE reads (`SAGE_HOME`, embeddings, hybrid recall, TLS, snapshots, …), with defaults and the `file:line` that consumes each. |
+| [`cpu-only-embeddings.md`](cpu-only-embeddings.md) | Model/dimension pairing, CPU timeout sizing, Ollama and TEI/OpenAI-compatible deployment, plus the reproducible real-endpoint latency/request-count benchmark. |
 | [`concepts/memory-lifecycle.md`](concepts/memory-lifecycle.md) | submit → proposed → committed/deprecated; node-local vs on-chain data; confidence decay; corroboration. |
 | [`concepts/clearance-classification.md`](concepts/clearance-classification.md) | Per-record classification (0–4), the REST-vs-wire default gotcha, and the per-record query gate. |
 | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) | Orgs, departments, agent clearance, cross-org federation, current fail-closed cross-chain Read/Copy policy, the five-gate query pipeline, and the app-v20 one-chain quorum-scope boundary. |
@@ -57,6 +58,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | Create a local Access Group, choose its authority, or understand join/leave behavior | [`concepts/app-v26-access-groups.md`](concepts/app-v26-access-groups.md) |
 | Understand why an upgrade is repairing, partially displaying, or preserving historical memories | [`app-v25-upgrade-recovery.md`](app-v25-upgrade-recovery.md) |
 | Configure SAGE via environment variables | [`environment-variables.md`](environment-variables.md) |
+| Benchmark or tune embeddings on a CPU-only node | [`cpu-only-embeddings.md`](cpu-only-embeddings.md) |
 
 ---
 

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"sync"
-	"time"
 )
 
 // OpenAICompatibleClient generates embeddings via any server that speaks the
@@ -54,7 +53,7 @@ func NewOpenAICompatibleClient(baseURL, model, apiKey string, dimension int) *Op
 		apiKey:    apiKey,
 		dimension: dimension,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: resolveHTTPTimeout(),
 		},
 	}
 }
@@ -64,7 +63,7 @@ func NewOpenAICompatibleClient(baseURL, model, apiKey string, dimension int) *Op
 // per call to keep parity with the Ollama and Hash providers.
 type openAIEmbedRequest struct {
 	Model string `json:"model"`
-	Input string `json:"input"`
+	Input any    `json:"input"`
 }
 
 // openAIEmbedResponse mirrors the OpenAI POST /v1/embeddings response. We
@@ -73,15 +72,33 @@ type openAIEmbedRequest struct {
 type openAIEmbedResponse struct {
 	Data []struct {
 		Embedding []float64 `json:"embedding"`
+		Index     int       `json:"index"`
 	} `json:"data"`
 }
 
 // Embed generates an embedding vector for the given text via the configured
 // OpenAI-compatible endpoint and validates the response dimension.
 func (c *OpenAICompatibleClient) Embed(ctx context.Context, text string) ([]float32, error) {
+	results, err := c.embed(ctx, text, 1)
+	if err != nil {
+		return nil, err
+	}
+	return results[0], nil
+}
+
+// EmbedBatch sends one OpenAI-compatible request for all inputs and restores
+// response items to their specified indexes.
+func (c *OpenAICompatibleClient) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return [][]float32{}, nil
+	}
+	return c.embed(ctx, texts, len(texts))
+}
+
+func (c *OpenAICompatibleClient) embed(ctx context.Context, input any, count int) ([][]float32, error) {
 	body, err := json.Marshal(openAIEmbedRequest{
 		Model: c.model,
-		Input: text,
+		Input: input,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embed request: %w", err)
@@ -113,26 +130,42 @@ func (c *OpenAICompatibleClient) Embed(ctx context.Context, text string) ([]floa
 		return nil, fmt.Errorf("decode embed response: %w", err)
 	}
 
-	if len(embedResp.Data) == 0 || len(embedResp.Data[0].Embedding) == 0 {
+	if len(embedResp.Data) == 0 {
 		return nil, fmt.Errorf("openai-compatible endpoint returned no embeddings")
 	}
-
-	f64 := embedResp.Data[0].Embedding
-	if c.dimension > 0 && len(f64) != c.dimension {
-		return nil, fmt.Errorf("openai-compatible embed dimension mismatch: configured %d, got %d", c.dimension, len(f64))
+	if len(embedResp.Data) != count {
+		return nil, fmt.Errorf("openai-compatible endpoint returned %d embeddings for %d inputs", len(embedResp.Data), count)
 	}
 
-	// Convert float64 to float32 for pgvector parity with the Ollama provider.
-	result := make([]float32, len(f64))
-	for i, v := range f64 {
-		result[i] = float32(v)
+	results := make([][]float32, count)
+	seen := make([]bool, count)
+	for position, item := range embedResp.Data {
+		index := item.Index
+		// Some compatible servers omit index for scalar requests.
+		if count == 1 {
+			index = 0
+		}
+		if index < 0 || index >= count || seen[index] {
+			return nil, fmt.Errorf("openai-compatible endpoint returned invalid embedding index %d", index)
+		}
+		if len(item.Embedding) == 0 {
+			return nil, fmt.Errorf("openai-compatible endpoint returned no embedding at item %d", position)
+		}
+		if c.dimension > 0 && len(item.Embedding) != c.dimension {
+			return nil, fmt.Errorf("openai-compatible embed dimension mismatch: configured %d, got %d", c.dimension, len(item.Embedding))
+		}
+		results[index] = make([]float32, len(item.Embedding))
+		for i, value := range item.Embedding {
+			results[index][i] = float32(value)
+		}
+		seen[index] = true
 	}
 
 	c.mu.Lock()
 	c.ready = true
 	c.mu.Unlock()
 
-	return result, nil
+	return results, nil
 }
 
 // Dimension returns the configured output dimension.

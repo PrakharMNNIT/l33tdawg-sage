@@ -77,3 +77,40 @@ func TestStoreMemory_AttachesVectorForOlderNodeCompatibility(t *testing.T) {
 	assert.False(t, degraded)
 	assert.Equal(t, []float64{0.1, 0.2, 0.3}, submitted)
 }
+
+func TestStoreMemory_CurrentNodeSkipsRedundantClientEmbed(t *testing.T) {
+	var embedCalls int
+	var submittedEmbedding any = "unset"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/memory/pre-validate", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true})
+	})
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"semantic": true, "submit_embedding_authoritative": true,
+		})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		embedCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1, 0.2}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		submittedEmbedding = body["embedding"]
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "m1", "status": "proposed", "embedding_queued": false,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	degraded, err := NewServer(ts.URL, priv).storeMemory(
+		context.Background(), "one authoritative embed", "general", "observation", 0.8,
+	)
+	require.NoError(t, err)
+	assert.False(t, degraded)
+	assert.Zero(t, embedCalls)
+	assert.Nil(t, submittedEmbedding)
+}

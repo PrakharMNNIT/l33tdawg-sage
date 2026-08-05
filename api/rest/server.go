@@ -1090,13 +1090,7 @@ func (s *Server) Router() chi.Router {
 
 // Start begins listening on the given address.
 func (s *Server) Start(addr string) error {
-	s.httpServer = &http.Server{
-		Addr:         addr,
-		Handler:      s.router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
+	s.httpServer = s.newHTTPServer(addr, nil)
 	s.logger.Info().Str("addr", addr).Msg("starting REST API server")
 	return s.httpServer.ListenAndServe()
 }
@@ -1104,16 +1098,49 @@ func (s *Server) Start(addr string) error {
 // StartTLS begins listening with TLS on the given address.
 // Certificates are loaded from the provided tls.Config (not from file paths).
 func (s *Server) StartTLS(addr string, tlsConfig *tls.Config) error {
-	s.httpServer = &http.Server{
+	s.httpServer = s.newHTTPServer(addr, tlsConfig)
+	s.logger.Info().Str("addr", addr).Msg("starting REST API server (TLS)")
+	return s.httpServer.ListenAndServeTLS("", "") // Certs from TLSConfig.
+}
+
+const (
+	defaultEmbeddingHTTPTimeout = 30 * time.Second
+	restWriteTimeoutHeadroom    = 15 * time.Second
+	maxRESTWriteTimeout         = 10 * time.Minute
+)
+
+// embeddingAwareWriteTimeout keeps the outer REST writer alive longer than a
+// configured CPU embedding request. Without this, http.Server's historical
+// 15-second ceiling can discard a valid 30/60/120-second embed response. The
+// upper bound prevents an accidental duration such as 24h from turning every
+// response writer into an effectively unbounded resource reservation.
+func embeddingAwareWriteTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("SAGE_EMBEDDING_TIMEOUT"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("SAGE_EMBED_TIMEOUT"))
+	}
+	embedTimeout := defaultEmbeddingHTTPTimeout
+	if raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			embedTimeout = parsed
+		}
+	}
+	writeTimeout := embedTimeout + restWriteTimeoutHeadroom
+	if writeTimeout > maxRESTWriteTimeout || writeTimeout < embedTimeout {
+		return maxRESTWriteTimeout
+	}
+	return writeTimeout
+}
+
+func (s *Server) newHTTPServer(addr string, tlsConfig *tls.Config) *http.Server {
+	return &http.Server{
 		Addr:         addr,
 		Handler:      s.router,
 		TLSConfig:    tlsConfig,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: embeddingAwareWriteTimeout(),
 		IdleTimeout:  60 * time.Second,
 	}
-	s.logger.Info().Str("addr", addr).Msg("starting REST API server (TLS)")
-	return s.httpServer.ListenAndServeTLS("", "") // Certs from TLSConfig.
 }
 
 // Shutdown gracefully shuts down the server.

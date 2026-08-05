@@ -21,10 +21,11 @@ type EmbedResponse struct {
 
 // EmbedInfoResponse describes the active embedding provider.
 type EmbedInfoResponse struct {
-	Semantic  bool   `json:"semantic"`
-	Provider  string `json:"provider"`
-	Dimension int    `json:"dimension"`
-	Ready     bool   `json:"ready"`
+	Semantic                     bool   `json:"semantic"`
+	Provider                     string `json:"provider"`
+	Dimension                    int    `json:"dimension"`
+	Ready                        bool   `json:"ready"`
+	SubmitEmbeddingAuthoritative bool   `json:"submit_embedding_authoritative"`
 }
 
 // vaultStatusReporter is satisfied by stores that can report whether content
@@ -74,10 +75,11 @@ func (s *Server) handleEmbedInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, EmbedInfoResponse{
-		Semantic:  semantic,
-		Provider:  provider,
-		Dimension: s.embedder.Dimension(),
-		Ready:     s.embedder.Ready(),
+		Semantic:                     semantic,
+		Provider:                     provider,
+		Dimension:                    s.embedder.Dimension(),
+		Ready:                        s.embedder.Ready(),
+		SubmitEmbeddingAuthoritative: true,
 	})
 }
 

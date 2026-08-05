@@ -26,13 +26,14 @@ func isTimeout(err error) bool {
 	return (errors.As(err, &netErr) && netErr.Timeout()) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// Dimension is the output dimension of nomic-embed-text.
+// Dimension is the legacy output dimension of nomic-embed-text.
 const Dimension = 768
 
 // Client generates embeddings via a local Ollama instance.
 type Client struct {
-	baseURL string
-	model   string
+	baseURL   string
+	model     string
+	dimension int
 	// keepAlive is a duration STRING ("30m") or an int64 (seconds; -1 pins in memory,
 	// 0 unloads) — the two forms Ollama's /api/embed keep_alive field accepts.
 	keepAlive  any
@@ -45,6 +46,13 @@ type Client struct {
 // baseURL defaults to OLLAMA_URL env var or "http://localhost:11434".
 // model defaults to "nomic-embed-text".
 func NewClient(baseURL, model string) *Client {
+	return NewClientWithDimension(baseURL, model, Dimension)
+}
+
+// NewClientWithDimension creates an Ollama client bound to an exact vector
+// dimension. The response is validated so a model/config mismatch cannot mix
+// incompatible vectors in one space.
+func NewClientWithDimension(baseURL, model string, dimension int) *Client {
 	if baseURL == "" {
 		baseURL = os.Getenv("OLLAMA_URL")
 	}
@@ -54,12 +62,16 @@ func NewClient(baseURL, model string) *Client {
 	if model == "" {
 		model = "nomic-embed-text"
 	}
+	if dimension <= 0 {
+		dimension = Dimension
+	}
 	return &Client{
 		baseURL:   baseURL,
 		model:     model,
+		dimension: dimension,
 		keepAlive: resolveKeepAlive(),
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: resolveHTTPTimeout(),
 		},
 	}
 }
@@ -94,7 +106,7 @@ func resolveKeepAlive() any {
 
 type embedRequest struct {
 	Model     string `json:"model"`
-	Input     string `json:"input"`
+	Input     any    `json:"input"`
 	KeepAlive any    `json:"keep_alive,omitempty"`
 }
 
@@ -106,16 +118,33 @@ type embedResponse struct {
 // embed failures; len+1 is the max attempt count. A var so tests can shrink it.
 var embedRetryBackoffs = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond}
 
-// Embed generates a 768-dim embedding for the given text, retrying transient
+// Embed generates an embedding for the given text, retrying transient
 // failures. Ollama commonly blips on the first call after an idle model-unload, a
 // cold load, or a sidecar restart; a couple of short retries absorb that so a single
 // hiccup doesn't fail a sage_turn (whose recall AND store both embed). Combined with
 // keep_alive keeping the model resident, this is the fix for the intermittent
 // "embed failed / can't connect to Ollama" errors.
 func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
+	results, err := c.embedTexts(ctx, []string{text})
+	if err != nil {
+		return nil, err
+	}
+	return results[0], nil
+}
+
+// EmbedBatch uses Ollama's native input-array support so migrations and imports
+// amortize model scheduling and HTTP overhead.
+func (c *Client) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return [][]float32{}, nil
+	}
+	return c.embedTexts(ctx, texts)
+}
+
+func (c *Client) embedTexts(ctx context.Context, texts []string) ([][]float32, error) {
 	var lastErr error
 	for attempt := 0; ; attempt++ {
-		result, retryable, err := c.embedOnce(ctx, text)
+		result, retryable, err := c.embedOnce(ctx, texts)
 		if err == nil {
 			return result, nil
 		}
@@ -135,10 +164,14 @@ func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
 // embedOnce performs a single embed attempt. retryable is true for a transient
 // condition worth retrying (network error, 5xx/429, empty result); false for a
 // definite failure (marshal error, 4xx) that a retry won't fix.
-func (c *Client) embedOnce(ctx context.Context, text string) (result []float32, retryable bool, err error) {
+func (c *Client) embedOnce(ctx context.Context, texts []string) (result [][]float32, retryable bool, err error) {
+	var input any = texts
+	if len(texts) == 1 {
+		input = texts[0]
+	}
 	req := embedRequest{
 		Model:     c.model,
-		Input:     text,
+		Input:     input,
 		KeepAlive: c.keepAlive,
 	}
 
@@ -182,10 +215,18 @@ func (c *Client) embedOnce(ctx context.Context, text string) (result []float32, 
 	}
 
 	// Convert float64 to float32 for pgvector
-	f64 := embedResp.Embeddings[0]
-	result = make([]float32, len(f64))
-	for i, v := range f64 {
-		result[i] = float32(v)
+	if len(embedResp.Embeddings) != len(texts) {
+		return nil, true, fmt.Errorf("ollama returned %d embeddings for %d inputs", len(embedResp.Embeddings), len(texts))
+	}
+	result = make([][]float32, len(embedResp.Embeddings))
+	for item, f64 := range embedResp.Embeddings {
+		if len(f64) != c.dimension {
+			return nil, false, fmt.Errorf("ollama embed dimension mismatch: configured %d, got %d", c.dimension, len(f64))
+		}
+		result[item] = make([]float32, len(f64))
+		for i, v := range f64 {
+			result[item][i] = float32(v)
+		}
 	}
 
 	c.mu.Lock()
@@ -197,7 +238,7 @@ func (c *Client) embedOnce(ctx context.Context, text string) (result []float32, 
 
 // Dimension returns the output dimension of this provider.
 func (c *Client) Dimension() int {
-	return Dimension
+	return c.dimension
 }
 
 // Ready returns true if at least one successful embedding has been generated.

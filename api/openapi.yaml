@@ -2146,6 +2146,13 @@ components:
           type: integer
         ready:
           type: boolean
+        submit_embedding_authoritative:
+          type: boolean
+          description: >-
+            True when POST /v1/memory/submit always generates the authoritative
+            vector with the node's active provider. Current MCP clients use this
+            capability to omit a redundant compatibility embedding; older nodes
+            omit the field and continue receiving the client-generated vector.
 
     # -- MCP Tokens ----------------------------------------------------------
     MCPTokenIssueRequest:

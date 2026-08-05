@@ -34,6 +34,8 @@ type Manager struct {
 	mu      sync.Mutex
 	dataDir string
 	port    int
+	model   string
+	dim     int
 	cmd     *exec.Cmd
 
 	dlMu       sync.Mutex
@@ -45,7 +47,28 @@ type Manager struct {
 }
 
 func New(dataDir string) *Manager {
-	return &Manager{dataDir: dataDir, port: DefaultPort}
+	manager, _ := NewConfigured(dataDir, ModelName, ModelDimension)
+	return manager
+}
+
+// NewConfigured binds the managed runtime to the exact model and vector
+// dimension used by the node embedding provider. Keeping this explicit avoids
+// a custom CPU profile being declared unhealthy—or worse, silently treated as
+// nomic/768—by the sidecar readiness and pull paths.
+func NewConfigured(dataDir, model string, dimension int) (*Manager, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, errors.New("managed Ollama model is required")
+	}
+	if dimension <= 0 {
+		return nil, errors.New("managed Ollama dimension must be positive")
+	}
+	return &Manager{
+		dataDir: dataDir,
+		port:    DefaultPort,
+		model:   model,
+		dim:     dimension,
+	}, nil
 }
 
 func (m *Manager) URL() string { return fmt.Sprintf("http://127.0.0.1:%d", m.port) }
@@ -167,7 +190,7 @@ func (m *Manager) ModelReady(ctx context.Context) bool {
 		return false
 	}
 	for _, model := range tags.Models {
-		if model.Name == ModelName || strings.HasPrefix(model.Name, ModelName+":") {
+		if model.Name == m.model || strings.HasPrefix(model.Name, m.model+":") {
 			return m.embedProbe(cctx)
 		}
 	}
@@ -176,13 +199,13 @@ func (m *Manager) ModelReady(ctx context.Context) bool {
 
 func (m *Manager) embedProbe(ctx context.Context) bool {
 	if m.tryEmbedProbe(ctx, "/api/embed", map[string]any{
-		"model": ModelName,
+		"model": m.model,
 		"input": "sage semantic readiness probe",
 	}) {
 		return true
 	}
 	return m.tryEmbedProbe(ctx, "/api/embeddings", map[string]any{
-		"model":  ModelName,
+		"model":  m.model,
 		"prompt": "sage semantic readiness probe",
 	})
 }
@@ -210,10 +233,10 @@ func (m *Manager) tryEmbedProbe(ctx context.Context, path string, payload map[st
 	if json.NewDecoder(resp.Body).Decode(&out) != nil || out.Error != "" {
 		return false
 	}
-	if len(out.Embedding) == ModelDimension {
+	if len(out.Embedding) == m.dim {
 		return true
 	}
-	return len(out.Embeddings) > 0 && len(out.Embeddings[0]) == ModelDimension
+	return len(out.Embeddings) > 0 && len(out.Embeddings[0]) == m.dim
 }
 
 func (m *Manager) Start(ctx context.Context) (string, error) {
@@ -313,7 +336,7 @@ func (m *Manager) PullModel(ctx context.Context, status func(string), progress f
 		m.dlMu.Unlock()
 	}()
 
-	body, _ := json.Marshal(map[string]any{"name": ModelName, "stream": true})
+	body, _ := json.Marshal(map[string]any{"name": m.model, "stream": true})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.URL()+"/api/pull", strings.NewReader(string(body)))
 	if err != nil {
 		return err
@@ -362,7 +385,7 @@ func (m *Manager) PullModel(ctx context.Context, status func(string), progress f
 		return fmt.Errorf("pull model: %w", err)
 	}
 	if !m.ModelReady(ctx) {
-		return fmt.Errorf("%s did not become available after download", ModelName)
+		return fmt.Errorf("%s did not become available after download", m.model)
 	}
 	return nil
 }

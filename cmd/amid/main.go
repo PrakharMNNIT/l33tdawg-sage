@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -69,6 +70,10 @@ func main() {
 	// Setup logger
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}).
 		With().Timestamp().Str("service", "amid").Logger()
+	embedProvider, err := newAMIDEmbeddingProviderFromEnv()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("invalid embedding configuration")
+	}
 
 	if *postgresURL == "" {
 		logger.Fatal().Msg("PostgreSQL URL is required (--postgres-url or POSTGRES_URL)")
@@ -77,6 +82,7 @@ func main() {
 	logger.Info().
 		Str("rest_addr", *restAddr).
 		Str("metrics_addr", *metricsAddr).
+		Str("embedding_space", embedding.SpaceID(embedProvider)).
 		Str("mode", modeStr(*abciAddr)).
 		Msg("starting SAGE ABCI daemon")
 
@@ -149,13 +155,13 @@ func main() {
 
 	if *abciAddr != "" {
 		// ── Standalone ABCI server mode (Docker: separate CometBFT container) ──
-		runABCIServer(app, *abciAddr, *restAddr, *metricsAddr, *cometRPC, *validatorKeyFile, *cerebrumRootKeyFile, *governanceOperatorID, *tlsCert, *tlsKey, *tlsCA, *requireVoter, health, logger)
+		runABCIServer(app, *abciAddr, *restAddr, *metricsAddr, *cometRPC, *validatorKeyFile, *cerebrumRootKeyFile, *governanceOperatorID, *tlsCert, *tlsKey, *tlsCA, *requireVoter, embedProvider, health, logger)
 	} else {
 		// ── In-process mode (single binary: ABCI + CometBFT embedded) ──
 		if *cometHome == "" {
 			logger.Fatal().Msg("CometBFT home directory is required in in-process mode (--home or COMETBFT_HOME)")
 		}
-		runInProcess(app, *cometHome, *restAddr, *metricsAddr, *cerebrumRootKeyFile, *governanceOperatorID, *tlsCert, *tlsKey, *tlsCA, *requireVoter, health, logger)
+		runInProcess(app, *cometHome, *restAddr, *metricsAddr, *cerebrumRootKeyFile, *governanceOperatorID, *tlsCert, *tlsKey, *tlsCA, *requireVoter, embedProvider, health, logger)
 	}
 }
 
@@ -355,7 +361,7 @@ func bindExpectedGovernanceDomainFromRPCUntilReady(
 }
 
 // runABCIServer starts the ABCI app as a TCP server for an external CometBFT node.
-func runABCIServer(app *sageabci.SageApp, abciAddr, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, requireVoter bool, health *metrics.HealthChecker, logger zerolog.Logger) {
+func runABCIServer(app *sageabci.SageApp, abciAddr, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, requireVoter bool, embedProvider embedding.Provider, health *metrics.HealthChecker, logger zerolog.Logger) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cmtLogger := cmtlog.NewTMLogger(cmtlog.NewSyncWriter(os.Stdout))
@@ -383,7 +389,7 @@ func runABCIServer(app *sageabci.SageApp, abciAddr, restAddr, metricsAddr, comet
 	logger.Info().Str("addr", abciAddr).Msg("ABCI server listening")
 
 	// Start metrics + REST + health in background
-	startServices(ctx, app, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA, health, logger)
+	startServices(ctx, app, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA, embedProvider, health, logger)
 
 	// Socket mode: the consensus key lives with the separate CometBFT process, so
 	// the voter needs it supplied explicitly (operator mounts priv_validator_key.json
@@ -419,7 +425,7 @@ func runABCIServer(app *sageabci.SageApp, abciAddr, restAddr, metricsAddr, comet
 }
 
 // runInProcess embeds CometBFT in the same process as the ABCI app.
-func runInProcess(app *sageabci.SageApp, cometHome, restAddr, metricsAddr, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, requireVoter bool, health *metrics.HealthChecker, logger zerolog.Logger) {
+func runInProcess(app *sageabci.SageApp, cometHome, restAddr, metricsAddr, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, requireVoter bool, embedProvider embedding.Provider, health *metrics.HealthChecker, logger zerolog.Logger) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cometCfg, err := loadCometConfig(cometHome)
@@ -484,7 +490,7 @@ func runInProcess(app *sageabci.SageApp, cometHome, restAddr, metricsAddr, cereb
 
 	// In-process: CometBFT RPC is localhost
 	cometRPC := fmt.Sprintf("http://127.0.0.1%s", cometCfg.RPC.ListenAddress[len("tcp://0.0.0.0"):])
-	startServices(ctx, app, restAddr, metricsAddr, cometRPC, cometCfg.PrivValidatorKeyFile(), cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA, health, logger)
+	startServices(ctx, app, restAddr, metricsAddr, cometRPC, cometCfg.PrivValidatorKeyFile(), cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA, embedProvider, health, logger)
 
 	// In-process: the consensus key is right here under --home; the voter signs
 	// memory votes with it (same key CometBFT validates blocks with).
@@ -504,7 +510,7 @@ func runInProcess(app *sageabci.SageApp, cometHome, restAddr, metricsAddr, cereb
 }
 
 // startServices launches the metrics server and REST API.
-func startServices(ctx context.Context, app *sageabci.SageApp, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, health *metrics.HealthChecker, logger zerolog.Logger) {
+func startServices(ctx context.Context, app *sageabci.SageApp, restAddr, metricsAddr, cometRPC, validatorKeyFile, cerebrumRootKeyFile, governanceOperatorID, tlsCert, tlsKey, tlsCA string, embedProvider embedding.Provider, health *metrics.HealthChecker, logger zerolog.Logger) {
 	// Prometheus metrics server
 	metricsServer := metrics.NewMetricsServer(metricsAddr, health)
 	go func() {
@@ -517,7 +523,7 @@ func startServices(ctx context.Context, app *sageabci.SageApp, restAddr, metrics
 	// REST API server
 	pgStore := app.GetOffchainStore()
 	badgerStore := app.GetBadgerStore()
-	restServer := rest.NewServer(cometRPC, pgStore, pgStore, badgerStore, health, logger, embedding.NewClient("", ""))
+	restServer := rest.NewServer(cometRPC, pgStore, pgStore, badgerStore, health, logger, embedProvider)
 	// --home/--validator-key-file is authoritative for amid. Neutralize any key
 	// NewServer inherited from the compatibility env path before explicit load.
 	restServer.DisableValidatorSigningKey()
@@ -640,6 +646,56 @@ func envOrDefault(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// newAMIDEmbeddingProviderFromEnv keeps the standalone daemon on the same
+// provider/model/dimension contract as sage-gui. amid has no config.yaml, so
+// the SAGE_EMBEDDING_* environment is authoritative. The historical default is
+// still Ollama + nomic-embed-text + 768 dimensions, but an explicit malformed
+// dimension or unknown provider fails closed rather than silently stamping a
+// different vector space.
+func newAMIDEmbeddingProviderFromEnv() (embedding.Provider, error) {
+	providerName := strings.ToLower(strings.TrimSpace(envOrDefault("SAGE_EMBEDDING_PROVIDER", "ollama")))
+	baseURL := strings.TrimSpace(os.Getenv("SAGE_EMBEDDING_BASE_URL"))
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(os.Getenv("OLLAMA_URL"))
+	}
+	model := strings.TrimSpace(os.Getenv("SAGE_EMBEDDING_MODEL"))
+	if model == "" {
+		model = strings.TrimSpace(os.Getenv("OLLAMA_MODEL"))
+	}
+	dimension := embedding.Dimension
+	if raw := strings.TrimSpace(os.Getenv("SAGE_EMBEDDING_DIMENSION")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return nil, fmt.Errorf("SAGE_EMBEDDING_DIMENSION=%q must be a positive integer", raw)
+		}
+		dimension = parsed
+	}
+
+	switch providerName {
+	case "ollama":
+		return embedding.NewDefaultCachedProvider(
+			embedding.NewClientWithDimension(baseURL, model, dimension),
+		), nil
+	case "openai-compatible":
+		if baseURL == "" {
+			return nil, errors.New("SAGE_EMBEDDING_BASE_URL is required for openai-compatible amid embeddings")
+		}
+		if model == "" {
+			return nil, errors.New("SAGE_EMBEDDING_MODEL is required for openai-compatible amid embeddings")
+		}
+		return embedding.NewDefaultCachedProvider(embedding.NewOpenAICompatibleClient(
+			baseURL,
+			model,
+			os.Getenv("SAGE_EMBEDDING_API_KEY"),
+			dimension,
+		)), nil
+	case "hash":
+		return embedding.NewHashProvider(dimension), nil
+	default:
+		return nil, fmt.Errorf("unsupported SAGE_EMBEDDING_PROVIDER %q", providerName)
+	}
 }
 
 // envBoolOrDefault parses key as a boolean ("true", "1", "false", ...); unset
