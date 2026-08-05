@@ -170,6 +170,7 @@ func newVerifiedSnapshotScheduler(t *testing.T, dataDir string, db *badger.DB) *
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler")
+		return nil
 	}
 	return sched
 }
@@ -241,6 +242,7 @@ func TestSnapshotScheduler_HeightTriggerFires(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler, got nil")
+		return
 	}
 
 	// Ticks below the interval should NOT fire — but the first tick
@@ -273,6 +275,7 @@ func TestSnapshotScheduler_ConcurrentTicksCoalesce(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler, got nil")
+		return
 	}
 
 	var wg sync.WaitGroup
@@ -327,6 +330,7 @@ func TestSnapshotScheduler_KeepLastDefaults(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler, got nil")
+		return
 	}
 	if sched.cfg.KeepLast != defaultSnapshotKeepLast {
 		t.Fatalf("KeepLast default: got %d want %d", sched.cfg.KeepLast, defaultSnapshotKeepLast)
@@ -377,6 +381,7 @@ func TestSnapshotScheduler_RetentionPrunesAfterTake(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler, got nil")
+		return
 	}
 
 	// Fire a real snapshot at height 100. lastHeight=0, interval=5 → fires.
@@ -497,6 +502,7 @@ func TestSnapshotScheduler_IdleFlushFires(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler, got nil")
+		return
 	}
 	defer sched.Close()
 	sched.idleCheckEvery = 50 * time.Millisecond // before the first Tick — the loop starts lazily there
@@ -546,6 +552,7 @@ func TestSnapshotScheduler_IdleFlushNotArmedWithoutTimeInterval(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler, got nil")
+		return
 	}
 	defer sched.Close()
 	sched.idleCheckEvery = 20 * time.Millisecond
@@ -580,6 +587,7 @@ func TestSnapshotScheduler_CloseStopsIdleFlush(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler, got nil")
+		return
 	}
 	sched.idleCheckEvery = 30 * time.Millisecond
 
@@ -609,6 +617,7 @@ func TestSnapshotScheduler_TriggerForceFires(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler, got nil")
+		return
 	}
 
 	sched.Trigger(42, []byte{0x42}, "pre-upgrade-test")
@@ -631,6 +640,7 @@ func TestSnapshotSchedulerTakeVerifiedBindsStateAndRunningBinary(t *testing.T) {
 	}, zerolog.Nop())
 	if sched == nil {
 		t.Fatal("expected scheduler")
+		return
 	}
 	manifest, err := sched.TakeVerified(context.Background(), 77, appHash[:], "pre-upgrade-v11.17.0", nil)
 	if err != nil {
@@ -987,6 +997,7 @@ func TestTakeVerifiedRejectsCometBlockIdentityMismatch(t *testing.T) {
 				commit := store.LoadSeenCommit(77)
 				if commit == nil {
 					t.Fatal("missing seeded seen commit")
+					return
 				}
 				commit.BlockID.Hash[0] ^= 0xff
 				if err := store.SaveSeenCommit(77, commit); err != nil {
