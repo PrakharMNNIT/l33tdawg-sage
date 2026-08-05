@@ -345,7 +345,9 @@ func inspectMachine() machineContext {
 
 func cpuModel() string {
 	if runtime.GOOS == "darwin" {
-		if output, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if output, err := exec.CommandContext(ctx, "sysctl", "-n", "machdep.cpu.brand_string").Output(); err == nil {
 			return strings.TrimSpace(string(output))
 		}
 	}
