@@ -6,6 +6,16 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/sage-tauri-appimage-tools-test.XXXXXX")
 trap 'rm -rf -- "${TEST_ROOT}"' EXIT INT TERM
 
+manifest_entries=0
+while IFS='|' read -r allowed_hashes helper_name helper_url; do
+  case ${allowed_hashes} in ''|'#'*) continue ;; esac
+  [[ ${allowed_hashes} =~ ^[a-f0-9]{64}(,[a-f0-9]{64})*$ ]]
+  [[ ${helper_name} =~ ^[A-Za-z0-9._-]+$ ]]
+  [[ ${helper_url} =~ ^https:// ]]
+  manifest_entries=$((manifest_entries + 1))
+done < "${REPO_ROOT}/scripts/tauri-appimage-tools.sha256"
+test "${manifest_entries}" = 5
+
 SOURCE=${TEST_ROOT}/source-helper
 MANIFEST=${TEST_ROOT}/manifest
 CACHE=${TEST_ROOT}/cache
