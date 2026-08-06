@@ -94,6 +94,42 @@ func TestConsensusTimedGovernanceProofFailsClosedWithoutCommittedClock(t *testin
 	assert.Zero(t, ptx.AgentTimestamp)
 }
 
+func TestRetryGovernanceProofAtCommittedTimeAfterIdleRejection(t *testing.T) {
+	want := time.Date(2026, 8, 6, 7, 42, 22, 0, time.UTC)
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/status", r.URL.Path)
+		_, _ = fmt.Fprintf(w, `{"result":{"sync_info":{"latest_block_time":%q}}}`, want.Format(time.RFC3339Nano))
+	}))
+	t.Cleanup(rpc.Close)
+	_, operatorKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	ptx := &tx.ParsedTx{Type: tx.TxTypeGovPropose, GovPropose: &tx.GovPropose{}}
+	h := &DashboardHandler{CometBFTRPC: rpc.URL}
+
+	retried, err := h.retryGovernanceProofAtCommittedTime(
+		ptx,
+		operatorKey,
+		http.MethodPost,
+		"/v1/governance/propose",
+		[]byte(`{}`),
+		fmt.Errorf("tx rejected in FinalizeBlock (code 109): agent proof rejected: %s", governanceProofAheadOfConsensus),
+	)
+	require.NoError(t, err)
+	assert.True(t, retried)
+	assert.Equal(t, want.Unix(), ptx.AgentTimestamp)
+	assert.Len(t, ptx.AgentNonce, 8)
+}
+
+func TestRetryGovernanceProofAtCommittedTimeIgnoresOtherFailures(t *testing.T) {
+	h := &DashboardHandler{CometBFTRPC: "http://unused.invalid"}
+	retried, err := h.retryGovernanceProofAtCommittedTime(
+		&tx.ParsedTx{}, nil, http.MethodPost, "/v1/governance/propose", nil,
+		fmt.Errorf("governance propose failed: proposer is in cooldown"),
+	)
+	require.NoError(t, err)
+	assert.False(t, retried)
+}
+
 func TestSignAndBroadcastCommitLeavesDirectGovernanceProofless(t *testing.T) {
 	_, key, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)

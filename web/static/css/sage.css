@@ -5275,6 +5275,9 @@ input[type="range"]::-moz-range-thumb {
 .fed-perm-cell input[type="checkbox"]:disabled { cursor: not-allowed; opacity: 0.45; }
 .fed-perm-empty { padding: 16px 6px; text-align: center; font-size: 12px; }
 .fed-perm-error { margin: 12px 0 0; }
+.fed-agent-policy-block { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.fed-agent-policy-block > span { display: flex; flex-direction: column; gap: 3px; }
+.fed-agent-policy-block .btn { flex: none; }
 .fed-perm-actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 11.5px; }
 .fed-perm-actions-top { margin: 10px 0 2px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
 .fed-perm-top-actions {

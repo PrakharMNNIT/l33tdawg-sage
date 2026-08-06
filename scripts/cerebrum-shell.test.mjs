@@ -532,6 +532,22 @@ test('app-v26 domain transfer UI never invents a deferred owner self-grant', () 
         /if \(res\.grant_deferred\) \{/,
         'app-v26 owner-derived authority must not be treated as a deferred target-key grant',
     );
+    const recoveryPanel = appSource.slice(
+        appSource.indexOf('function AgentMemoryRecoveryPanel('),
+        appSource.indexOf('function MemoryRecoveryModal('),
+    );
+    const searchPage = appSource.slice(
+        appSource.indexOf('function SearchPage('),
+        appSource.indexOf('// Synaptic Ledger'),
+    );
+    for (const [surface, source] of [['agent recovery', recoveryPanel], ['Search', searchPage]]) {
+        assert.match(source, /enqueueGovernedTransfer\(/,
+            `${surface} transfers must join the application-wide governance queue`);
+        assert.match(source, /runWithGovernanceCooldown\(/,
+            `${surface} transfers must retry only the exact committed governance cooldown`);
+    }
+    assert.match(searchPage, /You can leave this screen/,
+        'Search must make the background continuation explicit after confirmation');
 });
 
 test('first-run onboarding offers a real create-or-join decision', () => {
@@ -1096,6 +1112,7 @@ test('direct federation controls are symmetric after pairing', () => {
 test('federation agent contacts stay administrative and default-off', () => {
     const panel = appSource.slice(appSource.indexOf('function FedPermissionsPanel('), appSource.indexOf('// FederationWarmup'));
     const page = appSource.slice(appSource.indexOf('function FederationPage('), appSource.indexOf('// PAGE_LABELS'));
+    const contactPoll = panel.slice(panel.indexOf('const poll = async () => {'), panel.indexOf('if (catalog === null'));
 
     assert.match(apiSource, /connections\/\$\{encodeURIComponent\(chainId\)\}\/pipe-contacts/);
     assert.match(apiSource, /agent_id: agentId, contact_id: contactId, accepting: !!accepting/,
@@ -1156,8 +1173,13 @@ test('federation agent contacts stay administrative and default-off', () => {
         'a stale poll must not mark a newer failed contact projection as known');
     assert.match(panel, /check access<\/option>/,
         'directory options must disclose that shared-domain eligibility is not known until selection');
-    assert.match(panel, /const currentDirectoryResponse = await fetchAgents\(\)[\s\S]*!appV23FederatedInboxEnabled\(currentAgent\.capabilities\)[\s\S]*has federated inbox messaging blocked[\s\S]*return;[\s\S]*fedPipeContactsGet\(chain, false, agentID\)/,
+    assert.match(panel, /const currentDirectoryResponse = await fetchAgents\(\)[\s\S]*!appV23FederatedInboxEnabled\(currentAgent\.capabilities\)[\s\S]*setPipeContactPolicyBlock\(\{ agentID, selectedName \}\)[\s\S]*return;[\s\S]*fedPipeContactsGet\(chain, false, agentID\)/,
         'the picker must refresh authoritative agent policy, then stop a current federation block before domain sharing or contact lookup');
+    assert.match(panel, /Open this agent’s inbox setting/,
+        'a blocked inbox must remain actionable and deep-link to the exact agent policy');
+    assert.match(panel, /#\/access\?agent=\$\{encodeURIComponent\(pipeContactPolicyBlock\.agentID\)\}&inbox=1/);
+    assert.doesNotMatch(contactPoll, /setPipeContactPolicyBlock/,
+        'background refresh must not dismiss the policy block');
     assert.match(panel, /Up to four newly selected agents outside the recent list/,
         'the bounded exact-revalidation behavior must be explained beside the picker');
     assert.match(panel, /contact\.address \|\| contact\.handle/,
@@ -1198,6 +1220,10 @@ test('Access Controls exposes the independent federated inbox kill switch', () =
         'the explicit switch must preserve the named profile bits while toggling only the independent restriction');
     assert.match(panel, /updateAppV23AgentPolicy\(selected\.agent_id, draft\)/,
         'the switch must use the ordinary consensus policy save instead of a browser-only mutation');
+    assert.match(panel, /const requestedLocalAgentID = routeQuery\.get\('agent'\) \|\| '';/,
+        'an agent deep link must select the requested active principal without an unrelated recovery flag');
+    assert.match(panel, /v23-federated-inbox-label[\s\S]*scrollIntoView/,
+        'an inbox deep link must bring the exact switch into view');
 });
 
 test('federation contact projection drops stale exact contacts and keeps only revalidated extensions', () => {
