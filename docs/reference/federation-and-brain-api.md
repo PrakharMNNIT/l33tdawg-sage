@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.17.11 code (2026-08-05). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
+<!-- Verified against SAGE v11.17.12 code (2026-08-06). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
 
 # SAGE Federation and Brain HTTP API Reference (v11)
 
@@ -271,8 +271,9 @@ or substitute the agent (`api/rest/pipe_handler.go:132-321`,
 Under app-v23, the named Companion profile derives the app-v22
 `ReadAllDomains` compatibility restriction. It satisfies the sender's local
 caller/domain intersection for authenticated contact discovery without
-bypassing numeric memory clearance. Federated inbox messaging remains enabled
-for that profile; the independent
+bypassing numeric memory clearance. Federated inbox messaging is enabled by
+default for that profile; Access Controls may independently enable or block it
+without changing the profile. The independent
 `DenyFederatedPipe` bit (`16`) makes targeted recipient discovery, cached
 contact reauthorization, resolve, and send fail closed for that caller. The
 general federation view still returns authorized peer/domain topology but
@@ -772,9 +773,13 @@ level-1 Read access to a shared domain (the owner is eligible by definition). Ev
 new/changed contact starts Off. CEREBRUM shows remote friendly handles but
 makes exact `agent@chain` the primary copyable address. Saving a changed domain
 snapshot warns that enabled contact choices will reset, then refreshes both
-projections authoritatively. Pause preserves the domain and contact choices
+projections authoritatively. The independent `DenyFederatedPipe` restriction
+still wins over ownership and domain access. Access Controls exposes that one
+restriction as the explicit **Allow messages from connected SAGEs** switch;
+the Federation agent picker detects a blocked local agent before changing the
+shared-domain snapshot and points the operator to that control. Pause preserves the domain and contact choices
 while suspending delivery
-(`web/static/js/app.js:12181-12558`,
+(`web/static/js/app.js`, `web/static/js/appv23-policy.js`,
 `web/federation_pipe_contacts.go:20-107`).
 
 The permissions `PUT` body is

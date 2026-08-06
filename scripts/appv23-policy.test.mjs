@@ -7,6 +7,8 @@ import {
     appV23CapabilityIndicators,
     appV23NeedsHomeReapproval,
     appV23PolicyChanged,
+    appV23FederatedInboxDefaults,
+    appV23FederatedInboxEnabled,
     appV23ProfileDefaults,
     appV23ProfileIsSelectable,
     appV23ProfileNeedsReview,
@@ -190,6 +192,15 @@ test('named policy editing preserves the independent federated-pipe hard restric
         0,
         'pending mask 30 must not turn the explicitly selected Companion preset into mask 31',
     );
+});
+
+test('the operator can explicitly toggle the independent federated inbox restriction', () => {
+    assert.equal(appV23FederatedInboxEnabled(15), true);
+    assert.equal(appV23FederatedInboxEnabled(31), false);
+    assert.deepEqual(appV23FederatedInboxDefaults(true, 31), { capabilities: 15 });
+    assert.deepEqual(appV23FederatedInboxDefaults(false, 15), { capabilities: 31 });
+    assert.deepEqual(appV23FederatedInboxDefaults(true, 17), { capabilities: 1 });
+    assert.deepEqual(appV23FederatedInboxDefaults(false, 1), { capabilities: 17 });
 });
 
 test('policy change detection avoids meaningless consensus saves', () => {

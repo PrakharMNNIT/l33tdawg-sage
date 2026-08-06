@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.11 is the current release.** This release completes the CPU-only embedding work in #117 with native batching, bounded authorized imports, safe concurrent coalescing, coherent provider configuration, server-authoritative MCP submission, and a reproducible benchmark. It also restores domain transfers after an idle chain without weakening the consensus proof window, duplicates Federation Save/Revoke controls around long catalogs, and retains v11.17.10's symmetric peer-domain and shared-agent visibility fix. Governed app-v26 adds explicit per-group `read`, `read_write`, and `read_write_modify` authority without weakening owner control or federated read-only isolation. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 through app-v26 replay and state-sync checks, and the native-shell productization bridge spans v11.11–v11.17.
+**Status (2026-08):** **v11.17.12 is the current release.** This corrective release makes federated agent sharing preflight the selected agent's inbox eligibility before mutating domain visibility, exposes the independent federated-inbox restriction as an explicit Access Controls switch, and keeps long Tasks cards from widening the four-column board beyond the viewport. It retains v11.17.11's CPU-only embedding, idle-chain governance, and long-catalog Federation fixes. Governed app-v26 adds explicit per-group `read`, `read_write`, and `read_write_modify` authority without weakening owner control or federated read-only isolation. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 through app-v26 replay and state-sync checks, and the native-shell productization bridge spans v11.11–v11.17.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -28,6 +28,13 @@ bounded, current MCP clients avoid redundant vector generation, and operators
 gain a real benchmark plus configuration guidance. It also fixes stale proof
 creation on idle single-validator chains and places Federation Save/Revoke
 actions at both ends of long permission catalogs.
+
+v11.17.12 makes the independent federated-inbox restriction visible in Access
+Controls and blocks the agent-share workflow before any domain mutation when
+that restriction is enabled. Companion remains a least-privilege profile; the
+operator explicitly decides whether connected SAGEs may discover its inbox.
+The same patch constrains long Tasks cards to their responsive grid tracks so
+all four desktop columns remain visible without horizontal page scrolling.
 
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:

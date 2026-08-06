@@ -314,8 +314,9 @@ test('app-v23 access UI uses named policy choices and visibly separates local gr
         appSource.indexOf('function AppV23AccessControl()'),
         appSource.indexOf('function NetworkPage('),
     );
-    assert.doesNotMatch(access, /type="checkbox"/,
-        'raw capability bits must never return as an editable checkbox wall');
+    assert.equal((access.match(/type="checkbox"/g) || []).length, 1,
+        'only the independent federated-inbox kill switch may be editable; raw capability bits must not return as a checkbox wall');
+    assert.match(access, /type="checkbox" role="switch"[\s\S]*appV23FederatedInboxDefaults/);
     assert.match(access, /role="group" aria-labelledby="v23-role-label"/);
     assert.match(access, /role="group" aria-labelledby="v23-profile-label"/);
     assert.match(access, /class="btn btn-primary" disabled=\$\{saveDisabled\}/);
@@ -775,6 +776,20 @@ test('task board scrolls as one page instead of trapping wheel input in columns'
     assert.match(cards, /overflow-y:\s*visible/);
 });
 
+test('task board columns shrink to the content viewport without horizontal page scrolling', () => {
+    const tasksPage = cssSource.match(/\.tasks-page\s*\{([^}]*)\}/)?.[1] || '';
+    const board = cssSource.match(/\.kanban-board\s*\{([^}]*)\}/)?.[1] || '';
+    const column = cssSource.match(/\.kanban-column\s*\{([^}]*)\}/)?.[1] || '';
+    assert.match(tasksPage, /overflow-x:\s*hidden/,
+        'the task page must not expose a horizontal page scrollbar');
+    assert.match(board, /grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\)/,
+        'long task content must not expand one desktop track beyond its equal share');
+    assert.match(column, /min-width:\s*0/,
+        'grid columns must be allowed to shrink below their intrinsic content width');
+    assert.match(cssSource, /@media \(max-width:\s*1000px\)[\s\S]*?\.kanban-board\s*\{\s*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/,
+        'the two-column breakpoint must retain the same intrinsic-width guard');
+});
+
 test('federation owns a viewport-bounded vertical scroll container', () => {
     const federationPage = cssSource.match(/\.fed-page\s*\{([^}]*)\}/)?.[1] || '';
     assert.match(federationPage, /flex:\s*1/);
@@ -1093,6 +1108,8 @@ test('federation agent contacts stay administrative and default-off', () => {
         'a stale poll must not mark a newer failed contact projection as known');
     assert.match(panel, /check access<\/option>/,
         'directory options must disclose that shared-domain eligibility is not known until selection');
+    assert.match(panel, /const currentDirectoryResponse = await fetchAgents\(\)[\s\S]*!appV23FederatedInboxEnabled\(currentAgent\.capabilities\)[\s\S]*has federated inbox messaging blocked[\s\S]*return;[\s\S]*fedPipeContactsGet\(chain, false, agentID\)/,
+        'the picker must refresh authoritative agent policy, then stop a current federation block before domain sharing or contact lookup');
     assert.match(panel, /Up to four newly selected agents outside the recent list/,
         'the bounded exact-revalidation behavior must be explained beside the picker');
     assert.match(panel, /contact\.address \|\| contact\.handle/,
@@ -1124,6 +1141,15 @@ test('federation agent contacts stay administrative and default-off', () => {
         'pause feedback must cover every suspended federation capability');
     assert.doesNotMatch(panel, /Send message|Compose message|Message body/,
         'the federation panel must not grow a human chat composer');
+});
+
+test('Access Controls exposes the independent federated inbox kill switch', () => {
+    const panel = appSource.slice(appSource.indexOf('function AppV23AccessControl('), appSource.indexOf('function NetworkPage('));
+    assert.match(panel, /Allow messages from connected SAGEs/);
+    assert.match(panel, /appV23FederatedInboxDefaults\(event\.target\.checked, draft\.capabilities\)/,
+        'the explicit switch must preserve the named profile bits while toggling only the independent restriction');
+    assert.match(panel, /updateAppV23AgentPolicy\(selected\.agent_id, draft\)/,
+        'the switch must use the ordinary consensus policy save instead of a browser-only mutation');
 });
 
 test('federation contact projection drops stale exact contacts and keeps only revalidated extensions', () => {
