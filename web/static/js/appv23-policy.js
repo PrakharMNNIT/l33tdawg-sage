@@ -11,6 +11,24 @@ export const APPV23_SELECTABLE_PROFILES = Object.freeze([
 ]);
 const APPV23_DENY_FEDERATED_PIPE = 16;
 
+export function appV23FederatedInboxEnabled(capabilities) {
+    const recorded = Number(capabilities ?? 0);
+    return Number.isFinite(recorded) &&
+        (Math.max(0, Math.trunc(recorded)) & APPV23_DENY_FEDERATED_PIPE) === 0;
+}
+
+export function appV23FederatedInboxDefaults(enabled, currentCapabilities = 0) {
+    const recorded = Number(currentCapabilities ?? 0);
+    const capabilities = Number.isFinite(recorded)
+        ? Math.max(0, Math.trunc(recorded))
+        : 0;
+    return {
+        capabilities: enabled
+            ? capabilities & ~APPV23_DENY_FEDERATED_PIPE
+            : capabilities | APPV23_DENY_FEDERATED_PIPE,
+    };
+}
+
 // Keep the Access Controls render boundary total even when an older node or a
 // historical consensus row represents an empty Go slice as JSON null.
 export function appV23NormalizeAccessState(state) {

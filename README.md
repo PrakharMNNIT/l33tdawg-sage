@@ -51,6 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.17.12
+
+**Federation agent sharing now fails safely and explains the real policy.** The
+agent picker checks the selected local agent's federated-inbox capability before
+changing any shared domains, so an inbox blocked by policy can no longer leave a
+partial domain share followed by a misleading refresh error. Access Controls now
+shows an explicit **Allow messages from connected SAGEs** switch and changes only
+the independent federation-deny bit; Companion agents keep their existing role,
+clearance, home domain, and other restrictions.
+
+**The Tasks board stays inside the viewport.** Four- and two-column layouts now
+allow every track to shrink below its content's intrinsic width, so long Done or
+Dropped cards wrap inside their columns instead of creating a page-level
+horizontal scrollbar or clipping the final column.
+
+This patch changes no consensus rule, AppHash input, transaction type, key
+encoding, fork target, or application version. Existing v11.17 chains upgrade
+in place without rewriting trust, domain grants, agent acceptance, memories, or
+history.
+
+Container: `ghcr.io/l33tdawg/sage:11.17.12`. SDK 11.17.12.
+
 ## What's New in v11.17.11
 
 **CPU-only embeddings are faster, bounded, and observable.** Native Ollama and
@@ -1300,7 +1322,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.11`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.12`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

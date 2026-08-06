@@ -470,15 +470,18 @@ func TestAppV23PolicyRejectsInvalidAdminThenBuildsAtomicRoleChange(t *testing.T)
 	require.Equal(t, http.StatusBadRequest, badRec.Code, badRec.Body.String())
 	assert.Zero(t, calls.Load())
 
-	badMaskReq := appV23AccessRequest(t, http.MethodPut, "/policy", "id", fixture.agentID, map[string]any{
+	denyFederatedInboxReq := appV23AccessRequest(t, http.MethodPut, "/policy", "id", fixture.agentID, map[string]any{
 		"role": "admin", "profile": "standard", "clearance": 4, "capabilities": 17,
 	})
-	badMaskReq = appV23AccessAs(badMaskReq, fixture.rootID)
-	badMaskRec := httptest.NewRecorder()
-	h.handleAppV23AgentPolicy().ServeHTTP(badMaskRec, badMaskReq)
-	require.Equal(t, http.StatusBadRequest, badMaskRec.Code, badMaskRec.Body.String())
-	assert.Contains(t, badMaskRec.Body.String(), "invalid_admin_policy")
-	assert.Zero(t, calls.Load())
+	denyFederatedInboxReq = appV23AccessAs(denyFederatedInboxReq, fixture.rootID)
+	denyFederatedInboxRec := httptest.NewRecorder()
+	h.handleAppV23AgentPolicy().ServeHTTP(denyFederatedInboxRec, denyFederatedInboxReq)
+	require.Equal(t, http.StatusOK, denyFederatedInboxRec.Code, denyFederatedInboxRec.Body.String())
+	assert.Equal(t, int32(1), calls.Load())
+	require.NotNil(t, captured)
+	require.NotNil(t, captured.AgentRoleChange)
+	assert.Equal(t, uint32(17), captured.AgentRoleChange.Capabilities,
+		"Admin retains Read-all while the independent federated inbox restriction is enabled")
 
 	goodReq := appV23AccessRequest(t, http.MethodPut, "/policy", "id", fixture.agentID, map[string]any{
 		"role": "admin", "profile": "standard", "clearance": 4, "capabilities": 1,
@@ -487,7 +490,7 @@ func TestAppV23PolicyRejectsInvalidAdminThenBuildsAtomicRoleChange(t *testing.T)
 	goodRec := httptest.NewRecorder()
 	h.handleAppV23AgentPolicy().ServeHTTP(goodRec, goodReq)
 	require.Equal(t, http.StatusOK, goodRec.Code, goodRec.Body.String())
-	assert.Equal(t, int32(1), calls.Load())
+	assert.Equal(t, int32(2), calls.Load())
 	require.NotNil(t, captured)
 	require.NotNil(t, captured.AgentRoleChange)
 	change := captured.AgentRoleChange

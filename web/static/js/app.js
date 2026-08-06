@@ -21,6 +21,8 @@ import {
     appV23CapabilityIndicators,
     appV23NeedsHomeReapproval,
     appV23PolicyChanged,
+    appV23FederatedInboxDefaults,
+    appV23FederatedInboxEnabled,
     appV23ProfileDefaults,
     appV23ProfileIsSelectable,
     appV23ProfileNeedsReview,
@@ -53,7 +55,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.11';
+const SAGE_VERSION = 'v11.17.12';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -9787,6 +9789,7 @@ function AppV23AccessControl() {
     const saveDisabled = saving || !mutationReady || !targetConsentReady || !homeReapprovalReady ||
         !adminLocalReady || !draft || !draftProfileSelectable || !policyCommitNeeded;
     const capabilityIndicators = appV23CapabilityIndicators(draft || {});
+    const federatedInboxEnabled = appV23FederatedInboxEnabled(draft?.capabilities);
     const selectLocalAgent = async agentID => {
         if (saving || renameBusy || agentID === selectedID) return;
         if (policyDirty && !await showConfirmation(
@@ -10040,6 +10043,20 @@ function AppV23AccessControl() {
                             </div>
                         </div>
 
+                        ${draftProfileSelectable && html`<div class="v23-control-block">
+                            <div class="v23-control-label" id="v23-federated-inbox-label">Federated inbox <span>Independent emergency block</span></div>
+                            <label class="v23-federated-inbox-toggle" aria-labelledby="v23-federated-inbox-label">
+                                <span>
+                                    <strong>Allow messages from connected SAGEs</strong>
+                                    <small>Lets this agent appear as a recipient after you separately share a domain and enable it on that connection. Turning this off keeps local inbox notes available.</small>
+                                </span>
+                                <input type="checkbox" role="switch"
+                                    checked=${federatedInboxEnabled}
+                                    disabled=${saving}
+                                    onChange=${event => mutateDraft(appV23FederatedInboxDefaults(event.target.checked, draft.capabilities))} />
+                            </label>
+                        </div>`}
+
                         ${draftProfileSelectable && html`<div class="v23-policy-row">
                             <label class="v23-field">
                                 <span>Clearance</span>
@@ -10066,7 +10083,7 @@ function AppV23AccessControl() {
 
                         ${draftProfileSelectable && html`<details class="v23-advanced">
                             <summary>Advanced · derived policy details <span>mask ${draft.capabilities}</span></summary>
-                            <p>Read-only audit view. Role and security profile select the complete consensus policy; raw restriction bits cannot be edited independently.</p>
+                            <p>Read-only audit view. Role and security profile select the core consensus policy; the federated-inbox control above owns its independent emergency block.</p>
                             <div class="v23-switch-list">
                                 ${capabilityIndicators.map(item => html`
                                     <div class="v23-switch-row">
@@ -16554,6 +16571,22 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 		const selectedName = selectedAgent ? fedFriendlyLocalAgentLabel(selectedAgent).split(' · ')[0] : 'That agent';
 		setPipeContactLookupBusy(true); setPipeContactLookupStatus(`Checking ${selectedName}'s shared-domain access…`); setPipeContactErr('');
 		try {
+			const currentDirectoryResponse = await fetchAgents();
+			const currentDirectory = Array.isArray(currentDirectoryResponse && currentDirectoryResponse.agents)
+				? currentDirectoryResponse.agents
+				: [];
+			setLocalAgentDirectory(currentDirectory);
+			const currentAgent = currentDirectory.find(agent => agent && agent.agent_id === agentID && agent.status === 'active' && !agent.removed_at);
+			if (!currentAgent) {
+				setPipeContactLookupStatus('');
+				setPipeContactErr(`${selectedName} is no longer an active local agent. Refresh the connection and choose another agent.`);
+				return;
+			}
+			if (!appV23FederatedInboxEnabled(currentAgent.capabilities)) {
+				setPipeContactLookupStatus('');
+				setPipeContactErr(`${selectedName} has federated inbox messaging blocked. Enable “Allow messages from connected SAGEs” for this agent in Access Controls, save the policy, then choose it again.`);
+				return;
+			}
 			let result = await fedPipeContactsGet(chain, false, agentID);
 			if (lookupGeneration !== pinnedLocalAgentGenerationRef.current) {
 				setPipeContactLookupStatus('Agent access changed while SAGE was checking. Choose the agent again.');

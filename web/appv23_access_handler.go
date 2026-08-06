@@ -997,9 +997,9 @@ func (h *DashboardHandler) handleAppV23AgentPolicy() http.HandlerFunc {
 		}
 		if req.Role == store.AppV23RoleAdmin &&
 			(req.Profile != store.AppV23ProfileStandard ||
-				req.Clearance != 4 || req.Capabilities != uint32(store.AgentCapabilityReadAllDomains)) {
+				req.Clearance != 4) {
 			writeAppV23AccessError(w, http.StatusBadRequest, "invalid_admin_policy",
-				"Admin requires the Standard profile, Top Secret clearance, and exactly the Read-all capability.")
+				"Admin requires the Standard profile, Top Secret clearance, and the canonical Read-all policy.")
 			return
 		}
 		if req.Role == store.AppV23RoleAdmin {
