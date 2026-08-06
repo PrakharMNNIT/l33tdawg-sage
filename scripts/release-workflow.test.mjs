@@ -105,6 +105,17 @@ test('release actions stay pinned to immutable commits', () => {
   }
 });
 
+test('Linux native packaging preloads a bounded verified AppImage helper cache', () => {
+  const prepare = nativeShellWorkflow.indexOf('Prepare verified AppImage helper cache');
+  const build = nativeShellWorkflow.indexOf('Build unsigned installable package smoke');
+  assert.ok(prepare >= 0 && build >= 0 && prepare < build,
+    'verified AppImage helpers must be prepared before Tauri packaging');
+  const stepEnd = nativeShellWorkflow.indexOf('\n      - name:', prepare + 1);
+  const step = nativeShellWorkflow.slice(prepare, stepEnd);
+  assert.match(step, /if: runner\.os == 'Linux'/);
+  assert.match(step, /scripts\/prepare-tauri-appimage-tools\.sh/);
+});
+
 test('CodeQL uses the exact bundle audited by the CometBFT baseline', () => {
   const expected = `https://github.com/github/codeql-action/releases/download/codeql-bundle-v${codeqlBaseline.codeql.semanticVersion}/codeql-bundle-linux64.tar.gz`;
   const initMarkers = [...codeqlWorkflow.matchAll(/^      - name: Initialize CodeQL$/gm)];

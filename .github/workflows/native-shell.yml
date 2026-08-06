@@ -123,6 +123,10 @@ jobs:
           cargo clippy --locked --target ${{ matrix.rust-target }} --manifest-path desktop/sage-shell/Cargo.toml --all-targets -- -D warnings
       - name: Install pinned Tauri packager
         run: cargo install tauri-cli --version 2.11.4 --locked
+      - name: Prepare verified AppImage helper cache
+        if: runner.os == 'Linux'
+        shell: bash
+        run: scripts/prepare-tauri-appimage-tools.sh
       - name: Build unsigned installable package smoke
         shell: bash
         working-directory: desktop/sage-shell

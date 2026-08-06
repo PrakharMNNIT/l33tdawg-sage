@@ -51,6 +51,31 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.17.13
+
+**New agents now appear where operators expect them.** Agents waiting for first
+approval are separated from activated local principals and shown in a
+conditional review queue at the top of **Agents**, with the existing atomic
+approve/reject controls. **Access Controls** remains focused on activated local
+agents. Exact ordinary agents advertised by connected SAGEs now have a distinct
+**From federation** directory, including whether read-only group permissions are
+unset or already linked; permission setup opens the existing Linked readers
+control focused on that exact `agent_id@chain` pair. Federation transport,
+ceremony, and Root identities are never cast as ordinary agents.
+
+**Linux preview packaging survives transient helper outages.** The native-shell
+gate preloads every Tauri AppImage helper through a three-attempt bounded retry,
+an atomic reusable cache, and an exact SHA-256 allowlist. Partial or corrupt
+entries are rejected, retries report the helper and attempt, and persistent or
+changed upstream artifacts fail with deterministic diagnostics instead of being
+silently trusted.
+
+This patch also refreshes the pinned Go runtime dependencies and CodeQL action.
+It changes no consensus rule, AppHash input, transaction type, key encoding,
+fork target, or application version. Existing v11.17 chains upgrade in place.
+
+Container: `ghcr.io/l33tdawg/sage:11.17.13`. SDK 11.17.13.
+
 ## What's New in v11.17.12
 
 **Federation agent sharing now fails safely and explains the real policy.** The
@@ -1322,7 +1347,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.12`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.13`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

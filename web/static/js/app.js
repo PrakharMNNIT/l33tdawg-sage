@@ -55,7 +55,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.12';
+const SAGE_VERSION = 'v11.17.13';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -8858,8 +8858,15 @@ function AgentMemoryRecoveryPanel({ agent, agents, canControl }) {
 }
 
 function AppV23AccessControl() {
+    const {
+        reviewQueueOnly = false,
+        onDirectoryChanged = null,
+        onReviewQueueChanged = null,
+    } = arguments[0] || {};
     const routeQuery = new URLSearchParams((window.location.hash.split('?')[1] || ''));
     const recoveryAgentID = routeQuery.get('recovery') === '1' ? (routeQuery.get('agent') || '') : '';
+    const requestedRemoteChainID = routeQuery.get('remote_chain') || '';
+    const requestedRemoteAgentID = routeQuery.get('remote_agent') || '';
     const [state, setState] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -8920,8 +8927,15 @@ function AppV23AccessControl() {
             const next = appV23NormalizeAccessState(await fetchAppV23Access());
             setState(next);
             setError('');
-            const editable = (next.agents || [])[0];
-            setSelectedID(current => current && (next.agents || []).some(a => a.agent_id === current)
+            const candidates = (next.agents || []).filter(agent => {
+                const pendingEnrollment = agent.needs_approval && !agent.enrollment_active && !agent.needs_reauthorization;
+                return reviewQueueOnly ? pendingEnrollment : !pendingEnrollment;
+            });
+            if (reviewQueueOnly && onReviewQueueChanged) {
+                onReviewQueueChanged(candidates.map(agent => agent.agent_id));
+            }
+            const editable = candidates[0];
+            setSelectedID(current => current && candidates.some(a => a.agent_id === current)
                 ? current
                 : (editable?.agent_id || ''));
         } catch (e) {
@@ -8929,13 +8943,13 @@ function AppV23AccessControl() {
         } finally {
             setLoading(false);
         }
-    }, []);
+    }, [reviewQueueOnly]);
 
     useEffect(() => { load(); }, [load]);
 
     useEffect(() => {
         let cancelled = false;
-        if (state?.linked_readers?.status !== 'ready') {
+        if (reviewQueueOnly || state?.linked_readers?.status !== 'ready') {
             setRemoteCandidates([]);
             setSelectedRemoteKey('');
             return () => { cancelled = true; };
@@ -8993,9 +9007,14 @@ function AppV23AccessControl() {
                 const next = Array.from(discovered.values()).sort((a, b) =>
                     `${a.peer_name}/${a.label}`.localeCompare(`${b.peer_name}/${b.label}`));
                 setRemoteCandidates(next);
-                setSelectedRemoteKey(current => current && next.some(item => item.key === current)
-                    ? current
-                    : (next[0]?.key || ''));
+                const requestedKey = requestedRemoteChainID && requestedRemoteAgentID
+                    ? `${requestedRemoteChainID}\u0000${requestedRemoteAgentID}`
+                    : '';
+                setSelectedRemoteKey(current => requestedKey && next.some(item => item.key === requestedKey)
+                    ? requestedKey
+                    : current && next.some(item => item.key === current)
+                        ? current
+                        : (next[0]?.key || ''));
                 setLinkedError('');
             } catch (e) {
                 if (!cancelled) {
@@ -9006,10 +9025,22 @@ function AppV23AccessControl() {
             }
         })();
         return () => { cancelled = true; };
-    }, [state?.linked_readers?.status]);
+    }, [reviewQueueOnly, state?.linked_readers?.status, requestedRemoteChainID, requestedRemoteAgentID]);
+
+    useEffect(() => {
+        if (!requestedRemoteChainID || !requestedRemoteAgentID || !selectedRemoteKey) return;
+        const frame = requestAnimationFrame(() => {
+            document.querySelector('.v23-linked-readers')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+        return () => cancelAnimationFrame(frame);
+    }, [requestedRemoteChainID, requestedRemoteAgentID, selectedRemoteKey]);
 
     const agents = state?.agents || [];
-    const localAgents = agents;
+    const pendingEnrollmentAgents = agents.filter(agent =>
+        agent.needs_approval && !agent.enrollment_active && !agent.needs_reauthorization);
+    const localAgents = reviewQueueOnly
+        ? pendingEnrollmentAgents
+        : agents.filter(agent => !pendingEnrollmentAgents.some(pending => pending.agent_id === agent.agent_id));
     const selected = localAgents.find(a => a.agent_id === selectedID) || null;
     const selectedRemote = remoteCandidates.find(item => item.key === selectedRemoteKey) || null;
     const selectedRemoteMaxClearance = Number(selectedRemote?.max_clearance ?? 4);
@@ -9221,6 +9252,7 @@ function AppV23AccessControl() {
                 showToast(result.projection_warning, 'info', 10000);
             }
             await load();
+            if (onDirectoryChanged) await onDirectoryChanged();
         } catch (e) {
             if (mutationMayHaveCommitted(e)) {
                 await holdPendingConfirmation(e.message);
@@ -9288,6 +9320,7 @@ function AppV23AccessControl() {
             await removeAgent(selected.agent_id, false);
             showToast('Registration rejected and removed from the review queue.', 'success');
             await load();
+            if (onDirectoryChanged) await onDirectoryChanged();
         } catch (e) {
             showToast(e.message || 'The registration could not be rejected.', 'error', 9000);
         } finally {
@@ -9774,6 +9807,7 @@ function AppV23AccessControl() {
 
     if (loading) return html`<div class="v23-access-loading">Loading consensus access policy…</div>`;
     if (error) return html`<div class="v23-access-banner danger"><strong>Access policy unavailable</strong><span>${error}</span><button class="btn" onClick=${load}>Retry</button></div>`;
+    if (reviewQueueOnly && localAgents.length === 0) return null;
 
     const brokerReady = state?.broker?.available === true;
     const mutationReady = state?.active === true && brokerReady && !saving && !renameBusy && !groupBusy && !pendingConfirmation;
@@ -9800,7 +9834,17 @@ function AppV23AccessControl() {
     };
 
     return html`
-        <section class="v23-access-shell">
+        <section class="v23-access-shell ${reviewQueueOnly ? 'review-queue-only' : ''}">
+            ${reviewQueueOnly && html`
+                <div class="v23-review-queue-heading">
+                    <div>
+                        <div class="v23-eyebrow">Activation queue</div>
+                        <h3>Agents needing review</h3>
+                        <p>These new identities have no access yet. Review, activate, or reject them before they join the active agent directory.</p>
+                    </div>
+                    <span class="v23-review-badge">${localAgents.length} pending</span>
+                </div>
+            `}
             ${!state.active && html`
                 <div class="v23-access-banner warning">
                     <strong>Upgrade required</strong>
@@ -9888,8 +9932,8 @@ function AppV23AccessControl() {
                     }}>
                     <div class="v23-section-heading">
                         <div>
-                            <div class="v23-eyebrow">Local principals</div>
-                            <h3>Agents</h3>
+                            <div class="v23-eyebrow">${reviewQueueOnly ? 'Awaiting activation' : 'Activated principals'}</div>
+                            <h3>${reviewQueueOnly ? 'Review queue' : 'Active agents'}</h3>
                         </div>
                         <span>${localAgents.length}</span>
                     </div>
@@ -9935,7 +9979,7 @@ function AppV23AccessControl() {
                                 : html`<span class="v23-state-chip active">Active</span>`}
                         </button>
                     `)}
-                    ${localAgents.length === 0 && html`<p class="v23-empty">No registered local agents.</p>`}
+                    ${localAgents.length === 0 && html`<p class="v23-empty">No activated local agents.</p>`}
                 </div>
 
                 <div class="v23-policy-panel">
@@ -10608,12 +10652,136 @@ function AppV23AccessControl() {
     `;
 }
 
+function FederatedAgentDirectory() {
+    const [remoteAgents, setRemoteAgents] = useState([]);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const [connectionResponse, inventoryResponse] = await Promise.all([
+                    fedConnections(),
+                    fetchAppV23LinkedReaderIdentities().catch(() => ({ identities: [] })),
+                ]);
+                const connections = Array.isArray(connectionResponse)
+                    ? connectionResponse
+                    : (connectionResponse?.connections || []);
+                const inventory = Array.isArray(inventoryResponse?.identities)
+                    ? inventoryResponse.identities
+                    : [];
+                const discovered = new Map();
+                const addRemote = (connection, agentID, label, source, linkCount = 0) => {
+                    const id = String(agentID || '').trim();
+                    const chain = String(connection?.remote_chain_id || '').trim();
+                    if (!chain || !/^[a-f0-9]{64}$/.test(id)) return;
+                    const key = `${chain}\u0000${id}`;
+                    const prior = discovered.get(key);
+                    discovered.set(key, {
+                        key,
+                        remote_chain_id: chain,
+                        remote_agent_id: id,
+                        label: label || prior?.label || `Agent ${id.slice(0, 8)}`,
+                        peer_name: connection?.peer_name || prior?.peer_name || chain,
+                        source: source || prior?.source || 'advertised',
+                        link_count: Math.max(Number(linkCount || 0), Number(prior?.link_count || 0)),
+                    });
+                };
+
+                await Promise.all(connections.map(async connection => {
+                    if (!connection?.remote_chain_id || connection.status === 'revoked') return;
+                    inventory
+                        .filter(identity => identity.remote_chain_id === connection.remote_chain_id)
+                        .forEach(identity => addRemote(
+                            connection,
+                            identity.remote_agent_id,
+                            `Known linked agent ${String(identity.remote_agent_id || '').slice(0, 8)}`,
+                            'existing_link',
+                            identity.link_count,
+                        ));
+                    try {
+                        const response = await fedPipeContactsGet(connection.remote_chain_id, true);
+                        const contacts = Array.isArray(response?.remote_contacts?.contacts)
+                            ? response.remote_contacts.contacts
+                            : [];
+                        contacts.forEach(contact => addRemote(
+                            connection,
+                            contact.agent_id,
+                            contact.display_name || contact.handle,
+                            'advertised',
+                        ));
+                    } catch (_) {
+                        // A federation connection proves a node, not an ordinary
+                        // remote agent. Only exact advertised or already-linked
+                        // identities belong in this directory.
+                    }
+                }));
+                if (!cancelled) {
+                    setRemoteAgents(Array.from(discovered.values()).sort((left, right) =>
+                        `${left.peer_name}/${left.label}`.localeCompare(`${right.peer_name}/${right.label}`)));
+                }
+            } catch (_) {
+                if (!cancelled) setRemoteAgents([]);
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
+
+    if (loading || remoteAgents.length === 0) return null;
+
+    const openPermissions = agent => {
+        const query = new URLSearchParams({
+            remote_chain: agent.remote_chain_id,
+            remote_agent: agent.remote_agent_id,
+        });
+        window.location.hash = `/access?${query.toString()}`;
+    };
+
+    return html`
+        <section class="federated-agent-directory" aria-labelledby="federated-agent-directory-title">
+            <div class="federated-agent-directory-heading">
+                <div>
+                    <div class="v23-eyebrow">Federated identities</div>
+                    <h3 id="federated-agent-directory-title">From federation</h3>
+                    <p>Agents advertised by connected SAGEs. They are never local members or roles; you may give an exact identity read-only access to selected local Access Groups.</p>
+                </div>
+                <span>${remoteAgents.length}</span>
+            </div>
+            <div class="federated-agent-directory-list">
+                ${remoteAgents.map(agent => html`
+                    <article class="federated-agent-card" key=${agent.key}>
+                        <div class="agent-avatar federated" aria-hidden="true">↗</div>
+                        <div class="federated-agent-card-copy">
+                            <strong>${agent.label}</strong>
+                            <span>${agent.peer_name}</span>
+                            <code title=${`${agent.remote_agent_id}@${agent.remote_chain_id}`}>
+                                ${agent.remote_agent_id.slice(0, 12)}@${agent.remote_chain_id}
+                            </code>
+                        </div>
+                        <span class="v23-state-chip ${agent.link_count > 0 ? 'active' : 'pending'}">
+                            ${agent.link_count > 0
+                                ? `${agent.link_count} linked group${agent.link_count === 1 ? '' : 's'}`
+                                : 'Permissions not set'}
+                        </span>
+                        <button class="btn ${agent.link_count > 0 ? 'ghost' : ''}" onClick=${() => openPermissions(agent)}>
+                            ${agent.link_count > 0 ? 'Manage permissions' : 'Set permissions'}
+                        </button>
+                    </article>
+                `)}
+            </div>
+        </section>
+    `;
+}
+
 // --- Network Page (Accordion) ---
 function NetworkPage({ sse, accessMode = false }) {
     const routeQuery = new URLSearchParams((window.location.hash.split('?')[1] || ''));
     const recoveryAgentID = routeQuery.get('recovery') === '1' ? (routeQuery.get('agent') || '') : '';
     const recoveryDomain = routeQuery.get('recovery') === '1' ? (routeQuery.get('domain') || '') : '';
     const [agents, setAgents] = useState([]);
+    const [pendingReviewIDs, setPendingReviewIDs] = useState([]);
     const [loading, setLoading] = useState(true);
     const [agentQuery, setAgentQuery] = useState('');
     const [agentSort, setAgentSort] = useState('last_seen');
@@ -11274,7 +11442,8 @@ function NetworkPage({ sse, accessMode = false }) {
         const value = Date.parse(agent?.[field] || '');
         return Number.isFinite(value) ? value : 0;
     };
-    const visibleAgents = agents
+    const activeDirectoryAgents = agents.filter(agent => !pendingReviewIDs.includes(agent.agent_id));
+    const visibleAgents = activeDirectoryAgents
         .filter(agent => {
             if (!normalizedAgentQuery) return true;
             return [agentDisplayName(agent), agent?.registered_name, agent?.agent_id, agent?.provider]
@@ -11357,8 +11526,13 @@ function NetworkPage({ sse, accessMode = false }) {
             <div class="network-header">
                 ${accessMode
                     ? html`<div><h2>Access Controls <${HelpTip} text="Review and change each local agent's domain permissions, clearance, and visibility. Access grants are enforced on-chain." /><${PageHelp} section="network" label="Access controls guide" /></h2><div class="network-header-sub">Select an agent to manage its access · ${agents.length} agent${agents.length !== 1 ? 's' : ''} on this node</div></div>`
-                    : html`<div><h2>Agents <${HelpTip} text="Manage the agents on your own SAGE node. Each agent is a separate participant in BFT consensus with its own permissions. Click any agent to expand its details and access. (To connect your whole node to ANOTHER SAGE, use Federation.)" /><${PageHelp} section="network" label="Agents guide" /></h2><div class="network-header-sub">${visibleAgents.length === agents.length ? agents.length : `${visibleAgents.length} of ${agents.length}`} agent${agents.length !== 1 ? 's' : ''} on this node</div></div>`}
+                    : html`<div><h2>Agents <${HelpTip} text="Manage the agents on your own SAGE node. New identities appear in the review queue before activation. Click an active agent to expand its details. (To connect your whole node to ANOTHER SAGE, use Federation.)" /><${PageHelp} section="network" label="Agents guide" /></h2><div class="network-header-sub">${visibleAgents.length === activeDirectoryAgents.length ? activeDirectoryAgents.length : `${visibleAgents.length} of ${activeDirectoryAgents.length}`} active agent${activeDirectoryAgents.length !== 1 ? 's' : ''} on this node</div></div>`}
             </div>
+
+            <${AppV23AccessControl} reviewQueueOnly=${true} onDirectoryChanged=${loadAgents}
+                onReviewQueueChanged=${setPendingReviewIDs} />
+
+            <${FederatedAgentDirectory} />
 
             <div class="agent-directory-toolbar" role="search" aria-label="Find and sort agents">
                 <label class="agent-directory-search">
