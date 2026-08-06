@@ -51,7 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.17.13
+## What's New in v11.17.14
+
+**Bulk domain recovery now completes on idle personal chains.** CEREBRUM keeps
+an explicitly confirmed multi-domain transfer alive across the existing
+50-block governance cooldown, shows the current/required block while consensus
+advances, and stops on every non-cooldown failure. Confirmed batches belong to
+the CEREBRUM session rather than one screen, so operators may navigate away and
+enqueue another transfer behind the active governance job. If an idle CometBFT clock
+rejects the first app-v20 authorization as too far ahead, the server re-signs
+the exact request once against the newly committed chain time; the proof window
+and every consensus authorization check remain unchanged.
+
+**Companion inbox setup now matches the profile’s purpose.** Choosing the
+Companion/voice-bridge preset enables connected-SAGE inbox messaging by default;
+the independent emergency block remains available afterward. If an existing
+agent is blocked, Federation now keeps the warning visible and provides a
+one-click path to that exact agent and inbox switch in Access Controls.
+
+v11.17.14 also contains the v11.17.13 Agents directory and Linux packaging
+changes below; v11.17.13 was never published after its release run was canceled.
+
+## Included from v11.17.13
 
 **New agents now appear where operators expect them.** Agents waiting for first
 approval are separated from activated local principals and shown in a
@@ -74,7 +95,7 @@ This patch also refreshes the pinned Go runtime dependencies and CodeQL action.
 It changes no consensus rule, AppHash input, transaction type, key encoding,
 fork target, or application version. Existing v11.17 chains upgrade in place.
 
-Container: `ghcr.io/l33tdawg/sage:11.17.13`. SDK 11.17.13.
+Container: `ghcr.io/l33tdawg/sage:11.17.14`. SDK 11.17.14.
 
 ## What's New in v11.17.12
 
@@ -1347,7 +1368,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.13`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.14`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

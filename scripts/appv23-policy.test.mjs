@@ -65,6 +65,16 @@ test('Admin and Companion presets remain exact and mutually exclusive', () => {
     });
 });
 
+test('choosing Companion enables its connected-SAGE inbox by default', () => {
+    assert.deepEqual(appV23ProfileDefaults('companion', 'member', 31), {
+        role: 'member', profile: 'companion', capabilities: 15,
+    });
+    assert.equal(
+        appV23FederatedInboxEnabled(appV23ProfileDefaults('companion', 'member', 31).capabilities),
+        true,
+    );
+});
+
 test('Read-only is the explicit reviewed read-all profile without write authority bits', () => {
     assert.deepEqual(
         appV23ProfileDefaults('read_only', 'manager'),

@@ -15,6 +15,7 @@ import { buildUpdateBanner } from './update-banner.js';
 import { computeReorderedColumn, applyColumnOrder } from './task-reorder.js';
 import { normalizeFederationJoinState } from './federation-flow.js';
 import { buildBrainDomainInventory } from './domain-inventory.js';
+import { enqueueGovernedTransfer, runWithGovernanceCooldown } from './governance-retry.js';
 import {
     appV23PolicyDraft,
     appV23NormalizeAccessState,
@@ -55,7 +56,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.13';
+const SAGE_VERSION = 'v11.17.14';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -396,11 +397,17 @@ function MemoryAdoptionResolutionModal({ progress, onProgress, onClose }) {
         setError('');
         setSuccess('');
         try {
-            const result = await reassignDomainOwnership({
-                source_agent_id: reviewed.authority_owner_id,
-                target_agent_id: target.agent_id,
-                domain: ownedDomain,
-            });
+            const queued = enqueueGovernedTransfer(() => runWithGovernanceCooldown(
+                () => reassignDomainOwnership({
+                    source_agent_id: reviewed.authority_owner_id,
+                    target_agent_id: target.agent_id,
+                    domain: ownedDomain,
+                }),
+            ));
+            if (queued.position > 1) {
+                setSuccess(`Domain “${ownedDomain}” is queued behind ${queued.position - 1} confirmed governance ${queued.position === 2 ? 'operation' : 'operations'}. You can leave this screen; the transfer will continue.`);
+            }
+            const result = await queued.promise;
             setSuccess(result.message || `Domain “${ownedDomain}” ownership transferred. Historical authorship and chain history remain unchanged.`);
             setAuthorityDomain('');
             await loadInventory();
@@ -4045,15 +4052,38 @@ function SearchPage() {
     async function handleDomainOwnershipTransfer(targetId) {
         if (!domXfer?.selectedDomain) return;
         const dom = domXfer.selectedDomain.domain;
+        const target = agents.find(candidate => candidate.agent_id === targetId);
+        if (!target) return;
         setXferring(true);
-        try {
-            const res = await reassignDomainOwnership({
+        const confirmed = await showConfirmation(
+            `Transfer current ownership of the whole domain “${dom}” to ${agentDisplayName(target)}?\n\nThis changes control for every memory in that domain, including records not visible or selected here. Existing grants are purged and must be reviewed again. Historical authorship and content do not change.`,
+            { title: 'Transfer whole domain ownership?', confirmLabel: 'Transfer whole domain', tone: 'danger' },
+        );
+        if (!confirmed) {
+            setXferring(false);
+            return;
+        }
+        const transferSnapshot = domXfer;
+        const queued = enqueueGovernedTransfer(() => runWithGovernanceCooldown(
+            () => reassignDomainOwnership({
                 // The server resolves the current chain owner. Memory authorship
                 // is immutable history and must never be guessed as live authority.
                 source_agent_id: '',
                 target_agent_id: targetId,
                 domain: dom,
-            });
+            }),
+        ));
+        setDomXfer(null);
+        setXferring(false);
+        showToast(
+            queued.position > 1
+                ? `Domain “${dom}” is queued as governance transfer #${queued.position}. You can leave this screen.`
+                : `Domain “${dom}” transfer started. You can leave this screen.`,
+            'info',
+            8000,
+        );
+        try {
+            const res = await queued.promise;
             await loadMemories(query, agentFilter, domainFilter, tagFilter);
             const status = res.status || 'ok';
             let msg = res.message || `Domain "${dom}" ownership transferred.`;
@@ -4063,19 +4093,15 @@ function SearchPage() {
             }
             const level = status === 'error' ? 'error' : ((status === 'partial' || legacyGrantDeferred) ? 'warning' : 'success');
             showToast(msg, level, 9000);
-            if (domXfer.fromSelection) {
-                const remaining = (domXfer.domains || []).filter(d => d.domain !== dom);
+            if (transferSnapshot.fromSelection) {
+                const remaining = (transferSnapshot.domains || []).filter(d => d.domain !== dom);
                 if (remaining.length > 0) {
-                    setDomXfer(prev => ({ ...prev, domains: remaining, step: 'domains', selectedDomain: null }));
+                    setDomXfer({ ...transferSnapshot, domains: remaining, step: 'domains', selectedDomain: null });
                 } else {
-                    setDomXfer(null);
                     clearSelection();
                 }
-            } else {
-                setDomXfer(null);
             }
         } catch (e) { showToast('Transfer failed: ' + (e.message || e), 'error'); }
-        setXferring(false);
     }
 
     return html`
@@ -8653,6 +8679,7 @@ function AgentMemoryRecoveryPanel({ agent, agents, canControl }) {
     const [selected, setSelected] = useState(() => new Set());
     const [targetID, setTargetID] = useState('');
     const [busy, setBusy] = useState('');
+    const [transferProgress, setTransferProgress] = useState(null);
 
     const loadMemories = useCallback(async (search = '') => {
         if (!agent?.agent_id) return;
@@ -8747,18 +8774,33 @@ function AgentMemoryRecoveryPanel({ agent, agents, canControl }) {
             { title: 'Transfer domain control?', confirmLabel: 'Transfer domains', tone: 'danger' },
         )) return;
         setBusy('transfer');
+        setTransferProgress({ completed: 0, total: selectedDomains.length, domain: selectedDomains[0], cooldown: null, queued: true, position: 1 });
         let completed = 0;
         try {
-            for (const domain of selectedDomains) {
-                await reassignDomainOwnership({
-                    // Associated-memory authorship is not proof of current
-                    // domain ownership; let the server bind canonical state.
-                    source_agent_id: '',
-                    target_agent_id: targetID,
-                    domain,
-                });
-                completed++;
+            const queued = enqueueGovernedTransfer(async () => {
+                for (const domain of selectedDomains) {
+                    setTransferProgress({ completed, total: selectedDomains.length, domain, cooldown: null, queued: false, position: 0 });
+                    await runWithGovernanceCooldown(
+                        () => reassignDomainOwnership({
+                            // Associated-memory authorship is not proof of current
+                            // domain ownership; let the server bind canonical state.
+                            source_agent_id: '',
+                            target_agent_id: targetID,
+                            domain,
+                        }),
+                        {
+                            onCooldown: cooldown => setTransferProgress({
+                                completed, total: selectedDomains.length, domain, cooldown, queued: false, position: 0,
+                            }),
+                        },
+                    );
+                    completed++;
+                }
+            });
+            if (queued.position > 1) {
+                setTransferProgress({ completed: 0, total: selectedDomains.length, domain: selectedDomains[0], cooldown: null, queued: true, position: queued.position });
             }
+            await queued.promise;
             showToast(`${selectedDomains.length} ${selectedDomains.length === 1 ? 'domain was' : 'domains were'} transferred on-chain.`, 'success', 8000);
             setSelected(new Set());
             await loadMemories(query);
@@ -8769,6 +8811,7 @@ function AgentMemoryRecoveryPanel({ agent, agents, canControl }) {
             await loadMemories(query);
         } finally {
             setBusy('');
+            setTransferProgress(null);
         }
     };
 
@@ -8841,7 +8884,11 @@ function AgentMemoryRecoveryPanel({ agent, agents, canControl }) {
                 <button type="button" class="btn btn-primary"
                     disabled=${!!busy || !canControl || !selectedDomains.length || !targetID}
                     onClick=${transferSelectedDomains}>
-                    ${busy === 'transfer' ? 'Transferring…' : selectedDomains.length
+                    ${busy === 'transfer' ? (transferProgress?.queued
+                        ? `Queued transfer · #${transferProgress.position}`
+                        : transferProgress?.cooldown
+                        ? `Governance cooldown · block ${transferProgress.cooldown.current}/${transferProgress.cooldown.until}`
+                        : `Transferring ${Math.min((transferProgress?.completed || 0) + 1, transferProgress?.total || 1)}/${transferProgress?.total || selectedDomains.length}…`) : selectedDomains.length
                         ? `Transfer ${selectedDomains.length} selected domain${selectedDomains.length === 1 ? '' : 's'}`
                         : 'Transfer selected domains'}
                 </button>
@@ -8864,13 +8911,14 @@ function AppV23AccessControl() {
         onReviewQueueChanged = null,
     } = arguments[0] || {};
     const routeQuery = new URLSearchParams((window.location.hash.split('?')[1] || ''));
-    const recoveryAgentID = routeQuery.get('recovery') === '1' ? (routeQuery.get('agent') || '') : '';
+    const requestedLocalAgentID = routeQuery.get('agent') || '';
+    const focusFederatedInbox = routeQuery.get('inbox') === '1';
     const requestedRemoteChainID = routeQuery.get('remote_chain') || '';
     const requestedRemoteAgentID = routeQuery.get('remote_agent') || '';
     const [state, setState] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
-    const [selectedID, setSelectedID] = useState(recoveryAgentID);
+    const [selectedID, setSelectedID] = useState(requestedLocalAgentID);
     const [draft, setDraft] = useState(null);
     const [displayNameDraft, setDisplayNameDraft] = useState('');
     const [renameBusy, setRenameBusy] = useState(false);
@@ -8919,8 +8967,16 @@ function AppV23AccessControl() {
     const legacyModel = loadAgentGroups();
 
     useEffect(() => {
-        if (recoveryAgentID) setSelectedID(recoveryAgentID);
-    }, [recoveryAgentID]);
+        if (requestedLocalAgentID) setSelectedID(requestedLocalAgentID);
+    }, [requestedLocalAgentID]);
+
+    useEffect(() => {
+        if (!focusFederatedInbox || !requestedLocalAgentID || selectedID !== requestedLocalAgentID || !draft) return;
+        const timer = setTimeout(() => {
+            document.getElementById('v23-federated-inbox-label')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 0);
+        return () => clearTimeout(timer);
+    }, [focusFederatedInbox, requestedLocalAgentID, selectedID, draft?.capabilities]);
 
     const load = useCallback(async () => {
         try {
@@ -16314,6 +16370,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 	const [remotePipeKnown, setRemotePipeKnown] = useState(false);
 	const [pipeContactBusy, setPipeContactBusy] = useState('');
 	const [pipeContactErr, setPipeContactErr] = useState('');
+	const [pipeContactPolicyBlock, setPipeContactPolicyBlock] = useState(null);
 	const [localAgentDirectory, setLocalAgentDirectory] = useState(null);
 	const [localAgentDirectoryErr, setLocalAgentDirectoryErr] = useState('');
 	const [selectedLocalAgentID, setSelectedLocalAgentID] = useState('');
@@ -16743,7 +16800,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 		const selectedAgent = (Array.isArray(localAgentDirectory) ? localAgentDirectory : [])
 			.find(agent => agent && agent.agent_id === agentID);
 		const selectedName = selectedAgent ? fedFriendlyLocalAgentLabel(selectedAgent).split(' · ')[0] : 'That agent';
-		setPipeContactLookupBusy(true); setPipeContactLookupStatus(`Checking ${selectedName}'s shared-domain access…`); setPipeContactErr('');
+		setPipeContactLookupBusy(true); setPipeContactLookupStatus(`Checking ${selectedName}'s shared-domain access…`); setPipeContactErr(''); setPipeContactPolicyBlock(null);
 		try {
 			const currentDirectoryResponse = await fetchAgents();
 			const currentDirectory = Array.isArray(currentDirectoryResponse && currentDirectoryResponse.agents)
@@ -16758,7 +16815,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 			}
 			if (!appV23FederatedInboxEnabled(currentAgent.capabilities)) {
 				setPipeContactLookupStatus('');
-				setPipeContactErr(`${selectedName} has federated inbox messaging blocked. Enable “Allow messages from connected SAGEs” for this agent in Access Controls, save the policy, then choose it again.`);
+				setPipeContactPolicyBlock({ agentID, selectedName });
 				return;
 			}
 			let result = await fedPipeContactsGet(chain, false, agentID);
@@ -17043,6 +17100,14 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 					})}
 				</div>
 			</div>
+			${pipeContactPolicyBlock && html`
+				<div class="fed-err fed-perm-error fed-agent-policy-block" role="alert">
+					<span><strong>${pipeContactPolicyBlock.selectedName} has connected-SAGE inbox messaging blocked.</strong> Enable its inbox in Access Controls, save the policy, then choose it again here.</span>
+					<button type="button" class="btn" onClick=${() => {
+						window.location.hash = `#/access?agent=${encodeURIComponent(pipeContactPolicyBlock.agentID)}&inbox=1`;
+					}}>Open this agent’s inbox setting</button>
+				</div>
+			`}
 			${pipeContactErr && html`<div class="fed-err fed-perm-error" role="alert">${pipeContactErr}</div>`}
 		</section>`}
 

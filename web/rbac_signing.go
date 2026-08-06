@@ -90,6 +90,34 @@ func (h *DashboardHandler) embedConsensusTimedGovernanceProof(ptx *tx.ParsedTx, 
 	return embedDashboardGovernanceProofAt(ptx, operatorKey, method, path, body, proofTime)
 }
 
+const governanceProofAheadOfConsensus = "app-v20 governance proof timestamp is more than 5 minutes ahead of consensus time"
+
+// retryGovernanceProofAtCommittedTime repairs the one honest race exposed by
+// an idle single-validator chain. The rejected proposal mutates no consensus
+// state, but its block gives us the clock the next proof must bind to.
+func (h *DashboardHandler) retryGovernanceProofAtCommittedTime(
+	ptx *tx.ParsedTx,
+	operatorKey ed25519.PrivateKey,
+	method string,
+	path string,
+	body []byte,
+	broadcastErr error,
+) (bool, error) {
+	if broadcastErr == nil || !strings.Contains(broadcastErr.Error(), governanceProofAheadOfConsensus) {
+		return false, nil
+	}
+	consensusTime, err := latestConsensusTimeWeb(h.CometBFTRPC)
+	if err != nil {
+		return true, fmt.Errorf("read committed consensus time after rejected proof: %w", err)
+	}
+	if err := embedDashboardGovernanceProofAt(
+		ptx, operatorKey, method, path, body, consensusTime,
+	); err != nil {
+		return true, fmt.Errorf("re-sign governance proof at committed time: %w", err)
+	}
+	return true, nil
+}
+
 // This file is the commit-confirmed signing/broadcast plumbing for the v11.3
 // RBAC reassign + access-control flow. The existing dashboard broadcast path
 // (broadcastTxSync) is fire-and-forget: it cannot confirm a tx executed or

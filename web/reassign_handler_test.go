@@ -389,7 +389,7 @@ func TestReassignDomainOwnershipAlreadyOwnedIsIdempotent(t *testing.T) {
 	assert.Zero(t, broadcasts.Load())
 }
 
-func TestReassignDomainOwnershipPostAppV20AfterIdleUsesFreshChainBoundOperatorProof(t *testing.T) {
+func TestReassignDomainOwnershipPostAppV20AfterIdleRetriesAtCommittedChainTime(t *testing.T) {
 	h, agentStore := newTestHandler(t)
 	badgerStore := newGrantTestBadger(t)
 	_, adminKey, err := ed25519.GenerateKey(nil)
@@ -411,6 +411,7 @@ func TestReassignDomainOwnershipPostAppV20AfterIdleUsesFreshChainBoundOperatorPr
 
 	idleBlockTime := time.Now().Add(-6 * time.Minute)
 	var captured []*tx.ParsedTx
+	var broadcasts int
 	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/status" {
 			_, _ = fmt.Fprintf(w, `{"result":{"sync_info":{"latest_block_time":%q}}}`, idleBlockTime.Format(time.RFC3339Nano))
@@ -422,6 +423,12 @@ func TestReassignDomainOwnershipPostAppV20AfterIdleUsesFreshChainBoundOperatorPr
 		parsed, decodeErr := tx.DecodeTx(encoded)
 		require.NoError(t, decodeErr)
 		captured = append(captured, parsed)
+		broadcasts++
+		if broadcasts == 1 {
+			_, _ = fmt.Fprintf(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":109,"log":%q},"hash":"REJECTED","height":"42"}}`,
+				"agent proof rejected: "+governanceProofAheadOfConsensus)
+			return
+		}
 		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0,"log":"purged 1 grants"},"hash":"ABC123","height":"42"}}`)
 	}))
 	t.Cleanup(rpc.Close)
@@ -461,15 +468,19 @@ func TestReassignDomainOwnershipPostAppV20AfterIdleUsesFreshChainBoundOperatorPr
 	var result map[string]any
 	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &result))
 	assert.Equal(t, "ok", result["status"])
-	require.Len(t, captured, 3, "single-validator post-app-v20 propose auto-votes; only propose, reassign, and grant broadcast")
+	require.Len(t, captured, 4, "the rejected idle-clock proposal is retried once before reassign and grant")
 
-	propose := captured[0]
+	firstPropose := captured[0]
+	require.Equal(t, tx.TxTypeGovPropose, firstPropose.Type)
+	assert.Greater(t, firstPropose.AgentTimestamp, idleBlockTime.Add(governanceProofClockSkew).Unix(),
+		"the first attempt uses the current host clock")
+	propose := captured[1]
 	require.Equal(t, tx.TxTypeGovPropose, propose.Type)
 	assert.Equal(t, []byte(validatorKey.Public().(ed25519.PublicKey)), []byte(propose.PublicKey))
 	assert.Equal(t, []byte(adminKey.Public().(ed25519.PublicKey)), []byte(propose.AgentPubKey))
 	assert.Len(t, propose.AgentNonce, 8)
-	assert.Greater(t, propose.AgentTimestamp, idleBlockTime.Add(governanceProofClockSkew).Unix(),
-		"a transfer after an idle period must sign a newly fresh proof")
+	assert.Equal(t, idleBlockTime.Unix(), propose.AgentTimestamp,
+		"the retry must bind the exact newly committed consensus clock")
 	assert.True(t, bytes.HasPrefix(propose.AgentRequest, []byte("POST /v1/governance/propose\n")))
 	var proofBody map[string]any
 	require.NoError(t, json.Unmarshal(
@@ -481,7 +492,7 @@ func TestReassignDomainOwnershipPostAppV20AfterIdleUsesFreshChainBoundOperatorPr
 	assert.Equal(t, "domain_reassign", proofBody["operation"])
 	assert.Equal(t, "quiettype-pages", proofBody["target_id"])
 
-	reassign := captured[1]
+	reassign := captured[2]
 	require.Equal(t, tx.TxTypeDomainReassign, reassign.Type)
 	assert.Equal(t, []byte(adminKey.Public().(ed25519.PublicKey)), []byte(reassign.PublicKey))
 	assert.Empty(t, reassign.DomainReassign.ExpectedOwnerID,
@@ -492,7 +503,7 @@ func TestReassignDomainOwnershipPostAppV20AfterIdleUsesFreshChainBoundOperatorPr
 		reassign.DomainReassign.ProposalID,
 	)
 
-	grant := captured[2]
+	grant := captured[3]
 	require.Equal(t, tx.TxTypeAccessGrant, grant.Type)
 	assert.Equal(t, []byte(targetKey.Public().(ed25519.PublicKey)), []byte(grant.PublicKey))
 	assert.Equal(t, targetID, grant.AccessGrant.GranteeID)

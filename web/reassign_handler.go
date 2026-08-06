@@ -744,13 +744,15 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 		}
 		proposerKey := adminKey
 		proposerID := adminID
+		var proofBody []byte
 		if postAppV20 {
 			validatorID, governanceDomain, contextErr := h.dashboardGovernanceAuthorizationContext()
 			if contextErr != nil {
 				fail(http.StatusServiceUnavailable, "propose", contextErr.Error())
 				return
 			}
-			proofBody, proofBodyErr := json.Marshal(struct {
+			var proofBodyErr error
+			proofBody, proofBodyErr = json.Marshal(struct {
 				ValidatorID      string `json:"validator_id"`
 				GovernanceDomain string `json:"governance_domain"`
 				Operation        string `json:"operation"`
@@ -789,6 +791,18 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 			}
 		}
 		proposeHash, height, _, pErr := h.signAndBroadcastCommit(proposeTx, proposerKey)
+		if pErr != nil && postAppV20 {
+			retry, retryErr := h.retryGovernanceProofAtCommittedTime(
+				proposeTx, adminKey, http.MethodPost, "/v1/governance/propose", proofBody, pErr,
+			)
+			if retryErr != nil {
+				fail(http.StatusBadGateway, "propose", retryErr.Error())
+				return
+			}
+			if retry {
+				proposeHash, height, _, pErr = h.signAndBroadcastCommit(proposeTx, proposerKey)
+			}
+		}
 		if pErr != nil {
 			fail(http.StatusBadGateway, "propose", pErr.Error())
 			return

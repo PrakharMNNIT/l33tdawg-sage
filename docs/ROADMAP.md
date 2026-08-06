@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.13 is the current release.** This corrective release moves first-approval identities into a conditional Agents review queue, keeps Access Controls focused on activated local principals, adds an exact-identity From federation directory with a safe path to read-only Linked-reader permissions, and makes Tauri AppImage helper acquisition bounded, cached, atomic, and SHA-256 verified. It retains v11.17.12's federated-inbox preflight and responsive Tasks fixes. Governed app-v26 adds explicit per-group `read`, `read_write`, and `read_write_modify` authority without weakening owner control or federated read-only isolation. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 through app-v26 replay and state-sync checks, and the native-shell productization bridge spans v11.11–v11.17.
+**Status (2026-08):** **v11.17.14 is the current release.** This corrective release makes confirmed multi-domain recovery complete across the existing governance cooldown on idle personal chains and repairs the honest idle-clock proof race without relaxing consensus validation. It also moves first-approval identities into a conditional Agents review queue, keeps Access Controls focused on activated local principals, adds an exact-identity From federation directory with a safe path to read-only Linked-reader permissions, and makes Tauri AppImage helper acquisition bounded, cached, atomic, and SHA-256 verified. Governed app-v26 remains unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -42,6 +42,15 @@ exact ordinary agents advertised by connected SAGEs appear under From
 federation with their read-only Linked-reader state. The Linux native preview
 gate also preloads Tauri's AppImage helpers through a bounded SHA-256-verified
 cache, closing [#134](https://github.com/l33tdawg/sage/issues/134).
+
+v11.17.14 keeps an explicitly confirmed bulk ownership transfer running across
+the 50-block proposer cooldown on idle single-validator chains, exposes live
+block progress, retains the job across CEREBRUM route changes, serializes later
+confirmed transfers behind it, and retries the narrow idle-clock authorization race once using
+the newly committed consensus time. Other governance and authorization errors
+still fail closed. Companion/voice-bridge presets now default their connected-SAGE
+inbox to enabled, while an existing policy block stays visible in Federation
+with a deep link to the exact agent setting. v11.17.13 was not published.
 
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:

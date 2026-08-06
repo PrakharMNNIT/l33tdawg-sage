@@ -112,7 +112,10 @@ export function appV23ProfileDefaults(profile, role, currentCapabilities = 0) {
         return {
             profile,
             role: 'member',
-            capabilities: 15 | federatedPipeRestriction,
+            // A companion/voice bridge exists to receive work. Choosing this
+            // preset is an explicit reset to the useful default; an operator
+            // can still apply the independent emergency inbox block afterward.
+            capabilities: 15,
         };
     }
     if (profile === 'read_only') {
