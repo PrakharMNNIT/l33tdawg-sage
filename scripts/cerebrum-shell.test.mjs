@@ -272,6 +272,54 @@ test('Access Controls is a first-class sidebar route', () => {
     );
 });
 
+test('pending agent activation is surfaced on Agents and excluded from Access Controls', () => {
+    const access = appSource.slice(
+        appSource.indexOf('function AppV23AccessControl()'),
+        appSource.indexOf('function NetworkPage('),
+    );
+    const agentsPage = appSource.slice(
+        appSource.indexOf('function NetworkPage('),
+        appSource.indexOf('function RemoteAccessWizard('),
+    );
+    assert.match(access, /reviewQueueOnly \? pendingEnrollment : !pendingEnrollment/);
+    assert.match(access, /Agents needing review/);
+    assert.match(access, /if \(reviewQueueOnly && localAgents\.length === 0\) return null/,
+        'the review section must disappear when there is nothing to review');
+    assert.match(agentsPage, /<\$\{AppV23AccessControl\} reviewQueueOnly=\$\{true\}/,
+        'the activation queue belongs at the top of Agents');
+    assert.ok(
+        agentsPage.indexOf('reviewQueueOnly=${true}') < agentsPage.indexOf('agent-directory-toolbar'),
+        'the conditional review queue must render before the active agent directory',
+    );
+    assert.match(agentsPage, /activeDirectoryAgents = agents\.filter\(agent => !pendingReviewIDs\.includes\(agent\.agent_id\)\)/,
+        'pending identities must not be duplicated in the active directory');
+});
+
+test('Agents has a separate exact-identity directory for federated agents', () => {
+    const federated = appSource.slice(
+        appSource.indexOf('function FederatedAgentDirectory()'),
+        appSource.indexOf('function NetworkPage('),
+    );
+    const agentsPage = appSource.slice(
+        appSource.indexOf('function NetworkPage('),
+        appSource.indexOf('function RemoteAccessWizard('),
+    );
+    assert.match(federated, /<h3 id="federated-agent-directory-title">From federation<\/h3>/);
+    assert.match(federated, /fedPipeContactsGet\(connection\.remote_chain_id, true\)/,
+        'new remote identities must come from authenticated contact discovery');
+    assert.match(federated, /fetchAppV23LinkedReaderIdentities\(\)/,
+        'already configured remote identities must remain visible while offline');
+    assert.doesNotMatch(federated, /peer_agent_id/,
+        'a federation transport or ceremony principal must never be cast as an ordinary remote agent');
+    assert.match(federated, /Permissions not set/);
+    assert.match(federated, /remote_chain: agent\.remote_chain_id[\s\S]*remote_agent: agent\.remote_agent_id/,
+        'permission setup must preserve the exact remote chain and agent identity');
+    assert.ok(
+        agentsPage.indexOf('<${FederatedAgentDirectory} />') < agentsPage.indexOf('agent-directory-toolbar'),
+        'federated identities must be categorized before the active local directory',
+    );
+});
+
 test('CEREBRUM Root is separate from agents and uses a two-stage one-time handover', () => {
     const access = appSource.slice(
         appSource.indexOf('function AppV23AccessControl()'),

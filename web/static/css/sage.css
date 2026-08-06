@@ -6511,6 +6511,93 @@ input[type="range"]::-moz-range-thumb {
 .v23-state-chip.active { background: var(--success-tint); color: var(--accent); }
 .v23-state-chip.pending,
 .v23-review-badge { background: var(--warning-tint); color: var(--warning); }
+
+.v23-access-shell.review-queue-only {
+    border-color: rgba(245, 158, 11, .35);
+    margin-bottom: 22px;
+}
+.v23-review-queue-heading {
+    align-items: flex-start;
+    display: flex;
+    gap: 18px;
+    justify-content: space-between;
+    padding: 20px 22px 0;
+}
+.v23-review-queue-heading h3 { margin: 2px 0 6px; }
+.v23-review-queue-heading p {
+    color: var(--text-muted);
+    font-size: 12px;
+    margin: 0;
+    max-width: 680px;
+}
+.v23-access-shell.review-queue-only .v23-access-legend,
+.v23-access-shell.review-queue-only .v23-groups-section,
+.v23-access-shell.review-queue-only .v23-root-card,
+.v23-access-shell.review-queue-only .v23-linked-readers,
+.v23-access-shell.review-queue-only .v23-linked-messages {
+    display: none;
+}
+.federated-agent-directory {
+    background: var(--bg-card);
+    border: 1px solid rgba(34, 211, 238, .28);
+    border-radius: 14px;
+    margin-bottom: 22px;
+    overflow: hidden;
+}
+.federated-agent-directory-heading {
+    align-items: flex-start;
+    display: flex;
+    gap: 18px;
+    justify-content: space-between;
+    padding: 20px 22px 14px;
+}
+.federated-agent-directory-heading h3 { margin: 2px 0 6px; }
+.federated-agent-directory-heading p {
+    color: var(--text-muted);
+    font-size: 12px;
+    margin: 0;
+    max-width: 760px;
+}
+.federated-agent-directory-heading > span {
+    background: rgba(34, 211, 238, .1);
+    border-radius: 999px;
+    color: #22d3ee;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 5px 10px;
+}
+.federated-agent-directory-list { border-top: 1px solid var(--border); }
+.federated-agent-card {
+    align-items: center;
+    display: grid;
+    gap: 14px;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    padding: 14px 18px;
+}
+.federated-agent-card + .federated-agent-card { border-top: 1px solid var(--border); }
+.federated-agent-card .agent-avatar.federated {
+    color: #22d3ee;
+    font-size: 20px;
+}
+.federated-agent-card-copy {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.federated-agent-card-copy > span { color: var(--text-muted); font-size: 12px; }
+.federated-agent-card-copy code {
+    color: var(--text-dim);
+    font-size: 10px;
+    margin-top: 3px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+@media (max-width: 760px) {
+    .federated-agent-card { grid-template-columns: auto minmax(0, 1fr); }
+    .federated-agent-card > .v23-state-chip,
+    .federated-agent-card > .btn { grid-column: 2; justify-self: start; }
+}
 .v23-policy-panel { min-width: 0; padding: 18px; }
 .v23-policy-title {
     align-items: flex-start;
