@@ -37,5 +37,6 @@ cargo build --locked --release --manifest-path "${MANIFEST}"
 # in the working tree, while CI's package job exercises the real bundle path.
 scripts/stage-native-shell-daemon.sh "$(rustc -vV | sed -n 's/^host: //p')"
 scripts/verify-native-shell-bundle.test.sh
+scripts/prepare-tauri-appimage-tools.test.sh
 
 bash -n scripts/acceptance-endpoint-guard.sh
