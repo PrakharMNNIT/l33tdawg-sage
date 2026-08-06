@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.14 is the current release.** This corrective release makes confirmed multi-domain recovery complete across the existing governance cooldown on idle personal chains and repairs the honest idle-clock proof race without relaxing consensus validation. It also moves first-approval identities into a conditional Agents review queue, keeps Access Controls focused on activated local principals, adds an exact-identity From federation directory with a safe path to read-only Linked-reader permissions, and makes Tauri AppImage helper acquisition bounded, cached, atomic, and SHA-256 verified. Governed app-v26 remains unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
+**Status (2026-08):** **v11.17.15 is the current release.** This corrective release makes blank writable-agent approvals atomically generate a readable name-based home domain with a cryptographically random suffix. It also completes confirmed multi-domain recovery across the existing governance cooldown on idle personal chains, repairs the honest idle-clock proof race without relaxing consensus validation, moves first-approval identities into Agents, adds an exact-identity From federation directory, and hardens Tauri AppImage helper acquisition. Governed app-v26 remains unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -43,14 +43,16 @@ federation with their read-only Linked-reader state. The Linux native preview
 gate also preloads Tauri's AppImage helpers through a bounded SHA-256-verified
 cache, closing [#134](https://github.com/l33tdawg/sage/issues/134).
 
-v11.17.14 keeps an explicitly confirmed bulk ownership transfer running across
+v11.17.15 keeps an explicitly confirmed bulk ownership transfer running across
 the 50-block proposer cooldown on idle single-validator chains, exposes live
 block progress, retains the job across CEREBRUM route changes, serializes later
 confirmed transfers behind it, and retries the narrow idle-clock authorization race once using
 the newly committed consensus time. Other governance and authorization errors
 still fail closed. Companion/voice-bridge presets now default their connected-SAGE
 inbox to enabled, while an existing policy block stays visible in Federation
-with a deep link to the exact agent setting. v11.17.13 was not published.
+with a deep link to the exact agent setting. It also generates a unique
+name-based home domain when a writable pending-agent approval leaves that field
+blank. v11.17.13 and the superseded v11.17.14 tag were not published.
 
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:

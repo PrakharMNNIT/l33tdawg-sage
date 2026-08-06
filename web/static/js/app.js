@@ -56,7 +56,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.14';
+const SAGE_VERSION = 'v11.17.15';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -9872,11 +9872,10 @@ function AppV23AccessControl() {
     const homeReapproval = appV23NeedsHomeReapproval(selected, draft);
     const legacyHomeReapproval = legacyProfileNeedsReview && homeReapproval;
     const targetConsentReady = (!selected?.needs_approval && !homeReapproval) || selected?.local_key_available;
-    const homeReapprovalReady = !homeReapproval || !!draft?.home_domain?.trim();
     const adminLocalReady = draft?.role !== 'admin' || selected?.local_key_available;
     const policyDirty = !!selected && !!draft && appV23PolicyChanged(selected, draft);
     const policyCommitNeeded = !!selected?.needs_approval || homeReapproval || policyDirty;
-    const saveDisabled = saving || !mutationReady || !targetConsentReady || !homeReapprovalReady ||
+    const saveDisabled = saving || !mutationReady || !targetConsentReady ||
         !adminLocalReady || !draft || !draftProfileSelectable || !policyCommitNeeded;
     const capabilityIndicators = appV23CapabilityIndicators(draft || {});
     const federatedInboxEnabled = appV23FederatedInboxEnabled(draft?.capabilities);
@@ -10175,8 +10174,8 @@ function AppV23AccessControl() {
                                     <input value=${draft.home_domain}
                                         disabled=${saving}
                                         onInput=${e => mutateDraft({ home_domain: e.target.value })}
-                                        placeholder="agent-home-domain" />
-                                    <small>Created atomically if it is unowned; never reassigned from another agent.</small>
+                                        placeholder="Generated from agent name if blank" />
+                                    <small>Leave blank to create a unique domain from the agent name, or enter an unowned domain. It is never reassigned from another agent.</small>
                                 </label>
                             `}
                         </div>`}
@@ -10209,10 +10208,8 @@ function AppV23AccessControl() {
                                         ? 'Select Standard, Companion, or Read-only'
                                     : !targetConsentReady
                                         ? 'Target consent key unavailable'
-                                        : !homeReapprovalReady
-                                            ? 'Owned home domain required for this preset'
-                                        : !adminLocalReady
-                                            ? 'Admin promotion requires this machine’s exact agent key'
+                                    : !adminLocalReady
+                                        ? 'Admin promotion requires this machine’s exact agent key'
                                         : !policyCommitNeeded
                                             ? 'No unsaved policy changes'
                                             : 'Unsaved changes · applied only after consensus commit'}</span>

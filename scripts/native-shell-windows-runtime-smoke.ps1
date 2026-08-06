@@ -401,7 +401,11 @@ try {
     Assert-True (-not $first.HasExited) 'primary native shell exited during second-instance handoff'
 
     Assert-True ($first.CloseMainWindow()) 'installed shell did not expose a closeable main window'
-    Assert-True ($first.WaitForExit(10000)) 'installed shell did not exit after normal window close'
+    # windows-2025 may spend more than ten seconds draining WebView2 after the
+    # close event even though Tauri has accepted the normal main-window exit.
+    # Keep this as a real graceful-exit assertion; cleanup force-kills remain
+    # failure-only and cannot satisfy the lifecycle evidence.
+    Assert-True ($first.WaitForExit(30000)) 'installed shell did not exit after normal window close'
     $daemonOnly = Get-ReadyStatusResult $pipeName $origin $ExpectedVersion
     Assert-True ($daemonOnly.Status.instance_generation -ceq $firstGeneration) 'window close changed the daemon generation'
     Assert-True ($daemonOnly.ServerPid -eq $firstResult.ServerPid) 'window close changed the daemon PID'
@@ -449,7 +453,7 @@ try {
     Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $nodeDataRoot 'preserve.sentinel')) -ceq 'native-shell-uninstall-preservation') 'reinstall modified SAGE_HOME'
 
     Assert-True ($reinstalled.CloseMainWindow()) 'reinstalled native shell did not expose a closeable main window'
-    Assert-True ($reinstalled.WaitForExit(10000)) 'reinstalled native shell did not exit after normal window close'
+    Assert-True ($reinstalled.WaitForExit(30000)) 'reinstalled native shell did not exit after normal window close'
     Assert-True (-not $reinstallDaemon.HasExited) 'reinstalled bundled daemon did not survive normal shell close'
     Stop-LaunchedTree $reinstallDaemon $daemonPath 'reinstalled bundled daemon'
     Wait-PipeGone $pipeName
