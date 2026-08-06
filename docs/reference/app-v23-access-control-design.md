@@ -1,6 +1,6 @@
 # App-v23 Access Control and Federation Design
 
-Status: implementation contract through SAGE v11.17.14.
+Status: implementation contract through SAGE v11.17.15.
 
 This document fixes the security and product invariants for app-v23. It is not
 permission to weaken an invariant to preserve app-v22 runtime behavior.
@@ -343,6 +343,12 @@ principal. Approval is one commit-confirmed operation combining:
 - clearance;
 - owned non-shared home-domain creation or explicit transfer; and
 - expected revision bindings.
+
+The dashboard may leave the writable agent's home-domain field blank. The
+approval handler then derives a readable ASCII slug from the agent's committed
+name, appends a cryptographically random suffix, and signs that generated
+domain into the same atomic approval. A supplied non-shared domain remains
+exact and is never replaced by the fallback.
 
 When local CEREBRUM generates a new agent, it must durably store the target
 seed and recovery bundle before submitting that target's self-signed

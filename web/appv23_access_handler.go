@@ -180,6 +180,38 @@ func appV23PolicyNeedsHomeReapproval(
 		nextProfile != store.AppV23ProfileReadOnly
 }
 
+func appV23GeneratedHomeDomain(agentName string) (string, error) {
+	var slug strings.Builder
+	lastSeparator := false
+	for _, c := range strings.ToLower(strings.TrimSpace(agentName)) {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			if slug.Len() < 48 {
+				slug.WriteRune(c)
+			}
+			lastSeparator = false
+		default:
+			if slug.Len() > 0 && slug.Len() < 48 && !lastSeparator {
+				slug.WriteByte('-')
+				lastSeparator = true
+			}
+		}
+	}
+	base := strings.Trim(slug.String(), "-")
+	if base == "" {
+		base = "agent"
+	}
+	nonce := make([]byte, 6)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", errors.New("could not generate a unique agent home domain")
+	}
+	domain := fmt.Sprintf("agent-%s-%s", base, hex.EncodeToString(nonce))
+	if err := store.ValidateAppV23DomainName(domain); err != nil {
+		return "", fmt.Errorf("generated agent home domain is invalid: %w", err)
+	}
+	return domain, nil
+}
+
 // handleAppV26AgentDisplayName gives the local human operator a governed way
 // to change only an agent's mutable display label. The registered name,
 // agent_id, and boot bio are copied from current consensus state and cannot be
@@ -1043,10 +1075,24 @@ func (h *DashboardHandler) handleAppV23AgentPolicy() http.HandlerFunc {
 			} else {
 				mode = "approve"
 			}
-			if req.Profile != store.AppV23ProfileReadOnly &&
-				(req.HomeDomain == "" || store.IsSharedDomainName(req.HomeDomain)) {
+			if req.Profile != store.AppV23ProfileReadOnly && req.HomeDomain == "" {
+				agent, agentErr := h.BadgerStore.GetRegisteredAgent(agentID)
+				if agentErr != nil || agent == nil {
+					writeAppV23AccessError(w, http.StatusInternalServerError, "agent_state_unavailable",
+						"Could not load the registered agent name for home-domain creation.")
+					return
+				}
+				generated, generatedErr := appV23GeneratedHomeDomain(agent.Name)
+				if generatedErr != nil {
+					writeAppV23AccessError(w, http.StatusInternalServerError, "home_domain_generation_failed",
+						"Could not generate a unique owned home domain for this agent.")
+					return
+				}
+				req.HomeDomain = generated
+			}
+			if req.Profile != store.AppV23ProfileReadOnly && store.IsSharedDomainName(req.HomeDomain) {
 				writeAppV23AccessError(w, http.StatusBadRequest, "home_domain_required",
-					"Approval or migration-profile review requires a non-shared home domain owned by this local agent.")
+					"Approval or migration-profile review requires a non-shared home domain owned by this local agent. Leave it blank to generate one automatically.")
 				return
 			}
 			if h.ResolveAgentKeyFn == nil {
@@ -1153,6 +1199,7 @@ func (h *DashboardHandler) handleAppV23AgentPolicy() http.HandlerFunc {
 			"reconciled":         reconciled,
 			"projection_ready":   projectionReady,
 			"projection_warning": projectionWarning,
+			"home_domain":        req.HomeDomain,
 		})
 	}
 }

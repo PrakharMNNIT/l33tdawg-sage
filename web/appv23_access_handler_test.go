@@ -294,6 +294,46 @@ func TestAppV23PolicyApprovalUsesCommittedRootAndTargetConsent(t *testing.T) {
 	))
 }
 
+func TestAppV23PolicyApprovalGeneratesNamedRandomHomeDomainWhenBlank(t *testing.T) {
+	fixture := newAppV23AccessFixture(t)
+	_, pendingKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	pendingID := agentIDForKey(pendingKey)
+	require.NoError(t, fixture.badger.RegisterAgentWithCapabilities(
+		pendingID, "Claude Code / Sage Voice Bridge", store.AppV23RoleMember, "", "", "", 2, 30,
+	))
+
+	var captured *tx.ParsedTx
+	var calls atomic.Int32
+	rpc := newGrantRPC(t, &captured, &calls)
+	defer rpc.Close()
+	h := appV23AccessTestHandler(fixture, rpc.URL, map[string]ed25519.PrivateKey{pendingID: pendingKey})
+	req := appV23AccessRequest(t, http.MethodPut, "/v1/dashboard/network/access/agents/"+pendingID+"/policy", "id", pendingID, map[string]any{
+		"role": "member", "profile": "companion", "home_domain": "",
+		"clearance": 1, "capabilities": 15,
+	})
+	req = appV23AccessAs(req, fixture.rootID)
+	rec := httptest.NewRecorder()
+	h.handleAppV23AgentPolicy().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NotNil(t, captured)
+	require.NotNil(t, captured.LocalAgentApprove)
+	home := captured.LocalAgentApprove.HomeDomain
+	const prefix = "agent-claude-code-sage-voice-bridge-"
+	require.True(t, strings.HasPrefix(home, prefix), home)
+	suffix := strings.TrimPrefix(home, prefix)
+	require.Len(t, suffix, 12)
+	_, err = hex.DecodeString(suffix)
+	require.NoError(t, err)
+	assert.Contains(t, rec.Body.String(), `"home_domain":"`+home+`"`)
+	assert.True(t, ed25519.Verify(
+		pendingKey.Public().(ed25519.PublicKey),
+		tx.LocalAgentApprovalSignBytes(fixture.rootID, captured.LocalAgentApprove),
+		captured.LocalAgentApprove.TargetSignature,
+	))
+}
+
 func TestAppV26RootDisplayRenameBroadcastsOnlyMutableLabel(t *testing.T) {
 	fixture := newAppV23AccessFixture(t)
 	require.NoError(t, fixture.badger.UpdateAgentMeta(
