@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.12 is the current release.** This corrective release makes federated agent sharing preflight the selected agent's inbox eligibility before mutating domain visibility, exposes the independent federated-inbox restriction as an explicit Access Controls switch, and keeps long Tasks cards from widening the four-column board beyond the viewport. It retains v11.17.11's CPU-only embedding, idle-chain governance, and long-catalog Federation fixes. Governed app-v26 adds explicit per-group `read`, `read_write`, and `read_write_modify` authority without weakening owner control or federated read-only isolation. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 through app-v26 replay and state-sync checks, and the native-shell productization bridge spans v11.11–v11.17.
+**Status (2026-08):** **v11.17.13 is the current release.** This corrective release moves first-approval identities into a conditional Agents review queue, keeps Access Controls focused on activated local principals, adds an exact-identity From federation directory with a safe path to read-only Linked-reader permissions, and makes Tauri AppImage helper acquisition bounded, cached, atomic, and SHA-256 verified. It retains v11.17.12's federated-inbox preflight and responsive Tasks fixes. Governed app-v26 adds explicit per-group `read`, `read_write`, and `read_write_modify` authority without weakening owner control or federated read-only isolation. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks. The complete CI/security/fault matrix remains a mandatory publication invariant, including app-v23 through app-v26 replay and state-sync checks, and the native-shell productization bridge spans v11.11–v11.17.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -35,6 +35,13 @@ that restriction is enabled. Companion remains a least-privilege profile; the
 operator explicitly decides whether connected SAGEs may discover its inbox.
 The same patch constrains long Tasks cards to their responsive grid tracks so
 all four desktop columns remain visible without horizontal page scrolling.
+
+v11.17.13 separates lifecycle populations in CEREBRUM: pending local identities
+are reviewed on Agents, activated principals remain in Access Controls, and
+exact ordinary agents advertised by connected SAGEs appear under From
+federation with their read-only Linked-reader state. The Linux native preview
+gate also preloads Tauri's AppImage helpers through a bounded SHA-256-verified
+cache, closing [#134](https://github.com/l33tdawg/sage/issues/134).
 
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:
