@@ -1741,18 +1741,28 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	// If the agent passes this check (no restrictions or explicit read permission),
 	// we skip the multi-org gate — the two systems are alternatives, not stacked AND.
 	domainAccessApproved := false
+	localDomainReadable := true
 	if req.DomainTag != "" {
 		agentID := middleware.ContextAgentID(r.Context())
 		if accessErr := s.checkDomainAccess(r.Context(), agentID, req.DomainTag, "read"); accessErr != nil {
-			writeDomainReadAccessError(w, accessErr)
-			return
+			federatedAllowed, _ := s.federationCallerCanRead(r.Context(), agentID, req.DomainTag)
+			if (req.Federated || len(req.FederateChains) > 0) && federatedAllowed {
+				// A remote-only domain needs no mirrored local grant. Keep local
+				// results empty so this exception cannot disclose a same-name local
+				// domain the caller is not allowed to read.
+				localDomainReadable = false
+			} else {
+				writeDomainReadAccessError(w, accessErr)
+				return
+			}
+		} else {
+			domainAccessApproved = true
 		}
-		domainAccessApproved = true
 	}
 
 	// Multi-org access control gate — only enforce when domain has a registered owner
 	// AND the agent wasn't already approved by the DomainAccess policy above.
-	if req.DomainTag != "" && !domainAccessApproved && s.badgerStore != nil {
+	if localDomainReadable && req.DomainTag != "" && !domainAccessApproved && s.badgerStore != nil {
 		domainOwner, domainErr := s.badgerStore.GetDomainOwner(req.DomainTag)
 		if domainErr == nil && domainOwner != "" {
 			agentID := middleware.ContextAgentID(r.Context())
@@ -1828,7 +1838,9 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	setDecayFloor(&opts, start)
 
 	var records []*memory.MemoryRecord
-	records, err = s.store.QuerySimilar(r.Context(), req.Embedding, opts)
+	if localDomainReadable {
+		records, err = s.store.QuerySimilar(r.Context(), req.Embedding, opts)
+	}
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to query memories")
 		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
@@ -2263,36 +2275,48 @@ func (s *Server) mergeFederatedRecall(r *http.Request, resp *QueryMemoryResponse
 	resp.Federation = info
 }
 
+// federationReaderScopesV23 evaluates the requester-side federation read
+// boundary without reusing local ownership, grants, or Access Groups. A
+// federation connection is its own read group: every active ordinary local
+// agent may read a peer's exported domains by default. Only the peer-bound
+// federation reader restriction narrows that default; local DomainAccess,
+// ownership, grants and Access Groups govern local memory only. Clearance
+// remains a hard cap.
+func (s *Server) federationReaderScopesV23(callerID, remoteScope string) ([]string, int, bool) {
+	if callerID == "" || remoteScope == "" || s.badgerStore == nil {
+		return nil, 0, false
+	}
+	active, err := s.appV23ActiveOrdinaryAgent(callerID)
+	if err != nil || !active {
+		return nil, 0, false
+	}
+	policyID, err := appV23PolicyPrincipal(s.badgerStore, callerID)
+	if err != nil {
+		return nil, 0, false
+	}
+	enrollment, err := s.badgerStore.GetAppV23Enrollment(policyID)
+	if err != nil || enrollment == nil || !enrollment.Active {
+		return nil, 0, false
+	}
+	role, err := s.badgerStore.GetAppV23Role(policyID)
+	if err != nil || role == nil || store.ValidateAppV23Policy(
+		role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+	) != nil {
+		return nil, 0, false
+	}
+	return []string{remoteScope}, int(enrollment.Clearance), true
+}
+
 // federationCallerCanRead applies the local caller's federation delegation
-// policy. Unlike the historical operator-only gate it lets ordinary registered
-// agents use the same domain subtree semantics as normal SAGE access grants,
-// while unknown identities fail closed.
+// policy. Local same-name domains, ownership, grants, and Access Groups are
+// deliberately irrelevant to remote exports.
 func (s *Server) federationCallerCanRead(ctx context.Context, callerID, domain string) (bool, int) {
 	if callerID == "" {
 		return false, 0
 	}
 	if s.isPostV23ForNextTx() {
-		active, err := s.appV23ActiveOrdinaryAgent(callerID)
-		if err != nil || !active {
-			return false, 0
-		}
-	}
-	if s.isPostV23ForNextTx() && s.badgerStore != nil {
-		if domain == "" {
-			return false, 0
-		}
-		policyID, policyErr := appV23PolicyPrincipal(s.badgerStore, callerID)
-		if policyErr != nil {
-			return false, 0
-		}
-		enrollment, err := s.badgerStore.GetAppV23Enrollment(policyID)
-		if err != nil || enrollment == nil || !enrollment.Active {
-			return false, 0
-		}
-		if err := checkAppV23DomainAccess(s.badgerStore, callerID, domain, "read"); err != nil {
-			return false, int(enrollment.Clearance)
-		}
-		return true, int(enrollment.Clearance)
+		_, clearance, exactAllowed := s.federationReaderScopesV23(callerID, domain)
+		return exactAllowed, clearance
 	}
 	if s.nodeOperatorID != "" && callerID == s.nodeOperatorID {
 		return true, 4
@@ -2444,17 +2468,24 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 
 	// Domain access control (same as handleQueryMemory)
 	domainAccessApproved := false
+	localDomainReadable := true
 	if req.DomainTag != "" {
 		agentID := middleware.ContextAgentID(r.Context())
 		if accessErr := s.checkDomainAccess(r.Context(), agentID, req.DomainTag, "read"); accessErr != nil {
-			writeDomainReadAccessError(w, accessErr)
-			return
+			federatedAllowed, _ := s.federationCallerCanRead(r.Context(), agentID, req.DomainTag)
+			if (req.Federated || len(req.FederateChains) > 0) && federatedAllowed {
+				localDomainReadable = false
+			} else {
+				writeDomainReadAccessError(w, accessErr)
+				return
+			}
+		} else {
+			domainAccessApproved = true
 		}
-		domainAccessApproved = true
 	}
 
 	// Multi-org access control gate
-	if req.DomainTag != "" && !domainAccessApproved && s.badgerStore != nil {
+	if localDomainReadable && req.DomainTag != "" && !domainAccessApproved && s.badgerStore != nil {
 		domainOwner, domainErr := s.badgerStore.GetDomainOwner(req.DomainTag)
 		if domainErr == nil && domainOwner != "" {
 			agentID := middleware.ContextAgentID(r.Context())
@@ -2520,7 +2551,11 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	// set before the top-K trim, pinned to `start` so it matches what we serialize.
 	setDecayFloor(&opts, start)
 
-	records, err := s.store.SearchByText(r.Context(), req.Query, opts)
+	var records []*memory.MemoryRecord
+	var err error
+	if localDomainReadable {
+		records, err = s.store.SearchByText(r.Context(), req.Query, opts)
+	}
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to search memories")
 		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {
@@ -2770,16 +2805,23 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	}
 
 	domainAccessApproved := false
+	localDomainReadable := true
 	if req.DomainTag != "" {
 		agentID := middleware.ContextAgentID(r.Context())
 		if accessErr := s.checkDomainAccess(r.Context(), agentID, req.DomainTag, "read"); accessErr != nil {
-			writeDomainReadAccessError(w, accessErr)
-			return
+			federatedAllowed, _ := s.federationCallerCanRead(r.Context(), agentID, req.DomainTag)
+			if (req.Federated || len(req.FederateChains) > 0) && federatedAllowed {
+				localDomainReadable = false
+			} else {
+				writeDomainReadAccessError(w, accessErr)
+				return
+			}
+		} else {
+			domainAccessApproved = true
 		}
-		domainAccessApproved = true
 	}
 
-	if req.DomainTag != "" && !domainAccessApproved && s.badgerStore != nil {
+	if localDomainReadable && req.DomainTag != "" && !domainAccessApproved && s.badgerStore != nil {
 		domainOwner, domainErr := s.badgerStore.GetDomainOwner(req.DomainTag)
 		if domainErr == nil && domainOwner != "" {
 			agentID := middleware.ContextAgentID(r.Context())
@@ -2845,7 +2887,11 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	// the decayed value before their trim, pinned to `start` for serialize-parity.
 	setDecayFloor(&opts, start)
 
-	records, err := s.runHybridWithExpansions(r.Context(), req, opts)
+	var records []*memory.MemoryRecord
+	var err error
+	if localDomainReadable {
+		records, err = s.runHybridWithExpansions(r.Context(), req, opts)
+	}
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to hybrid-search memories")
 		if errors.Is(err, errAppV23RecordDisclosureUnavailable) {

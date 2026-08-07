@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.17.15
+  version: 11.17.16
   description: |-
     (Sovereign) Agent Governed Experience — network REST API for memory
     submission, validation, and query.
@@ -5810,7 +5810,12 @@ paths:
         performs targeted lookup with agent_limit 1-20. peer_cursor is the
         short-lived signed-caller/query-bound continuation returned by an
         incomplete page; it contains no peer ID or hidden agreement count.
-        Results are authorization metadata, not presence or delivery evidence.
+        read_candidate_domains are local/peer policy intersections only;
+        shared_read_domains additionally passed a live destination check using
+        the same linked-reader and access-group gates as recall. Callers must
+        inspect read_authorization and must not present candidates as readable
+        unless verification completed. Results are authorization metadata, not
+        presence or delivery evidence.
         Distinct lookups consume fixed per-caller and process-wide outbound-call
         budgets; 429 includes Retry-After. Exact saved recipient addresses do
         not require discovery, and clients must not auto-walk every page.

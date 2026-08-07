@@ -1,4 +1,4 @@
-# v11.17.6 federation Docker acceptance
+# v11.17.16 federation Docker acceptance
 
 This harness gives two SAGE personal nodes separate persisted homes, separate
 Docker edge networks, and one self-hosted natter relay. A temporary third
@@ -9,7 +9,7 @@ default (`FED_NODE_A_PORT` / `FED_NODE_B_PORT` override them).
 Run the reproducible topology smoke test with:
 
 ```sh
-FED_ACCEPTANCE_STATE=/tmp/sage-v11176-fed \
+FED_ACCEPTANCE_STATE=/tmp/sage-v111716-fed \
   deploy/federation-acceptance/run.sh topology
 ```
 
@@ -22,9 +22,10 @@ inside each node signs the loopback dashboard requests and drives the real JOIN,
 MCP, permission, and inbox APIs. Three environment commands remain optional
 diagnostic overrides:
 
-- `FED_ACCEPTANCE_PAIR_COMMAND`: replace the built-in real dashboard JOIN ceremony,
-  share `mynah-a-home` and `mynah-b-home` read-only, and enable reciprocal
-  exact Mynah contacts.
+- `FED_ACCEPTANCE_PAIR_COMMAND`: replace the built-in real dashboard JOIN
+  ceremony and explicit reciprocal Mynah agent exports. The built-in path does
+  not create mirrored Access Groups, receiving domains, or manual PeerRBAC
+  identity rows.
 - `FED_ACCEPTANCE_MIGRATION_COMMAND`: replace the built-in v11.17.4 migration gate,
   `p2p_peers` fixture for a paired node, restart it, and assert the peer is
   retained and upgraded to a current non-expired generation-bound route.

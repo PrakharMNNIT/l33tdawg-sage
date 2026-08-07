@@ -170,7 +170,10 @@ func (m *Manager) validateQueryEnvelopeV23(ctx context.Context, peer *peerIdenti
 	if err != nil {
 		return 0, err
 	}
-	ceiling, err := m.authorizeFederatedGuestRead(ctx, peer, agreement, req.AgentProof.AgentID, req.DomainTag)
+	ceiling, err := m.authorizeFederatedPeerRead(
+		ctx, peer, agreement, req.AgentProof.AgentID, req.DomainTag,
+		req.SourceAuthorizationModel, req.SourceAgentEligible, req.SourceAgentMaxClassification,
+	)
 	if err != nil {
 		return 0, err
 	}

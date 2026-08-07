@@ -77,6 +77,7 @@ func (m *Manager) Router() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(m.peerAuth)
 		r.Get("/fed/v1/status", m.handleStatus)
+		r.Post("/fed/v1/query/available", m.handleQueryAvailability)
 		r.Post("/fed/v1/query/plan", m.handleQueryPlan)
 		r.Post("/fed/v1/query", m.handleQuery)
 		r.Post("/fed/v1/write", m.handleRemoteWrite)
@@ -502,7 +503,17 @@ func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusForbidden, "requesting operator is not bound to this peer RBAC policy")
 			return
 		}
-		peerRBACGrant = peerRBACGrantFromPolicy(policy)
+		effectivePolicy := *policy
+		effectivePolicy.Domains = append([]store.PeerRBACDomainPermission(nil), policy.Domains...)
+		derivedDomains, exportErr := m.effectiveAgentExportDomainPermissions(r.Context(), peer, policy)
+		if exportErr != nil {
+			releaseSnapshot()
+			m.logger.Error().Err(exportErr).Str("peer", peer.ChainID).Msg("federation status agent export projection failed")
+			httpError(w, http.StatusInternalServerError, "agent export projection failed")
+			return
+		}
+		effectivePolicy.Domains = mergePeerRBACReadDomains(effectivePolicy.Domains, derivedDomains)
+		peerRBACGrant = peerRBACGrantFromPolicy(&effectivePolicy)
 		if !clientRequestsPipeContactLookup(r) {
 			pipeContacts, err = m.buildPipeContactStatusGrant(r.Context(), peer, policy)
 			if err != nil {
@@ -540,6 +551,8 @@ func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
 			response.QueryAgreementBindingDigest = digest
 			response.Capabilities = append(response.Capabilities,
 				CapabilityFederationV23, CapabilityQueryAgentProofV2,
+				CapabilityPeerExportReadV1,
+				CapabilityQueryAvailabilityV1,
 				CapabilityFederatedGuestAgentEligibility,
 				CapabilityLinkedMessageDirectoryEnumeration)
 			if m.postV26ForNextTx != nil && m.postV26ForNextTx() && ss != nil {
@@ -556,6 +569,83 @@ func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// status readers must not delay consensus agent projection.
 	releaseSnapshot()
 	writeJSON(w, http.StatusOK, response)
+}
+
+// handleQueryAvailability checks a bounded candidate set against the same
+// peer policy, agreement generation, negotiated exported-agent authorization,
+// and domain ownership gates used by query planning. It issues no challenge and
+// discloses no group or principal topology: callers receive only the subset
+// they could successfully take into the normal signed recall flow right now.
+func (m *Manager) handleQueryAvailability(w http.ResponseWriter, r *http.Request) {
+	peer := peerFromCtx(r.Context())
+	if peer == nil {
+		httpError(w, http.StatusForbidden, "unauthenticated")
+		return
+	}
+	var req QueryAvailabilityRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		httpError(w, http.StatusBadRequest, "invalid trailing JSON")
+		return
+	}
+	if _, err := auth.AgentIDToPublicKey(req.AgentID); err != nil ||
+		len(req.DomainTags) > MaxQueryAvailabilityDomains {
+		httpError(w, http.StatusBadRequest, "valid agent_id and at most 128 exact domain_tags are required")
+		return
+	}
+	domains := make([]string, 0, len(req.DomainTags))
+	seen := make(map[string]struct{}, len(req.DomainTags))
+	for _, raw := range req.DomainTags {
+		domain := strings.TrimSpace(raw)
+		if store.ValidateAppV23DomainName(domain) != nil {
+			httpError(w, http.StatusBadRequest, "domain_tags must contain valid exact domains")
+			return
+		}
+		if _, duplicate := seen[domain]; duplicate {
+			continue
+		}
+		seen[domain] = struct{}{}
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+
+	ss := m.syncStore()
+	if ss == nil || m.badger == nil {
+		httpError(w, http.StatusServiceUnavailable, "federation v23 authorization store is unavailable")
+		return
+	}
+	policyUnlock := ss.LockSyncPolicyRead()
+	defer policyUnlock()
+	ownerUnlock := m.badger.LockDomainOwnershipRead()
+	defer ownerUnlock()
+	agreement, err := m.currentRequestAgreementBound(r.Context(), peer)
+	if err != nil {
+		httpError(w, http.StatusForbidden, "federation agreement is no longer active for this operator")
+		return
+	}
+	_, err = m.v23BindingReady(r.Context(), agreement, peer.AgentID)
+	if err != nil {
+		httpError(w, http.StatusForbidden, "federation v23 binding is unavailable")
+		return
+	}
+	readable := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		if _, err := m.authorizeFederatedPeerRead(
+			r.Context(), peer, agreement, req.AgentID, domain,
+			req.SourceAuthorizationModel, req.SourceAgentEligible, req.SourceAgentMaxClassification,
+		); err == nil {
+			readable = append(readable, domain)
+		}
+	}
+	writeJSON(w, http.StatusOK, &QueryAvailabilityResponse{
+		ProtocolVersion: FederationProtocolV23, SourceChainID: peer.ChainID,
+		DestinationChainID: m.localChainID, AgentID: req.AgentID,
+		ReadableDomains: readable,
+	})
 }
 
 func clientRequestsPipeContactLookup(r *http.Request) bool {
@@ -899,8 +989,8 @@ func (m *Manager) handleQueryPlan(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, "federation agreement is no longer active for this operator")
 		return
 	}
-	policy, err := m.v23BindingReady(r.Context(), agreement, peer.AgentID)
-	if err != nil || !peerRBACAllowsRead(policy, req.DomainTag) {
+	_, err = m.v23BindingReady(r.Context(), agreement, peer.AgentID)
+	if err != nil {
 		httpError(w, http.StatusForbidden, "peer Read grant is inactive for this domain")
 		return
 	}
@@ -909,10 +999,11 @@ func (m *Manager) handleQueryPlan(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, "federation v23 binding is unavailable")
 		return
 	}
-	if _, err := m.authorizeFederatedGuestRead(
+	if _, err := m.authorizeFederatedPeerRead(
 		r.Context(), peer, agreement, req.AgentID, req.DomainTag,
+		req.SourceAuthorizationModel, req.SourceAgentEligible, req.SourceAgentMaxClassification,
 	); err != nil {
-		httpError(w, http.StatusForbidden, "remote agent has no active linked-reader grant for this domain")
+		httpError(w, http.StatusForbidden, "remote agent is not authorized for this exported domain")
 		return
 	}
 
@@ -979,8 +1070,8 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, "federation agreement is no longer active for this operator")
 		return
 	}
-	policy, policyErr := m.v23BindingReady(r.Context(), agreement, peer.AgentID)
-	if policyErr != nil || !peerRBACAllowsRead(policy, req.DomainTag) {
+	_, policyErr := m.v23BindingReady(r.Context(), agreement, peer.AgentID)
+	if policyErr != nil {
 		httpError(w, http.StatusForbidden, "peer Read grant is inactive for this domain")
 		return
 	}
@@ -1012,8 +1103,7 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// federatable until its exact hash/status/domain/author snapshot exists in
 	// canonical state.
 	opts.CandidateFilter = func(rec *memory.MemoryRecord) (bool, error) {
-		if rec == nil || rec.Status != memory.StatusCommitted ||
-			!peerRBACAllowsRead(policy, rec.DomainTag) {
+		if rec == nil || rec.Status != memory.StatusCommitted {
 			return false, nil
 		}
 		canonical, projectionErr := m.badger.ValidateMemoryProjection(rec)
@@ -1023,8 +1113,9 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 			}
 			return false, projectionErr
 		}
-		recordCeiling, guestErr := m.authorizeFederatedGuestRead(
+		recordCeiling, guestErr := m.authorizeFederatedPeerRead(
 			r.Context(), peer, agreement, req.AgentProof.AgentID, rec.DomainTag,
+			req.SourceAuthorizationModel, req.SourceAgentEligible, req.SourceAgentMaxClassification,
 		)
 		if guestErr != nil {
 			return false, nil
@@ -1105,12 +1196,9 @@ func (m *Manager) handleQuery(w http.ResponseWriter, r *http.Request) {
 			hidden++
 			continue
 		}
-		if !peerRBACAllowsRead(policy, rec.DomainTag) {
-			hidden++
-			continue
-		}
-		recordCeiling, guestErr := m.authorizeFederatedGuestRead(
+		recordCeiling, guestErr := m.authorizeFederatedPeerRead(
 			r.Context(), peer, agreement, req.AgentProof.AgentID, rec.DomainTag,
+			req.SourceAuthorizationModel, req.SourceAgentEligible, req.SourceAgentMaxClassification,
 		)
 		if guestErr != nil {
 			hidden++

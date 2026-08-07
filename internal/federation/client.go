@@ -380,7 +380,29 @@ func (m *Manager) QueryPeer(ctx context.Context, remoteChainID string, qr *Query
 	v23req.DestinationChainID = remoteChainID
 	v23req.AgreementBindingDigest = expectedDigest
 	v23req.QueryChallenge = expectedChallenge
+	if slices.Contains(peerStatus.Capabilities, CapabilityPeerExportReadV1) {
+		ceiling, eligible, attestErr := m.attestLocalFederatedAgent(v23req.AgentProof.AgentID)
+		if attestErr != nil || !eligible {
+			return nil, errors.New("federated recall requires an active ordinary source agent")
+		}
+		v23req.SourceAuthorizationModel = SourceAuthorizationPeerExportV1
+		v23req.SourceAgentEligible = true
+		v23req.SourceAgentMaxClassification = ceiling
+	}
+	ss := m.syncStore()
+	if ss == nil {
+		return nil, errors.New("federated reader restrictions require SQLite")
+	}
+	readerUnlock := ss.LockSyncPolicyRead()
+	readerAllowed, readerErr := m.federatedReaderAllowsLocked(
+		ctx, agreement, v23req.AgentProof.AgentID, v23req.DomainTag,
+	)
+	if readerErr != nil || !readerAllowed {
+		readerUnlock()
+		return nil, errors.New("local federation access controls deny this peer domain")
+	}
 	body, status, err := m.doPeerRequest(ctx, agreement, http.MethodPost, "/fed/v1/query", v23req)
+	readerUnlock()
 	if err != nil {
 		return nil, err
 	}
@@ -392,6 +414,91 @@ func (m *Manager) QueryPeer(ctx context.Context, remoteChainID string, qr *Query
 		return nil, fmt.Errorf("decode peer response: %w", err)
 	}
 	return &out, nil
+}
+
+// AvailableRecallDomains asks one authenticated peer to apply its exact live
+// negotiated peer-export (or legacy linked-reader) gates to a bounded candidate
+// set. Unlike PlanRecall this does not issue challenges and is safe for
+// directory/discovery projections.
+func (m *Manager) AvailableRecallDomains(
+	ctx context.Context, remoteChainID, agentID string, domains []string,
+) ([]string, error) {
+	if len(domains) > MaxQueryAvailabilityDomains {
+		return nil, fmt.Errorf("query availability exceeds %d domains", MaxQueryAvailabilityDomains)
+	}
+	agreement, err := m.ActiveAgreement(remoteChainID)
+	if err != nil {
+		return nil, err
+	}
+	peerStatus, err := m.fetchPeerStatus(ctx, agreement)
+	if err != nil {
+		return nil, fmt.Errorf("federation discovery negotiation failed: %w", err)
+	}
+	request := &QueryAvailabilityRequest{AgentID: agentID, DomainTags: domains}
+	if slices.Contains(peerStatus.Capabilities, CapabilityPeerExportReadV1) {
+		ceiling, eligible, attestErr := m.attestLocalFederatedAgent(agentID)
+		if attestErr != nil || !eligible {
+			return nil, errors.New("federation discovery requires an active ordinary source agent")
+		}
+		request.SourceAuthorizationModel = SourceAuthorizationPeerExportV1
+		request.SourceAgentEligible = true
+		request.SourceAgentMaxClassification = ceiling
+	}
+	ss := m.syncStore()
+	if ss == nil {
+		return nil, errors.New("federated reader restrictions require SQLite")
+	}
+	readerUnlock := ss.LockSyncPolicyRead()
+	allowedDomains := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		allowed, allowErr := m.federatedReaderAllowsLocked(ctx, agreement, agentID, domain)
+		if allowErr != nil {
+			readerUnlock()
+			return nil, allowErr
+		}
+		if allowed {
+			allowedDomains = append(allowedDomains, domain)
+		}
+	}
+	if len(allowedDomains) == 0 {
+		readerUnlock()
+		return []string{}, nil
+	}
+	request.DomainTags = allowedDomains
+	body, status, err := m.doPeerRequest(ctx, agreement, http.MethodPost,
+		"/fed/v1/query/available", request)
+	readerUnlock()
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("peer returned %d: %s", status, truncate(body, 200))
+	}
+	var response QueryAvailabilityResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("decode query availability: %w", err)
+	}
+	if response.ProtocolVersion != FederationProtocolV23 ||
+		response.SourceChainID != m.localChainID ||
+		response.DestinationChainID != remoteChainID || response.AgentID != agentID {
+		return nil, errors.New("peer returned mismatched query availability")
+	}
+	allowedCandidates := make(map[string]struct{}, len(domains))
+	for _, domain := range domains {
+		allowedCandidates[domain] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(response.ReadableDomains))
+	for _, domain := range response.ReadableDomains {
+		if _, ok := allowedCandidates[domain]; !ok {
+			return nil, errors.New("peer returned query availability outside the candidate set")
+		}
+		if _, duplicate := seen[domain]; duplicate {
+			return nil, errors.New("peer returned duplicate query availability domain")
+		}
+		seen[domain] = struct{}{}
+	}
+	sort.Strings(response.ReadableDomains)
+	return response.ReadableDomains, nil
 }
 
 // PlanRecall expands wildcard targets to an exact finite set and obtains one
@@ -450,8 +557,32 @@ func (m *Manager) PlanRecall(ctx context.Context, targets []string, agentID, dom
 			plan.Errors[chain] = validationErr.Error()
 			continue
 		}
+		request := &QueryPlanRequest{AgentID: agentID, DomainTag: domain}
+		if slices.Contains(status.Capabilities, CapabilityPeerExportReadV1) {
+			ceiling, eligible, attestErr := m.attestLocalFederatedAgent(agentID)
+			if attestErr != nil || !eligible {
+				plan.Errors[chain] = "federated recall requires an active ordinary source agent"
+				continue
+			}
+			request.SourceAuthorizationModel = SourceAuthorizationPeerExportV1
+			request.SourceAgentEligible = true
+			request.SourceAgentMaxClassification = ceiling
+		}
+		ss := m.syncStore()
+		if ss == nil {
+			plan.Errors[chain] = "federated reader restrictions require SQLite"
+			continue
+		}
+		readerUnlock := ss.LockSyncPolicyRead()
+		readerAllowed, readerErr := m.federatedReaderAllowsLocked(ctx, agreement, agentID, domain)
+		if readerErr != nil || !readerAllowed {
+			readerUnlock()
+			plan.Errors[chain] = "local federation access controls deny this peer domain"
+			continue
+		}
 		body, httpStatus, err := m.doPeerRequest(ctx, agreement, http.MethodPost,
-			"/fed/v1/query/plan", &QueryPlanRequest{AgentID: agentID, DomainTag: domain})
+			"/fed/v1/query/plan", request)
+		readerUnlock()
 		if err != nil {
 			plan.Errors[chain] = err.Error()
 			continue

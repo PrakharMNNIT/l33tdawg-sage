@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.17.15/app-v26 code (2026-08-06). Cite file:line when behavior is non-obvious. -->
+<!-- Verified against SAGE v11.17.16/app-v26 code (2026-08-07). Cite file:line when behavior is non-obvious. -->
 
 # App-v26 Access Groups and member authority
 
@@ -84,10 +84,13 @@ generation is suspended and cannot remain eligible for a current app-v26 group
 mutation (`web/appv23_access_handler.go:1128-1162`;
 `internal/store/appv23_local_rbac.go:4336-4363`).
 
-Federated agents are never local group members. A federated linked reader is a
-separate, chain-qualified, node-local relation that can supply bounded exact
-Read only. It cannot acquire local Write, Modify, ownership, claims, grants, or
-transitive access through a local group. See
+Federated agents are never local group members. Every trusted pairwise
+connection is already its own federation group, with exact local-agent exports
+as membership. Exported owned domains supply bounded live Read to active
+ordinary agents on the peer without a mirrored Access Group. Legacy linked
+readers remain separate, chain-qualified compatibility relations. Neither path
+can acquire local Write, Modify, ownership, claims, grants, or transitive access
+through a local group. See
 [`../federation-and-brain-api.md`](../federation-and-brain-api.md) for that
 separate contract.
 
@@ -150,5 +153,7 @@ validation; it never silently falls back to the old role-derived behavior
 4. Remove an agent from a group to revoke only the shared relationship. Do not
    transfer or deprecate its own domains unless that is a separate intended
    governance action.
-5. Configure federated linked readers and linked messaging separately; neither
-   is local group membership.
+5. Export an agent explicitly into the pairwise federation; do not create a
+   matching local Access Group. Use federation reader restrictions only for
+   receiving-side exceptions. Legacy linked readers remain separate from local
+   membership.

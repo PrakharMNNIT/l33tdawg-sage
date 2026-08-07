@@ -122,7 +122,12 @@ func planAndSignV23Query(
 	request *QueryRequest,
 ) *QueryRequest {
 	t.Helper()
-	callerID := hex.EncodeToString(source.agentPub)
+	callerPub, callerKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerID := hex.EncodeToString(callerPub)
+	enrollV23SourceReadAllAdmin(t, source, "federated-query-caller", callerPub, 20)
 	addV23TestGuest(t, destination, source, callerID, request.DomainTag, 4)
 	plan, err := source.mgr.PlanRecall(
 		context.Background(), []string{destination.chainID}, callerID, request.DomainTag,
@@ -161,7 +166,7 @@ func planAndSignV23Query(
 	request.AgentProof = &QueryAgentProof{
 		AgentID: callerID,
 		Signature: auth.SignRequestWithNonce(
-			source.agentKey, "POST", path, body, now, nonce,
+			callerKey, "POST", path, body, now, nonce,
 		),
 		Timestamp: now, Nonce: nonce,
 		CanonicalRequest: append([]byte("POST "+path+"\n"), body...),

@@ -1,6 +1,6 @@
 # App-v23 Access Control and Federation Design
 
-Status: implementation contract through SAGE v11.17.15.
+Status: implementation contract through SAGE v11.17.16.
 
 This document fixes the security and product invariants for app-v23. It is not
 permission to weaken an invariant to preserve app-v22 runtime behavior.
@@ -415,14 +415,40 @@ CEREBRUM does not claim to offer a direct level-2 grant editor in this release.
 Neither action is suggested when a capability restriction would override the
 resulting scope.
 
-## Federation v23
+## Federation v23 and pairwise exported-agent authorization
 
 Runtime federation after app-v23 has no pre-v23 compatibility fallback.
 Negotiation rejects peers that do not support the v23 agent-delegated query
 protocol.
 
+The current v11.17.16 authorization layer is off-consensus and does not require
+a new application protocol. Every active trusted node connection is itself a
+pairwise federation group. Each operator explicitly exports the local ordinary
+agents that join that federation; the other SAGE does not create a matching
+Access Group, receiving domain, or same-name object. An export derives the
+agent's current owned domain tree live. Any active ordinary agent on the peer
+may Read that tree by default, subject to classification ceilings and optional
+receiver-local deny-all/domain-subtree exceptions. A manual PeerRBAC domain
+share remains valid but never creates a remote identity.
+
+`peer-export-v1` is negotiated explicitly. Omission uses the legacy exact
+linked-reader gate; an unknown authorization model is denied. Export pause,
+revoke, ownership loss, inactive standing, agreement drift, and re-pair all
+fail closed. Exported Read never grants Copy, Write, Modify, ownership, roles,
+or local membership; the authenticated remote-write endpoint remains `501`.
+An active export also exposes the exact agent for ordinary trusted messaging by
+default, while `DenyFederatedPipe` is a messaging-only hard deny. Messages
+remain untrusted data and carry no delegated memory authority
+(`internal/federation/agent_exports.go`;
+`internal/federation/reader_restrictions.go`;
+`internal/federation/v23_guest.go`).
+
+### Legacy exact linked-reader compatibility
+
 A visual drag of `X@Laptop-B` into a Laptop-A group means "Attach as linked
-reader", never local membership.
+reader", never local membership. This path remains for negotiated older peers
+and advanced exact relations; it is not required by `peer-export-v1` and never
+narrows the pairwise default Read lane.
 
 Federated Query v2 requires:
 

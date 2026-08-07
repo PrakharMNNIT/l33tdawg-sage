@@ -902,6 +902,14 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	if err := s.migrateFederatedGroupGuests(ctx); err != nil {
 		return fmt.Errorf("migrate federated group guests: %w", err)
 	}
+	// Explicit local-agent membership exported to an exact federated peer.
+	// This remains a separate lane from directional domain-only PeerRBAC.
+	if err := s.migrateFederatedAgentExports(ctx); err != nil {
+		return fmt.Errorf("migrate federated agent exports: %w", err)
+	}
+	if err := s.migrateFederatedReaderRestrictions(ctx); err != nil {
+		return fmt.Errorf("migrate federated reader restrictions: %w", err)
+	}
 	if err := s.migrateFederatedQueryChallenges(ctx); err != nil {
 		return fmt.Errorf("migrate federated query challenges: %w", err)
 	}

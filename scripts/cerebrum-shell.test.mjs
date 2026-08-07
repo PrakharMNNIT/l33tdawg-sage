@@ -1101,7 +1101,11 @@ test('direct federation controls are symmetric after pairing', () => {
     assert.match(panel, /const showOutgoing = roleKnown/);
     assert.match(panel, /\$\{roleKnown && html`<section class="fed-perm-section fed-agent-section">/,
         'agent contact controls must not disappear merely because this SAGE scanned the first code');
-    assert.match(panel, /The setup role does not control ongoing access/);
+	assert.match(panel, /Each SAGE independently chooses which local agents join it/,
+		'the ceremony role must not control ongoing pairwise membership');
+	assert.match(panel, /This trusted connection is its own federation group/,
+		'the pairwise relationship itself must be the group; no mirrored local group is required');
+	assert.match(panel, /neither side creates a matching local group/);
     assert.match(panel, /<h4>This SAGE → \$\{peerName\}<\/h4>/);
     assert.match(panel, /<h4>\$\{peerName\} → this SAGE<\/h4>/);
     assert.doesNotMatch(panel, /\$\{localIsHost && html`<section class="fed-perm-section fed-agent-section">/);
@@ -1109,7 +1113,7 @@ test('direct federation controls are symmetric after pairing', () => {
     assert.match(panel, /memories already copied onto either SAGE survive until their local owner explicitly deletes them/);
 });
 
-test('federation agent contacts stay administrative and default-off', () => {
+test('federation agent membership stays administrative and message RBAC remains explicit', () => {
     const panel = appSource.slice(appSource.indexOf('function FedPermissionsPanel('), appSource.indexOf('// FederationWarmup'));
     const page = appSource.slice(appSource.indexOf('function FederationPage('), appSource.indexOf('// PAGE_LABELS'));
     const contactPoll = panel.slice(panel.indexOf('const poll = async () => {'), panel.indexOf('if (catalog === null'));
@@ -1117,11 +1121,12 @@ test('federation agent contacts stay administrative and default-off', () => {
     assert.match(apiSource, /connections\/\$\{encodeURIComponent\(chainId\)\}\/pipe-contacts/);
     assert.match(apiSource, /agent_id: agentId, contact_id: contactId, accepting: !!accepting/,
         'a toggle must carry the exact agent and contact revision instead of a display handle');
-    assert.match(panel, /Agent work requests/);
-    assert.match(panel, /It is not a chat/,
+    assert.match(panel, /<h4>Federated agents<\/h4>/);
+    assert.match(panel, /CEREBRUM manages the connection/,
         'CEREBRUM must remain the administrative surface, not become a second inbox');
-    assert.match(panel, /New contacts start off/);
-    assert.match(panel, /role="switch"/);
+    assert.match(panel, /Work requests are Off until you enable them/);
+    assert.match(panel, /messages blocked by Agent RBAC/,
+        'message delivery must remain visibly governed separately from exported Read membership');
     assert.match(panel, /contact\.contact_id/,
         'acceptance mutations must use the opaque contact identity');
     assert.match(panel, /fetchAgents\(\)/,
@@ -1133,10 +1138,16 @@ test('federation agent contacts stay administrative and default-off', () => {
         'raw agent hashes must not be required by the federation UI');
     assert.match(panel, /fedPipeContactsGet\(chain, false, agentID\)/,
         'the friendly selection must still resolve through the exact authorization identity');
-	assert.match(panel, /fedPermissionsSet\(chain, fedPermissionSnapshot\(nextPermissions\)\)/,
-		'auto-sharing an agent-owned domain must send the permissions array required by the API');
-	assert.doesNotMatch(panel, /fedPermissionsSet\(chain, nextPermissions\)/,
-		'the normalized permission map must never be sent as the wire-level permissions array');
+	assert.match(apiSource, /connections\/\$\{encodeURIComponent\(chainId\)\}\/agent-exports/,
+		'explicit federation membership must have its own browser API route');
+	assert.match(panel, /fedAgentExportSet\(chain, \{[\s\S]*agent_id: agentID,[\s\S]*state: 'active',[\s\S]*expected_revision:/,
+		'Share Agent must create a revision-bound exported-agent membership');
+	assert.doesNotMatch(panel, /fedPermissionsSet\(chain, fedPermissionSnapshot\(nextPermissions\)\)/,
+		'Share Agent must not synthesize manual domain rows for the agent-owned domain tree');
+	assert.match(panel, /if \(dirty\) \{[\s\S]*fedPermissionsSet\(chain, fedPermissionSnapshot\(draft\)\);[\s\S]*fedAgentExportSet\(chain, \{/,
+		'pending manual domain edits may save first, but exported membership remains the Share Agent authority');
+	assert.match(panel, /fedAgentExportSet\(chain, \{[\s\S]*state: 'paused',[\s\S]*expected_revision:/,
+		'Remove Agent must pause the exact exported-agent revision without rewriting manual domain shares');
     assert.match(appSource, /function mergeFedPipeContactGrant\(base, targeted = \[\]\)/);
     assert.match(appSource, /grant\.agreement_id \|\| grant\.agreementId/,
         'normalized grants must retain their agreement binding');
@@ -1180,7 +1191,7 @@ test('federation agent contacts stay administrative and default-off', () => {
     assert.match(panel, /#\/access\?agent=\$\{encodeURIComponent\(pipeContactPolicyBlock\.agentID\)\}&inbox=1/);
     assert.doesNotMatch(contactPoll, /setPipeContactPolicyBlock/,
         'background refresh must not dismiss the policy block');
-    assert.match(panel, /Up to four newly selected agents outside the recent list/,
+    assert.match(panel, /oldest unenabled selection was hidden/,
         'the bounded exact-revalidation behavior must be explained beside the picker');
     assert.match(panel, /contact\.address \|\| contact\.handle/,
         'the primary copy action must prefer the exact single-peer route');
@@ -1410,8 +1421,11 @@ test('Sharing & Sync groups expose health and guarded operator controls', () => 
         'the explicit peer refresh needs visible progress instead of looking like an ordinary local reload');
     assert.match(panel, /aria-busy=\$\{busy === 'groups:refresh'\}/,
         'assistive technology must receive the same refresh progress state');
-    assert.match(apiSource, /export function fedGroupCreate\(name\)/,
-        'a group must be explicitly created instead of being implied by a connection');
+	assert.match(panel, /Every trusted connection is already its own federation group/,
+		'optional multi-SAGE workspaces must not redefine the pairwise federation group');
+	assert.match(panel, /optional multi-SAGE workspaces are only for sharing one policy across three or more connected SAGEs/);
+	assert.match(apiSource, /export function fedGroupCreate\(name\)/,
+		'only an optional multi-SAGE policy workspace must be explicitly created');
     assert.match(apiSource, /groups\/\$\{encodeURIComponent\(groupId\)\}\/domains/);
     assert.match(apiSource, /entry_type: 'member_remove', payload: \{ member_chain: memberChain \}/);
     assert.match(panel, /Sharing & Sync/);
@@ -1479,11 +1493,11 @@ test('Sharing & Sync groups expose health and guarded operator controls', () => 
         'a failed invite must not prevent later selected SAGEs from being attempted');
     assert.match(createGroup, /await loadGroups\(\);[\s\S]*if \(finalError\) setError\(finalError\)/,
         'a final partial-setup error must survive the local projection reload');
-    assert.match(appSource, /direct 1:1 relationship/,
+	assert.match(appSource, /For one other SAGE, use the direct relationship above instead/,
         'the direct relationship and group models must be visibly separate');
-    assert.match(appSource, /The setup role does not control ongoing access/,
+	assert.match(appSource, /Each SAGE independently chooses which local agents join it/,
         'the ceremony role must not hide ordinary directional controls after trust is established');
-    assert.match(appSource, /each SAGE can independently share domains/,
+	assert.match(appSource, /Each SAGE independently chooses which local agents join it, which manual domains it shares/,
         'symmetric control means independent explicit grants, never an implied bilateral grant');
     assert.match(panel, /Select a trusted SAGE/,
         'adding a member must choose an established trust connection, not copy a key by hand');

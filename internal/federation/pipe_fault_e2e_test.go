@@ -68,6 +68,12 @@ func restartPipeManager(c *testChain) {
 		MemStore:     c.mem,
 		Logger:       c.mgr.logger,
 	})
+	if sqlite, ok := c.mem.(*store.SQLiteStore); ok {
+		c.mgr.federatedGuestStore = sqlite
+		c.mgr.queryChallengeStore = sqlite
+	}
+	c.mgr.postV23ForNextTx = func() bool { return true }
+	c.mgr.postV22ForNextTx = func() bool { return true }
 }
 
 func pipeSQLite(t *testing.T, c *testChain) *store.SQLiteStore {
@@ -79,6 +85,7 @@ func pipeSQLite(t *testing.T, c *testChain) *store.SQLiteStore {
 
 func activatePipePeer(t *testing.T, local, remote *testChain, role string) {
 	t.Helper()
+	ensurePipeContactAppV23(t, local.mgr, local.badger)
 	agreement, err := local.mgr.ActiveAgreement(remote.chainID)
 	require.NoError(t, err)
 	left, right := local.chainID, remote.chainID
@@ -128,15 +135,12 @@ func configurePipeFaultFixture(t *testing.T, source, destination *testChain) pip
 		targetAgent: hex.EncodeToString(targetPub), targetKey: targetKey,
 		unrelatedAgent: hex.EncodeToString(unrelatedPub),
 	}
-	require.NoError(t, pipeSQLite(t, source).CreateAgent(ctx, &store.AgentEntry{
-		AgentID: fixture.sourceAgent, Name: "source-agent", Status: "active",
-	}))
-	require.NoError(t, pipeSQLite(t, destination).CreateAgent(ctx, &store.AgentEntry{
-		AgentID: fixture.targetAgent, Name: "target-agent", Status: "active",
-	}))
-	require.NoError(t, pipeSQLite(t, destination).CreateAgent(ctx, &store.AgentEntry{
-		AgentID: fixture.unrelatedAgent, Name: "unrelated-agent", Status: "active",
-	}))
+	seedPipeContactOrdinaryAgent(t, source.mgr, pipeSQLite(t, source), source.badger,
+		fixture.sourceAgent, "source-agent", "active", 0, 10)
+	seedPipeContactOrdinaryAgent(t, destination.mgr, pipeSQLite(t, destination), destination.badger,
+		fixture.targetAgent, "target-agent", "active", 0, 10)
+	seedPipeContactOrdinaryAgent(t, destination.mgr, pipeSQLite(t, destination), destination.badger,
+		fixture.unrelatedAgent, "unrelated-agent", "active", 0, 20)
 	require.NoError(t, destination.badger.RegisterDomain("fault-gate", fixture.targetAgent, "", 10))
 	require.NoError(t, destination.badger.RegisterDomain("fault-unrelated", fixture.unrelatedAgent, "", 11))
 	_, err = destination.mgr.ReplacePeerRBACPolicy(ctx, source.chainID, []store.PeerRBACDomainPermission{
@@ -144,6 +148,8 @@ func configurePipeFaultFixture(t *testing.T, source, destination *testChain) pip
 		{Domain: "fault-unrelated.work", Read: true},
 	})
 	require.NoError(t, err)
+	exportPipeContactAgent(t, destination.mgr, source.chainID, fixture.targetAgent)
+	exportPipeContactAgent(t, destination.mgr, source.chainID, fixture.unrelatedAgent)
 	grant, err := destination.mgr.LocalPipeContacts(ctx, source.chainID)
 	require.NoError(t, err)
 	require.Len(t, grant.Contacts, 2)
@@ -156,11 +162,7 @@ func configurePipeFaultFixture(t *testing.T, source, destination *testChain) pip
 		t.Fatalf("contact %s not found", agentID)
 		return ""
 	}
-	_, err = destination.mgr.SetPipeContactAcceptance(ctx, source.chainID, fixture.targetAgent, contactID(fixture.targetAgent), true)
-	require.NoError(t, err)
 	fixture.unrelatedContact = contactID(fixture.unrelatedAgent)
-	_, err = destination.mgr.SetPipeContactAcceptance(ctx, source.chainID, fixture.unrelatedAgent, fixture.unrelatedContact, true)
-	require.NoError(t, err)
 	fixture.target, err = source.mgr.ResolveRemotePipeTarget(ctx, fixture.targetAgent+"@"+destination.chainID)
 	require.NoError(t, err)
 	return fixture
@@ -240,11 +242,10 @@ func exercisePipeDisconnectRestart(t *testing.T, source, destination *testChain,
 	require.Equal(t, "pending", failedSend.State)
 	require.NotEmpty(t, failedSend.LastError)
 
-	// An unrelated visible agent changing its reversible acceptance while this
+	// An unrelated visible agent changing its reversible availability while this
 	// exact-target request is offline must not poison the queued X authorization.
-	_, err = destination.mgr.SetPipeContactAcceptance(ctx, source.chainID,
-		fixture.unrelatedAgent, fixture.unrelatedContact, false)
-	require.NoError(t, err)
+	require.NoError(t, pipeSQLite(t, destination).UpdateAgentStatus(ctx,
+		fixture.unrelatedAgent, "inactive"))
 
 	// The receiver returns and commits the send, but the sender crashes before
 	// recording the acknowledgement. Restart the receiver once more: the retry

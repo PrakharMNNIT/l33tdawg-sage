@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.17.15.
+Reconciled against internal/mcp for SAGE v11.17.16.
 
 # SAGE MCP Tools Reference
 
@@ -401,7 +401,7 @@ mode as the primary in-session recall mechanism.
 ### sage_federation
 
 **Purpose:** Read-only discovery of connected SAGEs and the remote capabilities
-they currently expose to this SAGE.
+they currently expose to this exact signed caller.
 
 **Source:** `internal/mcp/tools.go` (`registerTools` entry `sage_federation`; `Server.toolFederation`).
 
@@ -410,11 +410,23 @@ previous incomplete call. Omit it for the first page. One MCP call performs one
 bounded caller-authorized peer page and never walks every connected node automatically.
 
 **Returns:**
-- `connections`: active, reachable SAGEs whose authenticated remote grant
-  intersects this caller's local read subtrees; includes `remote_chain_id`,
+- `connections`: active, reachable SAGEs whose authenticated remote grant is
+  readable by this active ordinary caller after local federation restrictions;
+  includes `remote_chain_id`,
   `network_name`, capabilities, and normalized `remote_permissions`.
-- `shared_read_domains`: exact domains eligible for `sage_recall` with
-  `federated=true`.
+- `read_candidate_domains`: domains currently offered by the peer's exported
+  agents or manual domain-only Read policy. Candidates are not readable by
+  themselves; the peer must live-verify the negotiated authorization model.
+- `shared_read_domains`: the candidate subset that the destination has
+  live-verified against the active agreement, exported-agent ownership (or
+  legacy linked-reader compatibility gate), and peer policy, after this SAGE
+  applies any local per-agent federation deny. No mirrored Access Group,
+  receiving domain, or same-name local grant is required. Only these domains are
+  eligible for `sage_recall` with `federated=true`.
+- `read_authorization` / `read_authorization_complete`: whether the live check
+  was `verified`, unsupported by an older peer, temporarily unavailable, or
+  partial because the bounded candidate limit was reached. An unverified
+  candidate must never be presented as readable.
 - `copy_offered_domains`: exact domains this node may independently subscribe
   to retain.
 - `remote_agents`: authenticated peer-scoped agent contacts when the peer
@@ -425,10 +437,13 @@ bounded caller-authorized peer page and never walks every connected node automat
   remains, the caller/query-bound short-lived continuation. The token exposes
   no peer ID or hidden agreement count.
 
-The REST broker probes one caller-authorized page concurrently under a shared timeout,
-then filters the authenticated disclosures for the signed caller. It does not
-change trust, permissions, subscriptions, or contacts; those routes remain
-exact-node-operator-only.
+The REST broker probes one caller-authorized page concurrently under a shared
+timeout, then applies a bounded, non-mutating destination check to each
+candidate set. That check issues no recall challenge and returns only the exact
+readable subset; it never discloses groups or authorization topology. A local
+reader-policy mutation invalidates the short availability cache immediately. The
+broker does not change trust, permissions, subscriptions, or contacts; those
+routes remain exact-node-operator-only.
 
 **REST:** `GET /v1/federation/available`.
 
@@ -1127,18 +1142,22 @@ Legacy `AllowedDomains` metadata cannot suppress a current v3 grant. The
 response still reveals a peer only after that live projection intersects the
 exact caller's local policy.
 
-App-v26 also permits friendly discovery across an exact linked-reader
-messaging edge when the receiver has separately enabled that exact caller.
-This does not use or reveal a shared-memory domain: the result contains only
-sanitized name/provider metadata and an exact `agent_id@chain_id` address.
-Root, historical Root, pending, inactive, Read-only, unrelated-group, paused,
-revoked, stale-generation, and `DenyFederatedPipe` principals collapse to no
-match. The response has no peer-roster total, truncation bit, online presence,
-delivery status, or read receipt. Its internal `linked-v23` marker means only
-that the exact relation was authorized during this live lookup; it is never
-rendered as online, reachable, or accepting. Direct and relay routes use the same signed
-lookup contract, and `sage_pipe` revalidates the exact relation and consent
-before any payload leaves the node.
+Current peers permit friendly discovery of explicitly exported agents. Export
+is the pairwise federation membership action: a manual domain-only share never
+synthesizes an identity. An active export is message-addressable by default;
+`DenyFederatedPipe` is the messaging hard deny and does not remove exported
+Read. Legacy exact linked-reader messaging remains additive when the receiver
+has separately enabled that exact caller. These paths return only sanitized
+name/provider metadata and an exact `agent_id@chain_id` address.
+Root, historical Root, pending, inactive, paused, revoked, and stale-generation
+exports collapse to no identity. `DenyFederatedPipe` keeps exported Read but
+prevents the contact from accepting messages. The response has no peer-roster
+total, truncation bit, online presence, delivery status, or read receipt. A
+legacy internal `linked-v23` marker means only that the exact compatibility
+relation was authorized during lookup; it is never rendered as presence.
+Direct and relay routes use the same signed lookup contract, and `sage_pipe`
+revalidates the export/relation and messaging policy before any payload leaves
+the node.
 
 To make a follow-up request fast, SAGE keeps up to 128 caller-and-name lookup
 results in an in-memory cache for one minute (at most 64 chains and 20 matched
@@ -1218,8 +1237,9 @@ most 100 local recipients and reports `complete=false` when capped; use
 only the minimal identity picker above; it does not expose roles, capability
 masks, memory counts, domain grants, key material, or other RBAC topology.
 
-Federated rows are not a peer roster. Shared-domain contacts come from the
-peer's caller-filtered contact grant; linked-reader contacts use the additive
+Federated rows are not a peer roster. Current contacts come only from explicit
+active agent exports; manual shared domains do not expose their owner.
+Legacy linked-reader contacts use the additive
 `linked-message-directory-enumeration-v1` capability and contain only exact
 current relations already authorized for this caller. Each linked relation,
 agreement generation, local eligibility, and receiver consent is revalidated
