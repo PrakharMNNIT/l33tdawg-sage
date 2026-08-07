@@ -859,40 +859,53 @@ func extractBackupArchive(path string, targets []string) error {
 	}
 	defer func() { _ = gz.Close() }()
 
-	cleanTargets := make([]string, len(targets))
-	for i, t := range targets {
-		abs, absErr := filepath.Abs(t)
-		if absErr != nil {
-			return fmt.Errorf("resolve restore target %s: %w", t, absErr)
+	// Open each restore target as an os.Root and perform EVERY filesystem
+	// operation below through that handle. os.Root resolves each name inside the
+	// root and refuses anything that leaves it — including a traversal through a
+	// symlink an earlier archive entry planted. That is strictly stronger than
+	// validating a path and then calling the plain os functions: the check and
+	// the use are the same operation, so there is no window between them, and no
+	// archive-derived string is ever passed to an unscoped filesystem call.
+	roots := make([]*os.Root, len(targets))
+	defer func() {
+		for _, r := range roots {
+			if r != nil {
+				_ = r.Close()
+			}
 		}
-		cleanTargets[i] = abs
+	}()
+	for i, t := range targets {
+		if mkErr := os.MkdirAll(t, 0700); mkErr != nil {
+			return fmt.Errorf("create restore target %s: %w", t, mkErr)
+		}
+		r, openErr := os.OpenRoot(t)
+		if openErr != nil {
+			return fmt.Errorf("open restore target %s: %w", t, openErr)
+		}
+		roots[i] = r
 	}
 
 	tr := tar.NewReader(gz)
 	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
+		hdr, nextErr := tr.Next()
+		if nextErr == io.EOF {
 			return nil
 		}
-		if err != nil {
-			return fmt.Errorf("read archive: %w", err)
+		if nextErr != nil {
+			return fmt.Errorf("read archive: %w", nextErr)
 		}
 		if hdr.Name == backupManifestName {
 			continue
 		}
 
 		idx, rel, ok := splitRootPrefix(hdr.Name)
-		if !ok || idx >= len(cleanTargets) {
+		if !ok || idx >= len(roots) {
 			continue
 		}
-		root := cleanTargets[idx]
+		root := roots[idx]
 
-		// Sanitize the archive-supplied path into a value BEFORE it becomes a
-		// filesystem path. filepath.IsLocal rejects absolute paths, volume names,
-		// and every ".." escape, so nothing derived from the header can address
-		// anything outside root. Guarding the joined path afterwards would be
-		// equally safe at runtime but leaves the untrusted string flowing into
-		// the sink, which is both harder to audit and unprovable to a scanner.
+		// Reject non-local entry paths up front so a malformed archive fails with
+		// a message naming the entry, rather than as an opaque root-scope error.
 		safeRel := filepath.Clean(filepath.FromSlash(rel))
 		if safeRel == "." {
 			continue
@@ -900,61 +913,61 @@ func extractBackupArchive(path string, targets []string) error {
 		if !filepath.IsLocal(safeRel) {
 			return fmt.Errorf("archive entry %q escapes its restore root", hdr.Name)
 		}
-		dest := filepath.Join(root, safeRel)
-
-		// Defence in depth: the join above cannot escape a local path, but keep
-		// the containment assertion so a future refactor cannot quietly remove it.
-		if !pathWithin(dest, root) {
-			return fmt.Errorf("archive entry %q escapes its restore root", hdr.Name)
-		}
+		parent := filepath.Dir(safeRel)
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(dest, os.FileMode(hdr.Mode)&os.ModePerm); err != nil { //nolint:gosec // mode from the operator's own backup
-				return fmt.Errorf("create %s: %w", dest, err)
+			if mkErr := root.MkdirAll(safeRel, os.FileMode(hdr.Mode)&os.ModePerm); mkErr != nil { //nolint:gosec // mode from the operator's own backup
+				return fmt.Errorf("create %s: %w", hdr.Name, mkErr)
 			}
+
 		case tar.TypeSymlink:
-			// A symlink whose target escapes the root turns every LATER file
-			// entry into an arbitrary write: extracting "root0/link/file" would
-			// follow the link out of the tree. Sanitize the target into a new
-			// value and create THAT — the archive's own string never reaches
-			// os.Symlink.
+			// The link is created inside the root, and every later entry is also
+			// resolved through the root, so an escaping link cannot become a
+			// write primitive. Reject one anyway: restoring a link that points
+			// out of the tree would hand the operator a node whose paths lie.
 			safeLink, linkErr := sanitizeSymlinkTarget(hdr.Linkname, safeRel)
 			if linkErr != nil {
 				return fmt.Errorf("archive symlink %q: %w", hdr.Name, linkErr)
 			}
-			if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
-				return fmt.Errorf("create parent of %s: %w", dest, err)
-			}
-			_ = os.Remove(dest)
-			if err := os.Symlink(safeLink, dest); err != nil {
-				return fmt.Errorf("symlink %s: %w", dest, err)
-			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
-				return fmt.Errorf("create parent of %s: %w", dest, err)
-			}
-			// Even with target validation, never write THROUGH a symlink planted
-			// at the destination itself. os.O_NOFOLLOW is not portable (undefined
-			// on Windows), so drop any existing symlink first and create fresh.
-			if info, lstatErr := os.Lstat(dest); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
-				if rmErr := os.Remove(dest); rmErr != nil {
-					return fmt.Errorf("remove symlink at %s before restoring a file there: %w", dest, rmErr)
+			if parent != "." {
+				if mkErr := root.MkdirAll(parent, 0700); mkErr != nil {
+					return fmt.Errorf("create parent of %s: %w", hdr.Name, mkErr)
 				}
 			}
-			out, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&os.ModePerm) //nolint:gosec // mode from the operator's own backup
-			if err != nil {
-				return fmt.Errorf("create %s: %w", dest, err)
+			_ = root.Remove(safeRel)
+			if symErr := root.Symlink(safeLink, safeRel); symErr != nil {
+				return fmt.Errorf("symlink %s: %w", hdr.Name, symErr)
+			}
+
+		case tar.TypeReg:
+			if parent != "." {
+				if mkErr := root.MkdirAll(parent, 0700); mkErr != nil {
+					return fmt.Errorf("create parent of %s: %w", hdr.Name, mkErr)
+				}
+			}
+			// Never write through a symlink sitting at the destination. Opening
+			// through the root already refuses to follow one out of the tree;
+			// dropping it keeps an in-tree link from being clobbered by content.
+			if info, lstatErr := root.Lstat(safeRel); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+				if rmErr := root.Remove(safeRel); rmErr != nil {
+					return fmt.Errorf("remove symlink at %s before restoring a file there: %w", hdr.Name, rmErr)
+				}
+			}
+			out, openErr := root.OpenFile(safeRel, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&os.ModePerm) //nolint:gosec // mode from the operator's own backup
+			if openErr != nil {
+				return fmt.Errorf("create %s: %w", hdr.Name, openErr)
 			}
 			// Copy exactly the declared size: an unbounded io.Copy on a hostile
 			// archive is a decompression-bomb sink.
-			if _, err := io.CopyN(out, tr, hdr.Size); err != nil && err != io.EOF {
+			if _, copyErr := io.CopyN(out, tr, hdr.Size); copyErr != nil && copyErr != io.EOF {
 				_ = out.Close()
-				return fmt.Errorf("write %s: %w", dest, err)
+				return fmt.Errorf("write %s: %w", hdr.Name, copyErr)
 			}
-			if err := out.Close(); err != nil {
-				return fmt.Errorf("close %s: %w", dest, err)
+			if closeErr := out.Close(); closeErr != nil {
+				return fmt.Errorf("close %s: %w", hdr.Name, closeErr)
 			}
+
 		default:
 			continue
 		}

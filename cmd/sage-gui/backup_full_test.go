@@ -832,3 +832,88 @@ func TestExtractRejectsNonLocalEntryName(t *testing.T) {
 		t.Fatalf("unexpected error %v", err)
 	}
 }
+
+// The attack a check-then-use guard cannot stop: a symlinked DIRECTORY already
+// sitting in the restore target. Validating the entry path proves only that the
+// string is in-tree; the write still follows the link out. Extraction goes
+// through os.Root, which refuses to traverse a link that leaves the root, so the
+// write must fail rather than land outside.
+func TestExtractRefusesTraversalThroughPlantedSymlinkDir(t *testing.T) {
+	base := t.TempDir()
+	dest := filepath.Join(base, "target")
+	outside := filepath.Join(base, "outside")
+	for _, d := range []string{dest, outside} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	// Pre-plant the hostile link, as a partial earlier extraction might leave.
+	if err := os.Symlink(outside, filepath.Join(dest, "sub")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	archive := filepath.Join(t.TempDir(), "traverse.tar.gz")
+	f, createErr := os.Create(archive)
+	if createErr != nil {
+		t.Fatalf("create: %v", createErr)
+	}
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	payload := []byte("PWNED")
+	// The entry name is entirely local — no "..", nothing a path check rejects.
+	if headerErr := tw.WriteHeader(&tar.Header{
+		Name: "root0/sub/evil.txt", Mode: 0600,
+		Size: int64(len(payload)), Typeflag: tar.TypeReg,
+	}); headerErr != nil {
+		t.Fatalf("header: %v", headerErr)
+	}
+	if _, writeErr := tw.Write(payload); writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
+	}
+	_ = tw.Close()
+	_ = gz.Close()
+	_ = f.Close()
+
+	err := extractBackupArchive(archive, []string{dest})
+
+	// The decisive assertion is not the error — it is that nothing was written
+	// outside the restore root.
+	if _, statErr := os.Stat(filepath.Join(outside, "evil.txt")); statErr == nil {
+		t.Fatal("archive wrote through a planted symlink to outside the restore root")
+	}
+	if err == nil {
+		t.Fatal("traversal through a planted symlink directory was accepted")
+	}
+}
+
+// A legitimate in-tree tree still extracts through the root handle unchanged —
+// the hardening must not cost ordinary restores.
+func TestExtractThroughRootHandlesNestedTree(t *testing.T) {
+	src := t.TempDir()
+	writeTree(t, src, map[string]string{
+		"config.yaml":             "c",
+		"a/b/c/deep.txt":          "deep",
+		"data/badger/000000.vlog": "v",
+	})
+	archive := filepath.Join(t.TempDir(), "nested.tar.gz")
+	if _, _, err := writeBackupArchive(archive, []string{src}, backupManifest{
+		Kind: backupKindFull, ForkVersion: ConsensusForkVersion, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("writeBackupArchive: %v", err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "restored")
+	if err := extractBackupArchive(archive, []string{dest}); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	for rel, want := range map[string]string{
+		"config.yaml":             "c",
+		"a/b/c/deep.txt":          "deep",
+		"data/badger/000000.vlog": "v",
+	} {
+		b, readErr := os.ReadFile(filepath.Join(dest, filepath.FromSlash(rel)))
+		if readErr != nil || string(b) != want {
+			t.Fatalf("%s: got %q err %v, want %q", rel, b, readErr, want)
+		}
+	}
+}
