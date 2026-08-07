@@ -741,3 +741,94 @@ func TestRestoreDataDirLinkDoesNotClobber(t *testing.T) {
 		t.Fatalf("existing directory at the link path was clobbered: %v", err)
 	}
 }
+
+// sanitizeSymlinkTarget is the restore-side sink guard: it must return a
+// recomputed relative target and refuse anything that leaves the restore root.
+// An escaping link is not merely a bad link — it turns every LATER file entry in
+// the archive into an arbitrary write.
+func TestSanitizeSymlinkTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		linkname string
+		entryRel string
+		want     string
+		wantErr  bool
+	}{
+		{"sibling", "sibling", "a/link", "sibling", false},
+		{"nested", "sub/file", "a/link", "sub/file", false},
+		{"up-but-still-inside", "../b/file", "a/link", "../b/file", false},
+		{"escapes-root", "../../outside", "a/link", "", true},
+		{"escapes-root-deep", "../../../etc/passwd", "a/b/link", "", true},
+		{"absolute", "/etc/passwd", "a/link", "", true},
+		{"empty", "", "a/link", "", true},
+		{"dot-dot-only", "..", "link", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := sanitizeSymlinkTarget(tc.linkname, tc.entryRel)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("linkname %q from %q was accepted, got %q", tc.linkname, tc.entryRel, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("linkname %q from %q rejected: %v", tc.linkname, tc.entryRel, err)
+			}
+			if filepath.ToSlash(got) != tc.want {
+				t.Fatalf("sanitized = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The sanitized target must resolve to the same place the original did, for
+// every target that is legitimately inside the root — sanitizing must not
+// silently redirect a valid link.
+func TestSanitizeSymlinkTargetPreservesResolution(t *testing.T) {
+	entryRel := filepath.Join("a", "link")
+	got, err := sanitizeSymlinkTarget("../b/file", entryRel)
+	if err != nil {
+		t.Fatalf("sanitize: %v", err)
+	}
+	origin := filepath.Join(filepath.Dir(entryRel), "../b/file")
+	sanitized := filepath.Join(filepath.Dir(entryRel), got)
+	if filepath.Clean(origin) != filepath.Clean(sanitized) {
+		t.Fatalf("sanitized target resolves to %q, original resolved to %q", sanitized, origin)
+	}
+}
+
+// An archive entry name that escapes must be refused before it becomes a path.
+func TestExtractRejectsNonLocalEntryName(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "abs-entry.tar.gz")
+	f, createErr := os.Create(archive)
+	if createErr != nil {
+		t.Fatalf("create: %v", createErr)
+	}
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	payload := []byte("x")
+	if headerErr := tw.WriteHeader(&tar.Header{
+		Name: "root0/../../escape.txt", Mode: 0600,
+		Size: int64(len(payload)), Typeflag: tar.TypeReg,
+	}); headerErr != nil {
+		t.Fatalf("header: %v", headerErr)
+	}
+	if _, writeErr := tw.Write(payload); writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
+	}
+	_ = tw.Close()
+	_ = gz.Close()
+	_ = f.Close()
+
+	dest := filepath.Join(t.TempDir(), "target")
+	if mkdirErr := os.MkdirAll(dest, 0700); mkdirErr != nil {
+		t.Fatalf("mkdir: %v", mkdirErr)
+	}
+	err := extractBackupArchive(archive, []string{dest})
+	if err == nil {
+		t.Fatal("entry name escaping the root was accepted")
+	}
+	if !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("unexpected error %v", err)
+	}
+}

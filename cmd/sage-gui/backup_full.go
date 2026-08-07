@@ -886,10 +886,24 @@ func extractBackupArchive(path string, targets []string) error {
 			continue
 		}
 		root := cleanTargets[idx]
-		dest := filepath.Join(root, filepath.FromSlash(rel))
 
-		// Path traversal guard: a crafted archive must never write outside its
-		// target root.
+		// Sanitize the archive-supplied path into a value BEFORE it becomes a
+		// filesystem path. filepath.IsLocal rejects absolute paths, volume names,
+		// and every ".." escape, so nothing derived from the header can address
+		// anything outside root. Guarding the joined path afterwards would be
+		// equally safe at runtime but leaves the untrusted string flowing into
+		// the sink, which is both harder to audit and unprovable to a scanner.
+		safeRel := filepath.Clean(filepath.FromSlash(rel))
+		if safeRel == "." {
+			continue
+		}
+		if !filepath.IsLocal(safeRel) {
+			return fmt.Errorf("archive entry %q escapes its restore root", hdr.Name)
+		}
+		dest := filepath.Join(root, safeRel)
+
+		// Defence in depth: the join above cannot escape a local path, but keep
+		// the containment assertion so a future refactor cannot quietly remove it.
 		if !pathWithin(dest, root) {
 			return fmt.Errorf("archive entry %q escapes its restore root", hdr.Name)
 		}
@@ -902,16 +916,18 @@ func extractBackupArchive(path string, targets []string) error {
 		case tar.TypeSymlink:
 			// A symlink whose target escapes the root turns every LATER file
 			// entry into an arbitrary write: extracting "root0/link/file" would
-			// follow the link out of the tree. Validate the target, not just the
-			// entry name.
-			if err := validateSymlinkTarget(hdr.Linkname, dest, root); err != nil {
-				return err
+			// follow the link out of the tree. Sanitize the target into a new
+			// value and create THAT — the archive's own string never reaches
+			// os.Symlink.
+			safeLink, linkErr := sanitizeSymlinkTarget(hdr.Linkname, safeRel)
+			if linkErr != nil {
+				return fmt.Errorf("archive symlink %q: %w", hdr.Name, linkErr)
 			}
 			if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
 				return fmt.Errorf("create parent of %s: %w", dest, err)
 			}
 			_ = os.Remove(dest)
-			if err := os.Symlink(hdr.Linkname, dest); err != nil {
+			if err := os.Symlink(safeLink, dest); err != nil {
 				return fmt.Errorf("symlink %s: %w", dest, err)
 			}
 		case tar.TypeReg:
@@ -945,20 +961,32 @@ func extractBackupArchive(path string, targets []string) error {
 	}
 }
 
-// validateSymlinkTarget rejects absolute targets and relative targets that
-// resolve outside the restore root.
-func validateSymlinkTarget(linkname, dest, root string) error {
+// sanitizeSymlinkTarget validates an archive-supplied symlink target and returns
+// the exact relative target to create.
+//
+// It deliberately returns a RECOMPUTED value rather than echoing the header
+// field back: the untrusted string must never reach os.Symlink. entryRel is the
+// link's own already-sanitized path relative to the restore root, so resolving
+// the target against its directory and requiring the result to stay local is
+// sufficient — an escaping link would otherwise turn every later file entry into
+// an arbitrary write.
+func sanitizeSymlinkTarget(linkname, entryRel string) (string, error) {
 	if linkname == "" {
-		return fmt.Errorf("archive contains a symlink with an empty target at %q", dest)
+		return "", errors.New("empty target")
 	}
 	if filepath.IsAbs(linkname) {
-		return fmt.Errorf("archive symlink %q points to an absolute path %q; refusing to restore it", dest, linkname)
+		return "", fmt.Errorf("target %q is an absolute path", linkname)
 	}
-	resolved := filepath.Clean(filepath.Join(filepath.Dir(dest), linkname))
-	if !pathWithin(resolved, root) {
-		return fmt.Errorf("archive symlink %q points outside the restore root (%q)", dest, linkname)
+	linkDir := filepath.Dir(entryRel)
+	resolved := filepath.Join(linkDir, filepath.Clean(filepath.FromSlash(linkname)))
+	if !filepath.IsLocal(resolved) {
+		return "", fmt.Errorf("target %q points outside the restore root", linkname)
 	}
-	return nil
+	safe, err := filepath.Rel(linkDir, resolved)
+	if err != nil {
+		return "", fmt.Errorf("target %q could not be made relative: %w", linkname, err)
+	}
+	return safe, nil
 }
 
 // splitRootPrefix parses the "rootN/rest" entry naming written by the archiver.
