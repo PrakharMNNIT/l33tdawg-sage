@@ -33,9 +33,11 @@ type signedRecallBody struct {
 }
 
 type signedFederationContext struct {
-	SourceChainID     string            `json:"source_chain_id"`
-	AgreementBindings map[string]string `json:"agreement_bindings"`
-	QueryChallenges   map[string]string `json:"query_challenges"`
+	SourceChainID             string                                    `json:"source_chain_id"`
+	AgreementBindings         map[string]string                         `json:"agreement_bindings"`
+	QueryChallenges           map[string]string                         `json:"query_challenges"`
+	AuthorizationModels       map[string]string                         `json:"authorization_models"`
+	AuthorizationAttestations map[string]SourceAuthorizationAttestation `json:"authorization_attestations"`
 }
 
 func splitCanonicalAgentRequest(canonical []byte) (method, path string, body []byte, err error) {
@@ -128,10 +130,24 @@ func (m *Manager) verifyQueryAgentProofV23(now time.Time, req *QueryRequest) (st
 	if !signed.Federated || !containsExactChain(signed.FederateChains, req.DestinationChainID) {
 		return "", errors.New("v23 signed recall body does not authorize this exact destination")
 	}
+	signedAuthorizationModel := ""
+	signedAttestation := SourceAuthorizationAttestation{}
+	modelBound := false
+	attestationBound := false
+	if signed.FederationContext != nil {
+		signedAuthorizationModel, modelBound =
+			signed.FederationContext.AuthorizationModels[req.DestinationChainID]
+		signedAttestation, attestationBound =
+			signed.FederationContext.AuthorizationAttestations[req.DestinationChainID]
+	}
 	if signed.FederationContext == nil ||
 		signed.FederationContext.SourceChainID != req.SourceChainID ||
 		signed.FederationContext.AgreementBindings[req.DestinationChainID] != req.AgreementBindingDigest ||
-		signed.FederationContext.QueryChallenges[req.DestinationChainID] != req.QueryChallenge {
+		signed.FederationContext.QueryChallenges[req.DestinationChainID] != req.QueryChallenge ||
+		!modelBound || signedAuthorizationModel != req.SourceAuthorizationModel ||
+		!attestationBound ||
+		signedAttestation.Eligible != req.SourceAgentEligible ||
+		signedAttestation.MaxClassification != req.SourceAgentMaxClassification {
 		return "", errors.New("v23 signed recall body does not authorize this source, agreement generation, and challenge")
 	}
 	mode, err := queryModeForSignedPath(path, signed)
@@ -170,7 +186,10 @@ func (m *Manager) validateQueryEnvelopeV23(ctx context.Context, peer *peerIdenti
 	if err != nil {
 		return 0, err
 	}
-	ceiling, err := m.authorizeFederatedGuestRead(ctx, peer, agreement, req.AgentProof.AgentID, req.DomainTag)
+	ceiling, err := m.authorizeFederatedPeerRead(
+		ctx, peer, agreement, req.AgentProof.AgentID, req.DomainTag,
+		req.SourceAuthorizationModel, req.SourceAgentEligible, req.SourceAgentMaxClassification,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -178,13 +197,16 @@ func (m *Manager) validateQueryEnvelopeV23(ctx context.Context, peer *peerIdenti
 		return 0, errors.New("v23 durable query challenge store is unavailable")
 	}
 	if err := m.queryChallengeStore.ConsumeFederatedQueryChallenge(ctx, store.FederatedQueryChallenge{
-		ChallengeID:            req.QueryChallenge,
-		RemoteChainID:          peer.ChainID,
-		PeerAgentID:            peer.AgentID,
-		RequestedAgentID:       requestedAgentID,
-		DomainTag:              req.DomainTag,
-		AgreementBindingDigest: req.AgreementBindingDigest,
-		ExpiresAt:              1, // validated from the durable row by the atomic UPDATE.
+		ChallengeID:                  req.QueryChallenge,
+		RemoteChainID:                peer.ChainID,
+		PeerAgentID:                  peer.AgentID,
+		RequestedAgentID:             requestedAgentID,
+		DomainTag:                    req.DomainTag,
+		AgreementBindingDigest:       req.AgreementBindingDigest,
+		SourceAuthorizationModel:     req.SourceAuthorizationModel,
+		SourceAgentEligible:          req.SourceAgentEligible,
+		SourceAgentMaxClassification: req.SourceAgentMaxClassification,
+		ExpiresAt:                    1, // validated from the durable row by the atomic UPDATE.
 	}, time.Now()); err != nil {
 		return 0, err
 	}

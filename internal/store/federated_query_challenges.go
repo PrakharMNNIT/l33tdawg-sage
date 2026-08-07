@@ -20,13 +20,16 @@ const (
 // FederatedQueryChallenge is a destination-issued, durable, single-use token.
 // The original local agent signs it into the final recall request.
 type FederatedQueryChallenge struct {
-	ChallengeID            string
-	RemoteChainID          string
-	PeerAgentID            string
-	RequestedAgentID       string
-	DomainTag              string
-	AgreementBindingDigest string
-	ExpiresAt              int64
+	ChallengeID                  string
+	RemoteChainID                string
+	PeerAgentID                  string
+	RequestedAgentID             string
+	DomainTag                    string
+	AgreementBindingDigest       string
+	SourceAuthorizationModel     string
+	SourceAgentEligible          bool
+	SourceAgentMaxClassification uint8
+	ExpiresAt                    int64
 }
 
 func validateFederatedQueryChallenge(c FederatedQueryChallenge) error {
@@ -54,6 +57,19 @@ func validateFederatedQueryChallenge(c FederatedQueryChallenge) error {
 		len(c.DomainTag) > 256 || strings.ContainsAny(c.DomainTag, "\x00\r\n") {
 		return errors.New("federated query challenge domain is invalid")
 	}
+	if c.SourceAuthorizationModel != "" && c.SourceAuthorizationModel != "peer-export-v1" {
+		return errors.New("federated query challenge authorization model is invalid")
+	}
+	if c.SourceAuthorizationModel == "" &&
+		(c.SourceAgentEligible || c.SourceAgentMaxClassification != 0) {
+		return errors.New("legacy federated query challenge has a source attestation")
+	}
+	if c.SourceAuthorizationModel == "peer-export-v1" && !c.SourceAgentEligible {
+		return errors.New("peer-export federated query challenge lacks source eligibility")
+	}
+	if c.SourceAgentMaxClassification > 4 {
+		return errors.New("federated query challenge source classification is invalid")
+	}
 	if c.ExpiresAt <= 0 {
 		return errors.New("federated query challenge expiry is invalid")
 	}
@@ -69,11 +85,34 @@ func (s *SQLiteStore) migrateFederatedQueryChallenges(ctx context.Context) error
 		requested_agent_id           TEXT NOT NULL,
 		domain_tag                   TEXT NOT NULL,
 		agreement_binding_digest     TEXT NOT NULL,
+		source_authorization_model  TEXT NOT NULL DEFAULT '__unbound__',
+		source_agent_eligible       INTEGER NOT NULL DEFAULT 0,
+		source_agent_max_classification INTEGER NOT NULL DEFAULT 0,
 		expires_at                   INTEGER NOT NULL,
 		consumed_at                  INTEGER NOT NULL DEFAULT 0,
 		created_at                   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	)`); err != nil {
 		return fmt.Errorf("create federated query challenge table: %w", err)
+	}
+	for column, statement := range map[string]string{
+		"source_authorization_model": `ALTER TABLE federated_query_challenge
+			ADD COLUMN source_authorization_model TEXT NOT NULL DEFAULT '__unbound__'`,
+		"source_agent_eligible": `ALTER TABLE federated_query_challenge
+			ADD COLUMN source_agent_eligible INTEGER NOT NULL DEFAULT 0`,
+		"source_agent_max_classification": `ALTER TABLE federated_query_challenge
+			ADD COLUMN source_agent_max_classification INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if err := s.addSQLiteColumnIfMissing(ctx, "federated_query_challenge", column, statement); err != nil {
+			return fmt.Errorf("migrate federated query challenge %s: %w", column, err)
+		}
+	}
+	// Pre-binding rows cannot reveal whether they were minted under legacy
+	// linked-reader or peer-export authorization. Invalidate them instead of
+	// silently defaulting a peer-export challenge to legacy after upgrade. Run
+	// this on every startup so a crash between ALTER and cleanup remains safe.
+	if _, err := s.writeExecContext(ctx, `DELETE FROM federated_query_challenge
+		WHERE source_authorization_model='__unbound__'`); err != nil {
+		return fmt.Errorf("invalidate unbound federated query challenges: %w", err)
 	}
 	if _, err := s.writeExecContext(ctx, `
 	CREATE INDEX IF NOT EXISTS idx_federated_query_challenge_peer
@@ -109,7 +148,9 @@ func (s *SQLiteStore) FederationV23SchemaReady(ctx context.Context) error {
 			authorized_by, authority_kind, authority_root_generation,
 			authority_role_revision, authority_enrollment_revision, signature`,
 		"federated_query_challenge": `challenge_id, remote_chain_id, peer_agent_id,
-			requested_agent_id, domain_tag, agreement_binding_digest, expires_at,
+			requested_agent_id, domain_tag, agreement_binding_digest,
+			source_authorization_model, source_agent_eligible,
+			source_agent_max_classification, expires_at,
 			consumed_at`,
 		"federated_admin_elevation_nonce": `scope, root_generation, admin_id,
 			nonce, expires_at, consumed_at`,
@@ -187,11 +228,14 @@ func (s *SQLiteStore) IssueFederatedQueryChallenge(ctx context.Context, challeng
 		_, err := tx.conn.ExecContext(ctx, `
 			INSERT INTO federated_query_challenge (
 				challenge_id, remote_chain_id, peer_agent_id, requested_agent_id, domain_tag,
-				agreement_binding_digest, expires_at, consumed_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+				agreement_binding_digest, source_authorization_model,
+				source_agent_eligible, source_agent_max_classification, expires_at, consumed_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
 			challenge.ChallengeID, challenge.RemoteChainID, challenge.PeerAgentID,
 			challenge.RequestedAgentID, challenge.DomainTag,
-			challenge.AgreementBindingDigest, challenge.ExpiresAt)
+			challenge.AgreementBindingDigest, challenge.SourceAuthorizationModel,
+			challenge.SourceAgentEligible, challenge.SourceAgentMaxClassification,
+			challenge.ExpiresAt)
 		return err
 	})
 }
@@ -212,10 +256,13 @@ func (s *SQLiteStore) ConsumeFederatedQueryChallenge(ctx context.Context, challe
 		SET consumed_at=?
 		WHERE challenge_id=? AND remote_chain_id=? AND peer_agent_id=?
 			AND requested_agent_id=? AND domain_tag=?
-			AND agreement_binding_digest=? AND consumed_at=0 AND expires_at>=?`,
+			AND agreement_binding_digest=? AND source_authorization_model=?
+			AND source_agent_eligible=? AND source_agent_max_classification=?
+			AND consumed_at=0 AND expires_at>=?`,
 		now.Unix(), challenge.ChallengeID, challenge.RemoteChainID,
 		challenge.PeerAgentID, challenge.RequestedAgentID, challenge.DomainTag,
-		challenge.AgreementBindingDigest, now.Unix())
+		challenge.AgreementBindingDigest, challenge.SourceAuthorizationModel,
+		challenge.SourceAgentEligible, challenge.SourceAgentMaxClassification, now.Unix())
 	if err != nil {
 		return err
 	}

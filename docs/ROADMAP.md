@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.15 is the current release.** This corrective release makes blank writable-agent approvals atomically generate a readable name-based home domain with a cryptographically random suffix. It also completes confirmed multi-domain recovery across the existing governance cooldown on idle personal chains, repairs the honest idle-clock proof race without relaxing consensus validation, moves first-approval identities into Agents, adds an exact-identity From federation directory, and hardens Tauri AppImage helper acquisition. Governed app-v26 remains unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
+**Status (2026-08):** **v11.17.17 is the current release.** This corrective release pins the exported-agent authorization model and source-agent attestation into every signed federated Read plan and holds final authorization through disclosure. It also makes authenticated-read capability readiness visible and extends the Docker lane through bidirectional Copy backfill, incremental mirroring, and restart recovery. Governed app-v26 and consensus remain unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -53,6 +53,15 @@ inbox to enabled, while an existing policy block stays visible in Federation
 with a deep link to the exact agent setting. It also generates a unique
 name-based home domain when a writable pending-agent approval leaves that field
 blank. v11.17.13 and the superseded v11.17.14 tag were not published.
+
+v11.17.17 closes the final plan-versus-disclosure race exposed while validating
+the physical Mynah pair. The source authorization model and exact active-agent
+and clearance attestation are signed, challenge-bound, revalidated under the
+source authorization lease, and held until the destination query completes.
+Capability projection reports missing authenticated-read support without
+guessing whether the peer is still binding or needs an update. The acceptance
+lane now proves pairwise default Read, explicit denial, non-transitive exports,
+and bidirectional Copy backfill/incremental/restart behavior.
 
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:

@@ -51,6 +51,33 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.17.17
+
+**Federated Read plans now stay true until disclosure.** The v11.17.16
+exported-agent model correctly made a trusted node pair its own federation
+group, but a source agent's standing or clearance could change between planning
+and the remote query. v11.17.17 binds the source authorization model and exact
+attestation into the signed plan and single-use challenge, then holds the final
+source authorization lease through the destination query. A changed export,
+domain owner, enrollment, clearance, agreement, or capability now fails closed
+before any memory is returned and requires a fresh plan and signature.
+
+CEREBRUM and `sage_federation` also expose the negotiated authenticated-read
+capability explicitly. A reachable peer missing it is described honestly as
+possibly still warming/binding or needing an update; SAGE does not guess which.
+Policy candidates stay separate from domains the destination has verified. The
+Docker federation lane covers pairwise default Read, explicit denial,
+non-transitive exports, Copy backfill, incremental mirroring, bidirectional
+mirroring, and restart recovery.
+
+This is an off-consensus protocol, authorization, and projection correction. It
+changes no transaction codec, AppHash input, fork target, key format, memory, domain,
+linked-reader row, or existing agreement. Both SAGEs must run v11.17.17 for the
+complete signed authorization tuple; older clients are told to re-plan and
+re-sign instead of silently downgrading it.
+
+Container: `ghcr.io/l33tdawg/sage:11.17.17`. SDK 11.17.17.
+
 ## What's New in v11.17.15
 
 **Blank home-domain approval now does what the form promises.** When an
@@ -1378,7 +1405,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.15`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.17`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

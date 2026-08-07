@@ -122,7 +122,12 @@ func planAndSignV23Query(
 	request *QueryRequest,
 ) *QueryRequest {
 	t.Helper()
-	callerID := hex.EncodeToString(source.agentPub)
+	callerPub, callerKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerID := hex.EncodeToString(callerPub)
+	enrollV23SourceReadAllAdmin(t, source, "federated-query-caller", callerPub, 20)
 	addV23TestGuest(t, destination, source, callerID, request.DomainTag, 4)
 	plan, err := source.mgr.PlanRecall(
 		context.Background(), []string{destination.chainID}, callerID, request.DomainTag,
@@ -144,9 +149,11 @@ func planAndSignV23Query(
 		"tags": request.Tags, "federated": true,
 		"federate_chains": plan.Destinations,
 		"federation_context": map[string]any{
-			"source_chain_id":    plan.SourceChainID,
-			"agreement_bindings": plan.AgreementBindings,
-			"query_challenges":   plan.QueryChallenges,
+			"source_chain_id":            plan.SourceChainID,
+			"agreement_bindings":         plan.AgreementBindings,
+			"query_challenges":           plan.QueryChallenges,
+			"authorization_models":       plan.AuthorizationModels,
+			"authorization_attestations": plan.AuthorizationAttestations,
 		},
 	}
 	if request.EmbeddingProvider != "" {
@@ -161,12 +168,14 @@ func planAndSignV23Query(
 	request.AgentProof = &QueryAgentProof{
 		AgentID: callerID,
 		Signature: auth.SignRequestWithNonce(
-			source.agentKey, "POST", path, body, now, nonce,
+			callerKey, "POST", path, body, now, nonce,
 		),
 		Timestamp: now, Nonce: nonce,
 		CanonicalRequest: append([]byte("POST "+path+"\n"), body...),
 	}
 	request.PlanAgreementBindings = plan.AgreementBindings
 	request.PlanChallenges = plan.QueryChallenges
+	request.PlanAuthorizationModels = plan.AuthorizationModels
+	request.PlanAuthorizationAttestations = plan.AuthorizationAttestations
 	return request
 }

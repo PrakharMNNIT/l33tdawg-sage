@@ -334,9 +334,11 @@ func peerRBACV23Request(
 		"query": text, "domain_tag": domain, "top_k": 10,
 		"federated": true, "federate_chains": []string{m.localChainID},
 		"federation_context": map[string]any{
-			"source_chain_id":    chainID,
-			"agreement_bindings": map[string]string{m.localChainID: digest},
-			"query_challenges":   map[string]string{m.localChainID: challenge},
+			"source_chain_id":            chainID,
+			"agreement_bindings":         map[string]string{m.localChainID: digest},
+			"query_challenges":           map[string]string{m.localChainID: challenge},
+			"authorization_models":       map[string]string{m.localChainID: ""},
+			"authorization_attestations": map[string]SourceAuthorizationAttestation{m.localChainID: {}},
 		},
 	})
 	if signedBodyErr != nil {

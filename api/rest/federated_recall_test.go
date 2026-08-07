@@ -36,12 +36,13 @@ type fakeFederation struct {
 
 type parallelStatusFederation struct {
 	*fakeFederation
-	statuses map[string]*federation.StatusResponse
-	delay    time.Duration
-	mu       sync.Mutex
-	calls    int
-	current  int
-	max      int
+	statuses        map[string]*federation.StatusResponse
+	readableDomains map[string][]string
+	delay           time.Duration
+	mu              sync.Mutex
+	calls           int
+	current         int
+	max             int
 }
 
 type parallelLookupFederation struct {
@@ -156,6 +157,22 @@ func (f *parallelStatusFederation) PeerStatus(ctx context.Context, chainID strin
 		return nil, errors.New("unreachable")
 	}
 	return status, nil
+}
+
+func (f *parallelStatusFederation) AvailableRecallDomains(
+	_ context.Context, chainID, _ string, candidates []string,
+) ([]string, error) {
+	allowed := make(map[string]struct{}, len(f.readableDomains[chainID]))
+	for _, domain := range f.readableDomains[chainID] {
+		allowed[domain] = struct{}{}
+	}
+	result := make([]string, 0, len(candidates))
+	for _, domain := range candidates {
+		if _, ok := allowed[domain]; ok {
+			result = append(result, domain)
+		}
+	}
+	return result, nil
 }
 
 func (f *parallelLookupFederation) FindRemotePipeContacts(ctx context.Context, chainID, _ string, _ int) (*federation.PipeContactLookupResponse, error) {
@@ -449,6 +466,50 @@ func TestFederatedSemanticRecallCarriesTextFallback(t *testing.T) {
 	assert.Equal(t, "benchmark exact words", fed.lastReq.Query)
 }
 
+func TestPostV23FederatedRecallRejectsOldClientAuthorizationTupleOmission(t *testing.T) {
+	srv, _, _ := newTestServer(t, "")
+	fed := &fakeFederation{}
+	srv.SetFederation(fed)
+	body, err := json.Marshal(SearchMemoryRequest{
+		Query: "signed plan", DomainTag: "shared", Federated: true,
+		FederateChains: []string{"chain-a"},
+		FederationContext: &FederatedRecallProofContext{
+			SourceChainID:     fed.LocalChainID(),
+			AgreementBindings: map[string]string{"chain-a": "binding-a"},
+			QueryChallenges:   map[string]string{"chain-a": "challenge-a"},
+			// A pre-authorization-tuple client copied only the historical plan
+			// fields. Empty authorization values are valid for a legacy peer, but
+			// omitted map entries are an old-client signing error.
+		},
+	})
+	require.NoError(t, err)
+	req, callerID := signedRequest(t, http.MethodPost, "/v1/memory/search", body)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Host = "127.0.0.1:8080"
+	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, badger.CloseBadger()) })
+	require.NoError(t, badger.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: callerID, Scope: "rest-old-client-plan",
+		AgentID: strings.Repeat("7a", 32), Profile: store.AppV23ProfileStandard,
+		HomeDomain: "companion.home", Clearance: 2, Height: 1,
+		BootstrapDigest: "rest-old-client-plan",
+	}))
+	srv.badgerStore = badger
+	srv.SetPostV23ForNextTxAccessor(func() bool { return true })
+
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var response QueryMemoryResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+	require.NotNil(t, response.Federation)
+	assert.Equal(t, 0, fed.calls, "an incomplete signed tuple must fail before peer fan-out")
+	assert.Contains(t, response.Federation.Errors["chain-a"], "signed federation authorization tuple")
+	assert.Contains(t, response.Federation.Errors["chain-a"], "recall-plan")
+	assert.Contains(t, response.Federation.Errors["chain-a"], "re-sign")
+}
+
 func TestFederatedRecallDeduplicatesLocalAndLiveByContentHash(t *testing.T) {
 	srv, memStore, _ := newTestServer(t, "")
 	memStore.memories["local-copy-shape"] = &memory.MemoryRecord{
@@ -536,6 +597,10 @@ func TestCrossFedStatusExposesAuthenticatedRemoteDiscovery(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
 	assert.Equal(t, true, response["reachable"])
 	assert.Equal(t, "DKAN-TII", response["network_name"])
+	assert.Equal(t, []any{
+		federation.CapabilitySync,
+		federation.CapabilityFederatedPipeline,
+	}, response["capabilities"])
 	assert.NotNil(t, response["peer_rbac_grant"])
 	assert.NotNil(t, response["pipe_contacts"])
 }
@@ -584,11 +649,58 @@ func TestFederationAvailableIsCallerFilteredSubtreeAndParallel(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
 	require.Len(t, response.Connections, 2)
 	for _, connection := range response.Connections {
-		assert.Equal(t, []string{"sage-autoresearch.benchmark"}, connection.SharedReadDomains)
+		assert.Equal(t, []string{"sage-autoresearch.benchmark"}, connection.ReadCandidateDomains)
+		assert.Empty(t, connection.SharedReadDomains)
+		assert.Equal(t, "unsupported", connection.ReadAuthorization)
 		assert.Equal(t, []string{"sage-autoresearch.benchmark"}, connection.CopyOfferedDomains)
 	}
 	assert.GreaterOrEqual(t, fed.max, 2, "peer status probes should overlap")
 	assert.Less(t, elapsed, 190*time.Millisecond, "discovery should be one bounded parallel window")
+}
+
+func TestFederationAvailableDoesNotPresentPeerPolicyAsLinkedReaderAuthority(t *testing.T) {
+	srv, _, _ := newTestServer(t, "")
+	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = badger.CloseBadger() })
+	srv.badgerStore = badger
+	require.NoError(t, badger.SetCrossFed(
+		"chain-mini", "https://redacted.invalid", []byte("peer-pin"),
+		3, 0, []string{}, nil, "active",
+	))
+	srv.SetFederation(&parallelStatusFederation{
+		fakeFederation: &fakeFederation{},
+		statuses: map[string]*federation.StatusResponse{
+			"chain-mini": {
+				ChainID: "chain-mini", NetworkName: "STUDIO-MACMINI",
+				Capabilities: []string{federation.CapabilityQueryAvailabilityV1},
+				PeerRBACGrant: &federation.PeerRBACGrant{Domains: []federation.PeerRBACDomainGrant{{
+					Domain: "modular-marketplaces", Read: true,
+				}}},
+			},
+		},
+		readableDomains: map[string][]string{"chain-mini": {}},
+	})
+
+	req, callerID := signedRequest(t, http.MethodGet, "/v1/federation/available", nil)
+	require.NoError(t, badger.RegisterAgent(callerID, "mynah", "member", "", "mynah", "", 1))
+	require.NoError(t, badger.SetAgentPermission(
+		callerID, 1, `[{"domain":"modular-marketplaces","read":true}]`, "*", "", "",
+	))
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var response struct {
+		Connections []availableFederationConnection `json:"connections"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+	require.Len(t, response.Connections, 1)
+	connection := response.Connections[0]
+	assert.Equal(t, []string{"modular-marketplaces"}, connection.ReadCandidateDomains)
+	assert.Empty(t, connection.SharedReadDomains,
+		"peer Read policy must not be presented as an active linked-reader grant")
+	assert.Equal(t, "verified", connection.ReadAuthorization)
+	assert.True(t, connection.ReadAuthorizationComplete)
 }
 
 func TestFederationAvailableProbesV3AgreementWithEmptyLegacyDomains(t *testing.T) {
@@ -627,7 +739,9 @@ func TestFederationAvailableProbesV3AgreementWithEmptyLegacyDomains(t *testing.T
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
 	require.Len(t, response.Connections, 1)
 	assert.Equal(t, "chain-v3", response.Connections[0].RemoteChainID)
-	assert.Equal(t, []string{"research"}, response.Connections[0].SharedReadDomains)
+	assert.Equal(t, []string{"research"}, response.Connections[0].ReadCandidateDomains)
+	assert.Empty(t, response.Connections[0].SharedReadDomains)
+	assert.Equal(t, "unsupported", response.Connections[0].ReadAuthorization)
 	assert.Equal(t, 1, fed.calls, "live peer RBAC, not obsolete JOIN domains, controls visibility")
 }
 
@@ -872,8 +986,8 @@ func TestFederationAvailableLargeInventoryReturnsBoundedUsefulPage(t *testing.T)
 	fed.mu.Lock()
 	calls := fed.calls
 	fed.mu.Unlock()
-	require.Equal(t, federationProbeBudgetPerCaller, calls,
-		"a large status-only inventory returns one useful bounded page instead of rejecting the whole request")
+	require.Equal(t, federationProbeBudgetPerCaller/2, calls,
+		"a general page reserves status plus exact read-authorization capacity for every peer")
 }
 
 func TestFederationAvailableRateCadenceDoesNotRevealHiddenPeerCount(t *testing.T) {
@@ -1298,8 +1412,10 @@ func TestFederationAvailableDiscoveryHonorsFederatedPipeDeny(t *testing.T) {
 	assert.Equal(t, "chain-peer", connection.RemoteChainID)
 	assert.Equal(t, "Peer SAGE", connection.NetworkName)
 	assert.True(t, connection.Reachable)
-	assert.Equal(t, []string{"research"}, connection.SharedReadDomains)
-	assert.NotEmpty(t, connection.RemotePermissions)
+	assert.Equal(t, []string{"research"}, connection.ReadCandidateDomains)
+	assert.Empty(t, connection.SharedReadDomains)
+	assert.Equal(t, "unsupported", connection.ReadAuthorization)
+	assert.Empty(t, connection.RemotePermissions)
 	assert.Empty(t, connection.RemoteAgents,
 		"the no-name topology view must not expose recipients while federated pipe is denied")
 	assert.False(t, connection.RemoteAgentsTruncated)

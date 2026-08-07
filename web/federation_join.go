@@ -93,6 +93,10 @@ func (h *DashboardHandler) registerFederationRoutes(r chi.Router) {
 	fr.Get("/v1/dashboard/federation/connections", h.handleFedConnections)
 	fr.Get("/v1/dashboard/federation/connections/{chain_id}/permissions", h.handleFedPermissionsGet)
 	fr.Put("/v1/dashboard/federation/connections/{chain_id}/permissions", h.handleFedPermissionsPut)
+	fr.Get("/v1/dashboard/federation/connections/{chain_id}/agent-exports", h.handleFedAgentExportsGet)
+	fr.Put("/v1/dashboard/federation/connections/{chain_id}/agent-exports", h.handleFedAgentExportsPut)
+	fr.Get("/v1/dashboard/federation/connections/{chain_id}/reader-restrictions", h.handleFedReaderRestrictionsGet)
+	fr.Put("/v1/dashboard/federation/connections/{chain_id}/reader-restrictions", h.handleFedReaderRestrictionsPut)
 	fr.Put("/v1/dashboard/federation/connections/{chain_id}/pause", h.handleFedPause)
 	fr.Get("/v1/dashboard/federation/connections/{chain_id}/pipe-contacts", h.handleFedPipeContactsGet)
 	fr.Put("/v1/dashboard/federation/connections/{chain_id}/pipe-contacts", h.handleFedPipeContactsPut)
@@ -972,9 +976,15 @@ func (h *DashboardHandler) handleFedPeerStatus(w http.ResponseWriter, r *http.Re
 	}
 	out := map[string]any{"remote_chain_id": chain, "reachable": true, "peer_time": st.Time, "network_name": st.NetworkName}
 	// The peer status call is the panel's one authenticated live probe. Preserve
-	// its already peer-scoped authorization projections so the UI does not show a
-	// reachable connection while claiming the peer reported no domains/agents.
-	// Do not expose the agreement binding digest or other transport internals.
+	// its advertised capabilities and already peer-scoped authorization
+	// projections so the UI does not show a reachable connection while claiming
+	// the peer reported no domains/agents. Capabilities are authenticated,
+	// read-only compatibility metadata already exposed by the operator REST
+	// status route; they grant no authority. Do not expose the agreement binding
+	// digest or other transport internals.
+	if len(st.Capabilities) > 0 {
+		out["capabilities"] = append([]string(nil), st.Capabilities...)
+	}
 	if st.PeerRBACGrant != nil {
 		out["peer_rbac_grant"] = st.PeerRBACGrant
 	}

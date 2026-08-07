@@ -322,6 +322,17 @@ func (m *Manager) initializePeerRBACPolicy(ctx context.Context, remoteChainID st
 	if err != nil {
 		return fmt.Errorf("install initial peer RBAC deny policy: %w", err)
 	}
+	binding := store.FederatedReaderBinding{
+		RemoteChainID: remoteChainID, PeerAgentID: peerAgentID,
+		PolicyEpoch: control.PolicyEpoch, RemoteCAPin: control.RemoteCAPin,
+	}
+	if _, err := ss.ResetFederatedAgentExportsForBinding(ctx, binding); err != nil {
+		return fmt.Errorf("reset retired agent exports for fresh connection: %w", err)
+	}
+	if _, err := ss.ResetFederatedReaderRestrictionsForBinding(ctx, binding); err != nil {
+		return fmt.Errorf("reset retired reader restrictions for fresh connection: %w", err)
+	}
+	m.federatedReaderPolicyRevision.Add(1)
 	return nil
 }
 

@@ -50,6 +50,11 @@ func (d *groupRefreshTestDriver) NudgeJournalReconcileAndWait(context.Context) e
 func (peerStatusTestDriver) PeerStatus(context.Context, string) (*federation.StatusResponse, error) {
 	return &federation.StatusResponse{
 		NetworkName: "DKAN-TII", Time: 123,
+		Capabilities: []string{
+			federation.CapabilityFederationV23,
+			federation.CapabilityPeerExportReadV1,
+			"future-additive-capability-v1",
+		},
 		PeerRBACGrant: &federation.PeerRBACGrant{
 			PolicyVersion: federation.SyncPolicyVersionPeerRBAC,
 			Domains:       []federation.PeerRBACDomainGrant{{Domain: "shared.research", Read: true}},
@@ -86,6 +91,7 @@ func TestFederationPeerStatusReturnsFriendlyNetworkName(t *testing.T) {
 		PeerRBACGrant *federation.PeerRBACGrant    `json:"peer_rbac_grant"`
 		SharingGrant  *federation.SharingGrant     `json:"sharing_grant"`
 		PipeContacts  *federation.PipeContactGrant `json:"pipe_contacts"`
+		Capabilities  []string                     `json:"capabilities"`
 		BindingDigest string                       `json:"query_agreement_binding_digest"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
@@ -99,6 +105,11 @@ func TestFederationPeerStatusReturnsFriendlyNetworkName(t *testing.T) {
 	require.NotNil(t, got.SharingGrant)
 	require.NotNil(t, got.PipeContacts)
 	require.True(t, got.PipeContacts.Contacts[0].Accepting)
+	require.Equal(t, []string{
+		federation.CapabilityFederationV23,
+		federation.CapabilityPeerExportReadV1,
+		"future-additive-capability-v1",
+	}, got.Capabilities, "dashboard projection must preserve authenticated additive peer capabilities")
 	require.Empty(t, got.BindingDigest, "dashboard projection must not expose transport binding internals")
 }
 
@@ -118,11 +129,13 @@ func TestFederationPeerStatusTypesFailureAheadOfHistoricalRoute(t *testing.T) {
 		FailureState string                      `json:"failure_state"`
 		Error        string                      `json:"error"`
 		Route        federation.RouteDiagnostics `json:"route"`
+		Capabilities []string                    `json:"capabilities"`
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
 	assert.False(t, got.Reachable)
 	assert.Equal(t, "trust_failure", got.FailureState)
 	assert.Contains(t, got.Error, "revoked")
+	assert.Empty(t, got.Capabilities, "an unreachable result must not fabricate peer capabilities")
 	assert.Equal(t, federation.RouteKindDirect, got.Route.ActiveKind,
 		"historical diagnostics remain available but must not override the typed failure")
 }

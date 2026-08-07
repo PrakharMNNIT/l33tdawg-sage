@@ -25,6 +25,66 @@ type blockingStatusWriter struct {
 	release chan struct{}
 }
 
+func ensurePipeContactAppV23(t *testing.T, m *Manager, bs *store.BadgerStore) {
+	t.Helper()
+	root, err := bs.GetAppV23Root()
+	require.NoError(t, err)
+	if root == nil {
+		companion := newPeerOperatorID(t)
+		require.NoError(t, bs.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+			RootID: hex.EncodeToString(m.agentPub), Scope: "pipe-contact-explicit-exports",
+			AgentID: companion, Profile: store.AppV23ProfileStandard,
+			HomeDomain: "pipe-contact-bootstrap", Clearance: 1, Height: 1,
+			BootstrapDigest: strings.Repeat("91", 32),
+		}))
+	}
+	m.postV23ForNextTx = func() bool { return true }
+	m.postV22ForNextTx = func() bool { return true }
+	m.postV8ForAccess = func() bool { return true }
+}
+
+func seedPipeContactOrdinaryAgent(
+	t *testing.T, m *Manager, ss *store.SQLiteStore, bs *store.BadgerStore,
+	agentID, name, status string, capabilities store.AgentCapabilities, height int64,
+) {
+	t.Helper()
+	ensurePipeContactAppV23(t, m, bs)
+	role := store.AppV23RoleMember
+	clearance := uint8(1)
+	if capabilities.Has(store.AgentCapabilityReadAllDomains) {
+		role = store.AppV23RoleAdmin
+		clearance = 4
+	}
+	require.NoError(t, bs.RegisterAgentWithCapabilities(
+		agentID, name, role, "", "pipe-contact-test", "", height, capabilities,
+	))
+	root, err := bs.GetAppV23Root()
+	require.NoError(t, err)
+	require.NotNil(t, root)
+	require.NoError(t, bs.ApproveAppV23LocalAgent(store.AppV23LocalEnrollment{
+		AgentID: agentID, ApprovedBy: root.CredentialID, RootGeneration: root.Generation,
+		Profile: store.AppV23ProfileStandard, HomeDomain: "local-" + agentID,
+		Clearance: clearance, Capabilities: capabilities, Active: status == "active",
+		UpdatedHeight: height + 1,
+	}, role, 0, 0))
+	require.NoError(t, ss.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: agentID, Name: name, RegisteredName: name, Status: status,
+	}))
+}
+
+func exportPipeContactAgent(
+	t *testing.T, m *Manager, remoteChainID, agentID string,
+) *store.FederatedAgentExport {
+	t.Helper()
+	exported, err := m.SetFederatedAgentExport(
+		context.Background(), remoteChainID, agentID,
+		store.FederatedAgentExportStateActive, 4, nil, 0,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, exported)
+	return exported
+}
+
 func (w *blockingStatusWriter) Header() http.Header { return w.header }
 func (w *blockingStatusWriter) WriteHeader(int)     {}
 func (w *blockingStatusWriter) Write(p []byte) (int, error) {
@@ -33,18 +93,17 @@ func (w *blockingStatusWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestStatusPipeContactsDeriveEffectiveOwnerContacts(t *testing.T) {
+func TestStatusPipeContactsExposeOnlyExplicitActiveOrdinaryOwners(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
 	m.SetNetworkName("Amy's SAGE")
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 
 	activeOwner := newPeerOperatorID(t)
 	inactiveOwner := newPeerOperatorID(t)
-	require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{
-		AgentID: activeOwner, Name: "tii-sentinel", RegisteredName: "tii-sentinel", Status: "active",
-	}))
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, activeOwner, "tii-sentinel", "active", 0, 10)
 	require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{
 		AgentID: inactiveOwner, Name: "ops-agent", RegisteredName: "ops-agent", Status: "inactive",
 	}))
@@ -61,6 +120,7 @@ func TestStatusPipeContactsDeriveEffectiveOwnerContacts(t *testing.T) {
 		{Domain: "tii.security", Read: true},
 	})
 	require.NoError(t, err)
+	exportPipeContactAgent(t, m, "chain-peer", activeOwner)
 
 	status := statusForPeer(t, m, "chain-peer", peerID, agreement)
 	require.NotNil(t, status.PipeContacts)
@@ -68,7 +128,8 @@ func TestStatusPipeContactsDeriveEffectiveOwnerContacts(t *testing.T) {
 	require.NotEmpty(t, status.PipeContacts.AgreementID)
 	require.NotEmpty(t, status.PipeContacts.Revision)
 	require.False(t, status.PipeContacts.Paused)
-	require.Len(t, status.PipeContacts.Contacts, 2, "ownerless and open-shared domains must not create contacts")
+	require.Len(t, status.PipeContacts.Contacts, 1,
+		"manual Read domains and unexported owners must not synthesize contacts")
 
 	contacts := make(map[string]PipeContact, len(status.PipeContacts.Contacts))
 	for _, contact := range status.PipeContacts.Contacts {
@@ -77,25 +138,20 @@ func TestStatusPipeContactsDeriveEffectiveOwnerContacts(t *testing.T) {
 	active := contacts[activeOwner]
 	require.Equal(t, "tii-sentinel", active.DisplayName)
 	require.True(t, active.Available)
-	require.False(t, active.Accepting, "discovery must not silently authorize inbound pipes")
+	require.True(t, active.Accepting, "explicit federation membership defaults messaging on")
 	require.NotEmpty(t, active.ContactID)
 	require.Equal(t, activeOwner+"@chain-local", active.Address)
 	require.True(t, strings.HasPrefix(active.Handle, "#amy-s-sage-"), active.Handle)
 	require.True(t, strings.HasSuffix(active.Handle, "/"+activeOwner[:pipeContactMinAgentPrefix]), active.Handle)
 	require.Equal(t, []PipeContactDomain{
-		{Domain: "tii.findings", OwningDomain: "tii", OwnerHeight: 1},
-		{Domain: "tii.security", OwningDomain: "tii", OwnerHeight: 1},
+		{Domain: "local-" + activeOwner, OwningDomain: "local-" + activeOwner, OwnerHeight: 11},
+		{Domain: "tii", OwningDomain: "tii", OwnerHeight: 1},
 	}, active.Domains)
-
-	inactive := contacts[inactiveOwner]
-	require.Equal(t, "ops-agent", inactive.DisplayName)
-	require.False(t, inactive.Available)
-	require.False(t, inactive.Accepting)
-	require.Equal(t, []PipeContactDomain{{Domain: "ops.alerts", OwningDomain: "ops", OwnerHeight: 2}}, inactive.Domains)
+	require.NotContains(t, contacts, inactiveOwner)
 	require.Contains(t, status.Capabilities, CapabilityFederatedPipeline)
 }
 
-func TestAppV23PipeContactsStopAtDynamicSharedOwnershipBarrier(t *testing.T) {
+func TestAppV23PipeContactsExplicitExportPauseRemovesContact(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
 	rootID := hex.EncodeToString(m.agentPub)
@@ -123,28 +179,22 @@ func TestAppV23PipeContactsStopAtDynamicSharedOwnershipBarrier(t *testing.T) {
 		}},
 	)
 	require.NoError(t, err)
-
-	// Legacy byte behavior knows only the historical reserved-name rule and
-	// therefore resolves the broader owner.
-	m.postV23ForNextTx = func() bool { return false }
-	legacy := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
-	require.Len(t, legacy.Contacts, 1)
-	require.Equal(t, companionID, legacy.Contacts[0].AgentID)
-
-	// App-v23 observes the consensus shared_domain marker at the intermediate
-	// ancestor and must not advertise the broader owner as a recipient.
 	m.postV23ForNextTx = func() bool { return true }
+	exported := exportPipeContactAgent(t, m, "chain-peer", companionID)
 	current := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
-	require.Empty(t, current.Contacts)
+	require.Len(t, current.Contacts, 1)
+	require.Equal(t, companionID, current.Contacts[0].AgentID)
+	require.Equal(t, []PipeContactDomain{{Domain: "team", OwningDomain: "team", OwnerHeight: 1}}, current.Contacts[0].Domains)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", companionID,
+		store.FederatedAgentExportStatePaused, 4, nil, exported.Revision)
+	require.NoError(t, err)
+	require.Empty(t, statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts.Contacts)
 }
 
-func TestPipeContactsIncludeActiveAgentsWithSharedDomainAccess(t *testing.T) {
+func TestPipeContactsRequireExplicitOwnerExportNotNonOwnerGrants(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
-	// The shared policy targets a child while the grants sit on its owner
-	// ancestor. This pins the live app-v8 ancestor-aware access semantics used
-	// by the node wiring, rather than only testing an exact grant coincidence.
-	m.postV8ForAccess = func() bool { return true }
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 
@@ -153,30 +203,18 @@ func TestPipeContactsIncludeActiveAgentsWithSharedDomainAccess(t *testing.T) {
 	writer := newPeerOperatorID(t)
 	unrelated := newPeerOperatorID(t)
 	inactive := newPeerOperatorID(t)
-	for _, agent := range []struct {
-		id             string
-		name           string
-		registeredName string
-		provider       string
-		status         string
-	}{
-		{owner, "domain-owner", "domain-owner", "local", "active"},
-		{reader, "Research worker", "innovium", "claude-code", "active"},
-		{writer, "domain-writer", "domain-writer", "local", "active"},
-		{unrelated, "unrelated", "unrelated", "local", "active"},
-		{inactive, "inactive-reader", "inactive-reader", "local", "inactive"},
-	} {
-		require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{
-			AgentID: agent.id, Name: agent.name, RegisteredName: agent.registeredName,
-			Provider: agent.provider, Status: agent.status,
-		}))
-	}
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, owner, "domain-owner", "active", 0, 10)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, reader, "Research worker", "active", 0, 20)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, writer, "domain-writer", "active", 0, 30)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, unrelated, "unrelated", "active", 0, 40)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, inactive, "inactive-reader", "inactive", 0, 50)
 	require.NoError(t, bs.RegisterDomain("research", owner, "", 10))
 	require.NoError(t, bs.SetAccessGrant("research", reader, 1, 0, owner))
 	require.NoError(t, bs.SetAccessGrant("research", writer, 2, 0, owner))
 	require.NoError(t, bs.SetAccessGrant("research", inactive, 1, 0, owner))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{Domain: "research.findings", Read: true}})
 	require.NoError(t, err)
+	exported := exportPipeContactAgent(t, m, "chain-peer", owner)
 
 	grant := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
 	require.NotNil(t, grant)
@@ -184,50 +222,42 @@ func TestPipeContactsIncludeActiveAgentsWithSharedDomainAccess(t *testing.T) {
 	for _, contact := range grant.Contacts {
 		contacts[contact.AgentID] = contact
 	}
-	require.Contains(t, contacts, owner, "the effective domain owner stays eligible")
-	require.Contains(t, contacts, reader, "read grant recipients get a shared-domain inbox")
-	require.Contains(t, contacts, writer, "write grants imply the required read capability")
+	require.Contains(t, contacts, owner, "the explicitly exported owner is visible")
+	require.NotContains(t, contacts, reader, "a non-owner read grant must not synthesize identity")
+	require.NotContains(t, contacts, writer, "a non-owner write grant must not synthesize identity")
 	require.NotContains(t, contacts, unrelated)
-	require.NotContains(t, contacts, inactive, "inactive agents never become new federated inbox contacts")
-	readerContact := contacts[reader]
-	require.Equal(t, []PipeContactDomain{{Domain: "research.findings", OwningDomain: "research", OwnerHeight: 10}}, readerContact.Domains)
-	require.Equal(t, "Research worker", readerContact.DisplayName)
-	require.Equal(t, "innovium", readerContact.RegisteredName)
-	require.Equal(t, "claude-code", readerContact.Provider)
-
-	updated, err := m.SetPipeContactAcceptance(ctx, "chain-peer", reader, readerContact.ContactID, true)
-	require.NoError(t, err)
-	var accepted PipeContact
-	for _, contact := range updated.Contacts {
-		if contact.AgentID == reader {
-			accepted = contact
-			break
-		}
-	}
+	require.NotContains(t, contacts, inactive)
+	accepted := contacts[owner]
 	require.True(t, accepted.Accepting)
+	require.Equal(t, []PipeContactDomain{
+		{Domain: "local-" + owner, OwningDomain: "local-" + owner, OwnerHeight: 11},
+		{Domain: "research", OwningDomain: "research", OwnerHeight: 10},
+	}, accepted.Domains)
 	policy, err := m.GetPeerRBACPolicy(ctx, "chain-peer")
 	require.NoError(t, err)
 	require.NotNil(t, policy)
 	event := &PipeEvent{
 		PolicyEpoch:     policy.PolicyEpoch,
-		AgreementID:     updated.AgreementID,
+		AgreementID:     grant.AgreementID,
 		ContactID:       accepted.ContactID,
-		ContactRevision: pipeContactAuthorizationRevision(updated, &accepted),
-		TargetAgentID:   reader,
+		ContactRevision: pipeContactAuthorizationRevision(grant, &accepted),
+		TargetAgentID:   owner,
 	}
 	peer := &peerIdentity{ChainID: "chain-peer", AgentID: peerID, Agreement: agreement}
 	resolved, err := m.authorizeInboundPipeContact(ctx, peer, event)
 	require.NoError(t, err)
-	require.Equal(t, reader, resolved.AgentID)
+	require.Equal(t, owner, resolved.AgentID)
 
-	// A grant revoke removes the recipient from the live projection, so an
+	// Pausing the explicit export removes the recipient from the live projection, so an
 	// already queued event cannot be accepted with a stale contact revision.
-	require.NoError(t, bs.DeleteAccessGrant("research", reader))
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", owner,
+		store.FederatedAgentExportStatePaused, 4, nil, exported.Revision)
+	require.NoError(t, err)
 	_, err = m.authorizeInboundPipeContact(ctx, peer, event)
 	require.ErrorIs(t, err, ErrFederatedPipeInvalid)
 }
 
-func TestAppV23PipeContactsNeverExposeRootButKeepGrantedAgentsOnRootOwnedDomains(t *testing.T) {
+func TestAppV23PipeContactsNeverExposeRootOrGrantedNonOwner(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
 	rootID := hex.EncodeToString(m.agentPub)
@@ -284,6 +314,9 @@ func TestAppV23PipeContactsNeverExposeRootButKeepGrantedAgentsOnRootOwnedDomains
 		{Domain: "root-owned.work", Read: true},
 	})
 	require.NoError(t, err)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", rootID,
+		store.FederatedAgentExportStateActive, 4, nil, 0)
+	require.Error(t, err, "Root authority must never be exportable as an ordinary identity")
 
 	grant := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
 	require.NotNil(t, grant)
@@ -294,11 +327,8 @@ func TestAppV23PipeContactsNeverExposeRootButKeepGrantedAgentsOnRootOwnedDomains
 	require.NotContains(t, contacts, rootID, "the immutable Root principal is authority, never an agent contact")
 	require.NotContains(t, contacts, currentRootID, "a retired Root generation is never an agent contact")
 	require.NotContains(t, contacts, finalRootID, "the live Root credential is never an agent contact")
-	readerContact, ok := contacts[reader]
-	require.True(t, ok, "ordinary agents keep their granted inbox on a Root-owned domain")
-	require.Equal(t, []PipeContactDomain{{
-		Domain: "root-owned.work", OwningDomain: "root-owned", OwnerHeight: 10,
-	}}, readerContact.Domains)
+	require.NotContains(t, contacts, reader,
+		"a non-owner grant on a Root-owned domain must not synthesize federation identity")
 }
 
 func TestAppV23PipeContactsExcludeConsensusInactiveAgentWithStaleSQLiteStatus(t *testing.T) {
@@ -326,6 +356,7 @@ func TestAppV23PipeContactsExcludeConsensusInactiveAgentWithStaleSQLiteStatus(t 
 		Domain: "stale-home", Read: true,
 	}})
 	require.NoError(t, err)
+	exportPipeContactAgent(t, m, "chain-peer", agentID)
 
 	before := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
 	require.Len(t, before.Contacts, 1)
@@ -355,32 +386,21 @@ func TestAppV23PipeContactsExcludeConsensusInactiveAgentWithStaleSQLiteStatus(t 
 	require.Empty(t, after.Contacts)
 }
 
-func TestPipeContactCapabilitiesIncludeReadAllAndLinearizeTargetDeny(t *testing.T) {
+func TestPipeContactExportDefaultsMessagingOnReadAllDoesNotSynthesizeAndDenySuspends(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
-	m.postV22ForNextTx = func() bool { return true }
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 
 	owner := newPeerOperatorID(t)
-	readAllTarget := newPeerOperatorID(t)
+	readAllNonOwner := newPeerOperatorID(t)
 	deniedOwner := newPeerOperatorID(t)
-	for _, agent := range []struct {
-		id   string
-		name string
-		caps store.AgentCapabilities
-	}{
-		{owner, "research-owner", 0},
-		{readAllTarget, "MYNAH companion", store.AgentCapabilityReadAllDomains},
-		{deniedOwner, "denied-owner", store.AgentCapabilityDenyFederatedPipe},
-	} {
-		require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{
-			AgentID: agent.id, Name: agent.name, RegisteredName: agent.name, Status: "active",
-		}))
-		require.NoError(t, bs.RegisterAgentWithCapabilities(
-			agent.id, agent.name, "member", "", "test", "", 1, agent.caps,
-		))
-	}
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, owner, "research-owner", "active", 0, 10)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, readAllNonOwner, "MYNAH companion", "active",
+		store.AgentCapabilityReadAllDomains, 20)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, deniedOwner, "denied-owner", "active",
+		store.AgentCapabilityDenyFederatedPipe, 30)
 	require.NoError(t, bs.RegisterDomain("research", owner, "", 10))
 	require.NoError(t, bs.RegisterDomain("operations", deniedOwner, "", 11))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{
@@ -388,6 +408,8 @@ func TestPipeContactCapabilitiesIncludeReadAllAndLinearizeTargetDeny(t *testing.
 		{Domain: "operations", Read: true},
 	})
 	require.NoError(t, err)
+	exportPipeContactAgent(t, m, "chain-peer", owner)
+	exportPipeContactAgent(t, m, "chain-peer", deniedOwner)
 
 	grant := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
 	require.NotNil(t, grant)
@@ -396,115 +418,68 @@ func TestPipeContactCapabilitiesIncludeReadAllAndLinearizeTargetDeny(t *testing.
 		contacts[contact.AgentID] = contact
 	}
 	require.Contains(t, contacts, owner)
-	require.NotContains(t, contacts, deniedOwner,
-		"DenyFederatedPipe must exclude a target even when it owns a shared domain")
-	targetContact, ok := contacts[readAllTarget]
-	require.True(t, ok, "ReadAllDomains must qualify an active reviewed target without a legacy access grant")
+	require.NotContains(t, contacts, readAllNonOwner,
+		"ReadAllDomains is local read authority, not explicit federation membership")
+	targetContact := contacts[owner]
+	require.True(t, targetContact.Accepting, "an explicit export defaults messaging on")
+	deniedContact, ok := contacts[deniedOwner]
+	require.True(t, ok, "DenyFederatedPipe is messaging-only and does not unexport readable domains")
+	require.False(t, deniedContact.Accepting)
 	require.Equal(t, []PipeContactDomain{
+		{Domain: "local-" + deniedOwner, OwningDomain: "local-" + deniedOwner, OwnerHeight: 31},
 		{Domain: "operations", OwningDomain: "operations", OwnerHeight: 11},
+	}, deniedContact.Domains)
+	require.Equal(t, []PipeContactDomain{
+		{Domain: "local-" + owner, OwningDomain: "local-" + owner, OwnerHeight: 11},
 		{Domain: "research", OwningDomain: "research", OwnerHeight: 10},
 	}, targetContact.Domains)
 
-	updated, err := m.SetPipeContactAcceptance(
-		ctx, "chain-peer", readAllTarget, targetContact.ContactID, true,
-	)
-	require.NoError(t, err)
-	for _, contact := range updated.Contacts {
-		if contact.AgentID == readAllTarget {
-			targetContact = contact
-			break
-		}
-	}
-	require.True(t, targetContact.Accepting)
 	policy, err := m.GetPeerRBACPolicy(ctx, "chain-peer")
 	require.NoError(t, err)
 	require.NotNil(t, policy)
 	event := &PipeEvent{
-		PolicyEpoch: policy.PolicyEpoch, AgreementID: updated.AgreementID,
+		PolicyEpoch: policy.PolicyEpoch, AgreementID: grant.AgreementID,
 		ContactID:       targetContact.ContactID,
-		ContactRevision: pipeContactAuthorizationRevision(updated, &targetContact),
-		TargetAgentID:   readAllTarget,
+		ContactRevision: pipeContactAuthorizationRevision(grant, &targetContact),
+		TargetAgentID:   owner,
 	}
 	peer := &peerIdentity{ChainID: "chain-peer", AgentID: peerID, Agreement: agreement}
 	resolved, err := m.authorizeInboundPipeContact(ctx, peer, event)
 	require.NoError(t, err)
-	require.Equal(t, readAllTarget, resolved.AgentID)
-
-	msg := &store.PipelineMessage{
-		PipeID: "pipe-read-all-target", FromAgent: newPeerOperatorID(t), ToAgent: readAllTarget,
-		SourceChainID: "chain-peer", SourcePipeID: "remote-event-id",
-		FederationPolicyEpoch: policy.PolicyEpoch, FederationAgreementID: updated.AgreementID,
-		FederationContactID:       targetContact.ContactID,
-		FederationContactRevision: pipeContactAuthorizationRevision(updated, &targetContact),
+	require.Equal(t, owner, resolved.AgentID)
+	deniedEvent := &PipeEvent{
+		PolicyEpoch: policy.PolicyEpoch, AgreementID: grant.AgreementID,
+		ContactID:       deniedContact.ContactID,
+		ContactRevision: pipeContactAuthorizationRevision(grant, &deniedContact),
+		TargetAgentID:   deniedOwner,
 	}
-	actionStarted := make(chan struct{})
-	releaseAction := make(chan struct{})
-	authorized := make(chan error, 1)
-	go func() {
-		authorized <- m.WithAuthorizedImportedPipe(ctx, msg, func() error {
-			close(actionStarted)
-			<-releaseAction
-			return nil
-		})
-	}()
-	<-actionStarted
-	denyPublished := make(chan error, 1)
-	go func() {
-		denyPublished <- bs.SetAgentPermissionWithCapabilities(
-			readAllTarget, 1, "", "", "", "",
-			store.AgentCapabilityReadAllDomains|store.AgentCapabilityDenyFederatedPipe,
-		)
-	}()
-	select {
-	case err := <-denyPublished:
-		t.Fatalf("target deny published while an older imported authorization action was active: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(releaseAction)
-	require.NoError(t, <-authorized)
-	require.NoError(t, <-denyPublished)
-
-	require.ErrorIs(t, m.AuthorizeImportedPipe(ctx, msg), ErrFederatedPipeInvalid,
-		"after target deny publishes, imported work must fail closed")
-	deniedGrant := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
-	require.NotNil(t, deniedGrant)
-	for _, contact := range deniedGrant.Contacts {
-		require.NotEqual(t, readAllTarget, contact.AgentID,
-			"target deny must remove an already accepted ReadAll contact from discovery")
-		require.NotEqual(t, deniedOwner, contact.AgentID)
-	}
+	_, err = m.authorizeInboundPipeContact(ctx, peer, deniedEvent)
+	require.ErrorIs(t, err, ErrFederatedPipeSuspended)
 }
 
-func TestLargeSharedRecipientProjectionUsesTargetedLookup(t *testing.T) {
+func TestPipeContactExplicitExportTargetedLookupFiltersSimilarlyNamedNonOwner(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
-	owner := newPeerOperatorID(t)
 	target := newPeerOperatorID(t)
-	require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{
-		AgentID: target, Name: "Innovium", RegisteredName: "innovium", Provider: "claude-code", Status: "active",
-	}))
-	require.NoError(t, bs.RegisterDomain("research", owner, "", 10))
-	require.NoError(t, bs.SetAccessGrant("research", target, 1, 0, owner))
-	// A valid shared-domain recipient set can exceed the legacy v1 status
-	// envelope. Every recipient remains discoverable by the new lookup route;
-	// none are silently dropped by a cache or snapshot cap.
-	for i := 0; i < maxPipeContactStatusContacts; i++ {
-		reader := newPeerOperatorID(t)
-		require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{AgentID: reader, Name: fmt.Sprintf("reader-%04d", i), Status: "active"}))
-		require.NoError(t, bs.SetAccessGrant("research", reader, 1, 0, owner))
-	}
+	nonOwner := newPeerOperatorID(t)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, target, "Innovium", "active", 0, 10)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, nonOwner, "Innovium helper", "active", 0, 20)
+	require.NoError(t, bs.RegisterDomain("research", target, "", 10))
+	require.NoError(t, bs.SetAccessGrant("research", nonOwner, 1, 0, target))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{Domain: "research", Read: true}})
+	require.NoError(t, err)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", target,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + target}, 0)
 	require.NoError(t, err)
 	admin, err := m.LocalPipeContacts(ctx, "chain-peer")
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(admin.Contacts), maxPipeContactStatusCandidates+1,
 		"the CEREBRUM contact endpoint must not construct a full recipient roster")
-	// The browser's default administrative view is intentionally bounded. A
-	// consent change asks for its exact target in addition to that sample, so
-	// an operator can still enable any authorized recipient without a full
-	// roster scan under revocation locks.
+	// Targeted lookup discovers the explicitly exported owner. The similarly
+	// named non-owner grant recipient remains invisible.
 	grant, err := m.localPipeContacts(ctx, "chain-peer", target)
 	require.NoError(t, err)
 	var targetContact PipeContact
@@ -515,8 +490,7 @@ func TestLargeSharedRecipientProjectionUsesTargetedLookup(t *testing.T) {
 		}
 	}
 	require.NotEmpty(t, targetContact.ContactID)
-	_, err = m.SetPipeContactAcceptance(ctx, "chain-peer", target, targetContact.ContactID, true)
-	require.NoError(t, err)
+	require.True(t, targetContact.Accepting)
 
 	status := statusForPeer(t, m, "chain-peer", peerID, agreement)
 	require.NotNil(t, status.PipeContacts, "legacy peers retain a valid bounded status snapshot")
@@ -595,6 +569,7 @@ func TestLargeSharedRecipientProjectionUsesTargetedLookup(t *testing.T) {
 func TestLegacyStatusLoadsAnOwnerOutsideItsCandidateSample(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 
@@ -602,15 +577,16 @@ func TestLegacyStatusLoadsAnOwnerOutsideItsCandidateSample(t *testing.T) {
 	// sampled ID to prove that the owner-specific metadata load, rather than
 	// incidental candidate ordering, makes legacy routing viable.
 	owner := strings.Repeat("f", 64)
-	require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{
-		AgentID: owner, Name: "out-of-sample-owner", RegisteredName: "owner", Provider: "local", Status: "active",
-	}))
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, owner, "out-of-sample-owner", "active", 0, 10)
 	for i := 1; i <= maxPipeContactStatusCandidates; i++ {
 		agentID := fmt.Sprintf("%064x", i)
 		require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{AgentID: agentID, Name: fmt.Sprintf("sample-%03d", i), Status: "active"}))
 	}
 	require.NoError(t, bs.RegisterDomain("research", owner, "", 10))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{Domain: "research", Read: true}})
+	require.NoError(t, err)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", owner,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + owner}, 0)
 	require.NoError(t, err)
 
 	status := statusForPeer(t, m, "chain-peer", peerID, agreement)
@@ -683,34 +659,33 @@ func TestPipeContactLookupCapsTargetMatchesAndResponseBytes(t *testing.T) {
 	require.LessOrEqual(t, len(encoded), maxPipeContactLookupBytes)
 }
 
-func TestPipeContactAcceptanceDefaultsOffPersistsPauseAndInvalidatesChanges(t *testing.T) {
+func TestPipeContactExplicitExportDefaultsOnPauseUnexportAndOwnershipChange(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 	owner := newPeerOperatorID(t)
 	replacement := newPeerOperatorID(t)
-	for _, agentID := range []string{owner, replacement} {
-		require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{AgentID: agentID, Name: "owner", Status: "active"}))
-	}
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, owner, "owner", "active", 0, 10)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, replacement, "replacement", "active", 0, 20)
 	require.NoError(t, bs.RegisterDomain("research", owner, "", 10))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{Domain: "research.work", Read: true}})
+	require.NoError(t, err)
+	exported, err := m.SetFederatedAgentExport(ctx, "chain-peer", owner,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + owner}, 0)
 	require.NoError(t, err)
 
 	initial := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
 	require.Len(t, initial.Contacts, 1)
 	contact := initial.Contacts[0]
-	require.False(t, contact.Accepting)
-	updated, err := m.SetPipeContactAcceptance(ctx, "chain-peer", owner, contact.ContactID, true)
-	require.NoError(t, err)
-	require.True(t, updated.Contacts[0].Accepting)
-	require.Equal(t, contact.ContactID, updated.Contacts[0].ContactID)
+	require.True(t, contact.Accepting, "explicit export defaults inbound messaging on")
 
 	_, err = m.SetPeerRBACPaused(ctx, "chain-peer", true)
 	require.NoError(t, err)
 	paused := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
 	require.True(t, paused.Paused)
-	require.True(t, paused.Contacts[0].Accepting, "pause must preserve the operator's stored choice")
+	require.True(t, paused.Contacts[0].Accepting, "peer pause suspends the lane without changing membership")
 	require.Equal(t, contact.ContactID, paused.Contacts[0].ContactID)
 	_, err = m.SetPeerRBACPaused(ctx, "chain-peer", false)
 	require.NoError(t, err)
@@ -718,42 +693,47 @@ func TestPipeContactAcceptanceDefaultsOffPersistsPauseAndInvalidatesChanges(t *t
 	require.False(t, resumed.Paused)
 	require.True(t, resumed.Contacts[0].Accepting)
 
-	_, err = m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{Domain: "research.work", Read: true}})
+	pausedExport, err := m.SetFederatedAgentExport(ctx, "chain-peer", owner,
+		store.FederatedAgentExportStatePaused, 4, []string{"local-" + owner}, exported.Revision)
 	require.NoError(t, err)
-	replacedPolicy := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
-	require.False(t, replacedPolicy.Contacts[0].Accepting, "full domain replacement must require an explicit re-enable")
-	require.NotEqual(t, contact.ContactID, replacedPolicy.Contacts[0].ContactID)
-	require.ErrorIs(t, func() error {
-		_, setErr := m.SetPipeContactAcceptance(ctx, "chain-peer", owner, contact.ContactID, true)
-		return setErr
-	}(), ErrPipeContactChanged)
-
-	current := replacedPolicy.Contacts[0]
-	_, err = m.SetPipeContactAcceptance(ctx, "chain-peer", owner, current.ContactID, true)
+	require.Empty(t, statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts.Contacts)
+	activeExport, err := m.SetFederatedAgentExport(ctx, "chain-peer", owner,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + owner}, pausedExport.Revision)
 	require.NoError(t, err)
 	require.NoError(t, bs.TransferDomain("research", replacement, "", 11))
 	transferred := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
+	require.Empty(t, transferred.Contacts, "ownership transfer must not follow the old owner's export")
+	replacementExport, err := m.SetFederatedAgentExport(ctx, "chain-peer", replacement,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + replacement}, 0)
+	require.NoError(t, err)
+	transferred = statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
+	require.Len(t, transferred.Contacts, 1)
 	require.Equal(t, replacement, transferred.Contacts[0].AgentID)
-	require.False(t, transferred.Contacts[0].Accepting, "ownership transfer must not inherit consent")
+	require.True(t, transferred.Contacts[0].Accepting)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", replacement,
+		store.FederatedAgentExportStateRevoked, 4, []string{"local-" + replacement}, replacementExport.Revision)
+	require.NoError(t, err)
+	require.Empty(t, statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts.Contacts)
+	require.Equal(t, int64(3), activeExport.Revision)
 }
 
 func TestPipeContactRevisionTracksOwnerAvailabilityAndPause(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
 	m.SetNetworkName("Owner Lab")
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 
 	ownerA := newPeerOperatorID(t)
 	ownerB := newPeerOperatorID(t)
-	for _, agent := range []*store.AgentEntry{
-		{AgentID: ownerA, Name: "owner-a", Status: "active"},
-		{AgentID: ownerB, Name: "owner-b", Status: "active"},
-	} {
-		require.NoError(t, ss.CreateAgent(ctx, agent))
-	}
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, ownerA, "owner-a", "active", 0, 10)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, ownerB, "owner-b", "active", 0, 20)
 	require.NoError(t, bs.RegisterDomain("research", ownerA, "", 10))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{Domain: "research.child", Read: true}})
+	require.NoError(t, err)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", ownerA,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + ownerA}, 0)
 	require.NoError(t, err)
 
 	first := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
@@ -774,10 +754,16 @@ func TestPipeContactRevisionTracksOwnerAvailabilityAndPause(t *testing.T) {
 
 	require.NoError(t, bs.TransferDomain("research", ownerB, "", 11))
 	transferred := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
+	require.Empty(t, transferred.Contacts, "ownership transfer does not implicitly export the replacement")
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", ownerB,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + ownerB}, 0)
+	require.NoError(t, err)
+	transferred = statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
 	require.Len(t, transferred.Contacts, 1)
 	require.Equal(t, ownerB, transferred.Contacts[0].AgentID)
 	require.NotEqual(t, first.Revision, transferred.Revision)
-	require.False(t, transferred.Contacts[0].Accepting, "new owner must never inherit acceptance")
+	require.True(t, transferred.Contacts[0].Accepting,
+		"the new owner is visible only after its own explicit export, which defaults messaging on")
 
 	require.NoError(t, ss.UpdateAgentStatus(ctx, ownerB, "inactive"))
 	inactive := statusForPeer(t, m, "chain-peer", peerID, agreement).PipeContacts
@@ -797,15 +783,20 @@ func TestPipeContactAuthorizationRevisionIgnoresUnrelatedReversibleState(t *test
 	peerID := newPeerOperatorID(t)
 	configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 	ownerX, ownerY := newPeerOperatorID(t), newPeerOperatorID(t)
-	for _, owner := range []string{ownerX, ownerY} {
-		require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{AgentID: owner, Name: owner[:8], Status: "active"}))
-	}
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, ownerX, ownerX[:8], "active", 0, 10)
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, ownerY, ownerY[:8], "active", 0, 20)
 	require.NoError(t, bs.RegisterDomain("exact-x", ownerX, "", 10))
 	require.NoError(t, bs.RegisterDomain("unrelated-y", ownerY, "", 11))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{
 		{Domain: "exact-x.work", Read: true},
 		{Domain: "unrelated-y.work", Read: true},
 	})
+	require.NoError(t, err)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", ownerX,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + ownerX}, 0)
+	require.NoError(t, err)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", ownerY,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + ownerY}, 0)
 	require.NoError(t, err)
 
 	find := func(t *testing.T, grant *PipeContactGrant, agentID string) PipeContact {
@@ -820,20 +811,12 @@ func TestPipeContactAuthorizationRevisionIgnoresUnrelatedReversibleState(t *test
 	}
 	grant, err := m.LocalPipeContacts(ctx, "chain-peer")
 	require.NoError(t, err)
-	for _, owner := range []string{ownerX, ownerY} {
-		contact := find(t, grant, owner)
-		_, err = m.SetPipeContactAcceptance(ctx, "chain-peer", owner, contact.ContactID, true)
-		require.NoError(t, err)
-		grant, err = m.LocalPipeContacts(ctx, "chain-peer")
-		require.NoError(t, err)
-	}
 	baseline := grant
 	xBaseline, yBaseline := find(t, baseline, ownerX), find(t, baseline, ownerY)
 	xRevision := pipeContactAuthorizationRevision(baseline, &xBaseline)
 	yRevision := pipeContactAuthorizationRevision(baseline, &yBaseline)
 
-	_, err = m.SetPipeContactAcceptance(ctx, "chain-peer", ownerY, yBaseline.ContactID, false)
-	require.NoError(t, err)
+	require.NoError(t, ss.UpdateAgentStatus(ctx, ownerY, "inactive"))
 	yOff, err := m.LocalPipeContacts(ctx, "chain-peer")
 	require.NoError(t, err)
 	xAfterYOff, yAfterOff := find(t, yOff, ownerX), find(t, yOff, ownerY)
@@ -841,8 +824,7 @@ func TestPipeContactAuthorizationRevisionIgnoresUnrelatedReversibleState(t *test
 	require.Equal(t, xRevision, pipeContactAuthorizationRevision(yOff, &xAfterYOff), "Y must not invalidate exact X work")
 	require.NotEqual(t, yRevision, pipeContactAuthorizationRevision(yOff, &yAfterOff))
 
-	_, err = m.SetPipeContactAcceptance(ctx, "chain-peer", ownerY, yBaseline.ContactID, true)
-	require.NoError(t, err)
+	require.NoError(t, ss.UpdateAgentStatus(ctx, ownerY, "active"))
 	restored, err := m.LocalPipeContacts(ctx, "chain-peer")
 	require.NoError(t, err)
 	xRestored, yRestored := find(t, restored, ownerX), find(t, restored, ownerY)
@@ -874,12 +856,16 @@ func TestPipeContactAuthorizationRevisionIgnoresUnrelatedReversibleState(t *test
 func TestStatusReleasesContactSnapshotBeforePeerSocketWrite(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 	owner := newPeerOperatorID(t)
-	require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{AgentID: owner, Name: "owner", Status: "active"}))
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, owner, "owner", "active", 0, 10)
 	require.NoError(t, bs.RegisterDomain("research", owner, "", 10))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{Domain: "research.work", Read: true}})
+	require.NoError(t, err)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", owner,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + owner}, 0)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/fed/v1/status", nil)
@@ -909,12 +895,16 @@ func TestStatusReleasesContactSnapshotBeforePeerSocketWrite(t *testing.T) {
 func TestPipeContactLookupReleasesSnapshotBeforePeerSocketWrite(t *testing.T) {
 	ctx := context.Background()
 	m, ss, bs := newDrainTestManager(t)
+	ensurePipeContactAppV23(t, m, bs)
 	peerID := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, m, ss, bs, "chain-peer", peerID, "host", nil, 4)
 	owner := newPeerOperatorID(t)
-	require.NoError(t, ss.CreateAgent(ctx, &store.AgentEntry{AgentID: owner, Name: "owner", Status: "active"}))
+	seedPipeContactOrdinaryAgent(t, m, ss, bs, owner, "owner", "active", 0, 10)
 	require.NoError(t, bs.RegisterDomain("research", owner, "", 10))
 	_, err := m.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{Domain: "research.work", Read: true}})
+	require.NoError(t, err)
+	_, err = m.SetFederatedAgentExport(ctx, "chain-peer", owner,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + owner}, 0)
 	require.NoError(t, err)
 
 	body, err := json.Marshal(PipeContactLookupRequest{Name: "owner", Limit: 1})

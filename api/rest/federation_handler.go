@@ -536,17 +536,20 @@ type availableFederationSync struct {
 }
 
 type availableFederationConnection struct {
-	RemoteChainID         string                          `json:"remote_chain_id"`
-	NetworkName           string                          `json:"network_name,omitempty"`
-	Reachable             bool                            `json:"reachable"`
-	Capabilities          []string                        `json:"capabilities,omitempty"`
-	SharingPaused         bool                            `json:"sharing_paused,omitempty"`
-	RemotePermissions     []availableFederationPermission `json:"remote_permissions"`
-	SharedReadDomains     []string                        `json:"shared_read_domains"`
-	CopyOfferedDomains    []string                        `json:"copy_offered_domains"`
-	RemoteAgents          []federation.PipeContact        `json:"remote_agents,omitempty"`
-	RemoteAgentsTruncated bool                            `json:"remote_agents_truncated,omitempty"`
-	Sync                  *availableFederationSync        `json:"sync,omitempty"`
+	RemoteChainID             string                          `json:"remote_chain_id"`
+	NetworkName               string                          `json:"network_name,omitempty"`
+	Reachable                 bool                            `json:"reachable"`
+	Capabilities              []string                        `json:"capabilities,omitempty"`
+	SharingPaused             bool                            `json:"sharing_paused,omitempty"`
+	RemotePermissions         []availableFederationPermission `json:"remote_permissions"`
+	ReadCandidateDomains      []string                        `json:"read_candidate_domains,omitempty"`
+	SharedReadDomains         []string                        `json:"shared_read_domains"`
+	ReadAuthorization         string                          `json:"read_authorization"`
+	ReadAuthorizationComplete bool                            `json:"read_authorization_complete"`
+	CopyOfferedDomains        []string                        `json:"copy_offered_domains"`
+	RemoteAgents              []federation.PipeContact        `json:"remote_agents,omitempty"`
+	RemoteAgentsTruncated     bool                            `json:"remote_agents_truncated,omitempty"`
+	Sync                      *availableFederationSync        `json:"sync,omitempty"`
 }
 
 type federationPipeContactFinder interface {
@@ -567,6 +570,14 @@ type federationLinkedMessageContactFinder interface {
 
 type federationLinkedMessageDirectoryLister interface {
 	ListRemoteLinkedMessageContacts(ctx context.Context, remoteChainID, sourceAgentID string) (*federation.LinkedMessageDirectoryResult, error)
+}
+
+type federationRecallAvailabilityFinder interface {
+	AvailableRecallDomains(ctx context.Context, remoteChainID, agentID string, domains []string) ([]string, error)
+}
+
+type federationReaderPolicyRevisioner interface {
+	FederatedReaderPolicyRevision() uint64
 }
 
 type federationMessageAdmissionRecorder interface {
@@ -754,7 +765,11 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 	}
 	if _, bypass := r.Context().Value(federationAvailabilityCacheBypassKey{}).(bool); !bypass &&
 		s.federationAvailability != nil {
-		cacheKey := callerID + "\x00" + agentName + "\x00" + peerChain + "\x00" + strconv.Itoa(agentLimit) + "\x00" + peerCursor
+		var readerPolicyRevision uint64
+		if revisioner, ok := s.federation.(federationReaderPolicyRevisioner); ok {
+			readerPolicyRevision = revisioner.FederatedReaderPolicyRevision()
+		}
+		cacheKey := callerID + "\x00" + agentName + "\x00" + peerChain + "\x00" + strconv.Itoa(agentLimit) + "\x00" + peerCursor + "\x00" + strconv.FormatUint(readerPolicyRevision, 10)
 		response, cacheErr := s.federationAvailability.load(
 			r.Context(), cacheKey, func(loadCtx context.Context) federationAvailabilityResponse {
 				recorder := newFederationAvailabilityRecorder()
@@ -768,6 +783,16 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		)
 		if cacheErr != nil {
 			writeProblem(w, http.StatusGatewayTimeout, "Federation discovery timed out", "The bounded federation discovery budget was exhausted.")
+			return
+		}
+		if revisioner, ok := s.federation.(federationReaderPolicyRevisioner); ok &&
+			revisioner.FederatedReaderPolicyRevision() != readerPolicyRevision {
+			// The operator narrowed this caller while the cache lookup or live
+			// peer probe was in flight. Recompute without cache under the
+			// Manager's reader-policy lock so a completed deny is immediately
+			// visible and an old response cannot escape after the mutation.
+			ctx := context.WithValue(r.Context(), federationAvailabilityCacheBypassKey{}, true)
+			s.handleFederationAvailable(w, r.Clone(ctx))
 			return
 		}
 		writeFederationAvailabilityResponse(w, response)
@@ -821,8 +846,14 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		if callerMayPipe && hasLinkedContactFinder {
 			peerCallCost++
 		}
-	} else if callerMayPipe && hasLinkedDirectoryLister {
+	} else {
+		// General discovery may perform one negotiated exported-agent (or legacy
+		// linked-reader) availability check after status. Charge the worst case even when an
+		// older peer does not advertise it, so rate cadence reveals nothing.
 		peerCallCost++
+		if callerMayPipe && hasLinkedDirectoryLister {
+			peerCallCost++
+		}
 	}
 	peerLimit := maxFederationAvailablePeers
 	if agentName != "" {
@@ -934,7 +965,7 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		"connections": connections,
 		"total":       len(connections),
 		"complete":    !hasMore,
-		"message":     "Use sage_recall with scope=auto and one of these exact domains. Federation mutations remain operator-only.",
+		"message":     "shared_read_domains passed the negotiated exported-agent policy (or legacy linked-reader compatibility gate) and are eligible for sage_recall with scope=auto. read_candidate_domains are policy intersections only and are not readable unless the authorization status is verified. Federation mutations remain operator-only.",
 	}
 	if hasMore {
 		response["next_peer_cursor"] = s.federationAvailability.putPeerCursor(federationPeerCursor{
@@ -995,12 +1026,54 @@ func (s *Server) availableFederationConnectionForCaller(
 	connection.RemotePermissions = normalizeAvailablePermissions(permissions)
 	for _, permission := range connection.RemotePermissions {
 		if permission.Read {
-			connection.SharedReadDomains = append(connection.SharedReadDomains, permission.Domain)
+			connection.ReadCandidateDomains = append(connection.ReadCandidateDomains, permission.Domain)
 		}
 		if permission.Copy {
 			connection.CopyOfferedDomains = append(connection.CopyOfferedDomains, permission.Domain)
 		}
 	}
+	connection.ReadAuthorization = "verified"
+	connection.ReadAuthorizationComplete = true
+	if len(connection.ReadCandidateDomains) != 0 && agentName == "" {
+		connection.ReadAuthorization = "unsupported"
+		connection.ReadAuthorizationComplete = false
+		finder, hasFinder := s.federation.(federationRecallAvailabilityFinder)
+		if hasFinder && slices.Contains(status.Capabilities, federation.CapabilityQueryAvailabilityV1) {
+			candidates := connection.ReadCandidateDomains
+			truncated := false
+			if len(candidates) > federation.MaxQueryAvailabilityDomains {
+				candidates = candidates[:federation.MaxQueryAvailabilityDomains]
+				truncated = true
+			}
+			connection.ReadAuthorization = "unavailable"
+			readable, availabilityErr := finder.AvailableRecallDomains(
+				ctx, remoteChainID, callerID, candidates,
+			)
+			if availabilityErr == nil {
+				connection.SharedReadDomains = append([]string(nil), readable...)
+				if truncated {
+					connection.ReadAuthorization = "partial"
+				} else {
+					connection.ReadAuthorization = "verified"
+					connection.ReadAuthorizationComplete = true
+				}
+			}
+		}
+	}
+	readable := make(map[string]struct{}, len(connection.SharedReadDomains))
+	for _, domain := range connection.SharedReadDomains {
+		readable[domain] = struct{}{}
+	}
+	effectivePermissions := connection.RemotePermissions[:0]
+	for _, permission := range connection.RemotePermissions {
+		if permission.Read {
+			_, permission.Read = readable[permission.Domain]
+		}
+		if permission.Read || permission.Copy {
+			effectivePermissions = append(effectivePermissions, permission)
+		}
+	}
+	connection.RemotePermissions = effectivePermissions
 
 	var contacts *federation.PipeContactGrant
 	if includePipeContacts {
@@ -1018,7 +1091,7 @@ func (s *Server) availableFederationConnectionForCaller(
 	}
 	if contacts != nil && !contacts.Paused &&
 		federation.ValidateRemotePipeContactGrant(remoteChainID, contacts) == nil {
-		connection.RemoteAgents = filterAvailablePipeContacts(contacts.Contacts, connection.SharedReadDomains)
+		connection.RemoteAgents = filterAvailablePipeContacts(contacts.Contacts, connection.ReadCandidateDomains)
 	}
 	if includePipeContacts && hasLinkedLookup &&
 		linkedErr == nil && linked != nil &&
@@ -1060,7 +1133,7 @@ func (s *Server) availableFederationConnectionForCaller(
 			connection.RemoteAgents = admitted
 		}
 	}
-	if len(connection.RemotePermissions) == 0 && len(connection.RemoteAgents) == 0 {
+	if len(connection.RemotePermissions) == 0 && len(connection.ReadCandidateDomains) == 0 && len(connection.RemoteAgents) == 0 {
 		return nil, false
 	}
 	if agentName != "" {
@@ -1074,7 +1147,10 @@ func (s *Server) availableFederationConnectionForCaller(
 		connection.Capabilities = nil
 		connection.SharingPaused = false
 		connection.RemotePermissions = nil
+		connection.ReadCandidateDomains = nil
 		connection.SharedReadDomains = nil
+		connection.ReadAuthorization = ""
+		connection.ReadAuthorizationComplete = false
 		connection.CopyOfferedDomains = nil
 		connection.Sync = nil
 		return connection, true
@@ -1228,33 +1304,8 @@ func (s *Server) federationVisibleRemoteScopes(ctx context.Context, callerID, re
 	}
 	postV23 := s.isPostV23ForNextTx()
 	if postV23 {
-		if s.badgerStore == nil {
-			return nil
-		}
-		root, err := s.badgerStore.GetAppV23Root()
-		if err != nil || root == nil ||
-			(callerID == root.PrincipalID && root.CredentialID != root.PrincipalID) {
-			return nil
-		}
-		if s.callerIsOperatorOrAdmin(ctx, callerID) {
-			return []string{remoteScope}
-		}
-		policyID, err := appV23PolicyPrincipal(s.badgerStore, callerID)
-		if err != nil {
-			return nil
-		}
-		enrollment, err := s.badgerStore.GetAppV23Enrollment(policyID)
-		if err != nil || enrollment == nil || !enrollment.Active {
-			return nil
-		}
-		role, err := s.badgerStore.GetAppV23Role(policyID)
-		if err != nil || role == nil ||
-			store.ValidateAppV23Policy(
-				role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
-			) != nil {
-			return nil
-		}
-		callerID = policyID
+		visible, _, _ := s.federationReaderScopesV23(callerID, remoteScope)
+		return visible
 	}
 	if !postV23 && s.nodeOperatorID != "" && callerID == s.nodeOperatorID {
 		return []string{remoteScope}

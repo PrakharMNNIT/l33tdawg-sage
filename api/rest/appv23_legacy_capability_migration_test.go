@@ -77,17 +77,26 @@ func TestAppV23MigratedLegacyMasksPreserveRESTReadSharedAndFederatedAuthority(t 
 			federatedRead, clearance := srv.federationCallerCanRead(
 				context.Background(), id, "legacy-foreign-owned",
 			)
-			require.Equal(t, wantReadAll, federatedRead)
+			require.Equal(t, active, federatedRead,
+				"pairwise federation Read defaults on for every active ordinary local agent; migrated local ReadAll and deny-write masks are irrelevant")
 			wantClearance := 0
 			if active {
 				wantClearance = int(enrollment.Clearance)
 			}
 			require.Equal(t, wantClearance, clearance)
+			visibleRemote := srv.federationVisibleRemoteScopes(
+				context.Background(), id, "legacy-foreign-owned",
+			)
+			if active {
+				require.Equal(t, []string{"legacy-foreign-owned"}, visibleRemote)
+			} else {
+				require.Empty(t, visibleRemote)
+			}
 
 			require.Equal(t,
 				active && !mask.Has(store.AgentCapabilityDenyFederatedPipe),
 				srv.callerMayUseFederatedPipe(id),
-				"DenyFederatedPipe must preserve recipient/contact eligibility exactly",
+				"DenyFederatedPipe remains a messaging-only recipient/contact restriction and must not disable pairwise Read",
 			)
 		})
 	}

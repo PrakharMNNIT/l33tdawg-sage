@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -117,17 +118,102 @@ func (m *Manager) agreementBindingDigestV23(ctx context.Context, agreement *stor
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// attestLocalFederatedAgent produces the source-side ordinary-agent fact carried
+// under the authenticated peer envelope. The destination cannot inspect
+// another chain's local RBAC tables, while the nested proof still binds the
+// original caller and exact query independently.
+func (m *Manager) attestLocalFederatedAgent(agentID string) (uint8, bool, error) {
+	ss := m.syncStore()
+	if ss == nil || m.badger == nil {
+		return 0, false, errors.New("local federation agent policy is unavailable")
+	}
+	policyUnlock := ss.LockSyncPolicyRead()
+	defer policyUnlock()
+	ownerUnlock := m.badger.LockDomainOwnershipRead()
+	defer ownerUnlock()
+	return m.attestLocalFederatedAgentLocked(agentID)
+}
+
+// attestLocalFederatedAgentLocked is the non-locking form for bounded
+// federation side effects that already hold the global sync-policy -> Badger
+// authorization read order. Keeping the final attestation and outbound request
+// inside that lease prevents an enrollment, suspension, or clearance mutation
+// from committing after the source fact is checked but before disclosure.
+func (m *Manager) attestLocalFederatedAgentLocked(agentID string) (uint8, bool, error) {
+	if m.badger == nil {
+		return 0, false, errors.New("local federation agent policy is unavailable")
+	}
+	eligible, err := m.localFederatedGuestAgentEligible(agentID)
+	if err != nil || !eligible {
+		return 0, false, err
+	}
+	enrollment, err := m.badger.GetAppV23Enrollment(agentID)
+	if err != nil || enrollment == nil || !enrollment.Active {
+		return 0, false, err
+	}
+	return enrollment.Clearance, true, nil
+}
+
+// authorizeFederatedPeerRead applies the directional federation export model.
+// Peer Read policy selects exported domains. Any active ordinary agent attested
+// by the source SAGE may read that export up to the lower source/agreement
+// classification ceiling. Explicit linked-reader rows remain a compatibility
+// path for older peers; they are not mirrored groups and never narrow the new
+// peer-export contract.
+func (m *Manager) authorizeFederatedPeerRead(ctx context.Context, peer *peerIdentity, agreement *store.CrossFedRecord, agentID, domain, sourceAuthorizationModel string, sourceAgentEligible bool, sourceAgentMaxClassification uint8) (uint8, error) {
+	if m.federatedGuestStore == nil || m.localGroupResolver == nil {
+		return 0, fmt.Errorf("federated guest authorization is unavailable")
+	}
+	domainCeiling, err := m.peerDomainExportCeiling(ctx, peer, agreement, domain)
+	if err != nil {
+		return 0, err
+	}
+	switch sourceAuthorizationModel {
+	case "":
+		legacyCeiling, legacyErr := m.authorizeFederatedGuestRead(ctx, peer, agreement, agentID, domain)
+		if legacyErr != nil {
+			return 0, legacyErr
+		}
+		if legacyCeiling > domainCeiling {
+			legacyCeiling = domainCeiling
+		}
+		return legacyCeiling, nil
+	case SourceAuthorizationPeerExportV1:
+		if !sourceAgentEligible || agentID == peer.AgentID {
+			return 0, errors.New("peer-export authorization requires an attested ordinary source agent")
+		}
+		ceiling := sourceAgentMaxClassification
+		if ceiling > agreement.MaxClearance {
+			ceiling = agreement.MaxClearance
+		}
+		if ceiling > domainCeiling {
+			ceiling = domainCeiling
+		}
+		return ceiling, nil
+	default:
+		return 0, errors.New("unsupported federation source authorization model")
+	}
+}
+
+// authorizeFederatedGuestRead retains the exact explicit linked-reader gate
+// used by linked messaging and control-plane tests. Federation recall uses
+// authorizeFederatedPeerRead so a missing override means the peer export's
+// default Read, not a missing mirrored group.
 func (m *Manager) authorizeFederatedGuestRead(ctx context.Context, peer *peerIdentity, agreement *store.CrossFedRecord, agentID, domain string) (uint8, error) {
 	if m.federatedGuestStore == nil || m.localGroupResolver == nil {
 		return 0, fmt.Errorf("federated guest authorization is unavailable")
 	}
-	digest, err := m.agreementBindingDigestV23(ctx, agreement, peer.AgentID)
-	if err != nil {
-		return 0, err
-	}
 	guests, err := m.federatedGuestStore.ListFederatedGroupGuests(ctx, peer.ChainID, agentID)
 	if err != nil {
 		return 0, fmt.Errorf("list federated guest links: %w", err)
+	}
+	return m.authorizeFederatedGuestRows(ctx, peer, agreement, agentID, domain, guests)
+}
+
+func (m *Manager) authorizeFederatedGuestRows(ctx context.Context, peer *peerIdentity, agreement *store.CrossFedRecord, agentID, domain string, guests []store.FederatedGroupGuest) (uint8, error) {
+	digest, err := m.agreementBindingDigestV23(ctx, agreement, peer.AgentID)
+	if err != nil {
+		return 0, err
 	}
 	var ceiling uint8
 	found := false

@@ -1,4 +1,4 @@
-# v11.17.6 federation Docker acceptance
+# v11.17.17 federation Docker acceptance
 
 This harness gives two SAGE personal nodes separate persisted homes, separate
 Docker edge networks, and one self-hosted natter relay. A temporary third
@@ -9,7 +9,7 @@ default (`FED_NODE_A_PORT` / `FED_NODE_B_PORT` override them).
 Run the reproducible topology smoke test with:
 
 ```sh
-FED_ACCEPTANCE_STATE=/tmp/sage-v11176-fed \
+FED_ACCEPTANCE_STATE=/tmp/sage-v111717-fed \
   deploy/federation-acceptance/run.sh topology
 ```
 
@@ -22,9 +22,10 @@ inside each node signs the loopback dashboard requests and drives the real JOIN,
 MCP, permission, and inbox APIs. Three environment commands remain optional
 diagnostic overrides:
 
-- `FED_ACCEPTANCE_PAIR_COMMAND`: replace the built-in real dashboard JOIN ceremony,
-  share `mynah-a-home` and `mynah-b-home` read-only, and enable reciprocal
-  exact Mynah contacts.
+- `FED_ACCEPTANCE_PAIR_COMMAND`: replace the built-in real dashboard JOIN
+  ceremony and explicit reciprocal Mynah agent exports. The built-in path does
+  not create mirrored Access Groups, receiving domains, or manual PeerRBAC
+  identity rows.
 - `FED_ACCEPTANCE_MIGRATION_COMMAND`: replace the built-in v11.17.4 migration gate,
   `p2p_peers` fixture for a paired node, restart it, and assert the peer is
   retained and upgraded to a current non-expired generation-bound route.
@@ -56,6 +57,10 @@ with the phase and tool name instead of hanging CI indefinitely.
 | Stale snapshot | set persisted `expires_at` in the past | stale route is rejected, refreshed, and flow recovers |
 | Relay outage | stop then restart natter | explicit offline/no-route while down; automatic recovery after restart |
 | Upgrade | v11.17.4 `p2p_peers` fixture | peer survives load and gains current route snapshot |
+| Pairwise Read | reciprocal exported Mynah agents; no mirrored Access Group or linked-reader fixture | either ordinary companion can read the other's exported owned domain; writes remain ungranted |
+| Copy backfill | each source independently offers Copy; each receiver independently subscribes | receiver-local recall finds memories created before consent in both directions |
+| Copy incremental | create a new source memory after consent | receiver-local recall finds the new copy in both directions |
+| Copy restart | restart both nodes, then stop each source in turn | each receiver still recalls both backfilled and incremental copies locally while its source is offline |
 | Offline inbox | recipient stopped after send | durable inbox delivery, read, reply, and final sender status |
 
 The contract test is fast and does not require Docker:

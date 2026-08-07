@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.17.15. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.17.17. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -1430,6 +1430,10 @@ dashboard-agent auth (`web/federation_join.go:71-102`, `1021-1037`).
 | `GET /v1/dashboard/federation/shareable-domains` | Returns `{"domains":[{"domain","memory_count","authority","can_share"}]}` from registered plus observed local domains. It never creates a domain (`web/federation_permissions.go:30-111`). |
 | `GET /v1/dashboard/federation/connections/{chain_id}/permissions` | Returns `local_permissions`, `local_legacy`, authenticated read-only `remote_permissions`, `remote_known`, and `remote_legacy`. With `?live=0`, it returns durable local state without probing the peer and therefore reports `remote_known:false` (`web/federation_permissions.go:200-287`). |
 | `PUT /v1/dashboard/federation/connections/{chain_id}/permissions` | Full replacement body: `{"permissions":[{"domain":"tii.work","read":true,"copy":false}]}`. Omitted domains are revoked; `[]` is explicit deny-all. Copy implies Read. Every enabled domain must already exist and be controlled by this operator. A `write:true` member is rejected with `400` because no consensus-bound federation ingress capability exists (`web/federation_permissions.go:223-258`, `279-305`). |
+| `GET /v1/dashboard/federation/connections/{chain_id}/agent-exports` | List explicitly exported local agents for this pairwise federation. Each row is bound to the active peer operator, CA pin, policy epoch, CAS revision, classification ceiling, and optional owned-domain exclusions. Manual domain-only shares never create an exported identity. |
+| `PUT /v1/dashboard/federation/connections/{chain_id}/agent-exports` | Operator-only CAS mutation of one exact active ordinary local agent using `agent_id`, `state` (`active` or `paused`), `max_classification`, `domain_exclusions`, and `expected_revision`. Active export makes the agent's current owned domain tree readable remotely and exposes its messaging identity; pause removes both derived lanes immediately. Revoked rows are internal generation-retirement state and are not accepted from this dashboard route. |
+| `GET /v1/dashboard/federation/connections/{chain_id}/reader-restrictions` | List this SAGE's local per-agent exceptions to default federation Read. Absent/revoked means allow; rows are exact-binding, revisioned, and never positive cross-node grants. |
+| `PUT /v1/dashboard/federation/connections/{chain_id}/reader-restrictions` | Operator-only CAS mutation for one active ordinary local reader using `agent_id`, `state` (`active` or `revoked`), `deny_all`, `denied_domains`, and `expected_revision`. Domain denies use symmetric subtree protection so a broad parent query cannot return a denied child. |
 | `GET /v1/dashboard/federation/connections/{chain_id}/sync` | Returns `publish_domains`, `subscribe_domains`, `remote_publish_domains`, `remote_subscribe_domains`, and revision state. |
 | `PUT /v1/dashboard/federation/connections/{chain_id}/sync` | v3 accepts `publish_domains` and/or `subscribe_domains`; an omitted lane is preserved and an explicit empty lane is cleared. The UI uses `{"subscribe_domains":[...]}` for the receiver's independent “Save here” decision (`web/federation_join.go:414-527`). |
 
@@ -1995,6 +1999,64 @@ Revocation returns the same empty projection as an absent name, and exact
 `POST /v1/pipe/resolve` repeats live authorization before send
 (`api/rest/federation_handler.go`;
 `internal/federation/v23_linked_directory.go`).
+
+### `POST /v1/federation/recall-plan`
+
+Federated recall is an authenticated two-request protocol. A current client
+must never construct the second request from cached agreement data or sign it
+before obtaining this plan.
+
+1. Sign and send a plan request containing the exact `domain_tag` and requested
+   `federate_chains` (`["*"]` may be used only at this planning step).
+2. The response expands the request to a finite `destinations` list and returns
+   five pieces of signing state: `source_chain_id`, `agreement_bindings`,
+   `query_challenges`, `authorization_models`, and
+   `authorization_attestations`. `expires_at` tells the client when each
+   challenge becomes unusable; `errors` reports peers excluded from
+   `destinations`.
+3. Build one of `POST /v1/memory/query`, `POST /v1/memory/search`, or
+   `POST /v1/memory/hybrid` with `federated:true`, copy `destinations` verbatim
+   to `federate_chains`, and copy all five signing-state fields verbatim into
+   `federation_context`. Then sign that complete second body with a fresh nonce.
+
+Plan request:
+
+```json
+{"domain_tag":"mynah-home","federate_chains":["*"]}
+```
+
+Complete plan response shape:
+
+```json
+{
+  "protocol_version": 23,
+  "source_chain_id": "chain-a",
+  "destinations": ["chain-b"],
+  "agreement_bindings": {"chain-b": "<binding-digest>"},
+  "query_challenges": {"chain-b": "<single-use-challenge>"},
+  "authorization_models": {"chain-b": "peer-export-v1"},
+  "authorization_attestations": {
+    "chain-b": {"eligible": true, "max_classification": 4}
+  },
+  "expires_at": {"chain-b": 1786071600}
+}
+```
+
+The map entry itself is significant. A compatibility-plan entry for a legacy
+peer has an empty authorization-model string and an explicit
+`{"eligible":false,"max_classification":0}` attestation; omitting either map
+entry does not mean legacy. It identifies an old client that failed to copy the
+current signed tuple. Such a second request is stopped before peer fan-out with
+`signed federation authorization tuple is missing or incomplete` and must be
+re-planned and re-signed.
+
+The version boundary is deliberately asymmetric. An old peer that cannot
+complete current v23 planning appears in the plan's `errors` and is absent from
+`destinations`; a current client does not downgrade the signed contract for it.
+An old client talking to a current local node may receive a complete plan but
+omit the newer authorization fields from its second signed body; the local node
+rejects that omission and directs the client to re-plan. Updating the remote
+peer is therefore not inferred from this particular error.
 
 ### `POST /v1/federation/contacts/authorize`
 

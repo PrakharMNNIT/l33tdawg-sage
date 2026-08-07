@@ -56,15 +56,15 @@ func configureReceiptRuntimeFixture(t *testing.T, source, destination *testChain
 	_, err = destination.mgr.ReplacePeerRBACPolicy(ctx, source.chainID,
 		[]store.PeerRBACDomainPermission{{Domain: "fault-gate.work", Read: true}})
 	require.NoError(t, err)
+	_, err = destination.mgr.SetFederatedAgentExport(ctx, source.chainID, targetID,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + targetID}, 0)
+	require.NoError(t, err)
 	grant, err := destination.mgr.LocalPipeContacts(ctx, source.chainID)
 	require.NoError(t, err)
 	require.Len(t, grant.Contacts, 1)
 	contact := grant.Contacts[0]
 	require.Equal(t, targetID, contact.AgentID)
-	_, err = destination.mgr.SetPipeContactAcceptance(
-		ctx, source.chainID, targetID, contact.ContactID, true,
-	)
-	require.NoError(t, err)
+	require.True(t, contact.Accepting)
 	target, err := source.mgr.ResolveRemotePipeTarget(ctx, targetID+"@"+destination.chainID)
 	require.NoError(t, err)
 	return pipeFaultFixture{
