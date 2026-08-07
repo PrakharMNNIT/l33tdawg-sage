@@ -195,7 +195,7 @@ the container stopped:
 
 ```bash
 docker stop sage
-docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:11.18.0 \
+docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:latest \
   backup --full --out /root/.sage/backups/pre-upgrade.tar.gz
 ```
 
@@ -204,22 +204,29 @@ The image's `ENTRYPOINT` is already `sage-gui`, so pass the subcommand directly 
 archive lands in the mounted volume, so it survives the container.
 
 > **Confirm the image is v11.18.0 or later before you rely on the backup.** An
-> older image does not necessarily reject
-> `--full` — it ignores the flag, writes the SQLite-only copy, and prints
-> `Backup saved`. A success message, for the wrong thing, right before an
-> irreversible climb. Check first:
+> older image does not necessarily reject `--full` — it ignores the flag, writes
+> the SQLite-only copy, and prints `Backup saved`. A success message, for the
+> wrong thing, right before an irreversible climb.
+>
+> Check the tag you are actually going to run. `:latest` is resolved from your
+> local cache, so a machine that pulled months ago still runs an old image under
+> that name:
 >
 > ```bash
-> docker run --rm ghcr.io/l33tdawg/sage:11.18.0 upgrade lineage verify --help
+> docker run --rm ghcr.io/l33tdawg/sage:latest version
+> docker run --rm ghcr.io/l33tdawg/sage:latest upgrade lineage verify --help
 > ```
 >
-> If that errors with an unknown subcommand, the image predates the complete
-> recovery commands—pull v11.18.0 or later before going further.
+> If the version is below v11.18.0, or the second command errors with an unknown
+> subcommand, that image predates the complete recovery commands. Re-run
+> `docker pull ghcr.io/l33tdawg/sage:latest` and check again before going
+> further. Checking a pinned `:11.18.0` instead would prove nothing — that tag
+> has the commands by definition, so the check could never fail.
 
 Then preflight the same way, using that same current image:
 
 ```bash
-docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:11.18.0 upgrade preflight
+docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:latest upgrade preflight
 ```
 
 ---

@@ -1474,9 +1474,11 @@ not an unauthenticated MCP endpoint.
 ### Upgrading from an older version?
 
 **Upgrading an existing node — including the v10.x → v11 jump — is
-[docs/UPGRADING.md](docs/UPGRADING.md).** Short version: install the new binary,
-stop the node, `sage-gui backup --full`, `sage-gui upgrade preflight`, then start
-it. (The binary comes first because it is what provides those two commands.)
+[docs/UPGRADING.md](docs/UPGRADING.md).** Short version: install **v11.18.0 or
+later**, stop the node, `sage-gui backup --full`, `sage-gui upgrade preflight`,
+then start it. (The binary comes first because it is what provides those
+commands — an older one ignores `--full` and silently backs up the SQLite
+projection instead.)
 Your chain advances in place; a personal node climbs the consensus fork ladder by
 itself. Read the guide before a multi-admin chain crosses app-v23 — that
 activation re-derives administrator authority.
