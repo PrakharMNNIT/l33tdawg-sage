@@ -52,7 +52,7 @@ most upgrade anxiety.
 
 | | What it is | When it changes |
 |---|---|---|
-| **Release version** (`v11.17.15`) | The binary/semver you download | Every release |
+| **Release version** (`v11.x.y`) | The binary/semver you download | Every release |
 | **App version** (`app-v26`) | The consensus state-machine version, activated by governance | Only when consensus rules change |
 
 There is also a **consensus fork version**, currently `1`, which has never been
@@ -109,7 +109,7 @@ git clone https://github.com/l33tdawg/sage.git && cd sage
 go build -o sage-gui ./cmd/sage-gui/
 
 # Docker
-docker pull ghcr.io/l33tdawg/sage:11.17.15
+docker pull ghcr.io/l33tdawg/sage:latest
 ```
 
 > Replacing a binary on disk does **not** upgrade a running node. A long-lived
@@ -187,7 +187,7 @@ the container stopped:
 
 ```bash
 docker stop sage
-docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:11.17.15 \
+docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:latest \
   backup --full --out /root/.sage/backups/pre-upgrade.tar.gz
 ```
 
@@ -195,10 +195,23 @@ The image's `ENTRYPOINT` is already `sage-gui`, so pass the subcommand directly 
 `docker run … sage-gui backup` would try to run `sage-gui sage-gui backup`. The
 archive lands in the mounted volume, so it survives the container.
 
-Then preflight the same way before pulling the new image:
+> **Confirm the image actually has these commands before you rely on the
+> backup.** An image older than the release that introduced them does not reject
+> `--full` — it ignores the flag, writes the SQLite-only copy, and prints
+> `Backup saved`. A success message, for the wrong thing, right before an
+> irreversible climb. Check first:
+>
+> ```bash
+> docker run --rm ghcr.io/l33tdawg/sage:latest upgrade preflight --help
+> ```
+>
+> If that errors with an unknown subcommand, the image predates these commands —
+> pull a newer one before going further.
+
+Then preflight the same way, using that same current image:
 
 ```bash
-docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:11.17.15 upgrade preflight
+docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:latest upgrade preflight
 ```
 
 ---
