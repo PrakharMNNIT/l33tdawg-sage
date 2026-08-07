@@ -140,8 +140,8 @@ func TestFederatedReaderRestrictionBindingMismatchAndControlledRepairReset(t *te
 	if err != nil || reset == nil || reset.State != FederatedReaderRestrictionStateRevoked || reset.Revision != 2 {
 		t.Fatalf("reset row = %#v, err %v", reset, err)
 	}
-	if allowed, err := s.FederatedReaderAllows(ctx, newBinding, agentID, "private"); err != nil || !allowed {
-		t.Fatalf("new generation after reset = allowed %v, err %v", allowed, err)
+	if allowed, allowErr := s.FederatedReaderAllows(ctx, newBinding, agentID, "private"); allowErr != nil || !allowed {
+		t.Fatalf("new generation after reset = allowed %v, err %v", allowed, allowErr)
 	}
 	if affected, err = s.ResetFederatedReaderRestrictionsForBinding(ctx, newBinding); err != nil || affected != 0 {
 		t.Fatalf("idempotent reset = affected %d, err %v", affected, err)
@@ -151,8 +151,8 @@ func TestFederatedReaderRestrictionBindingMismatchAndControlledRepairReset(t *te
 	if _, err = s.PutBoundFederatedReaderRestrictionCAS(ctx, reactivated, 2); err != nil {
 		t.Fatalf("reactivate against new binding: %v", err)
 	}
-	if allowed, err := s.FederatedReaderAllows(ctx, newBinding, agentID, "new-private.child"); err != nil || allowed {
-		t.Fatalf("reactivated deny = allowed %v, err %v", allowed, err)
+	if allowed, allowErr := s.FederatedReaderAllows(ctx, newBinding, agentID, "new-private.child"); allowErr != nil || allowed {
+		t.Fatalf("reactivated deny = allowed %v, err %v", allowed, allowErr)
 	}
 }
 
@@ -339,8 +339,8 @@ func TestFederatedReaderRestrictionPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("reopen store: %v", err)
 	}
 	defer func() { _ = reopened.Close() }()
-	if allowed, err := reopened.FederatedReaderAllows(ctx, binding, agentID, "durable.private.child"); err != nil || allowed {
-		t.Fatalf("reopened deny = allowed %v, err %v", allowed, err)
+	if allowed, allowErr := reopened.FederatedReaderAllows(ctx, binding, agentID, "durable.private.child"); allowErr != nil || allowed {
+		t.Fatalf("reopened deny = allowed %v, err %v", allowed, allowErr)
 	}
 	row, err := reopened.GetFederatedReaderRestriction(ctx, binding.RemoteChainID, agentID)
 	if err != nil || row == nil || row.Revision != 1 || len(row.DeniedDomains) != 1 {

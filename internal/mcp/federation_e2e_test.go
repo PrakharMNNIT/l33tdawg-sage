@@ -150,24 +150,6 @@ func enableMCPE2EV23Pair(t *testing.T, left, right *mcpE2ENode, domain string) {
 	}
 }
 
-func addMCPE2ELinkedReader(
-	t *testing.T, destination, source *mcpE2ENode, agentID, domain string,
-) {
-	t.Helper()
-	status, err := source.manager.PeerStatus(context.Background(), destination.chainID)
-	require.NoError(t, err)
-	require.Equal(t, 23, status.FederationProtocolVersion)
-	destination.resolver["mcp-linked-readers"][domain] = true
-	guest := store.FederatedGroupGuest{
-		GroupID: "mcp-linked-readers", RemoteChainID: source.chainID,
-		RemoteAgentID:          agentID,
-		AgreementBindingDigest: status.QueryAgreementBindingDigest,
-		MaxClassification:      4, Revision: 1, State: store.FederatedGuestStateActive,
-	}
-	require.NoError(t, store.SignFederatedGroupGuest(&guest, destination.private))
-	require.NoError(t, destination.sqlite.PutFederatedGroupGuest(context.Background(), guest))
-}
-
 func enrollMCPE2EOrdinaryMember(
 	t *testing.T, node *mcpE2ENode, name string, clearance uint8, active bool, domainAccess string,
 ) (string, ed25519.PrivateKey) {

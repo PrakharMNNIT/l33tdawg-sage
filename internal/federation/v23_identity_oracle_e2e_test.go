@@ -195,11 +195,11 @@ func TestV23FederatedGuestIdentityOracleOverTwoSAGEMTLS(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	available, err := source.mgr.AvailableRecallDomains(
+	available, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, agentXID, []string{domain},
 	)
-	if err != nil || len(available) != 1 || available[0] != domain {
-		t.Fatalf("linked agent availability = %v err=%v, want [%s]", available, err, domain)
+	if availabilityErr != nil || len(available) != 1 || available[0] != domain {
+		t.Fatalf("linked agent availability = %v err=%v, want [%s]", available, availabilityErr, domain)
 	}
 	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, agentXID, []string{domain, secondDomain},
@@ -218,9 +218,9 @@ func TestV23FederatedGuestIdentityOracleOverTwoSAGEMTLS(t *testing.T) {
 	yQuery := signV23QueryAs(t, agentYKey, yPlan, &QueryRequest{
 		Mode: ModeText, Query: "legacy linked rows", DomainTag: secondDomain, TopK: 5,
 	})
-	yResponse, err := source.mgr.QueryPeer(ctx, destination.chainID, yQuery)
-	if err != nil || len(yResponse.Results) != 1 || yResponse.Results[0].MemoryID != "second-memory" {
-		t.Fatalf("default-export Y recall: response=%+v err=%v", yResponse, err)
+	yResponse, yQueryErr := source.mgr.QueryPeer(ctx, destination.chainID, yQuery)
+	if yQueryErr != nil || len(yResponse.Results) != 1 || yResponse.Results[0].MemoryID != "second-memory" {
+		t.Fatalf("default-export Y recall: response=%+v err=%v", yResponse, yQueryErr)
 	}
 
 	// Root/the peer operator is never an ordinary agent. The source must refuse
@@ -239,47 +239,47 @@ func TestV23FederatedGuestIdentityOracleOverTwoSAGEMTLS(t *testing.T) {
 	}
 	// Even a directly authenticated peer request cannot omit the ordinary-agent
 	// attestation and use the outer operator as a read credential.
-	sourceAgreement, err := source.mgr.ActiveAgreement(destination.chainID)
-	if err != nil {
-		t.Fatal(err)
+	sourceAgreement, agreementErr := source.mgr.ActiveAgreement(destination.chainID)
+	if agreementErr != nil {
+		t.Fatal(agreementErr)
 	}
-	_, status, err := source.mgr.doPeerRequest(ctx, sourceAgreement, http.MethodPost,
+	_, status, requestErr := source.mgr.doPeerRequest(ctx, sourceAgreement, http.MethodPost,
 		"/fed/v1/query/plan", &QueryPlanRequest{
 			AgentID: operatorID, DomainTag: domain, SourceAgentEligible: false,
 		})
-	if err != nil || status != http.StatusForbidden {
-		t.Fatalf("missing source ordinary-agent attestation: status=%d err=%v", status, err)
+	if requestErr != nil || status != http.StatusForbidden {
+		t.Fatalf("missing source ordinary-agent attestation: status=%d err=%v", status, requestErr)
 	}
-	_, status, err = source.mgr.doPeerRequest(ctx, sourceAgreement, http.MethodPost,
+	_, status, requestErr = source.mgr.doPeerRequest(ctx, sourceAgreement, http.MethodPost,
 		"/fed/v1/query/plan", &QueryPlanRequest{
 			AgentID: agentYID, DomainTag: domain,
 			SourceAuthorizationModel: "future-unknown-model",
 			SourceAgentEligible:      true, SourceAgentMaxClassification: 4,
 		})
-	if err != nil || status != http.StatusForbidden {
-		t.Fatalf("unknown source authorization model: status=%d err=%v", status, err)
+	if requestErr != nil || status != http.StatusForbidden {
+		t.Fatalf("unknown source authorization model: status=%d err=%v", status, requestErr)
 	}
 	// Mixed-version compatibility is fail-closed: an omitted model uses only the
 	// legacy exact linked-reader capability. X has one; ordinary unlinked Y does
 	// not inherit the new broad export unless the peer negotiated peer-export-v1.
-	_, status, err = source.mgr.doPeerRequest(ctx, sourceAgreement, http.MethodPost,
+	_, status, requestErr = source.mgr.doPeerRequest(ctx, sourceAgreement, http.MethodPost,
 		"/fed/v1/query/plan", &QueryPlanRequest{AgentID: agentXID, DomainTag: domain})
-	if err != nil || status != http.StatusOK {
-		t.Fatalf("legacy linked-reader compatibility: status=%d err=%v", status, err)
+	if requestErr != nil || status != http.StatusOK {
+		t.Fatalf("legacy linked-reader compatibility: status=%d err=%v", status, requestErr)
 	}
-	_, status, err = source.mgr.doPeerRequest(ctx, sourceAgreement, http.MethodPost,
+	_, status, requestErr = source.mgr.doPeerRequest(ctx, sourceAgreement, http.MethodPost,
 		"/fed/v1/query/plan", &QueryPlanRequest{AgentID: agentYID, DomainTag: domain})
-	if err != nil || status != http.StatusForbidden {
-		t.Fatalf("legacy unlinked identity did not fail closed: status=%d err=%v", status, err)
+	if requestErr != nil || status != http.StatusForbidden {
+		t.Fatalf("legacy unlinked identity did not fail closed: status=%d err=%v", status, requestErr)
 	}
 
 	linkedPlan := planV23QueryForAgent(t, source, destination, agentXID, domain)
 	linkedQuery := signV23QueryAs(t, agentXKey, linkedPlan, &QueryRequest{
 		Mode: ModeText, Query: "connected peer ordinary agents", DomainTag: domain, TopK: 5,
 	})
-	response, err := source.mgr.QueryPeer(ctx, destination.chainID, linkedQuery)
-	if err != nil {
-		t.Fatalf("exact linked X recall: %v", err)
+	response, queryErr := source.mgr.QueryPeer(ctx, destination.chainID, linkedQuery)
+	if queryErr != nil {
+		t.Fatalf("exact linked X recall: %v", queryErr)
 	}
 	if len(response.Results) != 1 || response.Results[0].MemoryID != "identity-memory" {
 		t.Fatalf("exact linked X result: %+v", response.Results)
@@ -288,20 +288,20 @@ func TestV23FederatedGuestIdentityOracleOverTwoSAGEMTLS(t *testing.T) {
 	// Pausing a legacy linked capability does not turn it into a negative ACL or
 	// revoke the independent peer export. Source-side DomainAccess and the peer
 	// policy are the explicit narrowing layers.
-	guestRows, err := destination.mem.(*store.SQLiteStore).ListFederatedGroupGuests(
+	guestRows, guestErr := destination.mem.(*store.SQLiteStore).ListFederatedGroupGuests(
 		ctx, source.chainID, agentXID,
 	)
-	if err != nil || len(guestRows) != 1 {
-		t.Fatalf("load X override: rows=%+v err=%v", guestRows, err)
+	if guestErr != nil || len(guestRows) != 1 {
+		t.Fatalf("load X override: rows=%+v err=%v", guestRows, guestErr)
 	}
 	paused := guestRows[0]
 	paused.Revision++
 	paused.State = store.FederatedGuestStatePaused
-	if err := store.SignFederatedGroupGuest(&paused, destination.agentKey); err != nil {
-		t.Fatal(err)
+	if signErr := store.SignFederatedGroupGuest(&paused, destination.agentKey); signErr != nil {
+		t.Fatal(signErr)
 	}
-	if err := destination.mem.(*store.SQLiteStore).PutFederatedGroupGuest(ctx, paused); err != nil {
-		t.Fatal(err)
+	if putErr := destination.mem.(*store.SQLiteStore).PutFederatedGroupGuest(ctx, paused); putErr != nil {
+		t.Fatal(putErr)
 	}
 	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, agentXID, []string{domain},
@@ -316,29 +316,29 @@ func TestV23FederatedGuestIdentityOracleOverTwoSAGEMTLS(t *testing.T) {
 
 	// Pausing the peer policy itself revokes the export for every source agent;
 	// resuming restores the saved directional policy without recreating groups.
-	if _, err := destination.mgr.SetPeerRBACPaused(ctx, source.chainID, true); err != nil {
-		t.Fatal(err)
+	if _, pauseErr := destination.mgr.SetPeerRBACPaused(ctx, source.chainID, true); pauseErr != nil {
+		t.Fatal(pauseErr)
 	}
 	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, agentYID, []string{domain},
 	); availabilityErr != nil || len(got) != 0 {
 		t.Fatalf("paused peer policy disclosed to Y: domains=%v err=%v", got, availabilityErr)
 	}
-	if _, err := destination.mgr.SetPeerRBACPaused(ctx, source.chainID, false); err != nil {
-		t.Fatal(err)
+	if _, resumeErr := destination.mgr.SetPeerRBACPaused(ctx, source.chainID, false); resumeErr != nil {
+		t.Fatal(resumeErr)
 	}
 	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, agentYID, []string{domain},
 	); availabilityErr != nil || !reflect.DeepEqual(got, []string{domain}) {
 		t.Fatalf("resumed peer export did not restore Y: domains=%v err=%v", got, availabilityErr)
 	}
-	policy, err := destination.mgr.GetPeerRBACPolicy(ctx, source.chainID)
-	if err != nil || policy == nil {
-		t.Fatalf("load destination peer policy: policy=%+v err=%v", policy, err)
+	policy, policyErr := destination.mgr.GetPeerRBACPolicy(ctx, source.chainID)
+	if policyErr != nil || policy == nil {
+		t.Fatalf("load destination peer policy: policy=%+v err=%v", policy, policyErr)
 	}
 	policy.Domains = nil
-	if _, err := destination.mem.(*store.SQLiteStore).ReplaceBoundPeerRBACPolicy(ctx, *policy); err != nil {
-		t.Fatal(err)
+	if _, replaceErr := destination.mem.(*store.SQLiteStore).ReplaceBoundPeerRBACPolicy(ctx, *policy); replaceErr != nil {
+		t.Fatal(replaceErr)
 	}
 	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, agentYID, []string{domain},

@@ -188,11 +188,11 @@ func (s *SQLiteStore) putFederatedReaderRestrictionCAS(
 
 	err = s.RunInTx(ctx, func(txStore OffchainStore) error {
 		tx := txStore.(*SQLiteStore)
-		if err := tx.requireFederatedReaderSyncControl(ctx, FederatedReaderBinding{
+		if bindingErr := tx.requireFederatedReaderSyncControl(ctx, FederatedReaderBinding{
 			RemoteChainID: canonical.RemoteChainID, PeerAgentID: canonical.PeerAgentID,
 			PolicyEpoch: canonical.PolicyEpoch, RemoteCAPin: canonical.RemoteCAPin,
-		}); err != nil {
-			return err
+		}); bindingErr != nil {
+			return bindingErr
 		}
 
 		var currentRevision int64

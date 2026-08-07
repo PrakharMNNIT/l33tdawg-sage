@@ -20,22 +20,22 @@ func TestFederatedAgentExportOwnershipPauseAndUnexportOverMTLS(t *testing.T) {
 	federate(t, source, destination, listener.URL, []string{"manual-only"}, 4, 0)
 	enableV23Pair(t, source, destination, []string{"manual-only"})
 
-	readerPub, readerKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	readerPub, readerKey, keyErr := ed25519.GenerateKey(rand.Reader)
+	if keyErr != nil {
+		t.Fatal(keyErr)
 	}
 	readerID := hex.EncodeToString(readerPub)
 	enrollV23SourceReadAllAdmin(t, source, "ordinary-reader", readerPub, 10)
 
-	ownerPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	ownerPub, _, ownerKeyErr := ed25519.GenerateKey(rand.Reader)
+	if ownerKeyErr != nil {
+		t.Fatal(ownerKeyErr)
 	}
 	ownerID := hex.EncodeToString(ownerPub)
 	enrollV23SourceReadAllAdmin(t, destination, "exported-owner", ownerPub, 20)
 	domain := "exported.owner.notes"
-	if err := destination.badger.RegisterDomain(domain, ownerID, "", 21); err != nil {
-		t.Fatal(err)
+	if registerErr := destination.badger.RegisterDomain(domain, ownerID, "", 21); registerErr != nil {
+		t.Fatal(registerErr)
 	}
 	insertCommittedClassified(t, destination, "export-class-2", domain,
 		"agent export visible at classification two", 2)
@@ -51,10 +51,10 @@ func TestFederatedAgentExportOwnershipPauseAndUnexportOverMTLS(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, []string{domain, "manual-only"},
-	); err != nil || !reflect.DeepEqual(got, []string{domain, "manual-only"}) {
-		t.Fatalf("agent export availability: domains=%v err=%v", got, err)
+	); availabilityErr != nil || !reflect.DeepEqual(got, []string{domain, "manual-only"}) {
+		t.Fatalf("agent export availability: domains=%v err=%v", got, availabilityErr)
 	}
 	plan := planV23QueryForAgent(t, source, destination, readerID, domain)
 	query := signV23QueryAs(t, readerKey, plan, &QueryRequest{
@@ -71,10 +71,10 @@ func TestFederatedAgentExportOwnershipPauseAndUnexportOverMTLS(t *testing.T) {
 	if err != nil || paused.Revision != 2 {
 		t.Fatalf("pause export: export=%+v err=%v", paused, err)
 	}
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, []string{domain},
-	); err != nil || len(got) != 0 {
-		t.Fatalf("paused export remained readable: domains=%v err=%v", got, err)
+	); availabilityErr != nil || len(got) != 0 {
+		t.Fatalf("paused export remained readable: domains=%v err=%v", got, availabilityErr)
 	}
 	resumed, err := destination.mgr.SetFederatedAgentExport(
 		ctx, source.chainID, ownerID, store.FederatedAgentExportStateActive, 2, nil, 2,
@@ -83,39 +83,39 @@ func TestFederatedAgentExportOwnershipPauseAndUnexportOverMTLS(t *testing.T) {
 		t.Fatalf("resume export: export=%+v err=%v", resumed, err)
 	}
 
-	newOwnerPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	newOwnerPub, _, newOwnerKeyErr := ed25519.GenerateKey(rand.Reader)
+	if newOwnerKeyErr != nil {
+		t.Fatal(newOwnerKeyErr)
 	}
 	newOwnerID := hex.EncodeToString(newOwnerPub)
 	enrollV23SourceReadAllAdmin(t, destination, "replacement-owner", newOwnerPub, 30)
-	if err := destination.badger.TransferDomainAppV23(domain, newOwnerID, "", 31, false); err != nil {
-		t.Fatal(err)
+	if transferErr := destination.badger.TransferDomainAppV23(domain, newOwnerID, "", 31, false); transferErr != nil {
+		t.Fatal(transferErr)
 	}
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, []string{domain},
-	); err != nil || len(got) != 0 {
-		t.Fatalf("ownership transfer silently followed old export: domains=%v err=%v", got, err)
+	); availabilityErr != nil || len(got) != 0 {
+		t.Fatalf("ownership transfer silently followed old export: domains=%v err=%v", got, availabilityErr)
 	}
-	if _, err := destination.mgr.SetFederatedAgentExport(
+	if _, exportErr := destination.mgr.SetFederatedAgentExport(
 		ctx, source.chainID, newOwnerID, store.FederatedAgentExportStateActive, 2, nil, 0,
-	); err != nil {
-		t.Fatal(err)
+	); exportErr != nil {
+		t.Fatal(exportErr)
 	}
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, []string{domain},
-	); err != nil || !reflect.DeepEqual(got, []string{domain}) {
-		t.Fatalf("explicit replacement-owner export: domains=%v err=%v", got, err)
+	); availabilityErr != nil || !reflect.DeepEqual(got, []string{domain}) {
+		t.Fatalf("explicit replacement-owner export: domains=%v err=%v", got, availabilityErr)
 	}
-	if _, err := destination.mgr.SetFederatedAgentExport(
+	if _, revokeErr := destination.mgr.SetFederatedAgentExport(
 		ctx, source.chainID, newOwnerID, store.FederatedAgentExportStateRevoked, 2, nil, 1,
-	); err != nil {
-		t.Fatal(err)
+	); revokeErr != nil {
+		t.Fatal(revokeErr)
 	}
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, []string{domain},
-	); err != nil || len(got) != 0 {
-		t.Fatalf("unexported owner remained readable: domains=%v err=%v", got, err)
+	); availabilityErr != nil || len(got) != 0 {
+		t.Fatalf("unexported owner remained readable: domains=%v err=%v", got, availabilityErr)
 	}
 }
 

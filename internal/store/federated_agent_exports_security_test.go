@@ -13,8 +13,8 @@ func TestFederatedAgentExportSnapshotAndExclusionsCommitAtomically(t *testing.T)
 	s := newSyncTestStore(t)
 	export := testFederatedAgentExport(t, s)
 	export.DomainExclusions = []string{"old-private"}
-	if _, err := s.PutBoundFederatedAgentExportCAS(ctx, export, 0); err != nil {
-		t.Fatal(err)
+	if _, putErr := s.PutBoundFederatedAgentExportCAS(ctx, export, 0); putErr != nil {
+		t.Fatal(putErr)
 	}
 	if _, err := s.conn.ExecContext(ctx, `
 		CREATE TRIGGER reject_export_exclusion
@@ -64,8 +64,8 @@ func TestFederatedAgentExportAndDomainOnlyPeerRBACStayIndependent(t *testing.T) 
 	if err != nil || missing != nil {
 		t.Fatalf("domain-only grant synthesized export membership: export=%+v err=%v", missing, err)
 	}
-	if _, err := s.PutBoundFederatedAgentExportCAS(ctx, export, 0); err != nil {
-		t.Fatal(err)
+	if _, putErr := s.PutBoundFederatedAgentExportCAS(ctx, export, 0); putErr != nil {
+		t.Fatal(putErr)
 	}
 	stillPolicy, err := s.GetPeerRBACPolicy(ctx, export.RemoteChainID)
 	if err != nil {

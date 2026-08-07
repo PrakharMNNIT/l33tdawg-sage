@@ -426,17 +426,6 @@ func agentIDsFromAggregates(byAgent map[string]*pipeContactAggregate) []string {
 	return agentIDs
 }
 
-func canonicalPipeContactAgentIDs(byAgent map[string]*pipeContactAggregate) []string {
-	all := agentIDsFromAggregates(byAgent)
-	canonical := all[:0]
-	for _, agentID := range all {
-		if isCanonicalAgentID(agentID) {
-			canonical = append(canonical, agentID)
-		}
-	}
-	return canonical
-}
-
 // buildPipeContactLookupGrant first narrows the local candidate set with a
 // bounded SQLite query, then evaluates the normal live Badger RBAC rules only
 // for those candidates. Human name selectors may be substrings; exact matches

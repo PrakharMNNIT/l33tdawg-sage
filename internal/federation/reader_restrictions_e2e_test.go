@@ -27,9 +27,9 @@ func TestFederatedReaderRestrictionsFilterDiscoveryPlanAndQueryOverMTLS(t *testi
 	federate(t, source, destination, listener.URL, domains, 4, 0)
 	enableV23Pair(t, source, destination, domains)
 
-	readerPub, readerKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	readerPub, readerKey, keyErr := ed25519.GenerateKey(rand.Reader)
+	if keyErr != nil {
+		t.Fatal(keyErr)
 	}
 	readerID := hex.EncodeToString(readerPub)
 	enrollV23SourceReadAllAdmin(t, source, "reader-restriction-member", readerPub, 10)
@@ -38,10 +38,10 @@ func TestFederatedReaderRestrictionsFilterDiscoveryPlanAndQueryOverMTLS(t *testi
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, domains,
-	); err != nil || !reflect.DeepEqual(got, domains) {
-		t.Fatalf("absent restriction must default allow: domains=%v err=%v", got, err)
+	); availabilityErr != nil || !reflect.DeepEqual(got, domains) {
+		t.Fatalf("absent restriction must default allow: domains=%v err=%v", got, availabilityErr)
 	}
 	privatePlan := planV23QueryForAgent(t, source, destination, readerID, domains[0])
 	privateQuery := signV23QueryAs(t, readerKey, privatePlan, &QueryRequest{
@@ -60,10 +60,10 @@ func TestFederatedReaderRestrictionsFilterDiscoveryPlanAndQueryOverMTLS(t *testi
 	if err != nil || restriction.Revision != 1 {
 		t.Fatalf("create subtree restriction: restriction=%+v err=%v", restriction, err)
 	}
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, domains,
-	); err != nil || !reflect.DeepEqual(got, []string{domains[1]}) {
-		t.Fatalf("subtree restriction did not preserve sibling: domains=%v err=%v", got, err)
+	); availabilityErr != nil || !reflect.DeepEqual(got, []string{domains[1]}) {
+		t.Fatalf("subtree restriction did not preserve sibling: domains=%v err=%v", got, availabilityErr)
 	}
 	deniedPlan, err := source.mgr.PlanRecall(
 		ctx, []string{destination.chainID}, readerID, domains[0],
@@ -89,12 +89,12 @@ func TestFederatedReaderRestrictionsFilterDiscoveryPlanAndQueryOverMTLS(t *testi
 	if err != nil || denyAll.Revision != 2 {
 		t.Fatalf("activate deny-all: restriction=%+v err=%v", denyAll, err)
 	}
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, domains,
-	); err != nil || len(got) != 0 {
-		t.Fatalf("deny-all discovery: domains=%v err=%v", got, err)
+	); availabilityErr != nil || len(got) != 0 {
+		t.Fatalf("deny-all discovery: domains=%v err=%v", got, availabilityErr)
 	}
-	if _, err := source.mgr.QueryPeer(ctx, destination.chainID, publicQuery); err == nil {
+	if _, queryErr := source.mgr.QueryPeer(ctx, destination.chainID, publicQuery); queryErr == nil {
 		t.Fatal("deny-all did not recheck and reject a previously signed query")
 	}
 
@@ -105,20 +105,20 @@ func TestFederatedReaderRestrictionsFilterDiscoveryPlanAndQueryOverMTLS(t *testi
 	if err != nil || revoked.Revision != 3 {
 		t.Fatalf("revoke restriction: restriction=%+v err=%v", revoked, err)
 	}
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, destination.chainID, readerID, domains,
-	); err != nil || !reflect.DeepEqual(got, domains) {
-		t.Fatalf("revocation did not restore default allow: domains=%v err=%v", got, err)
+	); availabilityErr != nil || !reflect.DeepEqual(got, domains) {
+		t.Fatalf("revocation did not restore default allow: domains=%v err=%v", got, availabilityErr)
 	}
 
 	// Restrictions are keyed by the exact peer binding. Re-activate deny-all
 	// for destination, then prove discovery, planning, and querying still work
 	// against a different live peer in the same three-SAGE topology.
-	if _, err := source.mgr.SetFederatedReaderRestriction(
+	if _, restrictionErr := source.mgr.SetFederatedReaderRestriction(
 		ctx, destination.chainID, readerID,
 		store.FederatedReaderRestrictionStateActive, true, nil, 3,
-	); err != nil {
-		t.Fatalf("reactivate destination-only deny-all: %v", err)
+	); restrictionErr != nil {
+		t.Fatalf("reactivate destination-only deny-all: %v", restrictionErr)
 	}
 	otherPeer := newTestChain(t, "reader-other-peer")
 	otherListener := startListener(t, otherPeer)
@@ -127,10 +127,10 @@ func TestFederatedReaderRestrictionsFilterDiscoveryPlanAndQueryOverMTLS(t *testi
 	federate(t, source, otherPeer, otherListener.URL, []string{otherDomain}, 4, 0)
 	enableAdditionalV23Peer(t, source, otherPeer, []string{otherDomain})
 	insertCommitted(t, otherPeer, "other-memory", otherDomain, "other peer isolation note")
-	if got, err := source.mgr.AvailableRecallDomains(
+	if got, availabilityErr := source.mgr.AvailableRecallDomains(
 		ctx, otherPeer.chainID, readerID, []string{otherDomain},
-	); err != nil || !reflect.DeepEqual(got, []string{otherDomain}) {
-		t.Fatalf("restriction leaked into other peer discovery: domains=%v err=%v", got, err)
+	); availabilityErr != nil || !reflect.DeepEqual(got, []string{otherDomain}) {
+		t.Fatalf("restriction leaked into other peer discovery: domains=%v err=%v", got, availabilityErr)
 	}
 	otherPlan := planV23QueryForAgent(t, source, otherPeer, readerID, otherDomain)
 	otherQuery := signV23QueryAs(t, readerKey, otherPlan, &QueryRequest{
@@ -155,9 +155,9 @@ func TestFederatedReaderRestrictionMutationLinearizesWithInFlightQuery(t *testin
 	federate(t, source, destination, listener.URL, []string{domain}, 4, 0)
 	enableV23Pair(t, source, destination, []string{domain})
 
-	readerPub, readerKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	readerPub, readerKey, keyErr := ed25519.GenerateKey(rand.Reader)
+	if keyErr != nil {
+		t.Fatal(keyErr)
 	}
 	readerID := hex.EncodeToString(readerPub)
 	enrollV23SourceReadAllAdmin(t, source, "reader-lease-member", readerPub, 10)
@@ -188,21 +188,21 @@ func TestFederatedReaderRestrictionMutationLinearizesWithInFlightQuery(t *testin
 		mutationDone <- mutationErr
 	}()
 	select {
-	case err := <-mutationDone:
-		t.Fatalf("restriction completed while an authorized request held its policy snapshot: %v", err)
+	case mutationErr := <-mutationDone:
+		t.Fatalf("restriction completed while an authorized request held its policy snapshot: %v", mutationErr)
 	case <-time.After(150 * time.Millisecond):
 	}
 	close(releaseQuery)
-	if err := <-queryDone; err != nil {
-		t.Fatalf("in-flight authorized query: %v", err)
+	if queryErr := <-queryDone; queryErr != nil {
+		t.Fatalf("in-flight authorized query: %v", queryErr)
 	}
-	if err := <-mutationDone; err != nil {
-		t.Fatalf("restriction mutation after query drained: %v", err)
+	if mutationErr := <-mutationDone; mutationErr != nil {
+		t.Fatalf("restriction mutation after query drained: %v", mutationErr)
 	}
 	if got := queryRequests.Load(); got != 1 {
 		t.Fatalf("peer query requests = %d, want 1", got)
 	}
-	if _, err := source.mgr.QueryPeer(ctx, destination.chainID, query); err == nil {
+	if _, queryErr := source.mgr.QueryPeer(ctx, destination.chainID, query); queryErr == nil {
 		t.Fatal("completed restriction did not deny a stale signed query")
 	}
 	if got := queryRequests.Load(); got != 1 {
@@ -218,9 +218,9 @@ func startBlockingQueryListener(
 	requests *atomic.Int32,
 ) *httptest.Server {
 	t.Helper()
-	tlsConfig, err := chain.mgr.ServerTLSConfig()
-	if err != nil {
-		t.Fatal(err)
+	tlsConfig, tlsErr := chain.mgr.ServerTLSConfig()
+	if tlsErr != nil {
+		t.Fatal(tlsErr)
 	}
 	router := chain.mgr.Router()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -247,9 +247,9 @@ func enableAdditionalV23Peer(
 	t *testing.T, initialized, fresh *testChain, domains []string,
 ) {
 	t.Helper()
-	companion, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+	companion, _, keyErr := ed25519.GenerateKey(rand.Reader)
+	if keyErr != nil {
+		t.Fatal(keyErr)
 	}
 	if err := fresh.badger.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
 		RootID: hex.EncodeToString(fresh.agentPub), Scope: "test-" + fresh.chainID,

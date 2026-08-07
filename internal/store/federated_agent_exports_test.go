@@ -44,8 +44,8 @@ func TestFederatedAgentExportBoundCASAndFailClosedLifecycle(t *testing.T) {
 	if !reflect.DeepEqual(stored.DomainExclusions, []string{"finance", "private.notes"}) {
 		t.Fatalf("canonical exclusions = %v", stored.DomainExclusions)
 	}
-	if _, err := s.PutBoundFederatedAgentExportCAS(ctx, export, 0); !errors.Is(err, ErrFederatedAgentExportRevisionConflict) {
-		t.Fatalf("replayed create = %v", err)
+	if _, replayErr := s.PutBoundFederatedAgentExportCAS(ctx, export, 0); !errors.Is(replayErr, ErrFederatedAgentExportRevisionConflict) {
+		t.Fatalf("replayed create = %v", replayErr)
 	}
 
 	paused := *stored
@@ -58,15 +58,15 @@ func TestFederatedAgentExportBoundCASAndFailClosedLifecycle(t *testing.T) {
 	stale := paused
 	stale.Revision++
 	stale.PolicyEpoch = "replacement-generation"
-	if _, err := s.PutBoundFederatedAgentExportCAS(ctx, stale, paused.Revision); !errors.Is(err, ErrFederatedAgentExportBindingMismatch) {
-		t.Fatalf("stale generation mutation = %v", err)
+	if _, staleErr := s.PutBoundFederatedAgentExportCAS(ctx, stale, paused.Revision); !errors.Is(staleErr, ErrFederatedAgentExportBindingMismatch) {
+		t.Fatalf("stale generation mutation = %v", staleErr)
 	}
 
 	revoked := paused
 	revoked.Revision++
 	revoked.State = FederatedAgentExportStateRevoked
-	if _, err := s.PutBoundFederatedAgentExportCAS(ctx, revoked, paused.Revision); err != nil {
-		t.Fatal(err)
+	if _, revokeErr := s.PutBoundFederatedAgentExportCAS(ctx, revoked, paused.Revision); revokeErr != nil {
+		t.Fatal(revokeErr)
 	}
 	auditRows, err := s.ListFederatedAgentExports(ctx, export.RemoteChainID)
 	if err != nil || len(auditRows) != 1 || auditRows[0].State != FederatedAgentExportStateRevoked {
@@ -75,7 +75,7 @@ func TestFederatedAgentExportBoundCASAndFailClosedLifecycle(t *testing.T) {
 	reactivated := revoked
 	reactivated.Revision++
 	reactivated.State = FederatedAgentExportStateActive
-	if _, err := s.PutBoundFederatedAgentExportCAS(ctx, reactivated, revoked.Revision); err == nil {
+	if _, reactivationErr := s.PutBoundFederatedAgentExportCAS(ctx, reactivated, revoked.Revision); reactivationErr == nil {
 		t.Fatal("revoked export was resurrected without a new generation-bound create")
 	}
 }
@@ -88,11 +88,11 @@ func TestFederatedAgentExportPersistsAcrossSQLiteRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	export := testFederatedAgentExport(t, s)
-	if _, err := s.PutBoundFederatedAgentExportCAS(ctx, export, 0); err != nil {
-		t.Fatal(err)
+	if _, putErr := s.PutBoundFederatedAgentExportCAS(ctx, export, 0); putErr != nil {
+		t.Fatal(putErr)
 	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := s.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	reopened, err := NewSQLiteStore(ctx, path)
 	if err != nil {
