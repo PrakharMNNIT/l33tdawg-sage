@@ -81,34 +81,34 @@ func TestFederatedQueryChallengeBindsAuthorizationTupleWithoutConsumptionOnMisma
 func TestFederatedQueryChallengeMigrationInvalidatesUnboundRows(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "pre-binding.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
+	db, openErr := sql.Open("sqlite", path)
+	if openErr != nil {
+		t.Fatal(openErr)
 	}
-	_, err = db.Exec(`CREATE TABLE federated_query_challenge (
+	_, createErr := db.Exec(`CREATE TABLE federated_query_challenge (
 		challenge_id TEXT PRIMARY KEY, remote_chain_id TEXT NOT NULL,
 		peer_agent_id TEXT NOT NULL, requested_agent_id TEXT NOT NULL,
 		domain_tag TEXT NOT NULL, agreement_binding_digest TEXT NOT NULL,
 		expires_at INTEGER NOT NULL, consumed_at INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))`)
-	if err != nil {
-		t.Fatal(err)
+	if createErr != nil {
+		t.Fatal(createErr)
 	}
-	_, err = db.Exec(`INSERT INTO federated_query_challenge
+	_, insertErr := db.Exec(`INSERT INTO federated_query_challenge
 		(challenge_id, remote_chain_id, peer_agent_id, requested_agent_id,
 		 domain_tag, agreement_binding_digest, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, strings.Repeat("e5", 32), "chain-a",
 		strings.Repeat("11", 32), strings.Repeat("22", 32), "research.notes",
 		strings.Repeat("33", 32), time.Now().Add(time.Minute).Unix())
-	if err != nil {
-		t.Fatal(err)
+	if insertErr != nil {
+		t.Fatal(insertErr)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := db.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
-	s, err := NewSQLiteStore(ctx, path)
-	if err != nil {
-		t.Fatal(err)
+	s, storeErr := NewSQLiteStore(ctx, path)
+	if storeErr != nil {
+		t.Fatal(storeErr)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	var count int

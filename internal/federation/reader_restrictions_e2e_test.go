@@ -458,11 +458,11 @@ func TestFederatedRecallAuthorizationModelDriftFailsBeforeQueryAndPreservesChall
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			if _, err := source.mgr.QueryPeer(ctx, destination.chainID, query); err == nil ||
-				!strings.Contains(err.Error(), "authorization model changed after the agent signed") ||
-				!strings.Contains(err.Error(), "planned=\""+tc.planned+"\"") ||
-				!strings.Contains(err.Error(), "current=\""+tc.current+"\"") {
-				t.Fatalf("authorization drift error=%v", err)
+			if _, queryErr := source.mgr.QueryPeer(ctx, destination.chainID, query); queryErr == nil ||
+				!strings.Contains(queryErr.Error(), "authorization model changed after the agent signed") ||
+				!strings.Contains(queryErr.Error(), "planned=\""+tc.planned+"\"") ||
+				!strings.Contains(queryErr.Error(), "current=\""+tc.current+"\"") {
+				t.Fatalf("authorization drift error=%v", queryErr)
 			}
 			if got := queryRequests.Load(); got != 0 {
 				t.Fatalf("model-drift query reached peer %d times", got)
@@ -519,9 +519,9 @@ func startAuthorizationDriftListener(
 	statusRequests, queryRequests *atomic.Int32,
 ) *httptest.Server {
 	t.Helper()
-	tlsConfig, err := chain.mgr.ServerTLSConfig()
-	if err != nil {
-		t.Fatal(err)
+	tlsConfig, tlsErr := chain.mgr.ServerTLSConfig()
+	if tlsErr != nil {
+		t.Fatal(tlsErr)
 	}
 	router := chain.mgr.Router()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -574,11 +574,12 @@ func startAuthorizationDriftListener(
 				}
 			}
 			status.Capabilities = filtered
-			body, err = json.Marshal(&status)
-			if err != nil {
-				t.Errorf("encode status response: %v", err)
+			marshaledBody, marshalErr := json.Marshal(&status)
+			if marshalErr != nil {
+				t.Errorf("encode status response: %v", marshalErr)
 				return
 			}
+			body = marshaledBody
 		}
 		for key, values := range recorder.Header() {
 			for _, value := range values {
