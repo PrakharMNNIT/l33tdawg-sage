@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -339,6 +340,189 @@ func TestAutoHostJoinWindowAcceptsDirectCAFetchFromLegacyGuest(t *testing.T) {
 
 	_, err = guest.mgr.GuestScan(context.Background(), legacyURL.String(), "https://127.0.0.1:19444")
 	require.NoError(t, err)
+}
+
+func TestGuestScanDirectCAFetchHonorsFiveMinuteDiscoveryBudget(t *testing.T) {
+	host := newCeremonyNode(t, "host-slow-ca")
+	guest := newCeremonyNode(t, "guest-slow-ca")
+
+	hostTLS, err := host.mgr.ServerTLSConfig()
+	require.NoError(t, err)
+	baseHandler := host.mgr.Router()
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fed/v1/join/ca" {
+			// This deliberately crosses the v11.17 15-second fetch cutoff. The
+			// production GuestScan driver must keep the operator's bounded
+			// discovery request alive instead of replacing it with that cutoff.
+			timer := time.NewTimer(15*time.Second + 250*time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		baseHandler.ServeHTTP(w, r)
+	}))
+	srv.TLS = hostTLS
+	srv.StartTLS()
+	defer srv.Close()
+
+	create, err := host.mgr.HostCreate(srv.URL)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err = guest.mgr.GuestScan(ctx, create.OTPAuthURI, "https://127.0.0.1:19444")
+	require.NoError(t, err)
+}
+
+func TestGuestScanP2PAllowsDelayedTargetBeyondLegacyAttemptTimeout(t *testing.T) {
+	host := newCeremonyNode(t, "host-delayed-route")
+	guest := newCeremonyNode(t, "guest-delayed-route")
+	hostBundle := testDirectRouteBundle(t, "192.168.50.192")
+	guestBundle := testDirectRouteBundle(t, "192.168.50.193")
+	host.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return hostBundle, nil },
+	})
+
+	hostTLS, err := host.mgr.ServerTLSConfig()
+	require.NoError(t, err)
+	srv := httptest.NewUnstartedServer(host.mgr.Router())
+	srv.TLS = hostTLS
+	srv.StartTLS()
+	defer srv.Close()
+
+	guest.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return guestBundle, nil },
+		DialTarget: func(ctx context.Context, _ string) (net.Conn, error) {
+			// Relay negotiation can legitimately exceed the old hard-coded two
+			// second candidate timeout.
+			timer := time.NewTimer(2*time.Second + 250*time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+	})
+	create, err := host.mgr.HostCreateAuto(srv.URL)
+	require.NoError(t, err)
+	require.Equal(t, "p2p", create.Transport)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	_, err = guest.mgr.GuestScan(ctx, create.OTPAuthURI, "")
+	require.NoError(t, err)
+}
+
+func TestGuestScanP2PRetriesUntilExactTargetBecomesAvailable(t *testing.T) {
+	host := newCeremonyNode(t, "host-retry-route")
+	guest := newCeremonyNode(t, "guest-retry-route")
+	hostBundle := testDirectRouteBundle(t, "192.168.50.192")
+	guestBundle := testDirectRouteBundle(t, "192.168.50.193")
+	host.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return hostBundle, nil },
+	})
+	hostTLS, err := host.mgr.ServerTLSConfig()
+	require.NoError(t, err)
+	srv := httptest.NewUnstartedServer(host.mgr.Router())
+	srv.TLS = hostTLS
+	srv.StartTLS()
+	defer srv.Close()
+
+	var dialMu sync.Mutex
+	dialCount := 0
+	guest.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return guestBundle, nil },
+		DialTarget: func(ctx context.Context, _ string) (net.Conn, error) {
+			dialMu.Lock()
+			dialCount++
+			attempt := dialCount
+			dialMu.Unlock()
+			if attempt == 1 {
+				return nil, errors.New("relay reservation is still warming")
+			}
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+	})
+	create, err := host.mgr.HostCreateAuto(srv.URL)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = guest.mgr.GuestScan(ctx, create.OTPAuthURI, "")
+	require.NoError(t, err)
+	dialMu.Lock()
+	defer dialMu.Unlock()
+	assert.Equal(t, 2, dialCount)
+}
+
+func TestGuestScanP2PStopsImmediatelyOnClientCancellation(t *testing.T) {
+	host := newCeremonyNode(t, "host-cancel-route")
+	guest := newCeremonyNode(t, "guest-cancel-route")
+	hostBundle := testDirectRouteBundle(t, "192.168.50.192")
+	guestBundle := testDirectRouteBundle(t, "192.168.50.193")
+	host.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return hostBundle, nil },
+	})
+	started := make(chan struct{}, 1)
+	guest.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return guestBundle, nil },
+		DialTarget: func(ctx context.Context, _ string) (net.Conn, error) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+	create, err := host.mgr.HostCreateAuto("https://127.0.0.1:65535")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, scanErr := guest.mgr.GuestScan(ctx, create.OTPAuthURI, "")
+		done <- scanErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("P2P discovery did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("GuestScan did not stop after client cancellation")
+	}
+}
+
+func TestGuestScanP2PStopsAtCallerSessionDeadline(t *testing.T) {
+	host := newCeremonyNode(t, "host-expired-route")
+	guest := newCeremonyNode(t, "guest-expired-route")
+	hostBundle := testDirectRouteBundle(t, "192.168.50.192")
+	guestBundle := testDirectRouteBundle(t, "192.168.50.193")
+	host.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return hostBundle, nil },
+	})
+	guest.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return guestBundle, nil },
+		DialTarget: func(ctx context.Context, _ string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+	create, err := host.mgr.HostCreateAuto("https://127.0.0.1:65535")
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 125*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err = guest.mgr.GuestScan(ctx, create.OTPAuthURI, "")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(started), time.Second, "session deadline must preempt route attempts and retry backoff")
 }
 
 func TestHostCreateAutoUsesPreparedDirectBundle(t *testing.T) {

@@ -132,7 +132,15 @@ func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
 		})
 	})
 	mux.HandleFunc("/v1/pipe/remote-local/result", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "completed", "reply_event_id": "reply-event-1", "reply_status": "queued",
+		})
+	})
+	mux.HandleFunc("/v1/messages/replies/reply-event-1/status", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reply_event_id": "reply-event-1", "scope": "federated",
+			"reply_status": "delivered", "transport_status": "delivered",
+		})
 	})
 	mux.HandleFunc("/v1/messages/transport-1/status", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -169,6 +177,12 @@ func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "remote-local", reply.(map[string]any)["message_id"])
 	require.Equal(t, "federated", reply.(map[string]any)["scope"])
+	require.Equal(t, "reply-event-1", reply.(map[string]any)["reply_event_id"])
+	require.Contains(t, reply.(map[string]any)["message"], "immutable outbound reply receipt")
+	replyStatus, err := s.toolMessageStatus(context.Background(), map[string]any{"message_id": "reply-event-1"})
+	require.NoError(t, err)
+	require.Equal(t, "delivered", replyStatus.(map[string]any)["reply_status"])
+	require.NotContains(t, replyStatus.(map[string]any), "workflow_status")
 
 	status, err := s.toolMessageStatus(context.Background(), map[string]any{"message_id": "transport-1"})
 	require.NoError(t, err)
@@ -178,6 +192,43 @@ func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
 	require.Equal(t, "confirmed", status.(map[string]any)["read_status"])
 	require.Equal(t, "completed", status.(map[string]any)["workflow_status"])
 	require.False(t, statusFallbackCalled, "canonical federated status must not lose workflow via the legacy receipt fallback")
+}
+
+func TestMessageSendFriendlyFederatedNameQueuesOnlyCanonicalDestination(t *testing.T) {
+	remoteAgent := strings.Repeat("e", 64)
+	var sendBody map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pipe/resolve", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, "Mac Mini Mynah", body["to"])
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"to_agent": remoteAgent, "source_chain_id": "chain-local",
+			"destination_chain_id": "chain-mini", "address": remoteAgent + "@chain-mini",
+		})
+	})
+	mux.HandleFunc("/v1/pipe/send", func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&sendBody))
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"pipe_id": "canonical-message", "status": "pending", "destination_chain_id": "chain-mini",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, privateKey).toolMessageSend(context.Background(), map[string]any{
+		"to": "Mac Mini Mynah", "payload": "hello", "idempotency_key": "friendly-send",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "canonical-message", result.(map[string]any)["message_id"])
+	require.Equal(t, remoteAgent, sendBody["to_agent"])
+	require.Equal(t, "chain-mini", sendBody["destination_chain_id"])
+	require.Equal(t, "chain-local", sendBody["source_chain_id"])
+	require.NotContains(t, sendBody, "to")
+	require.NotContains(t, fmt.Sprint(sendBody), "Mac Mini Mynah")
 }
 
 func TestPipeReceiptStatusUsesExactSignedSenderProjection(t *testing.T) {

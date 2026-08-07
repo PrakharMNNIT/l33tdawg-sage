@@ -57,7 +57,31 @@ func (h *DashboardHandler) SetFederation(f FederationJoinDriver) { h.Federation 
 const (
 	fedCallTimeout   = 25 * time.Second
 	fedStatusTimeout = 6 * time.Second
+	// A pasted JOIN enrollment may need several libp2p target attempts before
+	// the host CA can be fetched. Keep that bounded, but give the operator the
+	// promised five-minute window while the pairing screen remains open instead
+	// of inheriting the ordinary dashboard request deadline.
+	fedJoinDiscoveryTimeout = 5 * time.Minute
+	// The handler context and the socket write deadline are independent. The
+	// combined REST server normally uses the shorter two-consensus-operation
+	// budget, so this one route needs enough response headroom to report a final
+	// discovery timeout without relaxing unrelated dashboard/API requests.
+	fedJoinDiscoveryResponseTimeout = fedJoinDiscoveryTimeout + 5*time.Second
 )
+
+func extendFedJoinDiscoveryWriteDeadline(w http.ResponseWriter, r *http.Request) error {
+	err := http.NewResponseController(w).SetWriteDeadline(
+		time.Now().Add(fedJoinDiscoveryResponseTimeout),
+	)
+	// Direct handler tests do not have a live net/http connection whose deadline
+	// can be extended. A production request does: fail closed if middleware hides
+	// that capability, otherwise the UI would promise five minutes while the
+	// outer server still tears down the response at its ordinary deadline.
+	if errors.Is(err, http.ErrNotSupported) && r.Context().Value(http.ServerContextKey) == nil {
+		return nil
+	}
+	return err
+}
 
 func fedWriteJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1174,7 +1198,11 @@ func (h *DashboardHandler) handleFedGuestScan(w http.ResponseWriter, r *http.Req
 		fedWriteErr(w, http.StatusBadRequest, "Invalid request.")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), fedCallTimeout)
+	if err := extendFedJoinDiscoveryWriteDeadline(w, r); err != nil {
+		fedWriteErr(w, http.StatusServiceUnavailable, "Could not reserve the bounded JOIN discovery window.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), fedJoinDiscoveryTimeout)
 	defer cancel()
 	res, err := h.Federation.GuestScan(ctx, body.URI, body.Endpoint)
 	if err != nil {

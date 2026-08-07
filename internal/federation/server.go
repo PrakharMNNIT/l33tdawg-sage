@@ -918,7 +918,9 @@ func pipeContactMatchesTarget(contact PipeContact, target string) bool {
 	if strings.HasPrefix(target, "#") {
 		return strings.EqualFold(contact.Handle, target)
 	}
-	return strings.EqualFold(contact.AgentID, target) || strings.EqualFold(contact.DisplayName, target)
+	return strings.EqualFold(contact.AgentID, target) ||
+		strings.EqualFold(contact.DisplayName, target) ||
+		strings.EqualFold(contact.RegisteredName, target)
 }
 
 func pipeContactMatchesName(query string, contact PipeContact) (exact bool, partial bool) {

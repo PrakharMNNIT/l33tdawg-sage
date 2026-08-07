@@ -661,12 +661,19 @@ func (m *Manager) resolveRemotePipeTarget(ctx context.Context, target string, al
 		return nil, errors.Join(ErrRemotePipeResolutionIncomplete, errors.Join(lookupErrors...))
 	}
 	if len(matches) != 1 {
-		choices := make([]string, 0, len(matches))
+		const maxAmbiguousChoices = 20
+		choices := make([]string, 0, min(len(matches), maxAmbiguousChoices))
 		for _, match := range matches {
-			choices = append(choices, match.contact.Address)
+			if len(choices) < maxAmbiguousChoices {
+				choices = append(choices, match.contact.Address)
+			}
 		}
 		sort.Strings(choices)
-		return nil, fmt.Errorf("%w: choose one of %s", ErrRemotePipeTargetAmbiguous, strings.Join(choices, ", "))
+		detail := strings.Join(choices, ", ")
+		if len(matches) > len(choices) {
+			detail += fmt.Sprintf(" (and %d more; use sage_find_agent)", len(matches)-len(choices))
+		}
+		return nil, fmt.Errorf("%w: choose one of %s", ErrRemotePipeTargetAmbiguous, detail)
 	}
 	match := matches[0]
 	if match.grant.Paused {
@@ -704,7 +711,12 @@ func matchRemotePipeCandidates(target string, candidates []remotePipeCandidate) 
 		case strings.HasPrefix(target, "#"):
 			matched = strings.EqualFold(contact.Handle, target)
 		default:
-			matched = strings.EqualFold(contact.AgentID, target) || strings.EqualFold(contact.DisplayName, target)
+			// Friendly labels are advisory inputs only. Resolution may match either
+			// exposed name, but the returned route and every signed transport event
+			// remain bound to the immutable AgentID/Address.
+			matched = strings.EqualFold(contact.AgentID, target) ||
+				strings.EqualFold(contact.DisplayName, target) ||
+				strings.EqualFold(contact.RegisteredName, target)
 		}
 		if matched {
 			out = append(out, candidate)

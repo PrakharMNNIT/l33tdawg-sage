@@ -78,6 +78,43 @@ func TestMatchRemotePipeCandidatesRequiresExactQualifiedIdentity(t *testing.T) {
 		"short agent prefixes are accepted only inside a peer-qualified handle")
 }
 
+func TestMatchRemotePipeCandidatesAcceptsRegisteredNameButReturnsCanonicalRoute(t *testing.T) {
+	agentID := strings.Repeat("c", 64)
+	candidate := remotePipeCandidate{
+		chainID: "chain-mini",
+		contact: PipeContact{
+			AgentID: agentID, Address: agentID + "@chain-mini",
+			DisplayName: "Mynah on the mini", RegisteredName: "mynah/voice-bridge",
+		},
+	}
+
+	matches := matchRemotePipeCandidates("mynah/voice-bridge", []remotePipeCandidate{candidate})
+	require.Len(t, matches, 1)
+	require.Equal(t, agentID+"@chain-mini", matches[0].contact.Address)
+	require.True(t, pipeContactMatchesTarget(candidate.contact, "mynah/voice-bridge"),
+		"the serving peer's targeted lookup must expose the same exact registered-name match")
+	require.Empty(t, matchRemotePipeCandidates("mynah", []remotePipeCandidate{candidate}),
+		"friendly send resolution must never use substring matching")
+}
+
+func TestMatchRemotePipeCandidatesRenameKeepsRegisteredAndCanonicalIdentityStable(t *testing.T) {
+	agentID := strings.Repeat("d", 64)
+	before := remotePipeCandidate{chainID: "chain-mini", contact: PipeContact{
+		AgentID: agentID, Address: agentID + "@chain-mini",
+		DisplayName: "Old Mynah", RegisteredName: "mynah/voice-bridge",
+	}}
+	after := before
+	after.contact.DisplayName = "Mac Mini Mynah"
+
+	require.Len(t, matchRemotePipeCandidates("Old Mynah", []remotePipeCandidate{before}), 1)
+	require.Empty(t, matchRemotePipeCandidates("Old Mynah", []remotePipeCandidate{after}))
+	for _, label := range []string{"Mac Mini Mynah", "mynah/voice-bridge"} {
+		matches := matchRemotePipeCandidates(label, []remotePipeCandidate{after})
+		require.Len(t, matches, 1)
+		require.Equal(t, agentID+"@chain-mini", matches[0].contact.Address)
+	}
+}
+
 func TestSplitPipeAddressRejectsMalformedQualifiedTargets(t *testing.T) {
 	agentID := strings.Repeat("a", 64)
 	agent, chain := splitPipeAddress(agentID + "@chain-amy")

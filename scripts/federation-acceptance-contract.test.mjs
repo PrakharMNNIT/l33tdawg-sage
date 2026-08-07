@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { findInboxMessage } from './federation-acceptance-find-inbox-message.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const base = path.join(root, 'deploy', 'federation-acceptance');
@@ -9,7 +10,7 @@ const runner = fs.readFileSync(path.join(base, 'run.sh'), 'utf8');
 const legacy = fs.readFileSync(path.join(base, 'v11.17.4-config.template.yaml'), 'utf8');
 
 for (const service of ['relay:', 'node-a:', 'node-b:']) assert.match(compose, new RegExp(`\\n  ${service}`));
-assert.equal((compose.match(/image: sage-v111717-node:local/g) || []).length, 2,
+assert.equal((compose.match(/image: sage-v111800-node:local/g) || []).length, 2,
   'both nodes must run the exact same built image');
 for (const network of ['edge_a:', 'edge_b:', 'lan:']) assert.match(compose, new RegExp(`\\n  ${network}`));
 assert.match(compose, /SAGE_VENDORED_AGENT_HOME_DOMAIN: mynah-a-home/);
@@ -22,7 +23,7 @@ for (const gate of [
   'relay outage and recovery',
   'expired route snapshot fixture',
   'v11.17.4 persisted p2p_peers compatibility shape',
-  'canonical MCP flow: find -> send -> offline inbox -> read -> reply/status',
+  'canonical MCP flow: friendly registered-name send -> reply receipt -> offline inbox -> read -> reply/status',
   'directional peer export read needs no mirrored group',
   'bidirectional Copy: seed pre-consent memories for initial backfill',
   'bidirectional Copy: each owner offers Copy and each receiver independently subscribes',
@@ -35,6 +36,41 @@ assert.match(runner, /automatic real JOIN ceremony over LAN/);
 assert.match(runner, /federation\/join\/guest\/confirm/);
 assert.match(runner, /sage_find_agent/);
 assert.match(runner, /sage_message_send/);
+assert.match(runner, /node-a\) project=voice-bridge-a[\s\S]*node-b\) project=voice-bridge-b/,
+  'fresh nodes need distinct immutable registered names so the friendly-name gate is not an intentional local/federated collision');
+assert.match(runner, /friendly_target=.*registered_name/);
+assert.equal((runner.match(/federation-acceptance-find-inbox-message\.mjs/g) || []).length, 2,
+  'friendly and offline inbox gates must use the exact correlation helper');
+assert.doesNotMatch(runner, /items\.0\.message_id/,
+  'inbox order is not a delivery guarantee');
+assert.doesNotMatch(runner, /friendly_received_id.*friendly_message_id/,
+  'federated delivery intentionally translates the sender-local message ID');
+
+const correlation = {
+  intent: 'acceptance',
+  payload: 'unique run payload',
+  senderAgent: 'agent-a',
+  sourceChain: 'chain-a',
+};
+const translated = findInboxMessage({ items: [
+  { message_id: 'stale-local', ...correlation, sender_agent: 'agent-a', source_chain: 'wrong-chain' },
+  { message_id: 'msg-fed-receiver-local', intent: correlation.intent, payload: correlation.payload,
+    sender_agent: correlation.senderAgent, source_chain: correlation.sourceChain },
+  { message_id: 'sender-local-id', intent: correlation.intent, payload: 'other run',
+    sender_agent: correlation.senderAgent, source_chain: correlation.sourceChain },
+] }, correlation);
+assert.equal(translated?.message_id, 'msg-fed-receiver-local',
+  'correlation must select the translated receiver-local ID regardless of inbox order');
+assert.equal(findInboxMessage({ items: [
+  { message_id: 'near-match', intent: correlation.intent, payload: correlation.payload,
+    sender_agent: correlation.senderAgent, source_chain: 'wrong-chain' },
+] }, correlation), undefined, 'correlation must reject a near-match from the wrong source chain');
+assert.match(runner, /reply_event_id/);
+assert.match(runner, /reply event status leaked original message workflow/);
+assert.match(runner, /friendly_sender_status=.*sage_message_status/);
+assert.match(runner, /friendly_read_status.*confirmed/);
+assert.match(runner, /friendly_workflow_status.*completed/);
+assert.match(runner, /friendly sender status lacks confirmed read and completed reply after retry window/);
 assert.match(runner, /transport_status.*queued/);
 assert.match(runner, /peer_status.*unconfirmed/);
 assert.match(runner, /send_elapsed.*-le 5/);

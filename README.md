@@ -51,32 +51,62 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.17.17
+## What's New in v11.18.0
 
-**Federated Read plans now stay true until disclosure.** The v11.17.16
-exported-agent model correctly made a trusted node pair its own federation
-group, but a source agent's standing or clearance could change between planning
-and the remote query. v11.17.17 binds the source authorization model and exact
-attestation into the signed plan and single-use challenge, then holds the final
-source authorization lease through the destination query. A changed export,
-domain owner, enrollment, clearance, agreement, or capability now fails closed
-before any memory is returned and requires a fresh plan and signature.
+**A connected pair is now the federation group users expect it to be.** Each
+side explicitly exports the ordinary local agents it places in that pair. Every
+active ordinary agent on the other SAGE may then live-read those exported
+agents' owned domain trees by default—no matching local group, receiving
+domain, or linked-reader grant is required. A receiving operator can narrow
+that default with exact agent/domain denials. Local-only group membership is
+never exported transitively, and adding another federated agent is an explicit
+new export. Read remains borrowed; Copy still requires a source offer plus the
+receiver's **Save here** subscription, while remote memory Write remains
+reserved and fails closed.
 
-CEREBRUM and `sage_federation` also expose the negotiated authenticated-read
-capability explicitly. A reachable peer missing it is described honestly as
-possibly still warming/binding or needing an update; SAGE does not guess which.
-Policy candidates stay separate from domains the destination has verified. The
-Docker federation lane covers pairwise default Read, explicit denial,
-non-transitive exports, Copy backfill, incremental mirroring, bidirectional
-mirroring, and restart recovery.
+**Federated authorization now stays true through disclosure.** The signed Read
+plan and single-use challenge bind the exact source-agent standing, clearance,
+export, agreement, policy generation, and negotiated authorization model. The
+source authorization lease is revalidated and held until the destination query
+finishes, so a concurrent rename-safe identity change, restriction, ownership
+change, pause, or revoke cannot leak a result. CEREBRUM and `sage_federation`
+also report authenticated-read readiness honestly, and the Docker acceptance
+lane proves default Read, explicit denial, non-transitive exports, bidirectional
+Copy backfill/incremental sync, and restart recovery.
 
-This is an off-consensus protocol, authorization, and projection correction. It
-changes no transaction codec, AppHash input, fork target, key format, memory, domain,
-linked-reader row, or existing agreement. Both SAGEs must run v11.17.17 for the
-complete signed authorization tuple; older clients are told to re-plan and
-re-sign instead of silently downgrading it.
+**People can address agents without giving up canonical identity.** Local and
+federated message targets accept a unique display or immutable registered name;
+the resolved request and wire proof still carry only the canonical agent ID and
+chain. Ambiguous local/remote collisions fail with bounded immutable choices
+instead of selecting the first label. Federated replies now return an immutable
+`reply_event_id`, and the replier can query that exact event's delivery status
+without pretending it is a new inbox message.
 
-Container: `ghcr.io/l33tdawg/sage:11.17.17`. SDK 11.17.17.
+**Access Controls is now one usable control surface.** Dedicated **Agents**,
+**Groups**, and **Federation** tabs use compact searchable/sortable lists and
+focused detail drawers instead of mounting every permission matrix at once.
+Modern and legacy URL deep links preserve the selected tab and exact local or
+federated identity. Dialog/drawer focus ownership, Escape/Tab handling, ARIA
+labels, and narrow-screen behavior are covered by browser-contract tests.
+
+**JOIN and upgrade recovery are bounded and explicit.** A JOIN session still
+expires after 15 minutes, while each pasted/scanned code gets up to five minutes
+of Direct/relay discovery as long as its pairing screen remains open. v11.18.0
+is also the first concrete release containing stopped-node `backup --full`,
+recoverable `restore --from`, `upgrade preflight`, and the app-v21 → app-v22
+`upgrade lineage status|doctor|verify` workflow. A legacy-lineage repair is
+create-only, chain/current-state bound, embedded in the exact immutable upgrade
+proposal, never auto-voted, and requires every validator to verify and vote
+explicitly; an unverified anchor requires a deliberate acknowledgement.
+
+The federation/UI work is off-consensus. The narrow lineage ceremony repairs
+only an eligible chain still at app-v21 before its governed app-v22 transition.
+Existing app-v22 through app-v26 chains are not rewritten, **app-v26 remains the
+binary ceiling, and v11.18.0 introduces no app-v27**. Both SAGEs should run
+v11.18.0 for the complete signed federation tuple; older peers fail closed
+rather than silently downgrade it.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.0`. SDK 11.18.0.
 
 ## What's New in v11.17.15
 
@@ -1405,7 +1435,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.17`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.0`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

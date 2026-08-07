@@ -8,8 +8,12 @@ lived-in node during an upgrade, and no supported procedure asks you to export
 SQLite and initialize a fresh chain. Memories, domains, grants, agent
 identities, governance records, and block history all survive.
 
-**Every command in this document ships in the binary.** If a step tells you to
-run something, it exists.
+**The recovery commands in this guide require SAGE v11.18.0 or later.** That is
+the first concrete release containing `backup --full`, `restore --from`,
+`upgrade preflight`, and `upgrade lineage status|doctor|verify`. Install the
+v11.18.0 binary before relying on any of them; an older binary may not recognize
+the command, and an old `backup` implementation may interpret `--full`
+differently.
 
 ---
 
@@ -30,13 +34,14 @@ sage-gui serve
 sage-gui upgrade status
 ```
 
-> **Install the new binary before you back up.** `backup --full` and `upgrade
-> preflight` are recent additions — an older `sage-gui` does not have them, and
-> a v10.x binary certainly does not. Installing a new binary is safe and
+> **Install SAGE v11.18.0 or later before you back up.** That is the concrete
+> minimum for `backup --full`, `restore --from`, `upgrade preflight`, and the
+> `upgrade lineage` commands; v10.x and older v11 binaries do not provide this
+> complete contract. Installing a new binary is safe and
 > reversible on its own: it changes no data and activates no fork until the node
 > runs and governance approves each rung. Check what you have with
-> `sage-gui upgrade preflight --help`; if it is not recognized, your binary
-> predates these commands.
+> `sage-gui upgrade lineage verify --help`; if it is not recognized, your
+> binary predates the complete v11.18.0 recovery toolset.
 
 On a personal node that is the whole upgrade. The node proposes and activates
 each consensus fork by itself until it reaches the binary's ceiling.
@@ -85,9 +90,12 @@ Use this to work out how far your chain has to climb.
 | v11.16.0 | app-v24 |
 | v11.16.2 | app-v25 |
 | v11.17.0 | app-v26 |
+| v11.18.0 | no new app version; app-v26 remains the ceiling |
 
 A v10.x chain therefore sits somewhere around **app-v11 to app-v14**, and
 current v11 binaries support up to **app-v26**. That is roughly a dozen rungs.
+v11.18.0 does **not** introduce app-v27 and does not rewrite an existing
+app-v22, app-v23, app-v24, app-v25, or app-v26 chain.
 
 Forks activate **strictly one at a time**: every proposal must target the
 chain's current version **+ 1**. Skipping is rejected — a jump from 14 to 26
@@ -187,7 +195,7 @@ the container stopped:
 
 ```bash
 docker stop sage
-docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:latest \
+docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:11.18.0 \
   backup --full --out /root/.sage/backups/pre-upgrade.tar.gz
 ```
 
@@ -195,23 +203,23 @@ The image's `ENTRYPOINT` is already `sage-gui`, so pass the subcommand directly 
 `docker run … sage-gui backup` would try to run `sage-gui sage-gui backup`. The
 archive lands in the mounted volume, so it survives the container.
 
-> **Confirm the image actually has these commands before you rely on the
-> backup.** An image older than the release that introduced them does not reject
+> **Confirm the image is v11.18.0 or later before you rely on the backup.** An
+> older image does not necessarily reject
 > `--full` — it ignores the flag, writes the SQLite-only copy, and prints
 > `Backup saved`. A success message, for the wrong thing, right before an
 > irreversible climb. Check first:
 >
 > ```bash
-> docker run --rm ghcr.io/l33tdawg/sage:latest upgrade preflight --help
+> docker run --rm ghcr.io/l33tdawg/sage:11.18.0 upgrade lineage verify --help
 > ```
 >
-> If that errors with an unknown subcommand, the image predates these commands —
-> pull a newer one before going further.
+> If that errors with an unknown subcommand, the image predates the complete
+> recovery commands—pull v11.18.0 or later before going further.
 
 Then preflight the same way, using that same current image:
 
 ```bash
-docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:latest upgrade preflight
+docker run --rm -v ~/.sage:/root/.sage ghcr.io/l33tdawg/sage:11.18.0 upgrade preflight
 ```
 
 ---
@@ -258,10 +266,82 @@ VERDICT: this chain CANNOT reach app-v22.
   app-v17: missing canonical applied app-v17 record
 ```
 
-If you get that: **do not delete the data directory.** The evidence is missing
-from consensus storage and cannot be re-proposed or synthesized. Restore a
-complete backup taken before the gap, or open an issue with the preflight
-output.
+If you get that: **do not delete the data directory and do not edit Badger.** A
+present-but-invalid record cannot be overwritten; restore a complete stopped-
+node backup taken before the damage or open an issue with the preflight output.
+If the named rungs are absent, v11.18.0 has one narrow recovery path: let the
+chain stop safely at app-v21, then use the governed lineage ceremony below.
+Never invent activation heights merely to make the ladder pass.
+
+### Governed legacy-lineage recovery at app-v21
+
+This workflow exists only for an upgraded chain that is **exactly app-v21** and
+is missing one or more canonical app-v6 through app-v21 activation records. It
+does not modify an already-upgraded app-v22–app-v26 chain, repair an invalid
+present record, or introduce app-v27.
+
+1. Keep the stopped-node `backup --full` from Step 2. Start every validator on
+   v11.18.0, allow lower healthy rungs to climb, and stop normal upgrade
+   proposals once `upgrade status` reports app-v21.
+2. On the proposing validator, inventory the live committed state and create a
+   candidate from retained Comet history:
+
+   ```bash
+   sage-gui upgrade lineage status --json
+   sage-gui upgrade lineage doctor --json --manifest-out repair.json
+   ```
+
+   `doctor` is read-only. It emits a manifest only when the chain, governance
+   domain, current valid-lineage digest, exact missing set, strictly ordered
+   committed heights, and one evidence mode agree.
+3. Copy only `repair.json` to every validator operator. Each operator verifies
+   the exact manifest independently against that validator's own chain and
+   retained block results, then compares `manifest_digest` values:
+
+   ```bash
+   sage-gui upgrade lineage verify --json --manifest repair.json
+   ```
+
+   A block hash in the proposal is not self-proving; `verify` must reproduce
+   the app-version update and hash from each validator's retained history.
+4. If retained history is pruned, use an independently audited anchor containing
+   **every** missing version. Do not mix it with retained-Comet claims. Both
+   creation and verification require the explicit unverified-history warning:
+
+   ```bash
+   sage-gui upgrade lineage doctor --json \
+     --legacy-anchor audited-heights.json \
+     --acknowledge-unverified-anchor \
+     --manifest-out repair.json
+
+   sage-gui upgrade lineage verify --json \
+     --manifest repair.json \
+     --acknowledge-unverified-anchor
+   ```
+
+   An anchor is an operator assertion, not recovered cryptographic history. An
+   ACCEPT vote attests those exact claims.
+5. After every validator reports the same eligible manifest digest, submit the
+   exact app-v22 proposal:
+
+   ```bash
+   sage-gui upgrade propose --target 22 --lineage-repair repair.json
+   ```
+
+6. Automatic voting is disabled for every lineage-repair proposal, including
+   on a one-validator chain. Each validator operator reopens the immutable
+   payload in CEREBRUM Governance (or `sage_gov_status`) and explicitly votes
+   ACCEPT, REJECT, or ABSTAIN. Do not accept merely because the proposer or
+   another validator did.
+7. After quorum and app-v22 activation, run `upgrade lineage status --json` on
+   every validator and confirm the immutable repair audit and complete ladder
+   before proposing app-v23.
+
+The manifest is chain/current-lineage bound and execution is create-only. A
+changed digest, extra/missing claim, mixed evidence source, future height,
+existing record, payload change, or insufficient explicit quorum fails closed.
+See [`reference/upgrade-lineage-repair.md`](reference/upgrade-lineage-repair.md)
+for the evidence and persistence contract.
 
 ### The app-v23 authority preview
 
@@ -345,7 +425,9 @@ sage-gui upgrade propose --target 16 --wait
 activates. Proposals route through the 2/3 governance quorum; validators
 auto-vote ACCEPT if they support the target. Upgrade every validator's binary
 before climbing — a validator that does not support the target cannot vote for
-it.
+it. The only exception is an app-v22 proposal carrying `--lineage-repair`:
+automatic voting is disabled and every validator must verify and vote
+explicitly, as described above.
 
 ---
 
@@ -497,6 +579,8 @@ sage-gui mcp-token create    # issue a replacement per client
 
 ## Related reference
 
+- [`reference/upgrade-lineage-repair.md`](reference/upgrade-lineage-repair.md)
+  — app-v21 → app-v22 evidence verification, explicit quorum, and immutable audit
 - [`reference/app-v23-access-control-design.md`](reference/app-v23-access-control-design.md)
   — Root, roles, security profiles, Access Groups, and the full migration contract
 - [`reference/app-v25-upgrade-recovery.md`](reference/app-v25-upgrade-recovery.md)

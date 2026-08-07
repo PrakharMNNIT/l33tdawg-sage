@@ -460,6 +460,11 @@ func TestPrintUpgradeUsage_CurrentLadder(t *testing.T) {
 	if !strings.Contains(out, "ONE AT A TIME") {
 		t.Errorf("usage should state the one-at-a-time sequential rule; output:\n%s", out)
 	}
+	for _, required := range []string{"MISSING canonical records", "stopped-node backup", "present-but-invalid", "never overwritten"} {
+		if !strings.Contains(out, required) {
+			t.Errorf("usage should contain lineage recovery contract %q; output:\n%s", required, out)
+		}
+	}
 }
 
 // shrinkProposeRetryDelay makes the landed-anyway probe immediate for tests.

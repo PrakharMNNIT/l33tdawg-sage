@@ -294,6 +294,9 @@ func inspectAppV20StateSyncStore(ctx context.Context, badgerStore *store.BadgerS
 	if state.EpochNum != poe.EpochNumber(state.Height) {
 		return 0, nil, fmt.Errorf("%s persisted epoch does not match height", label)
 	}
+	if auditErr := badgerStore.ValidateLegacyUpgradeLineageRepairAudit(); auditErr != nil {
+		return 0, nil, fmt.Errorf("verify %s legacy upgrade lineage repair audit: %w", label, auditErr)
+	}
 	applied, appliedErr := badgerStore.GetAppliedUpgrade(appV20UpgradeName)
 	if appliedErr != nil {
 		return 0, nil, appliedErr

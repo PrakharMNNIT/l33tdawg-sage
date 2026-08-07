@@ -2537,8 +2537,11 @@ func encodeUpgradePropose(u *UpgradePropose) []byte {
 	buf = appendInt64(buf, u.UpgradeDelayBlocks)
 	// Optional wire tail: omitting the empty field preserves every pre-app-v20
 	// UpgradePropose byte-for-byte while target 20 commits the chain domain.
-	if u.GovernanceDomain != "" {
+	if u.Name == "app-v20" && u.TargetAppVersion == 20 && u.GovernanceDomain != "" {
 		buf = appendBytes(buf, []byte(u.GovernanceDomain))
+	}
+	if u.Name == "app-v22" && u.TargetAppVersion == 22 && u.LineageRepair != "" {
+		buf = appendBytes(buf, []byte(u.LineageRepair))
 	}
 	return buf
 }
@@ -2589,6 +2592,11 @@ func decodeUpgradePropose(data []byte) (*UpgradePropose, error) {
 			if domainErr == nil && len(domain) == sha256.Size && hex.EncodeToString(domain) == encoded {
 				u.GovernanceDomain = encoded
 			}
+		}
+	}
+	if u.Name == "app-v22" && u.TargetAppVersion == 22 && off < len(data) {
+		if decoded, next, tailErr := readBytes(data, off); tailErr == nil && next == len(data) {
+			u.LineageRepair = string(decoded)
 		}
 	}
 

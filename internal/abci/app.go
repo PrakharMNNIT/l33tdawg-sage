@@ -2472,6 +2472,9 @@ func NewSageAppWithStores(bs *store.BadgerStore, offchain store.OffchainStore, l
 	if invariantErr := app.refreshAppV21Fork(); invariantErr != nil {
 		return nil, invariantErr
 	}
+	if invariantErr := bs.ValidateLegacyUpgradeLineageRepairAudit(); invariantErr != nil {
+		return nil, fmt.Errorf("validate legacy upgrade lineage repair audit: %w", invariantErr)
+	}
 	if invariantErr := app.validateAppV21Prerequisite(); invariantErr != nil {
 		return nil, invariantErr
 	}
@@ -2872,6 +2875,22 @@ func (app *SageApp) ActiveUpgradeVote() (proposalID string, targetVersion uint64
 				Uint64("current_app_version", app.currentAppVersion()).
 				Msg("app-v22 upgrade requires app-v21 as its immediate predecessor; skipping auto-vote")
 			supported = false
+		} else if payload.LineageRepair != "" {
+			// A repair manifest carries historical evidence which cannot be
+			// established from current consensus state alone. In particular, a
+			// retained Comet block hash proves only what this validator's local
+			// archive reports. Never turn local validation into an automatic vote:
+			// every validator operator must independently inspect the exact
+			// chain-bound manifest and cast an explicit governance vote. This is
+			// intentionally true even for a one-validator chain.
+			supported = false
+			if _, _, repairErr := app.validateLegacyLineageRepair(payload.LineageRepair); repairErr != nil {
+				app.logger.Warn().Err(repairErr).Str("proposal_id", prop.ProposalID).
+					Msg("app-v22 lineage repair is invalid; automatic voting is disabled")
+			} else {
+				app.logger.Warn().Str("proposal_id", prop.ProposalID).
+					Msg("app-v22 lineage repair requires manual validator review and vote; automatic voting is disabled")
+			}
 		} else if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
 			app.logger.Warn().Err(ladderErr).Str("proposal_id", prop.ProposalID).
 				Msg("app-v22 predecessor ladder is invalid; skipping auto-vote")
@@ -10602,6 +10621,16 @@ func (app *SageApp) Query(_ context.Context, req *abcitypes.RequestQuery) (*abci
 			return &abcitypes.ResponseQuery{Code: 1, Log: "encode current CEREBRUM Root state"}, nil
 		}
 		return &abcitypes.ResponseQuery{Code: 0, Value: value}, nil
+	case "/upgrade/lineage":
+		status, err := app.legacyUpgradeLineageStatus()
+		if err != nil {
+			return &abcitypes.ResponseQuery{Code: 1, Log: "upgrade lineage unavailable: " + err.Error()}, nil
+		}
+		value, err := json.Marshal(status)
+		if err != nil {
+			return &abcitypes.ResponseQuery{Code: 1, Log: "encode upgrade lineage status"}, nil
+		}
+		return &abcitypes.ResponseQuery{Code: 0, Value: value}, nil
 	default:
 		return &abcitypes.ResponseQuery{Code: 1, Log: "unknown query path"}, nil
 	}
@@ -11162,6 +11191,7 @@ type UpgradeProposalPayload struct {
 	BinarySHA256       string `json:"binary_sha256,omitempty"`
 	UpgradeDelayBlocks int64  `json:"upgrade_delay_blocks,omitempty"`
 	GovernanceDomain   string `json:"governance_domain,omitempty"`
+	LineageRepair      string `json:"lineage_repair,omitempty"`
 }
 
 // applyUpgradeProposal persists the pending UpgradePlanRecord for an executed
@@ -11250,7 +11280,11 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 		if current := app.currentAppVersion(); current != 21 {
 			return fmt.Errorf("app-v22 upgrade requires current app version 21, got %d", current)
 		}
-		if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+		if p.LineageRepair != "" {
+			if _, _, repairErr := app.validateLegacyLineageRepair(p.LineageRepair); repairErr != nil {
+				return fmt.Errorf("app-v22 lineage repair is invalid: %w", repairErr)
+			}
+		} else if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
 			return fmt.Errorf("app-v22 upgrade has invalid predecessor ladder: %w", ladderErr)
 		}
 	}
@@ -11338,6 +11372,14 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 		}
 		return nil
 	}
+	if p.Name == appV22UpgradeName && p.LineageRepair != "" {
+		if repairErr := app.applyLegacyLineageRepair(p.LineageRepair, proposal.ProposalID, height); repairErr != nil {
+			return fmt.Errorf("app-v22 lineage repair failed: %w", repairErr)
+		}
+		if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+			return fmt.Errorf("app-v22 predecessor ladder remains invalid after repair: %w", ladderErr)
+		}
+	}
 
 	delay := p.UpgradeDelayBlocks
 	if floor := effectiveUpgradeDelayFloorBlocks(); delay < floor {
@@ -11349,6 +11391,7 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 		ActivationHeight: height + delay,
 		BinarySHA256:     p.BinarySHA256,
 		GovernanceDomain: p.GovernanceDomain,
+		LineageRepair:    p.LineageRepair,
 		ProposedAt:       height,
 		ProposerID:       proposal.ProposerID,
 	}
@@ -11423,10 +11466,19 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
 				"upgrade propose: app-v22 requires current committed app version 21 (got %d)", current)}
 		}
-		if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+		if prop.GovernanceDomain != "" {
+			return &abcitypes.ExecTxResult{Code: 47, Log: "upgrade propose: app-v22 must not carry an app-v20 governance_domain tail"}
+		}
+		if prop.LineageRepair != "" {
+			if _, _, repairErr := app.validateLegacyLineageRepair(prop.LineageRepair); repairErr != nil {
+				return &abcitypes.ExecTxResult{Code: 47, Log: "upgrade propose: app-v22 lineage repair is invalid: " + repairErr.Error()}
+			}
+		} else if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
 			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
 				"upgrade propose: app-v22 predecessor ladder is invalid: %v", ladderErr)}
 		}
+	} else if prop.LineageRepair != "" {
+		return &abcitypes.ExecTxResult{Code: 47, Log: "upgrade propose: lineage repair is admitted only for app-v22"}
 	}
 	if prop.Name == appV23UpgradeName {
 		if prop.TargetAppVersion != 23 {
@@ -11626,16 +11678,30 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 			BinarySHA256:       prop.BinarySHA256,
 			UpgradeDelayBlocks: prop.UpgradeDelayBlocks,
 			GovernanceDomain:   prop.GovernanceDomain,
+			LineageRepair:      prop.LineageRepair,
 		})
 		if mErr != nil {
 			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf("upgrade propose: encode payload: %v", mErr)}
 		}
 
 		reason := "app-version upgrade to " + prop.Name
-		proposalID, propErr := app.govEngine.Propose(
-			govProposerID, governance.OpUpgrade, prop.Name, nil, 0,
-			0 /* default expiry */, reason, height, payload,
-		)
+		var proposalID string
+		var propErr error
+		if prop.LineageRepair != "" {
+			// Historical upgrade proposals mirror the proposer's ACCEPT vote.
+			// A lineage repair is intentionally different: its historical
+			// evidence requires an explicit, independent operator decision from
+			// every validator, including the proposer on a single-node chain.
+			proposalID, propErr = app.govEngine.ProposeWithoutAutoVote(
+				govProposerID, governance.OpUpgrade, prop.Name, nil, 0,
+				0 /* default expiry */, reason, height, payload,
+			)
+		} else {
+			proposalID, propErr = app.govEngine.Propose(
+				govProposerID, governance.OpUpgrade, prop.Name, nil, 0,
+				0 /* default expiry */, reason, height, payload,
+			)
+		}
 		if propErr != nil {
 			return &abcitypes.ExecTxResult{Code: 47, Log: "upgrade propose: governance propose failed: " + propErr.Error()}
 		}
@@ -11648,8 +11714,9 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 			}
 		}
 
-		// Mirror processGovPropose's offchain buffering so the proposal and the
-		// proposer's auto-accept vote surface in the SQL mirror / dashboard.
+		// Mirror processGovPropose's offchain buffering. Ordinary historical
+		// proposals include the proposer's auto-accept vote; repair proposals do
+		// not, so the dashboard must not invent a vote absent from consensus.
 		app.pendingWrites = append(app.pendingWrites, pendingWrite{
 			writeType: "gov_proposal",
 			data: govProposalData{
@@ -11663,15 +11730,17 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 				Reason:        reason,
 			},
 		})
-		app.pendingWrites = append(app.pendingWrites, pendingWrite{
-			writeType: "gov_vote",
-			data: govVoteData{
-				ProposalID:  proposalID,
-				ValidatorID: govProposerID,
-				Decision:    "accept",
-				Height:      height,
-			},
-		})
+		if prop.LineageRepair == "" {
+			app.pendingWrites = append(app.pendingWrites, pendingWrite{
+				writeType: "gov_vote",
+				data: govVoteData{
+					ProposalID:  proposalID,
+					ValidatorID: govProposerID,
+					Decision:    "accept",
+					Height:      height,
+				},
+			})
+		}
 
 		app.logger.Info().
 			Str("name", prop.Name).
@@ -11708,6 +11777,7 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 		ActivationHeight: height + delay,
 		BinarySHA256:     prop.BinarySHA256,
 		GovernanceDomain: prop.GovernanceDomain,
+		LineageRepair:    prop.LineageRepair,
 		ProposedAt:       height,
 		ProposerID:       proposerID,
 	}

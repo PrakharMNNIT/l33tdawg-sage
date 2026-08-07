@@ -1077,8 +1077,9 @@ async function fedFetch(path, opts) {
     }
     return data;
 }
-function fedPost(path, body) {
+function fedPost(path, body, options = {}) {
     return fedFetch(path, {
+        ...options,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body || {}),
@@ -1190,7 +1191,9 @@ export function fedHostApprove(sessionId, grant) { return fedPost(`/v1/dashboard
 export function fedHostAbort(sessionId) { return fedPost(`/v1/dashboard/federation/join/host/${encodeURIComponent(sessionId)}/abort`); }
 
 // Guest wizard.
-export function fedGuestScan(uri, endpoint) { return fedPost('/v1/dashboard/federation/join/guest/scan', { uri, endpoint }); }
+export function fedGuestScan(uri, endpoint, signal) {
+    return fedPost('/v1/dashboard/federation/join/guest/scan', { uri, endpoint }, { signal });
+}
 export function fedGuestRequest(body) { return fedPost('/v1/dashboard/federation/join/guest/request', body); }
 export function fedGuestStatus(sessionId) { return fedFetch(`/v1/dashboard/federation/join/guest/${encodeURIComponent(sessionId)}/status`); }
 export function fedGuestAbort(sessionId) { return fedPost(`/v1/dashboard/federation/join/guest/${encodeURIComponent(sessionId)}/abort`); }

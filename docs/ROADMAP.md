@@ -1,12 +1,21 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.17 is the current release.** This corrective release pins the exported-agent authorization model and source-agent attestation into every signed federated Read plan and holds final authorization through disclosure. It also makes authenticated-read capability readiness visible and extends the Docker lane through bidirectional Copy backfill, incremental mirroring, and restart recovery. Governed app-v26 and consensus remain unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
+**Status (2026-08):** **v11.18.0 is the current release.** It completes the
+pairwise exported-agent federation model, safe registered-name addressing and
+reply-event visibility, the three-tab Access Controls redesign, five-minute
+JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
+and a governed app-v21 → app-v22 legacy-lineage recovery ceremony. Existing
+app-v22 through app-v26 chains are not rewritten. The supported consensus
+ceiling remains app-v26; **v11.18.0 does not introduce app-v27**.
 
-**Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
+**Hard constraint driving the whole plan:** no chain reset. Existing chains must
+upgrade in place across all future releases. Routine personal-node upgrades
+remain automatic; the exceptional legacy-lineage repair is deliberately an
+explicit, reviewed operator ceremony rather than a silent mutation.
 
-## v11.17.x completion ledger
+## v11.18.0 completion ledger
 
-The 11.17 line has shipped the app-v23 through app-v26 governed upgrade path,
+v11.18.0 carries forward the 11.17 line's app-v23 through app-v26 governed upgrade path,
 historical-memory recovery controls, responsive Access Controls, authenticated
 Consensus loading, mutable agent display names, canonical Messages, deprecated
 hidden `sage_pipe*` compatibility aliases, durable-until-handled message retention, signed
@@ -54,14 +63,43 @@ with a deep link to the exact agent setting. It also generates a unique
 name-based home domain when a writable pending-agent approval leaves that field
 blank. v11.17.13 and the superseded v11.17.14 tag were not published.
 
-v11.17.17 closes the final plan-versus-disclosure race exposed while validating
-the physical Mynah pair. The source authorization model and exact active-agent
-and clearance attestation are signed, challenge-bound, revalidated under the
-source authorization lease, and held until the destination query completes.
-Capability projection reports missing authenticated-read support without
-guessing whether the peer is still binding or needs an update. The acceptance
-lane now proves pairwise default Read, explicit denial, non-transitive exports,
-and bidirectional Copy backfill/incremental/restart behavior.
+v11.18.0 makes every trusted two-SAGE connection its own pairwise federation
+group. An operator explicitly exports the local ordinary agent(s) participating
+in that pair; every active ordinary agent on the peer may then Read those
+agents' owned domain trees by default. Receiver-side exact agent/domain denies
+narrow that default. Local Access Groups are not exported transitively, and a
+new remote-visible agent exists only after an explicit federation export. Read
+is borrowed, Copy remains the two-sided source-offer plus receiver-subscription
+workflow, and remote memory Write remains reserved/denied.
+
+The signed Read plan now commits to the source authorization model, exact
+active-agent/clearance attestation, agreement and policy generations, and the
+single-use challenge. Final authorization is revalidated and leased through
+disclosure. Capability projection reports missing authenticated-read support
+without guessing whether a peer is binding or outdated. The Docker lane proves
+default Read, explicit denial, non-transitive exports, bidirectional Copy
+backfill and incremental sync, and restart recovery.
+
+Agent messaging resolves unique local or federated display/registered names to
+canonical IDs before signing; collisions return bounded immutable choices.
+Federated reply calls return `reply_event_id`, which the exact replier can use
+for payload-free delivery status. Access Controls now has dedicated Agents,
+Groups, and Federation tabs with compact search/sort lists, focused drawers,
+stable URL/deep-link selection, and keyboard/ARIA boundaries. JOIN retains its
+15-minute ceremony lifetime while a pasted/scanned code may spend up to five
+minutes discovering Direct/relay targets as long as the pairing screen stays
+open.
+
+The release also integrates the complete stopped-node recovery tooling from
+PR #161: `backup --full`, recoverable `restore --from`, and read-only `upgrade
+preflight`. For the narrow historical case where a chain is still at app-v21
+with absent but independently recoverable predecessor records, `upgrade lineage
+status|doctor|verify` builds and verifies a chain/current-lineage-bound,
+create-only app-v22 repair manifest. It is part of the exact immutable upgrade
+proposal, automatic voting is disabled even on one validator, and every
+validator explicitly verifies and votes. Unverified anchors require an explicit
+acknowledgement. Already-upgraded app-v22–app-v26 chains are untouched; there is
+no app-v27 fork in this release.
 
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:

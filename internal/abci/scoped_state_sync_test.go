@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,6 +23,43 @@ import (
 	"github.com/l33tdawg/sage/internal/tx"
 	"github.com/l33tdawg/sage/internal/validator"
 )
+
+func TestAppV20StateSyncPreservesAndValidatesLegacyLineageRepairAudit(t *testing.T) {
+	root := t.TempDir()
+	source, err := store.NewBadgerStore(filepath.Join(root, "source"))
+	require.NoError(t, err)
+	require.NoError(t, source.MarkUpgradeApplied(appV20UpgradeName, 20, 1))
+	seedTestGovernanceDelegationDomain(t, source)
+	manifest := `{"schema":"v1","governance_domain":"scope","prior_lineage_digest":"prior","evidence":[{"version":9,"name":"app-v9","applied_height":2}]}`
+	digest := sha256.Sum256([]byte(manifest))
+	require.NoError(t, source.ApplyLegacyUpgradeLineageRepair(store.LegacyUpgradeLineageRepairAudit{
+		Schema: "v1", GovernanceDomain: "scope", PriorLineageDigest: "prior",
+		ManifestDigest: hex.EncodeToString(digest[:]), Manifest: manifest,
+		ApprovedHeight: 3, ProposalID: "proposal-a",
+		Records: []store.AppliedUpgradeRecord{{Name: "app-v9", TargetAppVersion: 9, AppliedHeight: 2}},
+	}))
+	state := &AppState{Height: 3, EpochNum: poe.EpochNumber(3)}
+	for range 2 {
+		hash, hashErr := source.ComputeAppHashExcludingBookkeeping()
+		require.NoError(t, hashErr)
+		state.AppHash = append([]byte(nil), hash...)
+		require.NoError(t, SaveState(source, state))
+	}
+	trustedHash := append([]byte(nil), state.AppHash...)
+	backupPath := filepath.Join(root, "lineage.backup")
+	backup, err := os.OpenFile(backupPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, statesync.WriteCanonicalState(context.Background(), source.DB(), backup))
+	require.NoError(t, backup.Close())
+	require.NoError(t, source.CloseBadger())
+
+	target := filepath.Join(root, "target")
+	require.NoError(t, PrepareAppV20StateSyncBackup(context.Background(), backupPath, target, 3, trustedHash))
+	restored, err := store.OpenBadgerStoreReadOnly(target)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = restored.CloseBadger() })
+	require.NoError(t, restored.ValidateLegacyUpgradeLineageRepairAudit())
+}
 
 func TestPrepareAppV20StateSyncBackupValidatesWithoutActivating(t *testing.T) {
 	root := t.TempDir()

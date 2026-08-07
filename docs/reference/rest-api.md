@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.17.17. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.18.0. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -1000,6 +1000,19 @@ Pre-app-v23 nodes retain their legacy projection behavior.
 | `POST /v1/dashboard/memory/adoption-retry` | Current-Root-only request for a fresh scan of the exact unresolved App-v25 snapshot. Requires the `projection_revision` field (zero is valid for a first upgraded snapshot) and a positive `expected_count`; it never deletes rows or clears earlier dispositions. |
 | `POST /v1/dashboard/memory/adoption-deprecate` | Current-Root-only retirement of the exact unresolved snapshot. Requires the `projection_revision` field (including valid zero), positive `expected_count`, and typed `DEPRECATE <count>` confirmation. Records remain preserved for audit and are skipped by future automatic repair. |
 
+In v11.18.0 CEREBRUM presents this control plane as three explicit tabs:
+**Agents**, **Groups**, and **Federation**. Each tab uses a bounded compact list
+with local search/sort and opens one selected record in a detail drawer; it does
+not mount every policy editor simultaneously. The hash route
+`#/access?tab=<agents|groups|federation>&item=<exact-key>` preserves the selected
+tab and canonical item, while the older `agent`/`inbox` and
+`remote_chain`/`remote_agent` query forms map into the matching modern tab.
+Dialog and drawer focus is trapped and restored, Escape/Tab handling belongs to
+the active overlay, and controls expose stable ARIA labels. These are browser
+presentation contracts over the same authenticated endpoints, not new
+authorization paths (`web/static/js/access-controls-ui.js`;
+`web/static/js/app.js`; `scripts/access-controls-ui.test.mjs`).
+
 Once app-v26 is active, the legacy
 `PATCH /v1/dashboard/network/agents/{id}` metadata route rejects `name` and
 `boot_bio` with `governed_agent_metadata_required`. Display-label changes use
@@ -1924,7 +1937,7 @@ pipeline row. The MCP client calls this immediately before `send`, then signs
 the exact returned destination (`api/rest/pipe_handler.go:47-126`,
 `internal/mcp/tools.go:2108-2167`).
 
-**Request:** `{"to":"provider, agent name, #node/agent-prefix, or agent@chain"}`
+**Request:** `{"to":"provider, display/registered name, #node/agent-prefix, or agent@chain"}`
 
 **Response** (HTTP 200):
 
@@ -1940,7 +1953,16 @@ the exact returned destination (`api/rest/pipe_handler.go:47-126`,
 }
 ```
 
-Local targets retain their existing provider/name/ID behavior. Federated
+Canonical agent IDs remain exact and never invoke friendly-name discovery.
+Friendly labels match local display/registered/provider fields and federated
+display or registered names exactly (case-insensitive); substring matches are
+discovery-only. A friendly label must identify one caller-authorized target
+across local and federated scope. Local/local, federated/federated, and
+local/federated collisions return HTTP 409 with a bounded set of immutable
+choices instead of selecting the first match. Consequently a display-name
+rename changes that alias immediately while the immutable registered name and
+`agent@chain` address continue to resolve to the same transport identity.
+Federated
 resolution is limited to the finite authenticated contact projection disclosed
 by active peers. A qualified handle never falls through to a similarly named
 local target. Unknown, stale, paused, unavailable, non-accepting, ambiguous, or
@@ -2075,7 +2097,7 @@ malformed or oversize input receives 400.
 
 ### Canonical local Messages service (v11.17)
 
-The six `/v1/messages` operations are one same-node service over the existing
+The `/v1/messages` operations are one service over the existing
 encrypted `pipeline_messages` rows. They do not create a second inbox. Every
 route is inside the active-ordinary-agent boundary; Root is not a messaging
 principal.
@@ -2088,6 +2110,7 @@ principal.
 | `PUT /v1/messages/{message_id}/read` | Fresh nonce-bound exact-recipient signature. The message must already have been returned to that caller by canonical receive. Same acknowledgement is idempotent. |
 | `PUT /v1/messages/read-batch` | One fresh exact-recipient request acknowledges 1–20 already-fetched exact message IDs. Every item is authorized independently and returns `confirmed` or a generic per-item failure; one failure never rolls back independent successes. Exact replay is idempotent. |
 | `GET /v1/messages/{message_id}/status` | Exact sender only, payload-free metadata projection. Returns independent transport/read/workflow state and never decrypts content/proofs. |
+| `GET /v1/messages/replies/{reply_event_id}/status` | Exact federated replier only. Returns payload-free outbound result-event transport state. It is not another inbox request and exposes no original-message workflow/read status or result content. |
 
 Every operation requires a fresh nonce-bound request signed by the exact active
 ordinary agent, including send and sender status. Unauthorized and nonexistent
@@ -2104,6 +2127,11 @@ additive JSON-RPC method is `notifications/sage_message` and its params contain
 only `message_id`, `from_agent`, and `sent_at`. A missing/full stream never
 fails the send, does not alter any message state, and is not evidence that a
 recipient is online. Stdio and Streamable HTTP have no server-push contract.
+
+A successful federated reply returns its immutable `reply_event_id` and
+`reply_status:queued`. That ID names the already-existing signed result outbox
+event; it does not create a duplicate message. Only its signing replier can use
+the reply-status route, and unrelated/missing IDs share the same generic 404.
 
 The canonical same-node Messages routes remain separate from the
 capability-gated federated receipt-v2 surface. A negotiated imported pipe adds

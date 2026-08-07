@@ -66,6 +66,8 @@ func runUpgrade(args []string) error {
 		return runUpgradeStatus(args[1:])
 	case "preflight":
 		return runUpgradePreflight(args[1:])
+	case "lineage":
+		return runUpgradeLineage(args[1:])
 	case "help", "--help", "-h":
 		printUpgradeUsage()
 		return nil
@@ -93,6 +95,10 @@ Subcommands:
   preflight                    Read-only pre-upgrade check on a STOPPED node: verifies the
                                app-v22/app-v23 predecessor-ladder invariant and previews the
                                app-v23 Root election. Run this before adopting a new binary.
+  lineage status --json        Live, read-only persisted lineage inventory
+  lineage doctor --json        At app-v21, diagnose MISSING canonical records and optionally
+                               emit a repair manifest; take a stopped-node backup first
+  lineage verify --manifest F  Independently verify exact claims on each validator before voting
   propose --target <N>         Propose activation of app-v<N> (must be current+1)
 
 propose flags:
@@ -113,11 +119,17 @@ propose flags:
                     blocks, so on a quiescent node the plan's activation height
                     never arrives by itself (issue #41); a v10.5.2+ node pumps a
                     pending plan forward on its own, --wait does it interactively.
+  --lineage-repair <file>
+                    App-v22 only. Bind the exact doctor-emitted repair manifest
+                    into the ordinary quorum-approved upgrade proposal.
 
 The proposal is signed with the configured operator key before app-v23, and with the
 current CEREBRUM Root credential at app-v23+ (or the explicit --agent-key file). It is
 routed through the 2/3 governance quorum; validators auto-vote ACCEPT if they support
-the target. Run this on the node host where the key lives.
+the target. Lineage-repair proposals are the exception: automatic voting is disabled
+and every validator must independently review and explicitly vote. Run this on the
+node host where the key lives. A present-but-invalid canonical lineage record is
+never overwritten by repair; restore a complete backup from before that record.
 
 Past app-v8 the proposer must be a chain-admin agent: the signing key's agent ID must
 hold Role==admin in the on-chain registry. On a standard node that is usually your
@@ -184,6 +196,7 @@ func runUpgradePropose(args []string) error {
 	rpc := fs.String("rpc", defaultCometRPC(), "CometBFT RPC endpoint")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 	wait := fs.Bool("wait", false, "after the propose lands, heartbeat a quiescent chain until the fork activates (at app-v12+ an idle chain mints no blocks, so the activation height never arrives by itself)")
+	lineageRepairPath := fs.String("lineage-repair", "", "app-v22-only repair manifest emitted by upgrade lineage doctor")
 	agentKeyPath := fs.String("agent-key", "", "explicit signing-key override (an agent.key seed or a CometBFT priv_validator_key.json); app-v23+ otherwise resolves the current local CEREBRUM Root credential")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -211,6 +224,20 @@ func runUpgradePropose(args []string) error {
 	if err != nil {
 		return err
 	}
+	lineageRepair := ""
+	if *lineageRepairPath != "" {
+		if current != 21 || *target != 22 {
+			return fmt.Errorf("--lineage-repair is admitted only for the app-v21 to app-v22 proposal")
+		}
+		raw, readErr := os.ReadFile(*lineageRepairPath) //nolint:gosec // explicit operator path
+		if readErr != nil {
+			return fmt.Errorf("read --lineage-repair: %w", readErr)
+		}
+		lineageRepair, err = sageabci.CanonicalizeLegacyLineageRepair(raw)
+		if err != nil {
+			return fmt.Errorf("validate --lineage-repair: %w", err)
+		}
+	}
 
 	canonical, err := validateUpgradeTarget(current, *target, sageabci.MaxSupportedAppVersion(), *name)
 	if err != nil {
@@ -229,7 +256,12 @@ func runUpgradePropose(args []string) error {
 	// Confirm — this is a consensus action routed through the 2/3 quorum.
 	if !*yes {
 		fmt.Printf("Propose activation of %s (app version %d) on the chain at app-v%d?\n", canonical, *target, current)
-		fmt.Println("  • Routed through the 2/3 governance quorum; validators auto-vote ACCEPT if they support the target.")
+		if lineageRepair != "" {
+			fmt.Println("  • Routed through the 2/3 governance quorum; automatic voting is DISABLED for lineage repair.")
+			fmt.Println("  • Every validator must independently compare the manifest and cast an explicit vote.")
+		} else {
+			fmt.Println("  • Routed through the 2/3 governance quorum; validators auto-vote ACCEPT if they support the target.")
+		}
 		if current >= 8 {
 			fmt.Println("  • Post-app-v8: the proposer must be a chain-admin agent, else rejected at block execution (code 47).")
 		}
@@ -253,6 +285,12 @@ func runUpgradePropose(args []string) error {
 	ptx, err := buildUpgradeProposeTx(cfg, *target)
 	if err != nil {
 		return fmt.Errorf("build upgrade propose tx: %w", err)
+	}
+	if lineageRepair != "" {
+		ptx.UpgradePropose.LineageRepair = lineageRepair
+		if signErr := tx.SignTx(ptx, key); signErr != nil {
+			return fmt.Errorf("sign lineage-bound upgrade proposal: %w", signErr)
+		}
 	}
 	encoded, err := tx.EncodeTx(ptx)
 	if err != nil {
@@ -291,7 +329,7 @@ func runUpgradePropose(args []string) error {
 		// there's no fresh height/hash to print — go straight to the standard
 		// accepted guidance.
 		fmt.Printf("✓ Proposed %s (target app version %d) — the plan is pending (the first broadcast landed despite the RPC error).\n", canonical, *target)
-		printProposeAcceptedGuidance(*target)
+		printProposeAcceptedGuidance(*target, lineageRepair != "")
 		return finishProposeActivation(cfg, current, *wait)
 	}
 	if res.CheckTxCode != 0 {
@@ -324,7 +362,7 @@ func runUpgradePropose(args []string) error {
 
 	fmt.Printf("✓ Proposed %s (target app version %d) — accepted at height %d.\n", canonical, *target, res.Height)
 	fmt.Printf("  tx hash: %s\n", res.Hash)
-	printProposeAcceptedGuidance(*target)
+	printProposeAcceptedGuidance(*target, lineageRepair != "")
 	return finishProposeActivation(cfg, current, *wait)
 }
 
@@ -365,8 +403,15 @@ func finishProposeActivation(cfg upgradeWatchdogConfig, current uint64, wait boo
 // printProposeAcceptedGuidance prints the post-acceptance operator guidance
 // shared by the clean-commit path and the landed-despite-broadcast-error path:
 // how to track activation, and the next rung of the fork ladder.
-func printProposeAcceptedGuidance(target uint64) {
-	fmt.Println("  Routed to the governance quorum — validators will auto-vote ACCEPT. Track activation with:")
+func printProposeAcceptedGuidance(target uint64, lineageRepair bool) {
+	if lineageRepair {
+		fmt.Println("  Routed to the governance quorum — automatic voting is disabled for lineage repair.")
+		fmt.Println("  Every validator must independently review the manifest and explicitly vote ACCEPT or REJECT.")
+		fmt.Println("  Use CEREBRUM Governance, sage_gov_status + sage_gov_vote, or POST /v1/governance/vote.")
+		fmt.Println("  Track activation with:")
+	} else {
+		fmt.Println("  Routed to the governance quorum — validators will auto-vote ACCEPT. Track activation with:")
+	}
 	fmt.Println("    sage-gui upgrade status")
 	if target < sageabci.MaxSupportedAppVersion() {
 		fmt.Printf("  After it activates, propose the next fork: sage-gui upgrade propose --target %d\n", target+1)

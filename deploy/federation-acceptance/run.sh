@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 COMPOSE="$ROOT/deploy/federation-acceptance/docker-compose.yml"
-STATE=${FED_ACCEPTANCE_STATE:-/tmp/sage-v111717-federation-state}
+STATE=${FED_ACCEPTANCE_STATE:-/tmp/sage-v111800-federation-state}
 MODE=${1:-full}
 PORT_A=${FED_NODE_A_PORT:-28080}
 PORT_B=${FED_NODE_B_PORT:-28081}
@@ -22,11 +22,16 @@ jfield() {
 }
 mcp_call() {
   svc=$1 tool=$2 args=$3
+  case "$svc" in
+    node-a) project=voice-bridge-a ;;
+    node-b) project=voice-bridge-b ;;
+    *) die "unknown MCP acceptance service $svc" ;;
+  esac
   init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fed-acceptance","version":"1"}}}'
   inception='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sage_inception","arguments":{}}}'
   call=$(node -e 'process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:3,method:"tools/call",params:{name:process.argv[1],arguments:JSON.parse(process.argv[2])}}))' "$tool" "$args")
   out=$(printf '%s\n%s\n%s\n' "$init" "$inception" "$call" | dc exec -T \
-    -e SAGE_PROVIDER=mynah -e SAGE_PROJECT=voice-bridge \
+    -e SAGE_PROVIDER=mynah -e SAGE_PROJECT="$project" \
     -e SAGE_IDENTITY_PATH=/root/.sage/agents/mynah/agent.key "$svc" \
     timeout "$MCP_TIMEOUT_SECONDS" sage-gui mcp) ||
     die "MCP tool $tool on $svc failed or exceeded ${MCP_TIMEOUT_SECONDS}s"
@@ -61,13 +66,13 @@ container_ip() {
   docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$(container_id "$1")"
 }
 lan_ip() {
-  docker inspect -f '{{(index .NetworkSettings.Networks "sage-v111717-federation-lan").IPAddress}}' "$(container_id "$1")"
+  docker inspect -f '{{(index .NetworkSettings.Networks "sage-v111800-federation-lan").IPAddress}}' "$(container_id "$1")"
 }
 
 cleanup() {
   dc down --remove-orphans >/dev/null 2>&1 || true
   for cid in $CHURN_IDS; do docker stop "$cid" >/dev/null 2>&1 || true; done
-  docker network rm sage-v111717-federation-lan >/dev/null 2>&1 || true
+  docker network rm sage-v111800-federation-lan >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -100,10 +105,10 @@ wait_health "http://127.0.0.1:$PORT_A"
 wait_health "http://127.0.0.1:$PORT_B"
 
 phase "same-LAN topology"
-docker network inspect sage-v111717-federation-lan >/dev/null 2>&1 || \
-  docker network create --internal sage-v111717-federation-lan >/dev/null
-docker network connect --alias node-a sage-v111717-federation-lan "$(container_id node-a)"
-docker network connect --alias node-b sage-v111717-federation-lan "$(container_id node-b)"
+docker network inspect sage-v111800-federation-lan >/dev/null 2>&1 || \
+  docker network create --internal sage-v111800-federation-lan >/dev/null
+docker network connect --alias node-a sage-v111800-federation-lan "$(container_id node-a)"
+docker network connect --alias node-b sage-v111800-federation-lan "$(container_id node-b)"
 dc exec -T node-a getent hosts node-b >/dev/null
 dc exec -T node-b getent hosts node-a >/dev/null
 
@@ -286,8 +291,8 @@ if [ "$MODE" = full ]; then
 fi
 
 phase "remove LAN; only the relay bridges edge_a and edge_b"
-docker network disconnect sage-v111717-federation-lan "$(container_id node-a)"
-docker network disconnect sage-v111717-federation-lan "$(container_id node-b)"
+docker network disconnect sage-v111800-federation-lan "$(container_id node-a)"
+docker network disconnect sage-v111800-federation-lan "$(container_id node-b)"
 
 phase "restart A, B, then both and require container IP churn"
 for svc in node-a node-b; do
@@ -295,8 +300,8 @@ for svc in node-a node-b; do
   dc stop "$svc" >/dev/null
   dc rm -f "$svc" >/dev/null
   case "$svc" in
-    node-a) edge=sage-v111717-federation-edge-a; control=sage-v111717-federation-control-a ;;
-    node-b) edge=sage-v111717-federation-edge-b; control=sage-v111717-federation-control-b ;;
+    node-a) edge=sage-v111800-federation-edge-a; control=sage-v111800-federation-control-a ;;
+    node-b) edge=sage-v111800-federation-edge-b; control=sage-v111800-federation-control-b ;;
   esac
   # Occupy the just-freed addresses so Docker cannot hand the recreated node
   # the same pair and accidentally skip the stale-address recovery condition.
@@ -356,16 +361,52 @@ elif [ "$MODE" = full ]; then
 fi
 
 if [ -n "${FED_ACCEPTANCE_FLOW_COMMAND:-}" ]; then
-  phase "canonical MCP flow: find -> send -> offline inbox -> read -> reply/status"
+	phase "canonical MCP flow: friendly registered-name send -> reply receipt -> offline inbox -> read -> reply/status"
   sh -c "$FED_ACCEPTANCE_FLOW_COMMAND"
 elif [ "$MODE" = full ]; then
-  phase "canonical MCP flow: find -> send -> offline inbox -> read -> reply/status"
+  phase "canonical MCP flow: friendly registered-name send -> reply receipt -> offline inbox -> read -> reply/status"
   find_args=$(node -e 'process.stdout.write(JSON.stringify({name:"mynah",peer_chain:process.argv[1]}))' "$chain_a")
   found=$(mcp_call node-a sage_find_agent "$find_args")
   target=$(jfield "$found" matches.0.to)
   [ -n "$target" ] || die "sage_find_agent returned no exact remote Mynah target"
+  friendly_target=$(jfield "$found" matches.0.registered_name)
+  [ -n "$friendly_target" ] || die "sage_find_agent returned no immutable registered name"
+  friendly_payload="v11.18 friendly registered-name probe $RUN_TOKEN"
+  friendly_args=$(node -e 'process.stdout.write(JSON.stringify({to:process.argv[1],intent:"acceptance",payload:process.argv[2],idempotency_key:"v1118-friendly-probe-"+process.argv[3]}))' "$friendly_target" "$friendly_payload" "$RUN_TOKEN")
+  friendly_sent=$(mcp_call node-a sage_message_send "$friendly_args")
+  friendly_message_id=$(jfield "$friendly_sent" message_id)
+  [ -n "$friendly_message_id" ] || die "friendly registered-name send returned no canonical message_id"
+  [ "$(jfield "$friendly_sent" destination_chain_id)" = "$chain_a" ] || die "friendly registered-name send did not resolve the expected immutable peer chain"
+  i=0
+  while :; do
+    friendly_inbox=$(mcp_call node-b sage_inbox '{"limit":5}') || true
+    friendly_received_id=$(node "$ROOT/scripts/federation-acceptance-find-inbox-message.mjs" \
+      "$friendly_inbox" acceptance "$friendly_payload" "$agent_a" "$chain_b" 2>/dev/null || true)
+    [ -n "$friendly_received_id" ] && break
+    i=$((i + 1)); [ "$i" -lt 45 ] || die "friendly registered-name message did not reach the exact remote inbox"
+    sleep 2
+  done
+  friendly_reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.18 friendly acceptance reply"}))' "$friendly_received_id")
+  friendly_reply=$(mcp_call node-b sage_message_reply "$friendly_reply_args")
+  reply_event_id=$(jfield "$friendly_reply" reply_event_id)
+  [ -n "$reply_event_id" ] || die "federated reply returned no immutable reply_event_id"
+  reply_status_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1]}))' "$reply_event_id")
+  reply_status=$(mcp_call node-b sage_message_status "$reply_status_args")
+  [ "$(jfield "$reply_status" reply_event_id)" = "$reply_event_id" ] || die "replying agent cannot inspect its own immutable reply event"
+  [ -z "$(jfield "$reply_status" workflow_status 2>/dev/null || true)" ] || die "reply event status leaked original message workflow"
+  friendly_sender_status_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1]}))' "$friendly_message_id")
+  i=0
+  while :; do
+    friendly_sender_status=$(mcp_call node-a sage_message_status "$friendly_sender_status_args") || true
+    friendly_read_status=$(jfield "$friendly_sender_status" read_status 2>/dev/null || true)
+    friendly_workflow_status=$(jfield "$friendly_sender_status" workflow_status 2>/dev/null || true)
+    [ "$friendly_read_status" = confirmed ] && [ "$friendly_workflow_status" = completed ] && break
+    i=$((i + 1)); [ "$i" -lt 45 ] || die "friendly sender status lacks confirmed read and completed reply after retry window (read=$friendly_read_status workflow=$friendly_workflow_status)"
+    sleep 2
+  done
   dc stop node-b >/dev/null
-  send_args=$(node -e 'process.stdout.write(JSON.stringify({to:process.argv[1],intent:"acceptance",payload:"v11.17.17 durable offline inbox probe "+process.argv[2],idempotency_key:"v111717-offline-probe-"+process.argv[2]}))' "$target" "$RUN_TOKEN")
+  offline_payload="v11.18.0 durable offline inbox probe $RUN_TOKEN"
+  send_args=$(node -e 'process.stdout.write(JSON.stringify({to:process.argv[1],intent:"acceptance",payload:process.argv[2],idempotency_key:"v111800-offline-probe-"+process.argv[3]}))' "$target" "$offline_payload" "$RUN_TOKEN")
   send_started=$(date +%s)
   sent=$(mcp_call node-a sage_message_send "$send_args")
   send_elapsed=$(( $(date +%s) - send_started ))
@@ -380,12 +421,13 @@ elif [ "$MODE" = full ]; then
   i=0
   while :; do
     inbox=$(mcp_call node-b sage_inbox '{"limit":5}') || true
-    received_id=$(jfield "$inbox" items.0.message_id 2>/dev/null || true)
+    received_id=$(node "$ROOT/scripts/federation-acceptance-find-inbox-message.mjs" \
+      "$inbox" acceptance "$offline_payload" "$agent_a" "$chain_b" 2>/dev/null || true)
     [ -n "$received_id" ] && break
     i=$((i + 1)); [ "$i" -lt 45 ] || die "offline message did not persist/deliver to restarted inbox"
     sleep 2
   done
-  reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.17.17 acceptance reply"}))' "$received_id")
+  reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.18.0 acceptance reply"}))' "$received_id")
   mcp_call node-b sage_message_reply "$reply_args" >/dev/null
   status_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1]}))' "$message_id")
   i=0

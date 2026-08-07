@@ -37,6 +37,7 @@ func messageRouterAs(s *Server, callerID string, exactProof bool) http.Handler {
 	r.Put("/v1/messages/{message_id}/read", s.handleMessageRead)
 	r.Put("/v1/messages/read-batch", s.handleMessageReadBatch)
 	r.Get("/v1/messages/{message_id}/status", s.handleMessageStatus)
+	r.Get("/v1/messages/replies/{reply_event_id}/status", s.handleMessageReplyStatus)
 	return r
 }
 
