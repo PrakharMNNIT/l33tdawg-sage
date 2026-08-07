@@ -128,17 +128,6 @@ fn main() {
             },
         ))
         .plugin(tauri_plugin_deep_link::init())
-        .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. })
-                && should_exit_on_main_window_close(window.label())
-            {
-                // The native shell is only a view onto the independently
-                // supervised SAGE daemon. Make the main-window lifecycle
-                // explicit: a normal close exits this shell process while the
-                // daemon keeps serving CEREBRUM and MCP clients.
-                window.app_handle().exit(0);
-            }
-        })
         .setup({
             let session = Arc::clone(&session);
             move |app| {
@@ -202,12 +191,14 @@ fn main() {
                 Ok(())
             }
         })
+        // Leave a normal main-window close to Tauri/Wry's native lifecycle.
+        // CloseRequested first permits Windows to destroy WebView2; the
+        // resulting last-window Destroyed event then exits the event loop.
+        // Calling AppHandle::exit from CloseRequested races that teardown and
+        // can leave the installed Windows shell resident indefinitely. The
+        // bundled daemon is a separate process and therefore keeps serving.
         .run(tauri::generate_context!())
         .expect("SAGE native shell runtime failed");
-}
-
-fn should_exit_on_main_window_close(label: &str) -> bool {
-    label == "main"
 }
 
 fn supervise<R: tauri::Runtime>(
@@ -897,13 +888,6 @@ mod tests {
         let state = session.lock().unwrap();
         assert_eq!(state.pending_routes.len(), 1);
         assert_eq!(state.pending_routes.front().unwrap(), "/search/agent-123");
-    }
-
-    #[test]
-    fn normal_main_window_close_exits_only_the_shell() {
-        assert!(should_exit_on_main_window_close("main"));
-        assert!(!should_exit_on_main_window_close("settings"));
-        assert!(!should_exit_on_main_window_close(""));
     }
 
     #[test]
