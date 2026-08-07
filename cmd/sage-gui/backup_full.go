@@ -309,19 +309,20 @@ func resolveRoot(path string) (string, error) {
 // backups directory itself is skipped: archiving prior archives balloons the
 // output and serves no recovery purpose. torn counts files whose size changed
 // mid-read — the most reliable evidence the node was not actually stopped.
-func writeBackupArchive(archivePath string, roots []string, manifest backupManifest) (size int64, torn int, err error) {
-	f, err := os.OpenFile(archivePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return 0, 0, fmt.Errorf("create archive: %w", err)
+func writeBackupArchive(archivePath string, roots []string, manifest backupManifest) (int64, int, error) {
+	torn := 0
+	f, openErr := os.OpenFile(archivePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if openErr != nil {
+		return 0, 0, fmt.Errorf("create archive: %w", openErr)
 	}
 	defer func() { _ = f.Close() }()
 
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
 
-	payload, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return 0, 0, fmt.Errorf("encode manifest: %w", err)
+	payload, marshalErr := json.MarshalIndent(manifest, "", "  ")
+	if marshalErr != nil {
+		return 0, 0, fmt.Errorf("encode manifest: %w", marshalErr)
 	}
 	if err := tw.WriteHeader(&tar.Header{
 		Name: backupManifestName, Mode: 0600,
@@ -351,9 +352,9 @@ func writeBackupArchive(archivePath string, roots []string, manifest backupManif
 	if err := f.Sync(); err != nil {
 		return 0, 0, fmt.Errorf("sync archive: %w", err)
 	}
-	info, err := f.Stat()
-	if err != nil {
-		return 0, 0, fmt.Errorf("stat archive: %w", err)
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return 0, 0, fmt.Errorf("stat archive: %w", statErr)
 	}
 	return info.Size(), torn, nil
 }
@@ -428,8 +429,8 @@ func archiveTree(tw *tar.Writer, root, prefix, skipDir string) (int, error) {
 				return fmt.Errorf("header %s: %w", path, err)
 			}
 			hdr.Name = name
-			if err := tw.WriteHeader(hdr); err != nil {
-				return fmt.Errorf("write header %s: %w", path, err)
+			if headerErr := tw.WriteHeader(hdr); headerErr != nil {
+				return fmt.Errorf("write header %s: %w", path, headerErr)
 			}
 			src, err := os.Open(path) //nolint:gosec // path comes from walking the operator's own SAGE home
 			if err != nil {

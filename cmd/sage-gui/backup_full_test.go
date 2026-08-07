@@ -117,9 +117,9 @@ func TestBackupArchiveSeparatesMultipleRoots(t *testing.T) {
 // A crafted archive must never write outside its restore root.
 func TestExtractBackupArchiveRejectsPathTraversal(t *testing.T) {
 	archive := filepath.Join(t.TempDir(), "evil.tar.gz")
-	f, err := os.Create(archive)
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	f, createErr := os.Create(archive)
+	if createErr != nil {
+		t.Fatalf("create: %v", createErr)
 	}
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
@@ -141,7 +141,7 @@ func TestExtractBackupArchiveRejectsPathTraversal(t *testing.T) {
 	if err := os.MkdirAll(dest, 0700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	err = extractBackupArchive(archive, []string{dest})
+	err := extractBackupArchive(archive, []string{dest})
 	if err == nil {
 		t.Fatal("path-traversal entry was accepted")
 	}
@@ -271,9 +271,9 @@ func TestSplitRootPrefix(t *testing.T) {
 
 func TestReadArchiveManifestRejectsNonBackup(t *testing.T) {
 	archive := filepath.Join(t.TempDir(), "plain.tar.gz")
-	f, err := os.Create(archive)
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	f, createErr := os.Create(archive)
+	if createErr != nil {
+		t.Fatalf("create: %v", createErr)
 	}
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
@@ -366,9 +366,9 @@ func TestBackupRootsFollowsSymlinkedDataDir(t *testing.T) {
 // into an arbitrary write. Reject the symlink itself.
 func TestExtractBackupArchiveRejectsEscapingSymlink(t *testing.T) {
 	archive := filepath.Join(t.TempDir(), "hatch.tar.gz")
-	f, err := os.Create(archive)
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	f, createErr := os.Create(archive)
+	if createErr != nil {
+		t.Fatalf("create: %v", createErr)
 	}
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
@@ -385,7 +385,7 @@ func TestExtractBackupArchiveRejectsEscapingSymlink(t *testing.T) {
 	if err := os.MkdirAll(dest, 0700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	err = extractBackupArchive(archive, []string{dest})
+	err := extractBackupArchive(archive, []string{dest})
 	if err == nil {
 		t.Fatal("escaping symlink entry was accepted")
 	}
@@ -396,9 +396,9 @@ func TestExtractBackupArchiveRejectsEscapingSymlink(t *testing.T) {
 
 func TestExtractBackupArchiveRejectsAbsoluteSymlink(t *testing.T) {
 	archive := filepath.Join(t.TempDir(), "abs.tar.gz")
-	f, err := os.Create(archive)
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	f, createErr := os.Create(archive)
+	if createErr != nil {
+		t.Fatalf("create: %v", createErr)
 	}
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)

@@ -224,7 +224,7 @@ func explainBadgerOpenFailure(badgerPath string, err error) error {
 	return fmt.Errorf("open %s read-only: %w\n\n"+
 		"This does not look like a running node — the database needs recovery before it can\n"+
 		"be read read-only (an unclean shutdown leaves a value log to replay). Start the node\n"+
-		"once so it replays, stop it cleanly, then re-run preflight.", badgerPath, err)
+		"once so it replays, stop it cleanly, then re-run preflight", badgerPath, err)
 }
 
 // reportDirectV23Genesis handles chains born at app-v23, which have no
