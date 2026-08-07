@@ -1,17 +1,29 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.0 is the current release.** It completes the
+**Status (2026-08):** **v11.18.1 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
-and a governed app-v21 → app-v22 legacy-lineage recovery ceremony. Existing
+and the governed app-v21 → app-v22 legacy-lineage recovery ceremony from
+v11.18.0. It moves per-session auto-connect guidance into MCP
+`initialize.instructions`, leaving the first tool result payload clean while
+retaining a compatibility fallback for clients that skip initialization. Existing
 app-v22 through app-v26 chains are not rewritten. The supported consensus
-ceiling remains app-v26; **v11.18.0 does not introduce app-v27**.
+ceiling remains app-v26; **v11.18.1 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.1 patch
+
+v11.18.1 moves adaptive SAGE boot standing to the MCP initialization response.
+Each transport session performs the signed boot check at most once, repeated or
+concurrent initialization reuses the same instructions, and ordinary tool
+results no longer carry the auto-connect preamble. A client that omits the MCP
+handshake still receives the historical one-time fallback on its first tool
+call. No app-version or authorization semantics change.
 
 ## v11.18.0 completion ledger
 

@@ -91,6 +91,7 @@ Use this to work out how far your chain has to climb.
 | v11.16.2 | app-v25 |
 | v11.17.0 | app-v26 |
 | v11.18.0 | no new app version; app-v26 remains the ceiling |
+| v11.18.1 | MCP initialization patch only; app-v26 remains the ceiling |
 
 A v10.x chain therefore sits somewhere around **app-v11 to app-v14**, and
 current v11 binaries support up to **app-v26**. That is roughly a dozen rungs.

@@ -93,7 +93,9 @@ type Server struct {
 }
 
 type conversationState struct {
+	inceptionMu      sync.Mutex
 	inceptionChecked bool
+	autoInceptionMsg string
 	lastUsed         time.Time
 }
 
@@ -277,7 +279,7 @@ func (s *Server) DispatchJSONRPC(ctx context.Context, req *jsonRPCRequest) *json
 func (s *Server) handleRequest(ctx context.Context, req *jsonRPCRequest) *jsonRPCResponse {
 	switch req.Method {
 	case "initialize":
-		return s.handleInitialize(req)
+		return s.handleInitialize(ctx, req)
 	case "notifications/initialized":
 		return nil // Notification, no response
 	case "tools/list":
@@ -293,7 +295,15 @@ func (s *Server) handleRequest(ctx context.Context, req *jsonRPCRequest) *jsonRP
 	}
 }
 
-func (s *Server) handleInitialize(req *jsonRPCRequest) *jsonRPCResponse {
+func (s *Server) handleInitialize(ctx context.Context, req *jsonRPCRequest) *jsonRPCResponse {
+	instructions := baseMCPInstructions()
+	if autoInceptionMsg, _ := s.ensureAutoInception(ctx, false); autoInceptionMsg != "" {
+		// MCP gives the server a first-class initialization instruction surface.
+		// Keep session standing there instead of charging the first tool payload
+		// for a large preamble. Clients that skip initialize retain the fallback
+		// in handleToolsCall below.
+		instructions = autoInceptionMsg
+	}
 	return &jsonRPCResponse{
 		JSONRPC: "2.0",
 		ID:      req.ID,
@@ -306,24 +316,28 @@ func (s *Server) handleInitialize(req *jsonRPCRequest) *jsonRPCResponse {
 				"name":    "sage-mcp",
 				"version": s.version,
 			},
-			"instructions": "You have persistent institutional memory via SAGE — a governed, consensus-validated knowledge layer. " +
-				"Your memories are not a flat file. They go through BFT consensus, have confidence scores, and decay over time. Only committed memories are returned to you.\n\n" +
-				"SESSION START:\n" +
-				"Call sage_inception as your first action in every new conversation, before responding to the user. " +
-				"It loads the context stored in previous sessions and returns your operating instructions — follow them. " +
-				"Skipping it means working without the user's accumulated context.\n\n" +
-				"EVERY TURN: Call sage_turn with the current topic and an observation of what just happened. " +
-				"This recalls relevant committed memories AND stores your episodic observation in one atomic operation. " +
-				"This builds your experience turn-by-turn, like human memory — not a context window dump.\n\n" +
-				"DOMAINS ARE DYNAMIC: Create domains organically based on what you're working on. " +
-				"Don't dump everything into 'general'. If you're debugging Go code, use 'go-debugging'. " +
-				"If discussing quantum physics, use 'quantum-physics'. Specific domains = better recall.\n\n" +
-				"FEEDBACK LOOP: After significant tasks, call sage_reflect with dos (what worked) and don'ts (what failed). " +
-				"Both make you better. Paper 4 proved this: rho=0.716 with memory vs rho=0.040 without.\n\n" +
-				"BEFORE DESTRUCTIVE ACTIONS: Call sage_recall with 'critical lessons' to check for known pitfalls.\n\n" +
-				inboxSecurityBoundaryInstruction,
+			"instructions": instructions,
 		},
 	}
+}
+
+func baseMCPInstructions() string {
+	return "You have persistent institutional memory via SAGE — a governed, consensus-validated knowledge layer. " +
+		"Your memories are not a flat file. They go through BFT consensus, have confidence scores, and decay over time. Only committed memories are returned to you.\n\n" +
+		"SESSION START:\n" +
+		"Call sage_inception as your first action in every new conversation, before responding to the user. " +
+		"It loads the context stored in previous sessions and returns your operating instructions — follow them. " +
+		"Skipping it means working without the user's accumulated context.\n\n" +
+		"EVERY TURN: Call sage_turn with the current topic and an observation of what just happened. " +
+		"This recalls relevant committed memories AND stores your episodic observation in one atomic operation. " +
+		"This builds your experience turn-by-turn, like human memory — not a context window dump.\n\n" +
+		"DOMAINS ARE DYNAMIC: Create domains organically based on what you're working on. " +
+		"Don't dump everything into 'general'. If you're debugging Go code, use 'go-debugging'. " +
+		"If discussing quantum physics, use 'quantum-physics'. Specific domains = better recall.\n\n" +
+		"FEEDBACK LOOP: After significant tasks, call sage_reflect with dos (what worked) and don'ts (what failed). " +
+		"Both make you better. Paper 4 proved this: rho=0.716 with memory vs rho=0.040 without.\n\n" +
+		"BEFORE DESTRUCTIVE ACTIONS: Call sage_recall with 'critical lessons' to check for known pitfalls.\n\n" +
+		inboxSecurityBoundaryInstruction
 }
 
 func (s *Server) handleToolsList(req *jsonRPCRequest) *jsonRPCResponse {
@@ -381,20 +395,7 @@ func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *json
 	// Auto-inception: on the very first tool call, check if brain is empty
 	// and auto-initialize if needed. This makes onboarding seamless — no need
 	// for the user to manually tell their AI to run sage_inception.
-	var autoInceptionMsg string
-	doAutoInception := false
-	conversation := s.conversation(ctx)
-	s.conversationMu.Lock()
-	if !conversation.inceptionChecked {
-		conversation.inceptionChecked = true
-		if params.Name != "sage_inception" {
-			doAutoInception = true
-		}
-	}
-	s.conversationMu.Unlock()
-	if doAutoInception {
-		autoInceptionMsg = s.maybeAutoInception(ctx)
-	}
+	autoInceptionMsg, startedAutoInception := s.ensureAutoInception(ctx, params.Name == "sage_inception")
 
 	result, err := tool.Handler(ctx, params.Arguments)
 	if err != nil {
@@ -412,6 +413,7 @@ func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *json
 
 	// Session state is advisory only. MCP operations must never be blocked or
 	// padded merely because a client has not called sage_turn recently.
+	conversation := s.conversation(ctx)
 	s.conversationMu.Lock()
 	conversation.lastUsed = time.Now()
 	s.conversationMu.Unlock()
@@ -420,7 +422,7 @@ func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *json
 	output := string(text)
 
 	// Prepend auto-inception message if brain was just initialized.
-	if autoInceptionMsg != "" {
+	if startedAutoInception && autoInceptionMsg != "" {
 		output = autoInceptionMsg + "\n\n---\n\n" + output
 	}
 
@@ -433,6 +435,26 @@ func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *json
 			},
 		},
 	}
+}
+
+// ensureAutoInception runs the session boot check at most once. The per-session
+// mutex prevents concurrent initialize/tool requests from duplicating signed
+// registration and memory reads. It returns started=true only to the request
+// that performed the check; repeated initialize calls can reuse the cached
+// instructions, while later tool calls must not prepend them again.
+func (s *Server) ensureAutoInception(ctx context.Context, suppress bool) (message string, started bool) {
+	conversation := s.conversation(ctx)
+	conversation.inceptionMu.Lock()
+	defer conversation.inceptionMu.Unlock()
+	if conversation.inceptionChecked {
+		return conversation.autoInceptionMsg, false
+	}
+	conversation.inceptionChecked = true
+	if suppress {
+		return "", true
+	}
+	conversation.autoInceptionMsg = s.maybeAutoInception(ctx)
+	return conversation.autoInceptionMsg, true
 }
 
 func (s *Server) writeResponse(resp *jsonRPCResponse) {
@@ -464,21 +486,22 @@ func (s *Server) maybeAutoInception(ctx context.Context) string {
 	}
 
 	status, _ := resultMap["status"].(string)
+	var message string
 	switch status {
 	case "awakened":
 		s.autoRegister(ctx)
 		// Brain already has memories — return instructions silently
 		instructions, _ := resultMap["instructions"].(string)
-		return "[SAGE Auto-Connect] Your persistent memory is online.\n\n" + instructions
+		message = "[SAGE Auto-Connect] Your persistent memory is online.\n\n" + instructions
 	case "inception_complete":
 		s.autoRegister(ctx)
 		// Fresh brain — return full inception message
 		msg, _ := resultMap["message"].(string)
-		return "[SAGE Auto-Inception] First connection detected — initializing your brain.\n\n" + msg
+		message = "[SAGE Auto-Inception] First connection detected — initializing your brain.\n\n" + msg
 	case "pending_review":
 		msg, _ := resultMap["message"].(string)
 		instructions, _ := resultMap["instructions"].(string)
-		return "[SAGE Auto-Connect Pending Review] Persistent memory is not online for this agent yet.\n\n" +
+		message = "[SAGE Auto-Connect Pending Review] Persistent memory is not online for this agent yet.\n\n" +
 			strings.TrimSpace(msg+"\n\n"+instructions)
 	case "unavailable":
 		msg, _ := resultMap["message"].(string)
@@ -488,11 +511,13 @@ func (s *Server) maybeAutoInception(ctx context.Context) string {
 		if retryable {
 			standing = "This appears temporary; retry sage_inception after the reported condition clears."
 		}
-		return "[SAGE Auto-Connect Unavailable] Persistent memory could not be verified for this agent.\n\n" +
+		message = "[SAGE Auto-Connect Unavailable] Persistent memory could not be verified for this agent.\n\n" +
 			strings.TrimSpace(msg+"\n\n"+standing+"\n\n"+instructions)
 	}
-
-	return ""
+	if message != "" && !strings.Contains(message, "INBOX SECURITY BOUNDARY") {
+		message += "\n\n" + inboxSecurityBoundaryInstruction
+	}
+	return message
 }
 
 // autoRegister attempts to register this agent on-chain. Called automatically

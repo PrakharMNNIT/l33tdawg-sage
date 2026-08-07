@@ -51,6 +51,24 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.1
+
+**MCP session guidance now uses the protocol surface intended for it.** SAGE
+runs its per-session boot standing during `initialize` and returns the adaptive
+full, bookend, on-demand, pending-review, or unavailable guidance through
+`initialize.instructions`. The first real tool result is therefore only that
+tool's payload instead of being prefixed with a 1.5–2.9 KB auto-connect block.
+Repeated or concurrent initialization in one transport session reuses the same
+standing without duplicating signed registration or caller-scoped reads.
+Clients that skip the MCP initialization handshake keep the one-time first-tool
+fallback for compatibility.
+
+This is an MCP transport/ergonomics patch only. It does not change memory,
+agent, RBAC, federation, governance, or consensus semantics; **app-v26 remains
+the binary ceiling and v11.18.1 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.1`. SDK 11.18.1.
+
 ## What's New in v11.18.0
 
 **A connected pair is now the federation group users expect it to be.** Each
@@ -1435,7 +1453,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.0`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.1`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

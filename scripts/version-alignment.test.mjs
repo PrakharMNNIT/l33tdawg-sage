@@ -49,7 +49,7 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/reference/app-v23-access-control-design.md', `SAGE v${version}`],
     ['docs/reference/upgrade-lineage-repair.md', `SAGE v${version}`],
     ['docs/ADMIN_BOOTSTRAP.md', `Reconciled through SAGE v${version}/app-v26`],
-    ['docs/UPGRADING.md', `The recovery commands in this guide require SAGE v${version} or later.`],
+    ['docs/UPGRADING.md', 'The recovery commands in this guide require SAGE v11.18.0 or later.'],
     ['docs/UPGRADING.md', '`backup --full`, `restore --from`,'],
     ['docs/UPGRADING.md', '`upgrade lineage status|doctor|verify`'],
     ['deploy/federation-acceptance/Dockerfile.node', `ARG VERSION=v${version}-acceptance`],
@@ -70,7 +70,7 @@ test('release-facing version metadata stays aligned', () => {
   }
 });
 
-test('v11.18.0 user, recovery, federation, and SDK guides stay aligned', () => {
+test('v11.18 user, recovery, federation, and SDK guides stay aligned', () => {
   const architecture = read('docs/ARCHITECTURE.md');
   const roadmap = read('docs/ROADMAP.md');
   const gettingStarted = read('docs/GETTING_STARTED.md');
@@ -84,6 +84,7 @@ test('v11.18.0 user, recovery, federation, and SDK guides stay aligned', () => {
   assert.match(read('internal/mcp/tools.go'), /Canonical Messages remain durable and queryable/);
   assert.doesNotMatch(read('internal/mcp/tools.go'), /History is retained only for the normal transient message window/);
   assert.match(roadmap, /v11\.18\.0 completion ledger/);
+  assert.match(roadmap, /v11\.18\.1 patch/);
   assert.match(roadmap, /does not introduce app-v27/);
   assert.match(read('README.md'), /`reply_event_id`/);
   assert.match(read('README.md'), /\*\*Agents\*\*,\s+\*\*Groups\*\*, and \*\*Federation\*\* tabs/);
