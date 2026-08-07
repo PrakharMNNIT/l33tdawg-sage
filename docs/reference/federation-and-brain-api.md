@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.17.15 code (2026-08-06). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
+<!-- Verified against SAGE v11.17.16 code (2026-08-07). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
 
 # SAGE Federation and Brain HTTP API Reference (v11)
 
@@ -334,6 +334,19 @@ atomically paired with its durable return outbox event before the peer is
 acknowledged (`internal/store/pipeline_transport.go:126-189`, `:256-326`;
 `api/rest/pipe_handler.go:538-640`).
 
+### `POST /fed/v1/query/available`
+
+Authenticated, bounded preflight for caller-facing read discovery. The request
+contains one exact `agent_id` and at most 128 exact `domain_tags`. The serving
+peer validates the active agreement generation and app-v23 binding, then runs
+each candidate through its authoritative Read policy and the same exact
+linked-reader, Access Group, domain-ownership, and caller-eligibility gates used
+by query planning. The response repeats the protocol/source/destination/agent
+binding and returns only `readable_domains`, which must be a subset of the
+request. It issues no recall challenge and discloses no memory, group, or
+principal metadata. Capability `federated-query-availability-v1` advertises
+support (`internal/federation/server.go`; `internal/federation/client.go`).
+
 ### `POST /fed/v1/query`
 
 Live read-only recall served to an authenticated peer
@@ -568,7 +581,7 @@ caller-filtered.
 | `GET /v1/federation/cross` | `handleCrossFedList` (`federation_handler.go`) | Pre-v23 exact operator; app-v23 current local Root/Admin | List on-chain agreements (reads chain state directly; works without the transport wired). |
 | `POST /v1/federation/cross/{chain_id}/revoke` | `handleCrossFedRevoke` (`federation_handler.go`) | Pre-v23 exact operator; app-v23 current local Root/Admin + on-chain authz | Best-effort notify the exact active peer, then broadcast local tx-34 and purge the connection generation. |
 | `GET /v1/federation/cross/{chain_id}/status` | `handleCrossFedPeerStatus` (`federation_handler.go`) | Pre-v23 exact operator; app-v23 current local Root/Admin | Live reachability preflight against the peer's `/fed/v1/status`. |
-| `GET /v1/federation/available` | `handleFederationAvailable` | Registered Ed25519 caller | Probe at most 64 active peers with at most eight concurrent workers and return only the remote read/copy subtrees, contacts, and saved-copy summary intersecting this caller's local ACL. Optional `agent_name` and `agent_limit` (default 20, 1–20) use compact status preflight plus a bounded remote substring contact lookup; that named form returns only the peer label and matching contacts, not general policy, capabilities, subtree, or sync metadata. App-v22 `DenyFederatedPipe` suppresses contacts from the general form and makes the named form return empty before probing peers. Never returns endpoints, CA pins, agreement generations, secrets, or mutation controls. |
+| `GET /v1/federation/available` | `handleFederationAvailable` | Registered Ed25519 caller | Probe a bounded page of active peers and return caller-filtered contacts, copy state, and live read authorization. `read_candidate_domains` are policy intersections only; `shared_read_domains` additionally passed the destination's exact linked-reader and access-group gates. Optional `agent_name` and `agent_limit` (default 20, 1–20) use compact status preflight plus a bounded remote substring contact lookup; that named form returns only the peer label and matching contacts, not general policy, capabilities, subtree, or sync metadata. App-v22 `DenyFederatedPipe` suppresses contacts from the general form and makes the named form return empty before probing peers. Never returns endpoints, CA pins, agreement generations, secrets, or mutation controls. |
 | `POST /v1/federation/contacts/authorize` | `handleFederatedContactAuthorize` | Registered Ed25519 caller | Local-only reauthorization of supplied chain/domain contact pairs. Returns only input pairs whose agreement remains active/unexpired and whose domain is still readable by this caller; it neither probes a peer nor discloses contacts. |
 | `POST /v1/federation/cross/{chain_id}/write` | `handleCrossFedWrite` (`api/rest/federation_write_handler.go`) | Ed25519 + pre-v23 exact operator or app-v23 current local Root/Admin | Reserved compatibility surface. After authority and chain-id validation it returns `501` before parsing an inner credential or dialing a peer. |
 | `GET/PUT /v1/federation/cross/{chain_id}/sync` | `handleSyncDomainsGet/Set` (`api/rest/federation_handler.go`) | Ed25519 + pre-v23 exact operator or app-v23 current local Root/Admin | Read or replace local v3 Publish/Subscribe lanes; true legacy links retain their `domains` contract. |
@@ -608,8 +621,16 @@ single four-second request window. An unavailable peer is omitted for ordinary
 callers because no current authenticated grant exists to filter. Read scopes
 use the same dotted-subtree semantics as memory ACLs; a local parent grant
 covers a remote child, while a remote parent is narrowed to an explicitly
-allowed local child. Copy status exposes only authorized subscribed domains,
-saved-copy counts, and reconcile health.
+allowed local child. The broker reports that intersection as
+`read_candidate_domains`, then asks a peer advertising
+`federated-query-availability-v1` to evaluate each exact candidate through the
+same peer-policy, linked-reader, and access-group checks used by federated
+recall. Only the returned subset becomes `shared_read_domains` and retains
+`remote_permissions[].read=true`. `read_authorization` is `verified`,
+`unsupported`, `unavailable`, or `partial`; clients must not present candidates
+as readable unless verification completed. This availability check issues no
+recall challenge and returns no memory metadata. Copy status exposes only
+authorized subscribed domains, saved-copy counts, and reconcile health.
 
 `POST /v1/federation/contacts/authorize` accepts
 `{"contacts":[{"remote_chain_id":"chain-a","domain":"example.scope"}]}`

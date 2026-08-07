@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.15 is the current release.** This corrective release makes blank writable-agent approvals atomically generate a readable name-based home domain with a cryptographically random suffix. It also completes confirmed multi-domain recovery across the existing governance cooldown on idle personal chains, repairs the honest idle-clock proof race without relaxing consensus validation, moves first-approval identities into Agents, adds an exact-identity From federation directory, and hardens Tauri AppImage helper acquisition. Governed app-v26 remains unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
+**Status (2026-08):** **v11.17.16 is the current release.** This corrective release makes caller-facing federation discovery distinguish peer-policy candidates from domains that the destination has live-verified against the exact linked-reader relation. It preserves v11.17.15's writable-agent approval, governed bulk recovery, agent directory, messaging, and packaging corrections. Governed app-v26 and consensus remain unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -53,6 +53,13 @@ inbox to enabled, while an existing policy block stays visible in Federation
 with a deep link to the exact agent setting. It also generates a unique
 name-based home domain when a writable pending-agent approval leaves that field
 blank. v11.17.13 and the superseded v11.17.14 tag were not published.
+
+v11.17.16 closes the discovery-versus-recall authorization gap exposed by the
+physical Mynah pair. The peer Read catalog and local caller policy now form an
+explicit candidate list only. A bounded authenticated destination probe applies
+the live linked-reader, group, ownership, agreement-generation and peer-policy
+gates without issuing recall challenges; only its returned subset is advertised
+as readable. Mixed-version peers stay connected but mark candidates unverified.
 
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:

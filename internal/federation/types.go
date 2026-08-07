@@ -290,10 +290,30 @@ const (
 	FederationProtocolV23       = 23
 	CapabilityFederationV23     = "federation-v23"
 	CapabilityQueryAgentProofV2 = "federated-query-agent-proof-v2"
+	// CapabilityQueryAvailabilityV1 advertises the bounded, non-mutating
+	// linked-reader check used by caller-facing federation discovery. Peer Read
+	// policy alone is only a candidate scope; this route proves the exact remote
+	// agent currently has an active guest link before SAGE labels it readable.
+	CapabilityQueryAvailabilityV1 = "federated-query-availability-v1"
 	// CapabilityFederatedGuestAgentEligibility advertises the bounded exact-ID
 	// oracle used before a peer may create or rebind a linked-reader row.
 	CapabilityFederatedGuestAgentEligibility = "federated-guest-agent-eligibility-v1"
 )
+
+const MaxQueryAvailabilityDomains = 128
+
+type QueryAvailabilityRequest struct {
+	AgentID    string   `json:"agent_id"`
+	DomainTags []string `json:"domain_tags"`
+}
+
+type QueryAvailabilityResponse struct {
+	ProtocolVersion    int      `json:"protocol_version"`
+	SourceChainID      string   `json:"source_chain_id"`
+	DestinationChainID string   `json:"destination_chain_id"`
+	AgentID            string   `json:"agent_id"`
+	ReadableDomains    []string `json:"readable_domains"`
+}
 
 // FederatedGuestAgentEligibilityRequest asks an authenticated peer about one
 // exact consensus identity. It is deliberately not a directory or prefix

@@ -237,6 +237,27 @@ func TestMCPOrdinaryAgentFederatedRecallTwoNodesEndToEnd(t *testing.T) {
 	assert.Equal(t, "federated_live", memories[0]["source_kind"])
 	assert.Equal(t, "external_untrusted", memories[0]["trust"])
 
+	unlinkedPub, unlinkedKey, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	unlinkedID := auth.PublicKeyToAgentID(unlinkedPub)
+	require.NoError(t, nodeB.badger.RegisterAgent(unlinkedID, "unlinked-b", "member", "", "codex", "", 1))
+	require.NoError(t, nodeB.badger.SetAgentPermission(unlinkedID, 1,
+		`[{"domain":"sage-autoresearch-benchmark","read":true}]`, "*", "", ""))
+	unlinkedMCP := NewServer(bHTTP.URL, unlinkedKey)
+	unlinkedDiscovery, err := unlinkedMCP.toolFederation(context.Background(), nil)
+	require.NoError(t, err)
+	unlinkedConnections := unlinkedDiscovery.(map[string]any)["connections"].([]map[string]any)
+	require.Len(t, unlinkedConnections, 1)
+	assert.Equal(t, []any{benchmarkDomain}, unlinkedConnections[0]["read_candidate_domains"])
+	assert.Empty(t, unlinkedConnections[0]["shared_read_domains"],
+		"peer policy without an exact linked-reader row is not readable")
+	assert.Equal(t, "verified", unlinkedConnections[0]["read_authorization"])
+	_, err = unlinkedMCP.toolRecall(context.Background(), map[string]any{
+		"query": "benchmark federation", "domain": benchmarkDomain, "scope": "auto",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no authorized v23 federation destination")
+
 	deniedPub, deniedKey, err := auth.GenerateKeypair()
 	require.NoError(t, err)
 	deniedID := auth.PublicKeyToAgentID(deniedPub)

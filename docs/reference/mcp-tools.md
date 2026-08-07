@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.17.15.
+Reconciled against internal/mcp for SAGE v11.17.16.
 
 # SAGE MCP Tools Reference
 
@@ -401,7 +401,7 @@ mode as the primary in-session recall mechanism.
 ### sage_federation
 
 **Purpose:** Read-only discovery of connected SAGEs and the remote capabilities
-they currently expose to this SAGE.
+they currently expose to this exact signed caller.
 
 **Source:** `internal/mcp/tools.go` (`registerTools` entry `sage_federation`; `Server.toolFederation`).
 
@@ -413,8 +413,18 @@ bounded caller-authorized peer page and never walks every connected node automat
 - `connections`: active, reachable SAGEs whose authenticated remote grant
   intersects this caller's local read subtrees; includes `remote_chain_id`,
   `network_name`, capabilities, and normalized `remote_permissions`.
-- `shared_read_domains`: exact domains eligible for `sage_recall` with
-  `federated=true`.
+- `read_candidate_domains`: the intersection of the peer operator's Read
+  policy and the local caller's domain policy. Candidates are not readable by
+  themselves; app-v23 also requires an exact active linked-reader relation on
+  the destination.
+- `shared_read_domains`: the candidate subset that the destination has
+  live-verified against the exact linked-reader row, agreement generation,
+  group membership, domain ownership and peer policy. Only these domains are
+  eligible for `sage_recall` with `federated=true`.
+- `read_authorization` / `read_authorization_complete`: whether the live check
+  was `verified`, unsupported by an older peer, temporarily unavailable, or
+  partial because the bounded candidate limit was reached. An unverified
+  candidate must never be presented as readable.
 - `copy_offered_domains`: exact domains this node may independently subscribe
   to retain.
 - `remote_agents`: authenticated peer-scoped agent contacts when the peer
@@ -425,10 +435,12 @@ bounded caller-authorized peer page and never walks every connected node automat
   remains, the caller/query-bound short-lived continuation. The token exposes
   no peer ID or hidden agreement count.
 
-The REST broker probes one caller-authorized page concurrently under a shared timeout,
-then filters the authenticated disclosures for the signed caller. It does not
-change trust, permissions, subscriptions, or contacts; those routes remain
-exact-node-operator-only.
+The REST broker probes one caller-authorized page concurrently under a shared
+timeout, then applies a bounded, non-mutating destination check to each
+candidate set. That check issues no recall challenge and returns only the exact
+readable subset; it never discloses groups or linked-reader topology. The
+broker does not change trust, permissions, subscriptions, or contacts; those
+routes remain exact-node-operator-only.
 
 **REST:** `GET /v1/federation/available`.
 

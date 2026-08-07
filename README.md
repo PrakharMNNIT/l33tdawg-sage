@@ -51,6 +51,27 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.17.16
+
+**Federated domain discovery now reports effective authority, not intent.**
+`sage_federation` no longer labels the intersection of two policy catalogs as
+readable before the destination has checked the exact requesting agent. A new
+bounded, authenticated, non-mutating availability probe applies the same live
+agreement generation, peer policy, linked-reader row, Access Group membership,
+domain ownership, and classification gates used by recall planning. Only that
+verified subset appears in `shared_read_domains`; policy-only intersections are
+reported separately as `read_candidate_domains` with an explicit authorization
+status. Older or temporarily unavailable peers therefore fail honestly instead
+of inviting an agent to issue a recall that can only return 403.
+
+This is an off-consensus protocol and projection correction. It changes no
+transaction codec, AppHash input, fork target, key format, memory, domain,
+linked-reader row, or existing agreement. Both SAGEs must run v11.17.16 to use
+the exact availability probe; mixed-version pairs remain connected and mark
+the read candidates unverified.
+
+Container: `ghcr.io/l33tdawg/sage:11.17.16`. SDK 11.17.16.
+
 ## What's New in v11.17.15
 
 **Blank home-domain approval now does what the form promises.** When an
@@ -1378,7 +1399,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.15`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.17.16`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

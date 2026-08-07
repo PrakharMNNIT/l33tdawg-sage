@@ -394,6 +394,56 @@ func (m *Manager) QueryPeer(ctx context.Context, remoteChainID string, qr *Query
 	return &out, nil
 }
 
+// AvailableRecallDomains asks one authenticated peer to apply its exact live
+// linked-reader gates to a bounded candidate set. Unlike PlanRecall this does
+// not issue challenges and is safe for directory/discovery projections.
+func (m *Manager) AvailableRecallDomains(
+	ctx context.Context, remoteChainID, agentID string, domains []string,
+) ([]string, error) {
+	if len(domains) > MaxQueryAvailabilityDomains {
+		return nil, fmt.Errorf("query availability exceeds %d domains", MaxQueryAvailabilityDomains)
+	}
+	agreement, err := m.ActiveAgreement(remoteChainID)
+	if err != nil {
+		return nil, err
+	}
+	body, status, err := m.doPeerRequest(ctx, agreement, http.MethodPost,
+		"/fed/v1/query/available", &QueryAvailabilityRequest{
+			AgentID: agentID, DomainTags: domains,
+		})
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("peer returned %d: %s", status, truncate(body, 200))
+	}
+	var response QueryAvailabilityResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("decode query availability: %w", err)
+	}
+	if response.ProtocolVersion != FederationProtocolV23 ||
+		response.SourceChainID != m.localChainID ||
+		response.DestinationChainID != remoteChainID || response.AgentID != agentID {
+		return nil, errors.New("peer returned mismatched query availability")
+	}
+	allowedCandidates := make(map[string]struct{}, len(domains))
+	for _, domain := range domains {
+		allowedCandidates[domain] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(response.ReadableDomains))
+	for _, domain := range response.ReadableDomains {
+		if _, ok := allowedCandidates[domain]; !ok {
+			return nil, errors.New("peer returned query availability outside the candidate set")
+		}
+		if _, duplicate := seen[domain]; duplicate {
+			return nil, errors.New("peer returned duplicate query availability domain")
+		}
+		seen[domain] = struct{}{}
+	}
+	sort.Strings(response.ReadableDomains)
+	return response.ReadableDomains, nil
+}
+
 // PlanRecall expands wildcard targets to an exact finite set and obtains one
 // authenticated, durable destination challenge per peer. The returned maps are
 // designed to be copied verbatim into the original agent-signed recall body.

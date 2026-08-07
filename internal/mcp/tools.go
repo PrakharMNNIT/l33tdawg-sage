@@ -78,7 +78,7 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_federation": {
 			Name:        "sage_federation",
-			Description: "Discover the connected SAGEs, remote domains, agents, and copy status this caller is authorized to consume. Read-only and caller-filtered; pairing, sharing, subscriptions, and other mutations remain operator-only.",
+			Description: "Discover connected SAGEs, remote agents, copy offers, and this caller's domain authorization. shared_read_domains passed the live peer-policy and exact linked-reader gates and are eligible for federated recall. read_candidate_domains are policy intersections only; inspect read_authorization before treating them as readable. Read-only and caller-filtered; pairing, sharing, subscriptions, and other mutations remain operator-only.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

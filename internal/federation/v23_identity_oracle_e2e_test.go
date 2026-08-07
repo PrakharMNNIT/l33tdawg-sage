@@ -192,6 +192,12 @@ func TestV23FederatedGuestIdentityOracleOverTwoSAGEMTLS(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	available, err := source.mgr.AvailableRecallDomains(
+		ctx, destination.chainID, agentXID, []string{domain},
+	)
+	if err != nil || len(available) != 1 || available[0] != domain {
+		t.Fatalf("linked agent availability = %v err=%v, want [%s]", available, err, domain)
+	}
 	for _, denied := range []struct {
 		name string
 		id   string
@@ -200,6 +206,17 @@ func TestV23FederatedGuestIdentityOracleOverTwoSAGEMTLS(t *testing.T) {
 		{name: "unlinked agent Y", id: agentYID, key: agentYKey},
 		{name: "source peer operator", id: operatorID, key: source.agentKey},
 	} {
+		t.Run(denied.name+" is absent from read availability", func(t *testing.T) {
+			available, availabilityErr := source.mgr.AvailableRecallDomains(
+				ctx, destination.chainID, denied.id, []string{domain},
+			)
+			if availabilityErr != nil {
+				t.Fatal(availabilityErr)
+			}
+			if len(available) != 0 {
+				t.Fatalf("unlinked identity received readable domains: %v", available)
+			}
+		})
 		t.Run(denied.name+" plan is denied remotely", func(t *testing.T) {
 			plan, planErr := source.mgr.PlanRecall(
 				ctx, []string{destination.chainID}, denied.id, domain,
