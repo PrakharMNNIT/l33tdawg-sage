@@ -1416,6 +1416,14 @@ not an unauthenticated MCP endpoint.
 
 ### Upgrading from an older version?
 
+**Upgrading an existing node — including the v10.x → v11 jump — is
+[docs/UPGRADING.md](docs/UPGRADING.md).** Short version: install the new binary,
+stop the node, `sage-gui backup --full`, `sage-gui upgrade preflight`, then start
+it. (The binary comes first because it is what provides those two commands.)
+Your chain advances in place; a personal node climbs the consensus fork ladder by
+itself. Read the guide before a multi-admin chain crosses app-v23 — that
+activation re-derives administrator authority.
+
 If you installed SAGE before v5.0 and your AI isn't doing turn-by-turn memory updates, re-run the installer in your project directory:
 
 ```bash
@@ -1433,6 +1441,7 @@ This installs Claude Code hooks that enforce the memory lifecycle (boot, turn, r
 |-----|-------------|
 | [Architecture & Deployment](docs/ARCHITECTURE.md) | Multi-agent networks, BFT, RBAC, federation, API reference |
 | [Getting Started](docs/GETTING_STARTED.md) | Setup walkthrough, embedding providers, multi-agent network guide |
+| [Upgrading](docs/UPGRADING.md) | Moving an existing node to a new release, including v10.x → v11: backup, preflight, the app-version ladder, and what app-v23 does to your admins |
 | [Security FAQ](SECURITY_FAQ.md) | Threat model, encryption, auth, signature scheme |
 | [Connect Your AI](https://l33tdawg.github.io/sage/connect.html) | Interactive setup wizard for any provider |
 

@@ -42,6 +42,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 
 | You want to… | Go to |
 |--------------|-------|
+| Upgrade an existing node to a newer release (incl. v10.x → v11) | [`../UPGRADING.md`](../UPGRADING.md) — backup, `upgrade preflight`, the app-version ladder, app-v23 admin migration |
 | Boot your memory at conversation start | **Boot sequence** below, then [`mcp-tools.md`](mcp-tools.md) |
 | Submit a memory with a clearance level | [`python-sdk.md`](python-sdk.md) `propose()` / [`rest-api.md`](rest-api.md) `POST /v1/memory/submit` |
 | Understand why another agent can't see your memory | [`concepts/clearance-classification.md`](concepts/clearance-classification.md) + [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) |
