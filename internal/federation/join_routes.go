@@ -51,10 +51,20 @@ const (
 	// guestDraftTTL bounds how long a guest keeps the scanned seed in memory
 	// between the QR scan and its tx-33.
 	guestDraftTTL = 15 * time.Minute
-	// joinCAFetchTimeout / joinCallTimeout bound the guest's outbound ceremony
-	// calls to the host.
-	joinCAFetchTimeout = 15 * time.Second
-	joinCallTimeout    = 20 * time.Second
+	// joinCADiscoveryTimeout is the hard safety ceiling for the operator-driven
+	// CA discovery step. The dashboard supplies the same five-minute budget;
+	// deriving from the caller here means client cancellation and any earlier
+	// session deadline still win. Later ceremony calls deliberately retain their
+	// much smaller request budget.
+	joinCADiscoveryTimeout = 5 * time.Minute
+	joinCallTimeout        = 20 * time.Second
+
+	// Internet JOIN discovery retries only the exact, QR-attested route bundle.
+	// A candidate gets enough time for libp2p relay setup, while exponential
+	// backoff bounds repeated offline-peer attempts over the discovery window.
+	joinRouteAttemptTimeout = 10 * time.Second
+	joinRouteRetryInitial   = 1 * time.Second
+	joinRouteRetryMax       = 15 * time.Second
 )
 
 // joinP2POnlyEndpoint is transcript material for an Internet ceremony that has
@@ -1936,7 +1946,7 @@ func (m *Manager) fetchHostCA(ctx context.Context, hostEndpoint, sessionID strin
 		return nil, "", err
 	}
 	u += "?session_id=" + url.QueryEscape(sessionID)
-	reqCtx, cancel := context.WithTimeout(ctx, joinCAFetchTimeout)
+	reqCtx, cancel := context.WithTimeout(ctx, joinCADiscoveryTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
@@ -2104,33 +2114,64 @@ func joinP2PHTTPTransport(tlsCfg *tls.Config, dial func(context.Context, string)
 	return &http.Transport{
 		TLSClientConfig: tlsCfg,
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			attempts := make([]routeDialAttempt, 0, len(exact))
-			for _, target := range exact {
-				target := target
-				delay := time.Duration(0)
-				if routeKindForTarget(target) == RouteKindRelay {
-					delay = routeCandidateDelay
+			retryDelay := joinRouteRetryInitial
+			var lastErr error
+			for {
+				attempts := make([]routeDialAttempt, 0, len(exact))
+				for _, target := range exact {
+					target := target
+					delay := time.Duration(0)
+					if routeKindForTarget(target) == RouteKindRelay {
+						delay = routeCandidateDelay
+					}
+					attempts = append(attempts, routeDialAttempt{
+						delay: delay,
+						dial: func(attemptCtx context.Context) (PeerRouteDialResult, error) {
+							candidateCtx, cancel := context.WithTimeout(attemptCtx, joinRouteAttemptTimeout)
+							defer cancel()
+							start := time.Now()
+							conn, err := dial(candidateCtx, target)
+							return authenticate(candidateCtx, PeerRouteDialResult{
+								Conn: conn, Kind: routeKindForTarget(target),
+								Target: target, Latency: time.Since(start),
+							}, err)
+						},
+					})
 				}
-				attempts = append(attempts, routeDialAttempt{
-					delay: delay,
-					dial: func(attemptCtx context.Context) (PeerRouteDialResult, error) {
-						candidateCtx, cancel := context.WithTimeout(attemptCtx, 2*time.Second)
-						defer cancel()
-						start := time.Now()
-						conn, err := dial(candidateCtx, target)
-						return authenticate(candidateCtx, PeerRouteDialResult{
-							Conn: conn, Kind: routeKindForTarget(target),
-							Target: target, Latency: time.Since(start),
-						}, err)
-					},
-				})
+				winner, err := raceRouteDials(ctx, attempts)
+				if err == nil {
+					return winner.Conn, nil
+				}
+				lastErr = err
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("join p2p discovery stopped: %w (last route error: %v)", ctx.Err(), lastErr)
+				}
+				// A pin, certificate, or TLS identity failure is not an availability
+				// event. Retrying it would weaken fail-closed behavior and could hide
+				// a route substitution attempt behind a later candidate.
+				if isSecurityTransportError(err) {
+					return nil, fmt.Errorf("join p2p target authentication failed: %w", err)
+				}
+				if err := waitJoinRouteRetry(ctx, retryDelay); err != nil {
+					return nil, fmt.Errorf("join p2p discovery stopped: %w (last route error: %v)", err, lastErr)
+				}
+				retryDelay *= 2
+				if retryDelay > joinRouteRetryMax {
+					retryDelay = joinRouteRetryMax
+				}
 			}
-			winner, err := raceRouteDials(ctx, attempts)
-			if err != nil {
-				return nil, fmt.Errorf("join p2p targets unreachable: %w", err)
-			}
-			return winner.Conn, nil
 		},
+	}
+}
+
+func waitJoinRouteRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

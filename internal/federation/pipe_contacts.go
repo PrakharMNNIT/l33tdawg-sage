@@ -472,7 +472,8 @@ func (m *Manager) buildPipeContactLookupGrant(ctx context.Context, peer *peerIde
 		if err == nil {
 			filtered := agents[:0]
 			for _, agent := range agents {
-				if agent != nil && strings.EqualFold(pipeContactAgentDisplayName(agent), req.Target) {
+				if agent != nil && (strings.EqualFold(pipeContactAgentDisplayName(agent), req.Target) ||
+					strings.EqualFold(agent.RegisteredName, req.Target)) {
 					filtered = append(filtered, agent)
 				}
 			}

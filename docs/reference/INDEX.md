@@ -1,4 +1,4 @@
-<!-- Reference index reconciled for SAGE v11.17.17. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
+<!-- Reference index reconciled for SAGE v11.18.0. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
 
 
 # SAGE Reference — Agent Integration Index
@@ -33,7 +33,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | [`concepts/block-production-and-idle.md`](concepts/block-production-and-idle.md) | Why an idle chain mints **no** blocks (SAGE has no heartbeat), when a block *is* minted, and how to tell healthy-idle from actually-stuck. Read this before alarming on a frozen block height. |
 | [`concepts/voter-operations.md`](concepts/voter-operations.md) | How `proposed` memories become `committed` (the per-node auto-voter), how to *guarantee* auto-commit (`--require-voter` / `voter:` config), the stuck-memory alarm + triage, key safety, and the honest REST-vote caveat. |
 | [`concepts/content-validation-gate.md`](concepts/content-validation-gate.md) | The optional Layer-2 content-validation gate (`outcome_class`-keyed reject hook) and the deployment **arming seam** — both the stateless `contentvalidator.SetProvider` and the context-aware `SetProviderWithContext` (exposes the on-chain `RoleResolver` for signer-authority checks) — enabling it without patching the cmd entrypoints. |
-| [`federation-and-brain-api.md`](federation-and-brain-api.md) | The v11 HTTP surface: trust-only JOIN over direct HTTPS or libp2p relay/NAT traversal, independent per-peer Read/Copy grants over existing domains, receiver-controlled Copy subscriptions, authenticated domain-owner agent contacts, and the existing pipeline extended across federation through `/fed/v1/pipe/event`. Transport, peer policy, contacts, and pipeline work are off-consensus; tx-33/34 preserves agreement compatibility. The Write field/route remains reserved and fails closed. |
+| [`federation-and-brain-api.md`](federation-and-brain-api.md) | The v11 HTTP surface: trust-only JOIN over direct HTTPS or libp2p relay/NAT traversal; explicit pairwise agent exports with default borrowed Read of their owned trees and receiver-side narrowing; independent manual Read/Copy grants; receiver-controlled Copy subscriptions; authenticated agent messaging; and `/fed/v1/pipe/event`. Transport, peer policy, contacts, and pipeline work are off-consensus; tx-33/34 preserves agreement compatibility. The Write field/route remains reserved and fails closed. |
 | [`reranker-and-setup.md`](reranker-and-setup.md) | The v11 local-engine and setup surface: create-or-join/private-or-shared onboarding, Synaptic Ledger recovery acknowledgement, portable memory-backup boundaries, recall-tuning clamps, managed semantic memory setup (`/v1/dashboard/embeddings/*`, pinned Ollama runtime + readiness-gated model pull), the reranker config endpoint (`kind` field + verify-on-enable), the managed llama.cpp sidecar (`/v1/dashboard/reranker/setup/*`, pinned assets + sha256 + adopt-not-respawn), the TEI vs llama.cpp rerank dialects, and `embedding_provider` stamped at insert. Mostly off-consensus; imported memories re-enter the normal consensus lifecycle. |
 
 ---
@@ -42,7 +42,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 
 | You want to… | Go to |
 |--------------|-------|
-| Upgrade an existing node to a newer release (incl. v10.x → v11) | [`../UPGRADING.md`](../UPGRADING.md) — backup, `upgrade preflight`, the app-version ladder, app-v23 admin migration |
+| Upgrade an existing node to a newer release (incl. v10.x → v11) | [`../UPGRADING.md`](../UPGRADING.md) — v11.18.0 minimum, full backup/restore, preflight, the app-version ladder, governed legacy-lineage recovery, and app-v23 admin migration |
 | Boot your memory at conversation start | **Boot sequence** below, then [`mcp-tools.md`](mcp-tools.md) |
 | Submit a memory with a clearance level | [`python-sdk.md`](python-sdk.md) `propose()` / [`rest-api.md`](rest-api.md) `POST /v1/memory/submit` |
 | Understand why another agent can't see your memory | [`concepts/clearance-classification.md`](concepts/clearance-classification.md) + [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) |
@@ -51,7 +51,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | Know if a memory will decay | [`concepts/memory-lifecycle.md`](concepts/memory-lifecycle.md) |
 | Understand why your chain's block height isn't moving | [`concepts/block-production-and-idle.md`](concepts/block-production-and-idle.md) |
 | Make sure submitted memories actually get committed (not stuck at `proposed`) | [`concepts/voter-operations.md`](concepts/voter-operations.md) |
-| Pair two SAGE nodes, then change which existing domains they share without re-pairing | [`federation-and-brain-api.md`](federation-and-brain-api.md) — “Trust and directional peer RBAC” |
+| Pair two SAGE nodes, export participating agents for default borrowed Read, or change manual Read/Copy without re-pairing | [`federation-and-brain-api.md`](federation-and-brain-api.md) — “Trust and directional peer RBAC” |
 | Send agent work to a visible shared-domain recipient on another federated SAGE | [`mcp-tools.md`](mcp-tools.md) — `sage_find_agent`, then `sage_message_send`; [`federation-and-brain-api.md`](federation-and-brain-api.md) — internal compatibility transport `POST /fed/v1/pipe/event` |
 | Discover connected SAGEs and live-read a domain they share | [`mcp-tools.md`](mcp-tools.md) — `sage_federation`, then `sage_recall` with `federated=true` |
 | Distinguish internet federation, app-v20 quorum replication, and local-vs-network snapshot recovery | [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) — “v11.9 quorum scopes are not cross-chain federation” |
@@ -166,9 +166,11 @@ CometBFT without treating the consensus RPC as proof of application storage.
 
 ---
 
-## Related docs (reconciled through v11.17.17)
+## Related docs (reconciled through v11.18.0)
 
 These were stale earlier in v8 and have now been reconciled against the code. Where any of them still disagrees with this reference, this reference wins.
+
+- **[`upgrade-lineage-repair.md`](upgrade-lineage-repair.md)** — app-v21 → app-v22 create-only legacy-lineage inventory, independent validator verification, explicit-vote ceremony, and unverified-history anchor fallback.
 
 - **`api/openapi.yaml`** — the machine-readable **network/agent REST** spec, reconciled to the core remotely callable surface (including the v11.5 `reinstateMemory` operation; `classification` on `MemorySubmitRequest`; `task` in `MemoryType`; `tx_hash` on vote responses; clearance-0 labeled PUBLIC; `/v1/agent/register` documents 201-new / 200-idempotent). It intentionally excludes the same-machine, loopback-only human CEREBRUM control plane under `/v1/dashboard/**`; those operator routes are documented in [`rest-api.md`](rest-api.md), the app-v23 design, and the app-v26 Access Group reference. This exclusion is a trust boundary, not missing SDK coverage. *(A few org/federation/dept GET responses are typed as generic objects — their store models live outside the REST package; fill in later if needed.)*
 - **`docs/ARCHITECTURE.md`** — accurate: it documents *both* the operational and data-classification meanings of the 0–4 integer, and treats BadgerDB as authoritative with SQLite as legacy fallback. Documents PoE-weighted quorum (Phase 2, live since v8.2/`app-v3` and complete through v8.4/`app-v5`): post-fork blocks weight each vote by the validator's demonstrated PoE track record; the equal-weight (1.0) branch is retained only for pre-fork byte-identical replay. For precise per-record gate logic with file:line, prefer [`concepts/`](concepts/).

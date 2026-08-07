@@ -103,6 +103,27 @@ func TestEncodeDecodeUpgradePropose(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeUpgradeProposeAppV22LineageRepairTail(t *testing.T) {
+	pub, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	original := &ParsedTx{Type: TxTypeUpgradePropose, UpgradePropose: &UpgradePropose{
+		Name: "app-v22", TargetAppVersion: 22,
+		GovernanceDomain: strings.Repeat("a", 64),
+		LineageRepair:    `{"schema":"sage-upgrade-lineage-repair/v1"}`,
+	}}
+	require.NoError(t, SignTx(original, privateKey))
+	encoded, err := EncodeTx(original)
+	require.NoError(t, err)
+	decoded, err := DecodeTx(encoded)
+	require.NoError(t, err)
+	require.Equal(t, original.UpgradePropose.LineageRepair, decoded.UpgradePropose.LineageRepair)
+	require.Empty(t, decoded.UpgradePropose.GovernanceDomain, "app-v20 domain tails must never make app-v22 encoding ambiguous")
+	require.Equal(t, []byte(pub), decoded.PublicKey)
+	valid, err := VerifyTx(decoded)
+	require.NoError(t, err)
+	require.True(t, valid)
+}
+
 // TestDecodeUpgradeProposeLegacyMalformedAppV20Tail pins replay compatibility
 // with the pre-app-v20 decoder, which ignored every payload byte after
 // UpgradeDelayBlocks. A malformed optional tail must still decode and verify

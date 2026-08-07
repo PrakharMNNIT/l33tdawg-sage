@@ -28,6 +28,8 @@ test('release-facing version metadata stays aligned', () => {
     ['desktop/sage-shell/Cargo.toml', `version = "${version}"`],
     ['desktop/sage-shell/Cargo.lock', `name = "sage-shell"\nversion = "${version}"`],
     ['desktop/sage-shell/tauri.conf.json', `"version": "${version}"`],
+    ['desktop/sage-shell/src/control.rs', 'matches!(minor, Some(10..=18))'],
+    ['scripts/stage-native-shell-daemon.sh', 'through v11.18.x semver'],
     ['web/static/js/app.js', `const SAGE_VERSION = 'v${version}';`],
     ['README.md', `## What's New in v${version}`],
     ['README.md', 'App-v23 replaced capability-bit administration'],
@@ -45,7 +47,13 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/reference/rest-api.md', `Reconciled through SAGE v${version}`],
     ['docs/reference/concepts/rbac-orgs-federation.md', `reconciled through SAGE v${version}`],
     ['docs/reference/app-v23-access-control-design.md', `SAGE v${version}`],
+    ['docs/reference/upgrade-lineage-repair.md', `SAGE v${version}`],
     ['docs/ADMIN_BOOTSTRAP.md', `Reconciled through SAGE v${version}/app-v26`],
+    ['docs/UPGRADING.md', `The recovery commands in this guide require SAGE v${version} or later.`],
+    ['docs/UPGRADING.md', '`backup --full`, `restore --from`,'],
+    ['docs/UPGRADING.md', '`upgrade lineage status|doctor|verify`'],
+    ['deploy/federation-acceptance/Dockerfile.node', `ARG VERSION=v${version}-acceptance`],
+    ['deploy/federation-acceptance/docker-compose.yml', 'name: sage-v111800-federation'],
     ['docs/reference/app-v23-access-control-design.md', '## App-v24 readiness and memory-write barrier'],
     ['docs/reference/mcp-tools.md', 'A level-2 grant is never a remedy for a hard'],
     ['docs/reference/mcp-tools.md', 'never be substituted for this caller-scoped projection'],
@@ -62,7 +70,7 @@ test('release-facing version metadata stays aligned', () => {
   }
 });
 
-test('v11.17.17 user and SDK guides keep canonical Messages contracts aligned', () => {
+test('v11.18.0 user, recovery, federation, and SDK guides stay aligned', () => {
   const architecture = read('docs/ARCHITECTURE.md');
   const roadmap = read('docs/ROADMAP.md');
   const gettingStarted = read('docs/GETTING_STARTED.md');
@@ -75,7 +83,13 @@ test('v11.17.17 user and SDK guides keep canonical Messages contracts aligned', 
   assert.match(read('docs/reference/mcp-tools.md'), /call `sage_messages_receive`/);
   assert.match(read('internal/mcp/tools.go'), /Canonical Messages remain durable and queryable/);
   assert.doesNotMatch(read('internal/mcp/tools.go'), /History is retained only for the normal transient message window/);
-  assert.match(roadmap, /v11\.17\.x completion ledger/);
+  assert.match(roadmap, /v11\.18\.0 completion ledger/);
+  assert.match(roadmap, /does not introduce app-v27/);
+  assert.match(read('README.md'), /`reply_event_id`/);
+  assert.match(read('README.md'), /\*\*Agents\*\*,\s+\*\*Groups\*\*, and \*\*Federation\*\* tabs/);
+  assert.match(read('docs/FEDERATION.md'), /up to five minutes/);
+  assert.match(read('docs/FEDERATION.md'), /15 minutes/);
+  assert.match(read('docs/UPGRADING.md'), /sage-gui upgrade lineage verify --json --manifest repair\.json/);
   assert.match(roadmap, /helper outside the replaceable bundle/);
   assert.match(gettingStarted, /advertises 31 MCP tools/);
   assert.match(gettingStarted, /Deprecated `sage_pipe\*`\s+compatibility/);

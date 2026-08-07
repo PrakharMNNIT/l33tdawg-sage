@@ -614,6 +614,61 @@ func TestHandlePipeResolveReturnsExactFederatedBindingWithoutQueueing(t *testing
 	require.Empty(t, pipes)
 }
 
+func TestHandlePipeResolveRejectsLocalFederatedFriendlyNameCollision(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	localAgentID := strings.Repeat("31", 32)
+	remoteAgentID := strings.Repeat("42", 32)
+	callerID := strings.Repeat("53", 32)
+	require.NoError(t, memStore.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: localAgentID, Name: "Mynah", RegisteredName: "mynah/local",
+		Role: "member", Status: "active",
+	}))
+	require.NoError(t, memStore.CreateAgent(context.Background(), &store.AgentEntry{
+		AgentID: callerID, Name: "caller", Role: "member", Status: "active",
+		DomainAccess: `[{"domain":"research","read":true}]`,
+	}))
+	s.SetFederation(&remotePipeResolver{
+		fakeFederation: &fakeFederation{},
+		target: &federation.RemotePipeTarget{
+			ChainID: "chain-mini", AgentID: remoteAgentID,
+			Address: remoteAgentID + "@chain-mini", DisplayName: "Mynah",
+			Domains: []federation.PipeContactDomain{{Domain: "research"}},
+		},
+	})
+
+	body, err := json.Marshal(map[string]any{"to": "Mynah"})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	pipeRouterAs(s, callerID).ServeHTTP(rr,
+		httptest.NewRequest(http.MethodPost, "/v1/pipe/resolve", bytes.NewReader(body)))
+	require.Equal(t, http.StatusConflict, rr.Code, rr.Body.String())
+	problem := decodeProblem(t, rr)
+	assert.Contains(t, problem["detail"], localAgentID)
+	assert.Contains(t, problem["detail"], remoteAgentID+"@chain-mini")
+
+	pipes, err := memStore.ListPipelines(context.Background(), "", 10)
+	require.NoError(t, err)
+	assert.Empty(t, pipes, "ambiguous friendly resolution must not queue work")
+}
+
+func TestHandlePipeResolveRejectsMultipleLocalFriendlyNameMatches(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	for _, agentID := range []string{strings.Repeat("61", 32), strings.Repeat("62", 32)} {
+		require.NoError(t, memStore.CreateAgent(context.Background(), &store.AgentEntry{
+			AgentID: agentID, Name: "Shared Helper", Role: "member", Status: "active",
+		}))
+	}
+	body, err := json.Marshal(map[string]any{"to": "Shared Helper"})
+	require.NoError(t, err)
+	rr := httptest.NewRecorder()
+	pipeRouterAs(s, strings.Repeat("63", 32)).ServeHTTP(rr,
+		httptest.NewRequest(http.MethodPost, "/v1/pipe/resolve", bytes.NewReader(body)))
+	require.Equal(t, http.StatusConflict, rr.Code, rr.Body.String())
+	problem := decodeProblem(t, rr)
+	assert.Contains(t, problem["detail"], strings.Repeat("61", 32))
+	assert.Contains(t, problem["detail"], strings.Repeat("62", 32))
+}
+
 func TestFederatedPipeTargetRequiresCurrentCallerDomainAccess(t *testing.T) {
 	s, memStore := newPipeServer(t)
 	remoteAgentID := strings.Repeat("ab", 32)
@@ -726,12 +781,34 @@ func TestHandlePipeResult_ForeignWorkNeverAutoJournals(t *testing.T) {
 	pipeRouterAs(s, recipient).ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 	var response struct {
-		JournalID string `json:"journal_id"`
-		Journaled bool   `json:"journaled"`
+		JournalID    string `json:"journal_id"`
+		Journaled    bool   `json:"journaled"`
+		ReplyEventID string `json:"reply_event_id"`
+		ReplyStatus  string `json:"reply_status"`
 	}
 	require.NoError(t, json.NewDecoder(rr.Body).Decode(&response))
 	assert.Empty(t, response.JournalID)
 	assert.False(t, response.Journaled)
+	assert.NotEmpty(t, response.ReplyEventID)
+	assert.Equal(t, "queued", response.ReplyStatus)
+
+	replyStatusRequest := func(caller, eventID string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v1/messages/replies/"+eventID+"/status", nil)
+		rr := httptest.NewRecorder()
+		messageRouterAs(s, caller, true).ServeHTTP(rr, req)
+		return rr
+	}
+	ownedStatus := replyStatusRequest(recipient, response.ReplyEventID)
+	require.Equal(t, http.StatusOK, ownedStatus.Code, ownedStatus.Body.String())
+	assert.Contains(t, ownedStatus.Body.String(), `"reply_status":"queued"`)
+	assert.NotContains(t, ownedStatus.Body.String(), "foreign result must stay transient")
+	assert.NotContains(t, ownedStatus.Body.String(), `"workflow_status"`)
+
+	absentStatus := replyStatusRequest(foreignAgent, "missing-reply-event")
+	foreignStatus := replyStatusRequest(foreignAgent, response.ReplyEventID)
+	require.Equal(t, http.StatusNotFound, foreignStatus.Code)
+	assert.Equal(t, absentStatus.Body.String(), foreignStatus.Body.String(),
+		"unrelated callers must not learn whether a reply event exists")
 
 	stats, err := memStore.GetStats(ctx)
 	require.NoError(t, err)

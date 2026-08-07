@@ -4665,7 +4665,7 @@ func (s *Server) toolMessageReply(ctx context.Context, params map[string]any) (a
 		response = legacy.(map[string]any)
 		response["message_id"] = messageID
 		response["scope"] = "federated"
-		response["message"] = "Reply queued over the trusted connection. Repeating the same federated event is deduplicated by the receiving SAGE."
+		response["message"] = "Reply queued over the trusted connection. reply_event_id is the immutable outbound reply receipt; pass it to sage_message_status to inspect delivery without creating another inbox request. Repeating the same federated event is deduplicated by the receiving SAGE."
 		return response, nil
 	}
 	response["message"] = "Reply recorded. Repeating this exact reply is safe; a different second reply is rejected."
@@ -4684,6 +4684,12 @@ func (s *Server) toolMessageStatus(ctx context.Context, params map[string]any) (
 	if err := s.doSignedJSON(ctx, http.MethodGet, "/v1/messages/"+url.PathEscape(messageID)+"/status", nil, &response); err != nil {
 		if !isAPIStatus(err, http.StatusNotFound) {
 			return nil, fmt.Errorf("message status: %w", err)
+		}
+		if replyErr := s.doSignedJSON(ctx, http.MethodGet, "/v1/messages/replies/"+url.PathEscape(messageID)+"/status", nil, &response); replyErr == nil {
+			response["message"] = "This is your outbound federated reply event status. It is not a new request and exposes no original-message status or result content."
+			return response, nil
+		} else if !isAPIStatus(replyErr, http.StatusNotFound) {
+			return nil, fmt.Errorf("federated reply status: %w", replyErr)
 		}
 		if receiptErr := s.doSignedJSON(ctx, http.MethodGet, "/v1/pipe/"+url.PathEscape(messageID)+"/receipt", nil, &response); receiptErr != nil {
 			return nil, fmt.Errorf("federated message status: %w", receiptErr)
@@ -5515,9 +5521,11 @@ func (s *Server) toolPipeResult(ctx context.Context, params map[string]any) (any
 	}
 
 	var resp struct {
-		Status    string `json:"status"`
-		JournalID string `json:"journal_id"`
-		Journaled bool   `json:"journaled"`
+		Status       string `json:"status"`
+		JournalID    string `json:"journal_id"`
+		Journaled    bool   `json:"journaled"`
+		ReplyEventID string `json:"reply_event_id"`
+		ReplyStatus  string `json:"reply_status"`
 	}
 	if err := s.doSignedJSON(ctx, "PUT", "/v1/pipe/"+escapedPipeID+"/result", body, &resp); err != nil {
 		return nil, fmt.Errorf("pipeline result: %w", err)
@@ -5529,12 +5537,17 @@ func (s *Server) toolPipeResult(ctx context.Context, params map[string]any) (any
 	} else if resp.Journaled {
 		message += " A local journal entry was created summarizing the exchange."
 	}
-	return map[string]any{
+	response := map[string]any{
 		"status":     resp.Status,
 		"journal_id": resp.JournalID,
 		"journaled":  resp.Journaled,
 		"message":    message,
-	}, nil
+	}
+	if resp.ReplyEventID != "" {
+		response["reply_event_id"] = resp.ReplyEventID
+		response["reply_status"] = resp.ReplyStatus
+	}
+	return response, nil
 }
 
 // checkPipelineInbox keeps sage_turn payload-free. It reports only whether

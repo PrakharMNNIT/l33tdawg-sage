@@ -8,16 +8,32 @@ It is written for the person clicking the buttons. You do not need to understand
 
 ## What a federation connection is
 
-A federation connection is a trusted link between **two whole SAGE networks**. JOIN proves which SAGE is on the other end; it does not grant access to any domain. After the link is active, each person separately chooses what their own SAGE may share.
+A federation connection is a trusted link between **two whole SAGE networks**.
+JOIN proves which SAGE is on the other end; it does not indiscriminately expose
+that node's domains. During/after pairing, each operator explicitly chooses the
+ordinary local agent or agents participating in this pairwise federation group.
+That export carries each selected agent's owned domain tree into the default
+Read contract described below.
 
-Four things make it what it is:
+Five things make it what it is:
 
 - **Whole-SAGE to whole-SAGE.** You are linking one entire brain to another entire brain. This is not the same as adding an agent to your own SAGE (that is the **Agents** section), and it is not the same as joining more computers on your own LAN into one shared brain (that is the node-join flow under **Connect an AI tool**, which makes another computer a peer node on your own network).
+- **Exported-agent Read is the pairwise default.** Once you explicitly export a
+  local ordinary agent into this connection, any active ordinary agent on the
+  other SAGE may live-read that exported agent's owned domain tree. The receiver
+  needs no same-named group or receiving domain. Its operator may narrow this
+  default with exact local-agent/domain restrictions. Agents in an unrelated
+  local Access Group are not exported, and adding another federated agent is a
+  separate explicit action.
 - **Read borrows; Copy is a separate two-sided choice.** Read results come back tagged with their source and are shown in the moment; they are not stored merely because Read is enabled. Copy is offered by the source per domain, but nothing is retained unless the receiving SAGE independently selects **Save here**. An accepted copy enters the receiver's ordinary local consensus pipeline and then follows that brain's own lifecycle.
-- **Connection-bound Write is not available in v11.9.** The versioned field and route are reserved for compatibility, but the route returns authenticated `501`. An ordinary domain grant is not enough because it is not bound to one trusted connection and one exact submission.
-- **It deletes nothing.** Connecting adds a small treaty record and an empty permission policy. It does not touch, move, or erase a single memory on either side. Turning the connection off stops future access and synchronization; copies already accepted by either sovereign brain remain governed there.
+- **Connection-bound Write is not available.** The versioned field and route are reserved for compatibility, but the route returns authenticated `501`. An ordinary domain grant is not enough because it is not bound to one trusted connection and one exact submission.
+- **It deletes nothing.** Connecting adds a treaty and pairwise export/policy records. It does not touch, move, or erase a single memory on either side. Turning the connection off stops future access and synchronization; copies already accepted by either sovereign brain remain governed there.
 
-You grant what **they** may Read or Copy from **you**; they grant what **you** may Read or Copy from **them**. The two permission snapshots are independent, start empty, and can change at any time without running JOIN again. Neither side can quietly widen the other's access, and a Copy offer still cannot force the receiver to retain anything.
+You choose which of **your agents** the peer may see and Read; they make the
+same independent choice for their agents. Receiver-side restrictions can only
+narrow that default. Separately, manual domain-only peer permissions and Copy
+offers start empty and can change without running JOIN again. Neither side can
+quietly export a local-only group member or force the receiver to retain a Copy.
 
 ---
 
@@ -26,7 +42,11 @@ You grant what **they** may Read or Copy from **you**; they grant what **you** m
 - Both people need federation switched on. There is no LAN-versus-internet choice: SAGE prepares every usable direct and secure-relay candidate, then selects a working route during the encrypted exchange. The wizard reads the actual federation listener address and port (usually **8444**) for the Direct candidate. An explicit listener host is honored exactly; a wildcard bind lets the wizard offer detected addresses. Port `0` is invalid because an ephemeral port cannot be truthfully advertised.
 - Internet reachability depends on at least one configured relay being ready when no direct route works. SAGE ships with the project relay route and operators may add or replace relay multiaddrs. A relay outage can delay a relay-only connection, but does not weaken authentication or expose memory content.
 - You will each need a camera, or a shared screen, or at least a phone call you placed to a number you trust. The connection is safest when you are in the same room or on a video call you started.
-- You do not choose domains during JOIN. After both codes match, open the connection and choose from domains that already exist on your own SAGE. Leaving every box clear is a healthy connected state that shares nothing.
+- JOIN itself remains trust-only. Choose the local ordinary agent(s) that belong
+  to this pairwise federation explicitly. Leaving all agent exports and manual
+  domain permissions empty is a healthy connected state that shares nothing;
+  exporting an agent enables the default borrowed Read of that agent's owned
+  tree, not Copy or Write.
 
 Open **Federation** in the sidebar. You will see two big choices:
 
@@ -196,16 +216,25 @@ Under the covers each code is a short **time-based one-time code (TOTP, RFC-6238
 
 ---
 
-## Permissions after JOIN - what actually crosses the link
+## Permissions after JOIN - manual domain Read/Copy
 
-Open a connection from **Federation**. Each side controls a complete per-peer snapshot on its own SAGE; saving replaces that side's previous snapshot. The source enforces it again when serving or sending, so a peer cannot talk its way past a withdrawn permission (`web/federation_permissions.go`, `internal/federation/server.go`, `internal/federation/sync_outbox.go`).
+Open a connection from **Federation**. In addition to the exported-agent default
+Read above, each side controls a complete manual domain-only snapshot on its own
+SAGE; saving replaces that side's previous snapshot. The source enforces it
+again when serving or sending, so a peer cannot talk its way past a withdrawn
+permission (`web/federation_permissions.go`, `internal/federation/server.go`,
+`internal/federation/sync_outbox.go`).
 
 - **Existing domains only.** The picker is built from domains already registered or observed on the source node. A trailing `*` such as `tii*` filters the list for safe bulk selection; it does not create a wildcard grant or a new domain.
 - **Read.** Allows live recall inside that exact domain subtree. Every returned record is checked again, and the receiver borrows the result without storing it.
 - **Copy offer.** Implies Read and permits the source to synchronize the domain, but delivery is effective only where the receiver has separately checked **Save here**. Removing either the offer or the subscription closes future delivery.
-- **Write (not yet).** Always off in v11.9. Attempts fail closed because SAGE does not yet have a consensus authorization bound to the active connection generation, peer, domain, and exact submission.
+- **Write (not yet).** Always off in the current protocol. Attempts fail closed because SAGE does not yet have a consensus authorization bound to the active connection generation, peer, domain, and exact submission.
 
-A present empty snapshot is explicit deny-all, including immediately after a fresh JOIN. Each side can change its own snapshot independently and at any time without pairing again.
+A present empty snapshot is explicit deny-all for this **manual domain-only
+lane**, including immediately after a fresh JOIN. It does not synthesize or
+revoke exported-agent membership; narrow that separate default with the
+receiver's agent/domain restrictions. Each side can change its own snapshot
+independently and at any time without pairing again.
 
 ---
 
@@ -236,9 +265,11 @@ So: only ever connect when you are confident, by your own eyes or your own ears 
 
 **What the link can and cannot do once connected:**
 
-- It can serve live borrowed recall only for domains where you enabled Read.
+- It can serve live borrowed recall only for an explicitly exported agent's
+  owned tree or a domain where you enabled manual Read, always subject to the
+  receiver's current restrictions and classification ceiling.
 - It can offer copies only for domains where you enabled Copy, and the other person must independently choose **Save here** before their SAGE retains them.
-- It cannot perform connection-bound remote Write in v11.9. The authenticated endpoint returns `501` and never dispatches the submitted body into the memory API.
+- It cannot perform connection-bound remote Write in the current protocol. The authenticated endpoint returns `501` and never dispatches the submitted body into the memory API.
 - It cannot delete anything, on either side.
 - It cannot use the JOIN itself, a stale agreement generation, a different operator/CA, or unrelated group membership to widen domain access.
 
@@ -265,7 +296,11 @@ Generate fresh codes after correcting `federation.listen_addr`; never edit a QR
 payload or reuse the old return card.
 
 **The session expired / "join session not found or expired."**
-A join has to finish within about 15 minutes. If you left it sitting, the session times out for safety. Start over from the Federation page - nothing was created.
+A join has to finish within about 15 minutes. Within that session, each pasted
+or scanned code is allowed up to five minutes to discover and dial its Direct
+and secure-relay targets while the pairing screen remains open. Closing the
+screen cancels that attempt; expiry burns the session. Start over from the
+Federation page—nothing was created.
 
 **"Refusing self-federation."**
 You tried to connect a SAGE to itself (same network id). Federation is between two different networks.
@@ -277,7 +312,12 @@ The listener rate-limits repeated attempts from the same connection. Wait a minu
 Some treaties carry an expiry. An expired row no longer serves or queries. Turn it off and re-run the join to refresh it.
 
 **The connection is green but no memories are shared.**
-That is the safe default. JOIN establishes trust with an empty permission snapshot. Expand the connection, enable Read or Copy on existing domains you control, and save your snapshot. For copies, the other person must also enable **Save here** on their computer.
+JOIN alone is trust-only. Expand the connection and explicitly export the local
+ordinary agent that should participate; its owned tree then becomes readable to
+active ordinary agents on the peer unless that peer's operator has narrowed the
+default. Manual domain-only Read/Copy remains available for advanced sharing.
+For copies, you must offer Copy and the other person must also enable **Save
+here** on their computer.
 
 **Read works but copies do not arrive.**
 Check both halves of the Copy decision: the source must offer Copy for the domain and the receiver must subscribe with **Save here**. Either side can withdraw its half without reconnecting.
@@ -286,6 +326,6 @@ Check both halves of the Copy decision: the source must offer Copy for the domai
 
 ### Under the hood (optional)
 
-The ceremony runs over a dedicated mutually authenticated federation listener. Each operator's compatibility treaty set/revoke reaches its own chain, while mutable peer Read/Copy snapshots and transport subscriptions remain off-consensus. Fresh JOIN accepts only the fixed empty-domain compatibility envelope and installs an explicit deny-all policy. Peer admission binds the exact active agreement, chain, operator key, CA pin, and policy epoch; synchronization-group traffic additionally needs the exact active group/member/domain projection. Agreement changes, JOIN activation, narrowing, and revocation use the same mutation boundary across signed REST and dashboard paths, so a completed change cannot leave a superseded broader response in flight.
+The ceremony runs over a dedicated mutually authenticated federation listener. Each operator's compatibility treaty set/revoke reaches its own chain, while mutable peer Read/Copy snapshots, exported-agent membership, receiver restrictions, and transport subscriptions remain off-consensus. Fresh JOIN accepts only the fixed empty-domain compatibility envelope and installs an explicit deny-all **manual peer-RBAC** policy; it does not negate the separate default Read that begins only when an operator explicitly exports an ordinary agent into the pair. Peer admission binds the exact active agreement, chain, operator key, CA pin, and policy epoch; synchronization-group traffic additionally needs the exact active group/member/domain projection. Agreement changes, JOIN activation, narrowing, and revocation use the same mutation boundary across signed REST and dashboard paths, so a completed change cannot leave a superseded broader response in flight.
 
 The operator wizard routes live at `/v1/dashboard/federation/join/*` (`web/federation_join.go`), dashboard permissions at `/v1/dashboard/federation/connections/{chain_id}/permissions` (`web/federation_permissions.go`), the peer-facing ceremony and data plane at `/fed/v1/*` (`internal/federation/join_routes.go`, `internal/federation/server.go`), and Copy authorization in `internal/federation/sync_outbox.go`. Borrowed Read results are never persisted (`internal/federation/proxy.go`); accepted copies are locally signed ordinary memory submissions. The reserved Write route fails before parsing or dialing (`api/rest/federation_write_handler.go`, `internal/federation/remote_write.go`).

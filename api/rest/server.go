@@ -836,6 +836,7 @@ func (s *Server) setupRouter() chi.Router {
 			r.Put("/v1/messages/{message_id}/read", s.handleMessageRead)
 			r.Put("/v1/messages/read-batch", s.handleMessageReadBatch)
 			r.Get("/v1/messages/{message_id}/status", s.handleMessageStatus)
+			r.Get("/v1/messages/replies/{reply_event_id}/status", s.handleMessageReplyStatus)
 			r.Post("/v1/pipe/resolve", s.handlePipeResolve)
 			r.Post("/v1/pipe/send", s.handlePipeSend)
 			r.Get("/v1/pipe/inbox", s.handlePipeInbox)

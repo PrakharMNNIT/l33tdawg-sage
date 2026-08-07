@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.17.17 code (2026-08-07). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
+<!-- Verified against SAGE v11.18.0 code (2026-08-07). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
 
 # SAGE Federation and Brain HTTP API Reference (v11)
 
@@ -456,6 +456,14 @@ and a limited mutation receives `Retry-After: 60`. This keeps an authenticated
 ACTIVE confirmation replay reachable without increasing the total mutation
 cap (`internal/federation/joinsession.go`; `internal/federation/join_routes.go`).
 
+The cryptographic JOIN session and guest draft each expire after **15 minutes**
+(`joinSessionTTL`, `guestDraftTTL`). CEREBRUM gives each scan/paste route-
+discovery attempt up to **five minutes** (`fedJoinDiscoveryTimeout`) while the
+pairing screen remains open. That discovery allowance never extends the
+15-minute session; session expiry still wins, and leaving the screen cancels
+the browser request (`internal/federation/joinsession.go`;
+`internal/federation/join_routes.go`; `web/federation_join.go`).
+
 Final confirmation may contain two sequential consensus waits: the guest
 commits its local tx-33 and the host then commits its tx-33. The guest-to-host
 peer deadline covers one configured broadcast timeout plus headroom, while the
@@ -735,7 +743,9 @@ Every route 501s when the transport is not wired (`fedReady`,
 
 (JOIN handlers live in `web/federation_join.go`.) The dashboard owns automatic
 route intent and the fixed trust-only compatibility scope; the remaining join
-request/response bodies mirror the operator REST bodies of §2.
+request/response bodies mirror the operator REST bodies of §2. Scan/paste calls
+use the bounded five-minute discovery context above; the underlying session
+remains bounded to 15 minutes.
 
 The dashboard connection-status response is HTTP `200` for both successful and
 failed probes so a row does not disappear during recovery. A failure includes

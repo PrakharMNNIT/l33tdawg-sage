@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.17.17.
+Reconciled against internal/mcp for SAGE v11.18.0.
 
 # SAGE MCP Tools Reference
 
@@ -878,7 +878,7 @@ read.
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `to` | string | yes | Exact local agent ID/name, federated `#node/agent` handle, or `agent_id@chain` address. |
+| `to` | string | yes | Exact local agent ID, unique local/federated display or registered name, federated `#node/agent` handle, or `agent_id@chain` address. |
 | `payload` | string | yes | Untrusted agent request content. |
 | `intent` | string | no | Short purpose. |
 | `ttl_minutes` | integer | no | 0–1440; omitted/0 is durable until handled. |
@@ -893,6 +893,13 @@ HTTP MCP SSE sessions authenticated as the exact recipient. The notification
 contains only `message_id`, `from_agent`, and `sent_at`; it is best-effort,
 ignorable, and is never delivery, read, presence, attention, or workflow
 evidence. Stdio and Streamable HTTP remain poll-on-turn.
+
+Friendly labels are accepted only when one exact caller-authorized target wins
+across local and federated scope. Any local/local, remote/remote, or local/remote
+collision fails with bounded immutable candidates. A label is never signed or
+persisted: MCP signs and queues only the resolved agent ID and chain. Mutable
+display-name renames therefore do not alter an agent's registered-name or exact
+`agent_id@chain` address.
 
 **REST:** `POST /v1/messages`.
 
@@ -934,6 +941,12 @@ federated replies retain the negotiated secure transport and event
 deduplication. Only the exact recipient that fetched and claimed the message
 can reply.
 
+A federated reply result includes an immutable `reply_event_id` and its initial
+`reply_status:queued`. This is the signed result outbox event already created by
+the reply transaction, not a new ordinary message. Pass that event ID to
+`sage_message_status` to inspect only the replying agent's outbound transport
+state; no original request workflow/read state or result content is exposed.
+
 | Name | Type | Required | Description |
 |---|---|---|---|
 | `message_id` | string | yes | Exact receiver-local ID. |
@@ -946,7 +959,8 @@ can reply.
 ### sage_message_status
 
 **Purpose:** Query the payload-free state of one exact local or federated
-message sent by this caller. It returns independent `transport_status`, `read_status`, and
+message sent by this caller, or one immutable federated `reply_event_id` returned
+to this caller by `sage_message_reply`. Message status returns independent `transport_status`, `read_status`, and
 `workflow_status` facts plus their bounded timestamps. Recipient, unrelated
 agent, Manager, Admin, Root, node operator, and nonexistent IDs receive the
 same non-enumerating 404 behavior. The projection never decrypts payload or
@@ -954,7 +968,7 @@ result, so it remains usable while the content vault is locked.
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `message_id` | string | yes | Exact sender-local ID returned by `sage_message_send`. |
+| `message_id` | string | yes | Exact sender-local ID returned by `sage_message_send`, or exact outbound `reply_event_id` returned by `sage_message_reply`. |
 
 `read_status:confirmed` means the exact addressed credential fetched the
 message and signed an acknowledgement naming that exact ID. It does not prove
@@ -964,6 +978,8 @@ workflow row with transport state and receipt-v2 evidence; none of those
 independent facts is inferred from another.
 
 **REST:** `GET /v1/messages/{message_id}/status`.
+Federated reply-event lookup uses
+`GET /v1/messages/replies/{reply_event_id}/status`.
 
 ---
 

@@ -590,6 +590,11 @@ type UpgradePropose struct {
 	// lowercase-hex domain derived from the CometBFT chain_id and explicitly
 	// approved by the upgrade quorum before delegated governance turns on.
 	GovernanceDomain string
+	// LineageRepair is an optional canonical JSON manifest admitted only by the
+	// app-v21 -> app-v22 transition. It binds the exact missing predecessor
+	// records and their evidence into the ordinary quorum-approved upgrade
+	// proposal. Older transitions must leave it empty.
+	LineageRepair string
 }
 
 // CanonicalUpgradeName is the single source of truth for the name an

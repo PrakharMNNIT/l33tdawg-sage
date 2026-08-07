@@ -288,6 +288,7 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	var localMatches []*store.AgentEntry
 	if s.agentStore != nil {
 		if pub, err := auth.AgentIDToPublicKey(target); err == nil && auth.PublicKeyToAgentID(pub) == target {
 			isRoot, rootErr := s.appV23IsRootIdentity(target)
@@ -333,6 +334,7 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 					"The local agent directory could not be searched.")
 				return
 			}
+			seenLocal := make(map[string]struct{})
 			for _, agent := range agents {
 				if agent == nil {
 					continue
@@ -356,8 +358,10 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					if active {
-						writeJSON(w, http.StatusOK, map[string]any{"to_agent": agent.AgentID, "to_provider": "", "destination_chain_id": ""})
-						return
+						if _, seen := seenLocal[agent.AgentID]; !seen {
+							seenLocal[agent.AgentID] = struct{}{}
+							localMatches = append(localMatches, agent)
+						}
 					}
 				}
 			}
@@ -366,12 +370,40 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 					"The bounded local candidate scan was exhausted; use the exact agent ID from sage_find_agent.")
 				return
 			}
+			if len(localMatches) > 1 {
+				choices := make([]string, 0, min(len(localMatches), 20))
+				for _, agent := range localMatches[:min(len(localMatches), 20)] {
+					choices = append(choices, agent.AgentID)
+				}
+				writeProblem(w, http.StatusConflict, "Ambiguous local agent",
+					fmt.Sprintf("Multiple active local agents match %q; choose one immutable agent ID: %s", target, strings.Join(choices, ", ")))
+				return
+			}
 		}
 	}
 	if remote, handled := resolveRemote(); remote != nil {
+		if !s.callerCanReachFederatedPipeTarget(r.Context(), middleware.ContextAgentID(r.Context()), remote) {
+			// An unauthorized remote route is not a collision candidate and remains
+			// indistinguishable from an absent contact.
+			if len(localMatches) == 1 {
+				writeJSON(w, http.StatusOK, map[string]any{"to_agent": localMatches[0].AgentID, "to_provider": "", "destination_chain_id": ""})
+				return
+			}
+			writeProblem(w, http.StatusNotFound, "Unknown target", fmt.Sprintf("no registered local or visible federated agent matches %q", target))
+			return
+		}
+		if len(localMatches) == 1 {
+			writeProblem(w, http.StatusConflict, "Ambiguous agent",
+				fmt.Sprintf("A local and federated agent both match %q; choose %s or %s", target, localMatches[0].AgentID, remote.Address))
+			return
+		}
 		writeRemote(remote)
 		return
 	} else if handled {
+		return
+	}
+	if len(localMatches) == 1 {
+		writeJSON(w, http.StatusOK, map[string]any{"to_agent": localMatches[0].AgentID, "to_provider": "", "destination_chain_id": ""})
 		return
 	}
 	writeProblem(w, http.StatusNotFound, "Unknown target", fmt.Sprintf("no registered local or visible federated agent matches %q", target))
@@ -1308,6 +1340,7 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	// durable return event, so a crash cannot acknowledge locally and lose the
 	// requesting agent's answer.
 	var completeErr error
+	var replyEventID string
 	if msg.SourceChainID != "" {
 		transportStore, ok := pipeStore.(store.FederatedPipelineStore)
 		if !ok {
@@ -1339,6 +1372,7 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 			TargetAgentID:     msg.FromAgent, Proof: transportProof, CreatedAt: created,
 			ExpiresAt: created.Add(24 * time.Hour),
 		}
+		replyEventID = event.EventID
 		authorizer := s.federation.(federatedPipeAdmissionAuthorizer)
 		completeErr = authorizer.WithAuthorizedImportedPipe(r.Context(), msg, func() error {
 			return transportStore.CompleteFederatedPipelineWithTransport(r.Context(), pipeID, agentID, req.Result, event)
@@ -1364,11 +1398,16 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 		s.OnEvent("pipeline_complete", pipeID, "agent-pipeline", summary, nil)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"status":     "completed",
 		"journal_id": journalID,
 		"journaled":  journaled,
-	})
+	}
+	if replyEventID != "" {
+		response["reply_event_id"] = replyEventID
+		response["reply_status"] = "queued"
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // callerCanViewPipe reports whether callerID is a party to msg (sender,

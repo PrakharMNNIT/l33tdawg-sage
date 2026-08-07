@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +11,29 @@ import (
 	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/internal/tx"
 )
+
+func capturePreflightStdout(t *testing.T, run func()) string {
+	t.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	original := os.Stdout
+	os.Stdout = write
+	run()
+	os.Stdout = original
+	if closeErr := write.Close(); closeErr != nil {
+		t.Fatalf("close writer: %v", closeErr)
+	}
+	out, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if err := read.Close(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
+	return string(out)
+}
 
 // newPreflightStore builds a writable Badger store for ladder fixtures.
 func newPreflightStore(t *testing.T) (*store.BadgerStore, string) {
@@ -196,6 +221,51 @@ func TestLadderVerdictSkipsNotYetRungs(t *testing.T) {
 	}
 	if ok, problem := ladderVerdict(rungs); !ok {
 		t.Fatalf("not-yet-reached rung produced a failure: %s", problem)
+	}
+}
+
+func TestPreflightMissingLineagePrintsBoundedRecoveryWorkflow(t *testing.T) {
+	out := capturePreflightStdout(t, func() {
+		printLadderFailureRecovery([]ladderRung{{
+			Version: 17,
+			Name:    "app-v17",
+			Problem: "missing canonical applied app-v17 record",
+		}})
+	})
+
+	for _, required := range []string{
+		"stopped-node backup",
+		"exactly at app-v21",
+		"upgrade lineage doctor",
+		"upgrade lineage verify",
+		"manifest_digest",
+		"explicit quorum proposal/vote",
+		"Automatic voting is disabled",
+	} {
+		if !strings.Contains(out, required) {
+			t.Fatalf("missing-lineage guidance does not contain %q:\n%s", required, out)
+		}
+	}
+	if strings.Contains(out, "restore-only") {
+		t.Fatalf("missing lineage was incorrectly described as restore-only:\n%s", out)
+	}
+}
+
+func TestPreflightPresentInvalidLineageIsRestoreOnly(t *testing.T) {
+	out := capturePreflightStdout(t, func() {
+		printLadderFailureRecovery([]ladderRung{
+			{Version: 16, Name: "app-v16", Present: true, Problem: "height 2 is not after the previous rung's height 3"},
+			{Version: 17, Name: "app-v17", Problem: "missing canonical applied app-v17 record"},
+		})
+	})
+
+	for _, required := range []string{"present but invalid", "forbidden from overwriting", "restore-only"} {
+		if !strings.Contains(out, required) {
+			t.Fatalf("invalid-lineage guidance does not contain %q:\n%s", required, out)
+		}
+	}
+	if strings.Contains(out, "upgrade lineage doctor") {
+		t.Fatalf("present-invalid lineage was incorrectly sent to doctor repair:\n%s", out)
 	}
 }
 

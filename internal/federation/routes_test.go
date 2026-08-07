@@ -174,6 +174,21 @@ func TestJoinTransportBlackholedFirstTargetUsesRelay(t *testing.T) {
 	assert.Less(t, time.Since(start), 500*time.Millisecond)
 }
 
+func TestJoinTransportDoesNotRetrySecurityFailure(t *testing.T) {
+	var calls atomic.Int32
+	transport := joinP2PHTTPTransport(nil, func(context.Context, string) (net.Conn, error) {
+		calls.Add(1)
+		return nil, errors.New("tls: bad certificate")
+	}, []string{"/ip4/192.0.2.1/tcp/1/p2p/direct"})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := transport.DialTLSContext(ctx, "tcp", "unused")
+	require.ErrorContains(t, err, "authentication failed")
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Less(t, time.Since(start), 250*time.Millisecond, "security failures must not enter availability retry backoff")
+}
+
 func TestMountedRouterRejectsPeerAndJoinTrafficAfterRuntimeDisable(t *testing.T) {
 	m := &Manager{routeStatus: make(map[string]RouteDiagnostics)}
 	router := m.Router()

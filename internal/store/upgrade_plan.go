@@ -24,6 +24,7 @@ type UpgradePlanRecord struct {
 	ActivationHeight int64  `json:"activation_height"`
 	BinarySHA256     string `json:"binary_sha256,omitempty"`
 	GovernanceDomain string `json:"governance_domain,omitempty"`
+	LineageRepair    string `json:"lineage_repair,omitempty"`
 	ProposedAt       int64  `json:"proposed_at"`
 	ProposerID       string `json:"proposer_id"`
 }

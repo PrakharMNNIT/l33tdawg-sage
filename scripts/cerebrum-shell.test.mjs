@@ -276,7 +276,7 @@ test('Search page renders projection failures as errors, never empty search resu
 });
 
 test('Access Controls is a first-class sidebar route', () => {
-    assert.match(appSource, /hash === '\/access'\) setPage\('access'\)/);
+    assert.match(appSource, /hash === '\/access'\) \{[\s\S]*setPage\('access'\);[\s\S]*setHashRouteRevision\(current => current \+ 1\);/);
     assert.match(appSource, /navigate\('access'\)/);
     assert.match(appSource, /page === 'access'.*NetworkPage/s);
     assert.match(appSource, /accessMode \? 'access' : 'overview'/);
@@ -290,6 +290,41 @@ test('Access Controls is a first-class sidebar route', () => {
             access.indexOf('setState(next)'),
         'nullable historical collections must be normalized before the first full render',
     );
+});
+
+test('Access Controls uses routable tabs, compact lists, protected drawers, and responsive focus ownership', () => {
+    const access = appSource.slice(
+        appSource.indexOf('function AppV23AccessControl()'),
+        appSource.indexOf('function NetworkPage('),
+    );
+    assert.match(access, /class="access-control-tabs" role="tablist"/);
+    assert.match(access, /ACCESS_CONTROL_TABS\.map\(\(tab, index\)/);
+    assert.match(access, /role="tab"[\s\S]*aria-selected=\$\{activeAccessTab === tab\}[\s\S]*tabIndex=\$\{activeAccessTab === tab \? 0 : -1\}/,
+        'the three tabs must expose roving keyboard focus and selected state');
+    assert.match(access, /event\.key === 'ArrowRight'[\s\S]*event\.key === 'ArrowLeft'[\s\S]*event\.key === 'Home'[\s\S]*event\.key === 'End'/,
+        'tab navigation must support the standard arrow, Home, and End keys');
+    assert.match(access, /accessControlHash\(\{[\s\S]*window\.history\.replaceState\(window\.history\.state, '', `#\$\{next\}`\)/,
+        'the selected tab and exact item must survive reload without erasing the history position marker');
+    assert.match(access, /class="access-control-toolbar" role="search"/);
+    assert.match(access, /filterSortAccessAgents[\s\S]*filterSortAccessGroups[\s\S]*filterSortFederatedAgents/);
+    assert.match(access, /class="access-control-list-row/);
+    assert.match(access, /class="access-control-drawer/);
+    assert.match(access, /const accessDrawerRef = useModalDialog\([\s\S]*!reviewQueueOnly && activeAccessDrawerOpen/,
+        'an open editor must trap focus, own Escape, inert the obscured page branch, and restore the opener');
+    assert.match(access, /const accessDrawerRef = useModalDialog\([\s\S]*!reviewQueueOnly && activeAccessDrawerOpen,[\s\S]*true,/,
+        'the fixed Access drawer must identify itself as the modal surface so its exposed rail is inert');
+    assert.match(access, /const accessEditorDirty = policyDirty \|\| displayNameDirty/);
+    assert.match(access, /showConfirmation\([\s\S]*Discard the unsaved agent changes/);
+    assert.match(access, /window\.addEventListener\('beforeunload', guard\)/,
+        'unsaved agent edits must be protected on both in-app and browser navigation');
+    assert.match(access, /Active ordinary agents may live-read peer-exported domains by default unless explicitly denied/);
+    assert.match(access, /Remote Write is reserved and denied; Linked readers and messaging never enable it/,
+        'default-read federation and explicit write denial must remain understandable and separate');
+    assert.match(cssSource, /\.access-control-list-row\s*\{[\s\S]*grid-template-columns:/);
+    assert.match(cssSource, /@media \(max-width:\s*720px\)[\s\S]*\.access-control-drawer\s*\{[\s\S]*position:\s*fixed/,
+        'the focused editor must become a usable full-screen surface on narrow windows');
+    assert.match(cssSource, /\.access-control-tabs button:focus-visible/,
+        'tab and row focus must remain visually obvious');
 });
 
 test('pending agent activation is surfaced on Agents and excluded from Access Controls', () => {
@@ -332,8 +367,8 @@ test('Agents has a separate exact-identity directory for federated agents', () =
     assert.doesNotMatch(federated, /peer_agent_id/,
         'a federation transport or ceremony principal must never be cast as an ordinary remote agent');
     assert.match(federated, /Permissions not set/);
-    assert.match(federated, /remote_chain: agent\.remote_chain_id[\s\S]*remote_agent: agent\.remote_agent_id/,
-        'permission setup must preserve the exact remote chain and agent identity');
+    assert.match(federated, /accessControlHash\(\{[\s\S]*tab: 'federation',[\s\S]*item: `\$\{agent\.remote_chain_id\}\\u0000\$\{agent\.remote_agent_id\}`/,
+        'permission setup must preserve the exact remote chain and agent identity in the selected-item route');
     assert.ok(
         agentsPage.indexOf('<${FederatedAgentDirectory} />') < agentsPage.indexOf('agent-directory-toolbar'),
         'federated identities must be categorized before the active local directory',
@@ -1251,8 +1286,8 @@ test('Access Controls exposes the independent federated inbox kill switch', () =
         'the explicit switch must preserve the named profile bits while toggling only the independent restriction');
     assert.match(panel, /updateAppV23AgentPolicy\(selected\.agent_id, draft\)/,
         'the switch must use the ordinary consensus policy save instead of a browser-only mutation');
-    assert.match(panel, /const requestedLocalAgentID = routeQuery\.get\('agent'\) \|\| '';/,
-        'an agent deep link must select the requested active principal without an unrelated recovery flag');
+    assert.match(panel, /const initialRoute = accessControlRouteState\(window\.location\.hash\);[\s\S]*const requestedLocalAgentID = initialRoute\.tab === 'agents' \? initialRoute\.item : '';/,
+        'an agent deep link must select the requested active principal through normalized route state');
     assert.match(panel, /v23-federated-inbox-label[\s\S]*scrollIntoView/,
         'an inbox deep link must bring the exact switch into view');
 });

@@ -366,3 +366,40 @@ func (s *Server) handleMessageStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, status)
 }
+
+// handleMessageReplyStatus exposes only the replying agent's own immutable
+// federated result event. It is deliberately separate from sender-owned message
+// status: no request/result content or original-message workflow state crosses
+// this boundary, and the reply is never represented as another inbox request.
+func (s *Server) handleMessageReplyStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireExactSignedMessageAction(w, r) {
+		return
+	}
+	replyEventID := chi.URLParam(r, "reply_event_id")
+	transportStore, ok := s.store.(store.FederatedPipelineStore)
+	if !ok {
+		writeCanonicalMessageNotFound(w, replyEventID)
+		return
+	}
+	event, err := transportStore.GetPipelineTransport(r.Context(), replyEventID)
+	if err != nil || event == nil || event.EventKind != "result" ||
+		event.SourceAgentID != middleware.ContextAgentID(r.Context()) {
+		writeCanonicalMessageNotFound(w, replyEventID)
+		return
+	}
+	transportStatus := event.State
+	if transportStatus == "pending" {
+		transportStatus = "queued"
+	}
+	response := map[string]any{
+		"reply_event_id":   replyEventID,
+		"scope":            "federated",
+		"reply_status":     transportStatus,
+		"transport_status": transportStatus,
+		"created_at":       event.CreatedAt,
+	}
+	if event.DeliveredAt != nil {
+		response["delivered_at"] = event.DeliveredAt
+	}
+	writeJSON(w, http.StatusOK, response)
+}

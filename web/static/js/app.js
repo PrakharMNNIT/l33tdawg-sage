@@ -13,7 +13,7 @@ import { mountMriBrain } from './mri-brain.js';
 import { restartBaselineBootID, requestedRestartIsReady } from './restart-proof.js';
 import { buildUpdateBanner } from './update-banner.js';
 import { computeReorderedColumn, applyColumnOrder } from './task-reorder.js';
-import { normalizeFederationJoinState } from './federation-flow.js';
+import { createFederationJoinScanLifecycle, normalizeFederationJoinState } from './federation-flow.js';
 import { buildBrainDomainInventory } from './domain-inventory.js';
 import { enqueueGovernedTransfer, runWithGovernanceCooldown } from './governance-retry.js';
 import {
@@ -46,6 +46,22 @@ import {
     normalizeFederationRoutePlan,
 } from './federation-route-state.js';
 import { federationPeerAgentCompatibility } from './federation-peer-capabilities.js';
+import {
+    ACCESS_CONTROL_TABS,
+    accessControlHash,
+    accessControlDisplayNameDirty,
+    accessControlModalInertTargets,
+    accessControlNavigationSnapshot,
+    accessControlRouteState,
+    confirmAccessControlHashNavigation,
+    createAccessControlHistoryNavigator,
+    discardedAccessControlDraft,
+    filterSortAccessAgents,
+    filterSortAccessGroups,
+    filterSortFederatedAgents,
+    protectAccessControlTransition,
+    registerAccessControlNavigationGuard,
+} from './access-controls-ui.js';
 
 const { h, render, createContext, Fragment } = preact;
 const { useState, useEffect, useRef, useLayoutEffect, useCallback, useContext } = preactHooks;
@@ -57,7 +73,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.17';
+const SAGE_VERSION = 'v11.18.0';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -207,7 +223,7 @@ function ConfirmationDialogHost() {
 // Accessible modal behavior shared by the setup flows. `active` lets a parent
 // component temporarily return a child modal without keeping stale listeners or
 // focus ownership. The dialog branch, not the whole app, stays interactive.
-function useModalDialog(onRequestClose, active = true) {
+function useModalDialog(onRequestClose, active = true, dialogOwnsOverlay = false) {
     const dialogRef = useRef(null);
     const closeRef = useRef(onRequestClose);
     closeRef.current = onRequestClose;
@@ -225,7 +241,16 @@ function useModalDialog(onRequestClose, active = true) {
             // portalled directly under #app. Inert every sibling along the full
             // ancestor path so controls in that same page branch are hidden too,
             // while no ancestor containing the modal itself becomes inert.
-            let branch = overlay;
+            const accessTargets = dialogOwnsOverlay
+                ? accessControlModalInertTargets(dialog, app)
+                : null;
+            if (accessTargets) {
+                for (const child of accessTargets) {
+                    inerted.push([child, child.inert]);
+                    child.inert = true;
+                }
+            }
+            let branch = dialogOwnsOverlay ? app : overlay;
             while (branch && branch !== app) {
                 const parent = branch.parentElement;
                 if (!parent) break;
@@ -279,7 +304,7 @@ function useModalDialog(onRequestClose, active = true) {
             inerted.forEach(([child, wasInert]) => { child.inert = wasInert; });
             if (origin && origin.isConnected) origin.focus();
         };
-    }, [active]);
+    }, [active, dialogOwnsOverlay]);
 
     return dialogRef;
 }
@@ -8911,15 +8936,24 @@ function AppV23AccessControl() {
         onDirectoryChanged = null,
         onReviewQueueChanged = null,
     } = arguments[0] || {};
-    const routeQuery = new URLSearchParams((window.location.hash.split('?')[1] || ''));
-    const requestedLocalAgentID = routeQuery.get('agent') || '';
-    const focusFederatedInbox = routeQuery.get('inbox') === '1';
-    const requestedRemoteChainID = routeQuery.get('remote_chain') || '';
-    const requestedRemoteAgentID = routeQuery.get('remote_agent') || '';
+    const initialRoute = accessControlRouteState(window.location.hash);
+    const requestedLocalAgentID = initialRoute.tab === 'agents' ? initialRoute.item : '';
+    const focusFederatedInbox = initialRoute.inbox;
+    const requestedRemoteChainID = initialRoute.remoteChain;
+    const requestedRemoteAgentID = initialRoute.remoteAgent;
     const [state, setState] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [selectedID, setSelectedID] = useState(requestedLocalAgentID);
+    const [activeAccessTab, setActiveAccessTab] = useState(initialRoute.tab);
+    const [selectedGroupID, setSelectedGroupID] = useState(initialRoute.tab === 'groups' ? initialRoute.item : '');
+    const [federationEditorOpen, setFederationEditorOpen] = useState(
+        initialRoute.tab === 'federation' && !!initialRoute.item,
+    );
+    const [accessQuery, setAccessQuery] = useState('');
+    const [accessSort, setAccessSort] = useState('name');
+    const accessTabRefs = useRef([]);
+    const accessReturnFocusRef = useRef(null);
     const [draft, setDraft] = useState(null);
     const [displayNameDraft, setDisplayNameDraft] = useState('');
     const [renameBusy, setRenameBusy] = useState(false);
@@ -8991,10 +9025,9 @@ function AppV23AccessControl() {
             if (reviewQueueOnly && onReviewQueueChanged) {
                 onReviewQueueChanged(candidates.map(agent => agent.agent_id));
             }
-            const editable = candidates[0];
             setSelectedID(current => current && candidates.some(a => a.agent_id === current)
                 ? current
-                : (editable?.agent_id || ''));
+                : (reviewQueueOnly ? (candidates[0]?.agent_id || '') : ''));
         } catch (e) {
             setError(e.message || 'Could not load consensus access controls.');
         } finally {
@@ -9071,7 +9104,7 @@ function AppV23AccessControl() {
                     ? requestedKey
                     : current && next.some(item => item.key === current)
                         ? current
-                        : (next[0]?.key || ''));
+                        : '');
                 setLinkedError('');
             } catch (e) {
                 if (!cancelled) {
@@ -9099,7 +9132,11 @@ function AppV23AccessControl() {
         ? pendingEnrollmentAgents
         : agents.filter(agent => !pendingEnrollmentAgents.some(pending => pending.agent_id === agent.agent_id));
     const selected = localAgents.find(a => a.agent_id === selectedID) || null;
+    const selectedGroup = (state?.groups || []).find(group => group.group_id === selectedGroupID) || null;
     const selectedRemote = remoteCandidates.find(item => item.key === selectedRemoteKey) || null;
+    const visibleAccessAgents = filterSortAccessAgents(localAgents, accessQuery, accessSort);
+    const visibleAccessGroups = filterSortAccessGroups(state?.groups || [], accessQuery, accessSort);
+    const visibleFederatedAgents = filterSortFederatedAgents(remoteCandidates, accessQuery, accessSort);
     const selectedRemoteMaxClearance = Number(selectedRemote?.max_clearance ?? 4);
     const messageLocalCandidates = localAgents.filter(agent =>
         agent.enrollment_active && !agent.needs_reauthorization &&
@@ -9258,6 +9295,109 @@ function AppV23AccessControl() {
         setDisplayNameDraft(selected?.name || '');
     }, [selected?.agent_id, selected?.name]);
 
+    const policyDirty = !!selected && !!draft && appV23PolicyChanged(selected, draft);
+    const displayNameDirty = !!selected &&
+        accessControlDisplayNameDirty(selected.name, displayNameDraft);
+    const accessEditorDirty = policyDirty || displayNameDirty;
+    const activeAccessItem = activeAccessTab === 'agents'
+        ? selectedID
+        : activeAccessTab === 'groups' ? selectedGroupID : selectedRemoteKey;
+    const activeAccessDrawerOpen = activeAccessTab === 'federation'
+        ? federationEditorOpen
+        : !!activeAccessItem;
+    const discardAccessEditorChanges = () => {
+        const reset = discardedAccessControlDraft(
+            selected ? appV23PolicyDraft(selected) : null,
+            selected?.name || '',
+        );
+        setDraft(reset.draft);
+        setDisplayNameDraft(reset.displayNameDraft);
+    };
+    const confirmAccessNavigation = async () => {
+        if (!accessEditorDirty) return true;
+        const confirmed = await showConfirmation(
+            'Discard the unsaved agent changes before leaving this editor?',
+            { title: 'Discard unsaved changes?', confirmLabel: 'Discard changes', tone: 'danger' },
+        );
+        if (confirmed) discardAccessEditorChanges();
+        return confirmed;
+    };
+    const closeAccessDrawer = async () => {
+        if (!await confirmAccessNavigation()) return;
+        if (activeAccessTab === 'agents') setSelectedID('');
+        if (activeAccessTab === 'groups') setSelectedGroupID('');
+        if (activeAccessTab === 'federation') {
+            setSelectedRemoteKey('');
+            setFederationEditorOpen(false);
+        }
+        requestAnimationFrame(() => accessReturnFocusRef.current?.focus?.());
+    };
+    const chooseAccessTab = async tab => {
+        if (tab === activeAccessTab || !ACCESS_CONTROL_TABS.includes(tab)) return false;
+        if (!await confirmAccessNavigation()) return false;
+        setActiveAccessTab(tab);
+        setAccessQuery('');
+        setAccessSort('name');
+        return true;
+    };
+    const onAccessTabKeyDown = event => {
+        const index = ACCESS_CONTROL_TABS.indexOf(activeAccessTab);
+        let next = index;
+        if (event.key === 'ArrowRight') next = (index + 1) % ACCESS_CONTROL_TABS.length;
+        else if (event.key === 'ArrowLeft') next = (index - 1 + ACCESS_CONTROL_TABS.length) % ACCESS_CONTROL_TABS.length;
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = ACCESS_CONTROL_TABS.length - 1;
+        else return;
+        event.preventDefault();
+        chooseAccessTab(ACCESS_CONTROL_TABS[next]).then(changed => {
+            if (changed) accessTabRefs.current[next]?.focus();
+        });
+    };
+    const accessDrawerRef = useModalDialog(
+        closeAccessDrawer,
+        !reviewQueueOnly && activeAccessDrawerOpen,
+        true,
+    );
+
+    useEffect(() => {
+        if (reviewQueueOnly) return;
+        const next = accessControlHash({
+            tab: activeAccessTab,
+            item: activeAccessItem,
+            inbox: activeAccessTab === 'agents' && focusFederatedInbox,
+        });
+        window.history.replaceState(window.history.state, '', `#${next}`);
+    }, [reviewQueueOnly, activeAccessTab, activeAccessItem, focusFederatedInbox]);
+    useEffect(() => {
+        if (!accessEditorDirty) return undefined;
+        const guard = event => {
+            event.preventDefault();
+            event.returnValue = '';
+        };
+        window.addEventListener('beforeunload', guard);
+        return () => window.removeEventListener('beforeunload', guard);
+    }, [accessEditorDirty]);
+    useEffect(() => {
+        if (reviewQueueOnly) return undefined;
+        return registerAccessControlNavigationGuard({
+            confirmDiscard: confirmAccessNavigation,
+            currentHash: () => `#${accessControlHash({
+                tab: activeAccessTab,
+                item: activeAccessItem,
+                inbox: activeAccessTab === 'agents' && focusFederatedInbox,
+            })}`,
+        });
+    }, [
+        reviewQueueOnly,
+        accessEditorDirty,
+        selected?.agent_id,
+        selected?.enrollment_revision,
+        selected?.role_revision,
+        selected?.name,
+        activeAccessTab,
+        activeAccessItem,
+        focusFederatedInbox,
+    ]);
     const mutateDraft = (patch) => setDraft(current => ({ ...(current || {}), ...patch }));
     const beginMutation = (key) => {
         if (mutationLockRef.current) return false;
@@ -9474,6 +9614,7 @@ function AppV23AccessControl() {
             setNewGroupName('');
             showToast(`Access Group “${name}” created on-chain.`, 'success');
             await load();
+            setSelectedGroupID(groupID);
         } catch (e) {
             if (mutationMayHaveCommitted(e)) {
                 await holdPendingConfirmation(e.message);
@@ -9492,6 +9633,7 @@ function AppV23AccessControl() {
         const plan = appV23DirectLocalGroupPlan(state?.groups || [], source, target);
         clearLocalDrag();
         if (!plan || groupBusy || !mutationReady) return;
+        if (!await protectAccessControlTransition(confirmAccessNavigation)) return;
         if (plan.action === 'existing') {
             showToast(`These agents already share Access Group “${plan.name}”.`, 'info');
             return;
@@ -9512,6 +9654,8 @@ function AppV23AccessControl() {
             }
             showToast(`Access Group “${plan.name}” created on-chain at Read. Each owner keeps full control; widen the group only if its members should also write or modify.`, 'success', 8000);
             await load();
+            setActiveAccessTab('groups');
+            setSelectedGroupID(plan.group_id);
         } catch (e) {
             if (mutationMayHaveCommitted(e)) {
                 await holdPendingConfirmation(e.message);
@@ -9550,6 +9694,7 @@ function AppV23AccessControl() {
             }
             showToast(`Access Group “${group.name}” deleted.`, 'success');
             await load();
+            if (selectedGroupID === group.group_id) setSelectedGroupID('');
         } catch (e) {
             if (mutationMayHaveCommitted(e)) {
                 await holdPendingConfirmation(e.message);
@@ -9874,18 +10019,15 @@ function AppV23AccessControl() {
     const legacyHomeReapproval = legacyProfileNeedsReview && homeReapproval;
     const targetConsentReady = (!selected?.needs_approval && !homeReapproval) || selected?.local_key_available;
     const adminLocalReady = draft?.role !== 'admin' || selected?.local_key_available;
-    const policyDirty = !!selected && !!draft && appV23PolicyChanged(selected, draft);
     const policyCommitNeeded = !!selected?.needs_approval || homeReapproval || policyDirty;
     const saveDisabled = saving || !mutationReady || !targetConsentReady ||
         !adminLocalReady || !draft || !draftProfileSelectable || !policyCommitNeeded;
     const capabilityIndicators = appV23CapabilityIndicators(draft || {});
     const federatedInboxEnabled = appV23FederatedInboxEnabled(draft?.capabilities);
-    const selectLocalAgent = async agentID => {
+    const selectLocalAgent = async (agentID, trigger = null) => {
         if (saving || renameBusy || agentID === selectedID) return;
-        if (policyDirty && !await showConfirmation(
-            'Discard the unsaved policy changes for this agent?',
-            { title: 'Discard policy changes?', confirmLabel: 'Discard changes', tone: 'danger' },
-        )) return;
+        if (!await confirmAccessNavigation()) return;
+        accessReturnFocusRef.current = trigger;
         setSelectedID(agentID);
     };
 
@@ -9971,12 +10113,67 @@ function AppV23AccessControl() {
                 </div>
             `}
 
-            <div class="v23-access-legend" aria-label="Identity and access legend">
-                <span class="local"><i aria-hidden="true"></i> Same-node agents</span>
-                <span class="federated"><i aria-hidden="true">↗</i> Federated read-only links</span>
-            </div>
+            ${!reviewQueueOnly && html`
+                <div class="access-control-tabs" role="tablist" aria-label="Access control areas"
+                    onKeyDown=${onAccessTabKeyDown}>
+                    ${ACCESS_CONTROL_TABS.map((tab, index) => html`
+                        <button role="tab" id=${`access-tab-${tab}`}
+                            ref=${element => { accessTabRefs.current[index] = element; }}
+                            aria-selected=${activeAccessTab === tab}
+                            aria-controls=${`access-panel-${tab}`}
+                            tabIndex=${activeAccessTab === tab ? 0 : -1}
+                            class=${activeAccessTab === tab ? 'active' : ''}
+                            onClick=${() => chooseAccessTab(tab)}>
+                            <span>${tab[0].toUpperCase()}${tab.slice(1)}</span>
+                            <strong>${tab === 'agents'
+                                ? localAgents.length
+                                : tab === 'groups' ? (state.groups || []).length : remoteCandidates.length}</strong>
+                        </button>
+                    `)}
+                </div>
+                <div class="access-control-summary" role="status">
+                    ${activeAccessTab === 'agents' && html`
+                        <span><strong>${localAgents.filter(agent => !agent.needs_approval && !agent.needs_reauthorization).length}</strong> active</span>
+                        <span><strong>${localAgents.filter(agent => agent.needs_approval || agent.needs_reauthorization).length}</strong> need review</span>
+                        <span>Roles, profiles, clearance, owned home domains, and inbox restrictions commit atomically.</span>
+                    `}
+                    ${activeAccessTab === 'groups' && html`
+                        <span><strong>${(state.groups || []).length}</strong> local groups</span>
+                        <span>Group Write/Modify applies only among local members. Every owner keeps full control of its own domains.</span>
+                    `}
+                    ${activeAccessTab === 'federation' && html`
+                        <span><strong>${remoteConnections.filter(connection => connection.status !== 'revoked').length}</strong> connected SAGEs</span>
+                        <span>Active ordinary agents may live-read peer-exported domains by default unless explicitly denied. Remote Write is reserved and denied; Linked readers and messaging never enable it.</span>
+                    `}
+                </div>
+                <div class="v23-access-legend" aria-label="Identity type legend">
+                    <span class="local"><i aria-hidden="true"></i>Local agent</span>
+                    <span class="federated"><i aria-hidden="true"></i>Federated agent</span>
+                </div>
+                <div class="access-control-toolbar" role="search" aria-label=${`Find and sort ${activeAccessTab}`}>
+                    <label>
+                        <span class="sr-only">Search ${activeAccessTab}</span>
+                        <input type="search" value=${accessQuery} placeholder=${`Search ${activeAccessTab}`}
+                            onInput=${event => setAccessQuery(event.currentTarget.value)} />
+                    </label>
+                    <label>
+                        <span>Sort</span>
+                        <select value=${accessSort} onChange=${event => setAccessSort(event.currentTarget.value)}>
+                            <option value="name">Name</option>
+                            ${activeAccessTab === 'agents' && html`<option value="role">Role</option><option value="status">Status</option>`}
+                            ${activeAccessTab === 'groups' && html`<option value="members">Member count</option><option value="authority">Authority</option>`}
+                            ${activeAccessTab === 'federation' && html`<option value="peer">Connected SAGE</option><option value="status">Link status</option>`}
+                        </select>
+                    </label>
+                    <span>${activeAccessTab === 'agents'
+                        ? visibleAccessAgents.length
+                        : activeAccessTab === 'groups' ? visibleAccessGroups.length : visibleFederatedAgents.length} shown</span>
+                </div>
+            `}
 
-            <div class="v23-access-grid">
+            ${(reviewQueueOnly || activeAccessTab === 'agents') && html`
+            <div class="v23-access-grid" id="access-panel-agents" role=${reviewQueueOnly ? undefined : 'tabpanel'}
+                aria-labelledby=${reviewQueueOnly ? undefined : 'access-tab-agents'}>
                 <div class="v23-agent-rail ${dragSourceGroupID ? 'remove-drop-ready' : ''}" aria-label="Local agents"
                     onDragOver=${e => {
                         if (readLocalDrag(e).sourceGroupID) e.preventDefault();
@@ -9998,12 +10195,13 @@ function AppV23AccessControl() {
                             Drop here to remove this agent from this Access Group. Its own domains and access from any other groups remain unchanged.
                         </div>
                     `}
-                    ${localAgents.map(agent => html`
-                        <button class="v23-agent-choice local ${selectedID === agent.agent_id ? 'selected' : ''} ${dragAgentID && dragAgentID !== agent.agent_id && agent.enrollment_active ? 'drop-ready' : ''}"
+                    <div class="access-control-list">
+                    ${(reviewQueueOnly ? localAgents : visibleAccessAgents).map(agent => html`
+                        <button class="access-control-list-row v23-agent-choice local ${selectedID === agent.agent_id ? 'selected' : ''} ${dragAgentID && dragAgentID !== agent.agent_id && agent.enrollment_active ? 'drop-ready' : ''}"
                             aria-current=${selectedID === agent.agent_id ? 'true' : undefined}
                             disabled=${saving}
                             draggable=${agent.enrollment_active && mutationReady && !groupBusy && !saving}
-                            onClick=${() => selectLocalAgent(agent.agent_id)}
+                            onClick=${event => selectLocalAgent(agent.agent_id, event.currentTarget)}
                             onDragStart=${event => {
                                 event.stopPropagation();
                                 startLocalDrag(event, agent.agent_id);
@@ -10035,10 +10233,19 @@ function AppV23AccessControl() {
                                 : html`<span class="v23-state-chip active">Active</span>`}
                         </button>
                     `)}
-                    ${localAgents.length === 0 && html`<p class="v23-empty">No activated local agents.</p>`}
+                    ${(reviewQueueOnly ? localAgents : visibleAccessAgents).length === 0 && html`
+                        <p class="v23-empty">${localAgents.length
+                            ? 'No active agents match this search.'
+                            : 'No activated local agents.'}</p>
+                    `}
+                    </div>
                 </div>
 
-                <div class="v23-policy-panel">
+                <div class="v23-policy-panel ${!reviewQueueOnly && selected ? 'access-control-drawer open' : ''}"
+                    ref=${accessDrawerRef} role=${!reviewQueueOnly && selected ? 'dialog' : undefined}
+                    aria-modal=${!reviewQueueOnly && selected ? 'true' : undefined}
+                    aria-label=${!reviewQueueOnly && selected ? `Edit ${agentDisplayName(selected)}` : undefined}
+                    tabIndex=${!reviewQueueOnly && selected ? -1 : undefined}>
                     ${selected && draft ? html`
                         <div class="v23-policy-title">
                             <div>
@@ -10049,6 +10256,10 @@ function AppV23AccessControl() {
                                 ? html`<span class="v23-review-badge">Admin suspended</span>`
                                 : selected.needs_approval && !legacyProfileNeedsReview &&
                                     html`<span class="v23-review-badge">Pending review</span>`}
+                            ${!reviewQueueOnly && html`
+                                <button type="button" class="access-control-drawer-close"
+                                    aria-label="Close agent editor" onClick=${closeAccessDrawer}>×</button>
+                            `}
                         </div>
 
                         <form class="v23-agent-name-editor" onSubmit=${event => { event.preventDefault(); saveDisplayName(); }}>
@@ -10241,8 +10452,10 @@ function AppV23AccessControl() {
                     ` : html`<div class="v23-empty large">Select a local agent to review its policy.</div>`}
                 </div>
             </div>
+            `}
 
-            <div class="v23-groups-section">
+            ${!reviewQueueOnly && activeAccessTab === 'groups' && html`
+            <div class="v23-groups-section" id="access-panel-groups" role="tabpanel" aria-labelledby="access-tab-groups">
                 <div class="v23-section-heading wide">
                     <div>
                         <div class="v23-eyebrow">Consensus Access Groups</div>
@@ -10256,6 +10469,34 @@ function AppV23AccessControl() {
                             placeholder="New group name" />
                         <button type="submit" class="btn" disabled=${!mutationReady || !!groupBusy || !newGroupName.trim()}>Create group</button>
                     </form>
+                </div>
+
+                <div class="access-control-list" aria-label="Local Access Groups">
+                    ${visibleAccessGroups.map(group => html`
+                        <button class="access-control-list-row ${selectedGroupID === group.group_id ? 'selected' : ''}"
+                            aria-current=${selectedGroupID === group.group_id ? 'true' : undefined}
+                            onClick=${event => {
+                                accessReturnFocusRef.current = event.currentTarget;
+                                setSelectedGroupID(group.group_id);
+                            }}
+                            onDragOver=${event => event.preventDefault()}
+                            onDrop=${event => { event.preventDefault(); dropIntoGroup(group, event); }}>
+                            <span class="access-control-list-primary">
+                                <strong>${group.name}</strong>
+                                <small>${group.group_id}</small>
+                            </span>
+                            <span>${group.members.length} member${group.members.length === 1 ? '' : 's'}</span>
+                            <span class="v23-state-chip active">
+                                ${APPV26_GROUP_AUTHORITY_OPTIONS.find(option => option.key === (group.member_authority || 'read'))?.name || 'Read'}
+                            </span>
+                            <span aria-hidden="true">›</span>
+                        </button>
+                    `)}
+                    ${visibleAccessGroups.length === 0 && html`
+                        <div class="v23-empty group">${(state.groups || []).length
+                            ? 'No Access Groups match this search.'
+                            : 'No local groups yet. Create one, then add approved local agents.'}</div>
+                    `}
                 </div>
 
                 <div class="v23-agent-tray" aria-label="Approved local agents available for groups">
@@ -10272,8 +10513,12 @@ function AppV23AccessControl() {
                     `)}
                 </div>
 
-                <div class="v23-group-grid">
-                    ${(state.groups || []).map(group => html`
+                <div class="v23-group-grid access-control-drawer ${selectedGroup ? 'open' : ''}"
+                    ref=${accessDrawerRef} role=${selectedGroup ? 'dialog' : undefined}
+                    aria-modal=${selectedGroup ? 'true' : undefined}
+                    aria-label=${selectedGroup ? `Edit Access Group ${selectedGroup.name}` : undefined}
+                    tabIndex=${selectedGroup ? -1 : undefined}>
+                    ${(selectedGroup ? [selectedGroup] : []).map(group => html`
                         <article key=${`${group.group_id}:${group.revision}`} class="v23-group-card local ${dragAgentID ? 'drop-ready drop-local' : ''} ${dragRemoteKey ? 'drop-ready drop-linked' : ''}"
                             aria-label=${`Local group ${group.name}`}
                             onDragOver=${e => e.preventDefault()}
@@ -10300,6 +10545,8 @@ function AppV23AccessControl() {
                                     aria-label=${`Delete Access Group ${group.name}`}
                                     disabled=${!!groupBusy || !mutationReady}
                                     onClick=${() => deleteGroup(group)}>×</button>
+                                <button class="access-control-drawer-close" type="button"
+                                    aria-label="Close Access Group editor" onClick=${closeAccessDrawer}>×</button>
                             </div>
                             <label class="v23-field v23-group-authority">
                                 <span>Members may</span>
@@ -10369,9 +10616,6 @@ function AppV23AccessControl() {
                             </details>
                         </article>
                     `)}
-                    ${(state.groups || []).length === 0 && html`
-                        <div class="v23-empty group">No local groups yet. Create one, then add approved local agents.</div>
-                    `}
                 </div>
             </div>
 
@@ -10420,7 +10664,46 @@ function AppV23AccessControl() {
                     </div>
                 </div>
             `}
+            `}
 
+            ${!reviewQueueOnly && activeAccessTab === 'federation' && html`
+            <div id="access-panel-federation" role="tabpanel" aria-labelledby="access-tab-federation">
+                <div class="access-control-list" aria-label="Federated agents">
+                    ${visibleFederatedAgents.map(remote => html`
+                        <button class="access-control-list-row ${selectedRemoteKey === remote.key ? 'selected' : ''}"
+                            aria-current=${selectedRemoteKey === remote.key ? 'true' : undefined}
+                            onClick=${event => {
+                                accessReturnFocusRef.current = event.currentTarget;
+                                setSelectedRemoteKey(remote.key);
+                                setFederationEditorOpen(true);
+                            }}>
+                            <span class="access-control-list-primary">
+                                <strong>↗ ${remote.label}</strong>
+                                <small>${remote.remote_agent_id.slice(0, 12)}@${remote.remote_chain_id}</small>
+                            </span>
+                            <span>${remote.peer_name}</span>
+                            <span class="v23-state-chip ${remote.source === 'existing_link' ? 'active' : 'pending'}">
+                                ${remote.source === 'existing_link' ? 'Linked' : 'Available'}
+                            </span>
+                            <span aria-hidden="true">›</span>
+                        </button>
+                    `)}
+                    ${visibleFederatedAgents.length === 0 && html`
+                        <div class="v23-empty">No advertised federated agents match this view.</div>
+                    `}
+                </div>
+                <button class="btn" onClick=${event => {
+                    accessReturnFocusRef.current = event.currentTarget;
+                    setFederationEditorOpen(true);
+                }}>Manage an exact federated identity</button>
+            </div>
+            <div class="access-control-federation-drawer access-control-drawer ${federationEditorOpen ? 'open' : ''}"
+                ref=${accessDrawerRef} role=${federationEditorOpen ? 'dialog' : undefined}
+                aria-modal=${federationEditorOpen ? 'true' : undefined}
+                aria-label=${federationEditorOpen ? 'Federation access editor' : undefined}
+                tabIndex=${federationEditorOpen ? -1 : undefined}>
+                <button class="access-control-drawer-close" type="button"
+                    aria-label="Close federation access editor" onClick=${closeAccessDrawer}>×</button>
             <div class="v23-linked-readers">
                 <div class="v23-linked-intro">
                     <div class="v23-eyebrow">Federation · separate compartment</div>
@@ -10702,6 +10985,8 @@ function AppV23AccessControl() {
                     </div>
                 `}
             </div>
+            </div>
+            `}
         </section>
     `;
 }
@@ -10786,11 +11071,10 @@ function FederatedAgentDirectory() {
     if (loading || remoteAgents.length === 0) return null;
 
     const openPermissions = agent => {
-        const query = new URLSearchParams({
-            remote_chain: agent.remote_chain_id,
-            remote_agent: agent.remote_agent_id,
+        window.location.hash = accessControlHash({
+            tab: 'federation',
+            item: `${agent.remote_chain_id}\u0000${agent.remote_agent_id}`,
         });
-        window.location.hash = `/access?${query.toString()}`;
     };
 
     return html`
@@ -14978,6 +15262,7 @@ function App() {
     const [authState, setAuthState] = useState('loading'); // loading | login | ready
     const [isEncrypted, setIsEncrypted] = useState(false);
     const [page, setPage] = useState('brain');
+    const [hashRouteRevision, setHashRouteRevision] = useState(0);
     const [sseConnected, setSseConnected] = useState(false);
     const [showHelp, setShowHelp] = useState(false);
     const [showOnboarding, setShowOnboarding] = useState(false);
@@ -15015,6 +15300,7 @@ function App() {
         try { return localStorage.getItem('sage-tooltips') !== '0'; } catch (e) { return true; }
     });
     const sseRef = useRef(null);
+    const hashNavigatorRef = useRef(null);
     const [textSize, setTextSize] = useState(() => {
         try { return localStorage.getItem('sage-text-size') || 'medium'; } catch (e) { return 'medium'; }
     });
@@ -15162,26 +15448,50 @@ function App() {
         sseRef.current = sse;
         sse.on('connection', (data) => setSseConnected(data.connected));
 
-        // Hash routing
-        function onHash() {
-            const hash = (window.location.hash.slice(1) || '/').split('?')[0]; // strip ?query (e.g. /search?agent=…) for page matching
+        // Hash routing. Every same-document entry gets a stable position so a
+        // cancelled Back/Forward or direct hash push can be reversed without
+        // replacing (and therefore duplicating or destroying) either entry.
+        function applyHash(requestedHash) {
+            const hash = (requestedHash.slice(1) || '/').split('?')[0]; // strip ?query (e.g. /search?agent=…) for page matching
             if (hash === '/overview') setPage('overview');
             else if (hash === '/search') setPage('search');
             else if (hash === '/tasks') setPage('tasks');
             else if (hash === '/settings') setPage('settings');
             else if (hash === '/import') setPage('import');
             else if (hash === '/network') setPage('network');
-            else if (hash === '/access') setPage('access');
+            else if (hash === '/access') {
+                setPage('access');
+                setHashRouteRevision(current => current + 1);
+            }
             else if (hash === '/pipeline') setPage('tasks'); // legacy deep-link: the message bus lives in Tasks > Messages now
             else if (hash === '/federation') setPage('federation');
             else setPage('brain');
         }
+        const navigator = createAccessControlHistoryNavigator({
+            getHash: () => window.location.hash || '#/',
+            getState: () => window.history.state,
+            replaceState: (state, hash) => window.history.replaceState(state, '', hash),
+            pushState: (state, hash) => window.history.pushState(state, '', hash),
+            go: delta => window.history.go(delta),
+            confirmNavigation: async requestedHash => {
+                const accessNavigation = accessControlNavigationSnapshot();
+                if (!accessNavigation.active || requestedHash === accessNavigation.currentHash) return true;
+                return confirmAccessControlHashNavigation();
+            },
+            applyHash,
+        });
+        hashNavigatorRef.current = navigator;
+        const onHash = () => { navigator.handleHashChange(); };
+        const onPop = event => { navigator.handlePopState(event.state); };
         window.addEventListener('hashchange', onHash);
-        onHash();
+        window.addEventListener('popstate', onPop);
+        applyHash(window.location.hash || '#/');
 
         return () => {
             sse.disconnect();
             window.removeEventListener('hashchange', onHash);
+            window.removeEventListener('popstate', onPop);
+            if (hashNavigatorRef.current === navigator) hashNavigatorRef.current = null;
         };
     }, [authState]);
 
@@ -15220,7 +15530,12 @@ function App() {
     }
 
     function navigate(p) {
-        window.location.hash = p === 'brain' ? '/' : '/' + p;
+        const requestedHash = p === 'brain' ? '#/' : '#/' + p;
+        if (hashNavigatorRef.current) {
+            hashNavigatorRef.current.navigate(requestedHash);
+        } else {
+            window.location.hash = requestedHash;
+        }
     }
 
     function openUpdateSettings() {
@@ -15319,7 +15634,7 @@ function App() {
             ${page === 'tasks' && html`<${TasksPage} sse=${sseRef.current} />`}
             ${page === 'import' && html`<${ImportPage} sse=${sseRef.current} />`}
             ${page === 'network' && html`<${NetworkPage} sse=${sseRef.current} />`}
-            ${page === 'access' && html`<${NetworkPage} sse=${sseRef.current} accessMode=${true} />`}
+            ${page === 'access' && html`<${NetworkPage} key=${`access-route-${hashRouteRevision}`} sse=${sseRef.current} accessMode=${true} />`}
             ${page === 'federation' && html`<${FederationPage} />`}
             ${page === 'settings' && html`<${SettingsPage} onRunSetup=${() => setShowOnboarding(true)} requestedTab=${settingsTabRequest} />`}
         </div>
@@ -15724,6 +16039,13 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
     const [pollNote, setPollNote] = useState('');
     const [endedReason, setEndedReason] = useState('');
     const confirmInFlight = useRef(false);
+    const scanLifecycle = useRef(null);
+    if (!scanLifecycle.current) {
+        scanLifecycle.current = createFederationJoinScanLifecycle(
+            (uri, currentEndpoint, signal) => fedGuestScan(uri, currentEndpoint, signal),
+        );
+    }
+    useEffect(() => () => scanLifecycle.current?.abort(), []);
 
     useEffect(() => {
         requestAnimationFrame(() => {
@@ -15746,7 +16068,7 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
         setBusy(true); setErr('');
         try {
             if (source !== 'camera') setTier4(true);
-            const r = await fedGuestScan(uri, endpoint);
+            const r = await scanLifecycle.current.run(uri, endpoint);
             setScan(r);
             const route = normalizeFederationRoutePlan(
                 r && r.route
@@ -15762,7 +16084,9 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
             if (route.state === 'relay') setTier4(true);
             setStep('return');
         }
-        catch (e) { fail(e, 'route_failure'); }
+        catch (e) {
+            if (e?.name !== 'AbortError') fail(e, 'route_failure');
+        }
         setBusy(false);
     };
     const doRequest = async () => {

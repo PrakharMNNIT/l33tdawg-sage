@@ -138,12 +138,8 @@ func runUpgradePreflight(args []string) error {
 		fmt.Printf("  %s\n", firstProblem)
 		fmt.Println("  app-v22 and app-v23 refuse to be proposed, approved, activated, or restored")
 		fmt.Println("  without complete, strictly ordered predecessor evidence. The climb will stop")
-		fmt.Println("  at app-v21 and fail closed there.")
-		fmt.Println()
-		fmt.Println("  This is not repairable by proposing again: the evidence is missing from")
-		fmt.Println("  consensus storage, and synthesized records are rejected. Restore a complete")
-		fmt.Println("  stopped-node backup taken before the gap, or open an issue with this output —")
-		fmt.Println("  do NOT delete the data directory, that discards all canonical history.")
+		fmt.Println("  safely at app-v21 and fail closed there.")
+		printLadderFailureRecovery(rungs)
 	case adminErr == nil && reached < 23 && len(admins) == 0:
 		// app-v23 elects its singleton Root from the legacy Admin roster. With
 		// an empty roster there is nobody to promote, so the activation cannot
@@ -176,6 +172,47 @@ func runUpgradePreflight(args []string) error {
 	fmt.Println()
 	fmt.Println("Full procedure: docs/UPGRADING.md")
 	return nil
+}
+
+// printLadderFailureRecovery keeps preflight's operator guidance aligned with
+// the app-v22 lineage-repair contract. Missing canonical records can be
+// reconstructed only through the bounded app-v21 doctor/verify/quorum path.
+// A record that is already present but invalid is deliberately outside that
+// path: repair may never overwrite persisted consensus evidence.
+func printLadderFailureRecovery(rungs []ladderRung) {
+	presentInvalid := false
+	missingCanonical := false
+	for _, rung := range rungs {
+		if rung.NotYet || rung.Problem == "" {
+			continue
+		}
+		if rung.Present {
+			presentInvalid = true
+		}
+		if !rung.Present && strings.HasPrefix(rung.Problem, "missing canonical applied ") {
+			missingCanonical = true
+		}
+	}
+
+	fmt.Println()
+	switch {
+	case presentInvalid:
+		fmt.Println("  At least one canonical record is present but invalid. Lineage repair is")
+		fmt.Println("  forbidden from overwriting present consensus evidence. Restore a complete")
+		fmt.Println("  stopped-node backup from before the invalid record; this is restore-only.")
+	case missingCanonical:
+		fmt.Println("  Missing canonical records are recoverable only through the explicit app-v21")
+		fmt.Println("  lineage workflow. First take and retain a complete stopped-node backup. Then,")
+		fmt.Println("  with the chain exactly at app-v21, run `sage-gui upgrade lineage doctor`, have")
+		fmt.Println("  every validator run `sage-gui upgrade lineage verify` on the exact manifest")
+		fmt.Println("  and compare manifest_digest, then use the explicit quorum proposal/vote flow.")
+		fmt.Println("  Automatic voting is disabled for lineage repair, including single-validator")
+		fmt.Println("  chains. Do not synthesize records or delete the data directory.")
+	default:
+		fmt.Println("  This evidence could not be read or validated. Do not continue the climb or")
+		fmt.Println("  mutate the data directory; retain a stopped-node backup and investigate the")
+		fmt.Println("  reported storage error before choosing any recovery path.")
+	}
 }
 
 // openConsensusStoreForInspection opens the chain database for reading.

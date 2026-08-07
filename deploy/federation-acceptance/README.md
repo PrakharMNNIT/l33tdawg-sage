@@ -1,4 +1,4 @@
-# v11.17.17 federation Docker acceptance
+# v11.18.0 federation Docker acceptance
 
 This harness gives two SAGE personal nodes separate persisted homes, separate
 Docker edge networks, and one self-hosted natter relay. A temporary third
@@ -9,7 +9,7 @@ default (`FED_NODE_A_PORT` / `FED_NODE_B_PORT` override them).
 Run the reproducible topology smoke test with:
 
 ```sh
-FED_ACCEPTANCE_STATE=/tmp/sage-v111717-fed \
+FED_ACCEPTANCE_STATE=/tmp/sage-v111800-fed \
   deploy/federation-acceptance/run.sh topology
 ```
 
@@ -30,7 +30,9 @@ diagnostic overrides:
   `p2p_peers` fixture for a paired node, restart it, and assert the peer is
   retained and upgraded to a current non-expired generation-bound route.
 - `FED_ACCEPTANCE_FLOW_COMMAND`: replace the built-in actual MCP stdio flow and
-  prove `sage_find_agent` -> `sage_message_send`; stop the recipient before
+  prove `sage_find_agent` -> direct unique registered-name `sage_message_send`,
+  canonical remote delivery, and the replier-owned immutable reply-event status;
+  then stop the recipient before
   delivery; restart it; prove `sage_inbox` persistence, read/claim,
   `sage_message_reply`, and `sage_message_status` on the sender. The send must
   omit `ttl_minutes`, wait longer than the old 60-minute default in a nightly
