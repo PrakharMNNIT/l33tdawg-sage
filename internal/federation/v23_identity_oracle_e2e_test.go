@@ -99,9 +99,11 @@ func signV23QueryAs(
 		"tags": request.Tags, "federated": true,
 		"federate_chains": plan.Destinations,
 		"federation_context": map[string]any{
-			"source_chain_id":    plan.SourceChainID,
-			"agreement_bindings": plan.AgreementBindings,
-			"query_challenges":   plan.QueryChallenges,
+			"source_chain_id":            plan.SourceChainID,
+			"agreement_bindings":         plan.AgreementBindings,
+			"query_challenges":           plan.QueryChallenges,
+			"authorization_models":       plan.AuthorizationModels,
+			"authorization_attestations": plan.AuthorizationAttestations,
 		},
 	}
 	if request.EmbeddingProvider != "" {
@@ -128,6 +130,8 @@ func signV23QueryAs(
 	}
 	request.PlanAgreementBindings = plan.AgreementBindings
 	request.PlanChallenges = plan.QueryChallenges
+	request.PlanAuthorizationModels = plan.AuthorizationModels
+	request.PlanAuthorizationAttestations = plan.AuthorizationAttestations
 	return request
 }
 

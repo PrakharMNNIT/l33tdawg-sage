@@ -1,8 +1,8 @@
-name: sage-v111716-federation
+name: sage-v111717-federation
 
 services:
   relay:
-    image: sage-v111716-natter:local
+    image: sage-v111717-natter:local
     build:
       context: ../../natter
       dockerfile: ../deploy/federation-acceptance/Dockerfile.natter
@@ -22,12 +22,12 @@ services:
         aliases: [relay]
 
   node-a:
-    image: sage-v111716-node:local
+    image: sage-v111717-node:local
     build:
       context: ../..
       dockerfile: deploy/federation-acceptance/Dockerfile.node
       args:
-        VERSION: v11.17.16-acceptance
+        VERSION: v11.17.17-acceptance
         COMMIT: docker-acceptance
     environment:
       SAGE_HOME: /root/.sage
@@ -44,7 +44,7 @@ services:
       control_a: {}
 
   node-b:
-    image: sage-v111716-node:local
+    image: sage-v111717-node:local
     environment:
       SAGE_HOME: /root/.sage
       SAGE_EMBEDDING_PROVIDER: hash
@@ -61,17 +61,17 @@ services:
 
 networks:
   edge_a:
-    name: sage-v111716-federation-edge-a
+    name: sage-v111717-federation-edge-a
     internal: true
   edge_b:
-    name: sage-v111716-federation-edge-b
+    name: sage-v111717-federation-edge-b
     internal: true
   lan:
-    name: sage-v111716-federation-lan
+    name: sage-v111717-federation-lan
     internal: true
   # Separate host-control bridges keep REST observable without giving the two
   # nodes a shared container network that could bypass the relay assertion.
   control_a:
-    name: sage-v111716-federation-control-a
+    name: sage-v111717-federation-control-a
   control_b:
-    name: sage-v111716-federation-control-b
+    name: sage-v111717-federation-control-b

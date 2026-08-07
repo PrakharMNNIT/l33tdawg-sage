@@ -1,4 +1,4 @@
-# v11.17.16 federation Docker acceptance
+# v11.17.17 federation Docker acceptance
 
 This harness gives two SAGE personal nodes separate persisted homes, separate
 Docker edge networks, and one self-hosted natter relay. A temporary third
@@ -9,7 +9,7 @@ default (`FED_NODE_A_PORT` / `FED_NODE_B_PORT` override them).
 Run the reproducible topology smoke test with:
 
 ```sh
-FED_ACCEPTANCE_STATE=/tmp/sage-v111716-fed \
+FED_ACCEPTANCE_STATE=/tmp/sage-v111717-fed \
   deploy/federation-acceptance/run.sh topology
 ```
 
@@ -57,6 +57,10 @@ with the phase and tool name instead of hanging CI indefinitely.
 | Stale snapshot | set persisted `expires_at` in the past | stale route is rejected, refreshed, and flow recovers |
 | Relay outage | stop then restart natter | explicit offline/no-route while down; automatic recovery after restart |
 | Upgrade | v11.17.4 `p2p_peers` fixture | peer survives load and gains current route snapshot |
+| Pairwise Read | reciprocal exported Mynah agents; no mirrored Access Group or linked-reader fixture | either ordinary companion can read the other's exported owned domain; writes remain ungranted |
+| Copy backfill | each source independently offers Copy; each receiver independently subscribes | receiver-local recall finds memories created before consent in both directions |
+| Copy incremental | create a new source memory after consent | receiver-local recall finds the new copy in both directions |
+| Copy restart | restart both nodes, then stop each source in turn | each receiver still recalls both backfilled and incremental copies locally while its source is offline |
 | Offline inbox | recipient stopped after send | durable inbox delivery, read, reply, and final sender status |
 
 The contract test is fast and does not require Docker:

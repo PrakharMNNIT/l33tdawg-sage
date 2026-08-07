@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.17.16. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.17.17. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -1999,6 +1999,64 @@ Revocation returns the same empty projection as an absent name, and exact
 `POST /v1/pipe/resolve` repeats live authorization before send
 (`api/rest/federation_handler.go`;
 `internal/federation/v23_linked_directory.go`).
+
+### `POST /v1/federation/recall-plan`
+
+Federated recall is an authenticated two-request protocol. A current client
+must never construct the second request from cached agreement data or sign it
+before obtaining this plan.
+
+1. Sign and send a plan request containing the exact `domain_tag` and requested
+   `federate_chains` (`["*"]` may be used only at this planning step).
+2. The response expands the request to a finite `destinations` list and returns
+   five pieces of signing state: `source_chain_id`, `agreement_bindings`,
+   `query_challenges`, `authorization_models`, and
+   `authorization_attestations`. `expires_at` tells the client when each
+   challenge becomes unusable; `errors` reports peers excluded from
+   `destinations`.
+3. Build one of `POST /v1/memory/query`, `POST /v1/memory/search`, or
+   `POST /v1/memory/hybrid` with `federated:true`, copy `destinations` verbatim
+   to `federate_chains`, and copy all five signing-state fields verbatim into
+   `federation_context`. Then sign that complete second body with a fresh nonce.
+
+Plan request:
+
+```json
+{"domain_tag":"mynah-home","federate_chains":["*"]}
+```
+
+Complete plan response shape:
+
+```json
+{
+  "protocol_version": 23,
+  "source_chain_id": "chain-a",
+  "destinations": ["chain-b"],
+  "agreement_bindings": {"chain-b": "<binding-digest>"},
+  "query_challenges": {"chain-b": "<single-use-challenge>"},
+  "authorization_models": {"chain-b": "peer-export-v1"},
+  "authorization_attestations": {
+    "chain-b": {"eligible": true, "max_classification": 4}
+  },
+  "expires_at": {"chain-b": 1786071600}
+}
+```
+
+The map entry itself is significant. A compatibility-plan entry for a legacy
+peer has an empty authorization-model string and an explicit
+`{"eligible":false,"max_classification":0}` attestation; omitting either map
+entry does not mean legacy. It identifies an old client that failed to copy the
+current signed tuple. Such a second request is stopped before peer fan-out with
+`signed federation authorization tuple is missing or incomplete` and must be
+re-planned and re-signed.
+
+The version boundary is deliberately asymmetric. An old peer that cannot
+complete current v23 planning appears in the plan's `errors` and is absent from
+`destinations`; a current client does not downgrade the signed contract for it.
+An old client talking to a current local node may receive a complete plan but
+omit the newer authorization fields from its second signed body; the local node
+rejects that omission and directs the client to re-plan. Updating the remote
+peer is therefore not inferred from this particular error.
 
 ### `POST /v1/federation/contacts/authorize`
 

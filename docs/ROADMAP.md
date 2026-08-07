@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.17.16 is the current release.** This corrective release makes caller-facing federation discovery distinguish peer-policy candidates from domains that the destination has live-verified against the exact linked-reader relation. It preserves v11.17.15's writable-agent approval, governed bulk recovery, agent directory, messaging, and packaging corrections. Governed app-v26 and consensus remain unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
+**Status (2026-08):** **v11.17.17 is the current release.** This corrective release pins the exported-agent authorization model and source-agent attestation into every signed federated Read plan and holds final authorization through disclosure. It also makes authenticated-read capability readiness visible and extends the Docker lane through bidirectional Copy backfill, incremental mirroring, and restart recovery. Governed app-v26 and consensus remain unchanged. Existing chains upgrade in place without rewriting memories, historical authors, domains, trust, or prior blocks.
 
 **Hard constraint driving the whole plan:** no chain reset, no operator-typed commands. Existing chains must upgrade in place across all future releases.
 
@@ -54,12 +54,14 @@ with a deep link to the exact agent setting. It also generates a unique
 name-based home domain when a writable pending-agent approval leaves that field
 blank. v11.17.13 and the superseded v11.17.14 tag were not published.
 
-v11.17.16 closes the discovery-versus-recall authorization gap exposed by the
-physical Mynah pair. The peer Read catalog and local caller policy now form an
-explicit candidate list only. A bounded authenticated destination probe applies
-the live linked-reader, group, ownership, agreement-generation and peer-policy
-gates without issuing recall challenges; only its returned subset is advertised
-as readable. Mixed-version peers stay connected but mark candidates unverified.
+v11.17.17 closes the final plan-versus-disclosure race exposed while validating
+the physical Mynah pair. The source authorization model and exact active-agent
+and clearance attestation are signed, challenge-bound, revalidated under the
+source authorization lease, and held until the destination query completes.
+Capability projection reports missing authenticated-read support without
+guessing whether the peer is still binding or needs an update. The acceptance
+lane now proves pairwise default Read, explicit denial, non-transitive exports,
+and bidirectional Copy backfill/incremental/restart behavior.
 
 The following acceptance and follow-up boundaries remain open after the 11.17.9
 code merge; they are not implied complete by Docker or CI evidence:

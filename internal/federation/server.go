@@ -1016,25 +1016,31 @@ func (m *Manager) handleQueryPlan(w http.ResponseWriter, r *http.Request) {
 	expiresAt := now.Add(queryPlanTTL).Unix()
 	challengeID := hex.EncodeToString(challengeBytes)
 	if err := m.queryChallengeStore.IssueFederatedQueryChallenge(r.Context(), store.FederatedQueryChallenge{
-		ChallengeID:            challengeID,
-		RemoteChainID:          peer.ChainID,
-		PeerAgentID:            peer.AgentID,
-		RequestedAgentID:       req.AgentID,
-		DomainTag:              req.DomainTag,
-		AgreementBindingDigest: digest,
-		ExpiresAt:              expiresAt,
+		ChallengeID:                  challengeID,
+		RemoteChainID:                peer.ChainID,
+		PeerAgentID:                  peer.AgentID,
+		RequestedAgentID:             req.AgentID,
+		DomainTag:                    req.DomainTag,
+		AgreementBindingDigest:       digest,
+		SourceAuthorizationModel:     req.SourceAuthorizationModel,
+		SourceAgentEligible:          req.SourceAgentEligible,
+		SourceAgentMaxClassification: req.SourceAgentMaxClassification,
+		ExpiresAt:                    expiresAt,
 	}, now); err != nil {
 		m.logger.Warn().Err(err).Str("peer", peer.ChainID).Msg("federation v23 query plan denied")
 		httpError(w, http.StatusServiceUnavailable, "could not persist query challenge")
 		return
 	}
 	writeJSON(w, http.StatusOK, &QueryPlanResponse{
-		ProtocolVersion:        FederationProtocolV23,
-		SourceChainID:          peer.ChainID,
-		DestinationChainID:     m.localChainID,
-		AgreementBindingDigest: digest,
-		QueryChallenge:         challengeID,
-		ExpiresAt:              expiresAt,
+		ProtocolVersion:              FederationProtocolV23,
+		SourceChainID:                peer.ChainID,
+		DestinationChainID:           m.localChainID,
+		AgreementBindingDigest:       digest,
+		SourceAuthorizationModel:     req.SourceAuthorizationModel,
+		SourceAgentEligible:          req.SourceAgentEligible,
+		SourceAgentMaxClassification: req.SourceAgentMaxClassification,
+		QueryChallenge:               challengeID,
+		ExpiresAt:                    expiresAt,
 	})
 }
 

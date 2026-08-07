@@ -91,8 +91,11 @@ type QueryRequest struct {
 	// PlanAgreementBindings and PlanChallenges are local broker state only.
 	// They are populated from the agent-signed REST request and are never sent
 	// as a second, unsigned source of truth.
-	PlanAgreementBindings map[string]string `json:"-"`
-	PlanChallenges        map[string]string `json:"-"`
+	PlanAgreementBindings         map[string]string                         `json:"-"`
+	PlanChallenges                map[string]string                         `json:"-"`
+	PlanSourceChainID             string                                    `json:"-"`
+	PlanAuthorizationModels       map[string]string                         `json:"-"`
+	PlanAuthorizationAttestations map[string]SourceAuthorizationAttestation `json:"-"`
 }
 
 // QueryPlanResponse is returned by the destination after peer authentication
@@ -100,12 +103,15 @@ type QueryRequest struct {
 // gets an independent challenge so one peer cannot replay authorization at
 // another peer.
 type QueryPlanResponse struct {
-	ProtocolVersion        int    `json:"protocol_version"`
-	SourceChainID          string `json:"source_chain_id"`
-	DestinationChainID     string `json:"destination_chain_id"`
-	AgreementBindingDigest string `json:"agreement_binding_digest"`
-	QueryChallenge         string `json:"query_challenge"`
-	ExpiresAt              int64  `json:"expires_at"`
+	ProtocolVersion              int    `json:"protocol_version"`
+	SourceChainID                string `json:"source_chain_id"`
+	DestinationChainID           string `json:"destination_chain_id"`
+	AgreementBindingDigest       string `json:"agreement_binding_digest"`
+	SourceAuthorizationModel     string `json:"source_authorization_model"`
+	SourceAgentEligible          bool   `json:"source_agent_eligible"`
+	SourceAgentMaxClassification uint8  `json:"source_agent_max_classification"`
+	QueryChallenge               string `json:"query_challenge"`
+	ExpiresAt                    int64  `json:"expires_at"`
 }
 
 type QueryPlanRequest struct {
@@ -116,16 +122,23 @@ type QueryPlanRequest struct {
 	SourceAgentMaxClassification uint8  `json:"source_agent_max_classification"`
 }
 
+type SourceAuthorizationAttestation struct {
+	Eligible          bool  `json:"eligible"`
+	MaxClassification uint8 `json:"max_classification"`
+}
+
 // RecallPlan is the agent-facing projection of exact, authenticated
 // destination plans. Wildcards are expanded before the agent signs a recall.
 type RecallPlan struct {
-	ProtocolVersion   int               `json:"protocol_version"`
-	SourceChainID     string            `json:"source_chain_id"`
-	Destinations      []string          `json:"destinations"`
-	AgreementBindings map[string]string `json:"agreement_bindings"`
-	QueryChallenges   map[string]string `json:"query_challenges"`
-	ExpiresAt         map[string]int64  `json:"expires_at"`
-	Errors            map[string]string `json:"errors,omitempty"`
+	ProtocolVersion           int                                       `json:"protocol_version"`
+	SourceChainID             string                                    `json:"source_chain_id"`
+	Destinations              []string                                  `json:"destinations"`
+	AgreementBindings         map[string]string                         `json:"agreement_bindings"`
+	QueryChallenges           map[string]string                         `json:"query_challenges"`
+	AuthorizationModels       map[string]string                         `json:"authorization_models"`
+	AuthorizationAttestations map[string]SourceAuthorizationAttestation `json:"authorization_attestations"`
+	ExpiresAt                 map[string]int64                          `json:"expires_at"`
+	Errors                    map[string]string                         `json:"errors,omitempty"`
 }
 
 // QueryAgentProof is the original local REST authentication proof. The

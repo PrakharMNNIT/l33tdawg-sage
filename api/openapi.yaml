@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.17.16
+  version: 11.17.17
   description: |-
     (Sovereign) Agent Governed Experience — network REST API for memory
     submission, validation, and query.
@@ -5850,6 +5850,66 @@ paths:
         "403": {$ref: "#/components/responses/Forbidden"}
         "429":
           description: Caller or process outbound discovery budget exhausted; retry after Retry-After.
+          content: {application/problem+json: {schema: {$ref: "#/components/schemas/ProblemDetails"}}}
+
+  /v1/federation/recall-plan:
+    post:
+      operationId: createFederatedRecallPlan
+      summary: Create the destination-bound signing plan for a federated recall.
+      description: >-
+        First half of the app-v23 two-request recall protocol. The caller must
+        copy destinations to the second recall's federate_chains and copy
+        source_chain_id, agreement_bindings, query_challenges,
+        authorization_models, and authorization_attestations verbatim into its
+        signed federation_context. A peer that cannot complete current planning
+        is reported in errors and omitted from destinations. A second request
+        that omits authorization map entries is an old-client error and must be
+        re-planned and re-signed; an empty model plus explicit zero attestation
+        remains a valid legacy-peer tuple.
+      tags: [Federation]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain_tag]
+              properties:
+                domain_tag: {type: string, minLength: 1, maxLength: 256}
+                federate_chains:
+                  type: array
+                  maxItems: 8
+                  items: {type: string, minLength: 1}
+      responses:
+        "200":
+          description: Exact finite destination plan and complete signing tuple.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [protocol_version, source_chain_id, destinations, agreement_bindings, query_challenges, authorization_models, authorization_attestations, expires_at]
+                properties:
+                  protocol_version: {type: integer, const: 23}
+                  source_chain_id: {type: string, minLength: 1}
+                  destinations: {type: array, maxItems: 8, items: {type: string}}
+                  agreement_bindings: {type: object, additionalProperties: {type: string}}
+                  query_challenges: {type: object, additionalProperties: {type: string}}
+                  authorization_models: {type: object, additionalProperties: {type: string}}
+                  authorization_attestations:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      required: [eligible, max_classification]
+                      properties:
+                        eligible: {type: boolean}
+                        max_classification: {type: integer, minimum: 0, maximum: 4}
+                  expires_at: {type: object, additionalProperties: {type: integer, format: int64}}
+                  errors: {type: object, additionalProperties: {type: string}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "502":
+          description: Planning failed before a valid per-peer result could be returned.
           content: {application/problem+json: {schema: {$ref: "#/components/schemas/ProblemDetails"}}}
 
   /v1/federation/contacts/authorize:

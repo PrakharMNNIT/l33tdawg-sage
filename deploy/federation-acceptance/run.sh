@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 COMPOSE="$ROOT/deploy/federation-acceptance/docker-compose.yml"
-STATE=${FED_ACCEPTANCE_STATE:-/tmp/sage-v111716-federation-state}
+STATE=${FED_ACCEPTANCE_STATE:-/tmp/sage-v111717-federation-state}
 MODE=${1:-full}
 PORT_A=${FED_NODE_A_PORT:-28080}
 PORT_B=${FED_NODE_B_PORT:-28081}
@@ -32,6 +32,22 @@ mcp_call() {
     die "MCP tool $tool on $svc failed or exceeded ${MCP_TIMEOUT_SECONDS}s"
   node -e 'const lines=process.argv[1].trim().split(/\n/); const r=JSON.parse(lines.at(-1)); if(r.error) throw new Error(JSON.stringify(r.error)); const t=r.result.content[0].text; try { process.stdout.write(JSON.stringify(JSON.parse(t))) } catch { process.stdout.write(t) }' "$out"
 }
+remember_committed() {
+  remember_svc=$1 remember_args=$2
+  remember_result=$(mcp_call "$remember_svc" sage_remember "$remember_args")
+  node -e '
+    const result = JSON.parse(process.argv[1]);
+    if (result.skipped || result.status === "skipped" || result.status === "rejected") {
+      console.error(`sage_remember did not create a memory: ${JSON.stringify(result)}`);
+      process.exit(1);
+    }
+    if (!result.memory_id || result.committed !== true) {
+      console.error(`sage_remember did not confirm a committed memory: ${JSON.stringify(result)}`);
+      process.exit(1);
+    }
+  ' "$remember_result" || die "sage_remember on $remember_svc did not commit a new source memory"
+  printf '%s' "$remember_result"
+}
 wait_health() {
   url=$1
   i=0
@@ -45,13 +61,13 @@ container_ip() {
   docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$(container_id "$1")"
 }
 lan_ip() {
-  docker inspect -f '{{(index .NetworkSettings.Networks "sage-v111716-federation-lan").IPAddress}}' "$(container_id "$1")"
+  docker inspect -f '{{(index .NetworkSettings.Networks "sage-v111717-federation-lan").IPAddress}}' "$(container_id "$1")"
 }
 
 cleanup() {
   dc down --remove-orphans >/dev/null 2>&1 || true
   for cid in $CHURN_IDS; do docker stop "$cid" >/dev/null 2>&1 || true; done
-  docker network rm sage-v111716-federation-lan >/dev/null 2>&1 || true
+  docker network rm sage-v111717-federation-lan >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -84,10 +100,10 @@ wait_health "http://127.0.0.1:$PORT_A"
 wait_health "http://127.0.0.1:$PORT_B"
 
 phase "same-LAN topology"
-docker network inspect sage-v111716-federation-lan >/dev/null 2>&1 || \
-  docker network create --internal sage-v111716-federation-lan >/dev/null
-docker network connect --alias node-a sage-v111716-federation-lan "$(container_id node-a)"
-docker network connect --alias node-b sage-v111716-federation-lan "$(container_id node-b)"
+docker network inspect sage-v111717-federation-lan >/dev/null 2>&1 || \
+  docker network create --internal sage-v111717-federation-lan >/dev/null
+docker network connect --alias node-a sage-v111717-federation-lan "$(container_id node-a)"
+docker network connect --alias node-b sage-v111717-federation-lan "$(container_id node-b)"
 dc exec -T node-a getent hosts node-b >/dev/null
 dc exec -T node-b getent hosts node-a >/dev/null
 
@@ -163,6 +179,12 @@ if [ "$MODE" = full ]; then
   api node-a PUT "/v1/dashboard/federation/connections/$chain_a/agent-exports" "$export_a" >/dev/null
   api node-b PUT "/v1/dashboard/federation/connections/$chain_b/agent-exports" "$export_b" >/dev/null
 
+	phase "prove peer-export read has no legacy linked-reader fixture"
+	linked_a=$(api node-a GET /v1/dashboard/network/access/linked-readers)
+	linked_b=$(api node-b GET /v1/dashboard/network/access/linked-readers)
+	[ "$(jfield "$linked_a" total)" = 0 ] || die "node A contains legacy linked-reader state; peer-export acceptance is not isolated"
+	[ "$(jfield "$linked_b" total)" = 0 ] || die "node B contains legacy linked-reader state; peer-export acceptance is not isolated"
+
   phase "directional peer export read needs no mirrored group"
   export_probe="federation default read probe $RUN_TOKEN"
   remember_args=$(node -e 'process.stdout.write(JSON.stringify({content:process.argv[1],domain:"mynah-a-home",type:"fact",confidence:0.95}))' "$export_probe")
@@ -170,7 +192,16 @@ if [ "$MODE" = full ]; then
   i=0
   while :; do
     exported=$(mcp_call node-b sage_federation '{}') || true
-    echo "$exported" | grep -q 'mynah-a-home' && break
+		if node -e '
+			const response=JSON.parse(process.argv[1]);
+			const connection=(response.connections||[]).find(v=>v.remote_chain_id===process.argv[2]);
+			if (!connection) process.exit(1);
+			if (!(connection.capabilities||[]).includes("federated-peer-export-read-v1")) process.exit(1);
+			if (connection.read_authorization!=="verified" || connection.read_authorization_complete!==true) process.exit(1);
+			if (!(connection.shared_read_domains||[]).includes(process.argv[3])) process.exit(1);
+		' "$exported" "$chain_b" "mynah-a-home"; then
+			break
+		fi
     i=$((i + 1)); [ "$i" -lt 45 ] || die "node B never discovered node A's directional domain export"
     sleep 2
   done
@@ -182,11 +213,81 @@ if [ "$MODE" = full ]; then
     i=$((i + 1)); [ "$i" -lt 45 ] || die "ordinary node B companion could not read node A's export without a mirrored group"
     sleep 2
   done
+
+  phase "bidirectional Copy: seed pre-consent memories for initial backfill"
+  mirror_a_initial="federation mirror A initial $RUN_TOKEN"
+  mirror_b_initial="federation mirror B initial $RUN_TOKEN"
+  remember_a_initial=$(node -e 'process.stdout.write(JSON.stringify({content:process.argv[1],domain:"mynah-a-home",type:"fact",confidence:0.96}))' "$mirror_a_initial")
+  remember_b_initial=$(node -e 'process.stdout.write(JSON.stringify({content:process.argv[1],domain:"mynah-b-home",type:"fact",confidence:0.96}))' "$mirror_b_initial")
+  remember_committed node-a "$remember_a_initial" >/dev/null
+  remember_committed node-b "$remember_b_initial" >/dev/null
+
+  phase "bidirectional Copy: each owner offers Copy and each receiver independently subscribes"
+  permission_a='{"permissions":[{"domain":"mynah-a-home","read":true,"copy":true}]}'
+  permission_b='{"permissions":[{"domain":"mynah-b-home","read":true,"copy":true}]}'
+  api node-a PUT "/v1/dashboard/federation/connections/$chain_a/permissions" "$permission_a" >/dev/null
+  api node-b PUT "/v1/dashboard/federation/connections/$chain_b/permissions" "$permission_b" >/dev/null
+  subscribe_a='{"subscribe_domains":["mynah-b-home"]}'
+  subscribe_b='{"subscribe_domains":["mynah-a-home"]}'
+  i=0
+  while :; do
+    saved_a=$(api node-a PUT "/v1/dashboard/federation/connections/$chain_a/sync" "$subscribe_a" 2>/dev/null || true)
+    saved_b=$(api node-b PUT "/v1/dashboard/federation/connections/$chain_b/sync" "$subscribe_b" 2>/dev/null || true)
+    has_a=$(jfield "$saved_a" subscribe_domains.0 2>/dev/null || true)
+    has_b=$(jfield "$saved_b" subscribe_domains.0 2>/dev/null || true)
+    [ "$has_a" = mynah-b-home ] && [ "$has_b" = mynah-a-home ] && break
+    i=$((i + 1)); [ "$i" -lt 60 ] || die "bidirectional receiver Copy consent did not become active"
+    sleep 2
+  done
+
+  wait_local_copy() {
+    copy_svc=$1 copy_token=$2 copy_domain=$3
+    copy_args=$(node -e 'process.stdout.write(JSON.stringify({query:process.argv[1],domain:process.argv[2],scope:"local",top_k:10}))' "$copy_token" "$copy_domain")
+    copy_i=0
+    while :; do
+      copy_result=$(mcp_call "$copy_svc" sage_recall "$copy_args") || true
+      echo "$copy_result" | grep -q "$copy_token" && return 0
+      copy_i=$((copy_i + 1)); [ "$copy_i" -lt 90 ] || die "$copy_svc never stored local mirrored copy for $copy_domain"
+      sleep 2
+    done
+  }
+
+  phase "bidirectional Copy: initial anti-entropy backfill"
+  wait_local_copy node-b "$mirror_a_initial" mynah-a-home
+  wait_local_copy node-a "$mirror_b_initial" mynah-b-home
+
+  phase "bidirectional Copy: incremental delivery after consent"
+  # Keep these deliberately unlike the initial-backfill probes. sage_remember
+  # rejects >60%-similar content as a duplicate, and a skipped source write
+  # must never be misreported as a Copy delivery failure.
+  mirror_a_incremental="post-consent orchid telescope quartz from node A $RUN_TOKEN"
+  mirror_b_incremental="live delta copper nebula violin from node B $RUN_TOKEN"
+  remember_a_incremental=$(node -e 'process.stdout.write(JSON.stringify({content:process.argv[1],domain:"mynah-a-home",type:"fact",confidence:0.97}))' "$mirror_a_incremental")
+  remember_b_incremental=$(node -e 'process.stdout.write(JSON.stringify({content:process.argv[1],domain:"mynah-b-home",type:"fact",confidence:0.97}))' "$mirror_b_incremental")
+  remember_committed node-a "$remember_a_incremental" >/dev/null
+  remember_committed node-b "$remember_b_incremental" >/dev/null
+  wait_local_copy node-b "$mirror_a_incremental" mynah-a-home
+  wait_local_copy node-a "$mirror_b_incremental" mynah-b-home
+
+  phase "bidirectional Copy: restart persistence and source-offline local reads"
+  dc restart node-a node-b >/dev/null
+  wait_health "http://127.0.0.1:$PORT_A"
+  wait_health "http://127.0.0.1:$PORT_B"
+  dc stop node-a >/dev/null
+  wait_local_copy node-b "$mirror_a_initial" mynah-a-home
+  wait_local_copy node-b "$mirror_a_incremental" mynah-a-home
+  dc start node-a >/dev/null
+  wait_health "http://127.0.0.1:$PORT_A"
+  dc stop node-b >/dev/null
+  wait_local_copy node-a "$mirror_b_initial" mynah-b-home
+  wait_local_copy node-a "$mirror_b_incremental" mynah-b-home
+  dc start node-b >/dev/null
+  wait_health "http://127.0.0.1:$PORT_B"
 fi
 
 phase "remove LAN; only the relay bridges edge_a and edge_b"
-docker network disconnect sage-v111716-federation-lan "$(container_id node-a)"
-docker network disconnect sage-v111716-federation-lan "$(container_id node-b)"
+docker network disconnect sage-v111717-federation-lan "$(container_id node-a)"
+docker network disconnect sage-v111717-federation-lan "$(container_id node-b)"
 
 phase "restart A, B, then both and require container IP churn"
 for svc in node-a node-b; do
@@ -194,8 +295,8 @@ for svc in node-a node-b; do
   dc stop "$svc" >/dev/null
   dc rm -f "$svc" >/dev/null
   case "$svc" in
-    node-a) edge=sage-v111716-federation-edge-a; control=sage-v111716-federation-control-a ;;
-    node-b) edge=sage-v111716-federation-edge-b; control=sage-v111716-federation-control-b ;;
+    node-a) edge=sage-v111717-federation-edge-a; control=sage-v111717-federation-control-a ;;
+    node-b) edge=sage-v111717-federation-edge-b; control=sage-v111717-federation-control-b ;;
   esac
   # Occupy the just-freed addresses so Docker cannot hand the recreated node
   # the same pair and accidentally skip the stale-address recovery condition.
@@ -264,7 +365,7 @@ elif [ "$MODE" = full ]; then
   target=$(jfield "$found" matches.0.to)
   [ -n "$target" ] || die "sage_find_agent returned no exact remote Mynah target"
   dc stop node-b >/dev/null
-  send_args=$(node -e 'process.stdout.write(JSON.stringify({to:process.argv[1],intent:"acceptance",payload:"v11.17.16 durable offline inbox probe "+process.argv[2],idempotency_key:"v111716-offline-probe-"+process.argv[2]}))' "$target" "$RUN_TOKEN")
+  send_args=$(node -e 'process.stdout.write(JSON.stringify({to:process.argv[1],intent:"acceptance",payload:"v11.17.17 durable offline inbox probe "+process.argv[2],idempotency_key:"v111717-offline-probe-"+process.argv[2]}))' "$target" "$RUN_TOKEN")
   send_started=$(date +%s)
   sent=$(mcp_call node-a sage_message_send "$send_args")
   send_elapsed=$(( $(date +%s) - send_started ))
@@ -284,7 +385,7 @@ elif [ "$MODE" = full ]; then
     i=$((i + 1)); [ "$i" -lt 45 ] || die "offline message did not persist/deliver to restarted inbox"
     sleep 2
   done
-  reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.17.16 acceptance reply"}))' "$received_id")
+  reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.17.17 acceptance reply"}))' "$received_id")
   mcp_call node-b sage_message_reply "$reply_args" >/dev/null
   status_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1]}))' "$message_id")
   i=0
