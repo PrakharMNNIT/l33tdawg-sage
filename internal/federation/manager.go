@@ -293,17 +293,21 @@ type Manager struct {
 	peerRouteDialMu sync.RWMutex
 	peerRouteDialFn PeerRouteDialFunc
 
-	transportDisabled    atomic.Bool
-	routeMu              sync.RWMutex
-	routeStatus          map[string]RouteDiagnostics
-	localRouteRevision   uint64
-	routeRefreshMu       sync.Mutex
-	routeRefreshActive   map[string]bool
-	routeRefreshLast     map[string]time.Time
-	routeRefreshFn       func(context.Context, string, JoinP2PBundle) error
-	routeRefresherMu     sync.Mutex
-	routeRefresherCancel context.CancelFunc
-	routeRefresherDone   chan struct{}
+	transportDisabled atomic.Bool
+	// federatedReaderPolicyRevision invalidates caller-filtered discovery
+	// snapshots after a local reader restriction changes. It is process-local:
+	// restart already starts with an empty REST availability cache.
+	federatedReaderPolicyRevision atomic.Uint64
+	routeMu                       sync.RWMutex
+	routeStatus                   map[string]RouteDiagnostics
+	localRouteRevision            uint64
+	routeRefreshMu                sync.Mutex
+	routeRefreshActive            map[string]bool
+	routeRefreshLast              map[string]time.Time
+	routeRefreshFn                func(context.Context, string, JoinP2PBundle) error
+	routeRefresherMu              sync.Mutex
+	routeRefresherCancel          context.CancelFunc
+	routeRefresherDone            chan struct{}
 
 	joinP2PMu sync.RWMutex
 	joinP2P   JoinP2PHooks

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +18,7 @@ import (
 	"github.com/l33tdawg/sage/internal/store"
 )
 
-func TestAppV23LegacyReadCompatibilityIsLocalOnlyAndRestrictive(t *testing.T) {
+func TestAppV23LegacyReadCompatibilityRestrictsLocalRESTButNotPairwiseFederation(t *testing.T) {
 	srv, _, badger, _ := newRBACTestServer(t)
 	srv.SetPostV22ForNextTxAccessor(func() bool { return true })
 	srv.SetPostV23ForNextTxAccessor(func() bool { return true })
@@ -48,7 +50,7 @@ func TestAppV23LegacyReadCompatibilityIsLocalOnlyAndRestrictive(t *testing.T) {
 
 	require.Error(t, checkAppV23DomainAccess(
 		badger, reader, "legacy-allowed", "read",
-	), "the generic/federated app-v23 resolver must not receive migration widening")
+	), "the strict local app-v23 resolver must not receive migration widening")
 	require.NoError(t, srv.checkDomainAccess(
 		context.Background(), reader, "legacy-allowed", "read",
 	))
@@ -106,8 +108,18 @@ func TestAppV23LegacyReadCompatibilityIsLocalOnlyAndRestrictive(t *testing.T) {
 	federated, clearance := srv.federationCallerCanRead(
 		context.Background(), reader, "legacy-allowed",
 	)
-	require.False(t, federated)
+	require.True(t, federated,
+		"an active ordinary agent joins each federation connection's Read group by default")
 	require.Equal(t, 1, clearance)
+	federated, clearance = srv.federationCallerCanRead(
+		context.Background(), reader, "legacy-denied",
+	)
+	require.True(t, federated,
+		"a frozen local REST allowlist must not become a same-named remote-domain deny")
+	require.Equal(t, 1, clearance)
+	require.Equal(t, []string{"legacy-denied"}, srv.federationVisibleRemoteScopes(
+		context.Background(), reader, "legacy-denied",
+	))
 
 	agents, seeAll := srv.resolveVisibleAgents(reader)
 	require.False(t, seeAll)
@@ -146,11 +158,82 @@ func TestAppV23LegacyOrgMembershipClearanceSurvivesLocalRESTOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, allowed)
 
-	federated, _ := srv.federationCallerCanRead(
+	federated, federatedClearance := srv.federationCallerCanRead(
 		context.Background(), reader, "org-domain",
 	)
-	require.False(t, federated,
-		"the local migration envelope must not widen a federated caller")
+	require.True(t, federated,
+		"local organization membership is unnecessary for the connection's default pairwise Read")
+	require.Equal(t, 1, federatedClearance,
+		"local organization clearance must not silently raise the caller's federation ceiling")
+}
+
+func TestAppV23MigratedLocalRESTPolicyIsIndependentFromExplicitFederatedReaderOverlay(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "reader-overlay.db")
+	ss, err := store.NewSQLiteStore(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ss.Close() })
+
+	reader := fmt.Sprintf("%064x", 9152)
+	binding := store.FederatedReaderBinding{
+		RemoteChainID: "chain-peer",
+		PeerAgentID:   fmt.Sprintf("%064x", 9153),
+		PolicyEpoch:   "epoch-rest-migration",
+		RemoteCAPin:   strings.Repeat("ab", 32),
+	}
+	require.NoError(t, ss.PrepareSyncControl(ctx, store.SyncControl{
+		RemoteChainID: binding.RemoteChainID,
+		Role:          "host", ControllerChainID: "chain-local",
+		ControllerAgentID: reader, PeerAgentID: binding.PeerAgentID,
+		PolicyEpoch: binding.PolicyEpoch, RemoteCAPin: binding.RemoteCAPin,
+		PolicyVersion: 3,
+	}))
+	require.NoError(t, ss.ActivateSyncControl(ctx, binding.RemoteChainID, binding.PolicyEpoch))
+
+	allowed, err := ss.FederatedReaderAllows(ctx, binding, reader, "legacy-denied")
+	require.NoError(t, err)
+	require.True(t, allowed,
+		"absence of a peer-bound reader restriction is the explicit default allow")
+
+	restriction, err := ss.PutBoundFederatedReaderRestrictionCAS(ctx,
+		store.FederatedReaderRestriction{
+			RemoteChainID: binding.RemoteChainID, LocalAgentID: reader,
+			PeerAgentID: binding.PeerAgentID, PolicyEpoch: binding.PolicyEpoch,
+			RemoteCAPin:   binding.RemoteCAPin,
+			DeniedDomains: []string{"legacy-denied"}, Revision: 1,
+			State: store.FederatedReaderRestrictionStateActive,
+		}, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), restriction.Revision)
+
+	allowed, err = ss.FederatedReaderAllows(ctx, binding, reader, "legacy-allowed")
+	require.NoError(t, err)
+	require.True(t, allowed, "a subtree deny must not recreate the old local allowlist")
+	allowed, err = ss.FederatedReaderAllows(ctx, binding, reader, "legacy-denied.child")
+	require.NoError(t, err)
+	require.False(t, allowed, "the explicit federation deny must cover its remote subtree")
+
+	denyAll := *restriction
+	denyAll.Revision = 2
+	denyAll.DenyAll = true
+	denyAll.DeniedDomains = nil
+	denyAllStored, err := ss.PutBoundFederatedReaderRestrictionCAS(ctx, denyAll, 1)
+	require.NoError(t, err)
+	require.NotNil(t, denyAllStored)
+	allowed, err = ss.FederatedReaderAllows(ctx, binding, reader, "legacy-allowed")
+	require.NoError(t, err)
+	require.False(t, allowed, "the explicit per-peer deny-all overlay must fail closed")
+
+	revoked := *denyAllStored
+	revoked.Revision = 3
+	revoked.State = store.FederatedReaderRestrictionStateRevoked
+	revoked.DenyAll = false
+	revokedStored, err := ss.PutBoundFederatedReaderRestrictionCAS(ctx, revoked, 2)
+	require.NoError(t, err)
+	require.NotNil(t, revokedStored)
+	allowed, err = ss.FederatedReaderAllows(ctx, binding, reader, "legacy-allowed")
+	require.NoError(t, err)
+	require.True(t, allowed, "revoking the explicit restriction restores pairwise default Read")
 }
 
 func TestAppV25HistoricalMultiWriterContinuityIsNeverWriteOnly(t *testing.T) {

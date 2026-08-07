@@ -576,6 +576,10 @@ type federationRecallAvailabilityFinder interface {
 	AvailableRecallDomains(ctx context.Context, remoteChainID, agentID string, domains []string) ([]string, error)
 }
 
+type federationReaderPolicyRevisioner interface {
+	FederatedReaderPolicyRevision() uint64
+}
+
 type federationMessageAdmissionRecorder interface {
 	RememberRemotePipeContactForCaller(
 		context.Context, string, string, *federation.PipeContactGrant,
@@ -761,7 +765,11 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 	}
 	if _, bypass := r.Context().Value(federationAvailabilityCacheBypassKey{}).(bool); !bypass &&
 		s.federationAvailability != nil {
-		cacheKey := callerID + "\x00" + agentName + "\x00" + peerChain + "\x00" + strconv.Itoa(agentLimit) + "\x00" + peerCursor
+		var readerPolicyRevision uint64
+		if revisioner, ok := s.federation.(federationReaderPolicyRevisioner); ok {
+			readerPolicyRevision = revisioner.FederatedReaderPolicyRevision()
+		}
+		cacheKey := callerID + "\x00" + agentName + "\x00" + peerChain + "\x00" + strconv.Itoa(agentLimit) + "\x00" + peerCursor + "\x00" + strconv.FormatUint(readerPolicyRevision, 10)
 		response, cacheErr := s.federationAvailability.load(
 			r.Context(), cacheKey, func(loadCtx context.Context) federationAvailabilityResponse {
 				recorder := newFederationAvailabilityRecorder()
@@ -775,6 +783,16 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		)
 		if cacheErr != nil {
 			writeProblem(w, http.StatusGatewayTimeout, "Federation discovery timed out", "The bounded federation discovery budget was exhausted.")
+			return
+		}
+		if revisioner, ok := s.federation.(federationReaderPolicyRevisioner); ok &&
+			revisioner.FederatedReaderPolicyRevision() != readerPolicyRevision {
+			// The operator narrowed this caller while the cache lookup or live
+			// peer probe was in flight. Recompute without cache under the
+			// Manager's reader-policy lock so a completed deny is immediately
+			// visible and an old response cannot escape after the mutation.
+			ctx := context.WithValue(r.Context(), federationAvailabilityCacheBypassKey{}, true)
+			s.handleFederationAvailable(w, r.Clone(ctx))
 			return
 		}
 		writeFederationAvailabilityResponse(w, response)
@@ -829,8 +847,8 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 			peerCallCost++
 		}
 	} else {
-		// General discovery may perform one additive exact linked-reader
-		// availability check after status. Charge the worst case even when an
+		// General discovery may perform one negotiated exported-agent (or legacy
+		// linked-reader) availability check after status. Charge the worst case even when an
 		// older peer does not advertise it, so rate cadence reveals nothing.
 		peerCallCost++
 		if callerMayPipe && hasLinkedDirectoryLister {
@@ -947,7 +965,7 @@ func (s *Server) handleFederationAvailable(w http.ResponseWriter, r *http.Reques
 		"connections": connections,
 		"total":       len(connections),
 		"complete":    !hasMore,
-		"message":     "shared_read_domains passed the peer policy and exact linked-reader gates and are eligible for sage_recall with scope=auto. read_candidate_domains are policy intersections only and are not readable unless the authorization status is verified. Federation mutations remain operator-only.",
+		"message":     "shared_read_domains passed the negotiated exported-agent policy (or legacy linked-reader compatibility gate) and are eligible for sage_recall with scope=auto. read_candidate_domains are policy intersections only and are not readable unless the authorization status is verified. Federation mutations remain operator-only.",
 	}
 	if hasMore {
 		response["next_peer_cursor"] = s.federationAvailability.putPeerCursor(federationPeerCursor{
@@ -1286,33 +1304,8 @@ func (s *Server) federationVisibleRemoteScopes(ctx context.Context, callerID, re
 	}
 	postV23 := s.isPostV23ForNextTx()
 	if postV23 {
-		if s.badgerStore == nil {
-			return nil
-		}
-		root, err := s.badgerStore.GetAppV23Root()
-		if err != nil || root == nil ||
-			(callerID == root.PrincipalID && root.CredentialID != root.PrincipalID) {
-			return nil
-		}
-		if s.callerIsOperatorOrAdmin(ctx, callerID) {
-			return []string{remoteScope}
-		}
-		policyID, err := appV23PolicyPrincipal(s.badgerStore, callerID)
-		if err != nil {
-			return nil
-		}
-		enrollment, err := s.badgerStore.GetAppV23Enrollment(policyID)
-		if err != nil || enrollment == nil || !enrollment.Active {
-			return nil
-		}
-		role, err := s.badgerStore.GetAppV23Role(policyID)
-		if err != nil || role == nil ||
-			store.ValidateAppV23Policy(
-				role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
-			) != nil {
-			return nil
-		}
-		callerID = policyID
+		visible, _, _ := s.federationReaderScopesV23(callerID, remoteScope)
+		return visible
 	}
 	if !postV23 && s.nodeOperatorID != "" && callerID == s.nodeOperatorID {
 		return []string{remoteScope}

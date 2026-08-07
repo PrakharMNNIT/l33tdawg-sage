@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/l33tdawg/sage/internal/store"
 )
@@ -41,8 +40,7 @@ type pipeContactAggregate struct {
 }
 
 type pipeContactCapabilityOverlay struct {
-	readAll bool
-	denied  bool
+	denied bool
 }
 
 // buildPipeContactStatusGrant is the bounded legacy v1 status projection.
@@ -156,8 +154,6 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 
 	byAgent := make(map[string]*pipeContactAggregate)
 	ownerIDs := make(map[string]struct{})
-	now := time.Now()
-	postV8Access := m.postV8ForAccess != nil && m.postV8ForAccess()
 	postV22Capabilities := m.postV22ForNextTx != nil && m.postV22ForNextTx()
 	capabilityCache := make(map[string]pipeContactCapabilityOverlay, len(agentByID))
 	ordinaryEligibilityCache := make(map[string]bool, len(agentByID))
@@ -194,15 +190,20 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 			return pipeContactCapabilityOverlay{}, capabilityErr
 		}
 		overlay := pipeContactCapabilityOverlay{
-			readAll: registered &&
-				capabilities.Has(store.AgentCapabilityReadAllDomains),
 			denied: !registered ||
 				capabilities.Has(store.AgentCapabilityDenyFederatedPipe),
 		}
 		capabilityCache[agentID] = overlay
 		return overlay, nil
 	}
-	for _, permission := range policy.Domains {
+	// Manual domain-only PeerRBAC remains readable but never exposes its owner as
+	// a federated identity. Contacts are derived only from explicit agent exports
+	// and each exported agent's current owned-domain tree.
+	effectiveDomains, exportErr := m.effectiveAgentExportDomainPermissions(ctx, peer, policy)
+	if exportErr != nil {
+		return nil, fmt.Errorf("resolve explicit federated agent domains: %w", exportErr)
+	}
+	for _, permission := range effectiveDomains {
 		if !permission.Read && !permission.Copy {
 			continue
 		}
@@ -245,15 +246,11 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 		if metaOwner != owner {
 			return nil, fmt.Errorf("pipe contact owner changed while resolving %q", owningDomain)
 		}
-		ownerCapability, capabilityErr := capabilityFor(owner)
-		if capabilityErr != nil {
-			return nil, fmt.Errorf("read pipe contact capability for owner %q: %w", owner, capabilityErr)
-		}
 		ownerEligible, eligibilityErr := ordinaryEligible(owner)
 		if eligibilityErr != nil {
 			return nil, fmt.Errorf("read canonical pipe contact standing for owner %q: %w", owner, eligibilityErr)
 		}
-		if includeOwners && ownerEligible && !ownerCapability.denied {
+		if includeOwners && ownerEligible {
 			ownerIDs[owner] = struct{}{}
 		}
 
@@ -263,49 +260,10 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 			OwnerHeight:  ownerHeight,
 		}
 		eligible := make(map[string]struct{})
-		if includeOwners && ownerEligible && !ownerCapability.denied {
+		if includeOwners && ownerEligible {
 			eligible[owner] = struct{}{}
-		} else if _, selected := candidateIDSet[owner]; selected && ownerEligible && !ownerCapability.denied {
+		} else if _, selected := candidateIDSet[owner]; selected && ownerEligible {
 			eligible[owner] = struct{}{}
-		}
-		for agentID, agent := range agentByID {
-			if agent == nil || agent.Status != "active" || agent.RemovedAt != nil || agentID == owner {
-				continue
-			}
-			eligibleStanding, standingErr := ordinaryEligible(agentID)
-			if standingErr != nil {
-				return nil, fmt.Errorf("read canonical pipe contact standing for %q: %w", agentID, standingErr)
-			}
-			if !eligibleStanding {
-				continue
-			}
-			capability, capabilityErr := capabilityFor(agentID)
-			if capabilityErr != nil {
-				return nil, fmt.Errorf("read pipe contact capability for %q: %w", agentID, capabilityErr)
-			}
-			if capability.denied {
-				continue
-			}
-			// A federated inbox requires SAGE's ordinary level-1 Read verb.
-			// Passing classification 0 would admit any same-org member that can
-			// view PUBLIC memories, even though it has no domain Read capability.
-			// Level-2 Write is naturally included because it satisfies this bar.
-			// App-v22 ReadAllDomains is the consensus-backed alternative for a
-			// reviewed companion; its independent pipe deny bit still wins.
-			allowed := capability.readAll
-			if !allowed {
-				var accessErr error
-				allowed, accessErr = m.badger.HasAccessMultiOrgWithFederationPolicy(
-					permission.Domain, agentID, 1, now,
-					postV8Access, postV22Capabilities,
-				)
-				if accessErr != nil {
-					return nil, fmt.Errorf("check pipe contact access for %q on %q: %w", agentID, permission.Domain, accessErr)
-				}
-			}
-			if allowed {
-				eligible[agentID] = struct{}{}
-			}
 		}
 		for agentID := range eligible {
 			agg := byAgent[agentID]
@@ -346,18 +304,6 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 			}
 		}
 	}
-	acceptances := map[string]string{}
-	if policy.Revision > 0 {
-		if !selectedAcceptances {
-			acceptances, err = ss.GetFederatedPipeContactAcceptances(ctx, *policy)
-		} else {
-			acceptances, err = ss.GetFederatedPipeContactAcceptancesForAgents(ctx, *policy, canonicalPipeContactAgentIDs(byAgent))
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read pipe contact acceptance: %w", err)
-		}
-	}
-
 	agentIDs := agentIDsFromAggregates(byAgent)
 	sort.Strings(agentIDs)
 	prefixes := uniqueAgentPrefixes(agentIDs)
@@ -399,7 +345,15 @@ func (m *Manager) buildPipeContactGrantForCandidates(ctx context.Context, peer *
 			if err != nil {
 				return nil, err
 			}
-			contact.Accepting = acceptances[agentID] == contact.ContactID
+			capability, capabilityErr := capabilityFor(agentID)
+			if capabilityErr != nil {
+				return nil, fmt.Errorf("read exported contact messaging policy for %q: %w", agentID, capabilityErr)
+			}
+			// Exporting an agent is the operator's explicit federation membership
+			// consent. Group members may message that agent by default; the existing
+			// consensus DenyFederatedPipe restriction remains a hard messaging-only
+			// override.
+			contact.Accepting = !capability.denied
 		}
 		contacts = append(contacts, contact)
 	}

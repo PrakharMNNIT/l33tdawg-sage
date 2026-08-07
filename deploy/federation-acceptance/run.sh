@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 COMPOSE="$ROOT/deploy/federation-acceptance/docker-compose.yml"
-STATE=${FED_ACCEPTANCE_STATE:-/tmp/sage-v11176-federation-state}
+STATE=${FED_ACCEPTANCE_STATE:-/tmp/sage-v111716-federation-state}
 MODE=${1:-full}
 PORT_A=${FED_NODE_A_PORT:-28080}
 PORT_B=${FED_NODE_B_PORT:-28081}
@@ -45,13 +45,13 @@ container_ip() {
   docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$(container_id "$1")"
 }
 lan_ip() {
-  docker inspect -f '{{(index .NetworkSettings.Networks "sage-v11176-federation-lan").IPAddress}}' "$(container_id "$1")"
+  docker inspect -f '{{(index .NetworkSettings.Networks "sage-v111716-federation-lan").IPAddress}}' "$(container_id "$1")"
 }
 
 cleanup() {
   dc down --remove-orphans >/dev/null 2>&1 || true
   for cid in $CHURN_IDS; do docker stop "$cid" >/dev/null 2>&1 || true; done
-  docker network rm sage-v11176-federation-lan >/dev/null 2>&1 || true
+  docker network rm sage-v111716-federation-lan >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -84,10 +84,10 @@ wait_health "http://127.0.0.1:$PORT_A"
 wait_health "http://127.0.0.1:$PORT_B"
 
 phase "same-LAN topology"
-docker network inspect sage-v11176-federation-lan >/dev/null 2>&1 || \
-  docker network create --internal sage-v11176-federation-lan >/dev/null
-docker network connect --alias node-a sage-v11176-federation-lan "$(container_id node-a)"
-docker network connect --alias node-b sage-v11176-federation-lan "$(container_id node-b)"
+docker network inspect sage-v111716-federation-lan >/dev/null 2>&1 || \
+  docker network create --internal sage-v111716-federation-lan >/dev/null
+docker network connect --alias node-a sage-v111716-federation-lan "$(container_id node-a)"
+docker network connect --alias node-b sage-v111716-federation-lan "$(container_id node-b)"
 dc exec -T node-a getent hosts node-b >/dev/null
 dc exec -T node-b getent hosts node-a >/dev/null
 
@@ -153,24 +153,40 @@ if [ "$MODE" = full ]; then
   agent_a=$(jfield "$status_a" agent_id)
   agent_b=$(jfield "$status_b" agent_id)
 
-  phase "grant reciprocal Mynah home-domain read and exact inbox consent"
-  perms_a='{"permissions":[{"domain":"mynah-a-home","read":true,"write":false,"copy":false}]}'
-  perms_b='{"permissions":[{"domain":"mynah-b-home","read":true,"write":false,"copy":false}]}'
-  api node-a PUT "/v1/dashboard/federation/connections/$chain_a/permissions" "$perms_a" >/dev/null
-  api node-b PUT "/v1/dashboard/federation/connections/$chain_b/permissions" "$perms_b" >/dev/null
-  local_a=$(api node-a GET "/v1/dashboard/federation/connections/$chain_a/pipe-contacts?agent_id=$agent_a&live=1")
-  local_b=$(api node-b GET "/v1/dashboard/federation/connections/$chain_b/pipe-contacts?agent_id=$agent_b&live=1")
-  contact_a=$(jfield "$local_a" local_contacts.contacts.0.contact_id)
-  contact_b=$(jfield "$local_b" local_contacts.contacts.0.contact_id)
-  accept_a=$(node -e 'process.stdout.write(JSON.stringify({agent_id:process.argv[1],contact_id:process.argv[2],accepting:true}))' "$agent_a" "$contact_a")
-  accept_b=$(node -e 'process.stdout.write(JSON.stringify({agent_id:process.argv[1],contact_id:process.argv[2],accepting:true}))' "$agent_b" "$contact_b")
-  api node-a PUT "/v1/dashboard/federation/connections/$chain_a/pipe-contacts" "$accept_a" >/dev/null
-  api node-b PUT "/v1/dashboard/federation/connections/$chain_b/pipe-contacts" "$accept_b" >/dev/null
+  phase "explicitly add reciprocal Mynah agents to this federation"
+  exports_a=$(api node-a GET "/v1/dashboard/federation/connections/$chain_a/agent-exports")
+  exports_b=$(api node-b GET "/v1/dashboard/federation/connections/$chain_b/agent-exports")
+  rev_a=$(node -e 'const x=JSON.parse(process.argv[1]); const a=(x.exports||[]).find(v=>v.local_agent_id===process.argv[2]); process.stdout.write(String(a?a.revision:0))' "$exports_a" "$agent_a")
+  rev_b=$(node -e 'const x=JSON.parse(process.argv[1]); const a=(x.exports||[]).find(v=>v.local_agent_id===process.argv[2]); process.stdout.write(String(a?a.revision:0))' "$exports_b" "$agent_b")
+  export_a=$(node -e 'process.stdout.write(JSON.stringify({agent_id:process.argv[1],state:"active",max_classification:4,domain_exclusions:[],expected_revision:Number(process.argv[2])}))' "$agent_a" "$rev_a")
+  export_b=$(node -e 'process.stdout.write(JSON.stringify({agent_id:process.argv[1],state:"active",max_classification:4,domain_exclusions:[],expected_revision:Number(process.argv[2])}))' "$agent_b" "$rev_b")
+  api node-a PUT "/v1/dashboard/federation/connections/$chain_a/agent-exports" "$export_a" >/dev/null
+  api node-b PUT "/v1/dashboard/federation/connections/$chain_b/agent-exports" "$export_b" >/dev/null
+
+  phase "directional peer export read needs no mirrored group"
+  export_probe="federation default read probe $RUN_TOKEN"
+  remember_args=$(node -e 'process.stdout.write(JSON.stringify({content:process.argv[1],domain:"mynah-a-home",type:"fact",confidence:0.95}))' "$export_probe")
+  mcp_call node-a sage_remember "$remember_args" >/dev/null
+  i=0
+  while :; do
+    exported=$(mcp_call node-b sage_federation '{}') || true
+    echo "$exported" | grep -q 'mynah-a-home' && break
+    i=$((i + 1)); [ "$i" -lt 45 ] || die "node B never discovered node A's directional domain export"
+    sleep 2
+  done
+  recall_args=$(node -e 'process.stdout.write(JSON.stringify({query:process.argv[1],domain:"mynah-a-home",scope:"federated",federate_chains:[process.argv[2]],top_k:5}))' "$export_probe" "$chain_b")
+  i=0
+  while :; do
+    recalled=$(mcp_call node-b sage_recall "$recall_args") || true
+    echo "$recalled" | grep -q "$export_probe" && break
+    i=$((i + 1)); [ "$i" -lt 45 ] || die "ordinary node B companion could not read node A's export without a mirrored group"
+    sleep 2
+  done
 fi
 
 phase "remove LAN; only the relay bridges edge_a and edge_b"
-docker network disconnect sage-v11176-federation-lan "$(container_id node-a)"
-docker network disconnect sage-v11176-federation-lan "$(container_id node-b)"
+docker network disconnect sage-v111716-federation-lan "$(container_id node-a)"
+docker network disconnect sage-v111716-federation-lan "$(container_id node-b)"
 
 phase "restart A, B, then both and require container IP churn"
 for svc in node-a node-b; do
@@ -178,8 +194,8 @@ for svc in node-a node-b; do
   dc stop "$svc" >/dev/null
   dc rm -f "$svc" >/dev/null
   case "$svc" in
-    node-a) edge=sage-v11176-federation-edge-a; control=sage-v11176-federation-control-a ;;
-    node-b) edge=sage-v11176-federation-edge-b; control=sage-v11176-federation-control-b ;;
+    node-a) edge=sage-v111716-federation-edge-a; control=sage-v111716-federation-control-a ;;
+    node-b) edge=sage-v111716-federation-edge-b; control=sage-v111716-federation-control-b ;;
   esac
   # Occupy the just-freed addresses so Docker cannot hand the recreated node
   # the same pair and accidentally skip the stale-address recovery condition.
@@ -248,7 +264,7 @@ elif [ "$MODE" = full ]; then
   target=$(jfield "$found" matches.0.to)
   [ -n "$target" ] || die "sage_find_agent returned no exact remote Mynah target"
   dc stop node-b >/dev/null
-  send_args=$(node -e 'process.stdout.write(JSON.stringify({to:process.argv[1],intent:"acceptance",payload:"v11.17.6 durable offline inbox probe "+process.argv[2],idempotency_key:"v11176-offline-probe-"+process.argv[2]}))' "$target" "$RUN_TOKEN")
+  send_args=$(node -e 'process.stdout.write(JSON.stringify({to:process.argv[1],intent:"acceptance",payload:"v11.17.16 durable offline inbox probe "+process.argv[2],idempotency_key:"v111716-offline-probe-"+process.argv[2]}))' "$target" "$RUN_TOKEN")
   send_started=$(date +%s)
   sent=$(mcp_call node-a sage_message_send "$send_args")
   send_elapsed=$(( $(date +%s) - send_started ))
@@ -268,7 +284,7 @@ elif [ "$MODE" = full ]; then
     i=$((i + 1)); [ "$i" -lt 45 ] || die "offline message did not persist/deliver to restarted inbox"
     sleep 2
   done
-  reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.17.6 acceptance reply"}))' "$received_id")
+  reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.17.16 acceptance reply"}))' "$received_id")
   mcp_call node-b sage_message_reply "$reply_args" >/dev/null
   status_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1]}))' "$message_id")
   i=0

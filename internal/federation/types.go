@@ -59,6 +59,17 @@ type QueryRequest struct {
 	SourceChainID          string `json:"source_chain_id"`
 	DestinationChainID     string `json:"destination_chain_id"`
 	AgreementBindingDigest string `json:"agreement_binding_digest"`
+	// SourceAuthorizationModel selects the negotiated caller authorization
+	// contract. Omission preserves the legacy exact linked-reader gate; peers
+	// must advertise CapabilityPeerExportReadV1 before a source may select the
+	// peer-export model. Unknown models fail closed.
+	SourceAuthorizationModel string `json:"source_authorization_model,omitempty"`
+	// SourceAgentEligible is an outer peer-authenticated attestation produced by
+	// the source SAGE after it revalidates the exact caller as an active ordinary
+	// app-v23 agent. The source owns that local RBAC fact; AgentProof separately
+	// binds the original caller and exact recall body.
+	SourceAgentEligible          bool  `json:"source_agent_eligible"`
+	SourceAgentMaxClassification uint8 `json:"source_agent_max_classification"`
 	// QueryChallenge is issued by the destination during the authenticated
 	// recall-plan preflight. It is durable, short-lived, and single-use. The
 	// original agent signs it inside federation_context, preventing the local
@@ -98,8 +109,11 @@ type QueryPlanResponse struct {
 }
 
 type QueryPlanRequest struct {
-	AgentID   string `json:"agent_id"`
-	DomainTag string `json:"domain_tag"`
+	SourceAuthorizationModel     string `json:"source_authorization_model,omitempty"`
+	AgentID                      string `json:"agent_id"`
+	DomainTag                    string `json:"domain_tag"`
+	SourceAgentEligible          bool   `json:"source_agent_eligible"`
+	SourceAgentMaxClassification uint8  `json:"source_agent_max_classification"`
 }
 
 // RecallPlan is the agent-facing projection of exact, authenticated
@@ -290,10 +304,17 @@ const (
 	FederationProtocolV23       = 23
 	CapabilityFederationV23     = "federation-v23"
 	CapabilityQueryAgentProofV2 = "federated-query-agent-proof-v2"
-	// CapabilityQueryAvailabilityV1 advertises the bounded, non-mutating
-	// linked-reader check used by caller-facing federation discovery. Peer Read
-	// policy alone is only a candidate scope; this route proves the exact remote
-	// agent currently has an active guest link before SAGE labels it readable.
+	// CapabilityPeerExportReadV1 advertises the directional exported-domain
+	// model: the source attests its exact active ordinary caller and clearance;
+	// the destination applies its peer Read policy without requiring a mirrored
+	// linked-reader group.
+	CapabilityPeerExportReadV1      = "federated-peer-export-read-v1"
+	SourceAuthorizationPeerExportV1 = "peer-export-v1"
+	// CapabilityQueryAvailabilityV1 advertises the bounded, non-mutating live
+	// authorization check used by caller-facing federation discovery. Peer Read
+	// policy alone is only a candidate scope; this route verifies negotiated
+	// exported-agent authorization (or the legacy linked-reader fallback) before
+	// SAGE labels a domain readable.
 	CapabilityQueryAvailabilityV1 = "federated-query-availability-v1"
 	// CapabilityFederatedGuestAgentEligibility advertises the bounded exact-ID
 	// oracle used before a peer may create or rebind a linked-reader row.
@@ -303,8 +324,11 @@ const (
 const MaxQueryAvailabilityDomains = 128
 
 type QueryAvailabilityRequest struct {
-	AgentID    string   `json:"agent_id"`
-	DomainTags []string `json:"domain_tags"`
+	SourceAuthorizationModel     string   `json:"source_authorization_model,omitempty"`
+	AgentID                      string   `json:"agent_id"`
+	DomainTags                   []string `json:"domain_tags"`
+	SourceAgentEligible          bool     `json:"source_agent_eligible"`
+	SourceAgentMaxClassification uint8    `json:"source_agent_max_classification"`
 }
 
 type QueryAvailabilityResponse struct {

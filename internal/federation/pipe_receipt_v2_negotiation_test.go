@@ -28,18 +28,20 @@ func newReceiptAdmissionFixture(t *testing.T, postV26 bool, version int) receipt
 	t.Helper()
 	ctx := context.Background()
 	manager, sqlite, badger := newDrainTestManager(t)
+	ensurePipeContactAppV23(t, manager, badger)
 	manager.postV26ForNextTx = func() bool { return postV26 }
 	peerOperator := newPeerOperatorID(t)
 	agreement := configurePeerRBACConnection(t, manager, sqlite, badger,
 		"chain-peer", peerOperator, "host", nil, 4)
 	owner := newPeerOperatorID(t)
-	require.NoError(t, sqlite.CreateAgent(ctx, &store.AgentEntry{
-		AgentID: owner, Name: "receipt-target", Status: "active",
-	}))
+	seedPipeContactOrdinaryAgent(t, manager, sqlite, badger, owner, "receipt-target", "active", 0, 10)
 	require.NoError(t, badger.RegisterDomain("receipt-target", owner, "", 10))
 	_, err := manager.ReplacePeerRBACPolicy(ctx, "chain-peer", []store.PeerRBACDomainPermission{{
 		Domain: "receipt-target.messages", Read: true,
 	}})
+	require.NoError(t, err)
+	_, err = manager.SetFederatedAgentExport(ctx, "chain-peer", owner,
+		store.FederatedAgentExportStateActive, 4, []string{"local-" + owner}, 0)
 	require.NoError(t, err)
 	grant, err := manager.LocalPipeContacts(ctx, "chain-peer")
 	require.NoError(t, err)
@@ -51,16 +53,6 @@ func newReceiptAdmissionFixture(t *testing.T, postV26 bool, version int) receipt
 		}
 	}
 	require.Equal(t, owner, contact.AgentID)
-	_, err = manager.SetPipeContactAcceptance(ctx, "chain-peer", owner, contact.ContactID, true)
-	require.NoError(t, err)
-	grant, err = manager.LocalPipeContacts(ctx, "chain-peer")
-	require.NoError(t, err)
-	for _, candidate := range grant.Contacts {
-		if candidate.AgentID == owner {
-			contact = candidate
-			break
-		}
-	}
 	require.True(t, contact.Accepting)
 
 	_, sourceKey, err := ed25519.GenerateKey(rand.Reader)

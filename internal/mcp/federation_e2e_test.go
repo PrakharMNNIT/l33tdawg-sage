@@ -168,6 +168,30 @@ func addMCPE2ELinkedReader(
 	require.NoError(t, destination.sqlite.PutFederatedGroupGuest(context.Background(), guest))
 }
 
+func enrollMCPE2EOrdinaryMember(
+	t *testing.T, node *mcpE2ENode, name string, clearance uint8, active bool, domainAccess string,
+) (string, ed25519.PrivateKey) {
+	t.Helper()
+	pub, private, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	agentID := auth.PublicKeyToAgentID(pub)
+	require.NoError(t, node.badger.RegisterAgentWithCapabilities(
+		agentID, name, store.AppV23RoleMember, domainAccess, "codex", "", 2,
+		0,
+	))
+	root, err := node.badger.GetAppV23Root()
+	require.NoError(t, err)
+	require.NotNil(t, root)
+	require.NoError(t, node.badger.ApproveAppV23LocalAgent(store.AppV23LocalEnrollment{
+		AgentID: agentID, ApprovedBy: root.CredentialID,
+		RootGeneration: root.Generation, Profile: store.AppV23ProfileStandard,
+		HomeDomain: "local-" + name, Clearance: clearance,
+		Capabilities: 0,
+		Active:       active, UpdatedHeight: 3,
+	}, store.AppV23RoleMember, 0, 0))
+	return agentID, private
+}
+
 func TestMCPOrdinaryAgentFederatedRecallTwoNodesEndToEnd(t *testing.T) {
 	t.Setenv("SAGE_RECALL_HYBRID", "0")
 	nodeA := newMCPE2ENode(t, "chain-a")
@@ -198,7 +222,21 @@ func TestMCPOrdinaryAgentFederatedRecallTwoNodesEndToEnd(t *testing.T) {
 	require.NoError(t, nodeA.badger.SetMemoryAuthor(
 		"benchmark-a", hex.EncodeToString(nodeA.pub),
 	))
-	require.NoError(t, nodeA.badger.SetMemoryClassification("benchmark-a", 1))
+	require.NoError(t, nodeA.badger.SetMemoryClassification("benchmark-a", 2))
+	localSecret := "same-name local secret must never ride a federation-only read"
+	localSecretHash := sha256.Sum256([]byte(localSecret))
+	require.NoError(t, nodeB.sqlite.InsertMemory(context.Background(), &memory.MemoryRecord{
+		MemoryID: "local-secret-b", SubmittingAgent: hex.EncodeToString(nodeB.pub),
+		Content: localSecret, ContentHash: localSecretHash[:], MemoryType: memory.TypeFact,
+		DomainTag: benchmarkDomain, ConfidenceScore: .95, Status: memory.StatusCommitted,
+		CreatedAt: time.Now(),
+	}))
+	require.NoError(t, nodeB.badger.SetMemoryHash(
+		"local-secret-b", localSecretHash[:], string(memory.StatusCommitted),
+	))
+	require.NoError(t, nodeB.badger.SetMemoryDomain("local-secret-b", benchmarkDomain))
+	require.NoError(t, nodeB.badger.SetMemoryAuthor("local-secret-b", hex.EncodeToString(nodeB.pub)))
+	require.NoError(t, nodeB.badger.SetMemoryClassification("local-secret-b", 1))
 
 	health := metrics.NewHealthChecker()
 	// Keep the end-to-end federation gate hermetic: the MCP recall path probes
@@ -206,16 +244,13 @@ func TestMCPOrdinaryAgentFederatedRecallTwoNodesEndToEnd(t *testing.T) {
 	bREST := rest.NewServer("", nodeB.sqlite, nodeB.sqlite, nodeB.badger, health, zerolog.Nop(), embedding.NewHashProvider(768))
 	bREST.SetFederation(nodeB.manager)
 	bREST.SetNodeOperatorID(hex.EncodeToString(nodeB.pub))
+	bREST.SetPostV23ForNextTxAccessor(func() bool { return true })
 	bHTTP := httptest.NewServer(bREST.Router())
 	t.Cleanup(bHTTP.Close)
 
-	ordinaryPub, ordinaryKey, err := auth.GenerateKeypair()
-	require.NoError(t, err)
-	ordinaryID := auth.PublicKeyToAgentID(ordinaryPub)
-	require.NoError(t, nodeB.badger.RegisterAgent(ordinaryID, "ordinary-b", "member", "", "codex", "", 1))
-	require.NoError(t, nodeB.badger.SetAgentPermission(ordinaryID, 1,
-		`[{"domain":"sage-autoresearch-benchmark","read":true}]`, "*", "", ""))
-	addMCPE2ELinkedReader(t, nodeA, nodeB, ordinaryID, benchmarkDomain)
+	// Plain Standard Member: no ReadAll, no same-named local domain/grant, no
+	// local Access Group, and no destination linked-reader row.
+	ordinaryID, ordinaryKey := enrollMCPE2EOrdinaryMember(t, nodeB, "ordinary-b", 4, true, "")
 	mcpB := NewServer(bHTTP.URL, ordinaryKey)
 	discovery, err := mcpB.toolFederation(context.Background(), nil)
 	require.NoError(t, err)
@@ -236,40 +271,91 @@ func TestMCPOrdinaryAgentFederatedRecallTwoNodesEndToEnd(t *testing.T) {
 	assert.Equal(t, "chain-a", memories[0]["source_chain_id"])
 	assert.Equal(t, "federated_live", memories[0]["source_kind"])
 	assert.Equal(t, "external_untrusted", memories[0]["trust"])
+	assert.NotEqual(t, "local-secret-b", memories[0]["memory_id"],
+		"federation-only authority leaked a same-name local row")
 
-	unlinkedPub, unlinkedKey, err := auth.GenerateKeypair()
+	// Requester-side restrictions are local exceptions to the default read
+	// contract. They must affect both discovery and the recall planner without
+	// requiring the exporting peer to mirror any state.
+	restriction, err := nodeB.manager.SetFederatedReaderRestriction(
+		context.Background(), nodeA.chainID, ordinaryID,
+		store.FederatedReaderRestrictionStateActive, false,
+		[]string{benchmarkDomain}, 0,
+	)
 	require.NoError(t, err)
-	unlinkedID := auth.PublicKeyToAgentID(unlinkedPub)
-	require.NoError(t, nodeB.badger.RegisterAgent(unlinkedID, "unlinked-b", "member", "", "codex", "", 1))
-	require.NoError(t, nodeB.badger.SetAgentPermission(unlinkedID, 1,
-		`[{"domain":"sage-autoresearch-benchmark","read":true}]`, "*", "", ""))
+	require.Equal(t, int64(1), restriction.Revision)
+	restrictedDiscovery, err := mcpB.toolFederation(context.Background(), nil)
+	require.NoError(t, err)
+	restrictedConnections := restrictedDiscovery.(map[string]any)["connections"].([]map[string]any)
+	require.Len(t, restrictedConnections, 1)
+	assert.Empty(t, restrictedConnections[0]["shared_read_domains"],
+		"a denied domain must be filtered from discovery")
+	_, err = mcpB.toolRecall(context.Background(), map[string]any{
+		"query": "benchmark federation", "domain": benchmarkDomain, "scope": "auto",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no authorized v23 federation destination")
+	assert.Contains(t, err.Error(), "local federation access controls deny this peer domain")
+
+	revoked, err := nodeB.manager.SetFederatedReaderRestriction(
+		context.Background(), nodeA.chainID, ordinaryID,
+		store.FederatedReaderRestrictionStateRevoked, false, nil, 1,
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), revoked.Revision)
+	restoredDiscovery, err := mcpB.toolFederation(context.Background(), nil)
+	require.NoError(t, err)
+	restoredConnections := restoredDiscovery.(map[string]any)["connections"].([]map[string]any)
+	require.Len(t, restoredConnections, 1)
+	assert.Equal(t, []any{benchmarkDomain}, restoredConnections[0]["shared_read_domains"],
+		"revoking the local exception must restore default read access")
+	restoredResult, err := mcpB.toolRecall(context.Background(), map[string]any{
+		"query": "benchmark federation", "domain": benchmarkDomain, "scope": "auto",
+	})
+	require.NoError(t, err)
+	require.Len(t, restoredResult.(map[string]any)["memories"], 1)
+
+	// A second ordinary Member gets the same peer export by default. No group is
+	// mirrored onto this SAGE and no per-agent link is created at the destination.
+	_, unlinkedKey := enrollMCPE2EOrdinaryMember(t, nodeB, "ordinary-b-2", 4, true, "")
 	unlinkedMCP := NewServer(bHTTP.URL, unlinkedKey)
 	unlinkedDiscovery, err := unlinkedMCP.toolFederation(context.Background(), nil)
 	require.NoError(t, err)
 	unlinkedConnections := unlinkedDiscovery.(map[string]any)["connections"].([]map[string]any)
 	require.Len(t, unlinkedConnections, 1)
 	assert.Equal(t, []any{benchmarkDomain}, unlinkedConnections[0]["read_candidate_domains"])
-	assert.Empty(t, unlinkedConnections[0]["shared_read_domains"],
-		"peer policy without an exact linked-reader row is not readable")
+	assert.Equal(t, []any{benchmarkDomain}, unlinkedConnections[0]["shared_read_domains"],
+		"ordinary peer agents inherit the directional export by default")
 	assert.Equal(t, "verified", unlinkedConnections[0]["read_authorization"])
-	_, err = unlinkedMCP.toolRecall(context.Background(), map[string]any{
+	unlinkedResult, err := unlinkedMCP.toolRecall(context.Background(), map[string]any{
 		"query": "benchmark federation", "domain": benchmarkDomain, "scope": "auto",
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no authorized v23 federation destination")
-
-	deniedPub, deniedKey, err := auth.GenerateKeypair()
 	require.NoError(t, err)
-	deniedID := auth.PublicKeyToAgentID(deniedPub)
-	require.NoError(t, nodeB.badger.RegisterAgent(deniedID, "denied-b", "member", "", "codex", "", 1))
-	require.NoError(t, nodeB.badger.SetAgentPermission(deniedID, 1,
-		`[{"domain":"finance","read":true}]`, "*", "", ""))
-	deniedMCP := NewServer(bHTTP.URL, deniedKey)
-	_, err = deniedMCP.toolRecall(context.Background(), map[string]any{
+	require.Len(t, unlinkedResult.(map[string]any)["memories"], 1)
+
+	// Source attestation carries the actual classification ceiling. A low-
+	// clearance Member discovers the export but cannot receive its class-2 row.
+	_, lowKey := enrollMCPE2EOrdinaryMember(t, nodeB, "ordinary-low", 1, true, "")
+	lowMCP := NewServer(bHTTP.URL, lowKey)
+	lowDiscovery, err := lowMCP.toolFederation(context.Background(), nil)
+	require.NoError(t, err)
+	lowConnections := lowDiscovery.(map[string]any)["connections"].([]map[string]any)
+	require.Len(t, lowConnections, 1)
+	assert.Equal(t, []any{benchmarkDomain}, lowConnections[0]["shared_read_domains"])
+	lowResult, err := lowMCP.toolRecall(context.Background(), map[string]any{
 		"query":  "benchmark federation",
 		"domain": benchmarkDomain,
 		"scope":  "auto",
 	})
+	require.NoError(t, err)
+	assert.Empty(t, lowResult.(map[string]any)["memories"],
+		"classification above the attested source clearance leaked")
+
+	_, inactiveKey := enrollMCPE2EOrdinaryMember(t, nodeB, "ordinary-inactive", 4, false, "")
+	inactiveMCP := NewServer(bHTTP.URL, inactiveKey)
+	_, err = inactiveMCP.toolRecall(context.Background(), map[string]any{
+		"query": "benchmark federation", "domain": benchmarkDomain, "scope": "auto",
+	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not authorized to read this federated domain")
+	assert.Contains(t, err.Error(), "active ordinary agent")
 }

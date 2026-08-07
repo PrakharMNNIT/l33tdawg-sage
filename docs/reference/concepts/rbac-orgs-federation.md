@@ -18,11 +18,11 @@ SAGE's access control is a layered system. From outermost to innermost, a query 
 
 Consensus RBAC state includes organizations, departments, clearance levels,
 access grants, app-v23 roles, local enrollment, and local Access Groups.
-Federated linked-reader relations are deliberately node-local, but are bound to
-the exact consensus group and active federation generation. BadgerDB is the
-authoritative source for consensus access-control decisions; SQLite/PostgreSQL
-are rebuildable serving projections and also hold the explicitly node-local
-federation relation state.
+Federation exports, reader restrictions, and legacy linked-reader relations are
+deliberately node-local and bound to the exact active agreement generation.
+BadgerDB is the authoritative source for consensus access-control decisions;
+SQLite/PostgreSQL are rebuildable serving projections and also hold the
+explicitly node-local federation relation state.
 
 ---
 
@@ -256,8 +256,8 @@ reassignment with an all-record blast radius
 (`internal/store/appv26_domain_owner_retirement.go`;
 `web/appv25_memory_legacy_adoption_control.go`).
 
-An Access Group's local-member compartment is disjoint from its federated
-linked-reader compartment. Local rights are derived dynamically from current
+An Access Group's local-member compartment is disjoint from federation. Local
+rights are derived dynamically from current
 ownership rather than expanded into pairwise grants. Group authority is
 `read`, `read_write`, or `read_write_modify`; multiple groups form the union of
 their scope and strongest applicable authority. Existing groups migrate to
@@ -265,14 +265,23 @@ the least-privileged `read` tier at app-v26 activation without changing their
 operator revision. Leaving or deleting a group removes only that derived
 relationship: every agent retains full authority over its own domain tree.
 Ownership transfer changes derived scope immediately in consensus order. A
-remote `agent@chain` relation supplies only exact live
-Read bounded by group, domain ownership, agreement generation, host-selected
-classification ceiling, and the original remote agent's nested signature.
-It never supplies Copy, Write, Modify, claim, ownership, grants, roles,
-governance, or transitive access (`internal/federation/query_v23.go`;
-`internal/federation/v23_guest.go`; `internal/store/federated_group_guests.go`).
+Every active trusted node connection is already a pairwise federation group.
+An operator explicitly exports local ordinary agents into that federation;
+each export derives the agent's current owned domain tree. Any active ordinary
+agent on the peer receives live Read by default without a mirrored Access
+Group, receiving domain, local same-name grant, or exact linked-reader row. A
+receiver-local restriction may narrow that default for one local agent.
+Disclosure remains bounded by peer policy, ownership, agreement generation,
+export and requester classification ceilings, and the original requester's
+nested signature. It never supplies Copy, Write, Modify, claim, ownership,
+grants, roles, governance, or transitive access
+(`internal/federation/agent_exports.go`;
+`internal/federation/reader_restrictions.go`;
+`internal/federation/v23_guest.go`).
 
-That read relation does not open messaging. Linked-reader pipeline transport
+An active exported agent is message-addressable by default unless
+`DenyFederatedPipe` applies. This does not grant memory authority. The legacy
+linked-reader relation does not itself open messaging: its pipeline transport
 uses a separate `linked-v23` authorization mode and receiver-local,
 default-off consent for one exact
 `remote_chain_id + remote_agent_id -> local_agent_id` tuple. The local target

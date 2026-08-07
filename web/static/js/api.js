@@ -1110,6 +1110,10 @@ export function fedPermissionsGet(chainId, live = true) {
     return fedFetch(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/permissions${suffix}`);
 }
 export function fedPermissionsSet(chainId, permissions) { return fedPut(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/permissions`, { permissions }); }
+export function fedAgentExportsGet(chainId) { return fedFetch(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/agent-exports`); }
+export function fedAgentExportSet(chainId, exportPolicy) { return fedPut(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/agent-exports`, exportPolicy); }
+export function fedReaderRestrictionsGet(chainId) { return fedFetch(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/reader-restrictions`); }
+export function fedReaderRestrictionSet(chainId, restriction) { return fedPut(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/reader-restrictions`, restriction); }
 export function fedPause(chainId, paused) { return fedPut(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/pause`, { paused }); }
 export function fedPipeContactsGet(chainId, live = true, agentId = '') {
     const query = new URLSearchParams();

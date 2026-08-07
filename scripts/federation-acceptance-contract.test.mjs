@@ -9,7 +9,7 @@ const runner = fs.readFileSync(path.join(base, 'run.sh'), 'utf8');
 const legacy = fs.readFileSync(path.join(base, 'v11.17.4-config.template.yaml'), 'utf8');
 
 for (const service of ['relay:', 'node-a:', 'node-b:']) assert.match(compose, new RegExp(`\\n  ${service}`));
-assert.equal((compose.match(/image: sage-v11176-node:local/g) || []).length, 2,
+assert.equal((compose.match(/image: sage-v111716-node:local/g) || []).length, 2,
   'both nodes must run the exact same built image');
 for (const network of ['edge_a:', 'edge_b:', 'lan:']) assert.match(compose, new RegExp(`\\n  ${network}`));
 assert.match(compose, /SAGE_VENDORED_AGENT_HOME_DOMAIN: mynah-a-home/);
@@ -23,6 +23,7 @@ for (const gate of [
   'expired route snapshot fixture',
   'v11.17.4 persisted p2p_peers compatibility shape',
   'canonical MCP flow: find -> send -> offline inbox -> read -> reply/status',
+  'directional peer export read needs no mirrored group',
 ]) assert.ok(runner.includes(gate), `missing matrix gate: ${gate}`);
 
 assert.match(runner, /automatic real JOIN ceremony over LAN/);
@@ -36,6 +37,13 @@ assert.match(runner, /idempotent_replay.*false/);
 assert.match(runner, /sage_inbox/);
 assert.match(runner, /sage_message_reply/);
 assert.match(runner, /sage_message_status/);
+assert.match(runner, /mcp_call node-a sage_remember/);
+assert.match(runner, /connections\/\$chain_a\/agent-exports/);
+assert.match(runner, /connections\/\$chain_b\/agent-exports/);
+assert.doesNotMatch(runner, /grant reciprocal Mynah home-domain read and exact inbox consent/);
+assert.match(runner, /mcp_call node-b sage_federation/);
+assert.match(runner, /mcp_call node-b sage_recall/);
+assert.match(runner, /ordinary node B companion could not read node A's export without a mirrored group/);
 assert.match(runner, /timeout "\$MCP_TIMEOUT_SECONDS" sage-gui mcp/);
 assert.match(runner, /\[ "\$app_a" -ge 26 \]/);
 assert.match(runner, /\[ "\$app_b" -ge 26 \]/);
