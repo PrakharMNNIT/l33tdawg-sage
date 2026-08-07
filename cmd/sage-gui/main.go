@@ -141,7 +141,28 @@ func main() {
 	case "import":
 		err = runImport()
 	case "backup":
-		err = runBackup()
+		// `backup` alone copies only the SQLite projection (data/sage.db).
+		// `backup --full` takes the complete stopped-node archive that every
+		// recovery and upgrade procedure actually requires.
+		//
+		// --full is matched anywhere in the argument list, not just first:
+		// `backup --out X --full` silently falling through to the SQLite-only
+		// path would hand the operator a backup they believe is complete, right
+		// before an irreversible consensus upgrade.
+		if rest, full, flagErr := extractFullBackupFlag(os.Args[2:]); flagErr != nil {
+			err = flagErr
+		} else if full {
+			err = runBackupFull(rest)
+		} else if len(rest) > 0 {
+			// Silently ignoring a mistyped argument here would hand back a
+			// SQLite-only copy while the operator believes they asked for the
+			// complete archive.
+			err = fmt.Errorf("unknown argument %q for backup — did you mean \"sage-gui backup --full\"? (see: sage-gui help)", rest[0])
+		} else {
+			err = runBackup()
+		}
+	case "restore":
+		err = runRestore(os.Args[2:])
 	case "snapshot":
 		err = runSnapshot(os.Args[2:])
 	case "upgrade":
@@ -246,9 +267,13 @@ Commands:
   seed      Seed memories from a text/JSON file (bootstrap your AI's brain)
   export    Export memories to a .vault file (optionally encrypted)
   import    Import memories from a .vault file
-  backup    Create a timestamped backup of the memory database
+  backup    Back up the SQLite memory projection (timestamped copy of data/sage.db)
+  backup --full  Complete stopped-node archive (Badger + CometBFT + keys + config).
+            This is the backup every upgrade and recovery procedure requires;
+            a plain "backup" cannot rebuild a chain. See docs/UPGRADING.md
+  restore   Restore a complete backup (sage-gui restore --from <archive.tar.gz>)
   snapshot  List or prune on-disk chain snapshots (list | prune [--keep N])
-  upgrade   Activate app-version consensus forks (status | propose --target N)
+  upgrade   Activate app-version consensus forks (status | preflight | propose --target N)
   recover   Reset vault passphrase using your recovery key
   repair-chain  Disabled: SQLite cannot reconstruct canonical chain history; restore a complete stopped-node backup
   quorum-init   Initialize a quorum network (generates shared genesis)

@@ -64,6 +64,8 @@ func runUpgrade(args []string) error {
 		return runUpgradePropose(args[1:])
 	case "status":
 		return runUpgradeStatus(args[1:])
+	case "preflight":
+		return runUpgradePreflight(args[1:])
 	case "help", "--help", "-h":
 		printUpgradeUsage()
 		return nil
@@ -88,6 +90,9 @@ The voting/processing already exists; this submits the plan an operator needs.
 
 Subcommands:
   status                       Show the chain's app version and the next fork
+  preflight                    Read-only pre-upgrade check on a STOPPED node: verifies the
+                               app-v22/app-v23 predecessor-ladder invariant and previews the
+                               app-v23 Root election. Run this before adopting a new binary.
   propose --target <N>         Propose activation of app-v<N> (must be current+1)
 
 propose flags:
