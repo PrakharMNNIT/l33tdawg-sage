@@ -466,6 +466,50 @@ func TestFederatedSemanticRecallCarriesTextFallback(t *testing.T) {
 	assert.Equal(t, "benchmark exact words", fed.lastReq.Query)
 }
 
+func TestPostV23FederatedRecallRejectsOldClientAuthorizationTupleOmission(t *testing.T) {
+	srv, _, _ := newTestServer(t, "")
+	fed := &fakeFederation{}
+	srv.SetFederation(fed)
+	body, err := json.Marshal(SearchMemoryRequest{
+		Query: "signed plan", DomainTag: "shared", Federated: true,
+		FederateChains: []string{"chain-a"},
+		FederationContext: &FederatedRecallProofContext{
+			SourceChainID:     fed.LocalChainID(),
+			AgreementBindings: map[string]string{"chain-a": "binding-a"},
+			QueryChallenges:   map[string]string{"chain-a": "challenge-a"},
+			// A pre-authorization-tuple client copied only the historical plan
+			// fields. Empty authorization values are valid for a legacy peer, but
+			// omitted map entries are an old-client signing error.
+		},
+	})
+	require.NoError(t, err)
+	req, callerID := signedRequest(t, http.MethodPost, "/v1/memory/search", body)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Host = "127.0.0.1:8080"
+	badger, err := store.NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, badger.CloseBadger()) })
+	require.NoError(t, badger.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: callerID, Scope: "rest-old-client-plan",
+		AgentID: strings.Repeat("7a", 32), Profile: store.AppV23ProfileStandard,
+		HomeDomain: "companion.home", Clearance: 2, Height: 1,
+		BootstrapDigest: "rest-old-client-plan",
+	}))
+	srv.badgerStore = badger
+	srv.SetPostV23ForNextTxAccessor(func() bool { return true })
+
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var response QueryMemoryResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+	require.NotNil(t, response.Federation)
+	assert.Equal(t, 0, fed.calls, "an incomplete signed tuple must fail before peer fan-out")
+	assert.Contains(t, response.Federation.Errors["chain-a"], "signed federation authorization tuple")
+	assert.Contains(t, response.Federation.Errors["chain-a"], "recall-plan")
+	assert.Contains(t, response.Federation.Errors["chain-a"], "re-sign")
+}
+
 func TestFederatedRecallDeduplicatesLocalAndLiveByContentHash(t *testing.T) {
 	srv, memStore, _ := newTestServer(t, "")
 	memStore.memories["local-copy-shape"] = &memory.MemoryRecord{
@@ -553,6 +597,10 @@ func TestCrossFedStatusExposesAuthenticatedRemoteDiscovery(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
 	assert.Equal(t, true, response["reachable"])
 	assert.Equal(t, "DKAN-TII", response["network_name"])
+	assert.Equal(t, []any{
+		federation.CapabilitySync,
+		federation.CapabilityFederatedPipeline,
+	}, response["capabilities"])
 	assert.NotNil(t, response["peer_rbac_grant"])
 	assert.NotNil(t, response["pipe_contacts"])
 }

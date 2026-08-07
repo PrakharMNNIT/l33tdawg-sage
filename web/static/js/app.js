@@ -45,6 +45,7 @@ import {
     federationRoutePresentation,
     normalizeFederationRoutePlan,
 } from './federation-route-state.js';
+import { federationPeerAgentCompatibility } from './federation-peer-capabilities.js';
 
 const { h, render, createContext, Fragment } = preact;
 const { useState, useEffect, useRef, useLayoutEffect, useCallback, useContext } = preactHooks;
@@ -56,7 +57,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.17.16';
+const SAGE_VERSION = 'v11.17.17';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -16637,6 +16638,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     const hiddenRemoteRowCount = Math.max(0, orderedRemoteRows.length - renderedRemoteRows.length);
     const dirty = !fedPermissionMapsEqual(saved, draft);
     const subscribeDirty = JSON.stringify(subscribeSaved) !== JSON.stringify(subscribeDraft);
+	const peerAgentCompatibility = federationPeerAgentCompatibility(connectionStatus);
 
     const togglePermission = (row, field) => {
         if (field === 'write') return;
@@ -17170,6 +17172,13 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 					<p>Adding a local agent explicitly joins it to this federation. ${peerName}'s ordinary agents can read its owned domains by default and message it; Write remains blocked unless you configure a separate receiving rule.</p>
 				</div>
 			</div>
+			${peerAgentCompatibility.observed && !peerAgentCompatibility.fullySupported && html`
+				<div class="fed-warn" role="status">
+					<strong>Some federated-agent capabilities are not ready.</strong>
+					This SAGE's latest reachable status did not advertise ${peerAgentCompatibility.missing.join(', ')}.
+					The peer may still be starting or binding this connection, or may need an update. Your local agent choices remain saved; retry after both SAGEs show the connection as ready.
+				</div>
+			`}
 			<div class="fed-agent-columns">
 				<div class="fed-agent-column">
 					<h5>Agents on this SAGE</h5>

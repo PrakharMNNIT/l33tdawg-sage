@@ -37,6 +37,12 @@ func (f v23GroupResolverFake) FederatedGuestGroupAllowsDomain(_ context.Context,
 }
 
 func makeV23QueryFixture(t *testing.T) (*Manager, *peerIdentity, *store.CrossFedRecord, *QueryRequest) {
+	return makeV23QueryFixtureWithAuthorizationTuple(t, true)
+}
+
+func makeV23QueryFixtureWithAuthorizationTuple(
+	t *testing.T, includeAuthorizationTuple bool,
+) (*Manager, *peerIdentity, *store.CrossFedRecord, *QueryRequest) {
 	t.Helper()
 	localPub, localKey, localKeyErr := ed25519.GenerateKey(rand.Reader)
 	if localKeyErr != nil {
@@ -134,18 +140,24 @@ func makeV23QueryFixture(t *testing.T) (*Manager, *peerIdentity, *store.CrossFed
 	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	federationContext := map[string]any{
+		"source_chain_id":    "chain-a",
+		"agreement_bindings": map[string]string{"chain-b": digest},
+		"query_challenges":   map[string]string{"chain-b": challenge},
+	}
+	if includeAuthorizationTuple {
+		federationContext["authorization_models"] = map[string]string{"chain-b": ""}
+		federationContext["authorization_attestations"] =
+			map[string]SourceAuthorizationAttestation{"chain-b": {}}
+	}
 	signedBody, signedBodyErr := json.Marshal(map[string]any{
-		"query":           "needle",
-		"domain_tag":      "research",
-		"top_k":           7,
-		"tags":            []string{"reviewed"},
-		"federated":       true,
-		"federate_chains": []string{"chain-b"},
-		"federation_context": map[string]any{
-			"source_chain_id":    "chain-a",
-			"agreement_bindings": map[string]string{"chain-b": digest},
-			"query_challenges":   map[string]string{"chain-b": challenge},
-		},
+		"query":              "needle",
+		"domain_tag":         "research",
+		"top_k":              7,
+		"tags":               []string{"reviewed"},
+		"federated":          true,
+		"federate_chains":    []string{"chain-b"},
+		"federation_context": federationContext,
 	})
 	if signedBodyErr != nil {
 		t.Fatal(signedBodyErr)
@@ -232,9 +244,11 @@ func TestVerifyQueryAgentProofV23BindsEmbeddingProvider(t *testing.T) {
 					"federated":       true,
 					"federate_chains": []string{"chain-b"},
 					"federation_context": map[string]any{
-						"source_chain_id":    "chain-a",
-						"agreement_bindings": map[string]string{"chain-b": "binding-v23"},
-						"query_challenges":   map[string]string{"chain-b": "challenge-v23"},
+						"source_chain_id":            "chain-a",
+						"agreement_bindings":         map[string]string{"chain-b": "binding-v23"},
+						"query_challenges":           map[string]string{"chain-b": "challenge-v23"},
+						"authorization_models":       map[string]string{"chain-b": ""},
+						"authorization_attestations": map[string]SourceAuthorizationAttestation{"chain-b": {}},
 					},
 				}
 				embeddingProvider := ""
@@ -598,4 +612,22 @@ func TestFederatedQueryRequiresLivePeerReadAndUnpausedPolicy(t *testing.T) {
 			t.Fatalf("removed Read status=%d body=%s", recorder.Code, recorder.Body.String())
 		}
 	})
+}
+
+func TestFederatedQueryRejectsOmittedLegacyAuthorizationTuple(t *testing.T) {
+	m, peer, _, req := makeV23QueryFixtureWithAuthorizationTuple(t, false)
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpReq := httptest.NewRequest(http.MethodPost, "/fed/v1/query", bytes.NewReader(body))
+	httpReq = httpReq.WithContext(context.WithValue(httpReq.Context(), peerCtxKey{}, peer))
+	recorder := httptest.NewRecorder()
+	m.handleQuery(recorder, httpReq)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("omitted legacy authorization tuple status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "signed recall body does not authorize") {
+		t.Fatalf("omitted legacy authorization tuple returned the wrong error: %s", recorder.Body.String())
+	}
 }

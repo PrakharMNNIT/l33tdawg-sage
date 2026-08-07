@@ -49,6 +49,16 @@ func receiptDeliveryTimeout() time.Duration {
 
 const maxFedResponseBytes = 16 << 20
 
+// maxFederatedQueryAuthorizationLease bounds how long a peer can retain the
+// source node's sync-policy and Badger authorization read leases after final
+// attestation. context.WithTimeout preserves any earlier caller deadline; this
+// is only the hard ceiling for direct Manager callers without one.
+const maxFederatedQueryAuthorizationLease = 5 * time.Second
+
+func boundedFederatedQueryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, maxFederatedQueryAuthorizationLease)
+}
+
 // A v11.13.0 peer ignores the compact-status preference and can legally send
 // its older full v1 contact snapshot. Allow that compatibility retry one at a
 // time so an eight-peer named discovery fan-out never multiplies the legacy
@@ -355,6 +365,14 @@ func (m *Manager) QueryPeer(ctx context.Context, remoteChainID string, qr *Query
 	}
 	expectedDigest := qr.PlanAgreementBindings[remoteChainID]
 	expectedChallenge := qr.PlanChallenges[remoteChainID]
+	expectedAuthorizationModel, modelBound := qr.PlanAuthorizationModels[remoteChainID]
+	expectedAttestation, attestationBound := qr.PlanAuthorizationAttestations[remoteChainID]
+	if !modelBound || !attestationBound {
+		return nil, fmt.Errorf(
+			"v23 federation query signed plan is missing the source authorization tuple for %s; call POST /v1/federation/recall-plan again and re-sign the recall request with a current client",
+			remoteChainID,
+		)
+	}
 	if expectedDigest == "" || expectedChallenge == "" {
 		return nil, fmt.Errorf("v23 federation query has no agent-signed plan for %s", remoteChainID)
 	}
@@ -380,29 +398,61 @@ func (m *Manager) QueryPeer(ctx context.Context, remoteChainID string, qr *Query
 	v23req.DestinationChainID = remoteChainID
 	v23req.AgreementBindingDigest = expectedDigest
 	v23req.QueryChallenge = expectedChallenge
+	currentAuthorizationModel := ""
 	if slices.Contains(peerStatus.Capabilities, CapabilityPeerExportReadV1) {
-		ceiling, eligible, attestErr := m.attestLocalFederatedAgent(v23req.AgentProof.AgentID)
+		currentAuthorizationModel = SourceAuthorizationPeerExportV1
+	}
+	if currentAuthorizationModel != expectedAuthorizationModel {
+		return nil, fmt.Errorf(
+			"peer %s federation authorization model changed after the agent signed its recall plan (planned=%q current=%q)",
+			remoteChainID, authorizationModelDiagnostic(expectedAuthorizationModel),
+			authorizationModelDiagnostic(currentAuthorizationModel),
+		)
+	}
+	v23req.SourceAuthorizationModel = expectedAuthorizationModel
+	ss := m.syncStore()
+	if ss == nil || m.badger == nil {
+		return nil, errors.New("local federation agent policy is unavailable")
+	}
+	queryCtx, cancelQuery := boundedFederatedQueryContext(ctx)
+	defer cancelQuery()
+	// Global authorization lock order is sync-policy then Badger. Hold both from
+	// the final source-agent attestation through the bounded peer request so a
+	// completed enrollment, suspension, clearance, or reader-policy mutation
+	// guarantees that no later disclosure begins from the superseded snapshot.
+	readerUnlock := ss.LockSyncPolicyRead()
+	ownerUnlock := m.badger.LockDomainOwnershipRead()
+	locksHeld := true
+	releaseAuthorization := func() {
+		if !locksHeld {
+			return
+		}
+		ownerUnlock()
+		readerUnlock()
+		locksHeld = false
+	}
+	defer releaseAuthorization()
+	if expectedAuthorizationModel == SourceAuthorizationPeerExportV1 {
+		ceiling, eligible, attestErr := m.attestLocalFederatedAgentLocked(v23req.AgentProof.AgentID)
 		if attestErr != nil || !eligible {
 			return nil, errors.New("federated recall requires an active ordinary source agent")
 		}
-		v23req.SourceAuthorizationModel = SourceAuthorizationPeerExportV1
-		v23req.SourceAgentEligible = true
-		v23req.SourceAgentMaxClassification = ceiling
+		if !expectedAttestation.Eligible || expectedAttestation.MaxClassification != ceiling {
+			return nil, fmt.Errorf("peer %s source authorization attestation changed after the agent signed its recall plan", remoteChainID)
+		}
+	} else if expectedAttestation.Eligible || expectedAttestation.MaxClassification != 0 {
+		return nil, fmt.Errorf("peer %s signed legacy authorization plan has a non-legacy source attestation", remoteChainID)
 	}
-	ss := m.syncStore()
-	if ss == nil {
-		return nil, errors.New("federated reader restrictions require SQLite")
-	}
-	readerUnlock := ss.LockSyncPolicyRead()
+	v23req.SourceAgentEligible = expectedAttestation.Eligible
+	v23req.SourceAgentMaxClassification = expectedAttestation.MaxClassification
 	readerAllowed, readerErr := m.federatedReaderAllowsLocked(
-		ctx, agreement, v23req.AgentProof.AgentID, v23req.DomainTag,
+		queryCtx, agreement, v23req.AgentProof.AgentID, v23req.DomainTag,
 	)
 	if readerErr != nil || !readerAllowed {
-		readerUnlock()
 		return nil, errors.New("local federation access controls deny this peer domain")
 	}
-	body, status, err := m.doPeerRequest(ctx, agreement, http.MethodPost, "/fed/v1/query", v23req)
-	readerUnlock()
+	body, status, err := m.doPeerRequest(queryCtx, agreement, http.MethodPost, "/fed/v1/query", v23req)
+	releaseAuthorization()
 	if err != nil {
 		return nil, err
 	}
@@ -535,12 +585,14 @@ func (m *Manager) PlanRecall(ctx context.Context, targets []string, agentID, dom
 	}
 	sort.Strings(chains)
 	plan := &RecallPlan{
-		ProtocolVersion:   FederationProtocolV23,
-		SourceChainID:     m.localChainID,
-		AgreementBindings: make(map[string]string),
-		QueryChallenges:   make(map[string]string),
-		ExpiresAt:         make(map[string]int64),
-		Errors:            make(map[string]string),
+		ProtocolVersion:           FederationProtocolV23,
+		SourceChainID:             m.localChainID,
+		AgreementBindings:         make(map[string]string),
+		QueryChallenges:           make(map[string]string),
+		AuthorizationModels:       make(map[string]string),
+		AuthorizationAttestations: make(map[string]SourceAuthorizationAttestation),
+		ExpiresAt:                 make(map[string]int64),
+		Errors:                    make(map[string]string),
 	}
 	for _, chain := range chains {
 		agreement, err := m.ActiveAgreement(chain)
@@ -558,6 +610,8 @@ func (m *Manager) PlanRecall(ctx context.Context, targets []string, agentID, dom
 			continue
 		}
 		request := &QueryPlanRequest{AgentID: agentID, DomainTag: domain}
+		authorizationModel := ""
+		authorizationAttestation := SourceAuthorizationAttestation{}
 		if slices.Contains(status.Capabilities, CapabilityPeerExportReadV1) {
 			ceiling, eligible, attestErr := m.attestLocalFederatedAgent(agentID)
 			if attestErr != nil || !eligible {
@@ -565,8 +619,12 @@ func (m *Manager) PlanRecall(ctx context.Context, targets []string, agentID, dom
 				continue
 			}
 			request.SourceAuthorizationModel = SourceAuthorizationPeerExportV1
+			authorizationModel = SourceAuthorizationPeerExportV1
 			request.SourceAgentEligible = true
 			request.SourceAgentMaxClassification = ceiling
+			authorizationAttestation = SourceAuthorizationAttestation{
+				Eligible: true, MaxClassification: ceiling,
+			}
 		}
 		ss := m.syncStore()
 		if ss == nil {
@@ -600,6 +658,9 @@ func (m *Manager) PlanRecall(ctx context.Context, targets []string, agentID, dom
 			destination.SourceChainID != m.localChainID ||
 			destination.DestinationChainID != chain ||
 			destination.AgreementBindingDigest != status.QueryAgreementBindingDigest ||
+			destination.SourceAuthorizationModel != authorizationModel ||
+			destination.SourceAgentEligible != authorizationAttestation.Eligible ||
+			destination.SourceAgentMaxClassification != authorizationAttestation.MaxClassification ||
 			destination.QueryChallenge == "" || destination.ExpiresAt <= time.Now().Unix() {
 			plan.Errors[chain] = "peer returned a stale or mismatched v23 recall plan"
 			continue
@@ -607,12 +668,21 @@ func (m *Manager) PlanRecall(ctx context.Context, targets []string, agentID, dom
 		plan.Destinations = append(plan.Destinations, chain)
 		plan.AgreementBindings[chain] = destination.AgreementBindingDigest
 		plan.QueryChallenges[chain] = destination.QueryChallenge
+		plan.AuthorizationModels[chain] = authorizationModel
+		plan.AuthorizationAttestations[chain] = authorizationAttestation
 		plan.ExpiresAt[chain] = destination.ExpiresAt
 	}
 	if len(plan.Errors) == 0 {
 		plan.Errors = nil
 	}
 	return plan, nil
+}
+
+func authorizationModelDiagnostic(model string) string {
+	if model == "" {
+		return "legacy-linked-reader"
+	}
+	return model
 }
 
 func validatePeerV23Status(status *StatusResponse) error {

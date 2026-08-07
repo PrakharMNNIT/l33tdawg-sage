@@ -131,6 +131,18 @@ func (m *Manager) attestLocalFederatedAgent(agentID string) (uint8, bool, error)
 	defer policyUnlock()
 	ownerUnlock := m.badger.LockDomainOwnershipRead()
 	defer ownerUnlock()
+	return m.attestLocalFederatedAgentLocked(agentID)
+}
+
+// attestLocalFederatedAgentLocked is the non-locking form for bounded
+// federation side effects that already hold the global sync-policy -> Badger
+// authorization read order. Keeping the final attestation and outbound request
+// inside that lease prevents an enrollment, suspension, or clearance mutation
+// from committing after the source fact is checked but before disclosure.
+func (m *Manager) attestLocalFederatedAgentLocked(agentID string) (uint8, bool, error) {
+	if m.badger == nil {
+		return 0, false, errors.New("local federation agent policy is unavailable")
+	}
 	eligible, err := m.localFederatedGuestAgentEligible(agentID)
 	if err != nil || !eligible {
 		return 0, false, err

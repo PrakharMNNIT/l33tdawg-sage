@@ -33,6 +33,8 @@ func TestMCPFederatedRecallPlanExpandsAndSignsExactDestinationState(t *testing.T
 					"destinations":["chain-x"],
 					"agreement_bindings":{"chain-x":"binding-x"},
 					"query_challenges":{"chain-x":"challenge-x"},
+					"authorization_models":{"chain-x":"peer-export-v1"},
+					"authorization_attestations":{"chain-x":{"eligible":true,"max_classification":3}},
 					"expires_at":{"chain-x":9999999999}
 				}`)),
 			}, nil
@@ -66,6 +68,10 @@ func TestMCPFederatedRecallPlanExpandsAndSignsExactDestinationState(t *testing.T
 	require.Equal(t, "chain-local", contextBody["source_chain_id"])
 	require.Equal(t, "binding-x", contextBody["agreement_bindings"].(map[string]any)["chain-x"])
 	require.Equal(t, "challenge-x", contextBody["query_challenges"].(map[string]any)["chain-x"])
+	require.Equal(t, "peer-export-v1", contextBody["authorization_models"].(map[string]any)["chain-x"])
+	attestation := contextBody["authorization_attestations"].(map[string]any)["chain-x"].(map[string]any)
+	require.Equal(t, true, attestation["eligible"])
+	require.Equal(t, float64(3), attestation["max_classification"])
 }
 
 func TestMCPFederatedVectorRecallSignsDiscoveredEmbeddingProvider(t *testing.T) {
@@ -124,6 +130,8 @@ func TestMCPFederatedVectorRecallSignsDiscoveredEmbeddingProvider(t *testing.T) 
 						"destinations":["chain-x"],
 						"agreement_bindings":{"chain-x":"binding-x"},
 						"query_challenges":{"chain-x":"challenge-x"},
+						"authorization_models":{"chain-x":"peer-export-v1"},
+						"authorization_attestations":{"chain-x":{"eligible":true,"max_classification":4}},
 						"expires_at":{"chain-x":9999999999}
 					}`)
 				case test.path:

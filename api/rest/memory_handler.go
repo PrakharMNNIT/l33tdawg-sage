@@ -102,16 +102,51 @@ type QueryMemoryRequest struct {
 }
 
 type FederatedRecallProofContext struct {
-	SourceChainID     string            `json:"source_chain_id"`
-	AgreementBindings map[string]string `json:"agreement_bindings"`
-	QueryChallenges   map[string]string `json:"query_challenges"`
+	SourceChainID             string                                               `json:"source_chain_id"`
+	AgreementBindings         map[string]string                                    `json:"agreement_bindings"`
+	QueryChallenges           map[string]string                                    `json:"query_challenges"`
+	AuthorizationModels       map[string]string                                    `json:"authorization_models"`
+	AuthorizationAttestations map[string]federation.SourceAuthorizationAttestation `json:"authorization_attestations"`
 }
 
-func federationPlanFields(ctx *FederatedRecallProofContext) (map[string]string, map[string]string) {
+func federationPlanFields(ctx *FederatedRecallProofContext) (string, map[string]string, map[string]string, map[string]string, map[string]federation.SourceAuthorizationAttestation) {
 	if ctx == nil {
-		return nil, nil
+		return "", nil, nil, nil, nil
 	}
-	return ctx.AgreementBindings, ctx.QueryChallenges
+	return ctx.SourceChainID, ctx.AgreementBindings, ctx.QueryChallenges, ctx.AuthorizationModels, ctx.AuthorizationAttestations
+}
+
+const missingSignedFederationAuthorizationTuple = "signed federation authorization tuple is missing or incomplete; call POST /v1/federation/recall-plan again, copy its exact destinations and authorization tuple, then re-sign the recall request with a current client"
+
+func (s *Server) validateSignedFederationPlan(chains []string, req *federation.QueryRequest) map[string]string {
+	missing := make(map[string]string)
+	if req == nil || req.PlanSourceChainID == "" || req.PlanSourceChainID != s.federation.LocalChainID() {
+		missing["*"] = missingSignedFederationAuthorizationTuple
+		return missing
+	}
+	targets := chains
+	if len(targets) == 0 {
+		targets = []string{"*"}
+	}
+	if len(targets) == 1 && targets[0] == "*" {
+		if len(req.PlanAgreementBindings) == 0 {
+			missing["*"] = missingSignedFederationAuthorizationTuple
+			return missing
+		}
+		targets = make([]string, 0, len(req.PlanAgreementBindings))
+		for chain := range req.PlanAgreementBindings {
+			targets = append(targets, chain)
+		}
+	}
+	for _, chain := range targets {
+		_, modelBound := req.PlanAuthorizationModels[chain]
+		_, attestationBound := req.PlanAuthorizationAttestations[chain]
+		if chain == "" || chain == "*" || req.PlanAgreementBindings[chain] == "" ||
+			req.PlanChallenges[chain] == "" || !modelBound || !attestationBound {
+			missing[chain] = missingSignedFederationAuthorizationTuple
+		}
+	}
+	return missing
 }
 
 func (s *Server) requireFederatedEmbeddingProvider(
@@ -2012,19 +2047,22 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	if req.Query != "" {
 		federatedMode = federation.ModeHybrid
 	}
-	agreementBindings, queryChallenges := federationPlanFields(req.FederationContext)
+	planSourceChainID, agreementBindings, queryChallenges, authorizationModels, authorizationAttestations := federationPlanFields(req.FederationContext)
 	s.mergeFederatedRecall(r, &resp, req.Federated, req.FederateChains, &federation.QueryRequest{
-		Mode:                  federatedMode,
-		Query:                 req.Query,
-		Embedding:             req.Embedding,
-		EmbeddingProvider:     req.EmbeddingProvider,
-		Provider:              req.Provider,
-		DomainTag:             req.DomainTag,
-		MinConfidence:         req.MinConfidence,
-		TopK:                  req.TopK,
-		Tags:                  req.Tags,
-		PlanAgreementBindings: agreementBindings,
-		PlanChallenges:        queryChallenges,
+		Mode:                          federatedMode,
+		Query:                         req.Query,
+		Embedding:                     req.Embedding,
+		EmbeddingProvider:             req.EmbeddingProvider,
+		Provider:                      req.Provider,
+		DomainTag:                     req.DomainTag,
+		MinConfidence:                 req.MinConfidence,
+		TopK:                          req.TopK,
+		Tags:                          req.Tags,
+		PlanSourceChainID:             planSourceChainID,
+		PlanAgreementBindings:         agreementBindings,
+		PlanChallenges:                queryChallenges,
+		PlanAuthorizationModels:       authorizationModels,
+		PlanAuthorizationAttestations: authorizationAttestations,
 	})
 
 	writeJSON(w, http.StatusOK, resp)
@@ -2086,6 +2124,12 @@ func (s *Server) mergeFederatedRecall(r *http.Request, resp *QueryMemoryResponse
 	s.enrichStoredCopyProvenance(r.Context(), resp.Results)
 	if s.federation == nil || (!federated && len(chains) == 0) {
 		return
+	}
+	if s.isPostV23ForNextTx() {
+		if missing := s.validateSignedFederationPlan(chains, fedReq); len(missing) > 0 {
+			resp.Federation = &FederationInfo{Queried: []string{}, Errors: missing}
+			return
+		}
 	}
 	callerID := middleware.ContextAgentID(r.Context())
 	allowed, callerClearance := s.federationCallerCanRead(r.Context(), callerID, fedReq.DomainTag)
@@ -2719,17 +2763,20 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 	}
 	setFilterInfo(w, &resp, filterApplied, hiddenByClassification)
 
-	agreementBindings, queryChallenges := federationPlanFields(req.FederationContext)
+	planSourceChainID, agreementBindings, queryChallenges, authorizationModels, authorizationAttestations := federationPlanFields(req.FederationContext)
 	s.mergeFederatedRecall(r, &resp, req.Federated, req.FederateChains, &federation.QueryRequest{
-		Mode:                  federation.ModeText,
-		Query:                 req.Query,
-		Provider:              req.Provider,
-		DomainTag:             req.DomainTag,
-		MinConfidence:         req.MinConfidence,
-		TopK:                  req.TopK,
-		Tags:                  req.Tags,
-		PlanAgreementBindings: agreementBindings,
-		PlanChallenges:        queryChallenges,
+		Mode:                          federation.ModeText,
+		Query:                         req.Query,
+		Provider:                      req.Provider,
+		DomainTag:                     req.DomainTag,
+		MinConfidence:                 req.MinConfidence,
+		TopK:                          req.TopK,
+		Tags:                          req.Tags,
+		PlanSourceChainID:             planSourceChainID,
+		PlanAgreementBindings:         agreementBindings,
+		PlanChallenges:                queryChallenges,
+		PlanAuthorizationModels:       authorizationModels,
+		PlanAuthorizationAttestations: authorizationAttestations,
 	})
 
 	writeJSON(w, http.StatusOK, resp)
@@ -3052,19 +3099,22 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	}
 	setFilterInfo(w, &resp, filterApplied, hiddenByClassification)
 
-	agreementBindings, queryChallenges := federationPlanFields(req.FederationContext)
+	planSourceChainID, agreementBindings, queryChallenges, authorizationModels, authorizationAttestations := federationPlanFields(req.FederationContext)
 	s.mergeFederatedRecall(r, &resp, req.Federated, req.FederateChains, &federation.QueryRequest{
-		Mode:                  federation.ModeHybrid,
-		Query:                 req.Query,
-		Embedding:             req.Embedding,
-		EmbeddingProvider:     req.EmbeddingProvider,
-		Provider:              req.Provider,
-		DomainTag:             req.DomainTag,
-		MinConfidence:         req.MinConfidence,
-		TopK:                  req.TopK,
-		Tags:                  req.Tags,
-		PlanAgreementBindings: agreementBindings,
-		PlanChallenges:        queryChallenges,
+		Mode:                          federation.ModeHybrid,
+		Query:                         req.Query,
+		Embedding:                     req.Embedding,
+		EmbeddingProvider:             req.EmbeddingProvider,
+		Provider:                      req.Provider,
+		DomainTag:                     req.DomainTag,
+		MinConfidence:                 req.MinConfidence,
+		TopK:                          req.TopK,
+		Tags:                          req.Tags,
+		PlanSourceChainID:             planSourceChainID,
+		PlanAgreementBindings:         agreementBindings,
+		PlanChallenges:                queryChallenges,
+		PlanAuthorizationModels:       authorizationModels,
+		PlanAuthorizationAttestations: authorizationAttestations,
 	})
 
 	writeJSON(w, http.StatusOK, resp)

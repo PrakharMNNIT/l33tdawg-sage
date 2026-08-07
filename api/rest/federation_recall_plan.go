@@ -57,12 +57,14 @@ func (s *Server) handleFederationRecallPlan(w http.ResponseWriter, r *http.Reque
 		targets = s.federationRecallTargets(r.Context(), targets, req.DomainTag)
 		if len(targets) == 0 {
 			writeJSON(w, http.StatusOK, &federation.RecallPlan{
-				ProtocolVersion:   federation.FederationProtocolV23,
-				SourceChainID:     s.federation.LocalChainID(),
-				Destinations:      []string{},
-				AgreementBindings: map[string]string{},
-				QueryChallenges:   map[string]string{},
-				ExpiresAt:         map[string]int64{},
+				ProtocolVersion:           federation.FederationProtocolV23,
+				SourceChainID:             s.federation.LocalChainID(),
+				Destinations:              []string{},
+				AgreementBindings:         map[string]string{},
+				QueryChallenges:           map[string]string{},
+				AuthorizationModels:       map[string]string{},
+				AuthorizationAttestations: map[string]federation.SourceAuthorizationAttestation{},
+				ExpiresAt:                 map[string]int64{},
 			})
 			return
 		}

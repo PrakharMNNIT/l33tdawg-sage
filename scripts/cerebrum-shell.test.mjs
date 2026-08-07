@@ -11,6 +11,7 @@ const indexSource = await readFile(new URL('../web/static/index.html', import.me
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 const mriPageSource = await readFile(new URL('../web/static/mri.html', import.meta.url), 'utf8');
 const federationRouteSource = await readFile(new URL('../web/static/js/federation-route-state.js', import.meta.url), 'utf8');
+const federationPeerCapabilitiesSource = await readFile(new URL('../web/static/js/federation-peer-capabilities.js', import.meta.url), 'utf8');
 const traySource = await readFile(new URL('../cmd/sage-tray/main.swift', import.meta.url), 'utf8');
 const { MRI_LAYOUT, mriBrainstemBias, mriDepthForAge, mriVerticalPosition } = await import('../web/static/js/mri-layout.js');
 
@@ -83,6 +84,25 @@ test('inline script inspection follows case-insensitive HTML end-tag parsing', (
         inlineScriptBodies('<SCRIPT>one()</script ><script type="module">two()</SCRIPT data-x>'),
         ['one()', 'two()'],
     );
+});
+
+test('federated-agent compatibility warning is live, informational, and capability-derived', () => {
+    assert.match(appSource, /federationPeerAgentCompatibility\(connectionStatus\)/);
+    assert.match(appSource, /Some federated-agent capabilities are not ready/);
+    assert.match(appSource, /may still be starting or binding this connection, or may need an update/);
+    assert.match(appSource, /Your local agent choices remain saved; retry after both SAGEs show the connection as ready/);
+    assert.doesNotMatch(appSource, /can take effect after the peer updates/,
+        'missing live capabilities must not claim that an update is the proven cause or remedy');
+    assert.match(federationPeerCapabilitiesSource, /federated-peer-export-read-v1/);
+    assert.match(federationPeerCapabilitiesSource, /federated-query-availability-v1/);
+    assert.match(federationPeerCapabilitiesSource, /federated-pipeline-v1/);
+    assert.match(federationPeerCapabilitiesSource, /linked-message-directory-enumeration-v1/);
+
+    const pickerStart = appSource.indexOf('id=${`fed-agent-picker-${chain}`}');
+    const pickerEnd = appSource.indexOf('aria-busy=${pipeContactLookupBusy}', pickerStart);
+    assert.ok(pickerStart >= 0 && pickerEnd > pickerStart, 'federated-agent picker must remain present');
+    assert.doesNotMatch(appSource.slice(pickerStart, pickerEnd), /peerAgentCompatibility/,
+        'mixed-version diagnostics must not disable durable local export controls');
 });
 
 test('task status mutations reject HTTP failures before optimistic board state can settle', () => {
