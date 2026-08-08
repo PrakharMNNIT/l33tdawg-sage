@@ -20,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/l33tdawg/sage/internal/tx"
 )
 
 const (
@@ -543,12 +545,12 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 		_ = archiveTmp.Close()
 		h.sendUpdateProgress("extract", "active", "Opening signed SAGE app update...")
 		stagedVersion, installErr := installDarwinAppUpdate(ctx, archiveTmp.Name(), execPath, expectedVersion) //nolint:staticcheck // !darwin stub is unreachable behind runtime.GOOS
-		if installErr != nil { //nolint:staticcheck // the !darwin build-tag stub always errors, but this runtime branch is Darwin-only
+		if installErr != nil {                                                                                 //nolint:staticcheck // the !darwin build-tag stub always errors, but this runtime branch is Darwin-only
 			h.sendUpdateProgress("install", "error", installErrorMessage("Failed to install signed app update", installErr, downloadURL))
 			return
 		}
 		h.sendUpdateProgress("extract", "done", "Signed app verified")
-		h.sendUpdateProgress("install", "done", "SAGE "+stagedVersion+" installed — restart SAGE to apply")
+		h.sendUpdateProgress("install", "done", installedRestartAdvice("SAGE "+stagedVersion+" installed"))
 		h.sendUpdateProgress("complete", "done", "ready_to_restart")
 		return
 	}
@@ -590,8 +592,32 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 		return
 	}
 
-	h.sendUpdateProgress("install", "done", "Update installed — restart SAGE to apply")
+	h.sendUpdateProgress("install", "done", installedRestartAdvice("Update installed"))
 	h.sendUpdateProgress("complete", "done", "ready_to_restart")
+}
+
+// installedRestartAdvice appends a hold notice when a signing key is fenced.
+//
+// handleRestart already VETOES a coordinated restart while fences are held, but
+// this text is not routed through it: it is the operator-facing instruction at
+// the end of an install, and on the macOS app lane it tells the operator to quit
+// and reopen SAGE by hand — which bypasses the veto entirely. Saying
+// "restart SAGE to apply" with no qualification is therefore the one place the
+// product actively ADVISES the action that drops an in-process fence and loses
+// the transaction it was protecting. Condition 2 of the handoff is "never advise
+// restart"; this closes the last surface that did.
+//
+// It informs rather than blocks: the update is genuinely installed, and an
+// operator who understands the trade may still choose to restart. What must not
+// happen is that the product recommends it silently.
+func installedRestartAdvice(prefix string) string {
+	if held := tx.FencedSigners(); len(held) > 0 {
+		return prefix + " — but " + strconv.Itoa(len(held)) +
+			" signing key(s) are currently held awaiting proof of an earlier submission's fate. " +
+			"Restarting now discards that state and can lose the transaction it is protecting. " +
+			"Wait for the hold to clear, then restart."
+	}
+	return prefix + " — restart SAGE to apply"
 }
 
 const (
@@ -1099,6 +1125,24 @@ func (h *DashboardHandler) handleRestart(w http.ResponseWriter, r *http.Request)
 	}
 	if h.UpdateInProgress.Load() {
 		writeError(w, http.StatusConflict, "wait for the update installation to finish before restarting")
+		return
+	}
+	// Checked BEFORE the in-process-restart capability branch, because that
+	// branch's answer is "fully quit SAGE and open it again" — an instruction to
+	// do by hand the exact thing the signer fence exists to prevent. A restart
+	// while a key is fenced discards the only record that a transaction may still
+	// be in flight; the allocator then re-seeds from the highest COMMITTED nonce,
+	// which is below it, and the next transaction overtakes it into a Code 4
+	// rejection nobody can trace. cmd/sage-gui vetoes the coordinated path;
+	// this stops us TELLING an operator to take the manual one.
+	//
+	// It reads the fence state directly rather than through a hook: there is
+	// nothing here that can be left unwired, so there is no degraded mode to fail
+	// closed from.
+	if reason := tx.RestartVetoReason(); reason != "" {
+		w.Header().Set("Retry-After", strconv.Itoa(fencedSignerRetryAfterSeconds))
+		writeError(w, http.StatusServiceUnavailable,
+			"SAGE is not safe to restart yet: "+reason)
 		return
 	}
 	if !restartInProcessSupported() || h.RequestRestart == nil {

@@ -282,7 +282,6 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 				registrationKey := h.SigningKey
 				registerTx := &tx.ParsedTx{
 					Type:      tx.TxTypeAgentRegister,
-					Nonce:     tx.MonotonicNonce(registrationKey),
 					Timestamp: time.Now(),
 					AgentRegister: &tx.AgentRegister{
 						AgentID:    agentID,
@@ -293,22 +292,35 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 						P2PAddress: req.P2PAddress,
 					},
 				}
-				embedDashboardAgentProof(registerTx, registrationKey)
-				if signErr := tx.SignTx(registerTx, registrationKey); signErr != nil {
-					log.Printf("agent-create: on-chain AgentRegister sign failed for %s: %v", agentID, signErr)
-					return
-				}
-				encoded, encErr := tx.EncodeTx(registerTx)
-				if encErr != nil {
-					log.Printf("agent-create: on-chain AgentRegister encode failed for %s: %v", agentID, encErr)
-					return
-				}
-				// AgentRegister must land before AgentSetPermission (the agent has
-				// to exist on-chain first); broadcastTxSync waits for the commit.
-				// This runs after the 201 response, so failures can only be logged;
-				// the ABCI processor leaves on_chain_height unset on failure, which
-				// the dashboard surfaces as an un-synced agent.
-				if bErr := broadcastTxSync(h.CometBFTRPC, encoded); bErr != nil {
+				// Through the nonce lease, not a bare MonotonicNonce. This tx
+				// shares h.SigningKey with every commit-confirmed dashboard
+				// mutation, so allocating outside a lease let a concurrent
+				// mutation's higher nonce overtake it and app-v9 rejected this
+				// one Code 4 — invisibly, because nobody is waiting on a
+				// fire-and-forget broadcast. The agent then simply never
+				// appeared on-chain and the dashboard showed it un-synced
+				// forever. The nonce and the timestamp are stamped inside the
+				// lease; setting them here would be a nonce allocated outside
+				// the lock that makes it valid.
+				signCtx, cancelSign := context.WithTimeout(context.Background(), backgroundSigningBudget())
+				bErr := h.signAndBroadcastSyncContext(signCtx, registerTx, registrationKey)
+				cancelSign()
+				// AgentRegister should land before AgentSetPermission (the agent
+				// has to exist on-chain first). The lease does NOT provide that
+				// ordering — the permission tx below is signed by a different
+				// key (h.AdminSigningKey) and so never contends for this one's
+				// slot. What provides it, same as before this change: this call
+				// returns only once CheckTx has RUN on the registration.
+				// ADMISSION IS NOT VERIFIED — broadcast_tx_sync's response body
+				// is deliberately not decoded (see broadcastTxSyncContext), so a
+				// 200 carrying a non-zero CheckTx code (refused, NOT admitted)
+				// is indistinguishable from admission here. On such a refusal
+				// the permission tx below is broadcast anyway and references an
+				// agent that never entered the mempool; it is orphaned, the ABCI
+				// processor leaves on_chain_height unset, and the dashboard
+				// surfaces the agent as un-synced. This runs after the 201
+				// response, so failures can only be logged.
+				if bErr != nil {
 					log.Printf("agent-create: on-chain AgentRegister broadcast failed for %s: %v", agentID, bErr)
 					return
 				}
@@ -393,6 +405,11 @@ func (h *DashboardHandler) handleCreateAgent(agentStore store.AgentStore) http.H
 			}
 			registrationHash, registrationHeight, _, err = h.signAndBroadcastCommit(registerTx, priv)
 			if err != nil {
+				// Nothing signed or sent is not consensus declining the
+				// registration; see writeSignerNotSentIfHeld.
+				if writeSignerNotSentIfHeld(w, err) {
+					return
+				}
 				writeAppV23AccessError(w, http.StatusBadGateway, "agent_registration_rejected",
 					"The agent key is safely stored, but consensus did not register it. No approval or elevated policy was created.")
 				return
@@ -685,6 +702,9 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 					// Preserve unrelated metadata edits, but restore every
 					// consensus-owned policy field. Returning 2xx with a warning
 					// here made the dashboard claim grants that Badger denied.
+					// The restore runs for a fenced signer too: whether refused or
+					// never sent, the chain does not have this change, and the
+					// projection must mirror the chain.
 					existing.Role = policyBeforeUpdate.Role
 					existing.Clearance = policyBeforeUpdate.Clearance
 					existing.OrgID = policyBeforeUpdate.OrgID
@@ -694,6 +714,13 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 					existing.Capabilities = policyBeforeUpdate.Capabilities
 					if restoreErr := agentStore.UpdateAgent(r.Context(), existing); restoreErr != nil {
 						writeError(w, http.StatusInternalServerError, "permission transaction failed and the local projection could not be restored")
+						return
+					}
+					// FIRST among the response choices: a fenced/quiesced signer
+					// means the permission tx was never signed or sent, so
+					// answering "was rejected" below would report a verdict that
+					// never happened.
+					if writeSignerNotSentIfHeld(w, bErr) {
 						return
 					}
 					writeError(w, http.StatusBadGateway, "agent permission transaction was rejected: "+bErr.Error())
@@ -852,6 +879,13 @@ func (h *DashboardHandler) handleRemoveAgent(agentStore store.AgentStore) http.H
 			}
 			hash, height, _, err = h.signAndBroadcastAppV23Control(ptx, actor)
 			if err != nil {
+				// A fenced or quiesced signing key means nothing was signed or
+				// sent, so there is no consensus verdict to report. Reporting
+				// one would tell the operator the removal was refused when it
+				// was only deferred.
+				if writeSignerNotSentIfHeld(w, err) {
+					return
+				}
 				writeAppV23AccessError(w, http.StatusConflict, "consensus_deactivation_rejected",
 					"The agent was not removed because consensus did not commit its deactivation.")
 				return
@@ -1080,6 +1114,11 @@ func (h *DashboardHandler) handleAppV23RootCredentialHandover() http.HandlerFunc
 		ptx := &tx.ParsedTx{Type: tx.TxTypeRootCredentialRotate, RootCredentialRotate: rotation}
 		hash, height, _, err := h.signAndBroadcastAppV23Control(ptx, actor)
 		if err != nil {
+			// Nothing signed or sent is not a rotation refusal; see
+			// writeSignerNotSentIfHeld.
+			if writeSignerNotSentIfHeld(w, err) {
+				return
+			}
 			writeAppV23AccessError(w, http.StatusConflict, "root_rotation_rejected",
 				"The Root credential rotation was not committed. The unactivated recovery bundle remains local.")
 			return
@@ -1621,22 +1660,23 @@ func (h *DashboardHandler) handleMergeAgent(agentStore store.AgentStore) http.Ha
 			h.runBackground(func(_ context.Context) {
 				reassignTx := &tx.ParsedTx{
 					Type:      tx.TxTypeMemoryReassign,
-					Nonce:     tx.MonotonicNonce(h.SigningKey),
 					Timestamp: time.Now(),
 					MemoryReassign: &tx.MemoryReassign{
 						SourceAgentID: req.SourceAgentID,
 						TargetAgentID: req.TargetAgentID,
 					},
 				}
-				embedDashboardAgentProof(reassignTx, h.SigningKey)
-				if signErr := tx.SignTx(reassignTx, h.SigningKey); signErr != nil {
-					return
+				// Leased: this shares h.SigningKey with the dashboard's
+				// commit-confirmed mutations, so an unleased allocation here
+				// could be overtaken and silently dropped Code 4 — losing the
+				// on-chain audit record for a reassignment that already happened
+				// in SQLite.
+				signCtx, cancelSign := context.WithTimeout(context.Background(), backgroundSigningBudget())
+				if bErr := h.signAndBroadcastSyncContext(signCtx, reassignTx, h.SigningKey); bErr != nil {
+					log.Printf("memory-reassign: on-chain audit record broadcast failed for %s -> %s: %v",
+						req.SourceAgentID, req.TargetAgentID, bErr)
 				}
-				encoded, encErr := tx.EncodeTx(reassignTx)
-				if encErr != nil {
-					return
-				}
-				_ = broadcastTxSync(h.CometBFTRPC, encoded)
+				cancelSign()
 			})
 		}
 
@@ -1855,10 +1895,14 @@ This agent will connect to the primary node's network.
 
 // broadcastAgentUpdate signs and broadcasts a TxTypeAgentUpdate through CometBFT.
 // Returns an error if any step fails so callers can surface it to the UI.
+//
+// It goes through the nonce lease (signAndBroadcastSyncContext), like every other
+// producer that signs with h.SigningKey: a nonce allocated outside the lease that
+// serializes submission for that key can be overtaken by a concurrent dashboard
+// mutation and rejected Code 4 "nonce too low".
 func (h *DashboardHandler) broadcastAgentUpdate(agentID, name, bio string) error {
 	updateTx := &tx.ParsedTx{
 		Type:      tx.TxTypeAgentUpdate,
-		Nonce:     tx.MonotonicNonce(h.SigningKey),
 		Timestamp: time.Now(),
 		AgentUpdateTx: &tx.AgentUpdate{
 			AgentID: agentID,
@@ -1866,35 +1910,7 @@ func (h *DashboardHandler) broadcastAgentUpdate(agentID, name, bio string) error
 			BootBio: bio,
 		},
 	}
-	embedDashboardAgentProof(updateTx, h.SigningKey)
-	if err := tx.SignTx(updateTx, h.SigningKey); err != nil {
-		return fmt.Errorf("sign agent update: %w", err)
-	}
-	encoded, err := tx.EncodeTx(updateTx)
-	if err != nil {
-		return fmt.Errorf("encode agent update: %w", err)
-	}
-	return broadcastTxSync(h.CometBFTRPC, encoded)
-}
-
-// broadcastTxSync sends a transaction to CometBFT via broadcast_tx_sync RPC.
-// Used by dashboard handlers to put agent operations on-chain.
-func broadcastTxSync(cometRPC string, txBytes []byte) error {
-	txHex := hex.EncodeToString(txBytes)
-	u := fmt.Sprintf("%s/broadcast_tx_sync?tx=0x%s", cometRPC, txHex)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundSigningBudget())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return fmt.Errorf("create broadcast request: %w", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("broadcast tx: %w", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("broadcast tx: CometBFT returned status %d", resp.StatusCode)
-	}
-	return nil
+	return h.signAndBroadcastSyncContext(ctx, updateTx, h.SigningKey)
 }

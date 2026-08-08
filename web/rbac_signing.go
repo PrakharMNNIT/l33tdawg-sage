@@ -5,7 +5,9 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -160,14 +162,6 @@ func rbacCommitTimeout() time.Duration {
 	return 60 * time.Second
 }
 
-// broadcastTxCommitWeb sends a tx via /broadcast_tx_commit and waits for block
-// finalization, returning (hash, committedHeight, finalizeLog). It returns an
-// error if the RPC fails, or if the tx is rejected in CheckTx or FinalizeBlock,
-// so callers can surface real consensus rejections.
-func broadcastTxCommitWeb(cometRPC string, txBytes []byte) (hash string, height int64, txLog string, err error) {
-	return broadcastTxCommitWebContext(context.Background(), cometRPC, txBytes)
-}
-
 // broadcastTxCommitWebContext is the request-aware variant used by CEREBRUM
 // mutations. A closed browser tab or an explicit client deadline must cancel
 // the in-flight Comet request instead of leaving the server goroutine detached
@@ -185,24 +179,86 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, txByte
 
 	req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G107 -- internal CometBFT RPC
 	if reqErr != nil {
-		return "", 0, "", fmt.Errorf("create broadcast request: %w", reqErr)
+		// Pre-send: the URL was never dialed, so nothing is in flight and this
+		// must NOT fence. Still not %w — NewRequestWithContext fails with a
+		// *url.Error whose message is `parse "<the whole URL>": ...`, and this
+		// URL carries the entire signed transaction. A misconfigured CometBFTRPC
+		// (a stray control character, a bad scheme) would otherwise leak the
+		// full signed bytes into every 502 body and log line until the config
+		// was fixed. broadcastTxSyncContext and internal/tx's cometGetJSON
+		// already refuse %w here for the same reason.
+		return "", 0, "", fmt.Errorf("create broadcast request: %s", commitTransportCause(reqErr))
 	}
+	// From this point the bytes reach the kernel, so a PANIC below is exactly as
+	// ambiguous as a broken connection: the node may have accepted the
+	// transaction. Left to unwind, that panic would release the lease WITHOUT a
+	// fence (WithNonceLease cannot fence a panic — it carries no encoded bytes),
+	// and the next caller could allocate past a transaction still in flight.
+	// This function DOES have the bytes — its callers wrap this error in
+	// tx.Indeterminate — so a post-send panic is converted into the
+	// indeterminate outcome it factually is. Only the panic value's TYPE is
+	// reported: the value can be an error carrying the request URL, i.e. the
+	// whole signed transaction. Pre-send panics keep unwinding — nothing was
+	// sent, and fencing on them would have reconciliation broadcast a
+	// transaction the caller was told never went out.
+	onWire := false
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if !onWire {
+			panic(r)
+		}
+		hash, height, txLog = "", 0, ""
+		err = indeterminateCommit(fmt.Errorf("broadcast tx commit: panicked (%T) after the transaction was handed to the transport", r))
+	}()
+	onWire = true
+	// The three returns below are THE origin of commit ambiguity in web/, and
+	// each is marked indeterminate right here rather than being re-derived from
+	// its message downstream. By this point the encoded transaction has already
+	// been handed to the kernel: a broken connection, an undecodable body or an
+	// RPC-level error envelope all mean the node may have accepted it anyway.
 	resp, doErr := http.DefaultClient.Do(req)
 	if doErr != nil {
-		return "", 0, "", fmt.Errorf("broadcast tx commit: %w", doErr)
+		// NOT %w on doErr. net/http returns a *url.Error whose message embeds
+		// the request URL, and this request's URL is
+		// /broadcast_tx_commit?tx=0x<the entire signed transaction>. Wrapping it
+		// put the whole signed transaction into every error this function
+		// returns — which handlers surface to operators, the node logs, and (before
+		// the fence stopped keeping raw errors) repeated forever in the fence's
+		// retry lines. internal/voter/broadcast.go declines to attach these
+		// errors for exactly this reason. The category is what a caller acts on;
+		// the transaction's identity is already available as its hash.
+		return "", 0, "", indeterminateCommit(fmt.Errorf("broadcast tx commit: %s", commitTransportCause(doErr)))
 	}
 	defer resp.Body.Close()
 
 	var result cometCommitResult
 	if decErr := json.NewDecoder(resp.Body).Decode(&result); decErr != nil {
-		return "", 0, "", fmt.Errorf("decode broadcast commit response: %w", decErr)
+		return "", 0, "", indeterminateCommit(fmt.Errorf("decode broadcast commit response: %w", decErr))
 	}
 	if result.Error != nil {
+		// SCRUB THE ENVELOPE. Message and Data are remote-controlled text, and a
+		// reverse proxy in front of CometBFT can answer 200 with an envelope that
+		// echoes the request line — "GET /broadcast_tx_commit?tx=0x<signed hex>".
+		// Formatting that verbatim would re-open the signed-byte leak at a second
+		// origin: the fence record stays clean because it derives only a typed
+		// cause, but this error flows into operator-facing 502 bodies and node
+		// logs on every retry. internal/tx already scrubs the identical surface;
+		// leaving this one raw is the asymmetry that lets a closed leak return.
+		message := tx.ScrubBroadcastText(result.Error.Message, txBytes)
 		if result.Error.Data != "" {
-			return "", 0, "", fmt.Errorf("broadcast error: %s: %s", result.Error.Message, result.Error.Data)
+			data := tx.ScrubBroadcastText(result.Error.Data, txBytes)
+			return "", 0, "", indeterminateCommit(fmt.Errorf("broadcast error: %s: %s", message, data))
 		}
-		return "", 0, "", fmt.Errorf("broadcast error: %s", result.Error.Message)
+		return "", 0, "", indeterminateCommit(fmt.Errorf("broadcast error: %s", message))
 	}
+	// From here down consensus has spoken. A CheckTx or FinalizeBlock code is a
+	// verdict about a transaction that reached the chain, so it stays a plain,
+	// definitive error: marking it indeterminate would fence the signing key on
+	// every ordinary validation failure and turn one rejected transaction into
+	// an outage for that signer.
 	if result.Result.CheckTx.Code != 0 {
 		return "", 0, "", fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.Result.CheckTx.Code, result.Result.CheckTx.Log)
 	}
@@ -212,13 +268,53 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, txByte
 	return result.Result.Hash, result.Result.Height, result.Result.TxResult.Log, nil
 }
 
+// commitTransportCause renders a broadcast transport failure as a category, so
+// the error this package returns can never contain the request URL and
+// therefore can never contain the signed transaction.
+//
+// Classified by TYPE, never by matching text: the point of moving the
+// classification to the origin was to stop deriving meaning from messages, and a
+// category derived from a message would put that back one level down. The four
+// buckets are what a caller actually distinguishes — the client gave up, the
+// caller went away, or the wire broke.
+func commitTransportCause(err error) string {
+	switch {
+	case err == nil:
+		return "unknown"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timed out waiting for commit"
+	case errors.Is(err, context.Canceled):
+		return "the request was canceled"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "timed out waiting for commit"
+		}
+		return "the connection to the node failed"
+	}
+	return "the request to the node failed"
+}
+
+// backgroundSigningBudget bounds a submission that has no request context of its
+// own (the continuity/adoption workers, federation cleanup, import). The lease
+// can now BLOCK such a caller while the key is fenced, and context.Background()
+// would let a worker goroutine park there indefinitely. Two commit timeouts
+// leaves room for a full commit behind one queued ahead of it, and still fails
+// the caller loudly instead of wedging it.
+func backgroundSigningBudget() time.Duration {
+	return 2 * rbacCommitTimeout()
+}
+
 // signAndBroadcastCommit stamps the nonce, adds the legacy same-key proof for
 // non-governance RBAC transactions, signs the envelope, encodes it, and waits
 // for commit. Governance callers either supply a modern request-bound operator
 // proof before calling this helper or intentionally use the proofless direct
 // compatibility lane.
 func (h *DashboardHandler) signAndBroadcastCommit(ptx *tx.ParsedTx, key ed25519.PrivateKey) (hash string, height int64, txLog string, err error) {
-	return h.signAndBroadcastCommitContext(context.Background(), ptx, key)
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundSigningBudget())
+	defer cancel()
+	return h.signAndBroadcastCommitContext(ctx, ptx, key)
 }
 
 // signAndBroadcastCommitContext runs the whole stamp -> sign -> encode ->
@@ -234,13 +330,61 @@ func (h *DashboardHandler) signAndBroadcastCommit(ptx *tx.ParsedTx, key ed25519.
 // allocation with submission is what makes the emitted order match the
 // allocated order. Every signAndBroadcastCommit* caller in web/ inherits this.
 //
-// The lease's ordering guarantee holds only because this function does not
-// return until the outcome is definitive: broadcastTxCommitWebContext waits for
-// commit, and an indeterminate transport/RPC fault is classified by
-// isIndeterminateCommitError rather than being reported as a clean failure. A
-// submit that returned early on a timeout would release the lease while its
-// lower nonce was still in flight, letting the next higher nonce overtake it.
+// The lease's ordering guarantee survives a lost RPC response because this
+// function tells the lease WHICH KIND of failure it had. Waiting for commit is
+// not enough on its own: broadcastTxCommitWebContext can return because the
+// connection broke rather than because consensus answered, and releasing the
+// lease on that would let the next caller's higher nonce overtake a transaction
+// still in flight — Code 4 "nonce too low", the exact loss the lease exists to
+// stop. So an indeterminate broadcast is handed back wrapped in
+// tx.Indeterminate, which fences the signing key until that exact transaction's
+// fate is PROVEN — committed, or definitively refused by consensus. Nothing else
+// reopens the key: background reconciliation re-submits the identical bytes to
+// force an answer, and a fence that cannot be proven is HELD (loudly, and
+// visible through tx.FencedSigners) rather than conceded on a timer, because a
+// wrongly reopened key loses a later transaction silently to Code 4. Sign/encode
+// failures and real CheckTx or FinalizeBlock rejections are definitive, so they
+// stay plain errors and release the lease normally.
+//
+// A handler that gets tx.ErrSignerFenced back should surface it as
+// "not sent yet, ask again" — HTTP 503 with a Retry-After — and NEVER as a
+// rejection: nothing was signed, so there is no verdict to report and nothing
+// for the operator to undo.
+//
+// THE ONLY RESOLUTION IS RECONCILIATION FINISHING. Do not tell an operator to
+// restart. An earlier version of this comment did, on the theory that a restart
+// re-seeds the allocator from the highest committed on-chain nonce
+// (tx.SetNonceFloorFunc, wired in cmd/sage-gui/node.go). That reasoning is
+// wrong: the abandoned nonce is unresolved precisely because it sits ABOVE the
+// committed floor and may still be in flight, so a restart discards the fence,
+// seeds below it, and issues a nonce that overtakes it — the Code 4 loss the
+// fence exists to prevent, now untraceable. cmd/sage-gui accordingly VETOES a
+// coordinated restart while any key is fenced.
 func (h *DashboardHandler) signAndBroadcastCommitContext(ctx context.Context, ptx *tx.ParsedTx, key ed25519.PrivateKey) (string, int64, string, error) {
+	return h.signAndBroadcastCommitPrepared(ctx, ptx, key, nil)
+}
+
+// signAndBroadcastCommitPrepared is signAndBroadcastCommitContext for callers
+// that must run their OWN pre-signature steps — a request-bound app-v20
+// governance proof, an app-v23 elevation — which the generic path cannot build.
+//
+// prepare runs INSIDE THE LEASE, after the nonce is stamped and before the
+// signature. That placement is the whole reason this variant exists: the
+// governance handlers used to allocate a nonce, then embed a proof (which itself
+// makes an RPC for consensus time), then sign and broadcast, all outside any
+// lease — so two governance actions on one key could allocate N and N+1 and
+// reach CometBFT in the other order, and the late one was rejected Code 4. A
+// nonce is only meaningful while the lease that issued it is held.
+//
+// prepare must be a pure function of ptx and the request; anything it does is
+// covered by the signature that follows, so it must not be re-run on a
+// reconciliation (it is not — reconciliation re-sends the already-encoded bytes).
+func (h *DashboardHandler) signAndBroadcastCommitPrepared(
+	ctx context.Context,
+	ptx *tx.ParsedTx,
+	key ed25519.PrivateKey,
+	prepare func(*tx.ParsedTx) error,
+) (string, int64, string, error) {
 	var (
 		hash   string
 		height int64
@@ -252,17 +396,26 @@ func (h *DashboardHandler) signAndBroadcastCommitContext(ctx context.Context, pt
 		if ptx.Timestamp.IsZero() {
 			ptx.Timestamp = time.Now()
 		}
-		// Direct governance is authorized by the outer operator/validator signature
-		// and deliberately carries no HTTP-agent proof. App-v20+ treats any proof
-		// material on governance as a modern request-bound proof (8-byte request
-		// nonce + canonical request body). The generic legacy dashboard proof lacks
-		// those fields and is therefore correctly rejected. Keep the legacy same-key
-		// proof for non-governance RBAC transactions, whose consensus path still
-		// accepts it.
-		switch ptx.Type {
-		case tx.TxTypeGovPropose, tx.TxTypeGovVote, tx.TxTypeGovCancel:
-		default:
-			embedDashboardAgentProof(ptx, key)
+		if prepare != nil {
+			if prepErr := prepare(ptx); prepErr != nil {
+				// Definitive and pre-send: nothing reached the wire, so this
+				// releases the lease normally and must never fence.
+				txErr = prepErr
+				return txErr
+			}
+		} else {
+			// Direct governance is authorized by the outer operator/validator signature
+			// and deliberately carries no HTTP-agent proof. App-v20+ treats any proof
+			// material on governance as a modern request-bound proof (8-byte request
+			// nonce + canonical request body). The generic legacy dashboard proof lacks
+			// those fields and is therefore correctly rejected. Keep the legacy same-key
+			// proof for non-governance RBAC transactions, whose consensus path still
+			// accepts it.
+			switch ptx.Type {
+			case tx.TxTypeGovPropose, tx.TxTypeGovVote, tx.TxTypeGovCancel:
+			default:
+				embedDashboardAgentProof(ptx, key)
+			}
 		}
 		if signErr := tx.SignTx(ptx, key); signErr != nil {
 			txErr = fmt.Errorf("sign tx: %w", signErr)
@@ -274,31 +427,283 @@ func (h *DashboardHandler) signAndBroadcastCommitContext(ctx context.Context, pt
 			return txErr
 		}
 		hash, height, txLog, txErr = broadcastTxCommitWebContext(ctx, h.CometBFTRPC, encoded)
+		if isIndeterminateCommitError(txErr) {
+			// Fence the key on the EXACT bytes that went out. The lease needs
+			// the encoded transaction, not the error: reconciliation both
+			// identifies the transaction by its CometBFT hash and RE-SUBMITS
+			// those identical bytes to force consensus to answer, and neither
+			// is possible from the error text. Re-submitting identical bytes
+			// is idempotent (same nonce, same hash), so it can never produce a
+			// second transaction. txErr itself stays the plain error so every
+			// caller of this function keeps seeing the message it always saw.
+			return tx.Indeterminate(txErr, encoded, tx.CometTxResolver(h.CometBFTRPC))
+		}
 		return txErr
 	})
-	// txErr is still nil only when the closure never ran, i.e. the request was
-	// cancelled while queued for the key. Nothing was signed or sent, so this is
-	// a DEFINITIVE "no change" — deliberately not one of
-	// isIndeterminateCommitError's shapes, and worded so it cannot be mistaken
+	// txErr is still nil only when the closure never ran: the request was
+	// cancelled while queued for the key, or the key was fenced and this
+	// request's context expired before reconciliation lifted it. Either way
+	// nothing was signed or sent, so this is a DEFINITIVE "no change" —
+	// deliberately not marked indeterminate, and worded so it cannot be mistaken
 	// for a consensus rejection.
 	if txErr == nil && leaseErr != nil {
+		if errors.Is(leaseErr, tx.ErrSignerFenced) {
+			return "", 0, "", fmt.Errorf(
+				"this signing key is held pending confirmation of an earlier submission whose outcome was lost; "+
+					"nothing was signed or sent for this request: %w", leaseErr)
+		}
 		return "", 0, "", fmt.Errorf("await signing slot for this key: %w", leaseErr)
 	}
 	return hash, height, txLog, txErr
+}
+
+// signAndBroadcastSyncContext is the FIRE-AND-FORGET sibling of
+// signAndBroadcastCommitContext, for the background producers that put an audit
+// record on-chain and do not wait for a block.
+//
+// WHY THESE NEEDED A LEASE TOO. They used to call tx.MonotonicNonce and then
+// broadcast, with nothing serializing the two — and they share h.SigningKey with
+// every commit-confirmed dashboard mutation. Two of them (or one of them and one
+// dashboard action) could therefore allocate N and N+1 and hand them to CometBFT
+// in the other order, and app-v9's replay gate rejects the late lower nonce
+// Code 4. Being fire-and-forget made that WORSE rather than harmless: nobody was
+// waiting for the answer, so the loss was invisible — the agent simply never
+// showed up on-chain and the dashboard rendered it as "un-synced" forever.
+//
+// Holding the lease across allocate -> sign -> broadcast makes the emitted order
+// match the allocated order, which is what CometBFT's per-sender ascending-nonce
+// reaping needs to admit a burst intact.
+//
+// The broadcast is /broadcast_tx_sync, so a clean return means CheckTx has RUN
+// — NOT "committed", and not even "admitted": the response body is deliberately
+// never decoded (see broadcastTxSyncContext), so a 200 whose body carries a
+// non-zero CheckTx code (refused, NOT in the mempool) returns nil exactly like
+// an admission. network_handler.go's handleCreateAgent spells out what that
+// costs a caller that forgets it: a dependent transaction broadcast on the
+// strength of a nil here can reference one that never entered the mempool and
+// be orphaned. What a clean return IS good for is ordering — the lease has
+// serialized this key's broadcasts, and the mempool preserves a single sender's
+// broadcast order. A transport fault here is exactly as ambiguous as one on the
+// commit path: the bytes may already be in the mempool and about to commit. So
+// it fences, identically.
+func (h *DashboardHandler) signAndBroadcastSyncContext(ctx context.Context, ptx *tx.ParsedTx, key ed25519.PrivateKey) error {
+	var txErr error
+	leaseErr := tx.WithNonceLease(ctx, key, func(nonce uint64) error {
+		ptx.Nonce = nonce
+		if ptx.Timestamp.IsZero() {
+			ptx.Timestamp = time.Now()
+		}
+		embedDashboardAgentProof(ptx, key)
+		if signErr := tx.SignTx(ptx, key); signErr != nil {
+			txErr = fmt.Errorf("sign tx: %w", signErr)
+			return txErr
+		}
+		encoded, encErr := tx.EncodeTx(ptx)
+		if encErr != nil {
+			txErr = fmt.Errorf("encode tx: %w", encErr)
+			return txErr
+		}
+		txErr = broadcastTxSyncContext(ctx, h.CometBFTRPC, encoded)
+		if isIndeterminateCommitError(txErr) {
+			return tx.Indeterminate(txErr, encoded, tx.CometTxResolver(h.CometBFTRPC))
+		}
+		return txErr
+	})
+	if txErr == nil && leaseErr != nil {
+		if errors.Is(leaseErr, tx.ErrSignerFenced) {
+			return fmt.Errorf(
+				"this signing key is held pending confirmation of an earlier submission whose outcome was lost; "+
+					"nothing was signed or sent for this request: %w", leaseErr)
+		}
+		return fmt.Errorf("await signing slot for this key: %w", leaseErr)
+	}
+	return txErr
+}
+
+// broadcastTxSyncContext submits via /broadcast_tx_sync and classifies the
+// ambiguity at its origin, the same way broadcastTxCommitWebContext does.
+//
+// EVERY failure this can see is indeterminate, and that is not laziness. The
+// request URL carries the encoded transaction, so by the time any of these
+// errors exists the bytes have been handed to the kernel; a broken connection,
+// an HTTP-level refusal from a proxy, and CometBFT's own 500 for "tx already
+// exists in cache" are all consistent with the transaction sitting in a mempool
+// about to commit. Releasing the key on any of them would let the next caller
+// allocate a higher nonce and overtake it.
+//
+// The CheckTx verdict in the response body is deliberately NOT decoded here.
+// This helper's callers are audit-record producers that never consumed it, and
+// decoding it would create a second place where a non-zero code has to be
+// classified as permanent or transient — a decision that belongs in
+// internal/tx's reconciler, which already has the exact bytes and can re-ask.
+func broadcastTxSyncContext(parent context.Context, cometRPC string, txBytes []byte) (err error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	u := fmt.Sprintf("%s/broadcast_tx_sync?tx=0x%s", strings.TrimRight(cometRPC, "/"), hex.EncodeToString(txBytes))
+	ctx, cancel := context.WithTimeout(parent, syncBroadcastTimeout)
+	defer cancel()
+
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, u, nil) // #nosec G107 -- internal CometBFT RPC
+	if reqErr != nil {
+		// Pre-send: the URL was never dialed, so nothing is in flight and this
+		// must NOT fence. Still not %w — the parse error quotes the URL.
+		return fmt.Errorf("create broadcast request: %s", commitTransportCause(reqErr))
+	}
+	// Same post-send panic guard as broadcastTxCommitWebContext, for the same
+	// reason: a panic once the bytes may be on the wire is an unobserved
+	// outcome, not a definitive failure, and letting it unwind would free the
+	// lease slot without a fence. Only the panic value's TYPE is reported.
+	onWire := false
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if !onWire {
+			panic(r)
+		}
+		err = indeterminateCommit(fmt.Errorf("broadcast tx: panicked (%T) after the transaction was handed to the transport", r))
+	}()
+	onWire = true
+	resp, doErr := http.DefaultClient.Do(req)
+	if doErr != nil {
+		// Not %w: see commitTransportCause. The bytes are already gone.
+		return indeterminateCommit(fmt.Errorf("broadcast tx: %s", commitTransportCause(doErr)))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return indeterminateCommit(fmt.Errorf("broadcast tx: CometBFT returned status %d", resp.StatusCode))
+	}
+	return nil
+}
+
+// syncBroadcastTimeout bounds a fire-and-forget broadcast. It matches the value
+// the pre-lease broadcastTxSync used, because the request itself has not changed
+// — only what happens around it.
+const syncBroadcastTimeout = 5 * time.Second
+
+// commitIndeterminateError marks a commit-confirmed broadcast that could have
+// reached consensus but did not yield a trustworthy answer to this process.
+//
+// It replaces the message-prefix matching this file used to do. Prefix matching
+// was fragile in the direction that costs transactions: any wrapping that
+// prepended context ("update agent policy: broadcast tx commit: ...") silently
+// reclassified an indeterminate result as a definitive rejection, and the
+// classification could only run AFTER the error had travelled out of the code
+// that knew what actually happened. Marking at the origin removes both problems.
+//
+// Error() returns the wrapped message verbatim: several handlers surface this
+// text to operators and the nonce-lease contract returns submit's error
+// undecorated, so the marker must be invisible in the message.
+type commitIndeterminateError struct{ err error }
+
+func (e *commitIndeterminateError) Error() string { return e.err.Error() }
+
+func (e *commitIndeterminateError) Unwrap() error { return e.err }
+
+func indeterminateCommit(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &commitIndeterminateError{err: err}
 }
 
 // isIndeterminateCommitError reports whether a commit-confirmed request could
 // have reached consensus but did not yield a trustworthy response to this
 // process. CheckTx/FinalizeBlock failures are definitive rejections and must
 // remain errors; transport and RPC response faults are not proof of no change.
+//
+// A fenced request (tx.ErrSignerFenced) is deliberately NOT indeterminate:
+// nothing was signed or sent, so there is no change for a handler to go looking
+// for.
 func isIndeterminateCommitError(err error) bool {
-	if err == nil {
+	var indeterminate *commitIndeterminateError
+	return errors.As(err, &indeterminate)
+}
+
+// fencedSignerRetryAfterSeconds is the Retry-After a fenced request advertises.
+// Reconciliation re-submits the identical bytes on a backoff that tops out at a
+// minute, so this is roughly "after the next couple of attempts" — long enough
+// not to hammer a node that is already struggling, short enough that a fence
+// clearing normally is not followed by a needless wait.
+const fencedSignerRetryAfterSeconds = 15
+
+// signerHeldNotSent reports whether err is one of the two typed "NOTHING WAS
+// SIGNED OR SENT" refusals — a fenced signing key, or signing quiesced for a
+// coordinated restart. It exists for the surfaces that cannot answer through
+// writeSignerNotSentIfHeld (JSON result objects, multi-step batch responses):
+// they must still classify the refusal as "not sent, retry" rather than fold it
+// into their *_rejected verdict, because reporting a deferral as a rejection
+// sends an operator hunting for a change to undo that never existed.
+func signerHeldNotSent(err error) bool {
+	return errors.Is(err, tx.ErrSignerFenced) || errors.Is(err, tx.ErrSigningQuiesced)
+}
+
+// writeSignerNotSentIfHeld answers a request whose transaction was NEVER SIGNED
+// OR SENT — the signing key is fenced, or signing is quiesced for a restart —
+// and reports whether it did.
+//
+// Call it FIRST in any error branch that would otherwise report a consensus
+// rejection. That ordering is the point: `tx.ErrSignerFenced` is deliberately
+// not an "indeterminate commit" (nothing is in flight for the handler to go
+// looking for), so without this guard it falls through to whatever the handler
+// treats as its definitive-failure case — and telling an operator their change
+// was REFUSED, when it was merely deferred, is the misreport the typed error
+// exists to prevent. They would go hunting for a change to undo that does not
+// exist, or redo the work by hand.
+//
+// 503 + Retry-After is the honest shape: not sent, ask again. Never a rejection
+// status, never a suggestion to restart.
+func writeSignerNotSentIfHeld(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, tx.ErrSignerFenced):
+		w.Header().Set("Retry-After", strconv.Itoa(fencedSignerRetryAfterSeconds))
+		writeError(w, http.StatusServiceUnavailable,
+			"Not sent: this signing key is waiting for confirmation of an earlier submission whose "+
+				"outcome was lost. Nothing was signed or broadcast, and nothing needs undoing. Try again shortly.")
+		return true
+	case errors.Is(err, tx.ErrSigningQuiesced):
+		w.Header().Set("Retry-After", strconv.Itoa(fencedSignerRetryAfterSeconds))
+		writeError(w, http.StatusServiceUnavailable,
+			"Not sent: SAGE is restarting, so no new transaction was signed. Try again once it is back.")
+		return true
+	default:
 		return false
 	}
-	message := err.Error()
-	return strings.HasPrefix(message, "broadcast tx commit:") ||
-		strings.HasPrefix(message, "decode broadcast commit response:") ||
-		strings.HasPrefix(message, "broadcast error:")
+}
+
+// writeGovernanceBroadcastFailure maps a signing/broadcast failure onto the
+// right status, keeping a FENCED request distinguishable from a REJECTED one.
+//
+// This distinction is the reason ErrSignerFenced is a typed error at all. A
+// consensus rejection is a verdict about a transaction that reached the chain:
+// the operator's change was refused and they should not retry it unchanged. A
+// fence means NOTHING WAS SIGNED OR SENT — there is no verdict, nothing to undo,
+// and retrying is exactly the right thing to do once reconciliation resolves the
+// earlier submission. Reporting the second as the first tells an operator their
+// change was refused when it was merely deferred, which is how a transient
+// outage turns into someone re-doing work by hand.
+//
+// 503 + Retry-After is the honest HTTP shape for "not sent yet, ask again". It
+// is deliberately NOT 409/422 (a verdict) and NOT 502 (the node answered fine).
+// The body says nothing about restarting, because restarting discards the fence
+// and loses the transaction — see signAndBroadcastCommitPrepared.
+func writeGovernanceBroadcastFailure(w http.ResponseWriter, prefix string, err error) {
+	if errors.Is(err, tx.ErrSignerFenced) {
+		w.Header().Set("Retry-After", strconv.Itoa(fencedSignerRetryAfterSeconds))
+		writeError(w, http.StatusServiceUnavailable,
+			"not sent: this signing key is waiting for confirmation of an earlier submission whose outcome "+
+				"was lost. Nothing was signed or broadcast, and nothing needs undoing. Try again shortly.")
+		return
+	}
+	if errors.Is(err, tx.ErrSigningQuiesced) {
+		w.Header().Set("Retry-After", strconv.Itoa(fencedSignerRetryAfterSeconds))
+		writeError(w, http.StatusServiceUnavailable,
+			"not sent: SAGE is restarting, so no new transaction was signed. Try again once it is back.")
+		return
+	}
+	writeError(w, http.StatusBadGateway, prefix+err.Error())
 }
 
 // agentIDForKey returns the on-chain agent id (hex(pubkey)) for an Ed25519 key,
@@ -330,4 +735,76 @@ func parsePurgedGrantsWeb(log string) int {
 		return 0
 	}
 	return n
+}
+
+// signerFenceHealth renders the signer-fence state for the operator status
+// surface (/v1/dashboard/health).
+//
+// WHY THIS IS PART OF THE FEATURE, NOT A NICETY. A fence refuses every signing
+// request for one key and, by design, is never lifted by a timer — only by proof
+// of the earlier transaction's fate. Holding a key indefinitely is only a
+// defensible trade while the hold is VISIBLE: otherwise "my agent stopped being
+// able to write" is a mystery hang, which is precisely the outcome the loud-
+// failure argument promised to avoid.
+//
+// TWO TIERS, because /health is public (the CLI status command reads it
+// unauthenticated):
+//   - always: the COUNT and the age of the oldest hold. Both are pure liveness
+//     signals — they say this node cannot sign for somebody — and neither
+//     identifies a key or a transaction.
+//   - operator only: which signer, which transaction, which nonce, how many
+//     reconciliation attempts, and the typed cause. All of it is public on-chain
+//     data or a category string, but it is per-agent detail and it belongs
+//     behind the same gate as the rest of the operator view.
+//
+// EVERYTHING HERE IS ALREADY SANITIZED AT THE SOURCE. Cause and LastCause are
+// typed categories, LastDetail has been through the fence's scrubber, and the
+// signer is a PUBLIC key — never a key file path, never a raw error, never the
+// encoded transaction. See internal/tx/nonce_fence.go's fenceCause.
+func signerFenceHealth(operator bool) map[string]any {
+	held := tx.FencedSigners()
+	out := map[string]any{
+		"active":             len(held),
+		"oldest_age_seconds": 0,
+	}
+	if len(held) == 0 {
+		return out
+	}
+	// FencedSigners is oldest-first, so held[0] is the alarm.
+	out["oldest_age_seconds"] = int(held[0].HeldFor.Round(time.Second).Seconds())
+	// Said in the status payload as well as the log, because an operator looking
+	// at a stuck node needs to know the hold is deliberate — and must not be
+	// told to restart, which discards the fence and loses the transaction.
+	out["explanation"] = "one or more signing keys are waiting for proof of an earlier submission's fate; " +
+		"nothing was signed or sent for the requests they refused, and reconciliation is re-submitting the " +
+		"identical bytes to force an answer"
+	if !operator {
+		return out
+	}
+
+	signers := make([]map[string]any, 0, len(held))
+	for _, fence := range held {
+		row := map[string]any{
+			"signer":          fence.SignerPubKeyPrefix,
+			"tx_hash":         fence.TxHash,
+			"held_seconds":    int(fence.HeldFor.Round(time.Second).Seconds()),
+			"since":           fence.Since.UTC().Format(time.RFC3339),
+			"attempts":        fence.Attempts,
+			"cause":           fence.Cause,
+			"last_cause":      fence.LastCause,
+			"last_detail":     fence.LastDetail,
+			"signer_agent_id": fence.SignerPubKeyHex,
+		}
+		if fence.HasNonce {
+			// The nonce is what makes a fence actionable: it can be compared
+			// against what the chain has committed for this signer.
+			row["nonce"] = fence.Nonce
+		}
+		if !fence.LastAttemptAt.IsZero() {
+			row["last_attempt_at"] = fence.LastAttemptAt.UTC().Format(time.RFC3339)
+		}
+		signers = append(signers, row)
+	}
+	out["signers"] = signers
+	return out
 }

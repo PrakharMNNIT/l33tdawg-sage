@@ -193,9 +193,11 @@ func TestWithNonceLease_LeaseMapDrainsWhenIdle(t *testing.T) {
 	}
 }
 
-// TestWithNonceLease_ReturnsSubmitErrorUnwrapped keeps callers able to classify
-// broadcast failures (web's isIndeterminateCommitError matches on error text),
-// so the lease must not decorate what submit returned.
+// TestWithNonceLease_ReturnsSubmitErrorUnwrapped keeps the lease out of the way
+// of callers that still match on what submit returned — errors.Is chains, and
+// the operator-facing messages several web handlers render verbatim. Fencing is
+// decided by the TYPE an adopter opts into (Indeterminate), never by rewriting
+// or re-reading the message, so the message must come back exactly as sent.
 func TestWithNonceLease_ReturnsSubmitErrorUnwrapped(t *testing.T) {
 	_, sk, err := ed25519.GenerateKey(nil)
 	if err != nil {

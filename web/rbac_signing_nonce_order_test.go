@@ -197,7 +197,7 @@ func TestSignAndBroadcastCommitContextDoesNotSerializeDistinctKeys(t *testing.T)
 // the "no change" contract for a request whose context is already dead: it must
 // not consume a nonce (a burned nonce makes a later honest transaction look like
 // a replay), must not reach the node, and must report a DEFINITIVE failure —
-// deliberately not one of isIndeterminateCommitError's shapes, because nothing
+// deliberately not marked indeterminate, because nothing
 // was signed or sent, so the caller must not go hunting for a change that cannot
 // exist.
 func TestSignAndBroadcastCommitContextCancelledBeforeSigningNeverBroadcasts(t *testing.T) {

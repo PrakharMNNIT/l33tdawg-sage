@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -599,6 +600,24 @@ func (h *DashboardHandler) handleEmbeddingsDeprecateUnreadable(w http.ResponseWr
 				},
 			}
 			if _, _, _, err := h.signAndBroadcastCommit(forgetTx, actor.Key); err != nil {
+				// FIRST: fenced/quiesced means this batch step was never signed
+				// or sent — 503 "not sent, retry with the same cursor", never a
+				// consensus verdict. The counts stay in the body so the operator
+				// keeps the progress the batch really made.
+				if signerHeldNotSent(err) {
+					w.Header().Set("Retry-After", strconv.Itoa(fencedSignerRetryAfterSeconds))
+					writeJSONResp(w, http.StatusServiceUnavailable, map[string]any{
+						"ok": false,
+						"error": "not sent: the signing key is waiting for confirmation of an earlier " +
+							"submission whose outcome was lost; nothing was signed or broadcast for this " +
+							"step, and nothing needs undoing. Try again shortly.",
+						"submitted":            submitted,
+						"deprecated":           deprecated,
+						"remaining_unreadable": max(0, total-deprecated),
+						"next_cursor":          nextCursor,
+					})
+					return
+				}
 				writeJSONResp(w, http.StatusBadGateway, map[string]any{
 					"ok":                   false,
 					"error":                "consensus stopped the unreadable-memory retirement: " + err.Error(),

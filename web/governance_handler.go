@@ -260,7 +260,6 @@ func (h *DashboardHandler) handleDashboardGovPropose(w http.ResponseWriter, r *h
 
 	proposeTx := &tx.ParsedTx{
 		Type:      tx.TxTypeGovPropose,
-		Nonce:     tx.MonotonicNonce(outerKey),
 		Timestamp: time.Now(),
 		GovPropose: &tx.GovPropose{
 			Operation:    op,
@@ -273,38 +272,54 @@ func (h *DashboardHandler) handleDashboardGovPropose(w http.ResponseWriter, r *h
 		},
 	}
 
-	if postAppV20 {
-		operatorKey := h.AdminSigningKey
+	// The nonce, the proof and the elevation are all stamped INSIDE the lease
+	// (signAndBroadcastCommitPrepared). This handler previously allocated a
+	// nonce, then embedded a proof — which itself makes an RPC for consensus
+	// time — and only then signed and broadcast, all unserialized. Two
+	// governance actions on this key could therefore allocate N and N+1 and
+	// reach CometBFT in the other order, and app-v9's replay gate rejected the
+	// late one Code 4 "nonce too low". An unfenced adopter sharing a signing key
+	// also reopens that race for every OTHER adopter of the same key, so the
+	// dashboard's governance lane cannot be the one that opts out.
+	//
+	// proofErrKind carries which pre-signature step failed back out of the
+	// closure, because the two have different operator-facing responses.
+	var proofErrKind string
+	prepare := func(ptx *tx.ParsedTx) error {
+		if postAppV20 {
+			operatorKey := h.AdminSigningKey
+			if appV23Actor != nil {
+				operatorKey = appV23Actor.Key
+			}
+			if proofErr := h.embedConsensusTimedGovernanceProof(
+				ptx, operatorKey, r.Method, r.URL.RequestURI(), proofBody,
+			); proofErr != nil {
+				proofErrKind = "authorize"
+				return proofErr
+			}
+		} else {
+			embedDashboardAgentProof(ptx, outerKey)
+		}
 		if appV23Actor != nil {
-			operatorKey = appV23Actor.Key
+			if elevationErr := h.appV23AttachElevation(ptx, appV23Actor); elevationErr != nil {
+				proofErrKind = "elevation"
+				return elevationErr
+			}
 		}
-		if err = h.embedConsensusTimedGovernanceProof(proposeTx, operatorKey, r.Method, r.URL.RequestURI(), proofBody); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to authorize transaction")
-			return
-		}
-	} else {
-		embedDashboardAgentProof(proposeTx, outerKey)
-	}
-	if appV23Actor != nil {
-		if err = h.appV23AttachElevation(proposeTx, appV23Actor); err != nil {
-			writeAppV23AccessError(w, http.StatusServiceUnavailable, "local_elevation_failed",
-				"Could not bind the governance action to the current local authority.")
-			return
-		}
-	}
-	if err = tx.SignTx(proposeTx, outerKey); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to sign transaction")
-		return
-	}
-	encoded, err := tx.EncodeTx(proposeTx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to encode transaction")
-		return
+		return nil
 	}
 
-	txHash, committedHeight, _, err := broadcastTxCommitWeb(h.CometBFTRPC, encoded)
+	txHash, committedHeight, _, err := h.signAndBroadcastCommitPrepared(r.Context(), proposeTx, outerKey, prepare)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "governance proposal rejected: "+err.Error())
+		switch proofErrKind {
+		case "authorize":
+			writeError(w, http.StatusInternalServerError, "failed to authorize transaction")
+		case "elevation":
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "local_elevation_failed",
+				"Could not bind the governance action to the current local authority.")
+		default:
+			writeGovernanceBroadcastFailure(w, "governance proposal rejected: ", err)
+		}
 		return
 	}
 	validatorID := auth.PublicKeyToAgentID(ed25519.PublicKey(proposeTx.PublicKey))
@@ -454,7 +469,6 @@ func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http
 
 	voteTx := &tx.ParsedTx{
 		Type:      tx.TxTypeGovVote,
-		Nonce:     tx.MonotonicNonce(h.SigningKey),
 		Timestamp: time.Now(),
 		GovVote: &tx.GovVote{
 			ProposalID: req.ProposalID,
@@ -462,6 +476,25 @@ func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http
 		},
 	}
 
+	// Everything from the nonce to the signature happens inside the lease — see
+	// the equivalent comment on the propose handler. The operator-key and
+	// authorization-context checks stay OUT here: they are cheap, they cannot
+	// have side effects on the chain, and failing them before taking the key's
+	// submission slot keeps an unusable request from queueing ahead of live ones.
+	var (
+		voteProofErrKind string
+		votePrepare      func(*tx.ParsedTx) error
+	)
+	attachVoteElevation := func(ptx *tx.ParsedTx) error {
+		if appV23Actor == nil {
+			return nil
+		}
+		if elevationErr := h.appV23AttachElevation(ptx, appV23Actor); elevationErr != nil {
+			voteProofErrKind = "elevation"
+			return elevationErr
+		}
+		return nil
+	}
 	if h.AppV20ActiveFn != nil && h.AppV20ActiveFn() {
 		operatorKey := h.AdminSigningKey
 		if appV23Actor != nil {
@@ -481,33 +514,32 @@ func (h *DashboardHandler) handleDashboardGovVote(w http.ResponseWriter, r *http
 			writeError(w, http.StatusInternalServerError, "failed to encode governance authorization")
 			return
 		}
-		if err = h.embedConsensusTimedGovernanceProof(voteTx, operatorKey, r.Method, r.URL.RequestURI(), proofBody); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to authorize transaction")
-			return
+		votePrepare = func(ptx *tx.ParsedTx) error {
+			if proofErr := h.embedConsensusTimedGovernanceProof(
+				ptx, operatorKey, r.Method, r.URL.RequestURI(), proofBody,
+			); proofErr != nil {
+				voteProofErrKind = "authorize"
+				return proofErr
+			}
+			return attachVoteElevation(ptx)
 		}
 	} else {
-		embedDashboardAgentProof(voteTx, h.SigningKey)
-	}
-	if appV23Actor != nil {
-		if err = h.appV23AttachElevation(voteTx, appV23Actor); err != nil {
-			writeAppV23AccessError(w, http.StatusServiceUnavailable, "local_elevation_failed",
-				"Could not bind the governance vote to the current local authority.")
-			return
+		votePrepare = func(ptx *tx.ParsedTx) error {
+			embedDashboardAgentProof(ptx, h.SigningKey)
+			return attachVoteElevation(ptx)
 		}
 	}
-	if err = tx.SignTx(voteTx, h.SigningKey); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to sign transaction")
-		return
-	}
-	encoded, err := tx.EncodeTx(voteTx)
+	txHash, _, _, err := h.signAndBroadcastCommitPrepared(r.Context(), voteTx, h.SigningKey, votePrepare)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to encode transaction")
-		return
-	}
-
-	txHash, _, _, err := broadcastTxCommitWeb(h.CometBFTRPC, encoded)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "governance vote rejected: "+err.Error())
+		switch voteProofErrKind {
+		case "authorize":
+			writeError(w, http.StatusInternalServerError, "failed to authorize transaction")
+		case "elevation":
+			writeAppV23AccessError(w, http.StatusServiceUnavailable, "local_elevation_failed",
+				"Could not bind the governance vote to the current local authority.")
+		default:
+			writeGovernanceBroadcastFailure(w, "governance vote rejected: ", err)
+		}
 		return
 	}
 

@@ -276,6 +276,13 @@ func (h *DashboardHandler) handleAppV26AgentDisplayName() http.HandlerFunc {
 		hash, height, _, broadcastErr := h.signAndBroadcastAppV23ControlContext(r.Context(), ptx, actor)
 		reconciled := false
 		if broadcastErr != nil {
+			// A fenced or quiesced key means NOTHING WAS SIGNED OR SENT, which is
+			// neither an indeterminate commit (nothing to reconcile against) nor a
+			// rejection (no verdict exists). Checked first so it can never fall
+			// through to the consensus_rejected branch below.
+			if writeSignerNotSentIfHeld(w, broadcastErr) {
+				return
+			}
 			if isIndeterminateCommitError(broadcastErr) {
 				reconciled = waitForAppV23CommittedState(func() bool {
 					updated, lookupErr := h.BadgerStore.GetRegisteredAgent(agentID)
@@ -666,11 +673,23 @@ func (h *DashboardHandler) appV23AttachElevation(
 	return nil
 }
 
+// signAndBroadcastAppV23Control is the context-free variant for callers with no
+// request context of their own. It is BOUNDED for the same reason
+// signAndBroadcastCommit is: the lease can now hold a caller while its signing
+// key is fenced, and a bare context.Background() would park that caller — and
+// with it the key's lease slot — indefinitely. The handlers behind this
+// (remove agent, root credential handover, task submit, import) would then hang
+// with no response instead of returning tx.ErrSignerFenced, and the 503
+// "not sent" guards at their call sites could never fire. The budget makes a
+// fenced key fail loudly within two commit timeouts, which is the designed
+// shape of a held fence.
 func (h *DashboardHandler) signAndBroadcastAppV23Control(
 	ptx *tx.ParsedTx,
 	actor *appV23ControlActor,
 ) (string, int64, string, error) {
-	return h.signAndBroadcastAppV23ControlContext(context.Background(), ptx, actor)
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundSigningBudget())
+	defer cancel()
+	return h.signAndBroadcastAppV23ControlContext(ctx, ptx, actor)
 }
 
 func (h *DashboardHandler) signAndBroadcastAppV23ControlContext(
@@ -1156,6 +1175,12 @@ func (h *DashboardHandler) handleAppV23AgentPolicy() http.HandlerFunc {
 		hash, height, _, err := h.signAndBroadcastAppV23ControlContext(r.Context(), ptx, actor)
 		reconciled := false
 		if err != nil {
+			// See handleAppV26AgentDisplayName: a fenced or quiesced key means
+			// nothing was signed or sent, so it must never fall through to
+			// "consensus_rejected" — there is no verdict to report.
+			if writeSignerNotSentIfHeld(w, err) {
+				return
+			}
 			if isIndeterminateCommitError(err) {
 				reconciled = waitForAppV23CommittedState(func() bool {
 					return h.appV23PolicyMatches(ptx)
@@ -1308,6 +1333,12 @@ func (h *DashboardHandler) handleAppV23AccessGroupPut() http.HandlerFunc {
 		hash, height, _, err := h.signAndBroadcastAppV23ControlContext(r.Context(), ptx, actor)
 		reconciled := false
 		if err != nil {
+			// See handleAppV26AgentDisplayName: a fenced or quiesced key means
+			// nothing was signed or sent, so it must never fall through to
+			// "consensus_rejected" — there is no verdict to report.
+			if writeSignerNotSentIfHeld(w, err) {
+				return
+			}
 			if isIndeterminateCommitError(err) {
 				reconciled = waitForAppV23CommittedState(func() bool {
 					return h.appV23GroupMatches(ptx.AccessGroupMutate)
@@ -1357,6 +1388,12 @@ func (h *DashboardHandler) handleAppV23AccessGroupDelete() http.HandlerFunc {
 		hash, height, _, err := h.signAndBroadcastAppV23ControlContext(r.Context(), ptx, actor)
 		reconciled := false
 		if err != nil {
+			// See handleAppV26AgentDisplayName: a fenced or quiesced key means
+			// nothing was signed or sent, so it must never fall through to
+			// "consensus_rejected" — there is no verdict to report.
+			if writeSignerNotSentIfHeld(w, err) {
+				return
+			}
 			if isIndeterminateCommitError(err) {
 				reconciled = waitForAppV23CommittedState(func() bool {
 					return h.appV23GroupMatches(ptx.AccessGroupMutate)

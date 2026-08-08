@@ -88,10 +88,11 @@ func TestAppV23CerebrumForgetKeepsIndeterminateCommitPending(t *testing.T) {
 
 	// A response can be lost after CometBFT accepted the transaction. The
 	// dashboard must not lie that nothing changed or invite a duplicate click.
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// The indeterminate outcome fences the signing key, so the stub goes through
+	// fenceResolvingRPC to resolve that fence at teardown.
+	rpc := fenceResolvingRPC(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "temporary upstream failure", http.StatusBadGateway)
-	}))
-	t.Cleanup(rpc.Close)
+	})
 	fixture.handler.CometBFTRPC = rpc.URL
 
 	rec := appV23CanonicalMutationRequest(

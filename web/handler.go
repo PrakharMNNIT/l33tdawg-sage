@@ -3560,6 +3560,13 @@ func (h *DashboardHandler) handleDeleteMemory(w http.ResponseWriter, r *http.Req
 		}
 		_, _, txLog, err := h.signAndBroadcastCommit(forgetTx, actor.Key)
 		if err != nil {
+			// FIRST: a fenced/quiesced signer means nothing was signed or sent.
+			// Without this check the error falls through to the 409 below and
+			// the operator is told the deprecation was REJECTED — a verdict that
+			// never happened, for a transaction that never existed.
+			if writeSignerNotSentIfHeld(w, err) {
+				return
+			}
 			// broadcast_tx_commit can lose its response after the validator has
 			// accepted the transaction. Treat transport/RPC uncertainty as pending,
 			// never as proof that "nothing changed": a second click can otherwise
@@ -4664,6 +4671,11 @@ func (h *DashboardHandler) handleCreateTaskDashboard(w http.ResponseWriter, r *h
 			_, _, _, err = h.signAndBroadcastCommit(submitTx, submittingKey)
 		}
 		if err != nil {
+			// FIRST: fenced/quiesced means the submission was never signed or
+			// sent — 503 "not sent, retry", never a network/consensus failure.
+			if writeSignerNotSentIfHeld(w, err) {
+				return
+			}
 			writeError(w, http.StatusBadGateway, "the network did not confirm this task; nothing was added: "+err.Error())
 			return
 		}
@@ -4757,6 +4769,7 @@ func (h *DashboardHandler) handleHealth(w http.ResponseWriter, r *http.Request) 
 	if h.RESTAddr != "" {
 		health["rest_addr"] = h.RESTAddr
 	}
+	health["signer_fences"] = signerFenceHealth(h.isCEREBRUMReadRequest(r))
 
 	// Embedder status. Before v6.8.8 the dashboard hard-coded an Ollama probe
 	// to localhost:11434, which painted "Ollama offline" any time the operator

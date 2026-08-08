@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -813,22 +814,44 @@ func TestAppV26GroupMutationRejectsMissingMemberAuthority(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "invalid_group_authority")
 }
 
+// applyOnceOnBroadcast wraps a CometBFT stub that models a node which ACCEPTED a
+// transaction but whose response was lost.
+//
+// Two things force this shape now that an indeterminate commit fences the
+// signing key. First, the fence reconciles by probing /tx and RE-SUBMITTING the
+// identical bytes, so a stub that assumes every request is the handler's own
+// /broadcast_tx_commit will try to decode a transaction out of a /tx probe that
+// carries none. Second, a real node applies a given transaction once: its nonce
+// and its hash are already spent, so a re-submission is refused rather than
+// executed twice. A stub that re-applied the mutation on every call would fail
+// its own optimistic-revision check and report a defect that consensus cannot
+// produce.
+func applyOnceOnBroadcast(t *testing.T, apply func(parsed *tx.ParsedTx)) http.HandlerFunc {
+	t.Helper()
+	var applied atomic.Bool
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/broadcast_tx_commit" && applied.CompareAndSwap(false, true) {
+			raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+			require.NoError(t, err)
+			parsed, err := tx.DecodeTx(raw)
+			require.NoError(t, err)
+			apply(parsed)
+		}
+		// Truncated body: the node acted, but this process never learns that.
+		_, _ = fmt.Fprint(w, `{`)
+	}
+}
+
 func TestAppV23GroupMutationReconcilesCommittedStateAfterMalformedRPCResponse(t *testing.T) {
 	fixture := newAppV23AccessFixture(t)
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
-		require.NoError(t, err)
-		parsed, err := tx.DecodeTx(raw)
-		require.NoError(t, err)
+	rpc := fenceResolvingRPC(t, applyOnceOnBroadcast(t, func(parsed *tx.ParsedTx) {
 		require.NotNil(t, parsed.AccessGroupMutate)
 		mutation := parsed.AccessGroupMutate
 		require.NoError(t, fixture.badger.MutateAppV23AccessGroup(
 			fixture.rootID, mutation.GroupID, mutation.Name, mutation.Members,
 			mutation.ExpectedRevision, mutation.Delete, 2,
 		))
-		_, _ = fmt.Fprint(w, `{`)
 	}))
-	defer rpc.Close()
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
 	req := appV23AccessRequest(t, http.MethodPut, "/groups/research", "groupID", "research", map[string]any{
 		"name": "Research", "members": []string{fixture.agentID}, "expected_revision": 0,
@@ -847,11 +870,7 @@ func TestAppV23GroupMutationReconcilesCommittedStateAfterMalformedRPCResponse(t 
 
 func TestAppV26GroupMutationReconcilesAuthorityAfterMalformedRPCResponse(t *testing.T) {
 	fixture := newAppV23AccessFixture(t)
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
-		require.NoError(t, err)
-		parsed, err := tx.DecodeTx(raw)
-		require.NoError(t, err)
+	rpc := fenceResolvingRPC(t, applyOnceOnBroadcast(t, func(parsed *tx.ParsedTx) {
 		require.NotNil(t, parsed.AccessGroupMutate)
 		mutation := parsed.AccessGroupMutate
 		require.NoError(t, fixture.badger.MutateAppV26AccessGroup(
@@ -859,9 +878,7 @@ func TestAppV26GroupMutationReconcilesAuthorityAfterMalformedRPCResponse(t *test
 			mutation.MemberAuthority, mutation.ExpectedRevision,
 			mutation.Delete, 2,
 		))
-		_, _ = fmt.Fprint(w, `{`)
 	}))
-	defer rpc.Close()
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
 	h.AppV26ActiveFn = func() bool { return true }
 	req := appV23AccessRequest(t, http.MethodPut, "/groups/research", "groupID", "research", map[string]any{
@@ -882,14 +899,56 @@ func TestAppV26GroupMutationReconcilesAuthorityAfterMalformedRPCResponse(t *test
 	assert.Equal(t, uint64(1), group.Revision)
 }
 
-func TestAppV23GroupMutationDoesNotResubmitWhenCommitResponseIsUncertain(t *testing.T) {
+// TestAppV23GroupMutationNeverReSignsAnUncertainCommit replaces
+// TestAppV23GroupMutationDoesNotResubmitWhenCommitResponseIsUncertain, whose
+// assertion counted RPC calls and is no longer the invariant.
+//
+// WHAT CHANGED AND WHY. An uncertain commit now fences the signing key, and the
+// fence reconciles by re-submitting the BYTE-IDENTICAL transaction to force
+// consensus to answer. So the wire does see the transaction again. The old
+// call-count assertion would forbid that, but it was never the property that
+// mattered: identical bytes carry the identical nonce and the identical hash, so
+// a re-submission is refused as a duplicate or refused Code 4 once the nonce is
+// spent. It cannot apply the mutation twice, and it cannot bypass the
+// expected_revision guard.
+//
+// The property that DOES matter is ONE DISTINCT SIGNED TRANSACTION, not one
+// send — and it has TWO SIDES, both of which are asserted here:
+//
+//  1. Reconciliation ACTUALLY REBROADCASTS. More than one send must eventually
+//     be observed. Without this clause the second assertion passes VACUOUSLY:
+//     zero or one send trivially satisfies "all sends were identical", so a
+//     reconciler that had quietly stopped re-submitting would look perfect.
+//  2. Every send is BYTE-IDENTICAL — exactly one distinct payload.
+//
+// Clause 2 is the load-bearing precondition of the whole re-submission design.
+// De-duplication is BY HASH: if anything re-signs, re-stamps a timestamp or
+// re-allocates a nonce, the hash changes, CometBFT stops de-duping, and a
+// genuine second transaction races the first. That is how an operator ends up
+// applying a group change twice or losing one to Code 4. Identical bytes cannot:
+// same nonce, same hash, and app-v23 subsumes app-v9's nonce gate, which rejects
+// a replay BEFORE any AccessGroup mutation executes.
+func TestAppV23GroupMutationNeverReSignsAnUncertainCommit(t *testing.T) {
 	fixture := newAppV23AccessFixture(t)
-	var calls atomic.Int32
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
+	var (
+		broadcastMu sync.Mutex
+		broadcasts  = map[string]int{}
+		sends       int
+	)
+	rpc := fenceResolvingRPC(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/broadcast_tx_commit" {
+			broadcastMu.Lock()
+			broadcasts[r.URL.Query().Get("tx")]++
+			sends++
+			broadcastMu.Unlock()
+		}
+		// Truncated body on every path, so nothing this node says is ever
+		// definitive and the fence is never proven — which is what keeps
+		// reconciliation re-submitting for the duration of the test. Teardown
+		// flips the stub to a committed verdict so the fence resolves instead of
+		// leaking into the rest of the package (see fenceResolvingRPC).
 		_, _ = fmt.Fprint(w, `{`)
-	}))
-	defer rpc.Close()
+	})
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
 	req := appV23AccessRequest(t, http.MethodPut, "/groups/research", "groupID", "research", map[string]any{
 		"name": "Research", "members": []string{fixture.agentID}, "expected_revision": 0,
@@ -899,7 +958,26 @@ func TestAppV23GroupMutationDoesNotResubmitWhenCommitResponseIsUncertain(t *test
 	h.handleAppV23AccessGroupPut().ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
-	assert.Equal(t, int32(1), calls.Load(), "an uncertain commit must never be rebroadcast")
+
+	// Clause 1. The handler's own send is one; reconciliation must add at least
+	// one more, or "never lift without proof" would mean "fenced forever".
+	require.Eventually(t, func() bool {
+		broadcastMu.Lock()
+		defer broadcastMu.Unlock()
+		return sends > 1
+	}, 15*time.Second, 10*time.Millisecond,
+		"reconciliation never re-broadcast the uncertain transaction; without a re-submission nothing "+
+			"forces consensus to answer and the signing key would stay fenced indefinitely")
+
+	// Clause 2. Every one of those sends carried the same bytes.
+	broadcastMu.Lock()
+	distinct := len(broadcasts)
+	total := sends
+	broadcastMu.Unlock()
+	assert.Equal(t, 1, distinct,
+		"an uncertain commit must never be re-signed: all %d sends must be the byte-identical original, "+
+			"because CometBFT de-dupes by hash and a changed hash makes the re-submission a second "+
+			"real transaction racing the first", total)
 	assert.Contains(t, rec.Body.String(), `"status":"confirmation_pending"`)
 	assert.Contains(t, rec.Body.String(), `"retryable":false`)
 }

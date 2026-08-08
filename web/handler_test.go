@@ -2068,11 +2068,11 @@ func TestHandleUpdateAgent_SyncBroadcast_Success(t *testing.T) {
 func TestHandleUpdateAgent_SyncBroadcast_Failure_ReturnsWarning(t *testing.T) {
 	// When CometBFT broadcast fails, the response should include on_chain_warning
 	// but the SQLite update should still succeed (best-effort).
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simulate CometBFT being down
+	// Simulate CometBFT being down. That outcome is indeterminate and fences
+	// the signing key, so the stub resolves the fence at teardown.
+	cometMock := fenceResolvingRPC(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer cometMock.Close()
+	})
 
 	h, s := newTestHandler(t)
 	h.CometBFTRPC = cometMock.URL
@@ -2225,10 +2225,11 @@ func TestHandleUpdateAgent_AppV22CapabilitiesCommitBeforeSuccess(t *testing.T) {
 }
 
 func TestHandleUpdateAgent_AppV22CapabilityFailureRestoresProjection(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// A bare 500 is indeterminate (the node may have accepted the permission
+	// tx), so it fences the admin key; resolve that fence at teardown.
+	cometMock := fenceResolvingRPC(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer cometMock.Close()
+	})
 
 	h, s := newTestHandler(t)
 	h.CometBFTRPC = cometMock.URL
@@ -2296,10 +2297,11 @@ func TestHandleUpdateAgent_ZeroCapabilityIsLegacyCompatibleBeforeAppV22(t *testi
 }
 
 func TestHandleUpdateAgent_PermissionFailureRestoresAllPolicyFields(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// Same shape as the capability-failure test above: an indeterminate 500
+	// fences the admin key, and the stub resolves it at teardown.
+	cometMock := fenceResolvingRPC(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer cometMock.Close()
+	})
 
 	h, s := newTestHandler(t)
 	h.CometBFTRPC = cometMock.URL

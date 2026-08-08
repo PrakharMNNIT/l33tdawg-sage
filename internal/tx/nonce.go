@@ -86,8 +86,19 @@ func nonceFloorFor(pub ed25519.PublicKey) (uint64, bool) {
 // nonce instead of trusting the wall clock to exceed it. With no hook wired the
 // seed is a no-op and behavior is exactly as before.
 //
+// WHAT SEEDING DOES NOT DO, AND MUST NOT BE CLAIMED TO DO: it does not protect a
+// transaction that is still IN FLIGHT. The hook reports the highest COMMITTED
+// nonce; a submission whose outcome was never observed is unresolved precisely
+// because it sits ABOVE that floor. So seeding a restarted process gets it past
+// what the chain has accepted, and straight over the top of anything the
+// previous process abandoned — which then lands afterwards and is rejected
+// Code 4. That is the cross-restart residual documented in the header of
+// nonce_fence.go, and it is the reason a restart is NOT a way to clear a signer
+// fence. See docs/reference/concepts/signer-nonce-fence.md.
+//
 // SCOPE / KNOWN LIMITS (both are liveness-only — the consensus verdict is always
-// deterministic, never a fork — and both are LIFTED once a floor hook is wired):
+// deterministic, never a fork — and both are lifted, AS STATED AND NO FURTHER,
+// once a floor hook is wired; neither of them is the in-flight case above):
 //   - One process per signing key. Without a seed hook the map is process-global
 //     and NOT initialized from the committed on-chain nonce, so two processes
 //     signing with the SAME key against the SAME chain can allocate
@@ -182,19 +193,65 @@ var (
 // in the sequence cost nothing. The reason to check early is simply that a dead
 // request must not hold the slot other callers are queued on.
 //
-// SUBMIT MUST NOT RETURN UNTIL THE OUTCOME IS DEFINITIVE. This is the contract
-// the whole primitive rests on, and it is the one way a correct-looking adopter
-// can still lose transactions. If submit gives up on a timeout while its
-// transaction is still in flight, the lease releases, the next caller allocates
-// a HIGHER nonce and submits, and the abandoned LOWER nonce can still arrive
-// afterwards — rejected Code 4, which is exactly the failure this exists to
-// prevent. An adopter that cannot guarantee a definitive outcome must reconcile
-// the indeterminate case before releasing the lease. web/rbac_signing.go does
-// this by waiting for commit and classifying transport faults through
-// isIndeterminateCommitError instead of treating them as clean failures.
+// SUBMIT MUST EITHER REACH A DEFINITIVE OUTCOME OR SAY THAT IT DID NOT. Nothing
+// forces submit to wait for consensus, and an adopter that returns while its
+// transaction is still in flight would otherwise lose it: the lease releases,
+// the next caller allocates a HIGHER nonce and commits it, and the abandoned
+// LOWER nonce is rejected Code 4 when it finally arrives — exactly the failure
+// this primitive exists to prevent, reintroduced through its own error path.
+//
+// So the release is CONDITIONAL on what submit reports:
+//   - A nil error, or any ordinary error, releases the slot normally. That
+//     covers pre-send failures (sign, encode) and real consensus rejections
+//     (CheckTx / FinalizeBlock non-zero code) — nothing is in flight, so there
+//     is nothing to protect.
+//   - An error wrapped with Indeterminate FENCES the signing key. Later callers
+//     block on the fence instead of allocating past the abandoned nonce, and
+//     ONLY A PROVEN FATE for that exact transaction lifts it — committed, or
+//     definitively refused by consensus. No timer, no budget and no failed probe
+//     can reopen the key, so a fence can be held indefinitely; that is the
+//     deliberate trade, because a held fence fails loudly (ErrSignerFenced, plus
+//     tx.FencedSigners) while a wrongly lifted one loses a transaction silently.
+//     See nonce_fence.go.
+//
+// Getting that split backwards would fence the key on every ordinary validation
+// failure, so the signal is a TYPE the adopter opts into at the point the
+// ambiguity arises, never a guess made here from an error string.
+// web/rbac_signing.go classifies at broadcastTxCommitWebContext, where the
+// transport/decode/RPC ambiguity actually originates.
 //
 // Once the lease is held, submit owns cancellation. Errors from submit are
-// returned unwrapped so callers can keep matching on them.
+// returned undecorated so callers can keep matching on them — including an
+// Indeterminate wrapper, whose Error() is its wrapped error's message verbatim.
+//
+// A caller that arrives while the key is FENCED blocks on the same per-key gate,
+// bounded by its own ctx, and gets ErrSignerFenced if that ctx expires first.
+// That error means nothing was signed or sent, and must never be treated as a
+// consensus rejection. Neither error is cleared by restarting the node — a
+// restart DISCARDS the fence without resolving anything, which is the silent
+// loss the fence exists to prevent. See the header of nonce_fence.go.
+//
+// A caller that arrives once signing has been QUIESCED for a coordinated restart
+// is refused immediately with ErrSigningQuiesced, before any lease or nonce.
+// Same meaning: nothing was signed or sent.
+//
+// A PANIC out of submit propagates and releases the slot; it does NOT fence.
+// This is not the fail-open the fence rejects elsewhere: a panic carries no
+// encoded transaction, and the fence's entire mechanism is to identify and
+// RE-SUBMIT those exact bytes, so a fence raised here could never be proven and
+// would be a permanent hold bought with no evidence at all. The panic is made
+// loud twice over — a structured submit_panic event names the key before the
+// panic continues unwinding to the caller — because the residual it leaves is
+// real: if the bytes WERE already on the wire, the freed slot lets the next
+// caller allocate past them, and that Code 4 would otherwise be untraceable.
+// The contract that keeps the residual small is on the adopter: code that can
+// panic AFTER putting bytes on the wire must recover and return an
+// Indeterminate error carrying those bytes, because only it knows they were
+// sent. web/rbac_signing.go's broadcast helpers do exactly that — they convert
+// a panic raised while the request was on the wire into an indeterminate
+// result, so for every web adopter the fence still goes up. (Contrast the
+// RESOLVER panic in nonce_fence.go, which does have the bytes and therefore
+// keeps the fence and retries.)
 //
 // DEADLOCK: the lock is taken and released entirely inside this function and
 // never spans a return, so the only way to deadlock is for submit to reach back
@@ -230,6 +287,14 @@ func WithNonceLease(ctx context.Context, sk ed25519.PrivateKey, submit func(nonc
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Checked BEFORE the lease, so a quiesced node neither queues callers behind
+	// a slot nor burns a nonce. A transaction signed into a teardown that is
+	// already running is the likeliest transaction in this process's life to end
+	// with an unobserved fate, and an unobserved fate at that exact moment is
+	// the one case the in-process fence cannot carry across the restart.
+	if signingQuiesced.Load() {
+		return ErrSigningQuiesced
+	}
 	key := string(pub)
 
 	lease, err := acquireNonceLease(ctx, key)
@@ -238,7 +303,65 @@ func WithNonceLease(ctx context.Context, sk ed25519.PrivateKey, submit func(nonc
 	}
 	defer releaseNonceLease(key, lease)
 
-	return submit(MonotonicNonce(sk))
+	// Re-checked AFTER the slot is acquired, not just at entry. The entry check
+	// alone had a hole a cross-review caught: a caller can pass it, park in the
+	// queue for minutes behind a slow commit, and only acquire the slot AFTER a
+	// coordinated restart quiesced signing — at which point it would allocate,
+	// sign and broadcast straight into the drain. That submission is the
+	// likeliest in the process's life to end with an unobserved fate, and a
+	// fence raised for it at that moment is raised after the restart's veto was
+	// evaluated, so the exec would discard it. Refusing here, with the slot
+	// released by the deferred release and no nonce allocated, is what makes
+	// "stops new nonce allocations" actually true for queued callers.
+	if signingQuiesced.Load() {
+		return ErrSigningQuiesced
+	}
+
+	// The fence is waited on AFTER the slot is held and BEFORE any allocation.
+	// Holding the slot is what makes "block on the existing per-key gate" true
+	// rather than a second queue with its own ordering; allocating only after
+	// the fence lifts is what stops a later nonce from overtaking an abandoned
+	// one. Reconciliation never takes a lease, so waiting here cannot deadlock
+	// against the thing that lifts the fence.
+	if fenceErr := awaitFenceLifted(ctx, key); fenceErr != nil {
+		return fenceErr
+	}
+	// Same re-check after the fence wait, for the same reason: a caller can be
+	// parked here when quiesce flips, and the fence lifting must not launch it
+	// into a teardown.
+	if signingQuiesced.Load() {
+		return ErrSigningQuiesced
+	}
+
+	// Guard the adopter's own code. A panic out of submit AFTER the bytes were
+	// handed to the kernel releases the slot with no fence — a residual the
+	// fence cannot close from here, because a panic carries no encoded bytes to
+	// reconcile (see the contract in the function comment). What CAN be done is
+	// make the exposure loud: emit a structured event naming the key before the
+	// panic continues, so "this key's next submission was rejected Code 4 for no
+	// visible reason" has a line in the log pointing at the real cause. The
+	// panic value itself is never logged here — it can be an error built from a
+	// broadcast URL, which carries the whole signed transaction.
+	defer func() {
+		if r := recover(); r != nil {
+			emitFenceEvent("submit_panic",
+				fenceKV("signer", signerPrefix(key)),
+				fenceKV("note", "submit panicked while holding this key's lease; the slot is released WITHOUT a "+
+					"fence because a panic carries no encoded transaction to reconcile — if bytes were already "+
+					"on the wire, this key's next allocation may overtake them (Code 4)"))
+			panic(r)
+		}
+	}()
+
+	subErr := submit(MonotonicNonce(sk))
+	var indeterminate *indeterminateSubmit
+	if errors.As(subErr, &indeterminate) {
+		// Fence BEFORE the deferred release runs. Reversed, the next caller
+		// could take the freed slot and allocate past the abandoned nonce in
+		// the window before the fence appeared.
+		fenceSubmission(key, indeterminate)
+	}
+	return subErr
 }
 
 // acquireNonceLease blocks until this goroutine owns key's submission slot, or

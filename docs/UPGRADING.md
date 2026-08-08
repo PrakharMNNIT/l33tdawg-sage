@@ -93,6 +93,48 @@ Use this to work out how far your chain has to climb.
 | v11.18.0 | no new app version; app-v26 remains the ceiling |
 | v11.18.1 | MCP initialization plus safe schema-v2 skip-ahead lineage recovery; app-v26 remains the ceiling |
 | v11.18.2 | Sender-side reply visibility (`sage_message_replies`); no new app version; app-v26 remains the ceiling |
+| v11.18.3 | Signer fence for same-key nonce ordering; no new app version; app-v26 remains the ceiling |
+
+### v11.18.3 — the signer fence, and what it does *not* cover
+
+**The honest claim, and the only one to make:** same-key nonce inversion —
+allocating a nonce, losing the RPC response, and letting a later nonce overtake
+the in-flight transaction into a Code 4 "nonce too low" rejection — is
+**eliminated within a running process for every `web/` dashboard producer**.
+Every dashboard producer that signs with a shared key now allocates and submits
+under a per-key lease, and a submission whose outcome this process never
+observed closes that key until the exact transaction is proven committed or
+proven permanently refused.
+
+**Scope caveat — the remaining producers.** The `api/rest`, federation, voter
+and upgrade-watchdog producers still allocate nonces outside the lease; they are
+converted in the companion non-web adoption change. They share the node signing
+key with the dashboard, and a single unleased producer reopens the race for that
+key no matter how careful the others are — so the whole-process elimination
+claim holds for a key **only once both changes are in the running binary**. Ship
+them together; until then the claim above is scoped to the dashboard's own
+producers.
+
+**Cross-restart and crash exposure remain.** The fence is in memory only. A
+crash, a `kill -9`, or a power cut while a transaction's fate is unresolved still
+discards it, after which the allocator re-seeds from the highest *committed*
+nonce — which is below the abandoned one — and the next transaction can overtake
+it. This release actively prevents the case it controls: a **coordinated restart
+is refused while any signing key is fenced**. The veto is evaluated when the
+restart is requested and **re-evaluated after signing has quiesced and in-flight
+submissions have drained**, while the restart can still be abandoned — so a
+fence raised by a submission that was mid-flight when the restart began also
+refuses it, and the node keeps serving while reconciliation resolves the fence.
+It does not and cannot prevent an unplanned stop.
+
+Closing the residual needs durable pre-broadcast intent (the exact bytes recorded
+before the send, reconciled before any allocation on startup), which is **not in
+this release**.
+
+**Do not restart a node to clear a fenced signing key.** Restarting is the action
+that loses the transaction. See
+[`docs/reference/concepts/signer-nonce-fence.md`](reference/concepts/signer-nonce-fence.md)
+for the full contract, the operator triage steps, and the log/metric surface.
 
 A v10.x chain therefore sits somewhere around **app-v11 to app-v14**, and
 current v11 binaries support up to **app-v26**. That is roughly a dozen rungs.
