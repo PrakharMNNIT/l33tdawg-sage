@@ -44,7 +44,7 @@ func TestAppV23MemoryVoteIsLocalOperatorOnlyAndValidatorBound(t *testing.T) {
 		}))
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = comet.URL
+	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
 
 	const memoryID = "app-v23-operator-vote-target"
 	seedMemory(

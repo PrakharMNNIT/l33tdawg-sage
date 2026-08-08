@@ -80,7 +80,9 @@ func TestDomainReassign_HappyPath(t *testing.T) {
 
 	var resp DomainReassignResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
-	assert.Equal(t, "DEADBEEFCAFEBABE", resp.TxHash)
+	assert.Len(t, resp.TxHash, 64)
+	_, err := hex.DecodeString(resp.TxHash)
+	require.NoError(t, err)
 	assert.Equal(t, 7, resp.PurgedGrants, "purged_grants must be parsed from the ABCI success Log")
 }
 

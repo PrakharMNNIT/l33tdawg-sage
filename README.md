@@ -51,6 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.3
+
+**Same-key consensus submissions now fail closed across every producer in the
+running daemon.** The dashboard, REST API, federation manager, voter, and
+upgrade watchdog share a per-key nonce lease. Once exact transaction bytes
+reach CometBFT, any unproven transport, status, RPC, decode, shape, hash, or
+height outcome fences that signing key until reconciliation proves those same
+bytes committed or permanently refused. Strict shared Comet decoders require a
+single bounded JSON document, explicit nested verdicts, the exact transaction
+hash, and a positive committed height for success.
+
+**Update restart advice now follows live fence state.** A completed download no
+longer leaves stale restart guidance behind: status reads and retained update
+events recompute whether restart is currently safe, and the dashboard renders
+the server-provided instructions. Coordinated restarts are refused when a fence
+is present. Crash, power-loss, cross-restart, and separate-process CLI exposure
+still require durable pre-broadcast intent and remain explicitly out of scope.
+
+The consensus ceiling remains app-v26; **v11.18.3 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.3`. SDK 11.18.3.
+
 ## What's New in v11.18.2
 
 **A reply to a message you sent is readable again, through an advertised MCP
@@ -1492,7 +1514,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.2`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.3`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

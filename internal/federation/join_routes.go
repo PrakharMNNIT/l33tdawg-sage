@@ -1774,7 +1774,7 @@ func (m *Manager) broadcastCrossFedSetLockedAs(
 			return fmt.Errorf("encode cross_fed set tx: %w", encodeErr)
 		}
 		var broadcastErr error
-		hash, _, broadcastErr = m.broadcastContext(leaseCtx, encoded)
+		hash, _, broadcastErr = m.broadcastContext(leaseCtx, signingKey, encoded)
 		return broadcastErr
 	})
 	return hash, err
@@ -1877,7 +1877,7 @@ func (m *Manager) broadcastRevokeAgreementLockedReasonAs(
 			return fmt.Errorf("encode cross_fed revoke tx: %w", encodeErr)
 		}
 		var broadcastErr error
-		hash, _, broadcastErr = m.broadcastContext(leaseCtx, encoded)
+		hash, _, broadcastErr = m.broadcastContext(leaseCtx, signingKey, encoded)
 		return broadcastErr
 	})
 	return hash, err

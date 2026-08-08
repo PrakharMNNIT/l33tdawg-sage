@@ -182,7 +182,7 @@ func TestAppV23OrdinaryTaskAPIsRejectRootAndPreserveLocalAdmin(t *testing.T) {
 		}))
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = comet.URL
+	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
 	var heightBytes [8]byte
 	binary.BigEndian.PutUint64(heightBytes[:], 12)
 	require.NoError(t, fixture.badger.SetState("height", heightBytes[:]))
@@ -303,7 +303,7 @@ func TestAppV23TaskSubmitFailsBeforeBroadcastWithoutAssignmentBridge(t *testing.
 		broadcasts++
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = comet.URL
+	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
 
 	body := []byte(`{"content":"must stay assigned","memory_type":"task","domain_tag":"member.home","confidence_score":0.9,"task_status":"planned"}`)
 	req := appV23SignedRESTRouteRequest(
@@ -330,7 +330,7 @@ func TestAppV23TaskSubmitPollsExactProjectionBeforeReportingCreated(t *testing.T
 		}))
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = comet.URL
+	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
 
 	readbacks := 0
 	fixture.memories.getOpenTasksHook = func() {
@@ -375,7 +375,7 @@ func TestAppV23TaskSubmitReturnsNonRetryableCommittedUnconfirmed(t *testing.T) {
 		}))
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = comet.URL
+	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
 
 	body := []byte(`{"content":"[TASK] reconcile me","memory_type":"task","domain_tag":"member.home","confidence_score":0.9,"task_status":"planned"}`)
 	req := appV23SignedRESTRouteRequest(

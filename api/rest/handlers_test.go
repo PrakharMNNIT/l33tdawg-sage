@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -493,8 +494,76 @@ func newTestServer(t *testing.T, cometbftURL string) (*Server, *mockMemoryStore,
 	health.SetCometBFTHealth(true)
 	logger := zerolog.Nop()
 
+	if cometbftURL != "" {
+		cometbftURL = strictCometFixtureProxy(t, cometbftURL)
+	}
 	srv := NewServer(cometbftURL, memStore, scoreStore, nil, health, logger, embedding.NewClient("", ""))
 	return srv, memStore, scoreStore
+}
+
+// strictCometFixtureProxy upgrades historical REST fixtures to the production
+// /broadcast_tx_commit shape. Older tests used arbitrary hashes or the legacy
+// {result:{code,hash}} sync shape; the production parser now (correctly) binds
+// every verdict to SHA-256(exact bytes), explicit nested verdicts, and height.
+func strictCometFixtureProxy(t *testing.T, upstream string) string {
+	t.Helper()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req, err := http.NewRequestWithContext(r.Context(), r.Method,
+			strings.TrimRight(upstream, "/")+r.URL.RequestURI(), nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		var envelope map[string]any
+		if resp.StatusCode == http.StatusOK && json.Unmarshal(body, &envelope) == nil {
+			if result, ok := envelope["result"].(map[string]any); ok {
+				if legacyCode, legacy := result["code"]; legacy {
+					if _, exists := result["check_tx"]; !exists {
+						result["check_tx"] = map[string]any{"code": legacyCode}
+					}
+					if _, exists := result["tx_result"]; !exists {
+						result["tx_result"] = map[string]any{"code": 0}
+					}
+				}
+				_, hasCheck := result["check_tx"].(map[string]any)
+				_, hasResult := result["tx_result"].(map[string]any)
+				if hasCheck && hasResult {
+					raw, decErr := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+					if decErr == nil {
+						sum := tx.CometTxHash(raw)
+						result["hash"] = strings.ToUpper(hex.EncodeToString(sum[:]))
+						if _, exists := result["height"]; !exists {
+							result["height"] = "1"
+						}
+						body, _ = json.Marshal(envelope)
+					}
+				}
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(proxy.Close)
+	return proxy.URL
+}
+
+func assertStrictTxHash(t *testing.T, got string) {
+	t.Helper()
+	require.Len(t, got, 64)
+	_, err := hex.DecodeString(got)
+	require.NoError(t, err)
 }
 
 type capturingSuppCache struct {
@@ -612,7 +681,7 @@ func TestSubmitMemory(t *testing.T) {
 	err := json.Unmarshal(rr.Body.Bytes(), &resp)
 	require.NoError(t, err)
 	assert.NotEmpty(t, resp.MemoryID)
-	assert.Equal(t, "ABCDEF1234567890", resp.TxHash)
+	assertStrictTxHash(t, resp.TxHash)
 	assert.Equal(t, "proposed", resp.Status)
 
 	// Note: memory is no longer stored directly by the REST handler.
@@ -1306,7 +1375,7 @@ func TestVoteMemory(t *testing.T) {
 	var resp VoteResponse
 	err := json.Unmarshal(rr.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "VOTEHASH123", resp.TxHash)
+	assertStrictTxHash(t, resp.TxHash)
 }
 
 func TestVoteMemory_InvalidDecision(t *testing.T) {
@@ -1357,7 +1426,7 @@ func TestForgetMemory_Success(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code, "body=%s", rr.Body.String())
 	var resp ForgetResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
-	assert.Equal(t, "FORGETHASH", resp.TxHash)
+	assertStrictTxHash(t, resp.TxHash)
 	assert.Equal(t, string(memory.StatusDeprecated), resp.Status)
 	assert.NotEmpty(t, capturedTxHex, "broadcast should have been invoked")
 }
@@ -1455,7 +1524,7 @@ func TestReinstateMemory_SuccessBuildsAppV17Tx(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code, "body=%s", rr.Body.String())
 	var resp ReinstateResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
-	assert.Equal(t, "REINSTATEHASH", resp.TxHash)
+	assertStrictTxHash(t, resp.TxHash)
 	assert.Equal(t, "committed", resp.Status)
 
 	raw, err := hex.DecodeString(capturedTxHex)

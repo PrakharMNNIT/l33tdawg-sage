@@ -3360,46 +3360,19 @@ func (s *Server) broadcastTxCommitWithHeight(txBytes []byte) (string, int64, err
 // has rolled back local state. Ordinary REST handlers retain the historical
 // background+timeout behavior through broadcastTxCommitWithHeight.
 func (s *Server) broadcastTxCommitWithHeightContext(parent context.Context, txBytes []byte) (string, int64, error) {
-	txHex := hex.EncodeToString(txBytes)
-	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", s.cometbftRPC, txHex)
-
 	ctx, cancel := context.WithTimeout(parent, broadcastTxCommitTimeout())
 	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G107 -- internal CometBFT RPC
+	result, err := tx.BroadcastCometCommit(ctx, s.cometbftRPC, s.signingKey, txBytes)
 	if err != nil {
-		return "", 0, fmt.Errorf("create broadcast request: %w", err)
+		return "", 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", 0, fmt.Errorf("broadcast tx commit: %w", err)
+	if result.CheckTxCode != 0 {
+		return "", 0, fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.CheckTxCode, result.CheckTxLog)
 	}
-	defer resp.Body.Close()
-
-	var result cometCommitResponse
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", 0, fmt.Errorf("decode broadcast commit response: %w", err)
+	if result.TxResultCode != 0 {
+		return "", 0, fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.TxResultCode, result.TxResultLog)
 	}
-
-	if result.Error != nil {
-		if result.Error.Data != "" {
-			// error.data carries the real cause for mempool rejections
-			// (message is just "Internal error") — fold it in so
-			// broadcastErrorPublic can classify the failure.
-			return "", 0, fmt.Errorf("broadcast error: %s: %s", result.Error.Message, result.Error.Data)
-		}
-		return "", 0, fmt.Errorf("broadcast error: %s", result.Error.Message)
-	}
-
-	if result.Result.CheckTx.Code != 0 {
-		return "", 0, fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.Result.CheckTx.Code, result.Result.CheckTx.Log)
-	}
-
-	if result.Result.TxResult.Code != 0 {
-		return "", 0, fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.Result.TxResult.Code, result.Result.TxResult.Log)
-	}
-
-	return result.Result.Hash, result.Result.Height, nil
+	return result.Hash, result.Height, nil
 }
 
 // broadcastErrorPublic returns the HTTP status and a sanitized public

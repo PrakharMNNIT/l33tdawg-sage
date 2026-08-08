@@ -3,7 +3,6 @@ package rest
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -198,38 +197,17 @@ func domainReassignErrorPublic(err error) (int, string) {
 // surfaced on success. Domain reassign needs the success log to parse the
 // purged-grants count; reusing broadcastTxCommit would discard it.
 func (s *Server) broadcastTxCommitWithLog(txBytes []byte) (string, string, error) {
-	txHex := hex.EncodeToString(txBytes)
-	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", s.cometbftRPC, txHex)
-
 	ctx, cancel := context.WithTimeout(context.Background(), broadcastTxCommitTimeout())
 	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G107 -- internal CometBFT RPC
+	result, err := tx.BroadcastCometCommit(ctx, s.cometbftRPC, s.signingKey, txBytes)
 	if err != nil {
-		return "", "", fmt.Errorf("create broadcast request: %w", err)
+		return "", "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("broadcast tx commit: %w", err)
+	if result.CheckTxCode != 0 {
+		return "", "", fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.CheckTxCode, result.CheckTxLog)
 	}
-	defer resp.Body.Close()
-
-	var result cometCommitResponse
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", "", fmt.Errorf("decode broadcast commit response: %w", err)
+	if result.TxResultCode != 0 {
+		return "", "", fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.TxResultCode, result.TxResultLog)
 	}
-
-	if result.Error != nil {
-		return "", "", fmt.Errorf("broadcast error: %s", result.Error.Message)
-	}
-
-	if result.Result.CheckTx.Code != 0 {
-		return "", "", fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.Result.CheckTx.Code, result.Result.CheckTx.Log)
-	}
-
-	if result.Result.TxResult.Code != 0 {
-		return "", "", fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.Result.TxResult.Code, result.Result.TxResult.Log)
-	}
-
-	return result.Result.Hash, result.Result.TxResult.Log, nil
+	return result.Hash, result.TxResultLog, nil
 }

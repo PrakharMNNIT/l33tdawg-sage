@@ -714,8 +714,8 @@ func scrubChunkedHex(text string) string {
 	return text
 }
 
-// scrubControlRunes replaces every control rune with a space, with NO
-// exceptions — not even \n and \t.
+// scrubControlRunes replaces every control rune and every Unicode format
+// character with a space, with NO exceptions — not even \n and \t.
 //
 // The values this scrubber cleans are stored in fence records, surfaced
 // through FencedSigners() into status payloads, and printed on log lines by
@@ -729,11 +729,12 @@ func scrubChunkedHex(text string) string {
 // flatten to one line; emitFenceEvent quotes them anyway, so nothing readable
 // is lost.
 func scrubControlRunes(text string) string {
-	if !strings.ContainsFunc(text, unicode.IsControl) {
+	unsafe := func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+	if !strings.ContainsFunc(text, unsafe) {
 		return text
 	}
 	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unsafe(r) {
 			return ' '
 		}
 		return r

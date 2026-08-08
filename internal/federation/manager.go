@@ -707,20 +707,20 @@ func (m *Manager) SetNetworkName(name string) {
 }
 
 // broadcast dispatches an encoded tx through the (possibly test-injected) path.
-func (m *Manager) broadcast(txBytes []byte) (string, int64, error) {
+func (m *Manager) broadcast(signingKey ed25519.PrivateKey, txBytes []byte) (string, int64, error) {
 	if m.broadcastFn != nil {
 		return m.broadcastFn(txBytes)
 	}
-	return m.broadcastTxCommit(txBytes)
+	return m.broadcastTxCommit(signingKey, txBytes)
 }
 
 // broadcastContext dispatches through the production context-aware path while
 // preserving the existing context-free test injection seam.
-func (m *Manager) broadcastContext(ctx context.Context, txBytes []byte) (string, int64, error) {
+func (m *Manager) broadcastContext(ctx context.Context, signingKey ed25519.PrivateKey, txBytes []byte) (string, int64, error) {
 	if m.broadcastFn != nil {
 		return m.broadcastFn(txBytes)
 	}
-	return m.broadcastTxCommitContext(ctx, txBytes)
+	return m.broadcastTxCommitContext(ctx, signingKey, txBytes)
 }
 
 // JoinStore returns the host-side join session registry.
@@ -1119,7 +1119,7 @@ func (m *Manager) handleIncomingReceiptValidated(peerChainID string, push *Recei
 			return fmt.Errorf("encode attest tx: %w", encodeErr)
 		}
 		var broadcastErr error
-		hash, height, broadcastErr = m.broadcastTxCommitContext(leaseCtx, encoded)
+		hash, height, broadcastErr = m.broadcastTxCommitContext(leaseCtx, m.agentKey, encoded)
 		if broadcastErr != nil {
 			return fmt.Errorf("broadcast attest: %w", broadcastErr)
 		}

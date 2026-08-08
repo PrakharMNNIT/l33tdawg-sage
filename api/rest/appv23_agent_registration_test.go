@@ -45,7 +45,7 @@ func TestAppV23AgentRegisterReturnsCommittedPendingPolicy(t *testing.T) {
 		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"REGISTER","height":"7"}}`)
 	}))
 	defer rpc.Close()
-	srv.cometbftRPC = rpc.URL
+	srv.cometbftRPC = strictCometFixtureProxy(t, rpc.URL)
 
 	req := httptest.NewRequest(
 		http.MethodPost, "/v1/agent/register",
@@ -104,7 +104,7 @@ func TestAppV23RejectedPendingAgentSignedRetryReentersReview(t *testing.T) {
 		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"RETRY","height":"3"}}`)
 	}))
 	defer rpc.Close()
-	srv.cometbftRPC = rpc.URL
+	srv.cometbftRPC = strictCometFixtureProxy(t, rpc.URL)
 
 	req := httptest.NewRequest(
 		http.MethodPost, "/v1/agent/register",

@@ -100,20 +100,19 @@ Use this to work out how far your chain has to climb.
 **The honest claim, and the only one to make:** same-key nonce inversion —
 allocating a nonce, losing the RPC response, and letting a later nonce overtake
 the in-flight transaction into a Code 4 "nonce too low" rejection — is
-**eliminated within a running process for every `web/` dashboard producer**.
-Every dashboard producer that signs with a shared key now allocates and submits
-under a per-key lease, and a submission whose outcome this process never
-observed closes that key until the exact transaction is proven committed or
-proven permanently refused.
+**eliminated within a running daemon process for every shared-key producer**.
+The dashboard, REST API, federation manager, voter, and upgrade watchdog now
+allocate and submit under the same per-key lease, and a submission whose outcome
+this process never observed closes that key until the exact transaction is
+proven committed or proven permanently refused.
 
-**Scope caveat — the remaining producers.** The `api/rest`, federation, voter
-and upgrade-watchdog producers still allocate nonces outside the lease; they are
-converted in the companion non-web adoption change. They share the node signing
-key with the dashboard, and a single unleased producer reopens the race for that
-key no matter how careful the others are — so the whole-process elimination
-claim holds for a key **only once both changes are in the running binary**. Ship
-them together; until then the claim above is scoped to the dashboard's own
-producers.
+**Process-boundary caveat.** A standalone `sage-gui` CLI invocation is a
+different process. Its own submissions use the same safe lease and strict
+Comet verdict decoder, but that in-memory lease cannot observe a concurrently
+running daemon's fence. Do not run standalone signing commands concurrently
+with a daemon that uses the same private key. Cross-process coordination needs
+the same durable pre-broadcast intent described below and is not in this
+release.
 
 **Cross-restart and crash exposure remain.** The fence is in memory only. A
 crash, a `kill -9`, or a power cut while a transaction's fate is unresolved still

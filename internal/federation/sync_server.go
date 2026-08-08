@@ -855,7 +855,7 @@ func (m *Manager) broadcastSyncSubmit(localID string, item *SyncItem) (string, s
 			if buildErr != nil {
 				return fmt.Errorf("build sync submit tx: %w", buildErr)
 			}
-			hash, _, broadcastErr := m.broadcastTxCommitContext(leaseCtx, encoded)
+			hash, _, broadcastErr := m.broadcastTxCommitContext(leaseCtx, signingKey, encoded)
 			outcome := classifySyncBroadcast(broadcastErr)
 			if outcome == syncBcastNonceRace && attempt == 0 {
 				continue

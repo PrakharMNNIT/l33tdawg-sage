@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ type scriptedComet struct {
 }
 
 func (f *scriptedComet) handler() http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		n := int(f.calls.Add(1)) - 1
 		if n >= len(f.responses) {
 			n = len(f.responses) - 1
@@ -43,7 +44,22 @@ func (f *scriptedComet) handler() http.HandlerFunc {
 		if f.after != nil {
 			f.after()
 		}
-		_, _ = w.Write([]byte(f.responses[n]))
+		body := []byte(f.responses[n])
+		var envelope map[string]any
+		if json.Unmarshal(body, &envelope) == nil {
+			if result, ok := envelope["result"].(map[string]any); ok {
+				raw, decErr := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+				if decErr == nil {
+					sum := tx.CometTxHash(raw)
+					result["hash"] = strings.ToUpper(hex.EncodeToString(sum[:]))
+					if _, exists := result["height"]; !exists {
+						result["height"] = "7"
+					}
+					body, _ = json.Marshal(envelope)
+				}
+			}
+		}
+		_, _ = w.Write(body)
 	}
 }
 

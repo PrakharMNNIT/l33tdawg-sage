@@ -74,7 +74,7 @@ func TestAppV23RotatedRootPassesRESTControlHandlersWithoutSyntheticMembership(t 
 		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"CONTROL","height":"3"}}`)
 	}))
 	defer rpc.Close()
-	srv.cometbftRPC = rpc.URL
+	srv.cometbftRPC = strictCometFixtureProxy(t, rpc.URL)
 
 	orgReq := appV23RESTRequest(
 		http.MethodPost, "/v1/org/register", newRootID,

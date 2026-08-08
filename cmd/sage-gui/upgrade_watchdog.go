@@ -365,7 +365,7 @@ func proposeForAutoAdvance(ctx context.Context, cfg upgradeWatchdogConfig, targe
 		if encodeErr != nil {
 			return fmt.Errorf("encode propose tx: %w", encodeErr)
 		}
-		res, buildErr = broadcastTxCommit(ctx, cfg.CometRPC, encoded)
+		res, buildErr = broadcastTxCommitWithSigner(ctx, cfg.CometRPC, signingKey, encoded)
 		return buildErr
 	})
 	if err != nil {
@@ -467,7 +467,7 @@ func ensureOperatorAdminRegistered(ctx context.Context, cfg upgradeWatchdogConfi
 		if buildErr != nil {
 			return fmt.Errorf("build admin register tx: %w", buildErr)
 		}
-		res, buildErr = broadcastTxCommit(ctx, cfg.CometRPC, encoded)
+		res, buildErr = broadcastTxCommitWithSigner(ctx, cfg.CometRPC, signingKey, encoded)
 		return buildErr
 	})
 	if err != nil {
@@ -490,7 +490,7 @@ func sendHeartbeatTx(ctx context.Context, cfg upgradeWatchdogConfig) {
 		if buildErr != nil {
 			return buildErr
 		}
-		_, buildErr = broadcastTxSync(ctx, cfg.CometRPC, encoded)
+		_, buildErr = broadcastTxSync(ctx, cfg.CometRPC, signingKey, encoded)
 		return buildErr
 	})
 }
@@ -627,7 +627,7 @@ func maybeProposeUpgrade(ctx context.Context, cfg upgradeWatchdogConfig) bool {
 		if encodeErr != nil {
 			return fmt.Errorf("encode propose tx: %w", encodeErr)
 		}
-		res, buildErr = broadcastTxSync(ctx, cfg.CometRPC, encoded)
+		res, buildErr = broadcastTxSync(ctx, cfg.CometRPC, signingKey, encoded)
 		return buildErr
 	})
 	if err != nil {
@@ -903,40 +903,15 @@ func readCometChainID(ctx context.Context, cometRPC string) (string, error) {
 // watchdog doesn't need to block waiting for FinalizeBlock; subsequent
 // ticks pick up state). Returns CheckTx code so the caller can
 // distinguish "already pending" from genuine failures.
-func broadcastTxSync(ctx context.Context, cometRPC string, txBytes []byte) (*broadcastSyncResp, error) {
-	url := fmt.Sprintf("%s/broadcast_tx_sync?tx=0x%s", strings.TrimRight(cometRPC, "/"), hex.EncodeToString(txBytes))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func broadcastTxSync(ctx context.Context, cometRPC string, signingKey ed25519.PrivateKey, txBytes []byte) (*broadcastSyncResp, error) {
+	out, err := tx.BroadcastCometSync(ctx, cometRPC, signingKey, txBytes)
 	if err != nil {
 		return nil, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("broadcast_tx_sync: HTTP %d", resp.StatusCode)
-	}
-	var out struct {
-		Result struct {
-			Code int    `json:"code"`
-			Hash string `json:"hash"`
-			Log  string `json:"log"`
-		} `json:"result"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("decode broadcast: %w", err)
-	}
-	if out.Error != nil {
-		return nil, fmt.Errorf("rpc error: %s", out.Error.Message)
 	}
 	return &broadcastSyncResp{
-		Hash:        out.Result.Hash,
-		CheckTxCode: uint32(out.Result.Code), // #nosec G115 -- CheckTx code fits uint32
-		CheckTxLog:  out.Result.Log,
+		Hash:        out.Hash,
+		CheckTxCode: out.CheckTxCode,
+		CheckTxLog:  out.CheckTxLog,
 	}, nil
 }
 
@@ -963,60 +938,20 @@ type broadcastCommitResp struct {
 // deliberately uses the non-blocking sync variant; this is for the one-shot
 // operator command where the real outcome matters.
 func broadcastTxCommit(ctx context.Context, cometRPC string, txBytes []byte) (*broadcastCommitResp, error) {
-	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", strings.TrimRight(cometRPC, "/"), hex.EncodeToString(txBytes))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	return broadcastTxCommitWithSigner(ctx, cometRPC, nil, txBytes)
+}
+
+func broadcastTxCommitWithSigner(ctx context.Context, cometRPC string, signingKey ed25519.PrivateKey, txBytes []byte) (*broadcastCommitResp, error) {
+	out, err := tx.BroadcastCometCommit(ctx, cometRPC, signingKey, txBytes)
 	if err != nil {
 		return nil, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("broadcast_tx_commit: HTTP %d", resp.StatusCode)
-	}
-	var out struct {
-		Result struct {
-			Hash    string `json:"hash"`
-			Height  string `json:"height"` // CometBFT serializes int64 as a string
-			CheckTx struct {
-				Code uint32 `json:"code"`
-				Log  string `json:"log"`
-			} `json:"check_tx"`
-			TxResult struct {
-				Code uint32 `json:"code"`
-				Log  string `json:"log"`
-			} `json:"tx_result"`
-		} `json:"result"`
-		Error *struct {
-			Message string `json:"message"`
-			Data    string `json:"data"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("decode broadcast_tx_commit: %w", err)
-	}
-	if out.Error != nil {
-		// CometBFT returns an RPC error if the tx isn't committed within its
-		// broadcast-commit timeout; the tx may still land in a later block.
-		if out.Error.Data != "" {
-			return nil, fmt.Errorf("rpc error: %s (%s)", out.Error.Message, out.Error.Data)
-		}
-		return nil, fmt.Errorf("rpc error: %s", out.Error.Message)
-	}
-	var height int64
-	if out.Result.Height != "" {
-		if _, err := fmt.Sscanf(out.Result.Height, "%d", &height); err != nil {
-			height = 0
-		}
 	}
 	return &broadcastCommitResp{
-		Hash:         out.Result.Hash,
-		Height:       height,
-		CheckTxCode:  out.Result.CheckTx.Code,
-		CheckTxLog:   out.Result.CheckTx.Log,
-		TxResultCode: out.Result.TxResult.Code,
-		TxResultLog:  out.Result.TxResult.Log,
+		Hash:         out.Hash,
+		Height:       out.Height,
+		CheckTxCode:  out.CheckTxCode,
+		CheckTxLog:   out.CheckTxLog,
+		TxResultCode: out.TxResultCode,
+		TxResultLog:  out.TxResultLog,
 	}, nil
 }

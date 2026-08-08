@@ -181,12 +181,12 @@ uncomfortable half, so this document cannot quietly stop being true.
 ### The honest scope claim
 
 > Same-key nonce inversion is eliminated **within a running process, for every
-> producer that goes through the lease** — today that is every `web/` dashboard
-> producer; the `api/rest`, federation, voter and watchdog producers convert in
-> the companion change, and a key is only fully covered once **both** are in the
-> running binary (see "Every adopter sharing a signing key must fence" below).
-> Cross-restart and crash exposure remain until durable pre-broadcast intent
-> lands.
+> producer that goes through the lease**. In the daemon that includes the
+> dashboard, `api/rest`, federation, voter, and upgrade-watchdog producers. A
+> standalone CLI is a separate process: its lease protects its own work but
+> cannot coordinate with a concurrently running daemon using the same key.
+> Cross-process, cross-restart, and crash exposure remain until durable
+> pre-broadcast intent lands.
 
 Any stronger claim (lifecycle-wide elimination, "restart to recover") is wrong.
 

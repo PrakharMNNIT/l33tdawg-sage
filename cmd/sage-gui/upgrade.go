@@ -308,7 +308,7 @@ func runUpgradePropose(args []string) error {
 		if encodeErr != nil {
 			return fmt.Errorf("encode upgrade propose tx: %w", encodeErr)
 		}
-		res, buildErr = broadcastTxCommit(bcastCtx, *rpc, encoded)
+		res, buildErr = broadcastTxCommitWithSigner(bcastCtx, *rpc, key, encoded)
 		if buildErr == nil {
 			return nil
 		}
@@ -320,7 +320,7 @@ func runUpgradePropose(args []string) error {
 		// pending". Disambiguate by re-broadcasting the identical tx once while
 		// still holding the nonce lease. Inconclusive returns the original error.
 		logger.Warn().Err(buildErr).Msg("broadcast errored — probing whether the proposal landed anyway")
-		retryRes, landed := retryProposeAfterBroadcastError(*rpc, encoded)
+		retryRes, landed := retryProposeAfterBroadcastError(*rpc, key, encoded)
 		if retryRes == nil && !landed {
 			return fmt.Errorf("broadcast: %w\n(if the commit timed out the proposal may still land — re-check with: sage-gui upgrade status)", buildErr)
 		}
@@ -461,11 +461,11 @@ var proposeBroadcastRetryDelay = 3 * time.Second
 // window, making "already pending" theirs not ours — acceptable, since the
 // operator's intent (a plan for the next sequential fork is pending) holds
 // either way and `upgrade status` shows the truth.
-func retryProposeAfterBroadcastError(rpc string, encoded []byte) (res *broadcastCommitResp, landedAlreadyPending bool) {
+func retryProposeAfterBroadcastError(rpc string, key ed25519.PrivateKey, encoded []byte) (res *broadcastCommitResp, landedAlreadyPending bool) {
 	time.Sleep(proposeBroadcastRetryDelay)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	r, err := broadcastTxCommit(ctx, rpc, encoded)
+	r, err := broadcastTxCommitWithSigner(ctx, rpc, key, encoded)
 	if err != nil {
 		return nil, false
 	}

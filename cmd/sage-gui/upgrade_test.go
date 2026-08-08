@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -248,15 +249,17 @@ func TestUpgradePropose_AgentKey(t *testing.T) {
 	})
 	mux.HandleFunc("/broadcast_tx_commit", func(w http.ResponseWriter, r *http.Request) {
 		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
-		if decoded, decErr := hex.DecodeString(raw); decErr == nil {
+		decoded, decErr := hex.DecodeString(raw)
+		if decErr == nil {
 			if ptx, txErr := tx.DecodeTx(decoded); txErr == nil {
 				signedPub <- ed25519.PublicKey(ptx.PublicKey)
 			}
 		}
+		hash := sha256.Sum256(decoded)
 		// CheckTx admits it; the admin-gate rejection is a FinalizeBlock result.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"result": map[string]any{
-				"hash":      "DEAD",
+				"hash":      strings.ToUpper(hex.EncodeToString(hash[:])),
 				"height":    "10",
 				"check_tx":  map[string]any{"code": 0},
 				"tx_result": map[string]any{"code": 47, "log": "upgrade propose: under app-v8 only admin agents may propose upgrades"},
@@ -516,6 +519,16 @@ func proposeRetryTestServer(t *testing.T, handlers ...http.HandlerFunc) (*httpte
 	return srv, &calls
 }
 
+func requestTxHash(t *testing.T, r *http.Request) string {
+	t.Helper()
+	raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+	if err != nil {
+		t.Fatalf("decode submitted transaction: %v", err)
+	}
+	hash := sha256.Sum256(raw)
+	return strings.ToUpper(hex.EncodeToString(hash[:]))
+}
+
 func broadcastHTTP500(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusInternalServerError)
 }
@@ -529,10 +542,10 @@ func TestUpgradePropose_BroadcastErrorButLanded(t *testing.T) {
 	shrinkProposeRetryDelay(t)
 	srv, calls := proposeRetryTestServer(t,
 		broadcastHTTP500,
-		func(w http.ResponseWriter, _ *http.Request) {
+		func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"result": map[string]any{
-					"hash":      "RETRY",
+					"hash":      requestTxHash(t, r),
 					"height":    "12",
 					"check_tx":  map[string]any{"code": 0},
 					"tx_result": map[string]any{"code": 47, "log": "upgrade plan already pending"},
@@ -568,12 +581,14 @@ func TestUpgradePropose_BroadcastErrorButLanded(t *testing.T) {
 // probe's height/hash.
 func TestUpgradePropose_BroadcastErrorRetryCommitsClean(t *testing.T) {
 	shrinkProposeRetryDelay(t)
+	var retryHash string
 	srv, calls := proposeRetryTestServer(t,
 		broadcastHTTP500,
-		func(w http.ResponseWriter, _ *http.Request) {
+		func(w http.ResponseWriter, r *http.Request) {
+			retryHash = requestTxHash(t, r)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"result": map[string]any{
-					"hash":      "CAFE",
+					"hash":      retryHash,
 					"height":    "33",
 					"check_tx":  map[string]any{"code": 0},
 					"tx_result": map[string]any{"code": 0},
@@ -592,7 +607,7 @@ func TestUpgradePropose_BroadcastErrorRetryCommitsClean(t *testing.T) {
 	if *calls != 2 {
 		t.Errorf("broadcast_tx_commit called %d times, want 2", *calls)
 	}
-	if !strings.Contains(out, "accepted at height 33") || !strings.Contains(out, "CAFE") {
+	if !strings.Contains(out, "accepted at height 33") || !strings.Contains(out, retryHash) {
 		t.Errorf("clean retry should report the probe's height/hash; output:\n%s", out)
 	}
 }
@@ -611,7 +626,7 @@ func TestUpgradePropose_BroadcastErrorInconclusive(t *testing.T) {
 	if *calls != 2 {
 		t.Errorf("broadcast_tx_commit called %d times, want 2 (original + one probe, never more)", *calls)
 	}
-	if !strings.Contains(err.Error(), "broadcast:") || !strings.Contains(err.Error(), "HTTP 500") {
+	if !strings.Contains(err.Error(), "broadcast:") || !strings.Contains(err.Error(), "500 Internal Server Error") {
 		t.Errorf("error should carry the original broadcast failure; got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "sage-gui upgrade status") {
@@ -626,10 +641,10 @@ func TestUpgradePropose_BroadcastErrorRetryOtherRejection(t *testing.T) {
 	shrinkProposeRetryDelay(t)
 	srv, _ := proposeRetryTestServer(t,
 		broadcastHTTP500,
-		func(w http.ResponseWriter, _ *http.Request) {
+		func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"result": map[string]any{
-					"hash":      "NOPE",
+					"hash":      requestTxHash(t, r),
 					"height":    "9",
 					"check_tx":  map[string]any{"code": 0},
 					"tx_result": map[string]any{"code": 47, "log": "upgrade propose: under app-v8 only admin agents may propose upgrades"},
@@ -642,7 +657,7 @@ func TestUpgradePropose_BroadcastErrorRetryOtherRejection(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the original broadcast error to surface, got nil")
 	}
-	if !strings.Contains(err.Error(), "HTTP 500") {
+	if !strings.Contains(err.Error(), "500 Internal Server Error") {
 		t.Errorf("error should be the original broadcast failure, not the probe rejection; got: %v", err)
 	}
 }
@@ -655,11 +670,14 @@ func TestUpgradePropose_BroadcastErrorRetryOtherRejection(t *testing.T) {
 // command would print a false ✓; commit must expose tx_result so it's reported
 // as a failure.
 func TestBroadcastTxCommit_SurfacesBlockExecutionResult(t *testing.T) {
+	txBytes := []byte{0x01, 0x02}
+	sum := tx.CometTxHash(txBytes)
+	wantHash := strings.ToUpper(hex.EncodeToString(sum[:]))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/broadcast_tx_commit", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"result": map[string]any{
-				"hash":      "ABC123",
+				"hash":      wantHash,
 				"height":    "4242",
 				"check_tx":  map[string]any{"code": 0, "log": ""},
 				"tx_result": map[string]any{"code": 47, "log": "upgrade plan already pending"},
@@ -669,7 +687,7 @@ func TestBroadcastTxCommit_SurfacesBlockExecutionResult(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	res, err := broadcastTxCommit(context.Background(), srv.URL, []byte{0x01, 0x02})
+	res, err := broadcastTxCommit(context.Background(), srv.URL, txBytes)
 	if err != nil {
 		t.Fatalf("broadcastTxCommit: %v", err)
 	}
@@ -685,19 +703,22 @@ func TestBroadcastTxCommit_SurfacesBlockExecutionResult(t *testing.T) {
 	if res.Height != 4242 {
 		t.Errorf("Height = %d, want 4242", res.Height)
 	}
-	if res.Hash != "ABC123" {
-		t.Errorf("Hash = %q, want ABC123", res.Hash)
+	if res.Hash != wantHash {
+		t.Errorf("Hash = %q, want %s", res.Hash, wantHash)
 	}
 }
 
 // TestBroadcastTxCommit_Success confirms the happy path: both CheckTx and the
 // block-execution result are Code 0.
 func TestBroadcastTxCommit_Success(t *testing.T) {
+	txBytes := []byte{0xaa}
+	sum := tx.CometTxHash(txBytes)
+	wantHash := strings.ToUpper(hex.EncodeToString(sum[:]))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/broadcast_tx_commit", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"result": map[string]any{
-				"hash":      "FEED",
+				"hash":      wantHash,
 				"height":    "100",
 				"check_tx":  map[string]any{"code": 0},
 				"tx_result": map[string]any{"code": 0},
@@ -707,7 +728,7 @@ func TestBroadcastTxCommit_Success(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	res, err := broadcastTxCommit(context.Background(), srv.URL, []byte{0xaa})
+	res, err := broadcastTxCommit(context.Background(), srv.URL, txBytes)
 	if err != nil {
 		t.Fatalf("broadcastTxCommit: %v", err)
 	}

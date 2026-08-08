@@ -279,7 +279,9 @@ func TestGovernanceOperatorReceivesCommittedProposalIDAndReusesIt(t *testing.T) 
 		"validator-a",
 	)
 	assert.Equal(t, wantProposalID, proposed.ProposalID)
-	assert.Equal(t, "TXHASH1", proposed.TxHash)
+	assert.Len(t, proposed.TxHash, 64)
+	_, err = hex.DecodeString(proposed.TxHash)
+	require.NoError(t, err)
 	assert.NotEqual(t, proposed.TxHash, proposed.ProposalID)
 	assert.Equal(t, string(governance.StatusExecuted), proposed.Status, "status must come from committed state, not a hard-coded voting value")
 

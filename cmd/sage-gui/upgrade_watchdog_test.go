@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -59,6 +60,12 @@ func newFakeCometRPC(t *testing.T) *fakeCometRPC {
 		}
 		txHex := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
 		f.lastTxHex.Store(&txHex)
+		raw, err := hex.DecodeString(txHex)
+		if err != nil {
+			http.Error(w, "invalid transaction", http.StatusBadRequest)
+			return
+		}
+		hash := sha256.Sum256(raw)
 		logStr := ""
 		if p := f.broadcastLog.Load(); p != nil {
 			logStr = *p
@@ -66,7 +73,7 @@ func newFakeCometRPC(t *testing.T) *fakeCometRPC {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"result": map[string]any{
 				"code": int(code),
-				"hash": "DEADBEEF",
+				"hash": fmt.Sprintf("%X", hash),
 				"log":  logStr,
 			},
 		})
@@ -252,8 +259,9 @@ func TestUpgradeWatchdogSameKeyProducersSerializeThroughRPC(t *testing.T) {
 		case 2:
 			close(secondEntered)
 		}
+		hash := sha256.Sum256(raw)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{"code": 0, "hash": "AB", "log": ""},
+			"result": map[string]any{"code": 0, "hash": fmt.Sprintf("%X", hash), "log": ""},
 		})
 	})
 	server := httptest.NewServer(mux)

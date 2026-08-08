@@ -126,14 +126,16 @@ func TestEmitFenceEvent_ControlCharactersCannotForgeLogLines(t *testing.T) {
 // runes, with no exceptions (extending a character set is how this exact bug
 // shipped twice).
 func TestScrubFenceText_StripsEveryControlRune(t *testing.T) {
-	in := "line1" + hostileControls + "line2\tline3\nline4"
+	in := "line1" + hostileControls + "line2\tline3\nline4\u202efile5\u2066line6"
 	got := scrubFenceText(in, nil)
-	if strings.ContainsFunc(got, unicode.IsControl) {
-		t.Fatalf("scrubFenceText let control runes through: %q", got)
+	if strings.ContainsFunc(got, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+	}) {
+		t.Fatalf("scrubFenceText let control or Unicode format runes through: %q", got)
 	}
 	// The readable content must survive: scrubbing by deletion of everything
 	// would be indistinguishable from an empty diagnostic.
-	for _, want := range []string{"line1", "line2", "line3", "line4"} {
+	for _, want := range []string{"line1", "line2", "line3", "line4", "file5", "line6"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("scrubFenceText destroyed readable content %q: %q", want, got)
 		}
