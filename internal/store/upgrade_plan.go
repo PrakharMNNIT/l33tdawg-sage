@@ -19,14 +19,16 @@ import (
 // fine; renames break old reads. ProposedAt + ProposerID are tracked
 // for audit/replay, not consensus.
 type UpgradePlanRecord struct {
-	Name             string `json:"name"`
-	TargetAppVersion uint64 `json:"target_app_version"`
-	ActivationHeight int64  `json:"activation_height"`
-	BinarySHA256     string `json:"binary_sha256,omitempty"`
-	GovernanceDomain string `json:"governance_domain,omitempty"`
-	LineageRepair    string `json:"lineage_repair,omitempty"`
-	ProposedAt       int64  `json:"proposed_at"`
-	ProposerID       string `json:"proposer_id"`
+	Name                  string `json:"name"`
+	TargetAppVersion      uint64 `json:"target_app_version"`
+	ActivationHeight      int64  `json:"activation_height"`
+	BinarySHA256          string `json:"binary_sha256,omitempty"`
+	GovernanceDomain      string `json:"governance_domain,omitempty"`
+	LineageRepair         string `json:"lineage_repair,omitempty"`
+	LineageProposalID     string `json:"lineage_proposal_id,omitempty"`
+	LineageApprovedHeight int64  `json:"lineage_approved_height,omitempty"`
+	ProposedAt            int64  `json:"proposed_at"`
+	ProposerID            string `json:"proposer_id"`
 }
 
 // AppliedUpgradeRecord captures the moment an upgrade landed. Stored

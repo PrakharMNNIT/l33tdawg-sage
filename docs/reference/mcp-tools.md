@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.18.0.
+Reconciled against internal/mcp for SAGE v11.18.1.
 
 # SAGE MCP Tools Reference
 
@@ -122,8 +122,14 @@ uses the CEREBRUM operator-only `/v1/dashboard/stats` surface.
 `POST /v1/memory/submit`
 
 **When to call:** First action of every new conversation. No exceptions —
-not even for greetings. The server also runs auto-inception silently on the
-first non-inception tool call if the brain is empty (`server.go:239-248`).
+not even for greetings. Since v11.18.1, a compliant MCP session runs the
+adaptive auto-inception standing once during `initialize` and returns it in
+`initialize.instructions`; the first tool result is not padded with that
+preamble. Repeated or concurrent initialization in one transport session
+reuses the cached standing without repeating registration or memory reads. A
+client that skips `initialize` retains the historical one-time fallback on its
+first non-inception tool call. An explicit first `sage_inception` call suppresses
+that fallback because the tool itself returns the standing.
 
 ---
 

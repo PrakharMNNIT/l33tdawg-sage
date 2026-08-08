@@ -51,6 +51,34 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.1
+
+**MCP session guidance now uses the protocol surface intended for it.** SAGE
+runs its per-session boot standing during `initialize` and returns the adaptive
+full, bookend, on-demand, pending-review, or unavailable guidance through
+`initialize.instructions`. The first real tool result is therefore only that
+tool's payload instead of being prefixed with a 1.5–2.9 KB auto-connect block.
+Repeated or concurrent initialization in one transport session reuses the same
+standing without duplicating signed registration or caller-scoped reads.
+Clients that skip the MCP initialization handshake keep the one-time first-tool
+fallback for compatibility.
+
+**Legacy-lineage recovery now represents real skip-ahead history truthfully.**
+When retained Comet history proves a version jump such as `1→7` or `8→11`, the
+app-v21 doctor emits a v2 transition claim at the real activation height and
+records the skipped predecessors as virtual, subsumed coverage. It never
+invents interleaved heights or writes synthetic `upgrade:applied:*` records.
+Every validator independently replays the retained history and hashes before
+an explicit vote, and the immutable audit is installed atomically only when
+app-v22 activates. Existing valid v1 receipts on already-upgraded app-v22+
+chains remain readable; new v1 repair proposals fail closed.
+
+The lineage change is confined to the exceptional app-v21 → app-v22 recovery
+ceremony. Memory, agent, RBAC, and federation policy are unchanged; **app-v26
+remains the binary ceiling and v11.18.1 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.1`. SDK 11.18.1.
+
 ## What's New in v11.18.0
 
 **A connected pair is now the federation group users expect it to be.** Each
@@ -1435,7 +1463,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.0`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.1`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

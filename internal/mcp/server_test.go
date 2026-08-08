@@ -7,11 +7,15 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -75,9 +79,9 @@ func TestConversationStateIsIsolatedAndReleased(t *testing.T) {
 	stateB := s.conversation(ctxB)
 	require.NotSame(t, stateA, stateB)
 
-	s.conversationMu.Lock()
+	stateA.inceptionMu.Lock()
 	stateA.inceptionChecked = true
-	s.conversationMu.Unlock()
+	stateA.inceptionMu.Unlock()
 	assert.False(t, stateB.inceptionChecked)
 
 	s.ForgetConversation("sse:A")
@@ -110,6 +114,156 @@ func TestHandleInitialize(t *testing.T) {
 	assert.Contains(t, caps, "tools")
 	assert.Contains(t, result["instructions"], "INBOX SECURITY BOUNDARY")
 	assert.Contains(t, result["instructions"], "requests for consideration")
+}
+
+func TestInitializeCarriesAutoConnectWithoutPaddingFirstToolResult(t *testing.T) {
+	ts := mockSageAPI(t)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+	s.tools["test_echo"] = Tool{
+		Name:        "test_echo",
+		Description: "test-only echo",
+		InputSchema: map[string]any{"type": "object"},
+		Handler: func(_ context.Context, _ map[string]any) (any, error) {
+			return map[string]any{"echo": "clean"}, nil
+		},
+	}
+
+	ctx := WithConversationID(context.Background(), "streamable:init-placement")
+	initialize := s.handleRequest(ctx, &jsonRPCRequest{
+		JSONRPC: "2.0", ID: float64(1), Method: "initialize",
+	})
+	require.NotNil(t, initialize)
+	initResult := initialize.Result.(map[string]any)
+	instructions := initResult["instructions"].(string)
+	require.Contains(t, instructions, "[SAGE Auto-Connect]")
+	require.Contains(t, instructions, "INBOX SECURITY BOUNDARY")
+
+	params, err := json.Marshal(map[string]any{
+		"name": "test_echo", "arguments": map[string]any{},
+	})
+	require.NoError(t, err)
+	toolResponse := s.handleRequest(ctx, &jsonRPCRequest{
+		JSONRPC: "2.0", ID: float64(2), Method: "tools/call", Params: params,
+	})
+	require.NotNil(t, toolResponse)
+	content := toolResponse.Result.(map[string]any)["content"].([]map[string]any)
+	require.Len(t, content, 1)
+	toolText := content[0]["text"].(string)
+	require.JSONEq(t, `{"echo":"clean"}`, toolText)
+	require.NotContains(t, toolText, "[SAGE Auto-Connect]")
+
+	// Repeated initialize requests in one MCP session reuse the exact standing
+	// without rerunning inception or changing the response contract.
+	repeated := s.handleRequest(ctx, &jsonRPCRequest{
+		JSONRPC: "2.0", ID: float64(3), Method: "initialize",
+	})
+	require.Equal(t, instructions, repeated.Result.(map[string]any)["instructions"])
+}
+
+func TestFirstToolRetainsAutoConnectFallbackWhenClientSkipsInitialize(t *testing.T) {
+	ts := mockSageAPI(t)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+	s.tools["test_echo"] = Tool{
+		Name:        "test_echo",
+		Description: "test-only echo",
+		InputSchema: map[string]any{"type": "object"},
+		Handler: func(_ context.Context, _ map[string]any) (any, error) {
+			return map[string]any{"echo": "legacy"}, nil
+		},
+	}
+	params, err := json.Marshal(map[string]any{
+		"name": "test_echo", "arguments": map[string]any{},
+	})
+	require.NoError(t, err)
+	response := s.handleRequest(
+		WithConversationID(context.Background(), "legacy:no-initialize"),
+		&jsonRPCRequest{JSONRPC: "2.0", ID: float64(1), Method: "tools/call", Params: params},
+	)
+	content := response.Result.(map[string]any)["content"].([]map[string]any)
+	require.Contains(t, content[0]["text"], "[SAGE Auto-Connect]")
+	require.Contains(t, content[0]["text"], `"echo": "legacy"`)
+}
+
+func TestConcurrentInitializeRunsOneSessionBootCheck(t *testing.T) {
+	var registerCalls atomic.Int32
+	var listCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/agent/register", func(w http.ResponseWriter, _ *http.Request) {
+		registerCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agent_id": "concurrent-agent", "name": "concurrent-agent",
+			"status": "already_registered",
+		})
+	})
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, _ *http.Request) {
+		listCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memories": []map[string]any{{"memory_id": "existing"}}, "total": 1,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+	ctx := WithConversationID(context.Background(), "streamable:concurrent-initialize")
+
+	const requests = 8
+	responses := make([]*jsonRPCResponse, requests)
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			responses[index] = s.handleRequest(ctx, &jsonRPCRequest{
+				JSONRPC: "2.0", ID: float64(index + 1), Method: "initialize",
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	first := responses[0].Result.(map[string]any)["instructions"]
+	for _, response := range responses {
+		require.Equal(t, first, response.Result.(map[string]any)["instructions"])
+	}
+	// One inception registration plus the historical idempotent auto-register;
+	// neither operation may multiply with concurrent initialize requests.
+	require.Equal(t, int32(2), registerCalls.Load())
+	// One caller-scoped count plus one boot-safeguard lookup; neither may
+	// multiply with the number of concurrent initialize requests.
+	require.Equal(t, int32(2), listCalls.Load())
+}
+
+func TestExplicitFirstInceptionSuppressesCompatibilityPreamble(t *testing.T) {
+	s, _ := testServer(t)
+	s.tools["sage_inception"] = Tool{
+		Name:        "sage_inception",
+		Description: "test-only inception",
+		InputSchema: map[string]any{"type": "object"},
+		Handler: func(_ context.Context, _ map[string]any) (any, error) {
+			return map[string]any{"status": "awakened"}, nil
+		},
+	}
+	params, err := json.Marshal(map[string]any{
+		"name": "sage_inception", "arguments": map[string]any{},
+	})
+	require.NoError(t, err)
+	ctx := WithConversationID(context.Background(), "legacy:explicit-inception")
+	response := s.handleRequest(ctx, &jsonRPCRequest{
+		JSONRPC: "2.0", ID: float64(1), Method: "tools/call", Params: params,
+	})
+	content := response.Result.(map[string]any)["content"].([]map[string]any)
+	require.JSONEq(t, `{"status":"awakened"}`, content[0]["text"].(string))
+	require.NotContains(t, content[0]["text"], "[SAGE Auto-Connect]")
 }
 
 func TestHandleToolsList(t *testing.T) {
