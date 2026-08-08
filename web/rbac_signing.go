@@ -221,31 +221,70 @@ func (h *DashboardHandler) signAndBroadcastCommit(ptx *tx.ParsedTx, key ed25519.
 	return h.signAndBroadcastCommitContext(context.Background(), ptx, key)
 }
 
-func (h *DashboardHandler) signAndBroadcastCommitContext(ctx context.Context, ptx *tx.ParsedTx, key ed25519.PrivateKey) (hash string, height int64, txLog string, err error) {
-	ptx.Nonce = tx.MonotonicNonce(key)
-	if ptx.Timestamp.IsZero() {
-		ptx.Timestamp = time.Now()
+// signAndBroadcastCommitContext runs the whole stamp -> sign -> encode ->
+// broadcast sequence inside a per-signing-key nonce lease.
+//
+// The lease is load-bearing, not defensive. Every dashboard fan-out that
+// mutates several records at once (clearing a Done/Dropped board column,
+// bulk-forgetting selected memories) issues N concurrent HTTP requests that all
+// land here with the SAME key. Allocating the nonce and then racing to CometBFT
+// meant those txs could arrive in descending nonce order, and app-v9's replay
+// gate rejects the late-arriving lower nonce with Code 4 "nonce too low" — so a
+// random subset of the batch failed while the rest succeeded. Serializing
+// allocation with submission is what makes the emitted order match the
+// allocated order. Every signAndBroadcastCommit* caller in web/ inherits this.
+//
+// The lease's ordering guarantee holds only because this function does not
+// return until the outcome is definitive: broadcastTxCommitWebContext waits for
+// commit, and an indeterminate transport/RPC fault is classified by
+// isIndeterminateCommitError rather than being reported as a clean failure. A
+// submit that returned early on a timeout would release the lease while its
+// lower nonce was still in flight, letting the next higher nonce overtake it.
+func (h *DashboardHandler) signAndBroadcastCommitContext(ctx context.Context, ptx *tx.ParsedTx, key ed25519.PrivateKey) (string, int64, string, error) {
+	var (
+		hash   string
+		height int64
+		txLog  string
+		txErr  error
+	)
+	leaseErr := tx.WithNonceLease(ctx, key, func(nonce uint64) error {
+		ptx.Nonce = nonce
+		if ptx.Timestamp.IsZero() {
+			ptx.Timestamp = time.Now()
+		}
+		// Direct governance is authorized by the outer operator/validator signature
+		// and deliberately carries no HTTP-agent proof. App-v20+ treats any proof
+		// material on governance as a modern request-bound proof (8-byte request
+		// nonce + canonical request body). The generic legacy dashboard proof lacks
+		// those fields and is therefore correctly rejected. Keep the legacy same-key
+		// proof for non-governance RBAC transactions, whose consensus path still
+		// accepts it.
+		switch ptx.Type {
+		case tx.TxTypeGovPropose, tx.TxTypeGovVote, tx.TxTypeGovCancel:
+		default:
+			embedDashboardAgentProof(ptx, key)
+		}
+		if signErr := tx.SignTx(ptx, key); signErr != nil {
+			txErr = fmt.Errorf("sign tx: %w", signErr)
+			return txErr
+		}
+		encoded, encErr := tx.EncodeTx(ptx)
+		if encErr != nil {
+			txErr = fmt.Errorf("encode tx: %w", encErr)
+			return txErr
+		}
+		hash, height, txLog, txErr = broadcastTxCommitWebContext(ctx, h.CometBFTRPC, encoded)
+		return txErr
+	})
+	// txErr is still nil only when the closure never ran, i.e. the request was
+	// cancelled while queued for the key. Nothing was signed or sent, so this is
+	// a DEFINITIVE "no change" — deliberately not one of
+	// isIndeterminateCommitError's shapes, and worded so it cannot be mistaken
+	// for a consensus rejection.
+	if txErr == nil && leaseErr != nil {
+		return "", 0, "", fmt.Errorf("await signing slot for this key: %w", leaseErr)
 	}
-	// Direct governance is authorized by the outer operator/validator signature
-	// and deliberately carries no HTTP-agent proof. App-v20+ treats any proof
-	// material on governance as a modern request-bound proof (8-byte request
-	// nonce + canonical request body). The generic legacy dashboard proof lacks
-	// those fields and is therefore correctly rejected. Keep the legacy same-key
-	// proof for non-governance RBAC transactions, whose consensus path still
-	// accepts it.
-	switch ptx.Type {
-	case tx.TxTypeGovPropose, tx.TxTypeGovVote, tx.TxTypeGovCancel:
-	default:
-		embedDashboardAgentProof(ptx, key)
-	}
-	if signErr := tx.SignTx(ptx, key); signErr != nil {
-		return "", 0, "", fmt.Errorf("sign tx: %w", signErr)
-	}
-	encoded, encErr := tx.EncodeTx(ptx)
-	if encErr != nil {
-		return "", 0, "", fmt.Errorf("encode tx: %w", encErr)
-	}
-	return broadcastTxCommitWebContext(ctx, h.CometBFTRPC, encoded)
+	return hash, height, txLog, txErr
 }
 
 // isIndeterminateCommitError reports whether a commit-confirmed request could

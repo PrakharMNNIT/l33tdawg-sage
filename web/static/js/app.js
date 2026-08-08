@@ -13,6 +13,7 @@ import { mountMriBrain } from './mri-brain.js';
 import { restartBaselineBootID, requestedRestartIsReady } from './restart-proof.js';
 import { buildUpdateBanner } from './update-banner.js';
 import { computeReorderedColumn, applyColumnOrder } from './task-reorder.js';
+import { runSequential, summarizeClearedTasks, summarizeDroppedTasks, summarizeForgottenMemories } from './bulk-sequence.js';
 import { createFederationJoinScanLifecycle, normalizeFederationJoinState } from './federation-flow.js';
 import { buildBrainDomainInventory } from './domain-inventory.js';
 import { enqueueGovernedTransfer, runWithGovernanceCooldown } from './governance-retry.js';
@@ -3377,30 +3378,26 @@ function TasksPage({ sse }) {
         setClearingColumn(col.key);
         const ids = colTasks.map(t => t.memory_id);
         try {
+            // Both branches submit one id at a time and settle every one. See
+            // bulk-sequence.js for why concurrency here was actively harmful
+            // (same-key nonce ordering) and why partial success has to be
+            // reportable per card.
             if (terminal) {
                 ids.forEach(id => settlingClears.current.add(id));
                 setTasks(prev => prev.filter(t => !ids.includes(t.memory_id)));
-                const results = await Promise.allSettled(ids.map(id => deleteMemory(id)));
-                const rejected = results.filter(result => result.status === 'rejected');
-                const challenges = results.filter(result =>
-                    result.status === 'fulfilled' && result.value && result.value.status === 'challenge_opened');
+                const results = await runSequential(ids, id => deleteMemory(id));
                 const remaining = await reconcileClearedTasks(ids);
-                const resolved = count - remaining.length;
-                if (rejected.length) {
-                    const detail = rejected[0].reason?.message || 'a request was rejected';
-                    showToast(`${resolved} task${resolved === 1 ? '' : 's'} cleared; ${rejected.length} need${rejected.length === 1 ? 's' : ''} attention: ${detail}`, 'error');
-                } else if (challenges.length) {
-                    showToast(`${challenges.length} task${challenges.length === 1 ? ' needs' : 's need'} confirmation from another eligible domain manager before removal.`, 'warning');
-                } else if (remaining.length) {
-                    showToast(`SAGE is still confirming ${remaining.length} task${remaining.length === 1 ? '' : 's'}; the board will keep them visible until confirmation finishes.`, 'warning');
-                } else {
-                    showToast(`Cleared ${count} ${col.label} task${count !== 1 ? 's' : ''}`, 'success');
-                }
+                const outcome = summarizeClearedTasks({ results, remaining, total: count, label: col.label });
+                showToast(outcome.message, outcome.tone);
             } else {
                 ids.forEach(id => movedThisSession.current.add(id));
                 setTasks(prev => prev.map(t => ids.includes(t.memory_id) ? { ...t, task_status: 'dropped' } : t));
-                await Promise.all(ids.map(id => updateTaskStatus(id, 'dropped')));
-                showToast(`Moved ${count} ${col.label} task${count !== 1 ? 's' : ''} to Dropped`, 'success');
+                const results = await runSequential(ids, id => updateTaskStatus(id, 'dropped'));
+                const outcome = summarizeDroppedTasks({ results, total: count, label: col.label });
+                showToast(outcome.message, outcome.tone);
+                // The optimistic rewrite above marked every card dropped. When
+                // some did not move, only a reload tells the operator which.
+                if (outcome.tone !== 'success') loadTasks();
             }
         } catch (e) {
             showToast('Could not clear column: ' + (e.message || 'network error'), 'error');
@@ -3815,8 +3812,11 @@ function SearchPage() {
         if (!ids.length) return;
         setBulkBusy(true);
         try {
-            await fn(ids);
-            showToast(okMsg.replace('%n', ids.length), 'success');
+            // A fan-out that settles every id reports its own partial-success
+            // line; an all-or-nothing call returns nothing and keeps okMsg.
+            const outcome = await fn(ids);
+            if (outcome && outcome.message) showToast(outcome.message, outcome.tone || 'success');
+            else showToast(okMsg.replace('%n', ids.length), 'success');
             clearSelection();
             setBulkDomain(''); setBulkTag('');
             loadMemories(query, agentFilter, domainFilter, tagFilter);
@@ -3840,7 +3840,8 @@ function SearchPage() {
             `Careful: ${factCount} of these ${factCount === 1 ? 'is a durable FACT' : 'are durable FACTS'} (high-confidence, long-term knowledge). Forget ${factCount === 1 ? 'it' : 'them'} anyway?`,
             { title: 'Durable FACT warning', confirmLabel: factCount === 1 ? 'Forget FACT' : 'Forget FACTS', tone: 'danger' }
         )) return;
-        runBulk(idList => Promise.all(idList.map(id => deleteMemory(id))), 'Forgot %n memories');
+        runBulk(async idList => summarizeForgottenMemories(
+            await runSequential(idList, id => deleteMemory(id))), 'Forgot %n memories');
     };
 
     const toggleSelectAll = () => {
