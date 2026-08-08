@@ -1524,11 +1524,11 @@ func (s *Server) handlePipeStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-// pipeResultsPassiveRetryDetail is appended to every non-2xx answer this route
+// pipeResultsRepeatableReadDetail is appended to every non-2xx answer this route
 // produces. Both modes are passive sender projections that write nothing, so a
 // caller may always repeat the read; saying so keeps a transient failure from
 // being mistaken for "no replies exist".
-const pipeResultsPassiveRetryDetail = "This read is passive and safe to repeat; it claims, acknowledges, and re-queues nothing."
+const pipeResultsRepeatableReadDetail = "This read is passive and safe to repeat; it claims, acknowledges, and re-queues nothing."
 
 // writePipeResultsStoreProblem maps a sender-side reply projection failure onto
 // a status a caller can act on. The distinction matters: an empty list means
@@ -1540,7 +1540,7 @@ func writePipeResultsStoreProblem(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrPipelineUnsupported):
 		writeProblem(w, http.StatusNotImplemented, "Reply projection unsupported",
 			"This node's store backend does not implement the sender-side reply projection. "+
-				"This is a capability gap, not evidence that no replies exist. "+pipeResultsPassiveRetryDetail)
+				"This is a capability gap, not evidence that no replies exist. "+pipeResultsRepeatableReadDetail)
 	case errors.Is(err, store.ErrPipeContentUnavailable):
 		writeProblem(w, http.StatusServiceUnavailable, "Reply content unavailable",
 			"Replies are encrypted at rest and this node's content vault is locked. "+
@@ -1549,7 +1549,7 @@ func writePipeResultsStoreProblem(w http.ResponseWriter, err error) {
 		// The raw store error is deliberately not echoed: it can carry
 		// identifiers or SQL text that this sender-exact surface never returns.
 		writeProblem(w, http.StatusInternalServerError, "Results query failed",
-			"The reply projection could not be read. "+pipeResultsPassiveRetryDetail)
+			"The reply projection could not be read. "+pipeResultsRepeatableReadDetail)
 	}
 }
 
@@ -1628,7 +1628,7 @@ func (s *Server) handlePipeResults(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeProblem(w, http.StatusNotImplemented, "Reply projection unsupported",
 			"This node's store backend does not support pipeline operations. "+
-				"This is a capability gap, not evidence that no replies exist. "+pipeResultsPassiveRetryDetail)
+				"This is a capability gap, not evidence that no replies exist. "+pipeResultsRepeatableReadDetail)
 		return
 	}
 
@@ -1639,7 +1639,7 @@ func (s *Server) handlePipeResults(w http.ResponseWriter, r *http.Request) {
 			// has no replies when the node simply cannot count them.
 			writeProblem(w, http.StatusNotImplemented, "Reply count probe unsupported",
 				"This node's store backend cannot count retained replies. "+
-					"This is a capability gap, not a reply count of zero. "+pipeResultsPassiveRetryDetail)
+					"This is a capability gap, not a reply count of zero. "+pipeResultsRepeatableReadDetail)
 			return
 		}
 		summary, err := counter.SummarizeCompletedForSender(r.Context(), agentID)
@@ -1670,7 +1670,7 @@ func (s *Server) handlePipeResults(w http.ResponseWriter, r *http.Request) {
 				"before must be an RFC3339 timestamp, optionally followed by \"|<message_id>\" "+
 					"(for example 2026-08-08T00:05:00Z|msg-aaaa1111). "+
 					"Echo the next_before value from the previous page: a timestamp alone cannot "+
-					"separate replies that share the same millisecond. "+pipeResultsPassiveRetryDetail)
+					"separate replies that share the same millisecond. "+pipeResultsRepeatableReadDetail)
 			return
 		}
 		pager, pagerOK := pipeStore.(store.PipelineReplyPager)
@@ -1680,7 +1680,7 @@ func (s *Server) handlePipeResults(w http.ResponseWriter, r *http.Request) {
 			// silent-zero this route exists to avoid.
 			writeProblem(w, http.StatusNotImplemented, "Reply paging unsupported",
 				"This node's store backend cannot page backward through retained replies. "+
-					"This is a capability gap, not the end of the list. "+pipeResultsPassiveRetryDetail)
+					"This is a capability gap, not the end of the list. "+pipeResultsRepeatableReadDetail)
 			return
 		}
 		items, err = pager.GetCompletedForSenderBefore(r.Context(), agentID, before, beforeID, limit)

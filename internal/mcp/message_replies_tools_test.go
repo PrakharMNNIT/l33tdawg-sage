@@ -750,7 +750,7 @@ func (a *keysetReplyArchive) handler(t *testing.T) http.HandlerFunc {
 			if before != "" {
 				completed := row["completed_at"].(string)
 				id := row["pipe_id"].(string)
-				if !(completed < boundTime || (completed == boundTime && id < boundID)) {
+				if completed > boundTime || (completed == boundTime && id >= boundID) {
 					continue
 				}
 			}
