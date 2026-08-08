@@ -405,7 +405,7 @@ elif [ "$MODE" = full ]; then
     sleep 2
   done
   dc stop node-b >/dev/null
-  offline_payload="v11.18.0 durable offline inbox probe $RUN_TOKEN"
+  offline_payload="v11.18.1 durable offline inbox probe $RUN_TOKEN"
   send_args=$(node -e 'process.stdout.write(JSON.stringify({to:process.argv[1],intent:"acceptance",payload:process.argv[2],idempotency_key:"v111800-offline-probe-"+process.argv[3]}))' "$target" "$offline_payload" "$RUN_TOKEN")
   send_started=$(date +%s)
   sent=$(mcp_call node-a sage_message_send "$send_args")
@@ -427,7 +427,7 @@ elif [ "$MODE" = full ]; then
     i=$((i + 1)); [ "$i" -lt 45 ] || die "offline message did not persist/deliver to restarted inbox"
     sleep 2
   done
-  reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.18.0 acceptance reply"}))' "$received_id")
+  reply_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1],result:"v11.18.1 acceptance reply"}))' "$received_id")
   mcp_call node-b sage_message_reply "$reply_args" >/dev/null
   status_args=$(node -e 'process.stdout.write(JSON.stringify({message_id:process.argv[1]}))' "$message_id")
   i=0

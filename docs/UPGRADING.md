@@ -91,6 +91,7 @@ Use this to work out how far your chain has to climb.
 | v11.16.2 | app-v25 |
 | v11.17.0 | app-v26 |
 | v11.18.0 | no new app version; app-v26 remains the ceiling |
+| v11.18.1 | MCP initialization plus safe schema-v2 skip-ahead lineage recovery; app-v26 remains the ceiling |
 
 A v10.x chain therefore sits somewhere around **app-v11 to app-v14**, and
 current v11 binaries support up to **app-v26**. That is roughly a dozen rungs.
@@ -240,10 +241,13 @@ It answers the one question that is otherwise unanswerable until it is too late:
 ### The predecessor-ladder invariant
 
 app-v22 and app-v23 refuse to be proposed, approved, activated, *or restored*
-unless consensus storage proves the complete predecessor ladder: a canonical
-applied-upgrade record for app-v6, and an individual record for every version
-from app-v7 upward, each with the exact target and a strictly increasing
-activation height. Missing, synthesized, or out-of-order evidence fails closed.
+unless consensus storage proves the complete predecessor ladder. Ordinarily
+that is a canonical applied-upgrade record for app-v6 and every version from
+app-v7 upward. A narrowly governed v2 repair receipt may instead give a missing
+pre-app-v20 rung virtual compatibility coverage from an exact retained Comet
+version jump (or an explicitly acknowledged audited anchor). A skipped rung is
+never rewritten as an independent activation record. Invalid, ambiguous,
+fabricated, or out-of-order evidence fails closed.
 
 (app-v6's record is the single compatibility proof for the historical cumulative
 app-v2 through app-v5 activation. Everything from app-v7 needs its own record.)
@@ -291,9 +295,11 @@ present record, or introduce app-v27.
    sage-gui upgrade lineage doctor --json --manifest-out repair.json
    ```
 
-   `doctor` is read-only. It emits a manifest only when the chain, governance
-   domain, current valid-lineage digest, exact missing set, strictly ordered
-   committed heights, and one evidence mode agree.
+   `doctor` is read-only. It scans the complete retained history of Comet
+   app-version updates. When history says `app-v8 -> app-v11` at height H and
+   the canonical app-v11 record is really at H, it may cover missing app-v9 and
+   app-v10 virtually with that single transition. It does not invent H-1/H-2
+   heights and does not create fake app-v9/app-v10 activations.
 3. Copy only `repair.json` to every validator operator. Each operator verifies
    the exact manifest independently against that validator's own chain and
    retained block results, then compares `manifest_digest` values:
@@ -302,10 +308,16 @@ present record, or introduce app-v27.
    sage-gui upgrade lineage verify --json --manifest repair.json
    ```
 
-   A block hash in the proposal is not self-proving; `verify` must reproduce
-   the app-version update and hash from each validator's retained history.
+   A block hash in the proposal is not self-proving; `verify` reconstructs the
+   full app-version sequence from height 1 through the committed tip, including
+   intermediate transitions that cover no rung, then reproduces every claimed
+   jump, exact skipped-version set, target activation height, and block hash.
 4. If retained history is pruned, use an independently audited anchor containing
-   **every** missing version. Do not mix it with retained-Comet claims. Both
+   **every** missing version. Use `heights` only for genuine independent
+   activations. Represent an actual skip as one `transitions` entry with its
+   source version, target version, actual height, and exact missing open-interval
+   versions; never manufacture separate H-1/H-2 heights. Do not mix the anchor
+   with retained-Comet claims. Both
    creation and verification require the explicit unverified-history warning:
 
    ```bash
@@ -320,7 +332,12 @@ present record, or introduce app-v27.
    ```
 
    An anchor is an operator assertion, not recovered cryptographic history. An
-   ACCEPT vote attests those exact claims.
+   ACCEPT vote attests those exact claims. Its digest covers both maps and
+   transition bundles. A missing target through app-v19 can be virtual at the
+   transition height; app-v20/app-v21 targets require their real ceremony record.
+   An independent anchored activation or a validated virtual transition target
+   may source the next jump only at a strictly earlier height. A subsumed rung
+   cannot. Equal/reversed heights, overlaps, and unproven sources fail closed.
 5. After every validator reports the same eligible manifest digest, submit the
    exact app-v22 proposal:
 
@@ -337,9 +354,34 @@ present record, or introduce app-v27.
    every validator and confirm the immutable repair audit and complete ladder
    before proposing app-v23.
 
-The manifest is chain/current-lineage bound and execution is create-only. A
-changed digest, extra/missing claim, mixed evidence source, future height,
-existing record, payload change, or insufficient explicit quorum fails closed.
+Before step 1, coordinate a complete validator halt and install v11.18.1 on
+every validator. Confirm every node reports the v2 lineage schema and identical
+chain binding/digest before generating, proposing, or voting on a v2 manifest.
+Never run this ceremony with a mixed 11.17.x/v11.18.1 validator set.
+
+Also inspect `upgrade lineage status --json`, `sage_gov_status`, and the pending
+upgrade shown by `upgrade status`. An already-executed v1 receipt on app-v22+
+is historical: do not repair it again; retain it and confirm `legacy-v1`
+provenance after the coordinated rollout. If app-v21 still has an approved or
+pending app-v22 v1 payload, halt all validators before activation, preserve full
+backups and the proposal/plan output, and do not create a competing proposal or
+edit Badger. Upgrade all validators to v11.18.1, then confirm on every node that
+`upgrade lineage status --json` accepts the v1 receipt with `legacy-v1`
+provenance and `upgrade status` shows the identical bound app-v22 plan and
+activation height. Only then restart all validators together and let that exact
+plan finish in place. If any audit, plan, height, or record differs, stay
+stopped and do not resume or vote. There is no cancel/migration command. New v1
+doctor output, replacement v2 proposals, and storage edits are unsupported for
+an already-approved v1 plan. The v1 audit binds the retained governance
+proposal and approved payload directly; it does not use the pending plan's
+`ProposerID` as that binding.
+
+The manifest is chain/current-lineage bound. Direct historical and anchor
+claims remain virtual compatibility evidence; retained-transition claims bind
+missing rungs to one real target activation. None writes `upgrade:applied:*`
+for a skipped rung. A changed digest, extra/missing/duplicate transition member,
+mixed anchor evidence, future height, archive disagreement, payload change, or
+insufficient explicit quorum fails closed.
 See [`reference/upgrade-lineage-repair.md`](reference/upgrade-lineage-repair.md)
 for the evidence and persistence contract.
 
