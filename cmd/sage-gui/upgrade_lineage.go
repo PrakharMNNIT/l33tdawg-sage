@@ -22,20 +22,26 @@ import (
 )
 
 type upgradeLineageRPCStatus struct {
-	Schema             string `json:"schema"`
-	CurrentAppVersion  uint64 `json:"current_app_version"`
-	PersistedHeight    int64  `json:"persisted_height"`
-	GovernanceDomain   string `json:"governance_domain"`
-	ValidLineageDigest string `json:"valid_lineage_digest"`
-	RepairAudit        any    `json:"repair_audit,omitempty"`
-	Rungs              []struct {
-		Version       uint64 `json:"version"`
-		Name          string `json:"name"`
-		Present       bool   `json:"present"`
-		AppliedHeight int64  `json:"applied_height,omitempty"`
-		Valid         bool   `json:"valid"`
-		Problem       string `json:"problem,omitempty"`
-	} `json:"rungs"`
+	Schema             string                  `json:"schema"`
+	CurrentAppVersion  uint64                  `json:"current_app_version"`
+	PersistedHeight    int64                   `json:"persisted_height"`
+	GovernanceDomain   string                  `json:"governance_domain"`
+	ValidLineageDigest string                  `json:"valid_lineage_digest"`
+	RepairAudit        any                     `json:"repair_audit,omitempty"`
+	Rungs              []upgradeLineageRPCRung `json:"rungs"`
+}
+
+type upgradeLineageRPCRung struct {
+	Version           uint64 `json:"version"`
+	Name              string `json:"name"`
+	Present           bool   `json:"present"`
+	AppliedHeight     int64  `json:"applied_height,omitempty"`
+	Valid             bool   `json:"valid"`
+	Problem           string `json:"problem,omitempty"`
+	Provenance        string `json:"provenance,omitempty"`
+	SubsumedByVersion uint64 `json:"subsumed_by_version,omitempty"`
+	Virtual           bool   `json:"virtual,omitempty"`
+	TransitionTarget  bool   `json:"transition_target,omitempty"`
 }
 
 type lineageDoctorOutput struct {
@@ -49,13 +55,32 @@ type lineageDoctorOutput struct {
 }
 
 type lineageVerifyOutput struct {
-	Valid           bool                             `json:"valid"`
-	HistoryVerified bool                             `json:"history_verified"`
-	EligibleForVote bool                             `json:"eligible_for_manual_vote"`
-	ManifestDigest  string                           `json:"manifest_digest"`
-	EvidenceSource  string                           `json:"evidence_source,omitempty"`
-	Claims          []sageabci.LegacyLineageEvidence `json:"claims"`
-	Diagnostics     []string                         `json:"diagnostics"`
+	Valid           bool                                   `json:"valid"`
+	HistoryVerified bool                                   `json:"history_verified"`
+	EligibleForVote bool                                   `json:"eligible_for_manual_vote"`
+	ManifestDigest  string                                 `json:"manifest_digest"`
+	EvidenceSource  string                                 `json:"evidence_source,omitempty"`
+	Claims          []sageabci.LegacyLineageEvidence       `json:"claims"`
+	Transitions     []sageabci.LineageActivationTransition `json:"transitions,omitempty"`
+	Diagnostics     []string                               `json:"diagnostics"`
+}
+
+type retainedLineageEvidence struct {
+	Claims      []sageabci.LegacyLineageEvidence
+	Transitions []sageabci.LineageActivationTransition
+	Complete    bool `json:"-"`
+}
+
+type legacyAnchorTransition struct {
+	FromVersion      uint64   `json:"from_version"`
+	ToVersion        uint64   `json:"to_version"`
+	AppliedHeight    int64    `json:"applied_height"`
+	SubsumedVersions []uint64 `json:"subsumed_versions"`
+}
+
+type legacyAnchorDocument struct {
+	Heights     map[string]int64         `json:"heights,omitempty"`
+	Transitions []legacyAnchorTransition `json:"transitions,omitempty"`
 }
 
 func runUpgradeLineage(args []string) error {
@@ -99,7 +124,7 @@ func runUpgradeLineageVerify(args []string) error {
 		return err
 	}
 	digest := sha256.Sum256([]byte(canonical))
-	out := lineageVerifyOutput{ManifestDigest: hex.EncodeToString(digest[:]), Claims: manifest.Evidence}
+	out := lineageVerifyOutput{ManifestDigest: hex.EncodeToString(digest[:]), Claims: manifest.Evidence, Transitions: manifest.Transitions}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	status, statusErr := readUpgradeLineageStatus(ctx, *rpc)
@@ -116,56 +141,51 @@ func runUpgradeLineageVerify(args []string) error {
 			status.CurrentAppVersion != 21 || manifest.PriorLineageDigest != status.ValidLineageDigest {
 			out.Diagnostics = append(out.Diagnostics, "manifest chain, app version, governance domain, or prior-lineage digest does not match this validator")
 		} else {
-			missing := make(map[uint64]bool)
+			missing := make(map[uint64]struct{})
 			for _, rung := range status.Rungs {
 				if rung.Present && !rung.Valid {
 					out.Diagnostics = append(out.Diagnostics, rung.Name+" is present but invalid; create-only repair is forbidden")
 				}
 				if !rung.Present {
-					missing[rung.Version] = true
+					missing[rung.Version] = struct{}{}
 				}
 			}
-			if len(manifest.Evidence) != len(missing) {
-				out.Diagnostics = append(out.Diagnostics, "manifest evidence does not equal the exact current missing-rung set")
-			} else if len(manifest.Evidence) == 0 {
+			if len(manifest.Evidence)+len(manifest.Transitions) == 0 {
 				out.Diagnostics = append(out.Diagnostics, "manifest contains no missing-rung claims")
 			} else {
-				source := manifest.Evidence[0].Source
-				out.EvidenceSource = source
-				claimsOK := true
-				seen := make(map[uint64]bool, len(manifest.Evidence))
-				for _, claim := range manifest.Evidence {
-					if !missing[claim.Version] || claim.Name != tx.CanonicalUpgradeName(claim.Version) ||
-						claim.AppliedHeight <= 0 || claim.AppliedHeight > status.PersistedHeight || claim.Source != source || seen[claim.Version] {
-						claimsOK = false
-						break
-					}
-					seen[claim.Version] = true
+				source := "comet-block-results"
+				if len(manifest.Evidence) > 0 {
+					source = manifest.Evidence[0].Source
+				} else if len(manifest.Transitions) > 0 {
+					source = manifest.Transitions[0].Source
 				}
-				if !claimsOK {
-					out.Diagnostics = append(out.Diagnostics, "manifest contains mixed, future-height, duplicate, or non-missing claims")
-				} else if source == "comet-block-results" {
-					out.HistoryVerified = true
-					for _, claim := range manifest.Evidence {
-						version, versionErr := readBlockResultAppVersion(ctx, *rpc, claim.AppliedHeight)
-						hash, hashErr := readBlockHash(ctx, *rpc, claim.AppliedHeight)
-						if versionErr != nil || hashErr != nil || version != claim.Version || hash != claim.BlockHash {
-							out.HistoryVerified = false
-							out.Diagnostics = append(out.Diagnostics, fmt.Sprintf("app-v%d claim does not match this validator's retained block_results and block hash at height %d", claim.Version, claim.AppliedHeight))
+				out.EvidenceSource = source
+				if source == "legacy-anchor" {
+					if !exactLineageCoverage(missing, manifest.Evidence, manifest.Transitions) || !validAnchorTrustBundle(status, manifest.Evidence, manifest.Transitions) {
+						out.Diagnostics = append(out.Diagnostics, "legacy-anchor manifest does not exactly cover the current missing-rung set")
+					} else {
+						anchorBytes, anchorErr := hex.DecodeString(manifest.AnchorDigest)
+						canonicalAnchor := anchorErr == nil && len(anchorBytes) == sha256.Size && hex.EncodeToString(anchorBytes) == manifest.AnchorDigest
+						if !canonicalAnchor || !anchorDigestMatchesManifest(manifest) {
+							out.Diagnostics = append(out.Diagnostics, "legacy-anchor manifest has no canonical anchor_digest")
+						} else if manifest.AnchorAttestation != "operator-quorum-attested-unverified-history" || !*ackAnchor {
+							out.Diagnostics = append(out.Diagnostics, "legacy-anchor claims are unverified history and require --acknowledge-unverified-anchor before an operator vote")
+						} else {
+							out.Valid, out.EligibleForVote = true, true
+							out.Diagnostics = append(out.Diagnostics, "anchor heights are operator claims, not locally history-verified facts; the explicit vote attests these exact claims")
 						}
 					}
-					out.Valid = out.HistoryVerified
-					out.EligibleForVote = out.Valid
-				} else if source == "legacy-anchor" {
-					anchorBytes, anchorErr := hex.DecodeString(manifest.AnchorDigest)
-					canonicalAnchor := anchorErr == nil && len(anchorBytes) == sha256.Size && hex.EncodeToString(anchorBytes) == manifest.AnchorDigest
-					if !canonicalAnchor {
-						out.Diagnostics = append(out.Diagnostics, "legacy-anchor manifest has no canonical anchor_digest")
-					} else if manifest.AnchorAttestation != "operator-quorum-attested-unverified-history" || !*ackAnchor {
-						out.Diagnostics = append(out.Diagnostics, "legacy-anchor claims are unverified history and require --acknowledge-unverified-anchor before an operator vote")
+				} else if source == "comet-block-results" {
+					local, diagnostics := discoverRetainedLineageEvidence(ctx, *rpc, status, missing)
+					out.Diagnostics = append(out.Diagnostics, diagnostics...)
+					if !local.Complete {
+						out.Diagnostics = append(out.Diagnostics, "this validator could not replay retained version history through the committed tip")
+					} else if !exactLineageCoverage(missing, manifest.Evidence, manifest.Transitions) {
+						out.Diagnostics = append(out.Diagnostics, "manifest retained-history evidence does not exactly cover the current missing-rung set")
+					} else if !equalRetainedLineageEvidence(local, retainedLineageEvidence{Claims: manifest.Evidence, Transitions: manifest.Transitions}) {
+						out.Diagnostics = append(out.Diagnostics, "manifest does not match this validator's independently reconstructed retained version-transition history")
 					} else {
-						out.Valid, out.EligibleForVote = true, true
-						out.Diagnostics = append(out.Diagnostics, "anchor heights are operator claims, not locally history-verified facts; the explicit vote attests these exact claims")
+						out.HistoryVerified, out.Valid, out.EligibleForVote = true, true, true
 					}
 				} else {
 					out.Diagnostics = append(out.Diagnostics, "unsupported or mixed evidence source")
@@ -207,7 +227,12 @@ func runUpgradeLineageStatus(args []string) error {
 	fmt.Printf("Upgrade lineage: app-v%d at height %d\n", status.CurrentAppVersion, status.PersistedHeight)
 	for _, rung := range status.Rungs {
 		state := "missing"
-		if rung.Valid {
+		if rung.Valid && rung.Virtual {
+			state = fmt.Sprintf("virtual compatibility coverage at height %d", rung.AppliedHeight)
+			if rung.SubsumedByVersion != 0 {
+				state += fmt.Sprintf(" (subsumed by app-v%d)", rung.SubsumedByVersion)
+			}
+		} else if rung.Valid {
 			state = fmt.Sprintf("height %d", rung.AppliedHeight)
 		} else if rung.Present {
 			state = "INVALID: " + rung.Problem
@@ -222,7 +247,7 @@ func runUpgradeLineageDoctor(args []string) error {
 	rpc := fs.String("rpc", defaultCometRPC(), "CometBFT RPC endpoint")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	manifestOut := fs.String("manifest-out", "", "write only the canonical repair manifest to this file")
-	legacyAnchor := fs.String("legacy-anchor", "", "audited JSON fallback containing {\"heights\":{\"7\":123,...}}")
+	legacyAnchor := fs.String("legacy-anchor", "", "audited JSON fallback containing independent heights and/or actual version transitions")
 	ackAnchor := fs.Bool("acknowledge-unverified-anchor", false, "explicitly attest that legacy-anchor heights are not locally history-verified and require quorum review")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -262,15 +287,17 @@ func runUpgradeLineageDoctor(args []string) error {
 	if err != nil {
 		return err
 	}
-	evidence, diagnostics := discoverCometLineageEvidence(ctx, *rpc, status.PersistedHeight, missing)
+	retained, diagnostics := discoverRetainedLineageEvidence(ctx, *rpc, status, missing)
+	evidence := retained.Claims
+	transitions := retained.Transitions
 	out.Diagnostics = append(out.Diagnostics, diagnostics...)
-	if len(evidence) > 0 {
+	if len(evidence)+len(transitions) > 0 {
 		out.Diagnostics = append(out.Diagnostics,
-			"comet-block-results entries and block hashes are evidence from this validator's retained local archive; consensus does not independently verify those hashes")
+			"Comet version updates and block hashes are evidence from this validator's retained local archive; every validator must reconstruct them independently")
 	}
 
 	anchorDigest := ""
-	if len(evidence) < len(missing) && *legacyAnchor != "" {
+	if (!retained.Complete || !exactLineageCoverage(missing, evidence, transitions)) && *legacyAnchor != "" {
 		if !*ackAnchor {
 			out.Diagnostics = append(out.Diagnostics, "legacy-anchor fallback requires --acknowledge-unverified-anchor because its heights cannot be verified from retained local history")
 			return emitLineageDoctor(out, *jsonOut, "")
@@ -279,9 +306,7 @@ func runUpgradeLineageDoctor(args []string) error {
 		if readErr != nil {
 			return readErr
 		}
-		var anchor struct {
-			Heights map[string]int64 `json:"heights"`
-		}
+		var anchor legacyAnchorDocument
 		decoder := json.NewDecoder(strings.NewReader(string(raw)))
 		decoder.DisallowUnknownFields()
 		if decodeErr := decoder.Decode(&anchor); decodeErr != nil {
@@ -294,23 +319,34 @@ func runUpgradeLineageDoctor(args []string) error {
 		// history is incomplete, the explicit legacy anchor must attest every
 		// missing rung and replaces the partial local-history set wholesale.
 		evidence = evidence[:0]
+		transitions = transitions[:0]
 		for version := range missing {
 			height := anchor.Heights[strconv.FormatUint(version, 10)]
 			if height > 0 {
 				evidence = append(evidence, sageabci.LegacyLineageEvidence{Version: version, Name: tx.CanonicalUpgradeName(version), AppliedHeight: height, Source: "legacy-anchor"})
 			}
 		}
+		for _, transition := range anchor.Transitions {
+			transitions = append(transitions, sageabci.LineageActivationTransition{
+				FromVersion: transition.FromVersion, ToVersion: transition.ToVersion,
+				AppliedHeight: transition.AppliedHeight, Source: "legacy-anchor", SubsumedVersions: append([]uint64(nil), transition.SubsumedVersions...),
+			})
+		}
 	}
-	if len(evidence) != len(missing) {
+	if anchorDigest == "" && !retained.Complete {
+		out.Diagnostics = append(out.Diagnostics, "retained Comet history could not be replayed through the committed tip")
+		return emitLineageDoctor(out, *jsonOut, "")
+	}
+	if !exactLineageCoverage(missing, evidence, transitions) {
 		out.Diagnostics = append(out.Diagnostics, "retained Comet evidence is incomplete; provide --legacy-anchor only after an independent audit")
 		return emitLineageDoctor(out, *jsonOut, "")
 	}
 	sort.Slice(evidence, func(i, j int) bool { return evidence[i].Version < evidence[j].Version })
-	if evidenceErr := validateDoctorLineageEvidence(status, evidence); evidenceErr != nil {
+	if evidenceErr := validateDoctorLineageEvidenceV2(status, evidence, transitions); evidenceErr != nil {
 		out.Diagnostics = append(out.Diagnostics, evidenceErr.Error())
 		return emitLineageDoctor(out, *jsonOut, "")
 	}
-	manifest := sageabci.LegacyLineageRepairManifest{Schema: status.Schema, ChainID: chainID, GovernanceDomain: status.GovernanceDomain, CurrentAppVersion: 21, PriorLineageDigest: status.ValidLineageDigest, AnchorDigest: anchorDigest, Evidence: evidence}
+	manifest := sageabci.LegacyLineageRepairManifest{Schema: status.Schema, ChainID: chainID, GovernanceDomain: status.GovernanceDomain, CurrentAppVersion: 21, PriorLineageDigest: status.ValidLineageDigest, AnchorDigest: anchorDigest, Evidence: evidence, Transitions: transitions}
 	if anchorDigest != "" {
 		manifest.AnchorAttestation = "operator-quorum-attested-unverified-history"
 		out.Diagnostics = append(out.Diagnostics, "legacy-anchor claims are quorum-attested operator assertions and are not verified by retained local history")
@@ -326,6 +362,7 @@ func runUpgradeLineageDoctor(args []string) error {
 	manifestDigest := sha256.Sum256([]byte(canonical))
 	out.ManifestDigest = hex.EncodeToString(manifestDigest[:])
 	out.ReviewSteps = []string{
+		"halt every validator, deploy v11.18.1 everywhere, and confirm identical v2 status before proposing or voting",
 		"create the candidate manifest with upgrade lineage doctor on the proposing validator",
 		"run upgrade lineage verify with that exact manifest independently on every validator and compare manifest_digest before proposing",
 		"after proposing, inspect the active proposal with sage_gov_status and cast an explicit sage_gov_vote on every validator; automatic voting is disabled, including on one-validator chains",
@@ -356,6 +393,109 @@ func validateDoctorLineageEvidence(status *upgradeLineageRPCStatus, evidence []s
 			return fmt.Errorf("app-v%d claimed height %d is not a retained, strictly ordered committed height", rung.Version, height)
 		}
 		previous = height
+	}
+	return nil
+}
+
+func validateDoctorLineageEvidenceV2(status *upgradeLineageRPCStatus, evidence []sageabci.LegacyLineageEvidence, transitions []sageabci.LineageActivationTransition) error {
+	if len(transitions) == 0 {
+		return validateDoctorLineageEvidence(status, evidence)
+	}
+	virtualHeight := make(map[uint64]int64)
+	validatedActivationHeight := make(map[uint64]int64)
+	for _, rung := range status.Rungs {
+		if rung.Present && rung.Valid && !rung.Virtual {
+			validatedActivationHeight[rung.Version] = rung.AppliedHeight
+		}
+	}
+	for _, claim := range evidence {
+		if _, duplicate := virtualHeight[claim.Version]; duplicate {
+			return fmt.Errorf("duplicate app-v%d repair claim", claim.Version)
+		}
+		virtualHeight[claim.Version] = claim.AppliedHeight
+		validatedActivationHeight[claim.Version] = claim.AppliedHeight
+	}
+	var previousTransitionHeight int64
+	for _, transition := range transitions {
+		if transition.FromVersion >= transition.ToVersion || transition.ToVersion > 21 || transition.AppliedHeight <= previousTransitionHeight || transition.AppliedHeight > status.PersistedHeight || len(transition.SubsumedVersions) == 0 {
+			return errors.New("retained version transitions are invalid, future-dated, or not strictly ordered")
+		}
+		if transition.Source == "legacy-anchor" {
+			if transition.BlockHash != "" {
+				return errors.New("legacy-anchor transition must not claim a block hash")
+			}
+		} else if transition.Source == "comet-block-results" {
+			decoded, err := hex.DecodeString(transition.BlockHash)
+			if err != nil || len(decoded) != sha256.Size || hex.EncodeToString(decoded) != transition.BlockHash {
+				return errors.New("retained-Comet transition requires a canonical block hash")
+			}
+		} else {
+			return errors.New("unsupported transition evidence source")
+		}
+		previousTransitionHeight = transition.AppliedHeight
+		if transition.FromVersion >= 6 {
+			sourceHeight, sourceOK := validatedActivationHeight[transition.FromVersion]
+			if !sourceOK || sourceHeight >= transition.AppliedHeight {
+				return fmt.Errorf("app-v%d transition source is not a prior validated activation at a strictly earlier height", transition.FromVersion)
+			}
+		}
+		var targetOK, targetMissing bool
+		for _, rung := range status.Rungs {
+			if rung.Version == transition.ToVersion {
+				targetMissing = !rung.Present
+				targetOK = rung.Present && rung.Valid && rung.AppliedHeight == transition.AppliedHeight
+				break
+			}
+		}
+		if !targetOK && (!targetMissing || transition.ToVersion > 19) {
+			return fmt.Errorf("app-v%d is not a real canonical target activation at height %d", transition.ToVersion, transition.AppliedHeight)
+		}
+		if targetMissing {
+			if _, duplicate := virtualHeight[transition.ToVersion]; duplicate {
+				return fmt.Errorf("duplicate app-v%d repair claim", transition.ToVersion)
+			}
+			virtualHeight[transition.ToVersion] = transition.AppliedHeight
+		}
+		validatedActivationHeight[transition.ToVersion] = transition.AppliedHeight
+		var previousVersion uint64
+		expectedSubsumed := make([]uint64, 0)
+		for version := transition.FromVersion + 1; version < transition.ToVersion; version++ {
+			for _, rung := range status.Rungs {
+				if rung.Version == version && !rung.Present {
+					expectedSubsumed = append(expectedSubsumed, version)
+					break
+				}
+			}
+		}
+		if len(expectedSubsumed) != len(transition.SubsumedVersions) {
+			return errors.New("transition subsumed_versions is not the exact missing open-interval predecessor set")
+		}
+		for _, version := range transition.SubsumedVersions {
+			if version <= transition.FromVersion || version >= transition.ToVersion || (previousVersion != 0 && version <= previousVersion) {
+				return errors.New("transition subsumed_versions is not a strictly ordered open-interval subset")
+			}
+			if _, duplicate := virtualHeight[version]; duplicate {
+				return fmt.Errorf("duplicate app-v%d repair claim", version)
+			}
+			virtualHeight[version] = transition.AppliedHeight
+			previousVersion = version
+		}
+		for i := range expectedSubsumed {
+			if expectedSubsumed[i] != transition.SubsumedVersions[i] {
+				return errors.New("transition subsumed_versions is not the exact missing open-interval predecessor set")
+			}
+		}
+	}
+	var previousHeight int64
+	for _, rung := range status.Rungs {
+		height := rung.AppliedHeight
+		if !rung.Present {
+			height = virtualHeight[rung.Version]
+		}
+		if height <= 0 || height > status.PersistedHeight || height < previousHeight {
+			return fmt.Errorf("app-v%d height %d is not a retained, monotonically ordered committed height", rung.Version, height)
+		}
+		previousHeight = height
 	}
 	return nil
 }
@@ -422,30 +562,149 @@ func readABCIQueryValue(ctx context.Context, rpc, path string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(out.Result.Response.Value)
 }
 
-func discoverCometLineageEvidence(ctx context.Context, rpc string, maxHeight int64, missing map[uint64]struct{}) ([]sageabci.LegacyLineageEvidence, []string) {
-	found := make(map[uint64]sageabci.LegacyLineageEvidence)
+func discoverRetainedLineageEvidence(ctx context.Context, rpc string, status *upgradeLineageRPCStatus, missing map[uint64]struct{}) (retainedLineageEvidence, []string) {
+	result := retainedLineageEvidence{Complete: true}
 	diagnostics := []string{}
-	for height := int64(1); height <= maxHeight && len(found) < len(missing); height++ {
+	current := uint64(1)
+	for height := int64(1); height <= status.PersistedHeight; height++ {
 		version, err := readBlockResultAppVersion(ctx, rpc, height)
 		if err != nil {
+			result.Complete = false
 			diagnostics = append(diagnostics, fmt.Sprintf("retained block-results unavailable at height %d: %v", height, err))
 			break
 		}
-		if _, wanted := missing[version]; !wanted {
+		if version == 0 {
 			continue
 		}
-		hash, err := readBlockHash(ctx, rpc, height)
-		if err != nil {
-			diagnostics = append(diagnostics, fmt.Sprintf("block hash unavailable at height %d: %v", height, err))
-			continue
+		if version <= current {
+			result.Complete = false
+			diagnostics = append(diagnostics, fmt.Sprintf("ambiguous retained version history at height %d: app-v%d follows app-v%d", height, version, current))
+			break
 		}
-		found[version] = sageabci.LegacyLineageEvidence{Version: version, Name: tx.CanonicalUpgradeName(version), AppliedHeight: height, Source: "comet-block-results", BlockHash: strings.ToLower(hash)}
+
+		var targetPresent bool
+		for _, rung := range status.Rungs {
+			if rung.Version == version && rung.Present && rung.Valid && rung.AppliedHeight == height {
+				targetPresent = true
+				break
+			}
+		}
+		subsumed := make([]uint64, 0)
+		for candidate := current + 1; candidate < version; candidate++ {
+			if candidate > 19 {
+				break
+			}
+			if _, wanted := missing[candidate]; wanted {
+				subsumed = append(subsumed, candidate)
+			}
+		}
+		_, direct := missing[version]
+		if len(subsumed) > 0 && (targetPresent || (direct && version <= 19)) {
+			hash, hashErr := readBlockHash(ctx, rpc, height)
+			if hashErr != nil {
+				result.Complete = false
+				diagnostics = append(diagnostics, fmt.Sprintf("block hash unavailable at height %d: %v", height, hashErr))
+			} else {
+				result.Transitions = append(result.Transitions, sageabci.LineageActivationTransition{
+					FromVersion: current, ToVersion: version, AppliedHeight: height,
+					Source: "comet-block-results", BlockHash: hash, SubsumedVersions: subsumed,
+				})
+			}
+		} else if direct {
+			hash, hashErr := readBlockHash(ctx, rpc, height)
+			if hashErr != nil {
+				result.Complete = false
+				diagnostics = append(diagnostics, fmt.Sprintf("block hash unavailable at height %d: %v", height, hashErr))
+			} else {
+				result.Claims = append(result.Claims, sageabci.LegacyLineageEvidence{
+					Version: version, Name: tx.CanonicalUpgradeName(version), AppliedHeight: height,
+					Source: "comet-block-results", BlockHash: hash,
+				})
+			}
+		}
+		current = version
 	}
-	result := make([]sageabci.LegacyLineageEvidence, 0, len(found))
-	for _, evidence := range found {
-		result = append(result, evidence)
-	}
+	sort.Slice(result.Claims, func(i, j int) bool { return result.Claims[i].Version < result.Claims[j].Version })
 	return result, diagnostics
+}
+
+func exactLineageCoverage(missing map[uint64]struct{}, claims []sageabci.LegacyLineageEvidence, transitions []sageabci.LineageActivationTransition) bool {
+	seen := make(map[uint64]struct{}, len(missing))
+	for _, claim := range claims {
+		if _, wanted := missing[claim.Version]; !wanted || claim.Version > 19 || claim.Name != tx.CanonicalUpgradeName(claim.Version) || claim.AppliedHeight <= 0 {
+			return false
+		}
+		if _, duplicate := seen[claim.Version]; duplicate {
+			return false
+		}
+		seen[claim.Version] = struct{}{}
+	}
+	for _, transition := range transitions {
+		for _, version := range transition.SubsumedVersions {
+			if _, wanted := missing[version]; !wanted || version > 19 {
+				return false
+			}
+			if _, duplicate := seen[version]; duplicate {
+				return false
+			}
+			seen[version] = struct{}{}
+		}
+		if _, targetMissing := missing[transition.ToVersion]; targetMissing {
+			if transition.ToVersion > 19 {
+				return false
+			}
+			if _, duplicate := seen[transition.ToVersion]; duplicate {
+				return false
+			}
+			seen[transition.ToVersion] = struct{}{}
+		}
+	}
+	return len(seen) == len(missing)
+}
+
+func validAnchorTrustBundle(status *upgradeLineageRPCStatus, claims []sageabci.LegacyLineageEvidence, transitions []sageabci.LineageActivationTransition) bool {
+	for _, claim := range claims {
+		if claim.Source != "legacy-anchor" || claim.BlockHash != "" {
+			return false
+		}
+	}
+	for _, transition := range transitions {
+		if transition.Source != "legacy-anchor" || transition.BlockHash != "" {
+			return false
+		}
+	}
+	return validateDoctorLineageEvidenceV2(status, claims, transitions) == nil
+}
+
+func anchorDigestMatchesManifest(manifest sageabci.LegacyLineageRepairManifest) bool {
+	anchor := legacyAnchorDocument{Heights: make(map[string]int64)}
+	for _, claim := range manifest.Evidence {
+		if claim.Source != "legacy-anchor" {
+			return false
+		}
+		anchor.Heights[strconv.FormatUint(claim.Version, 10)] = claim.AppliedHeight
+	}
+	if len(anchor.Heights) == 0 {
+		anchor.Heights = nil
+	}
+	for _, transition := range manifest.Transitions {
+		if transition.Source != "legacy-anchor" {
+			return false
+		}
+		anchor.Transitions = append(anchor.Transitions, legacyAnchorTransition{FromVersion: transition.FromVersion, ToVersion: transition.ToVersion, AppliedHeight: transition.AppliedHeight, SubsumedVersions: append([]uint64(nil), transition.SubsumedVersions...)})
+	}
+	raw, err := json.Marshal(anchor)
+	if err != nil {
+		return false
+	}
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:]) == manifest.AnchorDigest
+}
+
+func equalRetainedLineageEvidence(a, b retainedLineageEvidence) bool {
+	aRaw, aErr := json.Marshal(a)
+	bRaw, bErr := json.Marshal(b)
+	return aErr == nil && bErr == nil && string(aRaw) == string(bRaw)
 }
 
 func readBlockResultAppVersion(ctx context.Context, rpc string, height int64) (uint64, error) {

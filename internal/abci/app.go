@@ -4233,11 +4233,25 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 					req.Height, current,
 				)
 			}
-			if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
-				return nil, fmt.Errorf(
-					"sage: refuse app-v22 activation at height %d: invalid predecessor ladder: %w",
-					req.Height, ladderErr,
-				)
+			if plan.LineageRepair != "" {
+				var lineageHeader struct {
+					Schema string `json:"schema"`
+				}
+				if decodeErr := json.Unmarshal([]byte(plan.LineageRepair), &lineageHeader); decodeErr != nil {
+					return nil, fmt.Errorf("sage: refuse app-v22 activation with malformed lineage manifest: %w", decodeErr)
+				}
+				if lineageHeader.Schema == legacyLineageRepairSchemaV1 {
+					if legacyErr := app.validateApprovedLegacyV1LineagePlan(plan); legacyErr != nil {
+						return nil, fmt.Errorf("sage: refuse app-v22 activation with mismatched legacy v1 lineage approval: %w", legacyErr)
+					}
+					if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+						return nil, fmt.Errorf("sage: refuse app-v22 activation with invalid legacy v1 predecessor ladder: %w", ladderErr)
+					}
+				} else if _, _, repairErr := app.validateLegacyLineageRepair(plan.LineageRepair); repairErr != nil {
+					return nil, fmt.Errorf("sage: refuse app-v22 activation at height %d: invalid virtual lineage bundle: %w", req.Height, repairErr)
+				}
+			} else if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
+				return nil, fmt.Errorf("sage: refuse app-v22 activation at height %d: invalid predecessor ladder: %w", req.Height, ladderErr)
 			}
 		}
 		if plan.Name == appV23UpgradeName {
@@ -4366,7 +4380,27 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				Int64("height", req.Height).
 				Msg("upgrade plan would regress consensus version.app; skipping the version bump (feature gate still activates) to prevent a handshake halt")
 		}
-		if markErr := app.badgerStore.MarkUpgradeApplied(plan.Name, plan.TargetAppVersion, req.Height); markErr != nil {
+		var markErr error
+		if plan.Name == appV22UpgradeName && plan.LineageRepair != "" {
+			var lineageHeader struct {
+				Schema string `json:"schema"`
+			}
+			if decodeErr := json.Unmarshal([]byte(plan.LineageRepair), &lineageHeader); decodeErr != nil {
+				return nil, decodeErr
+			}
+			if lineageHeader.Schema == legacyLineageRepairSchemaV1 {
+				markErr = app.badgerStore.MarkUpgradeApplied(plan.Name, plan.TargetAppVersion, req.Height)
+			} else {
+				audit, auditErr := app.legacyLineageRepairAudit(plan.LineageRepair, plan.LineageProposalID, plan.LineageApprovedHeight)
+				if auditErr != nil {
+					return nil, fmt.Errorf("sage: build app-v22 lineage activation audit: %w", auditErr)
+				}
+				markErr = app.badgerStore.MarkUpgradeAppliedWithLineageAudit(plan.Name, plan.TargetAppVersion, req.Height, *audit)
+			}
+		} else {
+			markErr = app.badgerStore.MarkUpgradeApplied(plan.Name, plan.TargetAppVersion, req.Height)
+		}
+		if markErr != nil {
 			app.logger.Error().Err(markErr).
 				Str("name", plan.Name).
 				Uint64("target_app_version", plan.TargetAppVersion).
@@ -11372,15 +11406,6 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 		}
 		return nil
 	}
-	if p.Name == appV22UpgradeName && p.LineageRepair != "" {
-		if repairErr := app.applyLegacyLineageRepair(p.LineageRepair, proposal.ProposalID, height); repairErr != nil {
-			return fmt.Errorf("app-v22 lineage repair failed: %w", repairErr)
-		}
-		if _, ladderErr := app.validatePersistedAppV22PredecessorLadder(); ladderErr != nil {
-			return fmt.Errorf("app-v22 predecessor ladder remains invalid after repair: %w", ladderErr)
-		}
-	}
-
 	delay := p.UpgradeDelayBlocks
 	if floor := effectiveUpgradeDelayFloorBlocks(); delay < floor {
 		delay = floor
@@ -11394,6 +11419,10 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 		LineageRepair:    p.LineageRepair,
 		ProposedAt:       height,
 		ProposerID:       proposal.ProposerID,
+	}
+	if p.LineageRepair != "" {
+		rec.LineageProposalID = proposal.ProposalID
+		rec.LineageApprovedHeight = height
 	}
 	if setErr := app.badgerStore.SetUpgradePlan(rec); setErr != nil {
 		app.logger.Error().Err(setErr).Str("name", p.Name).Msg("app-v8: persist approved upgrade plan failed")

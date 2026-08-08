@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -57,8 +58,57 @@ func TestAppV20StateSyncPreservesAndValidatesLegacyLineageRepairAudit(t *testing
 	require.NoError(t, PrepareAppV20StateSyncBackup(context.Background(), backupPath, target, 3, trustedHash))
 	restored, err := store.OpenBadgerStoreReadOnly(target)
 	require.NoError(t, err)
+	require.NoError(t, restored.ValidateLegacyUpgradeLineageRepairAudit())
+}
+
+func TestAppV20StateSyncPreservesVirtualV2LineageBundle(t *testing.T) {
+	root := t.TempDir()
+	source, err := store.NewBadgerStore(filepath.Join(root, "source-v2"))
+	require.NoError(t, err)
+	seedTestGovernanceDelegationDomain(t, source)
+	for version, height := range map[uint64]int64{7: 376, 8: 741, 11: 992, 20: 1080, 21: 1090} {
+		require.NoError(t, source.MarkUpgradeApplied(tx.CanonicalUpgradeName(version), version, height))
+	}
+	h1 := sha256.Sum256([]byte("376"))
+	h2 := sha256.Sum256([]byte("992"))
+	transitions := []store.LineageActivationTransition{{FromVersion: 1, ToVersion: 7, AppliedHeight: 376, Source: "comet-block-results", BlockHash: hex.EncodeToString(h1[:]), SubsumedVersions: []uint64{6}}, {FromVersion: 8, ToVersion: 11, AppliedHeight: 992, Source: "comet-block-results", BlockHash: hex.EncodeToString(h2[:]), SubsumedVersions: []uint64{9, 10}}}
+	manifestBytes, err := json.Marshal(map[string]any{"schema": "sage-upgrade-lineage-repair/v2", "governance_domain": "scope", "prior_lineage_digest": "prior", "transitions": transitions})
+	require.NoError(t, err)
+	digest := sha256.Sum256(manifestBytes)
+	audit := store.LegacyUpgradeLineageRepairAudit{Schema: "sage-upgrade-lineage-repair/v2", GovernanceDomain: "scope", PriorLineageDigest: "prior", ManifestDigest: hex.EncodeToString(digest[:]), Manifest: string(manifestBytes), ApprovedHeight: 1100, ProposalID: "proposal-v2", Records: []store.AppliedUpgradeRecord{{Name: "app-v6", TargetAppVersion: 6, AppliedHeight: 376}, {Name: "app-v9", TargetAppVersion: 9, AppliedHeight: 992}, {Name: "app-v10", TargetAppVersion: 10, AppliedHeight: 992}}, Transitions: transitions}
+	require.NoError(t, source.SetUpgradePlan(&store.UpgradePlanRecord{Name: appV22UpgradeName, TargetAppVersion: 22, ActivationHeight: 1200, LineageRepair: audit.Manifest, LineageProposalID: audit.ProposalID, LineageApprovedHeight: audit.ApprovedHeight, ProposedAt: 1100, ProposerID: "operator"}))
+	require.NoError(t, source.MarkUpgradeAppliedWithLineageAudit(appV22UpgradeName, 22, 1200, audit))
+	state := &AppState{Height: 1200, EpochNum: poe.EpochNumber(1200)}
+	for range 2 {
+		hash, hashErr := source.ComputeAppHashExcludingBookkeeping()
+		require.NoError(t, hashErr)
+		state.AppHash = append([]byte(nil), hash...)
+		require.NoError(t, SaveState(source, state))
+	}
+	trustedHash := append([]byte(nil), state.AppHash...)
+	backupPath := filepath.Join(root, "v2.backup")
+	backup, err := os.OpenFile(backupPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, statesync.WriteCanonicalState(context.Background(), source.DB(), backup))
+	require.NoError(t, backup.Close())
+	require.NoError(t, source.CloseBadger())
+	target := filepath.Join(root, "target-v2")
+	require.NoError(t, PrepareAppV20StateSyncBackup(context.Background(), backupPath, target, 1200, trustedHash))
+	restored, err := store.OpenBadgerStoreReadOnly(target)
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = restored.CloseBadger() })
 	require.NoError(t, restored.ValidateLegacyUpgradeLineageRepairAudit())
+	for _, name := range []string{"app-v6", "app-v9", "app-v10"} {
+		rec, getErr := restored.GetAppliedUpgrade(name)
+		require.NoError(t, getErr)
+		require.Nil(t, rec)
+	}
+	require.NoError(t, restored.CloseBadger())
+	tampered, err := store.NewBadgerStore(target)
+	require.NoError(t, err)
+	require.NoError(t, tampered.MarkUpgradeApplied("app-v11", 11, 993))
+	require.ErrorContains(t, tampered.ValidateLegacyUpgradeLineageRepairAudit(), "target app-v11")
+	require.NoError(t, tampered.CloseBadger())
 }
 
 func TestPrepareAppV20StateSyncBackupValidatesWithoutActivating(t *testing.T) {

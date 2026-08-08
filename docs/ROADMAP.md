@@ -7,9 +7,12 @@ JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
 and the governed app-v21 → app-v22 legacy-lineage recovery ceremony from
 v11.18.0. It moves per-session auto-connect guidance into MCP
 `initialize.instructions`, leaving the first tool result payload clean while
-retaining a compatibility fallback for clients that skip initialization. Existing
-app-v22 through app-v26 chains are not rewritten. The supported consensus
-ceiling remains app-v26; **v11.18.1 does not introduce app-v27**.
+retaining a compatibility fallback for clients that skip initialization. It
+also corrects the exceptional app-v21 → app-v22 recovery lane so proven
+skip-ahead transitions remain virtual, evidence-bound history rather than
+synthetic applied-upgrade records. Existing app-v22 through app-v26 chains are
+not rewritten. The supported consensus ceiling remains app-v26; **v11.18.1
+does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
@@ -23,7 +26,14 @@ Each transport session performs the signed boot check at most once, repeated or
 concurrent initialization reuses the same instructions, and ordinary tool
 results no longer carry the auto-connect preamble. A client that omits the MCP
 handshake still receives the historical one-time fallback on its first tool
-call. No app-version or authorization semantics change.
+call.
+
+The app-v21 lineage doctor now emits schema-v2 retained-Comet transition claims
+for proven skip-ahead history, independently verifies the exact transition and
+block hash on every validator, and installs virtual predecessor coverage only
+when app-v22 activates. It never fabricates heights or arms skipped historical
+fork gates. New schema-v1 repairs fail closed; valid receipts already completed
+on app-v22+ remain compatible. The binary ceiling stays app-v26.
 
 ## v11.18.0 completion ledger
 

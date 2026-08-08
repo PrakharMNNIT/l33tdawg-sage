@@ -686,18 +686,20 @@ path and never activate the domain-bound rules. Every validator must therefore
 restart on the identical v11.9 binary before the tagged ceremony; upgrading
 only a greater-than-two-thirds subset is not a supported rollout boundary.
 
-App-v22 has an additional persisted-ladder invariant at every transition
+App-v22 has an additional predecessor-coverage invariant at every transition
 boundary: proposal admission, approved-proposal execution, activation, and
-startup/restart recovery. Consensus storage must contain the canonical app-v6
-applied record, which is the historical protocol's cumulative proof for
-app-v2 through app-v5, followed by a distinct canonical record for every
-independent app-v7 through app-v21 activation. Every record must have its exact
-canonical name and target, a positive height, and a height strictly greater
-than its predecessor. Cached fork gates and synthesized/subsumed evidence do
-not satisfy the v7+ requirement. This check is confined to the app-v22
-transition and recovery boundary, so historical pre-v22 replay retains its
-original behavior (`internal/abci/appv22_agent_capabilities.go`,
-`internal/abci/app.go`).
+startup/restart recovery. Ordinarily consensus storage contains canonical,
+strictly ordered applied records from app-v6 through app-v21. At the app-v21 to
+app-v22 boundary only, a governed v2 repair receipt may supply virtual coverage
+for missing pre-app-v20 compatibility rungs. Retained-transition coverage must
+bind the exact missing open-interval versions to a real later target activation
+at the same Comet height and block hash; direct retained or explicitly attested
+legacy-anchor claims remain virtual as well. No skipped rung is written under
+`upgrade:applied:*`. Cached fork gates, invented per-rung heights, loose
+subsumption, and missing/duplicate coverage do not satisfy the invariant. This
+check is confined to the app-v22 transition and recovery boundary, so
+historical pre-v22 replay retains its original behavior
+(`internal/abci/appv22_agent_capabilities.go`, `internal/abci/app.go`).
 
 App-v23 keeps that canonical app-v22 record as its immediate predecessor.
 Activation block H still executes with v22 semantics; H+1 is the first v23

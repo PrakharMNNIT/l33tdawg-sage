@@ -63,9 +63,19 @@ standing without duplicating signed registration or caller-scoped reads.
 Clients that skip the MCP initialization handshake keep the one-time first-tool
 fallback for compatibility.
 
-This is an MCP transport/ergonomics patch only. It does not change memory,
-agent, RBAC, federation, governance, or consensus semantics; **app-v26 remains
-the binary ceiling and v11.18.1 introduces no app-v27**.
+**Legacy-lineage recovery now represents real skip-ahead history truthfully.**
+When retained Comet history proves a version jump such as `1→7` or `8→11`, the
+app-v21 doctor emits a v2 transition claim at the real activation height and
+records the skipped predecessors as virtual, subsumed coverage. It never
+invents interleaved heights or writes synthetic `upgrade:applied:*` records.
+Every validator independently replays the retained history and hashes before
+an explicit vote, and the immutable audit is installed atomically only when
+app-v22 activates. Existing valid v1 receipts on already-upgraded app-v22+
+chains remain readable; new v1 repair proposals fail closed.
+
+The lineage change is confined to the exceptional app-v21 → app-v22 recovery
+ceremony. Memory, agent, RBAC, and federation policy are unchanged; **app-v26
+remains the binary ceiling and v11.18.1 introduces no app-v27**.
 
 Container: `ghcr.io/l33tdawg/sage:11.18.1`. SDK 11.18.1.
 

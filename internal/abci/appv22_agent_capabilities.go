@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/l33tdawg/sage/internal/store"
-	"github.com/l33tdawg/sage/internal/tx"
 )
 
 func (app *SageApp) postAppV22Fork(height int64) bool {
@@ -78,11 +77,13 @@ func (app *SageApp) validateAppV22Prerequisite() error {
 // canonical app-v6 record: the original upgrade protocol defined app-v6 as the
 // cumulative PoE target and reconcilePoEForkMonotonicity makes that persisted
 // activation consensus evidence that app-v2 through app-v5 rules activated
-// together. No synthesized/subsumed evidence is accepted for app-v7 or later.
+// together. A v2 immutable activation bundle may supply virtual coverage for
+// retained, observed skip-ahead transitions only through app-v19. Virtual
+// coverage never becomes an applied record and never arms a historical gate.
 //
-// The validator deliberately reads persisted audit records rather than cached
-// fork heights. In-memory gate subsumption is an execution convenience, not
-// proof that an independent app-v7+ state-machine version activated.
+// The validator deliberately resolves persisted records plus the immutable
+// bundle rather than cached fork heights. Bundle coverage is explicitly not
+// proof that each skipped state-machine version activated independently.
 //
 // This invariant is consulted only when proposing, executing, or restoring
 // app-v22. Historical blocks below app-v22 retain their original replay rules.
@@ -94,48 +95,11 @@ func (app *SageApp) validatePersistedAppV22PredecessorLadder() (int64, error) {
 		return 0, fmt.Errorf("app-v22 predecessor validation requires app state")
 	}
 
-	var previousHeight int64
-	for version := uint64(6); version <= 21; version++ {
-		name := tx.CanonicalUpgradeName(version)
-		rec, err := app.badgerStore.GetAppliedUpgrade(name)
-		if err != nil {
-			return 0, fmt.Errorf("read applied %s record: %w", name, err)
-		}
-		if rec == nil {
-			return 0, fmt.Errorf("missing canonical applied %s predecessor", name)
-		}
-		if rec.Name != name {
-			return 0, fmt.Errorf("applied %s predecessor has name %q", name, rec.Name)
-		}
-		if rec.TargetAppVersion != version {
-			return 0, fmt.Errorf(
-				"applied %s predecessor has target app version %d, want %d",
-				name, rec.TargetAppVersion, version,
-			)
-		}
-		if rec.AppliedHeight <= 0 {
-			return 0, fmt.Errorf(
-				"applied %s predecessor has non-positive height %d",
-				name, rec.AppliedHeight,
-			)
-		}
-		if previousHeight > 0 && rec.AppliedHeight <= previousHeight {
-			return 0, fmt.Errorf(
-				"applied %s predecessor height %d must be after app-v%d height %d",
-				name, rec.AppliedHeight, version-1, previousHeight,
-			)
-		}
-		// MarkUpgradeApplied can be one height ahead of persisted AppState only
-		// during the crash window between FinalizeBlock and Commit.
-		if rec.AppliedHeight > app.state.Height+1 {
-			return 0, fmt.Errorf(
-				"applied %s predecessor height %d is ahead of persisted app height %d",
-				name, rec.AppliedHeight, app.state.Height,
-			)
-		}
-		previousHeight = rec.AppliedHeight
+	if err := app.badgerStore.ValidateLegacyUpgradeLineageRepairAudit(); err != nil {
+		return 0, err
 	}
-	return previousHeight, nil
+	_, last, err := app.resolveAppV22Lineage(nil)
+	return last, err
 }
 
 func (app *SageApp) agentCapabilitiesAt(agentID string, height int64) (store.AgentCapabilities, error) {
