@@ -902,13 +902,141 @@ func TestWithNonceLease_FailsClosedOnUnusableInput(t *testing.T) {
 	assertKeyStillGrantable(t, valid, "rejected unusable input")
 }
 
-// TestWithNonceLease_PanicInSubmitReleasesTheSlot covers the path a plain
-// `release()` at the end of the body would miss. The lease wraps handler code
-// that can panic (a nil map, a nil RPC client); if the panic unwound past the
-// semaphore without draining it, the node would keep serving every other key
-// while silently refusing to ever sign again with this one.
-func TestWithNonceLease_PanicInSubmitReleasesTheSlot(t *testing.T) {
+// TestWithNonceLease_PanicInSubmitFencesOnlyRegisteredBytes pins BOTH halves of
+// the panic contract, which hinges on one piece of evidence: whether submit
+// registered its encoded transaction (RegisterSubmittedTx) before it died.
+//
+// BEFORE registration, nothing was handed to the network, so the panic must
+// release the slot with no fence — fencing there would have reconciliation
+// re-broadcast a transaction the caller was told never went out. AFTER
+// registration, the bytes may be sitting in a mempool, so releasing the slot is
+// the fail-open this file exists to prevent: the next caller would allocate
+// past them and the abandoned nonce would be rejected Code 4 with nothing in
+// the log to say why. The panic must leave the key FENCED on the registered
+// bytes, reconciliation must be handed those exact bytes, and only a proven
+// fate may reopen the key. (An earlier revision of this test pinned the
+// opposite — panic always releases — which documented the fail-open instead of
+// closing it.)
+func TestWithNonceLease_PanicInSubmitFencesOnlyRegisteredBytes(t *testing.T) {
+	setFenceTimingsForTest(t, fastFenceTimings())
+
+	// Half one: a panic BEFORE any registration releases the slot and fences
+	// nothing — the submission never reached the wire.
+	preSend := newLeaseTestKey(t)
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Fatal("expected the panic to propagate out of WithNonceLease")
+			}
+		}()
+		_ = WithNonceLease(context.Background(), preSend, func(uint64) error {
+			panic("submit exploded before anything was sent")
+		})
+	}()
+	if keyIsFenced(leaseKeyFor(t, preSend)) {
+		t.Fatal("a pre-registration panic fenced the key: nothing was in flight, so the fence could never be proven")
+	}
+	assertKeyStillGrantable(t, preSend, "a pre-registration panic")
+	if leaseEntryExists(leaseKeyFor(t, preSend)) {
+		t.Fatal("a panicking submit left the lease entry behind")
+	}
+
+	// Half two: a panic AFTER registration fences the key on the registered
+	// bytes.
 	sk := newLeaseTestKey(t)
+	key := leaseKeyFor(t, sk)
+	sent := []byte("registered-encoded-transaction-bytes")
+	resolve := make(chan struct{})
+	var (
+		probeMu   sync.Mutex
+		probedTxs [][]byte
+	)
+	resolver := func(ctx context.Context, encoded []byte) (TxOutcome, error) {
+		probeMu.Lock()
+		probedTxs = append(probedTxs, encoded)
+		probeMu.Unlock()
+		select {
+		case <-resolve:
+			return TxOutcome{Verdict: TxVerdictCommitted, Detail: "committed at height 12"}, nil
+		case <-ctx.Done():
+			return TxOutcome{}, ctx.Err()
+		}
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Fatal("expected the panic to propagate out of WithNonceLease")
+			}
+		}()
+		_ = WithNonceLease(context.Background(), sk, func(uint64) error {
+			RegisterSubmittedTx(sk, sent, resolver)
+			panic("submit exploded after the bytes were handed to the transport")
+		})
+	}()
+	if !keyIsFenced(key) {
+		t.Fatal("a post-registration panic released the key: the next caller can allocate past bytes " +
+			"that may still be in flight — the silent Code 4 loss the fence exists to prevent")
+	}
+	if leaseEntryExists(key) {
+		t.Fatal("a panicking submit left the lease entry behind")
+	}
+
+	// A caller arriving at the fenced key is refused, not allowed past.
+	fencedCtx, cancelFenced := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelFenced()
+	var allocated bool
+	blockedErr := WithNonceLease(fencedCtx, sk, func(uint64) error {
+		allocated = true
+		return nil
+	})
+	if allocated {
+		t.Fatal("a caller allocated a nonce past a panic-raised fence")
+	}
+	if !errors.Is(blockedErr, ErrSignerFenced) {
+		t.Fatalf("blocked caller got %v, want ErrSignerFenced", blockedErr)
+	}
+
+	// Proof lifts it, and reconciliation must have been driven with the exact
+	// registered bytes — any other payload can neither find the abandoned
+	// transaction nor re-submit it idempotently.
+	close(resolve)
+	waitUntil(t, func() bool { return !keyIsFenced(key) }, "a proven commit to lift the panic-raised fence")
+	probeMu.Lock()
+	probes := len(probedTxs)
+	var exact bool
+	if probes > 0 {
+		exact = string(probedTxs[0]) == string(sent)
+	}
+	probeMu.Unlock()
+	if probes == 0 {
+		t.Fatal("the panic-raised fence lifted without reconciling anything")
+	}
+	if !exact {
+		t.Fatal("reconciliation was not handed the registered bytes")
+	}
+	assertKeyStillGrantable(t, sk, "a proven panic-raised fence")
+}
+
+// TestWithNonceLease_NormalReturnClearsRegistration pins the cleanup half of
+// RegisterSubmittedTx's contract: a registration consumed by a NORMAL return —
+// here a definitive rejection, which rightly fences nothing — must not survive
+// into the key's next submission, where an unrelated pre-send panic would
+// otherwise fence on stale bytes from a transaction whose fate was already
+// decided.
+func TestWithNonceLease_NormalReturnClearsRegistration(t *testing.T) {
+	sk := newLeaseTestKey(t)
+	key := leaseKeyFor(t, sk)
+
+	rejected := errors.New("tx rejected in CheckTx (code 2): unauthorized")
+	if err := WithNonceLease(context.Background(), sk, func(uint64) error {
+		RegisterSubmittedTx(sk, []byte("bytes-whose-fate-consensus-decided"), nil)
+		return rejected
+	}); !errors.Is(err, rejected) {
+		t.Fatalf("got %v, want the submit error", err)
+	}
+	if keyIsFenced(key) {
+		t.Fatal("a definitive rejection fenced the key despite consensus having answered")
+	}
 
 	func() {
 		defer func() {
@@ -917,12 +1045,92 @@ func TestWithNonceLease_PanicInSubmitReleasesTheSlot(t *testing.T) {
 			}
 		}()
 		_ = WithNonceLease(context.Background(), sk, func(uint64) error {
-			panic("submit exploded")
+			panic("pre-send panic in the NEXT submission")
 		})
 	}()
+	if keyIsFenced(key) {
+		t.Fatal("a stale registration leaked into the next submission and fenced it on bytes " +
+			"from a transaction whose fate was already decided")
+	}
+	assertKeyStillGrantable(t, sk, "a cleared registration")
+}
 
-	assertKeyStillGrantable(t, sk, "a panicking submit")
-	if leaseEntryExists(leaseKeyFor(t, sk)) {
+// TestWithNonceLease_ClearSubmittedTxRetiresRegistrationMidSubmit pins the
+// window the deferred take cannot cover: a registration stays live for the
+// REST of submit after the transaction's fate is definitively known, so a
+// panic between a decoded consensus rejection and submit's return would fence
+// bytes that are provably not in flight. That fence cannot lift while the
+// refusal's cause persists (re-submission keeps being refused non-permanently,
+// the index never finds a never-included tx) — and because most CheckTx causes
+// are mutable state, it can end worse than a stall: a later re-grant lets
+// reconciliation's re-submit be admitted and COMMIT bytes whose caller was
+// already told they were rejected. ClearSubmittedTx is the adopter's way to
+// retire the record at the moment of proof; after it, a panic must RELEASE
+// like any pre-send panic.
+func TestWithNonceLease_ClearSubmittedTxRetiresRegistrationMidSubmit(t *testing.T) {
+	setFenceTimingsForTest(t, fastFenceTimings())
+	sk := newLeaseTestKey(t)
+	key := leaseKeyFor(t, sk)
+
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Fatal("expected the panic to propagate out of WithNonceLease")
+			}
+		}()
+		_ = WithNonceLease(context.Background(), sk, func(uint64) error {
+			RegisterSubmittedTx(sk, []byte("bytes-consensus-just-refused"), nil)
+			// The adopter decodes a hash-bound CheckTx refusal here: nothing is
+			// in flight, so it retires the registration...
+			ClearSubmittedTx(sk)
+			// ...and a panic in the leftover window (metrics, classification)
+			// must not buy a fence on the refused bytes.
+			panic("post-verdict bookkeeping exploded")
+		})
+	}()
+	if keyIsFenced(key) {
+		t.Fatal("a panic after ClearSubmittedTx fenced the key on bytes consensus had already " +
+			"refused; that fence either stalls the key while the refusal persists or, after a " +
+			"re-grant, commits a transaction its caller was told was rejected")
+	}
+	if leaseEntryExists(key) {
 		t.Fatal("a panicking submit left the lease entry behind")
 	}
+	assertKeyStillGrantable(t, sk, "a retired registration")
+
+	// The dual: clearing must be an act of proof, not a side effect — a
+	// registration made AFTER a clear (a second send in the same submit) must
+	// still fence on the newly registered bytes.
+	sk2 := newLeaseTestKey(t)
+	key2 := leaseKeyFor(t, sk2)
+	resent := []byte("second-send-in-the-same-submit")
+	var proven atomic.Bool
+	resolver := func(context.Context, []byte) (TxOutcome, error) {
+		if proven.Load() {
+			return TxOutcome{Verdict: TxVerdictCommitted, Detail: "committed at height 3"}, nil
+		}
+		return TxOutcome{Verdict: TxVerdictUnresolved, Detail: "tx not found"}, nil
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Fatal("expected the panic to propagate out of WithNonceLease")
+			}
+		}()
+		_ = WithNonceLease(context.Background(), sk2, func(uint64) error {
+			RegisterSubmittedTx(sk2, []byte("first-send"), resolver)
+			ClearSubmittedTx(sk2)
+			RegisterSubmittedTx(sk2, resent, resolver)
+			panic("submit exploded with the second send on the wire")
+		})
+	}()
+	if !keyIsFenced(key2) {
+		t.Fatal("a clear erased a LATER registration's protection: the second send's bytes may be " +
+			"in flight and the slot was released over them")
+	}
+	// Resolve the deliberately raised fence with proof so it cannot leak into
+	// later tests in the package.
+	proven.Store(true)
+	waitUntil(t, func() bool { return !keyIsFenced(key2) }, "the eventual proof to lift the fence")
+	assertKeyStillGrantable(t, sk2, "a proven panic-raised fence after a mid-submit clear")
 }

@@ -235,31 +235,37 @@ var (
 // is refused immediately with ErrSigningQuiesced, before any lease or nonce.
 // Same meaning: nothing was signed or sent.
 //
-// A PANIC out of submit propagates and releases the slot; it does NOT fence.
-// This is not the fail-open the fence rejects elsewhere: a panic carries no
-// encoded transaction, and the fence's entire mechanism is to identify and
-// RE-SUBMIT those exact bytes, so a fence raised here could never be proven and
-// would be a permanent hold bought with no evidence at all. The panic is made
-// loud twice over — a structured submit_panic event names the key before the
-// panic continues unwinding to the caller — because the residual it leaves is
-// real: if the bytes WERE already on the wire, the freed slot lets the next
-// caller allocate past them, and that Code 4 would otherwise be untraceable.
-// The contract that keeps the residual small is on the adopter: code that can
-// panic AFTER putting bytes on the wire must recover and return an
-// Indeterminate error carrying those bytes, because only it knows they were
-// sent. web/rbac_signing.go's broadcast helpers do exactly that — they convert
-// a panic raised while the request was on the wire into an indeterminate
-// result, so for every web adopter the fence still goes up. (Contrast the
-// RESOLVER panic in nonce_fence.go, which does have the bytes and therefore
-// keeps the fence and retries.)
+// A PANIC out of submit is split by ONE fact: whether submit had already told
+// the lease which bytes were about to go out (RegisterSubmittedTx).
+//   - Registered: the panic is an UNOBSERVED OUTCOME, exactly like a broken
+//     connection, and the key is FENCED on the registered bytes before the
+//     panic continues unwinding. The registration is what makes the fence
+//     provable — reconciliation identifies and re-submits those exact bytes —
+//     so this is not a permanent hold bought with no evidence.
+//   - Not registered: nothing is in flight — either nothing had been handed to
+//     the network yet (the adopter's contract is to register immediately before
+//     the send), or the fate was already decided and the adopter retired the
+//     record on that proof (ClearSubmittedTx after a hash-bound consensus
+//     rejection). The slot is released; fencing would have reconciliation
+//     broadcast a transaction the caller was told never went out, or hold the
+//     key forever over bytes consensus already refused.
+//
+// Both paths emit a structured submit_panic event naming the key before the
+// panic continues unwinding to the caller. An adopter that broadcasts WITHOUT
+// registering keeps the old residual: a post-send panic then releases the slot,
+// the next caller allocates past bytes that may be in flight, and the eventual
+// Code 4 is untraceable — which is why every broadcast helper in
+// web/rbac_signing.go registers at the exact point the bytes reach the
+// transport. (Contrast the RESOLVER panic in nonce_fence.go, which always has
+// the bytes and therefore keeps the fence and retries.)
 //
 // DEADLOCK: the lock is taken and released entirely inside this function and
 // never spans a return, so the only way to deadlock is for submit to reach back
-// into WithNonceLease with the same key. Callers must not do that. The one
-// adopter today (web.DashboardHandler.signAndBroadcastCommitContext) submits via
-// CometBFT's HTTP RPC, and internal/abci does not import web, so the
-// FinalizeBlock work that /broadcast_tx_commit waits on cannot call back into a
-// lease. Do NOT "fix" a future re-entrancy report with a reentrant lock — a
+// into WithNonceLease with the same key. Callers must not do that. The web
+// adopters today (signAndBroadcastCommitPrepared and signAndBroadcastSyncContext,
+// plus the app-v23 control path layered on them) all submit via CometBFT's HTTP
+// RPC, and internal/abci does not import web, so the FinalizeBlock work that
+// /broadcast_tx_commit waits on cannot call back into a lease. Do NOT "fix" a future re-entrancy report with a reentrant lock — a
 // reentrant lease would silently re-permit the interleaving this exists to stop.
 func WithNonceLease(ctx context.Context, sk ed25519.PrivateKey, submit func(nonce uint64) error) error {
 	if submit == nil {
@@ -333,24 +339,55 @@ func WithNonceLease(ctx context.Context, sk ed25519.PrivateKey, submit func(nonc
 		return ErrSigningQuiesced
 	}
 
-	// Guard the adopter's own code. A panic out of submit AFTER the bytes were
-	// handed to the kernel releases the slot with no fence — a residual the
-	// fence cannot close from here, because a panic carries no encoded bytes to
-	// reconcile (see the contract in the function comment). What CAN be done is
-	// make the exposure loud: emit a structured event naming the key before the
-	// panic continues, so "this key's next submission was rejected Code 4 for no
-	// visible reason" has a line in the log pointing at the real cause. The
-	// panic value itself is never logged here — it can be an error built from a
-	// broadcast URL, which carries the whole signed transaction.
+	// Discard any registration a previous holder leaked. The deferred take below
+	// clears every exit of THIS call, so a live entry here can only come from
+	// RegisterSubmittedTx being misused outside a lease — and stale bytes left in
+	// place would make a pre-send panic in THIS submission fence on a transaction
+	// it never touched.
+	takeRegisteredSubmission(key)
+
+	// Guard the adopter's own code, and decide a panic's meaning from EVIDENCE
+	// rather than assuming either way. If submit registered the encoded bytes
+	// before handing them to the transport (RegisterSubmittedTx), a panic after
+	// that point is an unobserved outcome — the node may have accepted the
+	// transaction — so the key is fenced on those exact bytes BEFORE the deferred
+	// lease release runs, exactly as an Indeterminate return would have. With no
+	// registration the panic happened before anything was sent, so the slot is
+	// released: fencing there would have reconciliation broadcast a transaction
+	// the caller was told never went out. The take also clears the registration
+	// on NORMAL returns, so a registration can never leak into the key's next
+	// submission and mislabel an unrelated panic. The panic value itself is never
+	// logged on either path — it can be an error built from a broadcast URL,
+	// which carries the whole signed transaction.
 	defer func() {
-		if r := recover(); r != nil {
+		reg := takeRegisteredSubmission(key)
+		r := recover()
+		if r == nil {
+			return
+		}
+		if reg != nil {
+			// Fence BEFORE the deferred release runs, for the same reason the
+			// indeterminate return path does: reversed, the next caller could
+			// take the freed slot and allocate past these bytes in the window
+			// before the fence appeared.
+			fenceSubmission(key, &indeterminateSubmit{
+				err:     errSubmitPanickedOnWire,
+				cause:   fenceCauseSubmitPanic,
+				encoded: reg.encoded,
+				resolve: reg.resolve,
+			})
 			emitFenceEvent("submit_panic",
 				fenceKV("signer", signerPrefix(key)),
-				fenceKV("note", "submit panicked while holding this key's lease; the slot is released WITHOUT a "+
-					"fence because a panic carries no encoded transaction to reconcile — if bytes were already "+
-					"on the wire, this key's next allocation may overtake them (Code 4)"))
+				fenceKV("note", "submit panicked AFTER registering its transaction as handed to the network; "+
+					"the key is FENCED on those exact bytes and reconciliation will prove their fate"))
 			panic(r)
 		}
+		emitFenceEvent("submit_panic",
+			fenceKV("signer", signerPrefix(key)),
+			fenceKV("note", "submit panicked with no live registration (never registered via RegisterSubmittedTx, "+
+				"or retired on definitive proof via ClearSubmittedTx), so nothing is in flight and the slot is "+
+				"released without a fence"))
+		panic(r)
 	}()
 
 	subErr := submit(MonotonicNonce(sk))
@@ -362,6 +399,132 @@ func WithNonceLease(ctx context.Context, sk ed25519.PrivateKey, submit func(nonc
 		fenceSubmission(key, indeterminate)
 	}
 	return subErr
+}
+
+// registeredSubmission is the record RegisterSubmittedTx leaves for the panic
+// guard: the exact encoded transaction submit declared it was handing to the
+// network, plus the resolver that can prove its fate.
+type registeredSubmission struct {
+	encoded []byte
+	resolve TxResolveFunc
+}
+
+// registeredMu guards registeredSubmissions. Like leases and fences the map is
+// SPARSE: an entry exists only between RegisterSubmittedTx inside a running
+// submit and the deferred take in WithNonceLease, so at most one entry per key
+// with an in-flight submission — the lease serializes writers per key.
+var (
+	registeredMu          sync.Mutex
+	registeredSubmissions = make(map[string]*registeredSubmission)
+)
+
+// errSubmitPanickedOnWire raises the fence when submit panics after
+// registration. It is a fixed message on purpose: the panic value routinely
+// wraps a broadcast error whose URL carries the entire signed transaction, so
+// nothing derived from it may enter the fence record.
+var errSubmitPanickedOnWire = errors.New(
+	"submit panicked after handing its transaction to the network; the outcome was never observed")
+
+// RegisterSubmittedTx declares, from INSIDE a WithNonceLease submit callback and
+// immediately BEFORE the encoded bytes are handed to the transport, that these
+// exact bytes are about to go out for sk.
+//
+// This is what closes the lease's one remaining fail-open: a panic out of
+// submit. Without a registration the lease cannot tell a panic before the send
+// (nothing in flight — releasing is correct) from a panic after it (the node
+// may have accepted the transaction — releasing lets the next caller allocate
+// past it, the silent Code 4 loss the fence exists to prevent). With one, a
+// panic is fenced on these bytes exactly as an Indeterminate return would be,
+// and the fence is provable because reconciliation has the bytes to identify
+// and re-submit. WithNonceLease clears the registration on every return, so an
+// adopter never NEEDS to unregister — a normal return, definitive or
+// indeterminate, supersedes it. But the record stays live for the REMAINDER of
+// submit even after the transaction's fate becomes definitively known: an
+// adopter that decodes a definitive verdict and then keeps running code before
+// returning should retire the record with ClearSubmittedTx at that point, so a
+// panic in the leftover window cannot fence bytes that are provably not in
+// flight (see ClearSubmittedTx for what such a fence costs: an indefinite hold
+// at best, a late silent commit of "rejected" bytes at worst).
+//
+// encoded is copied for the same reason Indeterminate copies it: the caller's
+// buffer usually comes from an encoder and may be reused, and a fence must
+// re-submit the bytes that were SENT, not whatever the buffer holds later.
+// resolve reconciles the transaction on the panic path; nil falls back to the
+// process-wide resolver installed by SetTxResolverFunc.
+//
+// Calling it twice in one submit replaces the record: the latest registration
+// names the bytes currently at risk. A key WithNonceLease would refuse (wrong
+// length) cannot hold a lease and so has no submission to protect; empty bytes
+// could raise only an unprovable fence (nothing to identify or re-submit),
+// which is a permanent hold bought with no evidence. Both are ignored rather
+// than tracked.
+func RegisterSubmittedTx(sk ed25519.PrivateKey, encoded []byte, resolve TxResolveFunc) {
+	if len(sk) != ed25519.PrivateKeySize || len(encoded) == 0 {
+		return
+	}
+	pub, ok := sk.Public().(ed25519.PublicKey)
+	if !ok {
+		return
+	}
+	txBytes := make([]byte, len(encoded))
+	copy(txBytes, encoded)
+	registeredMu.Lock()
+	registeredSubmissions[string(pub)] = &registeredSubmission{encoded: txBytes, resolve: resolve}
+	registeredMu.Unlock()
+}
+
+// ClearSubmittedTx retires sk's registration from INSIDE a WithNonceLease
+// submit callback, at the moment a DEFINITIVE outcome for the registered bytes
+// has just been decoded — a hash-bound consensus rejection, which proves
+// nothing is left in flight.
+//
+// It exists because the registration otherwise stays live until submit
+// returns. A panic in that leftover window (recording metrics, classifying the
+// error) would fence a transaction consensus already refused — and THAT fence
+// goes wrong in one of two ways, depending on whether the refusal's cause
+// persists:
+//
+//   - While it persists (and forever, only for a cause that cannot un-happen),
+//     re-submission keeps drawing the same non-permanent-class refusal
+//     (checkTxRefusalIsPermanent accepts only the nonce-gate code), the index
+//     never finds a never-included transaction, and the signer's committed
+//     nonce cannot advance to make the supersession proof reachable. The key
+//     is refused, and the coordinated restart vetoed, indefinitely — a hold
+//     bought on bytes that were provably never in flight.
+//   - But most CheckTx refusals are MUTABLE state — authorization, clearance,
+//     org membership, domain grants can all be granted back a block later
+//     (checkTxRefusalIsPermanent's own doc). If that happens, reconciliation's
+//     re-submit of the refused bytes is ADMITTED — the fenced key never
+//     advanced its nonce past them — and can COMMIT, lifting the fence
+//     fate=committed on a transaction whose caller was already told,
+//     truthfully at the time, that it was definitively rejected. It executes
+//     late and silently, and an operator who redid the change by hand has now
+//     applied it twice. That is strictly worse than the loud stall above.
+//
+// Call it ONLY on proof that nothing is in flight. Clearing after an
+// indeterminate result would re-open the exact fail-open RegisterSubmittedTx
+// closes: the next panic would release the slot over bytes that may be in a
+// mempool.
+func ClearSubmittedTx(sk ed25519.PrivateKey) {
+	if len(sk) != ed25519.PrivateKeySize {
+		return
+	}
+	pub, ok := sk.Public().(ed25519.PublicKey)
+	if !ok {
+		return
+	}
+	takeRegisteredSubmission(string(pub))
+}
+
+// takeRegisteredSubmission removes and returns key's registration, or nil.
+// Removal and read are one atomic step so the record can never be consumed
+// twice — once by a panic fence and again by a later submission's guard.
+func takeRegisteredSubmission(key string) *registeredSubmission {
+	registeredMu.Lock()
+	reg := registeredSubmissions[key]
+	delete(registeredSubmissions, key)
+	registeredMu.Unlock()
+	return reg
 }
 
 // acquireNonceLease blocks until this goroutine owns key's submission slot, or

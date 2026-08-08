@@ -19,10 +19,6 @@ import (
 	"github.com/l33tdawg/sage/internal/tx"
 )
 
-// commitOKBody is what a single-validator node returns for an accepted
-// commit-confirmed broadcast.
-const commitOKBody = `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ABC123","height":"42"}}`
-
 // nonceFromBroadcast decodes the tx a CometBFT stub was just handed and returns
 // its replay nonce and hex signer id. Reading them off the wire — rather than
 // off the ParsedTx the caller still owns — is the point of these tests: the
@@ -90,7 +86,7 @@ func TestSignAndBroadcastCommitContextEmitsAscendingNoncesForOneKey(t *testing.T
 		mu.Lock()
 		arrived = append(arrived, arrival{nonce: nonce, signer: signer})
 		mu.Unlock()
-		_, _ = w.Write([]byte(commitOKBody))
+		writeCommitOK(w, r)
 	}))
 	t.Cleanup(rpc.Close)
 
@@ -153,7 +149,7 @@ func TestSignAndBroadcastCommitContextDoesNotSerializeDistinctKeys(t *testing.T)
 		bothIn   = make(chan struct{})
 		stalled  bool
 	)
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		inFlight++
 		reached := inFlight == 2
@@ -170,7 +166,7 @@ func TestSignAndBroadcastCommitContextDoesNotSerializeDistinctKeys(t *testing.T)
 			stalled = true
 			mu.Unlock()
 		}
-		_, _ = w.Write([]byte(commitOKBody))
+		writeCommitOK(w, r)
 	}))
 	t.Cleanup(rpc.Close)
 
@@ -206,11 +202,11 @@ func TestSignAndBroadcastCommitContextCancelledBeforeSigningNeverBroadcasts(t *t
 
 	var broadcasts int
 	var mu sync.Mutex
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		broadcasts++
 		mu.Unlock()
-		_, _ = w.Write([]byte(commitOKBody))
+		writeCommitOK(w, r)
 	}))
 	t.Cleanup(rpc.Close)
 
@@ -267,7 +263,7 @@ func TestSignAndBroadcastCommitContextCancelledWhileQueuedNeverBroadcasts(t *tes
 			close(holderIn)
 			<-releaseHolder
 		}
-		_, _ = w.Write([]byte(commitOKBody))
+		writeCommitOK(w, r)
 	}))
 	t.Cleanup(rpc.Close)
 

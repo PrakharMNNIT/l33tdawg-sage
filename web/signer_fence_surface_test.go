@@ -82,8 +82,17 @@ func answerCommitted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The re-submit leg, reached only if a probe raced the flip: report the
-	// commit a real node would.
-	_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0,"log":""},"tx_result":{"code":0,"log":""},"hash":"RESOLVED","height":"1"}}`)
+	// commit a real node would — with the REAL hash of the submitted bytes.
+	// The resolver now refuses any verdict whose hash is not bound to the
+	// exact bytes it re-submitted, so a placeholder here would stall the drain
+	// for an extra retry interval instead of proving anything.
+	txHex := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
+	hash := ""
+	if raw, err := hex.DecodeString(txHex); err == nil {
+		sum := tx.CometTxHash(raw)
+		hash = strings.ToUpper(hex.EncodeToString(sum[:]))
+	}
+	_, _ = fmt.Fprintf(w, `{"result":{"check_tx":{"code":0,"log":""},"tx_result":{"code":0,"log":""},"hash":%q,"height":"1"}}`, hash)
 }
 
 // fenceOneSigningKey drives a real indeterminate broadcast so the given key ends
@@ -435,6 +444,76 @@ func TestSignerFenceHealthHidesIdentifiersFromUnauthenticatedCallers(t *testing.
 		"the status surface carries a broadcast URL, which contains the signed transaction")
 }
 
+// TestManualRestartAdviceRefusesToAdviseARestartWhileFenced pins the central
+// helper every "fully quit SAGE and open it again" surface now routes through.
+// The manual quit-and-reopen lane has no enforcement hook — the process cannot
+// intercept Cmd-Q — so while a signing key is fenced, the ADVICE is the only
+// control that lane has, and it must become the hold notice instead of the
+// instruction.
+func TestManualRestartAdviceRefusesToAdviseARestartWhileFenced(t *testing.T) {
+	const instruction = "Fully quit SAGE and open it again to finish."
+
+	// Nothing held: the instruction passes through verbatim, or ordinary
+	// setting changes would nag operators about fences that do not exist.
+	require.Empty(t, tx.FencedSigners(), "an earlier test leaked a fence into this one")
+	assert.Equal(t, instruction, manualRestartAdvice(instruction))
+
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	fenceOneSigningKey(t, key)
+
+	advice := manualRestartAdvice(instruction)
+	assert.NotContains(t, advice, instruction,
+		"a fenced signer's advice still tells the operator to quit and reopen — the manual bypass of the restart veto")
+	lowered := strings.ToLower(advice)
+	assert.Contains(t, lowered, "do not quit or restart",
+		"the hold notice must say plainly that restarting is the wrong move")
+	assert.Contains(t, lowered, "may still be in flight",
+		"the hold notice must say WHY: the fence is protecting a transaction whose fate is unproven")
+}
+
+// TestEmbeddingsProviderSwitchDoesNotSwallowTheRestartVeto is the regression
+// for the worst of the manual-restart advice sites: persistEmbeddingProvider
+// called RequestRestart, the fence veto FIRED, and the handler swallowed the
+// error and answered 200 telling the operator to quit and relaunch by hand —
+// recommending the exact action the veto had just refused, at the exact moment
+// it was known to be unsafe.
+func TestEmbeddingsProviderSwitchDoesNotSwallowTheRestartVeto(t *testing.T) {
+	if !restartInProcessSupported() {
+		t.Skip("the RequestRestart error branch is unreachable where in-process restart is unsupported")
+	}
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	fenceOneSigningKey(t, key)
+
+	vetoed := false
+	h := &DashboardHandler{
+		SetEmbeddingProvider: func(string) error { return nil },
+		RequestRestart: func() error {
+			// What cmd/sage-gui's wiring does with a fence held: refuse.
+			vetoed = true
+			return fmt.Errorf("restart refused: %s", tx.RestartVetoReason())
+		},
+	}
+	rec := httptest.NewRecorder()
+	h.persistEmbeddingProvider(rec, httptest.NewRequest(http.MethodPost, "/v1/dashboard/embeddings/provider", nil), "hash")
+
+	require.True(t, vetoed, "test wiring: the restart request never ran")
+	require.Equal(t, http.StatusOK, rec.Code,
+		"the frontend discards non-200 guidance here; the honesty lives in the message")
+	var body struct {
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	lowered := strings.ToLower(body.Message)
+	assert.Contains(t, lowered, "do not quit or restart",
+		"the veto fired and the operator must be told to hold, not to relaunch by hand")
+	for _, forbidden := range []string{"fully quit", "relaunch", "reopen"} {
+		assert.NotContains(t, lowered, forbidden,
+			"the response advises the manual restart the veto just refused")
+	}
+}
+
 // TestBroadcastRequestBuildFailureNeverQuotesTheSignedTransaction pins the last
 // origin of the P0 signed-byte leak. http.NewRequestWithContext fails with a
 // *url.Error whose message is `parse "<the whole URL>": …`, and a broadcast URL
@@ -449,7 +528,9 @@ func TestBroadcastRequestBuildFailureNeverQuotesTheSignedTransaction(t *testing.
 	signed := []byte("signed-transaction-bytes")
 	signedHex := hex.EncodeToString(signed)
 
-	hash, height, txLog, err := broadcastTxCommitWebContext(context.Background(), badRPC, signed)
+	_, buildKey, keyErr := ed25519.GenerateKey(nil)
+	require.NoError(t, keyErr)
+	hash, height, txLog, err := broadcastTxCommitWebContext(context.Background(), badRPC, buildKey, signed)
 	require.Error(t, err)
 	assert.Empty(t, hash)
 	assert.Zero(t, height)
@@ -460,11 +541,73 @@ func TestBroadcastRequestBuildFailureNeverQuotesTheSignedTransaction(t *testing.
 		"the request-build error quotes the broadcast URL, which contains the whole signed transaction")
 	assert.NotContains(t, err.Error(), "tx=0x", "the request-build error quotes the broadcast URL")
 
-	syncErr := broadcastTxSyncContext(context.Background(), badRPC, signed)
+	syncErr := broadcastTxSyncContext(context.Background(), badRPC, buildKey, signed)
 	require.Error(t, syncErr)
 	assert.False(t, isIndeterminateCommitError(syncErr))
 	assert.NotContains(t, syncErr.Error(), signedHex)
 	assert.NotContains(t, syncErr.Error(), "tx=0x")
+}
+
+// TestBroadcastCommitOversizedBodyIsIndeterminate is the web half of the
+// oversized-body bound. The commit path's decoder feeds the SAME retry engine
+// as internal/tx's reconciliation (an indeterminate result fences, and the
+// fence re-reads forever), so it takes the same cap — and the same rule: a
+// body past the cap proves nothing, however perfect the envelope inside it,
+// and must be indeterminate rather than a success or a definitive rejection.
+func TestBroadcastCommitOversizedBodyIsIndeterminate(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	signed := []byte("oversized-commit-answer")
+	sum := tx.CometTxHash(signed)
+	boundHash := strings.ToUpper(hex.EncodeToString(sum[:]))
+	pad := strings.Repeat("a", int(tx.CometRPCMaxResponseBytes)+(1<<20))
+
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"pad":"`+pad+`","result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"`+
+			boundHash+`","height":"7"}}`)
+	}))
+	t.Cleanup(rpc.Close)
+
+	hash, height, txLog, err := broadcastTxCommitWebContext(context.Background(), rpc.URL, key, signed)
+	require.Error(t, err)
+	assert.Empty(t, hash)
+	assert.Zero(t, height)
+	assert.Empty(t, txLog)
+	assert.True(t, isIndeterminateCommitError(err),
+		"an oversized body is not proof of anything: it must fence, not fail definitively")
+}
+
+func TestBroadcastCommitTrailingDataIsIndeterminate(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	signed := []byte("trailing-commit-answer")
+	sum := tx.CometTxHash(signed)
+	boundHash := strings.ToUpper(hex.EncodeToString(sum[:]))
+	proof := `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"` +
+		boundHash + `","height":"7"}}`
+
+	for _, tc := range []struct {
+		name   string
+		suffix string
+	}{
+		{name: "second JSON document", suffix: `{}`},
+		{name: "oversized whitespace suffix", suffix: strings.Repeat(" ", int(tx.CometRPCMaxResponseBytes)+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, proof+tc.suffix)
+			}))
+			t.Cleanup(rpc.Close)
+
+			hash, height, txLog, err := broadcastTxCommitWebContext(context.Background(), rpc.URL, key, signed)
+			require.Error(t, err)
+			assert.Empty(t, hash)
+			assert.Zero(t, height)
+			assert.Empty(t, txLog)
+			assert.True(t, isIndeterminateCommitError(err),
+				"a non-single-document response is not proof and must hold the fence")
+		})
+	}
 }
 
 // TestBackgroundProducersAllocateNoncesUnderTheLease is condition 7 at the web

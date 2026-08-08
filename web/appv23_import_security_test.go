@@ -5,7 +5,6 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -131,7 +130,7 @@ func TestAppV23ImportRotatedRootConfirmsImmutablePrincipalProjection(t *testing.
 			ConfidenceScore: parsed.MemorySubmit.ConfidenceScore,
 			Status:          memory.StatusProposed, CreatedAt: time.Now().UTC(),
 		}))
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"IMPORT","height":"4"}}`)
+		writeCommitOKAt(w, r, 4, "")
 	}))
 	defer rpc.Close()
 
@@ -165,9 +164,9 @@ func TestAppV23ImportConsensusRejectionNeverWritesOffChain(t *testing.T) {
 	fixture := newAppV23AccessFixture(t)
 	sqlStore := appV23ImportSQLStore(t)
 	var calls atomic.Int32
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":9,"log":"denied"},"hash":"REJECT","height":"2"}}`)
+		writeCommitTxRejected(w, r, 9, "denied", 2)
 	}))
 	defer rpc.Close()
 

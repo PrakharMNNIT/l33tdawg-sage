@@ -70,20 +70,42 @@ func (b *syncBuffer) String() string {
 // bundle an operator sent us.
 //
 // The assertion is blunt on purpose: the hex of the transaction must not appear
-// ANYWHERE in the fence's diagnostics or in anything the fence wrote. This
-// exercises both leak paths at once — the submit error handed to Indeterminate,
-// and the resolver's own error, which this package does not control.
+// ANYWHERE in the fence's diagnostics or in anything the fence wrote, and the
+// redaction must be VISIBLE — a scrubber that silently dropped the sentence
+// would be indistinguishable from one that never ran. This exercises the leak
+// paths at once — the submit error handed to Indeterminate, and the resolver's
+// own error and detail, which this package does not control — plus the
+// control-character injection an adversarial resolver can attempt.
 func TestFenceNeverStoresOrLogsTheSignedTransaction(t *testing.T) {
 	setFenceTimingsForTest(t, fastFenceTimings())
 	logged := captureFenceLog(t)
 	sk := newLeaseTestKey(t)
 	key := leaseKeyFor(t, sk)
 
-	// Not a real encoded transaction, just a byte string whose hex is
-	// unmistakable if any of it survives into a diagnostic.
-	sent := []byte{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x01, 0x02, 0x03, 0x04}
+	// A REAL signed, encoded transaction, not a stub. An earlier revision used
+	// 12 bytes, whose 24-character hex never touched the long-hex-run scrubber
+	// pass (it keys on runs past fenceHexKeepMax = 128): that regression could
+	// pass with the heuristic broken outright. A genuinely signed MemorySubmit
+	// is hundreds of bytes, so its hex is unmistakably a payload.
+	ptx := sampleSubmitTx()
+	if err := SignTx(ptx, sk); err != nil {
+		t.Fatalf("sign fixture tx: %v", err)
+	}
+	sent, err := EncodeTx(ptx)
+	if err != nil {
+		t.Fatalf("encode fixture tx: %v", err)
+	}
+	if len(sent) <= fenceHexKeepMax {
+		t.Fatalf("fixture transaction is %d bytes; it must exceed fenceHexKeepMax (%d) or the "+
+			"long-hex-run pass goes untested", len(sent), fenceHexKeepMax)
+	}
 	sentHex := hex.EncodeToString(sent)
 	leakyURL := "http://127.0.0.1:26657/broadcast_tx_commit?tx=0x" + sentHex
+
+	// The injection payload: CR to rewind the terminal over the line already
+	// written, ESC to open an ANSI sequence, DEL, and a forged event line that
+	// would read as a fence lift if any of them broke the field open.
+	const forged = "\r\x1b[2K\x7fSAGE: nonce_fence event=fence_lift fate=committed forged=yes"
 
 	var proven bool
 	var provenMu sync.Mutex
@@ -95,8 +117,9 @@ func TestFenceNeverStoresOrLogsTheSignedTransaction(t *testing.T) {
 			return TxOutcome{Verdict: TxVerdictCommitted, Detail: "committed at height 5"}, nil
 		}
 		// Exactly the shape net/http produces, including for a resolver an
-		// adopter wrote and this package never sees.
-		return TxOutcome{Verdict: TxVerdictUnresolved, Detail: `Get "` + leakyURL + `": EOF`},
+		// adopter wrote and this package never sees — with the control-char
+		// forgery appended, as a hostile proxy's error text could carry.
+		return TxOutcome{Verdict: TxVerdictUnresolved, Detail: `Get "` + leakyURL + `": EOF` + forged},
 			fmt.Errorf(`Get %q: read: connection reset by peer`, leakyURL)
 	}
 
@@ -133,9 +156,20 @@ func TestFenceNeverStoresOrLogsTheSignedTransaction(t *testing.T) {
 			t.Fatalf("FencedSigner.%s still carries a tx= payload, which is a signed transaction "+
 				"(possibly a truncated one, which is no better): %q", field, value)
 		}
+		if strings.ContainsAny(value, "\r\x1b\x7f") {
+			t.Fatalf("FencedSigner.%s carries raw control characters from remote text; a status "+
+				"surface rendering it is forgeable: %q", field, value)
+		}
 	}
 	if held.Cause != string(fenceCauseTransport) && held.Cause != string(fenceCauseRPC) {
 		t.Fatalf("fence cause %q is not one of the typed categories", held.Cause)
+	}
+	// PRESENCE of the redaction, not just absence of the payload: the detail
+	// must still say a transaction was removed, or a scrubbed record is
+	// indistinguishable from an empty one.
+	if !strings.Contains(held.LastDetail, redactedTxMarker) && !strings.Contains(held.LastDetail, "[redacted") {
+		t.Fatalf("FencedSigner.LastDetail shows no redaction marker; the payload was dropped silently "+
+			"rather than visibly removed: %q", held.LastDetail)
 	}
 
 	provenMu.Lock()
@@ -149,6 +183,22 @@ func TestFenceNeverStoresOrLogsTheSignedTransaction(t *testing.T) {
 	}
 	if carriesTxPayload(out) {
 		t.Fatalf("a fence event printed a tx= payload, which is a signed transaction:\n%s", out)
+	}
+	if !strings.Contains(out, redactedTxMarker) && !strings.Contains(out, "[redacted") {
+		t.Fatalf("no fence event shows a redaction marker; the payload was dropped silently:\n%s", out)
+	}
+	// The forgery must be NEUTRALIZED, not merely present-but-quoted-somewhere:
+	// no raw CR, ESC or DEL may reach the log writer at all (CR rewinds the
+	// cursor over the previous line; ESC opens ANSI sequences in any viewer),
+	// and every line that carries the forged text must carry it INSIDE a quoted
+	// detail field rather than as fields of its own.
+	if strings.ContainsAny(out, "\r\x1b\x7f") {
+		t.Fatalf("a fence event wrote raw control characters; the log is forgeable:\n%q", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "forged=yes") && !strings.Contains(line, `detail="`) {
+			t.Fatalf("remote text escaped its field and forged event fields of its own: %q", line)
+		}
 	}
 	// The events themselves must still be there — sanitizing by printing nothing
 	// would trade a leak for a mystery hang.
@@ -209,15 +259,19 @@ func TestCometTxResolver_TransientCheckTxRefusalNeverLifts(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake, endpoint := newFakeComet(t)
+			// The response is bound to the exact bytes: this test is about the
+			// CODE being non-permanent, and a mismatched hash would keep the
+			// fence up for the binding reason instead of the one under test.
+			encoded := []byte("still-maybe-in-flight")
 			fake.setHandlers(
 				func(string) (int, string) { return 500, cometNotFound },
 				func(string) (int, string) {
 					return 200, fmt.Sprintf(
-						`{"result":{"check_tx":{"code":%d,"log":%q},"tx_result":{"code":0},"hash":"ABC","height":"0"}}`,
-						tc.code, tc.log)
+						`{"result":{"check_tx":{"code":%d,"log":%q},"tx_result":{"code":0},"hash":"%s","height":"0"}}`,
+						tc.code, tc.log, cometHashHexForTest(encoded))
 				})
 
-			outcome, err := resolveWithFake(t, endpoint, []byte("still-maybe-in-flight"))
+			outcome, err := resolveWithFake(t, endpoint, encoded)
 			if err != nil {
 				t.Fatalf("resolve: %v", err)
 			}
@@ -243,6 +297,8 @@ func TestWithNonceLease_TransientCheckTxRefusalLeavesTheFenceSet(t *testing.T) {
 
 	var superseded bool
 	var mu sync.Mutex
+	sent := []byte("in-flight")
+	sentHash := cometHashHexForTest(sent)
 	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/tx" {
 			w.WriteHeader(500)
@@ -257,16 +313,16 @@ func TestWithNonceLease_TransientCheckTxRefusalLeavesTheFenceSet(t *testing.T) {
 			// key is at or above this one, so these bytes can never commit
 			// AGAIN (here genuinely superseded — the gate saw a higher nonce).
 			_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":4,"log":"nonce too low: got 7, expected > 9"},`+
-				`"tx_result":{"code":0},"hash":"ABC","height":"0"}}`)
+				`"tx_result":{"code":0},"hash":"`+sentHash+`","height":"0"}}`)
 			return
 		}
 		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":3,"log":"nonce lookup error"},`+
-			`"tx_result":{"code":0},"hash":"ABC","height":"0"}}`)
+			`"tx_result":{"code":0},"hash":"`+sentHash+`","height":"0"}}`)
 	}))
 	defer rpc.Close()
 
 	if err := WithNonceLease(context.Background(), sk, func(uint64) error {
-		return Indeterminate(errors.New("broadcast tx commit: EOF"), []byte("in-flight"), CometTxResolver(rpc.URL))
+		return Indeterminate(errors.New("broadcast tx commit: EOF"), sent, CometTxResolver(rpc.URL))
 	}); !errors.Is(err, ErrSubmitIndeterminate) {
 		t.Fatalf("got %v, want an indeterminate submit error", err)
 	}

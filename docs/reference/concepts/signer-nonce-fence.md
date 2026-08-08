@@ -41,6 +41,29 @@ The **signer fence** closes that: an adopter that cannot rule the transaction ou
 returns its error wrapped in `tx.Indeterminate(err, encodedBytes, resolver)`, and
 the lease closes that signing key.
 
+A **panic** out of `submit` is handled by evidence, not assumption. An adopter
+calls `tx.RegisterSubmittedTx(sk, encodedBytes, resolver)` immediately before
+handing the bytes to the transport (the web broadcast helpers do this at the
+exact instant the request is issued). If `submit` then panics, the lease fences
+the key on the registered bytes — a panic after the send is an unobserved
+outcome, exactly like a broken connection — and reconciliation proves their fate
+as usual (`cause=submit_panic`). A panic **before** any registration releases
+the slot: nothing was sent, so there is nothing to protect, and fencing would
+have reconciliation broadcast a transaction the caller was told never went out.
+The registration is cleared on every return, so it cannot leak into the key's
+next submission. An adopter that decodes a **definitive, hash-bound rejection
+inside `submit`** should also retire the record at that moment with
+`tx.ClearSubmittedTx(sk)` (the web commit helper does): nothing is in flight
+once consensus has refused the bytes, and a panic in the leftover window before
+`submit` returns would otherwise fence a transaction whose fate is already
+decided. That fence cannot lift while the refusal's cause persists — re-submitting
+CheckTx-refused bytes keeps drawing the same non-permanent-class refusal, and the
+index never finds a never-included transaction — and because most CheckTx causes
+are **mutable** state (authorization, clearance, membership, domain grants), it
+can end worse than a stall: a later re-grant lets reconciliation's re-submit be
+admitted and **commit** bytes the caller was already told were rejected, late and
+silently. Both hazards argue for the same rule: clear on definitive proof.
+
 ### Only proven fate lifts a fence
 
 Exactly two things lift it, and both are statements about **the exact bytes that
@@ -182,9 +205,10 @@ SAGE: nonce_fence event=fence_held  signer=3d73cdbdffaacac7… held_for=5m0s att
 SAGE: nonce_fence event=fence_lift  signer=3d73cdbdffaacac7… fate=committed held_for=5m2s attempts=92
 ```
 
-Events: `fence_set`, `reconcile_retry`, `resolver_panic`, `fate_committed`,
-`fate_rejected`, `fence_lift`, `fence_held`, `signing_quiesced`,
-`signing_resumed`, `fence_dropped_at_shutdown`. Retry and panic lines are
+Events: `fence_set`, `reconcile_retry`, `resolver_panic`, `submit_panic`,
+`fate_committed`, `fate_rejected`, `fence_lift`, `fence_held`,
+`signing_quiesced`, `signing_resumed`, `fence_dropped_at_shutdown`. Retry and
+panic lines are
 rate-limited, so a long hold cannot flood the log. The last one is the terminal
 record: a process exit (signal, serve error, or a failed restart gate that
 execs a recovery binary) discards every held fence, and this line — one per
@@ -195,8 +219,8 @@ Code 4 loss be traced back to the exit that dropped its record.
 or any raw error. Broadcast errors from `net/http` embed the request URL, and a
 broadcast URL is `/broadcast_tx_commit?tx=0x<the entire signed transaction>` —
 so the fence keeps only a **typed cause category** (`transport`, `timeout`,
-`canceled`, `decode`, `rpc`, `pending`, `resolver_panic`, `no_resolver`,
-`no_encoded_tx`) plus the transaction's **hash** as its own field.
+`canceled`, `decode`, `rpc`, `pending`, `resolver_panic`, `submit_panic`,
+`no_resolver`, `no_encoded_tx`) plus the transaction's **hash** as its own field.
 
 **Status** — `GET /v1/dashboard/health` carries a `signer_fences` block. Public
 callers get `active` and `oldest_age_seconds`; an operator session — or, on an

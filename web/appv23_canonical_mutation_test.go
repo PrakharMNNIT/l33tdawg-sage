@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,14 +47,7 @@ func TestAppV23CerebrumForgetBroadcastsConsensusWithoutMutatingSQLite(t *testing
 		parsed, err := tx.DecodeTx(raw)
 		require.NoError(t, err)
 		captured <- parsed
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": 0, "log": ""},
-				"tx_result": map[string]any{"code": 0, "log": ""},
-				"hash":      "FORGET",
-				"height":    "9",
-			},
-		}))
+		writeCommitOKAt(w, r, 9, "")
 	}))
 	t.Cleanup(rpc.Close)
 	fixture.handler.CometBFTRPC = rpc.URL
@@ -112,13 +104,11 @@ func TestAppV23CerebrumForgetKeepsRejectedCommitAnError(t *testing.T) {
 		uint8(store.ClearanceInternal), true,
 	)
 
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": 92, "log": "authorization rejected"},
-				"tx_result": map[string]any{"code": 0, "log": ""},
-			},
-		}))
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bound like a real refusal: CometBFT computes Hash from the submitted
+		// bytes even when CheckTx rejects, and the handler now refuses an
+		// unbound rejection as indeterminate (which would fence, not 409).
+		writeCommitCheckTxRejected(w, r, 92, "authorization rejected")
 	}))
 	t.Cleanup(rpc.Close)
 	fixture.handler.CometBFTRPC = rpc.URL
@@ -187,14 +177,7 @@ func TestAppV23UnreadableDeprecationBroadcastsConsensusWithoutMutatingSQLite(t *
 		parsed, err := tx.DecodeTx(raw)
 		require.NoError(t, err)
 		captured <- parsed
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": 0, "log": ""},
-				"tx_result": map[string]any{"code": 0, "log": ""},
-				"hash":      "UNREADABLE",
-				"height":    "10",
-			},
-		}))
+		writeCommitOKAt(w, r, 10, "")
 	}))
 	t.Cleanup(rpc.Close)
 	fixture.handler.CometBFTRPC = rpc.URL

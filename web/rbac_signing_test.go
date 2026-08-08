@@ -3,7 +3,6 @@ package web
 import (
 	"crypto/ed25519"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +27,30 @@ func TestLatestConsensusTimeWeb(t *testing.T) {
 	got, err := latestConsensusTimeWeb(rpc.URL)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
+}
+
+func TestLatestConsensusTimeWebRejectsTrailingAndOversizedData(t *testing.T) {
+	want := time.Date(2026, 8, 5, 6, 14, 18, 0, time.UTC)
+	proof := fmt.Sprintf(`{"result":{"sync_info":{"latest_block_time":%q}}}`,
+		want.Format(time.RFC3339Nano))
+	for _, tc := range []struct {
+		name   string
+		suffix string
+	}{
+		{name: "second JSON document", suffix: `{}`},
+		{name: "oversized whitespace suffix", suffix: strings.Repeat(" ", int(tx.CometRPCMaxResponseBytes)+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, proof+tc.suffix)
+			}))
+			t.Cleanup(rpc.Close)
+
+			got, err := latestConsensusTimeWeb(rpc.URL)
+			require.Error(t, err)
+			assert.True(t, got.IsZero())
+		})
+	}
 }
 
 func TestFreshGovernanceProofTimeUsesWallClockAfterIdle(t *testing.T) {
@@ -141,14 +164,7 @@ func TestSignAndBroadcastCommitLeavesDirectGovernanceProofless(t *testing.T) {
 		require.NoError(t, decodeErr)
 		captured, decodeErr = tx.DecodeTx(encoded)
 		require.NoError(t, decodeErr)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": 0},
-				"tx_result": map[string]any{"code": 0},
-				"hash":      "ABC123",
-				"height":    "42",
-			},
-		})
+		writeCommitOK(w, r)
 	}))
 	t.Cleanup(rpc.Close)
 
@@ -182,7 +198,7 @@ func TestSignAndBroadcastCommitKeepsAgentProofForAccessGrant(t *testing.T) {
 		require.NoError(t, decodeErr)
 		captured, decodeErr = tx.DecodeTx(encoded)
 		require.NoError(t, decodeErr)
-		_, _ = w.Write([]byte(`{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ABC123","height":"42"}}`))
+		writeCommitOK(w, r)
 	}))
 	t.Cleanup(rpc.Close)
 
@@ -217,7 +233,7 @@ func TestSignAndBroadcastCommitPreservesModernGovernanceProof(t *testing.T) {
 		require.NoError(t, decodeErr)
 		captured, decodeErr = tx.DecodeTx(encoded)
 		require.NoError(t, decodeErr)
-		_, _ = w.Write([]byte(`{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ABC123","height":"42"}}`))
+		writeCommitOK(w, r)
 	}))
 	t.Cleanup(rpc.Close)
 

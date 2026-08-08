@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/l33tdawg/sage/internal/metrics"
@@ -251,6 +252,18 @@ type TxOutcome struct {
 // A non-nil error means the attempt could not resolve anything; the returned
 // verdict is then IGNORED and treated as TxVerdictUnresolved, so an
 // implementation can never accidentally lift a fence on a failed probe.
+//
+// THE PER-ATTEMPT DEADLINE IS COOPERATIVE, NOT PREEMPTIVE. ctx carries the
+// attempt bound (fenceTimings.attempt) and Go cannot kill a goroutine, so an
+// implementation that ignores ctx outlives the deadline and stalls THAT
+// FENCE's reconciliation loop for as long as it blocks — no retry runs, no
+// verdict can arrive, and the fence is effectively wedged on caller code. The
+// blast radius is deliberately contained rather than eliminated: the held-
+// fence alarm runs on its own goroutine and keeps reporting the hold, and
+// other keys' fences and leases are untouched, but nothing can force the
+// stuck attempt to end. An implementation MUST plumb ctx through every
+// blocking call (CometTxResolver does, end to end, via
+// http.NewRequestWithContext).
 type TxResolveFunc func(ctx context.Context, encoded []byte) (TxOutcome, error)
 
 // processTxResolverMu guards processTxResolver, the fallback resolver used by
@@ -418,6 +431,13 @@ const (
 	// network, and an operator seeing it repeatedly should be reading a stack
 	// trace, not a firewall rule.
 	fenceCausePanic fenceCause = "resolver_panic"
+	// fenceCauseSubmitPanic: submit panicked AFTER registering its encoded
+	// transaction as handed to the network (RegisterSubmittedTx), so the fence
+	// was raised by the lease's panic guard rather than by an Indeterminate
+	// return. Distinct from fenceCausePanic because it indicts the ADOPTER's
+	// broadcast path, not the reconciliation resolver, and the stack to read is
+	// the one the panic printed when it finished unwinding.
+	fenceCauseSubmitPanic fenceCause = "submit_panic"
 	// fenceCauseNoResolver / fenceCauseNoEncodedTx: the attempt could not even
 	// be made. These are the two shapes of "we have no way to ask", which is
 	// emphatically not the same as "the transaction is gone" — they hold the
@@ -485,7 +505,8 @@ const (
 // that is about to be stored in a fence or written to the log, and bounds its
 // length.
 //
-// Three passes, because signed bytes reach a message three ways.
+// Four passes: three because signed bytes reach a message three ways, and a
+// fourth because pass 3 alone is evadable on purpose-built input.
 //
 //  1. EXACT MATCH kills the known leak: a *url.Error carrying
 //     ".../broadcast_tx_commit?tx=0x<hex of exactly these bytes>".
@@ -499,6 +520,9 @@ const (
 //  3. LONG HEX RUNS catch anything that arrives without that shape, from
 //     adopter-supplied resolvers and RPC error envelopes this package does not
 //     control.
+//  4. CHUNKED/DENSE HEX catches deliberate evasion of pass 3: hex split into
+//     sub-threshold runs by separators. See scrubChunkedHex for the exact rule
+//     and its stated residual.
 //
 // ScrubBroadcastText is the exported entry point for adopters that build error
 // text at the SAME origin this package guards — the CometBFT broadcast call.
@@ -530,6 +554,11 @@ func scrubFenceText(text string, encoded []byte) string {
 	}
 	text = scrubTxQueryParams(text)
 	text = scrubLongHexRuns(text)
+	// The chunk pass runs AFTER the control pass on purpose: control-byte
+	// separators between hex chunks have just become single spaces, which is
+	// exactly the shape the reassembly rule bridges.
+	text = scrubControlRunes(text)
+	text = scrubChunkedHex(text)
 	if len(text) > fenceDetailMax {
 		cut := fenceDetailMax
 		// Never cut mid-rune: a broken UTF-8 tail turns a diagnostic line into
@@ -614,6 +643,99 @@ func isHexDigit(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
+// scrubChunkedHex is the backstop behind scrubLongHexRuns: it redacts a detail
+// whose hex content is over the identifier budget but arrives FRAGMENTED, so
+// no single run trips the long-run pass.
+//
+// The evasion it closes is concrete: a hostile proxy answering the
+// reconciler's re-submit with an error envelope whose data is the request's
+// own tx hex re-chunked every ~100 characters by separators. Each chunk is
+// under fenceHexKeepMax, there is no tx= parameter and no exact match, so all
+// three preceding passes wave it through — and up to fenceDetailMax bytes of
+// the signed transaction land in the fence record and re-emit on every
+// held-fence report for as long as the fence stands. A partial payload leak
+// repeating indefinitely is no better than a full one.
+//
+// Two triggers, each covering the other's blind spot, and the whole detail is
+// replaced rather than the fragments: by the time either fires the text is
+// established to be carrying encoded material, and prose stitched between
+// payload chunks is the attacker's, not worth preserving.
+//
+//   - REASSEMBLY: hex runs separated by a SINGLE non-hex byte are counted as
+//     one sequence; a sequence over fenceHexKeepMax is an encoded payload,
+//     however it was chunked. Single-byte bridging is why this runs after
+//     scrubControlRunes — control-byte separators have just become single
+//     spaces. Legitimate diagnostics survive because English words almost
+//     always contain adjacent non-hex letters, which break the bridge.
+//   - DENSITY: if hex digits are over the budget in TOTAL and also make up
+//     more than 40% of the detail, it is redacted even when every gap is wide.
+//     Both conjuncts are load-bearing: heights, ports, IPs and the a-f letters
+//     of ordinary prose inflate a raw total, so total count alone would nuke
+//     legitimate diagnostics, while density alone would nuke any short string
+//     that IS a legitimate identifier (a lone hash is 100% hex).
+//
+// STATED RESIDUAL, not a guarantee: a peer that both keeps every gap at two or
+// more bytes AND pads to under 40% density can still fit ~fenceDetailMax*0.4
+// hex characters through, and one that re-encodes the payload in a non-hex
+// alphabet is outside what any hex heuristic can see. Those are bounded by
+// fenceDetailMax and accepted; the alternative — redacting on any hex at all —
+// would blind every diagnostic to close a channel the exact-match and tx=
+// passes already close for the canonical leak shapes.
+func scrubChunkedHex(text string) string {
+	totalHex := 0
+	assembled := 0
+	maxAssembled := 0
+	gap := 0
+	for i := 0; i < len(text); i++ {
+		if isHexDigit(text[i]) {
+			totalHex++
+			assembled++
+			if assembled > maxAssembled {
+				maxAssembled = assembled
+			}
+			gap = 0
+			continue
+		}
+		gap++
+		if gap > 1 {
+			assembled = 0
+		}
+	}
+	if maxAssembled > fenceHexKeepMax ||
+		(totalHex > fenceHexKeepMax && totalHex*5 > len(text)*2) {
+		return fmt.Sprintf(
+			"[redacted detail: %d hex chars in fragments exceeds the %d-char identifier budget]",
+			totalHex, fenceHexKeepMax)
+	}
+	return text
+}
+
+// scrubControlRunes replaces every control rune with a space, with NO
+// exceptions — not even \n and \t.
+//
+// The values this scrubber cleans are stored in fence records, surfaced
+// through FencedSigners() into status payloads, and printed on log lines by
+// emitFenceEvent, and control characters are how a remote party FORGES those
+// surfaces: \r rewinds a terminal over the line just written, ESC starts ANSI
+// sequences in any viewer, and DEL/C1 controls survive most naive filters. The
+// no-exceptions rule is deliberate — a version-string injection elsewhere in
+// this release was fixed by extending a character set, and the set was wrong
+// again within a review cycle. Exempting "harmless" controls is the same
+// mistake on layaway. The cost is that multi-line details (a stack trace)
+// flatten to one line; emitFenceEvent quotes them anyway, so nothing readable
+// is lost.
+func scrubControlRunes(text string) string {
+	if !strings.ContainsFunc(text, unicode.IsControl) {
+		return text
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, text)
+}
+
 // fencedTxNonce recovers the nonce out of the encoded transaction so a held
 // fence can name the allocation it is stuck on.
 //
@@ -690,7 +812,7 @@ func emitFenceEvent(event string, fields ...fenceField) {
 		b.WriteByte(' ')
 		b.WriteString(f.key)
 		b.WriteByte('=')
-		if strings.ContainsAny(f.value, " \t\n\"") {
+		if fenceValueNeedsQuoting(f.value) {
 			b.WriteString(strconv.Quote(f.value))
 		} else {
 			b.WriteString(f.value)
@@ -705,6 +827,44 @@ func emitFenceEvent(event string, fields ...fenceField) {
 	fmt.Fprint(fenceLogW, b.String())
 }
 
+// fenceValueNeedsQuoting decides whether a field value goes into the event
+// line raw or through strconv.Quote.
+//
+// This is an ALLOWLIST, not a blocklist, and that is the fix for a real
+// injection: the earlier version quoted only on space/tab/newline/quote — a
+// character SET, and character sets drift. CR, ESC and DEL all passed raw, and
+// the values in these fields include RPC-derived details, i.e. remote text: a
+// detail containing \r rewinds the terminal cursor and overwrites the line
+// already emitted (a forged log entry), and ESC opens ANSI sequences in any
+// terminal or log viewer. Same failure shape as the version-string injection
+// fixed elsewhere this release — right mechanism, wrong set. So the test is
+// inverted: anything that is not a printable, backslash-free, single-token
+// rune is quoted, and strconv.Quote escapes every control and every invalid
+// byte. utf8.RuneError forces quoting because ranging yields it for each raw
+// invalid byte — which is how bare C1 controls (0x80–0x9F) arrive — and Quote
+// renders those as \x.. escapes instead of passing the raw byte through.
+func fenceValueNeedsQuoting(v string) bool {
+	for _, r := range v {
+		if r == ' ' || r == '"' || r == '\\' || r == utf8.RuneError || !unicode.IsPrint(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// fenceGaugePublishMu serializes publishFenceGauges' read-then-set. It is a
+// separate lock, not fenceMu held longer, because the SET reaches into the
+// metrics package and fenceMu must never be held across a foreign call — but
+// the read and the set do have to be one atomic step. Without that, two
+// publishers interleave read-A, read-B, set-B, set-A and the gauges FREEZE on
+// the older snapshot: a fence lift racing a periodic re-report could leave
+// sage_nonce_fences_active pinned at 1 on a node with nothing held (a
+// permanent false alarm), or — worse — at 0 while a fence stands (the silent
+// hold this file's observability exists to prevent). The lock covers a map
+// read and two gauge stores; nothing here waits on reconciliation, RPC, or a
+// lease, so distinct keys stay concurrent.
+var fenceGaugePublishMu sync.Mutex
+
 // publishFenceGauges recomputes the two held-fence alarm gauges from the map.
 //
 // It is called on every raise, lift and periodic re-report rather than from a
@@ -714,6 +874,8 @@ func emitFenceEvent(event string, fields ...fenceField) {
 //
 // Callers must NOT hold fenceMu: this takes it.
 func publishFenceGauges() {
+	fenceGaugePublishMu.Lock()
+	defer fenceGaugePublishMu.Unlock()
 	now := time.Now()
 	fenceMu.Lock()
 	active := len(fences)
@@ -1467,7 +1629,12 @@ func resolveOnce(key string, fence *keyFence, ind *indeterminateSubmit, attempt 
 	}
 
 	// Bounds THIS ATTEMPT only. Deliberately not called a budget: its expiry
-	// produces another attempt, never a lift.
+	// produces another attempt, never a lift. The bound is COOPERATIVE — see
+	// TxResolveFunc: a resolver that ignores ctx outlives it and stalls this
+	// fence's loop (the alarm keeps firing; other keys are unaffected), and
+	// running the resolver on a watchdog goroutine instead would not fix that
+	// — the hung call would leak and a second concurrent attempt would run
+	// against an adopter that was promised sequential attempts.
 	ctx, cancel := context.WithTimeout(context.Background(), attempt)
 	defer cancel()
 	outcome, err = resolve(ctx, ind.encoded)
@@ -1613,6 +1780,79 @@ func CometTxHash(encoded []byte) [sha256.Size]byte {
 	return sha256.Sum256(encoded)
 }
 
+// NormalizeCometHash canonicalizes a remote-supplied transaction hash for
+// comparison: trim surrounding space, lowercase, then strip one optional 0x
+// prefix. The order matters — lowercasing FIRST means a nonstandard "0X"
+// prefix normalizes identically to "0x". Exported because web's broadcast
+// helper once re-implemented these steps in the opposite order, and the two
+// proof surfaces diverged on exactly the formatting variance this function
+// exists to absorb (fail-closed — a needless fence, never a false lift — but
+// divergence on a single hazard across two files is how this branch re-opened
+// a closed leak once already). Every surface that compares or inspects a
+// remote hash must canonicalize through this one function.
+func NormalizeCometHash(reported string) string {
+	got := strings.ToLower(strings.TrimSpace(reported))
+	return strings.TrimPrefix(got, "0x")
+}
+
+// cometReportedHashMatches reports whether a remote-supplied hash string names
+// exactly the bytes this fence is holding.
+//
+// EVERY verdict either proof path produces must pass this check first. The RPC
+// answer is remote data: a reverse proxy replaying an earlier response, or a
+// node answering about a different transaction, produces an envelope that is
+// syntactically perfect and factually about someone else — and a verdict
+// adopted from it would lift the fence on bytes whose fate is still unknown,
+// which is the silent Code 4 loss this file exists to prevent. Normalization
+// (trim, optional 0x/0X prefix, case) exists because CometBFT renders hashes
+// uppercase while hex.EncodeToString is lowercase; anything that survives
+// normalization and still differs is a mismatch, never a formatting quirk.
+func cometReportedHashMatches(reported string, want [sha256.Size]byte) bool {
+	return NormalizeCometHash(reported) == hex.EncodeToString(want[:])
+}
+
+// CometReportedHashMatches is the exported face of cometReportedHashMatches,
+// for the OTHER proof surface: web's broadcast helper binds every claimed
+// verdict — success or rejection — through this same predicate, the way both
+// sides already share HexHashPrefix, so the two files cannot drift into
+// accepting or refusing different renderings of the same hash.
+func CometReportedHashMatches(reported string, want [sha256.Size]byte) bool {
+	return cometReportedHashMatches(reported, want)
+}
+
+// HexHashPrefix renders at most 8 characters of a remote-supplied transaction
+// hash for a diagnostic. The value PURPORTS to be a hex hash, so an allowlist
+// is the honest filter: after trimming, an optional 0x prefix, and lowercasing,
+// every rune outside [0-9a-f] is dropped rather than echoed. That keeps
+// ESC/CR/DEL — the forged-log alphabet — out of error text without a denylist
+// that drifts the next time someone finds a character nobody thought of. Both
+// proof surfaces (this package's reconciler and web's broadcast helper) render
+// mismatched hashes through this one function so the two sides cannot diverge.
+func HexHashPrefix(reported string) string {
+	const max = 8
+	got := strings.ToLower(strings.TrimSpace(reported))
+	got = strings.TrimPrefix(got, "0x")
+	kept := make([]byte, 0, max)
+	for i := 0; i < len(got) && len(kept) < max; i++ {
+		if c := got[i]; (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+			kept = append(kept, c)
+		}
+	}
+	if len(kept) == 0 {
+		return "(no hex characters)"
+	}
+	return string(kept)
+}
+
+// cometHashMismatchDetail renders a hash-binding failure for the fence's
+// diagnostics. Only a hex-filtered short prefix of the remote value is echoed
+// (HexHashPrefix): the reported string is remote-controlled text of unbounded
+// length and arbitrary alphabet.
+func cometHashMismatchDetail(op, reported string, want [sha256.Size]byte) string {
+	return fmt.Sprintf("%s answered about a different transaction (want %s…, got %s…): not proof of this one's fate",
+		op, hex.EncodeToString(want[:])[:8], HexHashPrefix(reported))
+}
+
 // cometTxLookup mirrors the /tx JSON-RPC envelope. Only the fields needed to
 // tell "in a block, executed" from "in a block, rejected" from "no answer" are
 // decoded.
@@ -1728,13 +1968,19 @@ func cometResolve(ctx context.Context, endpoint string, encoded []byte) (TxOutco
 	// and most specific evidence — notably the "refused in CheckTx, not a
 	// permanent class" case, which is the one an operator most needs to see and
 	// which an earlier version of this function buried under the lookup's
-	// unremarkable "tx not found".
-	parts := make([]string, 0, 3)
+	// unremarkable "tx not found". The lookup's unresolved detail is included
+	// too: since the hash/height binding it can carry the one fact that
+	// explains a stuck fence — the index is answering about a DIFFERENT
+	// transaction — and dropping it would leave that misbehavior invisible.
+	parts := make([]string, 0, 4)
 	if resubmitted.Detail != "" {
 		parts = append(parts, resubmitted.Detail)
 	}
 	if submitErr != nil {
 		parts = append(parts, submitErr.Error())
+	}
+	if outcome.Detail != "" {
+		parts = append(parts, outcome.Detail)
 	}
 	if lookupErr != nil {
 		parts = append(parts, lookupErr.Error())
@@ -1752,15 +1998,45 @@ func cometResolve(ctx context.Context, endpoint string, encoded []byte) (TxOutco
 func cometIndexedOutcome(ctx context.Context, endpoint string, encoded []byte, hash [sha256.Size]byte) (TxOutcome, error) {
 	url := fmt.Sprintf("%s/tx?hash=0x%s", endpoint, strings.ToUpper(hex.EncodeToString(hash[:])))
 	var lookup cometTxLookup
-	if err := cometGetJSON(ctx, "comet tx lookup", url, encoded, &lookup); err != nil {
+	resultOK, err := cometGetJSON(ctx, "comet tx lookup", url, encoded, &lookup)
+	if err != nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, err
 	}
 	if lookup.Error != nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved},
 			fmt.Errorf("comet tx lookup: %s", scrubFenceText(lookup.Error.Message+": "+lookup.Error.Data, encoded))
 	}
-	if lookup.Result == nil || lookup.Result.Hash == "" {
+	if !resultOK {
+		// A 500 reaches the decoder only for its JSON-RPC error envelope; one
+		// that carries a Result instead is a proxy artifact, and a proxy's 500
+		// body is never proof of anything.
+		return TxOutcome{
+			Verdict: TxVerdictUnresolved,
+			Detail:  "comet tx lookup answered 500 without a JSON-RPC error envelope: not a CometBFT answer",
+		}, nil
+	}
+	if lookup.Result == nil || strings.TrimSpace(lookup.Result.Hash) == "" {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, nil
+	}
+	// BIND THE ANSWER TO THE QUESTION before reading any verdict out of it. The
+	// /tx query named a hash, but nothing forces the response to be about that
+	// hash: a proxy replaying an earlier lookup, or a confused node, returns an
+	// envelope for a DIFFERENT transaction, and adopting its result field would
+	// lift this fence on someone else's fate. Same rule for the height — an
+	// "indexed" answer at height <= 0 claims block inclusion while naming no
+	// block, which is not a claim that can be checked, so it proves nothing.
+	// Both stay UNRESOLVED: the fence holds and reconciliation asks again.
+	if !cometReportedHashMatches(lookup.Result.Hash, hash) {
+		return TxOutcome{
+			Verdict: TxVerdictUnresolved,
+			Detail:  cometHashMismatchDetail("comet tx lookup", lookup.Result.Hash, hash),
+		}, nil
+	}
+	if lookup.Result.Height <= 0 {
+		return TxOutcome{
+			Verdict: TxVerdictUnresolved,
+			Detail:  "comet tx lookup reported an indexed transaction with no block height: not proof of inclusion",
+		}, nil
 	}
 	if lookup.Result.TxResult.Code != 0 {
 		// In a block and refused by FinalizeBlock. This is REAL PROOF for the
@@ -1878,18 +2154,42 @@ func checkTxRefusalIsPermanent(code int) bool { return code == checkTxNonceGateC
 //     all indistinguishable here and none is a verdict, so the fence stays up
 //     and the next attempt asks again. Not classifying them apart is
 //     intentional: it would be a decision made from RPC text.
+//
+// NO VERDICT IS READ FROM AN ENVELOPE WHOSE HASH IS NOT OURS. Every result
+// branch above assumes the response describes the bytes we just re-submitted,
+// and nothing about a 200-with-result guarantees that: a replaying proxy or a
+// node answering a different request produces a perfectly-shaped envelope about
+// a different transaction. So the hash is bound to sha256(encoded) before any
+// code is examined; a mismatch (or a missing hash) is UNRESOLVED — the fence
+// holds and the next attempt asks again.
 func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) (outcome TxOutcome, superseded bool, err error) {
 	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", endpoint, hex.EncodeToString(encoded))
+	wantHash := CometTxHash(encoded)
 	var res cometBroadcastCommit
-	if err := cometGetJSON(ctx, "comet re-submit", url, encoded, &res); err != nil {
+	resultOK, err := cometGetJSON(ctx, "comet re-submit", url, encoded, &res)
+	if err != nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, false, err
 	}
 	if res.Error != nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, false,
 			fmt.Errorf("comet re-submit: %s", scrubFenceText(res.Error.Message+": "+res.Error.Data, encoded))
 	}
+	if !resultOK {
+		// Same rule as the lookup: only a 200 may carry a Result. A 500 body
+		// that parses into one is not CometBFT and must never become a verdict.
+		return TxOutcome{
+			Verdict: TxVerdictUnresolved,
+			Detail:  "comet re-submit answered 500 without a JSON-RPC error envelope: not a CometBFT answer",
+		}, false, nil
+	}
 	if res.Result == nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, false, errors.New("comet re-submit returned no result")
+	}
+	if !cometReportedHashMatches(res.Result.Hash, wantHash) {
+		return TxOutcome{
+			Verdict: TxVerdictUnresolved,
+			Detail:  cometHashMismatchDetail("comet re-submit", res.Result.Hash, wantHash),
+		}, false, nil
 	}
 	if code := res.Result.CheckTx.Code; code != 0 {
 		log := scrubFenceText(res.Result.CheckTx.Log, encoded)
@@ -1904,6 +2204,12 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 					code, log),
 			}, false, nil
 		}
+		// The hash binding above is what ties this refusal to OUR bytes; a
+		// positive height is deliberately NOT demanded here, because unlike the
+		// two in-block verdicts this one claims no inclusion — a CheckTx-refused
+		// transaction never has a height, and requiring one would make the
+		// single most common proof (supersession) unreachable. The lift stands
+		// on the gate's monotonicity alone.
 		return TxOutcome{
 			Verdict: TxVerdictRejected,
 			Detail: fmt.Sprintf("re-submit refused by the committed-nonce gate (CheckTx code %d): %s — "+
@@ -1929,10 +2235,11 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 				res.Result.TxResult.Code, res.Result.Height, scrubFenceText(res.Result.TxResult.Log, encoded)),
 		}, false, nil
 	}
-	if res.Result.Height <= 0 || res.Result.Hash == "" {
-		// Both codes are zero but nothing says it landed. Treat the silence as
-		// no answer: a synthesized "committed" here would be the fail-open this
-		// rework removed.
+	if res.Result.Height <= 0 {
+		// Both codes are zero but nothing says it landed: "committed" with no
+		// block is not a claim that can be checked. (The hash was already bound
+		// above.) Treat the silence as no answer: a synthesized "committed" here
+		// would be the fail-open this rework removed.
 		return TxOutcome{Verdict: TxVerdictUnresolved}, false, errors.New("comet re-submit reported no committed height")
 	}
 	return TxOutcome{
@@ -1958,30 +2265,79 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 // rpc) and, for an HTTP-level refusal, the status line. The caller already knows
 // the transaction's hash and logs it as its own field, so nothing an operator
 // needs is lost.
-func cometGetJSON(ctx context.Context, op, url string, encoded []byte, out any) error {
+//
+// resultOK reports whether the HTTP status entitles the caller to read a
+// RESULT out of the decoded envelope. It is true only for 200: CometBFT
+// delivers "tx not found" and mempool refusals as 500 with a JSON-RPC ERROR
+// envelope, so a 500 must reach the decoder — but CometBFT never delivers a
+// Result on a non-200, so a 500 whose body carries one is a proxy or an
+// impostor and its Result must not become a verdict. Callers may always read
+// the Error envelope; they must check resultOK before reading Result.
+func cometGetJSON(ctx context.Context, op, url string, encoded []byte, out any) (resultOK bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G107 -- internal CometBFT RPC
 	if err != nil {
 		// NOT %w: url.Error.Error() is `parse "<the whole URL>": ...`.
-		return fmt.Errorf("%s: could not build request (%s)", op, classifyFenceCause(err))
+		return false, fmt.Errorf("%s: could not build request (%s)", op, classifyFenceCause(err))
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		// NOT %w, for the same reason. The category is what the retry loop and
 		// the metrics label actually use.
-		return fmt.Errorf("%s: %s", op, classifyFenceCause(err))
+		return false, fmt.Errorf("%s: %s", op, classifyFenceCause(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusInternalServerError {
-		// CometBFT reports "tx not found" and mempool refusals as 500 with a
-		// JSON-RPC error envelope, so 500 has to reach the decoder; anything
-		// else is a broken transport. resp.Status is the server's status line
-		// and never echoes the request.
-		return fmt.Errorf("%s: comet rpc returned %s", op, resp.Status)
+		// Anything but 200/500 is a broken transport, not CometBFT.
+		// resp.Status never echoes the request, but it IS the server's text and
+		// a hostile proxy writes it freely — scrub it like any other remote
+		// string.
+		return false, fmt.Errorf("%s: comet rpc returned %s", op, scrubFenceText(resp.Status, encoded))
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	// The body is read through a hard cap BEFORE the decoder sees it. This loop
+	// retries for as long as a fence stands — that is the design — so an
+	// unbounded read here is an AMPLIFIER: one node or proxy answering with a
+	// huge body turns a single indeterminate transaction into unbounded
+	// repeated allocation, once per attempt, forever. An oversized body is not
+	// proof of anything; it fails the attempt, the fence holds, and the next
+	// attempt asks again.
+	limited := &io.LimitedReader{R: resp.Body, N: CometRPCMaxResponseBytes + 1}
+	decoder := json.NewDecoder(limited)
+	if err := decoder.Decode(out); err != nil {
 		// A decode error quotes the RESPONSE, not the request, but the response
-		// of a proxy or a confused node can echo anything — scrub it.
-		return fmt.Errorf("%s: %s", op, scrubFenceText(err.Error(), encoded))
+		// of a proxy or a confused node can echo anything — scrub it. A body
+		// truncated by the cap fails here too (unexpected EOF), which is the
+		// correct verdictless outcome.
+		return false, fmt.Errorf("%s: %s", op, scrubFenceText(err.Error(), encoded))
 	}
-	return nil
+	// Decode through EOF, rather than accepting the first valid JSON value.
+	// json.Decoder.Decode may return after buffering only a small prefix, so a
+	// proof envelope followed by another JSON value, trailing garbage, or more
+	// than the response cap otherwise bypasses both the single-document
+	// protocol and the LimitedReader exhaustion check below.
+	if trailingErr := decoder.Decode(&struct{}{}); trailingErr == nil {
+		return false, fmt.Errorf("%s: response contained multiple JSON values", op)
+	} else if !errors.Is(trailingErr, io.EOF) {
+		return false, fmt.Errorf("%s: response contained trailing data: %s", op,
+			scrubFenceText(trailingErr.Error(), encoded))
+	}
+	if limited.N <= 0 {
+		// The document decoded but the body kept going past the cap: whatever
+		// answered is not a CometBFT node speaking its own protocol.
+		return false, fmt.Errorf("%s: response body exceeded %d bytes; refusing to treat it as a CometBFT envelope",
+			op, CometRPCMaxResponseBytes)
+	}
+	return resp.StatusCode == http.StatusOK, nil
 }
+
+// CometRPCMaxResponseBytes caps how much of a CometBFT RPC response body any
+// broadcast or reconciliation helper will read. Exported so web/'s broadcast
+// helpers apply the SAME bound — asymmetric handling of one hazard across two
+// packages is how this branch re-opened a closed leak once already.
+//
+// 8 MiB is comfortably above any legitimate envelope: CometBFT's default max
+// transaction is ~1 MiB, a /tx result carries the transaction base64-encoded
+// (~1.4x) plus events and proof, and a /broadcast_tx_commit envelope carries
+// logs and events on top of the codes — all well under this. Anything larger is
+// not CometBFT answering, and treating it as data would hand whoever controls
+// the RPC path an allocation lever inside an unstoppable retry loop.
+const CometRPCMaxResponseBytes = 8 << 20

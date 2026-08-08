@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -43,11 +44,25 @@ func latestConsensusTimeWeb(cometRPC string) (time.Time, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return time.Time{}, fmt.Errorf("comet status returned %s", resp.Status)
+		// resp.Status is the server's own status line: remote text, scrubbed
+		// like every other remote string this file formats.
+		return time.Time{}, fmt.Errorf("comet status returned %s", tx.ScrubBroadcastText(resp.Status, nil))
 	}
+	// Same body cap as every other CometBFT read in this file; a /status
+	// envelope is a few KB, so anything near the cap is not CometBFT.
+	limited := &io.LimitedReader{R: resp.Body, N: tx.CometRPCMaxResponseBytes + 1}
 	var result cometStatusTimeResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	decoder := json.NewDecoder(limited)
+	if err := decoder.Decode(&result); err != nil {
 		return time.Time{}, fmt.Errorf("decode comet status: %w", err)
+	}
+	if trailingErr := decoder.Decode(&struct{}{}); trailingErr == nil {
+		return time.Time{}, fmt.Errorf("decode comet status: multiple JSON values")
+	} else if !errors.Is(trailingErr, io.EOF) {
+		return time.Time{}, fmt.Errorf("decode comet status: trailing data: %w", trailingErr)
+	}
+	if limited.N <= 0 {
+		return time.Time{}, fmt.Errorf("comet status response body exceeded %d bytes", tx.CometRPCMaxResponseBytes)
 	}
 	if result.Result.SyncInfo.LatestBlockTime.IsZero() {
 		return time.Time{}, fmt.Errorf("comet status omitted latest block time")
@@ -167,7 +182,7 @@ func rbacCommitTimeout() time.Duration {
 // the in-flight Comet request instead of leaving the server goroutine detached
 // for the full commit timeout. Callers must still treat cancellation as an
 // indeterminate result: consensus may already have accepted the transaction.
-func broadcastTxCommitWebContext(parent context.Context, cometRPC string, txBytes []byte) (hash string, height int64, txLog string, err error) {
+func broadcastTxCommitWebContext(parent context.Context, cometRPC string, signingKey ed25519.PrivateKey, txBytes []byte) (hash string, height int64, txLog string, err error) {
 	txHex := hex.EncodeToString(txBytes)
 	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", cometRPC, txHex)
 
@@ -189,18 +204,23 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, txByte
 		// already refuse %w here for the same reason.
 		return "", 0, "", fmt.Errorf("create broadcast request: %s", commitTransportCause(reqErr))
 	}
-	// From this point the bytes reach the kernel, so a PANIC below is exactly as
-	// ambiguous as a broken connection: the node may have accepted the
-	// transaction. Left to unwind, that panic would release the lease WITHOUT a
-	// fence (WithNonceLease cannot fence a panic — it carries no encoded bytes),
-	// and the next caller could allocate past a transaction still in flight.
-	// This function DOES have the bytes — its callers wrap this error in
-	// tx.Indeterminate — so a post-send panic is converted into the
-	// indeterminate outcome it factually is. Only the panic value's TYPE is
-	// reported: the value can be an error carrying the request URL, i.e. the
-	// whole signed transaction. Pre-send panics keep unwinding — nothing was
-	// sent, and fencing on them would have reconciliation broadcast a
-	// transaction the caller was told never went out.
+	// From this point a PANIC below is treated as exactly as ambiguous as a
+	// broken connection: once Do(req) runs the node may have accepted the
+	// transaction, and the recover cannot tell which side of that call it
+	// interrupted. This recover is the CLEANER of two guards, not the only
+	// one: after the registration a few lines down, even a panic that unwound
+	// past it would be FENCED on the registered bytes by WithNonceLease's own
+	// panic guard — it no longer releases the slot. What the recover adds is
+	// the conversion itself (a typed indeterminate error the caller handles,
+	// instead of a panic unwinding through the handler) and cover for the
+	// one-line window between here and the registration, where nothing has
+	// been sent yet and the conservative answer is still indeterminate. Only
+	// the panic value's TYPE is reported: the value can be an error carrying
+	// the request URL, i.e. the whole signed transaction. Pre-onWire panics
+	// keep unwinding — nothing was sent and nothing was registered, so the
+	// lease releasing the slot is the correct outcome, and fencing would have
+	// reconciliation broadcast a transaction the caller was told never went
+	// out.
 	onWire := false
 	defer func() {
 		r := recover()
@@ -214,6 +234,15 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, txByte
 		err = indeterminateCommit(fmt.Errorf("broadcast tx commit: panicked (%T) after the transaction was handed to the transport", r))
 	}()
 	onWire = true
+	// Registered with the lease's panic guard at the same instant onWire flips,
+	// so the recover above and the registration can never disagree about whether
+	// bytes were at risk. The recover is the primary conversion; the
+	// registration is what saves the case the recover cannot see — a panic in
+	// code that runs AFTER this function returns but before submit does, which
+	// would otherwise unwind through WithNonceLease as a releasing pre-send
+	// panic while these bytes sit in a mempool. WithNonceLease clears the
+	// registration on every return.
+	tx.RegisterSubmittedTx(signingKey, txBytes, tx.CometTxResolver(cometRPC))
 	// The three returns below are THE origin of commit ambiguity in web/, and
 	// each is marked indeterminate right here rather than being re-derived from
 	// its message downstream. By this point the encoded transaction has already
@@ -234,9 +263,38 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, txByte
 	}
 	defer resp.Body.Close()
 
+	// A NON-200 IS NEVER PROOF OF ANYTHING. Nothing below examined the status
+	// code, so a 500 or 502 whose body happened to parse as JSON fell straight
+	// through to the success return. The transaction may well have reached the
+	// mempool before whatever failed, so this is INDETERMINATE — it must fence,
+	// not succeed and not be a definitive rejection.
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, "", indeterminateCommit(fmt.Errorf(
+			"broadcast tx commit: unexpected status %s", tx.ScrubBroadcastText(resp.Status, txBytes)))
+	}
+
+	// Bounded read, same cap as internal/tx's reconciliation RPC. A fenced key
+	// re-reads this endpoint forever by design, so an unbounded decode here is
+	// the same allocation amplifier codex flagged there — and the same hazard
+	// must be handled the same way on both sides, or the asymmetry reintroduces
+	// it. An oversized body proves nothing: indeterminate, so the fence holds.
+	limited := &io.LimitedReader{R: resp.Body, N: tx.CometRPCMaxResponseBytes + 1}
 	var result cometCommitResult
-	if decErr := json.NewDecoder(resp.Body).Decode(&result); decErr != nil {
+	decoder := json.NewDecoder(limited)
+	if decErr := decoder.Decode(&result); decErr != nil {
 		return "", 0, "", indeterminateCommit(fmt.Errorf("decode broadcast commit response: %w", decErr))
+	}
+	if trailingErr := decoder.Decode(&struct{}{}); trailingErr == nil {
+		return "", 0, "", indeterminateCommit(errors.New(
+			"decode broadcast commit response: multiple JSON values"))
+	} else if !errors.Is(trailingErr, io.EOF) {
+		return "", 0, "", indeterminateCommit(fmt.Errorf(
+			"decode broadcast commit response: trailing data: %w", trailingErr))
+	}
+	if limited.N <= 0 {
+		return "", 0, "", indeterminateCommit(fmt.Errorf(
+			"broadcast commit response body exceeded %d bytes; refusing to treat it as a CometBFT envelope",
+			tx.CometRPCMaxResponseBytes))
 	}
 	if result.Error != nil {
 		// SCRUB THE ENVELOPE. Message and Data are remote-controlled text, and a
@@ -254,18 +312,117 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, txByte
 		}
 		return "", 0, "", indeterminateCommit(fmt.Errorf("broadcast error: %s", message))
 	}
-	// From here down consensus has spoken. A CheckTx or FinalizeBlock code is a
-	// verdict about a transaction that reached the chain, so it stays a plain,
-	// definitive error: marking it indeterminate would fence the signing key on
-	// every ordinary validation failure and turn one rejected transaction into
-	// an outage for that signer.
+	// From here down the envelope claims a verdict — but NO VERDICT, SUCCESS OR
+	// REJECTION, IS READ FROM AN ENVELOPE WHOSE HASH IS NOT OURS — the rule
+	// internal/tx's proof paths already enforce, applied here through the SAME
+	// exported predicate (tx.CometReportedHashMatches) rather than a local
+	// re-implementation: a hand-rolled copy here once normalized in a different
+	// order and the two proof surfaces diverged on a "0X" prefix. The
+	// rejection branches used to run before the binding, so a replaying proxy
+	// answering with an EARLIER transaction's CheckTx refusal — while OUR bytes
+	// reached the real mempool — was adopted as a definitive verdict: the lease
+	// released with no fence, the next caller's nonce overtook the in-flight
+	// original, and it died to the silent Code 4 loss this file exists to
+	// prevent. The dual misreport is as bad: a transaction that actually
+	// committed gets reported "rejected", and the operator redoes the change by
+	// hand and applies it twice.
+	//
+	// Requiring the binding cannot misclassify a genuine rejection, because a
+	// real CometBFT node computes Hash locally from the submitted bytes on
+	// EVERY /broadcast_tx_commit return, including CheckTx refusals. So a bound
+	// rejection stays a plain, definitive error that releases the lease —
+	// marking it indeterminate would fence the signing key on every ordinary
+	// validation failure — while an unbound one is SILENCE about our
+	// transaction: indeterminate, fence, and let reconciliation ask consensus
+	// directly.
+	sentHash := tx.CometTxHash(txBytes)
+	wantHash := hex.EncodeToString(sentHash[:])
+	gotHash := tx.NormalizeCometHash(result.Result.Hash)
+	bound := tx.CometReportedHashMatches(result.Result.Hash, sentHash)
 	if result.Result.CheckTx.Code != 0 {
-		return "", 0, "", fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.Result.CheckTx.Code, result.Result.CheckTx.Log)
+		if !bound {
+			// Only hex-filtered prefixes are echoed: both values are remote text.
+			return "", 0, "", indeterminateCommit(fmt.Errorf(
+				"broadcast commit response reported a CheckTx rejection for a different transaction "+
+					"(want %s…, got %s…): not proof of this one's fate",
+				wantHash[:8], tx.HexHashPrefix(gotHash)))
+		}
+		// Definitively refused before any block, so nothing is in flight — the
+		// registration protecting these bytes is retired NOW rather than at
+		// submit's return. A panic between here and that return would otherwise
+		// fence a transaction consensus just refused, and that fence is a trap
+		// in both directions: while the refusal's cause persists it cannot lift
+		// (re-submission keeps drawing the same non-permanent-class refusal,
+		// and the index never finds a never-included transaction), and most
+		// CheckTx causes are MUTABLE state — re-grant the missing access and
+		// reconciliation's re-submit of these "rejected" bytes can be admitted
+		// and COMMIT, executing late a transaction whose caller was told it
+		// failed. See tx.ClearSubmittedTx.
+		tx.ClearSubmittedTx(signingKey)
+		return "", 0, "", fmt.Errorf("tx rejected in CheckTx (code %d): %s",
+			result.Result.CheckTx.Code, tx.ScrubBroadcastText(result.Result.CheckTx.Log, txBytes))
 	}
 	if result.Result.TxResult.Code != 0 {
-		return "", 0, "", fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.Result.TxResult.Code, result.Result.TxResult.Log)
+		// An in-block rejection additionally needs its block: a FinalizeBlock
+		// verdict IS inclusion in a block, so code != 0 at height 0 is a shape
+		// no real node produces. internal/tx's re-submit path treats a
+		// heightless FinalizeBlock code as silence for the same reason.
+		if !bound || result.Result.Height <= 0 {
+			return "", 0, "", indeterminateCommit(fmt.Errorf(
+				"broadcast commit response reported a FinalizeBlock rejection that is not bound to this "+
+					"transaction (hash match %t, height %d): not proof of its fate",
+				bound, result.Result.Height))
+		}
+		// In a block with a non-zero code: fate fully decided, nothing in
+		// flight. Retired for the same panic-window reason as the CheckTx
+		// branch above.
+		tx.ClearSubmittedTx(signingKey)
+		return "", 0, "", fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s",
+			result.Result.TxResult.Code, tx.ScrubBroadcastText(result.Result.TxResult.Log, txBytes))
 	}
-	return result.Result.Hash, result.Result.Height, result.Result.TxResult.Log, nil
+
+	// ZERO CODES ARE NOT PROOF OF COMMIT. Every field above zero-values, so a
+	// syntactically valid but EMPTY body — "{}", or a truncated/again-proxied
+	// response — reached this point with CheckTx.Code == 0 and TxResult.Code == 0
+	// and was returned as a SUCCESSFUL COMMIT carrying an empty hash and height 0.
+	// That is worse than the race this whole change exists to fix: the caller is
+	// told the transaction committed, the fence never engages because there is no
+	// error, and the write is simply lost with a success reported to the operator.
+	//
+	// So success requires the same POSITIVE evidence the rejections above do:
+	//   - a hash that is present AND equals sha256 of txBytes. Absent binding, a
+	//     stale or mismatched RPC answer — a proxy replaying an earlier response,
+	//     a node answering about a different transaction — would be accepted as
+	//     proof for THIS one.
+	//   - a positive height. Height 0 means no block, so nothing committed.
+	// Anything short of that is INDETERMINATE and must fence: we genuinely do not
+	// know whether the bytes are in flight.
+	switch {
+	case gotHash == "":
+		return "", 0, "", indeterminateCommit(errors.New(
+			"broadcast commit response carried no transaction hash: cannot prove this transaction committed"))
+	case !bound:
+		// Deliberately echoes only a hex-filtered short prefix of the remote
+		// hash (tx.HexHashPrefix): the returned value is remote-controlled
+		// text, and this error flows raw into handler logs — a raw ESC or CR
+		// here would reintroduce the forged-log vector everywhere else in this
+		// file is scrubbed against.
+		return "", 0, "", indeterminateCommit(fmt.Errorf(
+			"broadcast commit response hash does not match the transaction sent (want %s…, got %s…)",
+			wantHash[:8], tx.HexHashPrefix(gotHash)))
+	case result.Result.Height <= 0:
+		return "", 0, "", indeterminateCommit(errors.New(
+			"broadcast commit response reported no block height: cannot prove this transaction committed"))
+	}
+	// The returned hash is OUR canonical rendering (uppercase, CometBFT's
+	// convention), not result.Result.Hash. They are proven equal modulo
+	// trim/prefix/case by the switch above, and the difference is who authored
+	// the string: handlers put this value into activity events and responses,
+	// and the one remote-controlled degree of freedom left — its formatting —
+	// is not worth carrying there. The success-path log is scrubbed for the
+	// same reason: a committed transaction's log is exactly as
+	// remote-controlled as a failed one's.
+	return strings.ToUpper(wantHash), result.Result.Height, tx.ScrubBroadcastText(result.Result.TxResult.Log, txBytes), nil
 }
 
 // commitTransportCause renders a broadcast transport failure as a category, so
@@ -426,7 +583,7 @@ func (h *DashboardHandler) signAndBroadcastCommitPrepared(
 			txErr = fmt.Errorf("encode tx: %w", encErr)
 			return txErr
 		}
-		hash, height, txLog, txErr = broadcastTxCommitWebContext(ctx, h.CometBFTRPC, encoded)
+		hash, height, txLog, txErr = broadcastTxCommitWebContext(ctx, h.CometBFTRPC, key, encoded)
 		if isIndeterminateCommitError(txErr) {
 			// Fence the key on the EXACT bytes that went out. The lease needs
 			// the encoded transaction, not the error: reconciliation both
@@ -503,7 +660,7 @@ func (h *DashboardHandler) signAndBroadcastSyncContext(ctx context.Context, ptx 
 			txErr = fmt.Errorf("encode tx: %w", encErr)
 			return txErr
 		}
-		txErr = broadcastTxSyncContext(ctx, h.CometBFTRPC, encoded)
+		txErr = broadcastTxSyncContext(ctx, h.CometBFTRPC, key, encoded)
 		if isIndeterminateCommitError(txErr) {
 			return tx.Indeterminate(txErr, encoded, tx.CometTxResolver(h.CometBFTRPC))
 		}
@@ -536,7 +693,7 @@ func (h *DashboardHandler) signAndBroadcastSyncContext(ctx context.Context, ptx 
 // decoding it would create a second place where a non-zero code has to be
 // classified as permanent or transient — a decision that belongs in
 // internal/tx's reconciler, which already has the exact bytes and can re-ask.
-func broadcastTxSyncContext(parent context.Context, cometRPC string, txBytes []byte) (err error) {
+func broadcastTxSyncContext(parent context.Context, cometRPC string, signingKey ed25519.PrivateKey, txBytes []byte) (err error) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -552,8 +709,11 @@ func broadcastTxSyncContext(parent context.Context, cometRPC string, txBytes []b
 	}
 	// Same post-send panic guard as broadcastTxCommitWebContext, for the same
 	// reason: a panic once the bytes may be on the wire is an unobserved
-	// outcome, not a definitive failure, and letting it unwind would free the
-	// lease slot without a fence. Only the panic value's TYPE is reported.
+	// outcome, not a definitive failure. As there, the registration below
+	// means even an unwinding panic would be fenced on these exact bytes by
+	// the lease's own guard; this recover is the cleaner conversion — a typed
+	// indeterminate error instead of a panic unwinding through a background
+	// producer. Only the panic value's TYPE is reported.
 	onWire := false
 	defer func() {
 		r := recover()
@@ -566,6 +726,10 @@ func broadcastTxSyncContext(parent context.Context, cometRPC string, txBytes []b
 		err = indeterminateCommit(fmt.Errorf("broadcast tx: panicked (%T) after the transaction was handed to the transport", r))
 	}()
 	onWire = true
+	// Same registration as the commit path, at the same instant, for the same
+	// reason: a panic after this function returns but before submit does must
+	// fence these bytes, not release the slot over them.
+	tx.RegisterSubmittedTx(signingKey, txBytes, tx.CometTxResolver(cometRPC))
 	resp, doErr := http.DefaultClient.Do(req)
 	if doErr != nil {
 		// Not %w: see commitTransportCause. The bytes are already gone.

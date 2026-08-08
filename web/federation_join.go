@@ -395,10 +395,13 @@ func (h *DashboardHandler) handleSetFederationSetting(w http.ResponseWriter, r *
 	// Where in-process re-exec is unsupported (Windows), the setting is already
 	// persisted — it just needs a manual restart to take effect. Say so plainly
 	// instead of promising a restart that will fail and silently self-revert.
+	// Through manualRestartAdvice: while a signing key is fenced, the manual
+	// restart is the bypass of the veto, and the advice must become the hold
+	// notice instead.
 	if !restartInProcessSupported() {
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": true, "enabled": body.Enabled, "restarting": false,
-			"message": "Saved. Restart SAGE to apply the federation change.",
+			"message": "Saved. " + manualRestartAdvice("Restart SAGE to apply the federation change."),
 		})
 		return
 	}

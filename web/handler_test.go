@@ -1191,7 +1191,7 @@ func TestCreateTaskConsensusFailureDoesNotInsertPhantom(t *testing.T) {
 	h.SigningKey = key
 	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/broadcast_tx_commit", r.URL.Path)
-		_, _ = w.Write([]byte(`{"result":{"check_tx":{"code":0,"log":""},"tx_result":{"code":7,"log":"rejected"},"hash":"abc","height":"1"}}`))
+		writeCommitTxRejected(w, r, 7, "rejected", 1)
 	}))
 	t.Cleanup(rpc.Close)
 	h.CometBFTRPC = rpc.URL
@@ -2148,7 +2148,7 @@ func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 		captured, decErr = tx.DecodeTx(encoded)
 		require.NoError(t, decErr)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ABC123","height":"42"}}`)
+		writeCommitOK(w, r)
 	}))
 	defer cometMock.Close()
 
@@ -2191,7 +2191,7 @@ func TestHandleUpdateAgent_AppV22CapabilitiesCommitBeforeSuccess(t *testing.T) {
 		captured, decErr = tx.DecodeTx(encoded)
 		require.NoError(t, decErr)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"CAP123","height":"88"}}`)
+		writeCommitOKAt(w, r, 88, "")
 	}))
 	defer cometMock.Close()
 
@@ -2265,7 +2265,7 @@ func TestHandleUpdateAgent_ZeroCapabilityIsLegacyCompatibleBeforeAppV22(t *testi
 		captured, decErr = tx.DecodeTx(encoded)
 		require.NoError(t, decErr)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"LEGACY0","height":"87"}}`)
+		writeCommitOKAt(w, r, 87, "")
 	}))
 	defer cometMock.Close()
 
@@ -2354,9 +2354,9 @@ func TestOverlayOnChainAgentPolicyReplacesStaleSQLiteRBAC(t *testing.T) {
 }
 
 func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"PERM123","height":"77"}}`)
+		writeCommitOKAt(w, r, 77, "")
 	}))
 	defer cometMock.Close()
 
@@ -2389,7 +2389,7 @@ func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
 		body := string(event)
 		assert.Contains(t, body, "event: access")
 		assert.Contains(t, body, `"action":"permissions_updated"`)
-		assert.Contains(t, body, `"tx_hash":"PERM123"`)
+		assert.Regexp(t, `"tx_hash":"[0-9A-F]{64}"`, body)
 		assert.Contains(t, body, `"height":77`)
 	case <-time.After(time.Second):
 		t.Fatal("committed permission update did not emit Chain Activity event")

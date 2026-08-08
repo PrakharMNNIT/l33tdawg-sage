@@ -110,6 +110,17 @@ func resolveWithFake(t *testing.T, endpoint string, encoded []byte) (TxOutcome, 
 	return resolve(ctx, encoded)
 }
 
+// cometHashHexForTest renders the hash CometBFT would report for encoded, in
+// the uppercase form its RPC uses. Fixtures that expect a VERDICT must carry
+// this exact hash: the resolver now refuses to read a verdict out of an
+// envelope about any other transaction, so a lazily invented hash ("ABC") in a
+// fixture is no longer a shortcut — it is the replayed-proxy attack, and it
+// must stay unresolved.
+func cometHashHexForTest(encoded []byte) string {
+	h := CometTxHash(encoded)
+	return strings.ToUpper(hex.EncodeToString(h[:]))
+}
+
 // TestCometTxResolver_CommittedHashLiftsWithoutResubmitting covers the cheap
 // path. If the exact hash is already in a block there is nothing to force, and
 // re-broadcasting would be pointless traffic against a node that has already
@@ -117,7 +128,7 @@ func resolveWithFake(t *testing.T, endpoint string, encoded []byte) (TxOutcome, 
 func TestCometTxResolver_CommittedHashLiftsWithoutResubmitting(t *testing.T) {
 	fake, endpoint := newFakeComet(t)
 	encoded := []byte("committed-transaction")
-	wantHash := strings.ToUpper(hex.EncodeToString(func() []byte { h := CometTxHash(encoded); return h[:] }()))
+	wantHash := cometHashHexForTest(encoded)
 
 	fake.setHandlers(func(hash string) (int, string) {
 		if hash != wantHash {
@@ -184,7 +195,8 @@ func TestCometTxResolver_ResubmitsTheExactBytesToForceAnAnswer(t *testing.T) {
 				t.Errorf("re-submitted %q, want the exact original bytes %q: different bytes are a different "+
 					"transaction and re-submission would no longer be idempotent", txHex, wantHex)
 			}
-			return 200, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0,"log":"ok"},"hash":"ABC","height":"43"}}`
+			return 200, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0,"log":"ok"},"hash":"` +
+				cometHashHexForTest(encoded) + `","height":"43"}}`
 		})
 
 	outcome, err := resolveWithFake(t, endpoint, encoded)
@@ -215,13 +227,15 @@ func TestCometTxResolver_ResubmitsTheExactBytesToForceAnAnswer(t *testing.T) {
 // have applied.
 func TestCometTxResolver_SupersededNonceIsADefinitiveRejection(t *testing.T) {
 	fake, endpoint := newFakeComet(t)
+	encoded := []byte("superseded")
 	fake.setHandlers(
 		func(string) (int, string) { return 500, cometNotFound },
 		func(string) (int, string) {
-			return 200, `{"result":{"check_tx":{"code":4,"log":"nonce too low"},"tx_result":{"code":0},"hash":"ABC","height":"0"}}`
+			return 200, `{"result":{"check_tx":{"code":4,"log":"nonce too low"},"tx_result":{"code":0},"hash":"` +
+				cometHashHexForTest(encoded) + `","height":"0"}}`
 		})
 
-	outcome, err := resolveWithFake(t, endpoint, []byte("superseded"))
+	outcome, err := resolveWithFake(t, endpoint, encoded)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -251,7 +265,7 @@ func TestCometTxResolver_SupersededNonceIsADefinitiveRejection(t *testing.T) {
 func TestCometTxResolver_NonceGateRefusalPrefersTheIndexedFate(t *testing.T) {
 	fake, endpoint := newFakeComet(t)
 	encoded := []byte("self-committed")
-	wantHash := strings.ToUpper(hex.EncodeToString(func() []byte { h := CometTxHash(encoded); return h[:] }()))
+	wantHash := cometHashHexForTest(encoded)
 
 	// First lookup: not indexed yet. After the re-submit hits the nonce gate,
 	// the second lookup finds the exact hash committed — the self-commit case.
@@ -269,7 +283,8 @@ func TestCometTxResolver_NonceGateRefusalPrefersTheIndexedFate(t *testing.T) {
 			return 200, `{"result":{"hash":"` + wantHash + `","height":"77","tx_result":{"code":0,"log":"ok"}}}`
 		},
 		func(string) (int, string) {
-			return 200, `{"result":{"check_tx":{"code":4,"log":"nonce too low: got 7, expected > 7"},"tx_result":{"code":0},"hash":"ABC","height":"0"}}`
+			return 200, `{"result":{"check_tx":{"code":4,"log":"nonce too low: got 7, expected > 7"},"tx_result":{"code":0},"hash":"` +
+				wantHash + `","height":"0"}}`
 		})
 
 	outcome, err := resolveWithFake(t, endpoint, encoded)
@@ -289,7 +304,19 @@ func TestCometTxResolver_NonceGateRefusalPrefersTheIndexedFate(t *testing.T) {
 // TestCometTxResolver_UnprovenAnswersStayUnresolved sweeps every RPC shape that
 // is NOT proof. Each one of these was, in some form, a fail-open lift in the
 // superseded implementation, so the assertion is uniform and blunt: no verdict.
+//
+// The stale/mismatched-envelope cases are the adversarial half: every one of
+// them is a syntactically perfect answer — the shape a replaying proxy, or a
+// node describing a different transaction, actually produces — and the ONLY
+// thing wrong with it is that it is not bound to the bytes this fence holds.
+// Before the hash/height binding, each of them lifted.
 func TestCometTxResolver_UnprovenAnswersStayUnresolved(t *testing.T) {
+	// The bytes under reconciliation for every case; boundHash is what a
+	// truthful node would answer with.
+	encoded := []byte("in-flight")
+	boundHash := cometHashHexForTest(encoded)
+	// The hash of a DIFFERENT transaction — what a replayed response carries.
+	staleHash := cometHashHexForTest([]byte("someone-else-entirely"))
 	for _, tc := range []struct {
 		name   string
 		lookup func(string) (int, string)
@@ -325,14 +352,76 @@ func TestCometTxResolver_UnprovenAnswersStayUnresolved(t *testing.T) {
 			want: "mempool is full",
 		},
 		{
-			// Both codes zero but nothing says it landed. Synthesizing
-			// "committed" from silence is exactly the fail-open removed here.
+			// Both codes zero but nothing says WHICH transaction: a success
+			// envelope with no hash cannot be about these bytes.
+			name:   "success envelope with no transaction hash",
+			lookup: func(string) (int, string) { return 500, cometNotFound },
+			submit: func(string) (int, string) {
+				return 200, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"","height":"12"}}`
+			},
+			want: "different transaction",
+		},
+		{
+			// A perfectly-formed commit envelope for the WRONG transaction —
+			// the replayed-proxy shape. Accepting it lifts this fence on
+			// somebody else's fate.
+			name:   "success envelope for a different transaction",
+			lookup: func(string) (int, string) { return 500, cometNotFound },
+			submit: func(string) (int, string) {
+				return 200, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"` + staleHash + `","height":"12"}}`
+			},
+			want: "different transaction",
+		},
+		{
+			// The nonce-gate refusal — the one CheckTx code that lifts — on an
+			// envelope about a different transaction. The gate's monotonicity
+			// argument only holds for OUR bytes.
+			name:   "nonce-gate refusal bound to a different transaction",
+			lookup: func(string) (int, string) { return 500, cometNotFound },
+			submit: func(string) (int, string) {
+				return 200, `{"result":{"check_tx":{"code":4,"log":"nonce too low"},"tx_result":{"code":0},"hash":"` +
+					staleHash + `","height":"0"}}`
+			},
+			want: "different transaction",
+		},
+		{
+			// Both codes zero, hash correct, but nothing says it landed.
+			// Synthesizing "committed" from silence is exactly the fail-open
+			// removed here.
 			name:   "success envelope with no committed height",
 			lookup: func(string) (int, string) { return 500, cometNotFound },
 			submit: func(string) (int, string) {
-				return 200, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"","height":"0"}}`
+				return 200, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"` + boundHash + `","height":"0"}}`
 			},
 			want: "no committed height",
+		},
+		{
+			// An INDEXED answer for the wrong hash: the /tx side of the same
+			// replay attack. Its result field must be ignored outright.
+			name: "indexed lookup answers about a different transaction",
+			lookup: func(string) (int, string) {
+				return 200, `{"result":{"hash":"` + staleHash + `","height":"9","tx_result":{"code":0,"log":"ok"}}}`
+			},
+			submit: func(string) (int, string) { return 500, cometNotFound },
+			want:   "different transaction",
+		},
+		{
+			// An indexed answer with the right hash and NO height claims
+			// inclusion while naming no block — an uncheckable claim.
+			name: "indexed lookup reports no block height",
+			lookup: func(string) (int, string) {
+				return 200, `{"result":{"hash":"` + boundHash + `","height":"0","tx_result":{"code":0,"log":"ok"}}}`
+			},
+			submit: func(string) (int, string) { return 500, cometNotFound },
+			want:   "no block height",
+		},
+		{
+			// A partial envelope: result present but empty — every field
+			// zero-values, which must never assemble into a verdict.
+			name:   "partial envelope with an empty result",
+			lookup: func(string) (int, string) { return 200, `{"result":{}}` },
+			submit: func(string) (int, string) { return 200, `{"result":{}}` },
+			want:   "different transaction",
 		},
 		{
 			name:   "undecodable response",
@@ -351,7 +440,7 @@ func TestCometTxResolver_UnprovenAnswersStayUnresolved(t *testing.T) {
 			fake, endpoint := newFakeComet(t)
 			fake.setHandlers(tc.lookup, tc.submit)
 
-			outcome, err := resolveWithFake(t, endpoint, []byte("in-flight"))
+			outcome, err := resolveWithFake(t, endpoint, encoded)
 			if err != nil {
 				t.Fatalf("resolve returned an error rather than an unresolved outcome: %v", err)
 			}
@@ -362,6 +451,42 @@ func TestCometTxResolver_UnprovenAnswersStayUnresolved(t *testing.T) {
 				t.Fatalf("detail %q does not explain why the fence is still held (want it to mention %q)", outcome.Detail, tc.want)
 			}
 		})
+	}
+}
+
+// TestCometTxResolver_OversizedBodyStaysUnresolved pins the allocation bound.
+// Reconciliation retries for as long as a fence stands — by design — so an
+// unbounded body read would let one misbehaving node or proxy turn a single
+// indeterminate transaction into unbounded repeated allocation, once per
+// attempt, forever. The fixture is the nastiest shape: a response that would
+// PROVE a commit (bound hash, real height, zero codes) if only its size were
+// ignored. Size alone must disqualify it: oversized is not proof, not a
+// rejection — unresolved, fence held.
+func TestCometTxResolver_OversizedBodyStaysUnresolved(t *testing.T) {
+	fake, endpoint := newFakeComet(t)
+	encoded := []byte("oversized-answer")
+	boundHash := cometHashHexForTest(encoded)
+	pad := strings.Repeat("a", CometRPCMaxResponseBytes+(1<<20))
+
+	fake.setHandlers(
+		func(string) (int, string) {
+			return 200, `{"pad":"` + pad + `","result":{"hash":"` + boundHash + `","height":"3","tx_result":{"code":0}}}`
+		},
+		func(string) (int, string) {
+			return 200, `{"pad":"` + pad + `","result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"` +
+				boundHash + `","height":"3"}}`
+		})
+
+	outcome, err := resolveWithFake(t, endpoint, encoded)
+	if err != nil {
+		t.Fatalf("resolve returned an error rather than an unresolved outcome: %v", err)
+	}
+	if outcome.Verdict != TxVerdictUnresolved {
+		t.Fatalf("got %v, want unresolved: an oversized body must never lift a fence, however "+
+			"convincing its content", outcome.Verdict)
+	}
+	if outcome.Detail == "" {
+		t.Fatal("an unresolved outcome with no detail makes a held fence undiagnosable")
 	}
 }
 

@@ -903,30 +903,40 @@ func (h *DashboardHandler) persistEmbeddingProvider(w http.ResponseWriter, r *ht
 	// The provider switch is persisted above; a restart just makes every
 	// consumer pick it up. Where an in-process restart isn't supported (Windows
 	// has no exec(2)), tell the operator to relaunch manually instead of
-	// pretending to restart and silently doing nothing.
+	// pretending to restart and silently doing nothing. Every manual
+	// instruction below goes through manualRestartAdvice: a fenced signing key
+	// makes "quit and relaunch" the action that loses a transaction, and this
+	// handler once told the operator to take it AFTER the restart veto had
+	// fired (see the error branch).
 	if !restartInProcessSupported() {
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok":               true,
 			"restart_required": true,
-			"message":          modeName + " is selected. Quit SAGE and relaunch it to finish switching.",
+			"message":          modeName + " is selected. " + manualRestartAdvice("Quit SAGE and relaunch it to finish switching."),
 		})
 		return
 	}
 	if h.RequestRestart == nil {
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": true, "restart_required": true,
-			"message": modeName + " is selected. Fully quit SAGE and open it again to finish switching.",
+			"message": modeName + " is selected. " + manualRestartAdvice("Fully quit SAGE and open it again to finish switching."),
 		})
 		return
 	}
 	if err := h.RequestRestart(); err != nil {
-		// The setting IS persisted; only the automatic restart failed (e.g. one
-		// is already in flight). A 503 here makes the frontend throw a bare
-		// "HTTP 503" and discard the guidance, so answer 200 like the sibling
-		// restart_required branches above.
+		// The setting IS persisted; only the automatic restart was refused. A
+		// 503 here makes the frontend throw a bare "HTTP 503" and discard the
+		// guidance, so answer 200 like the sibling restart_required branches —
+		// but the MESSAGE must not paper over WHY it was refused. This error is
+		// routinely the signer-fence restart veto, and the previous text
+		// swallowed it and told the operator to quit and relaunch by hand: the
+		// exact action the veto exists to refuse, recommended at the exact
+		// moment it was known to be unsafe. manualRestartAdvice re-reads the
+		// veto and swaps the instruction for the hold notice while it stands.
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": true, "restart_required": true,
-			"message": modeName + " is saved, but SAGE could not restart cleanly. Fully quit and reopen it.",
+			"message": modeName + " is saved. " + manualRestartAdvice(
+				"SAGE could not restart cleanly — fully quit and reopen it."),
 		})
 		return
 	}

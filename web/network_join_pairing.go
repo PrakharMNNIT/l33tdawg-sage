@@ -162,9 +162,12 @@ func (h *DashboardHandler) handleEnableNetworkMode(w http.ResponseWriter, r *htt
 		return
 	}
 	if !restartInProcessSupported() || h.RequestRestart == nil {
+		// Through manualRestartAdvice: while a signing key is fenced, "quit and
+		// open it again" is the manual bypass of the restart veto, and the
+		// advice must become the hold notice instead.
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": true, "restart_required": true,
-			"message": "Network mode is saved. Fully quit SAGE and open it again to apply it.",
+			"message": "Network mode is saved. " + manualRestartAdvice("Fully quit SAGE and open it again to apply it."),
 		})
 		return
 	}

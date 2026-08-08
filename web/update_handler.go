@@ -144,7 +144,11 @@ func (h *DashboardHandler) handleCheckUpdate(w http.ResponseWriter, r *http.Requ
 			case "darwin":
 				return "SAGE can download and verify the signed DMG, install the app in place, then restart through its external recovery helper."
 			case "windows":
-				return "Download the signed installer, fully quit SAGE, install it, then open SAGE again."
+				// The one platform whose instruction is a MANUAL quit — so it
+				// goes through manualRestartAdvice like every other manual
+				// restart surface: while a signing key is fenced this text is
+				// the only control that lane has.
+				return manualRestartAdvice("Download the signed installer, fully quit SAGE, install it, then open SAGE again.")
 			default:
 				return "SAGE can install this verified update in the app."
 			}
@@ -303,9 +307,13 @@ func (h *DashboardHandler) handleApplyUpdate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if !inAppUpdateSupported(runtime.GOOS) {
-		message := "This platform uses the signed release installer. Fully quit SAGE, install the release, then reopen it."
+		// Manual-quit instructions, so both go through manualRestartAdvice:
+		// while a signing key is fenced they must become the hold notice.
+		message := "This platform uses the signed release installer. " +
+			manualRestartAdvice("Fully quit SAGE, install the release, then reopen it.")
 		if runtime.GOOS == "darwin" {
-			message = "macOS in-app replacement is disabled because no external recovery owner can restore SAGE.app if launch validation fails after the atomic swap. Download the signed DMG, fully quit SAGE, drag SAGE.app to Applications, then reopen it. Your node data is unchanged."
+			message = "macOS in-app replacement is disabled because no external recovery owner can restore SAGE.app if launch validation fails after the atomic swap. " +
+				manualRestartAdvice("Download the signed DMG, fully quit SAGE, drag SAGE.app to Applications, then reopen it. Your node data is unchanged.")
 		}
 		writeError(w, http.StatusBadRequest, message)
 		return
@@ -348,7 +356,7 @@ func (h *DashboardHandler) handleApplyUpdate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if pending := PendingUpdateVersion(execPath); pending != "" {
-		writeError(w, http.StatusConflict, "update "+pending+" is already installed and waiting for a restart; restart SAGE before installing another update")
+		writeError(w, http.StatusConflict, pendingUpdateConflictMessage(pending))
 		return
 	}
 	if !h.UpdateInProgress.CompareAndSwap(false, true) {
@@ -550,8 +558,7 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 			return
 		}
 		h.sendUpdateProgress("extract", "done", "Signed app verified")
-		h.sendUpdateProgress("install", "done", installedRestartAdvice("SAGE "+stagedVersion+" installed"))
-		h.sendUpdateProgress("complete", "done", "ready_to_restart")
+		h.sendInstalledUpdateComplete("SAGE " + stagedVersion + " installed")
 		return
 	}
 
@@ -592,32 +599,46 @@ func (h *DashboardHandler) performUpdate(ctx context.Context, downloadURL, check
 		return
 	}
 
-	h.sendUpdateProgress("install", "done", installedRestartAdvice("Update installed"))
-	h.sendUpdateProgress("complete", "done", "ready_to_restart")
+	h.sendInstalledUpdateComplete("Update installed")
 }
 
-// installedRestartAdvice appends a hold notice when a signing key is fenced.
+// installedRestartAdvice composes the end-of-install instruction, routed
+// through manualRestartAdvice like every other manual-restart surface: on the
+// macOS app lane this text tells the operator to quit and reopen SAGE by hand,
+// which bypasses the coordinated restart veto entirely, so while a fence is
+// held it must carry the hold notice instead of "restart SAGE to apply".
 //
-// handleRestart already VETOES a coordinated restart while fences are held, but
-// this text is not routed through it: it is the operator-facing instruction at
-// the end of an install, and on the macOS app lane it tells the operator to quit
-// and reopen SAGE by hand — which bypasses the veto entirely. Saying
-// "restart SAGE to apply" with no qualification is therefore the one place the
-// product actively ADVISES the action that drops an in-process fence and loses
-// the transaction it was protecting. Condition 2 of the handoff is "never advise
-// restart"; this closes the last surface that did.
-//
-// It informs rather than blocks: the update is genuinely installed, and an
-// operator who understands the trade may still choose to restart. What must not
-// happen is that the product recommends it silently.
+// It informs rather than blocks — the update is genuinely installed, and the
+// process cannot intercept a manual Cmd-Q anyway. And it is ADVICE, not a
+// guarantee: it names the fence state at composition time, and a fence can
+// rise or clear before the operator acts. The check that is actually atomic
+// with a restart lives on the restart paths — handleRestart re-reads the veto
+// per request, and cmd/sage-gui re-checks it under quiesce during the drain.
+// See manualRestartAdvice for the full statement of that limit.
 func installedRestartAdvice(prefix string) string {
-	if held := tx.FencedSigners(); len(held) > 0 {
-		return prefix + " — but " + strconv.Itoa(len(held)) +
-			" signing key(s) are currently held awaiting proof of an earlier submission's fate. " +
-			"Restarting now discards that state and can lose the transaction it is protecting. " +
-			"Wait for the hold to clear, then restart."
-	}
-	return prefix + " — restart SAGE to apply"
+	return prefix + " — " + manualRestartAdvice("restart SAGE to apply")
+}
+
+// sendInstalledUpdateComplete keeps the fence-aware restart advice in BOTH
+// the install event and the final retained completion state. The old final
+// event replaced it immediately with the literal "ready_to_restart", so a
+// reconnecting client saw only the unsafe instruction while a fence was held.
+func (h *DashboardHandler) sendInstalledUpdateComplete(prefix string) {
+	restartAdvice := installedRestartAdvice(prefix)
+	h.sendUpdateProgress("install", "done", restartAdvice)
+	h.sendUpdateProgress("complete", "done", restartAdvice)
+}
+
+// pendingUpdateConflictMessage composes the 409 for "an update is already
+// installed and waiting for a restart". The instruction half is routed through
+// manualRestartAdvice like every other manual-restart surface: this conflict
+// fires precisely when the operator is one restart away from activating an
+// update, and while a signing key is fenced that restart is the manual bypass
+// the veto refuses — telling them to take it here would discard the fence and
+// lose the protected transaction to an untraceable Code 4.
+func pendingUpdateConflictMessage(pending string) string {
+	return "update " + pending + " is already installed and waiting for a restart; " +
+		manualRestartAdvice("restart SAGE before installing another update")
 }
 
 const (
@@ -1146,9 +1167,12 @@ func (h *DashboardHandler) handleRestart(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if !restartInProcessSupported() || h.RequestRestart == nil {
+		// The veto above answered "" for THIS request, but this branch hands
+		// the operator a manual instruction they may act on much later, so it
+		// still goes through manualRestartAdvice with everything else.
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": false, "restart_required": true,
-			"message": "The update is installed. Fully quit SAGE and open it again to finish.",
+			"message": "The update is installed. " + manualRestartAdvice("Fully quit SAGE and open it again to finish."),
 		})
 		return
 	}
@@ -1242,14 +1266,20 @@ func isPermissionDenied(err error) bool {
 
 // installErrorMessage maps an install-step failure to a user-facing SSE message.
 // On macOS, permission errors get actionable TCC guidance instead of a dead end.
+// The TCC guidance instructs a manual quit-and-relaunch, so it goes through
+// manualRestartAdvice: while a signing key is fenced the operator gets the hold
+// notice first and the TCC steps once the fence clears and the update is
+// retried — losing an in-flight transaction to fix a permissions prompt is not
+// a trade this message may make for them.
 func installErrorMessage(action string, err error, downloadURL string) string {
 	if runtime.GOOS == "darwin" && isPermissionDenied(err) {
-		return fmt.Sprintf(
-			"macOS blocked SAGE from modifying its app bundle (%s). "+
+		return fmt.Sprintf("macOS blocked SAGE from modifying its app bundle (%s). %s",
+			err.Error(),
+			manualRestartAdvice(fmt.Sprintf(
 				"Either: (a) grant SAGE \"App Management\" in System Settings → Privacy & Security → App Management, "+
-				"fully quit SAGE from the menu bar, relaunch, and retry the update; "+
-				"or (b) download the DMG from %s, drag-replace SAGE in Finder, then restart SAGE.",
-			err.Error(), releasePageURL(downloadURL))
+					"fully quit SAGE from the menu bar, relaunch, and retry the update; "+
+					"or (b) download the DMG from %s, drag-replace SAGE in Finder, then restart SAGE.",
+				releasePageURL(downloadURL))))
 	}
 	return action + ": " + err.Error()
 }

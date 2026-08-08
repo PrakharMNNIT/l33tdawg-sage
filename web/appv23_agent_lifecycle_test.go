@@ -61,7 +61,7 @@ func TestAppV23RemoveCommitsDeactivationAndGroupCleanupBeforeSQLProjection(t *te
 			},
 			approval.Role, approval.ExpectedRevision, approval.ExpectedRoleRevision,
 		))
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"REMOVE","height":"3"}}`)
+		writeCommitOKAt(w, r, 3, "")
 	}))
 	defer rpc.Close()
 
@@ -274,7 +274,7 @@ func TestAppV26RemoveDoesNotTrustStaleRemovedProjectionOverActiveConsensus(t *te
 				Active: false, UpdatedHeight: 3, RetireOwnedDomainsToRoot: true,
 			}, approval.Role, approval.ExpectedRevision, approval.ExpectedRoleRevision,
 		))
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"REMOVE","height":"3"}}`)
+		writeCommitOKAt(w, r, 3, "")
 	}))
 	defer rpc.Close()
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
@@ -328,9 +328,9 @@ func TestAppV23LegacyAgentPolicyRouteIsGoneButDisplayMetadataStaysLocal(t *testi
 	}))
 
 	rpcCalls := 0
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rpcCalls++
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"UNEXPECTED","height":"3"}}`)
+		writeCommitOKAt(w, r, 3, "")
 	}))
 	defer rpc.Close()
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
@@ -441,7 +441,7 @@ func TestAppV23MergeRejectsBeforeLocalMemoryMutation(t *testing.T) {
 		require.NoError(t, decodeErr)
 		captured, decodeErr = tx.DecodeTx(raw)
 		require.NoError(t, decodeErr)
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":110,"log":"access denied"},"hash":"DENIED","height":"3"}}`)
+		writeCommitTxRejected(w, r, 110, "access denied", 3)
 	}))
 	defer rpc.Close()
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
@@ -487,7 +487,7 @@ func TestAppV23RootRotationUsesTx39AndStoresRecoveryBundle(t *testing.T) {
 			captured.RootCredentialRotate.NewCredentialID,
 			3,
 		))
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ROTATE","height":"3"}}`)
+		writeCommitOKAt(w, r, 3, "")
 	}))
 	defer rpc.Close()
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
@@ -877,7 +877,7 @@ func TestAppV23DashboardTaskUsesRotatedRootCredentialOnExistingRootDomain(t *tes
 		require.Equal(t, tx.TxTypeMemorySubmit, captured.Type)
 		require.NoError(t, fixture.badger.SetMemoryAuthor(captured.MemorySubmit.MemoryID, rotatedID))
 		require.NoError(t, fixture.badger.SetMemoryAuthorPrincipal(captured.MemorySubmit.MemoryID, fixture.rootID))
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"TASK","height":"3"}}`)
+		writeCommitOKAt(w, r, 3, "")
 	}))
 	defer rpc.Close()
 
@@ -989,7 +989,7 @@ func TestAppV26RootCanTransferCurrentlyRootOwnedDomainToActiveLocalAgent(t *test
 		parsed, decodeErr := tx.DecodeTx(raw)
 		require.NoError(t, decodeErr)
 		captured = append(captured, parsed)
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0,"log":"purged 0 grants"},"hash":"ROOTREASSIGN","height":"42"}}`)
+		writeCommitOKAt(w, r, 42, "purged 0 grants")
 	}))
 	t.Cleanup(rpc.Close)
 
@@ -1099,7 +1099,7 @@ func TestAppV23DomainReassignmentUsesCurrentRotatedRootCredential(t *testing.T) 
 		parsed, decodeErr := tx.DecodeTx(raw)
 		require.NoError(t, decodeErr)
 		captured = append(captured, parsed)
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0,"log":"purged 0 grants"},"hash":"REASSIGN","height":"42"}}`)
+		writeCommitOKAt(w, r, 42, "purged 0 grants")
 	}))
 	defer rpc.Close()
 	h := appV23AccessTestHandler(
@@ -1157,7 +1157,7 @@ func TestAppV23DashboardGovernanceProofUsesRotatedRootCredential(t *testing.T) {
 		require.NoError(t, decodeErr)
 		captured, decodeErr = tx.DecodeTx(raw)
 		require.NoError(t, decodeErr)
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"VOTE","height":"3"}}`)
+		writeCommitOKAt(w, r, 3, "")
 	}))
 	defer rpc.Close()
 	h := appV23AccessTestHandler(

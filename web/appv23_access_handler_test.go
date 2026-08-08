@@ -468,7 +468,7 @@ func TestAppV23PolicyApprovalImmediatelyRepairsAgentsProjection(t *testing.T) {
 			Clearance: approval.Clearance, Capabilities: store.AgentCapabilities(approval.Capabilities),
 			Active: approval.Active, UpdatedHeight: 3,
 		}, approval.Role, approval.ExpectedRevision, approval.ExpectedRoleRevision))
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"APPROVE","height":"3"}}`)
+		writeCommitOKAt(w, r, 3, "")
 	}))
 	defer rpc.Close()
 	h := appV23AccessTestHandler(fixture, rpc.URL, map[string]ed25519.PrivateKey{pendingID: pendingKey})
@@ -984,8 +984,8 @@ func TestAppV23GroupMutationNeverReSignsAnUncertainCommit(t *testing.T) {
 
 func TestAppV23GroupMutationReportsDefinitiveConsensusRejection(t *testing.T) {
 	fixture := newAppV23AccessFixture(t)
-	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":19,"log":"revision conflict"},"tx_result":{"code":0}}}`)
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCommitCheckTxRejected(w, r, 19, "revision conflict")
 	}))
 	defer rpc.Close()
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
@@ -1496,7 +1496,7 @@ func TestAppV23CreateRouteCannotMintElevatedRole(t *testing.T) {
 					42,
 					store.DefaultSelfRegisteredAgentCapabilities,
 				))
-				_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"REGISTER","height":"42"}}`)
+				writeCommitOK(w, r)
 			}))
 			defer rpc.Close()
 			h.CometBFTRPC = rpc.URL
@@ -1565,7 +1565,7 @@ func TestAppV23CreateBackgroundBroadcastsRestrictedIdentityOnly(t *testing.T) {
 			42,
 			store.DefaultSelfRegisteredAgentCapabilities,
 		))
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"APPV23","height":"42"}}`)
+		writeCommitOK(w, r)
 	}))
 	defer rpc.Close()
 	h.CometBFTRPC = rpc.URL
@@ -1610,7 +1610,7 @@ func TestAppV23CreateFailsHonestlyAfterDurableKeyWhenConsensusRejects(t *testing
 		require.NoError(t, decodeErr)
 		captured, decodeErr = tx.DecodeTx(raw)
 		require.NoError(t, decodeErr)
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":110,"log":"denied"},"hash":"DENIED","height":"42"}}`)
+		writeCommitTxRejected(w, r, 110, "denied", 42)
 	}))
 	defer rpc.Close()
 	h.CometBFTRPC = rpc.URL
