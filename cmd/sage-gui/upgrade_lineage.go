@@ -160,7 +160,8 @@ func runUpgradeLineageVerify(args []string) error {
 					source = manifest.Transitions[0].Source
 				}
 				out.EvidenceSource = source
-				if source == "legacy-anchor" {
+				switch source {
+				case "legacy-anchor":
 					if !exactLineageCoverage(missing, manifest.Evidence, manifest.Transitions) || !validAnchorTrustBundle(status, manifest.Evidence, manifest.Transitions) {
 						out.Diagnostics = append(out.Diagnostics, "legacy-anchor manifest does not exactly cover the current missing-rung set")
 					} else {
@@ -175,7 +176,7 @@ func runUpgradeLineageVerify(args []string) error {
 							out.Diagnostics = append(out.Diagnostics, "anchor heights are operator claims, not locally history-verified facts; the explicit vote attests these exact claims")
 						}
 					}
-				} else if source == "comet-block-results" {
+				case "comet-block-results":
 					local, diagnostics := discoverRetainedLineageEvidence(ctx, *rpc, status, missing)
 					out.Diagnostics = append(out.Diagnostics, diagnostics...)
 					if !local.Complete {
@@ -187,7 +188,7 @@ func runUpgradeLineageVerify(args []string) error {
 					} else {
 						out.HistoryVerified, out.Valid, out.EligibleForVote = true, true, true
 					}
-				} else {
+				default:
 					out.Diagnostics = append(out.Diagnostics, "unsupported or mixed evidence source")
 				}
 			}
@@ -420,16 +421,17 @@ func validateDoctorLineageEvidenceV2(status *upgradeLineageRPCStatus, evidence [
 		if transition.FromVersion >= transition.ToVersion || transition.ToVersion > 21 || transition.AppliedHeight <= previousTransitionHeight || transition.AppliedHeight > status.PersistedHeight || len(transition.SubsumedVersions) == 0 {
 			return errors.New("retained version transitions are invalid, future-dated, or not strictly ordered")
 		}
-		if transition.Source == "legacy-anchor" {
+		switch transition.Source {
+		case "legacy-anchor":
 			if transition.BlockHash != "" {
 				return errors.New("legacy-anchor transition must not claim a block hash")
 			}
-		} else if transition.Source == "comet-block-results" {
+		case "comet-block-results":
 			decoded, err := hex.DecodeString(transition.BlockHash)
 			if err != nil || len(decoded) != sha256.Size || hex.EncodeToString(decoded) != transition.BlockHash {
 				return errors.New("retained-Comet transition requires a canonical block hash")
 			}
-		} else {
+		default:
 			return errors.New("unsupported transition evidence source")
 		}
 		previousTransitionHeight = transition.AppliedHeight

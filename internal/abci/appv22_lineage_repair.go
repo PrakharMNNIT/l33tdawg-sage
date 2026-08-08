@@ -207,8 +207,8 @@ func (app *SageApp) validateApprovedLegacyV1LineagePlan(plan *store.UpgradePlanR
 	if audit.Schema != legacyLineageRepairSchemaV1 || audit.Manifest != plan.LineageRepair {
 		return errors.New("legacy v1 pending plan does not match its lineage audit manifest")
 	}
-	if err := app.badgerStore.ValidateLegacyUpgradeLineageRepairAudit(); err != nil {
-		return err
+	if auditErr := app.badgerStore.ValidateLegacyUpgradeLineageRepairAudit(); auditErr != nil {
+		return auditErr
 	}
 	proposal, err := app.govEngine.LoadProposal(audit.ProposalID)
 	if err != nil || proposal == nil {
