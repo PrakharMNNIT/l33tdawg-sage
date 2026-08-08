@@ -78,6 +78,21 @@ func TestBroadcastTxCommit_FalseSuccessShapesAreIndeterminate(t *testing.T) {
 			body:   `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"","height":"12"}}`,
 		},
 		{
+			name:   "bound success envelope missing both nested verdicts",
+			status: 200,
+			body:   `{"result":{"hash":"` + boundHash + `","height":"12"}}`,
+		},
+		{
+			name:   "bound success envelope with null checktx",
+			status: 200,
+			body:   `{"result":{"check_tx":null,"tx_result":{"code":0},"hash":"` + boundHash + `","height":"12"}}`,
+		},
+		{
+			name:   "bound success envelope with null txresult",
+			status: 200,
+			body:   `{"result":{"check_tx":{"code":0},"tx_result":null,"hash":"` + boundHash + `","height":"12"}}`,
+		},
+		{
 			// A perfectly-formed envelope about a DIFFERENT transaction — the
 			// replayed-proxy shape. Accepting it reports this transaction
 			// committed on the strength of someone else's fate.

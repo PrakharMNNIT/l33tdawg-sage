@@ -1017,19 +1017,20 @@ func TestWithNonceLease_PanicInSubmitFencesOnlyRegisteredBytes(t *testing.T) {
 	assertKeyStillGrantable(t, sk, "a proven panic-raised fence")
 }
 
-// TestWithNonceLease_NormalReturnClearsRegistration pins the cleanup half of
-// RegisterSubmittedTx's contract: a registration consumed by a NORMAL return —
-// here a definitive rejection, which rightly fences nothing — must not survive
+// TestWithNonceLease_DefinitiveErrorRequiresClear pins the cleanup half of
+// RegisterSubmittedTx's contract: a definitive rejection explicitly clears its
+// registration, fences nothing, and must not survive
 // into the key's next submission, where an unrelated pre-send panic would
 // otherwise fence on stale bytes from a transaction whose fate was already
 // decided.
-func TestWithNonceLease_NormalReturnClearsRegistration(t *testing.T) {
+func TestWithNonceLease_DefinitiveErrorRequiresClear(t *testing.T) {
 	sk := newLeaseTestKey(t)
 	key := leaseKeyFor(t, sk)
 
 	rejected := errors.New("tx rejected in CheckTx (code 2): unauthorized")
 	if err := WithNonceLease(context.Background(), sk, func(uint64) error {
 		RegisterSubmittedTx(sk, []byte("bytes-whose-fate-consensus-decided"), nil)
+		ClearSubmittedTx(sk)
 		return rejected
 	}); !errors.Is(err, rejected) {
 		t.Fatalf("got %v, want the submit error", err)
@@ -1053,6 +1054,41 @@ func TestWithNonceLease_NormalReturnClearsRegistration(t *testing.T) {
 			"from a transaction whose fate was already decided")
 	}
 	assertKeyStillGrantable(t, sk, "a cleared registration")
+}
+
+func TestWithNonceLease_RegisteredOrdinaryErrorFences(t *testing.T) {
+	setFenceTimingsForTest(t, fastFenceTimings())
+	sk := newLeaseTestKey(t)
+	key := leaseKeyFor(t, sk)
+	sent := []byte("ordinary-error-after-wire-bytes")
+	resolve := make(chan struct{})
+	resolver := func(ctx context.Context, encoded []byte) (TxOutcome, error) {
+		if string(encoded) != string(sent) {
+			t.Fatalf("resolver received %q, want exact registered bytes %q", encoded, sent)
+		}
+		select {
+		case <-resolve:
+			return TxOutcome{Verdict: TxVerdictCommitted, Detail: "committed at height 21"}, nil
+		case <-ctx.Done():
+			return TxOutcome{}, ctx.Err()
+		}
+	}
+
+	wantErr := errors.New("plain adopter error without Indeterminate wrapper")
+	err := WithNonceLease(context.Background(), sk, func(uint64) error {
+		RegisterSubmittedTx(sk, sent, resolver)
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("got %v, want the adopter's original error", err)
+	}
+	if !keyIsFenced(key) {
+		t.Fatal("a live registration plus an ordinary error released the signer over bytes that may be in flight")
+	}
+
+	close(resolve)
+	waitUntil(t, func() bool { return !keyIsFenced(key) }, "proof to lift ordinary-error fence")
+	assertKeyStillGrantable(t, sk, "a proven ordinary-error fence")
 }
 
 // TestWithNonceLease_ClearSubmittedTxRetiresRegistrationMidSubmit pins the

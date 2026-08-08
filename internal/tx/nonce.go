@@ -397,6 +397,18 @@ func WithNonceLease(ctx context.Context, sk ed25519.PrivateKey, submit func(nonc
 		// could take the freed slot and allocate past the abandoned nonce in
 		// the window before the fence appeared.
 		fenceSubmission(key, indeterminate)
+	} else if subErr != nil {
+		// Registration is an enforceable lifecycle, not merely a panic hint.
+		// Once bytes reached transport, every error is ambiguous unless the
+		// adopter first retired the record on a hash-bound definitive verdict.
+		if reg := takeRegisteredSubmission(key); reg != nil {
+			fenceSubmission(key, &indeterminateSubmit{
+				err:     errSubmitReturnedOnWire,
+				cause:   fenceCauseSubmitError,
+				encoded: reg.encoded,
+				resolve: reg.resolve,
+			})
+		}
 	}
 	return subErr
 }
@@ -425,6 +437,11 @@ var (
 var errSubmitPanickedOnWire = errors.New(
 	"submit panicked after handing its transaction to the network; the outcome was never observed")
 
+// Fixed text prevents a returned error containing a signed-transaction request
+// URL from entering the durable fence record.
+var errSubmitReturnedOnWire = errors.New(
+	"submit returned an error after handing its transaction to the network without definitive proof of its fate")
+
 // RegisterSubmittedTx declares, from INSIDE a WithNonceLease submit callback and
 // immediately BEFORE the encoded bytes are handed to the transport, that these
 // exact bytes are about to go out for sk.
@@ -436,15 +453,14 @@ var errSubmitPanickedOnWire = errors.New(
 // past it, the silent Code 4 loss the fence exists to prevent). With one, a
 // panic is fenced on these bytes exactly as an Indeterminate return would be,
 // and the fence is provable because reconciliation has the bytes to identify
-// and re-submit. WithNonceLease clears the registration on every return, so an
-// adopter never NEEDS to unregister — a normal return, definitive or
-// indeterminate, supersedes it. But the record stays live for the REMAINDER of
-// submit even after the transaction's fate becomes definitively known: an
-// adopter that decodes a definitive verdict and then keeps running code before
-// returning should retire the record with ClearSubmittedTx at that point, so a
-// panic in the leftover window cannot fence bytes that are provably not in
-// flight (see ClearSubmittedTx for what such a fence costs: an indefinite hold
-// at best, a late silent commit of "rejected" bytes at worst).
+// and re-submit. WithNonceLease clears the registration after success and after
+// consuming an explicit Indeterminate result. An ordinary error with a live
+// registration instead fences: the adopter must call ClearSubmittedTx once a
+// hash-bound definitive verdict proves nothing is in flight. The record stays
+// live for the REMAINDER of submit after such a verdict, so retiring it at that
+// exact point also prevents a later panic from fencing decided bytes.
+// See ClearSubmittedTx for what such a false fence costs: an indefinite hold at
+// best, a late silent commit of "rejected" bytes at worst.
 //
 // encoded is copied for the same reason Indeterminate copies it: the caller's
 // buffer usually comes from an encoder and may be reused, and a fence must

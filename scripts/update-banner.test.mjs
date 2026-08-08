@@ -43,8 +43,10 @@ test('update banner distinguishes an installed release awaiting restart', () => 
         disk_version: 'v11.8.0',
         update_available: false,
         restart_required: true,
+		update_instructions: 'Update installed — do not quit or restart while a signer fence is held.',
     });
     assert.equal(banner.banner_release, 'v11.8.0');
-    assert.equal(banner.banner_title, 'SAGE 11.8.0 is installed and ready to restart');
+	assert.equal(banner.banner_title, 'SAGE 11.8.0 is installed — restart pending');
+	assert.equal(banner.banner_message, 'Update installed — do not quit or restart while a signer fence is held.');
     assert.equal(banner.banner_action, 'Restart options');
 });

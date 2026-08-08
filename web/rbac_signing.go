@@ -148,11 +148,11 @@ func (h *DashboardHandler) retryGovernanceProofAtCommittedTime(
 // error rather than a silent success.
 type cometCommitResult struct {
 	Result struct {
-		CheckTx struct {
+		CheckTx *struct {
 			Code int    `json:"code"`
 			Log  string `json:"log"`
 		} `json:"check_tx"`
-		TxResult struct {
+		TxResult *struct {
 			Code int    `json:"code"`
 			Log  string `json:"log"`
 		} `json:"tx_result"`
@@ -282,14 +282,16 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, signin
 	var result cometCommitResult
 	decoder := json.NewDecoder(limited)
 	if decErr := decoder.Decode(&result); decErr != nil {
-		return "", 0, "", indeterminateCommit(fmt.Errorf("decode broadcast commit response: %w", decErr))
+		return "", 0, "", indeterminateCommit(fmt.Errorf("decode broadcast commit response: %s",
+			tx.ScrubBroadcastText(decErr.Error(), txBytes)))
 	}
 	if trailingErr := decoder.Decode(&struct{}{}); trailingErr == nil {
 		return "", 0, "", indeterminateCommit(errors.New(
 			"decode broadcast commit response: multiple JSON values"))
 	} else if !errors.Is(trailingErr, io.EOF) {
 		return "", 0, "", indeterminateCommit(fmt.Errorf(
-			"decode broadcast commit response: trailing data: %w", trailingErr))
+			"decode broadcast commit response: trailing data: %s",
+			tx.ScrubBroadcastText(trailingErr.Error(), txBytes)))
 	}
 	if limited.N <= 0 {
 		return "", 0, "", indeterminateCommit(fmt.Errorf(
@@ -311,6 +313,14 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, signin
 			return "", 0, "", indeterminateCommit(fmt.Errorf("broadcast error: %s: %s", message, data))
 		}
 		return "", 0, "", indeterminateCommit(fmt.Errorf("broadcast error: %s", message))
+	}
+	// A valid CometBFT commit result always carries both nested verdicts. With
+	// value structs, a missing or explicit-null check_tx/tx_result silently
+	// zero-valued to code 0; a proxy could therefore pair the correct hash and
+	// height with no execution verdict and manufacture a false success.
+	if result.Result.CheckTx == nil || result.Result.TxResult == nil {
+		return "", 0, "", indeterminateCommit(errors.New(
+			"broadcast commit response omitted check_tx or tx_result: cannot prove this transaction's fate"))
 	}
 	// From here down the envelope claims a verdict — but NO VERDICT, SUCCESS OR
 	// REJECTION, IS READ FROM AN ENVELOPE WHOSE HASH IS NOT OURS — the rule

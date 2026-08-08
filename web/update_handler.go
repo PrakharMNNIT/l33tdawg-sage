@@ -162,6 +162,7 @@ func (h *DashboardHandler) handleCheckUpdate(w http.ResponseWriter, r *http.Requ
 	if diskVer := runningBinaryDiskVersion(r.Context()); restartRequired(current, diskVer) {
 		result["restart_required"] = true
 		result["disk_version"] = diskVer
+		result["update_instructions"] = installedRestartAdvice("Update installed")
 	}
 
 	writeJSONResp(w, http.StatusOK, result)
@@ -408,6 +409,11 @@ func (h *DashboardHandler) handleGetUpdateStatus(w http.ResponseWriter, _ *http.
 		state[key] = value
 	}
 	h.updateStateMu.RUnlock()
+	// Completion is retained, but restart advice is not a retained fact: a fence
+	// may rise or clear after installation. Recompose it for every status read.
+	if state["step"] == "complete" && state["status"] == "done" {
+		state["message"] = installedRestartAdvice("Update installed")
+	}
 	writeJSONResp(w, http.StatusOK, map[string]any{
 		"in_progress": h.UpdateInProgress.Load(),
 		"state":       state,

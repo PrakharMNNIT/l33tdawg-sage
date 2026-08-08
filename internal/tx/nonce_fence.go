@@ -438,6 +438,10 @@ const (
 	// broadcast path, not the reconciliation resolver, and the stack to read is
 	// the one the panic printed when it finished unwinding.
 	fenceCauseSubmitPanic fenceCause = "submit_panic"
+	// fenceCauseSubmitError: submit returned an ordinary error while its
+	// registration was still live. Registration proves bytes reached transport;
+	// without ClearSubmittedTx, the error cannot safely reopen the signer.
+	fenceCauseSubmitError fenceCause = "submit_error"
 	// fenceCauseNoResolver / fenceCauseNoEncodedTx: the attempt could not even
 	// be made. These are the two shapes of "we have no way to ask", which is
 	// emphatically not the same as "the transaction is gone" — they hold the
@@ -1860,7 +1864,7 @@ type cometTxLookup struct {
 	Result *struct {
 		Hash     string `json:"hash"`
 		Height   int64  `json:"height,string"`
-		TxResult struct {
+		TxResult *struct {
 			Code int    `json:"code"`
 			Log  string `json:"log"`
 		} `json:"tx_result"`
@@ -1876,11 +1880,11 @@ type cometTxLookup struct {
 // definitive verdict on these exact bytes.
 type cometBroadcastCommit struct {
 	Result *struct {
-		CheckTx struct {
+		CheckTx *struct {
 			Code int    `json:"code"`
 			Log  string `json:"log"`
 		} `json:"check_tx"`
-		TxResult struct {
+		TxResult *struct {
 			Code int    `json:"code"`
 			Log  string `json:"log"`
 		} `json:"tx_result"`
@@ -1947,7 +1951,9 @@ func cometResolve(ctx context.Context, endpoint string, encoded []byte) (TxOutco
 		// would redo it by hand and apply it twice. A recheck that fails or
 		// still finds nothing indexed (indexer="null" is a stock CometBFT
 		// config, and SAGE's join/state-sync tooling deletes tx_index.db)
-		// changes nothing: the lift stands on the gate's monotonicity, and the
+		// changes nothing: the lift stands on the nonce gate's permanence (the
+		// committed floor is monotone for positive nonces; nonce zero remains
+		// forbidden after the monotone app-v9 activation height), and the
 		// detail already says the two fates are indistinguishable.
 		if recheck, recheckErr := cometIndexedOutcome(ctx, endpoint, encoded, hash); recheckErr == nil &&
 			recheck.Verdict != TxVerdictUnresolved {
@@ -2038,6 +2044,12 @@ func cometIndexedOutcome(ctx context.Context, endpoint string, encoded []byte, h
 			Detail:  "comet tx lookup reported an indexed transaction with no block height: not proof of inclusion",
 		}, nil
 	}
+	if lookup.Result.TxResult == nil {
+		return TxOutcome{
+			Verdict: TxVerdictUnresolved,
+			Detail:  "comet tx lookup omitted tx_result: not proof of execution",
+		}, nil
+	}
 	if lookup.Result.TxResult.Code != 0 {
 		// In a block and refused by FinalizeBlock. This is REAL PROOF for the
 		// property the fence guards — no later allocation can be overtaken —
@@ -2093,11 +2105,13 @@ const checkTxNonceGateCode = 4
 // promoting it to a verdict about the original is only sound when the reason
 // cannot un-happen.
 //
-// Only the nonce gate has that property, and it has it for a specific reason:
-// the signer's committed nonce is MONOTONE NON-DECREASING, so once the chain
-// says "nonce too low" for these bytes it will say so forever, at every node,
-// including to a copy that surfaces from a peer mempool an hour later. Nothing
-// else in SAGE's CheckTx is monotone:
+// Only the nonce gate has that property, for two separately permanent reasons:
+// a positive nonce is refused only when the signer's committed nonce is already
+// at least that high, and that floor is MONOTONE NON-DECREASING; nonce zero is
+// refused once the monotone app-v9 activation height has enabled the sentinel
+// rule. Either refusal therefore remains true at every node, including for a
+// copy that surfaces from a peer mempool an hour later. Nothing else in SAGE's
+// CheckTx is monotone:
 //   - code 3 is a nonce LOOKUP error — a local store fault, transient by nature;
 //   - the app-v20 resource limit and code 112 are admission/backpressure, which
 //     is by definition temporary;
@@ -2184,6 +2198,10 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 	}
 	if res.Result == nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, false, errors.New("comet re-submit returned no result")
+	}
+	if res.Result.CheckTx == nil || res.Result.TxResult == nil {
+		return TxOutcome{Verdict: TxVerdictUnresolved}, false,
+			errors.New("comet re-submit omitted check_tx or tx_result: not proof of this transaction's fate")
 	}
 	if !cometReportedHashMatches(res.Result.Hash, wantHash) {
 		return TxOutcome{

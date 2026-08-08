@@ -20,9 +20,9 @@ import (
 // is green only if you know to pass a custom -timeout is not green.
 //
 // TIMEOUT HONESTY: even WITH these shrunken timings, the full -race suite runs
-// ~540s on a fast dev machine (badger open/close dominates: 600+ tests
-// averaging ~0.85s each), leaving under a minute of headroom before the 600s
-// default fires on any machine ~10% slower. Until the per-test fixture cost is
+// roughly 9-10 minutes on fast dev machines (recent measured runs: 550-570s;
+// badger open/close dominates 600+ tests), leaving too little headroom before
+// the 600s default fires on a slightly slower machine. Until the fixture cost is
 // shaved, run this package as `go test -race -timeout 900s ./web`; a
 // mid-suite "panic: test timed out" with zero failing tests is this headroom
 // running out, not a red suite.

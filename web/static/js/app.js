@@ -4826,6 +4826,7 @@ function SoftwareUpdate() {
 				if (status.in_progress) setUpdating(true);
 				if (state.step === 'complete' && state.status === 'done') {
 					setInstalled(true); setUpdating(false); setCurrentStep(null);
+					setSteps(prev => [...prev.filter(s => s.step !== 'complete'), state]);
 				} else if (state.status === 'error') {
 					setError(state.message || 'Update failed'); setUpdating(false);
 				} else if (status.in_progress && state.step && state.step !== 'idle') {
@@ -4859,6 +4860,10 @@ function SoftwareUpdate() {
                     setInstalled(true);
                     setUpdating(false);
                     setCurrentStep(null);
+					setSteps(prev => [
+						...prev.filter(s => s.step !== 'complete'),
+						{ step, status, message },
+					]);
                     return;
                 }
 
@@ -5008,7 +5013,7 @@ function SoftwareUpdate() {
 			${updateInfo?.in_app_update_supported === false && (updateInfo?.update_available || (updateInfo?.restart_required && updateInfo?.in_app_restart_supported === false)) && html`
 				<div class="warning-banner" style="margin:12px 0;">
 					${updateInfo?.restart_required
-						? 'The update is installed. Fully quit SAGE—not just this browser tab—then open SAGE again to run the new version.'
+						? (updateInfo?.update_instructions || 'The update is installed. Check restart safety before restarting SAGE.')
 						: (updateInfo?.update_instructions || 'Download the signed release, fully quit SAGE, install it, then open SAGE again.')}
 				</div>
 			`}

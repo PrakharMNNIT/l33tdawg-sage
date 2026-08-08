@@ -362,6 +362,38 @@ func TestCometTxResolver_UnprovenAnswersStayUnresolved(t *testing.T) {
 			want: "different transaction",
 		},
 		{
+			name:   "bound resubmit omits both nested verdicts",
+			lookup: func(string) (int, string) { return 500, cometNotFound },
+			submit: func(string) (int, string) {
+				return 200, `{"result":{"hash":"` + boundHash + `","height":"12"}}`
+			},
+			want: "omitted check_tx or tx_result",
+		},
+		{
+			name: "bound indexed lookup omits tx result",
+			lookup: func(string) (int, string) {
+				return 200, `{"result":{"hash":"` + boundHash + `","height":"12"}}`
+			},
+			submit: func(string) (int, string) { return 500, cometNotFound },
+			want:   "omitted tx_result",
+		},
+		{
+			name:   "bound resubmit has null tx result",
+			lookup: func(string) (int, string) { return 500, cometNotFound },
+			submit: func(string) (int, string) {
+				return 200, `{"result":{"check_tx":{"code":0},"tx_result":null,"hash":"` + boundHash + `","height":"12"}}`
+			},
+			want: "omitted check_tx or tx_result",
+		},
+		{
+			name: "bound indexed lookup has null tx result",
+			lookup: func(string) (int, string) {
+				return 200, `{"result":{"hash":"` + boundHash + `","height":"12","tx_result":null}}`
+			},
+			submit: func(string) (int, string) { return 500, cometNotFound },
+			want:   "omitted tx_result",
+		},
+		{
 			// A perfectly-formed commit envelope for the WRONG transaction —
 			// the replayed-proxy shape. Accepting it lifts this fence on
 			// somebody else's fate.
@@ -421,7 +453,7 @@ func TestCometTxResolver_UnprovenAnswersStayUnresolved(t *testing.T) {
 			name:   "partial envelope with an empty result",
 			lookup: func(string) (int, string) { return 200, `{"result":{}}` },
 			submit: func(string) (int, string) { return 200, `{"result":{}}` },
-			want:   "different transaction",
+			want:   "omitted check_tx or tx_result",
 		},
 		{
 			name:   "undecodable response",

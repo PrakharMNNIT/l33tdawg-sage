@@ -97,3 +97,46 @@ func TestCompletedUpdateStateRetainsFenceAwareAdvice(t *testing.T) {
 	assert.NotEqual(t, "ready_to_restart", state["message"],
 		"the final retained state erased the signer-fence hold notice")
 }
+
+func TestCompletedUpdateStatusRecomputesRestartAdviceWhenFenceRises(t *testing.T) {
+	h := &DashboardHandler{}
+	h.sendInstalledUpdateComplete("Update installed")
+
+	w := httptest.NewRecorder()
+	h.handleGetUpdateStatus(w, httptest.NewRequest(http.MethodGet, "/v1/dashboard/settings/update/status", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, strings.ToLower(w.Body.String()), "restart sage to apply")
+
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	fenceOneSigningKey(t, key)
+	w = httptest.NewRecorder()
+	h.handleGetUpdateStatus(w, httptest.NewRequest(http.MethodGet, "/v1/dashboard/settings/update/status", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	lowered := strings.ToLower(w.Body.String())
+	assert.Contains(t, lowered, "do not quit or restart")
+	assert.NotContains(t, lowered, "restart sage to apply")
+}
+
+func TestCompletedUpdateStatusRecomputesRestartAdviceWhenFenceClears(t *testing.T) {
+	h := &DashboardHandler{}
+	t.Run("retain completion while fenced", func(t *testing.T) {
+		_, key, err := ed25519.GenerateKey(nil)
+		require.NoError(t, err)
+		fenceOneSigningKey(t, key)
+		h.sendInstalledUpdateComplete("Update installed")
+
+		w := httptest.NewRecorder()
+		h.handleGetUpdateStatus(w, httptest.NewRequest(http.MethodGet, "/v1/dashboard/settings/update/status", nil))
+		assert.Contains(t, strings.ToLower(w.Body.String()), "do not quit or restart")
+	})
+
+	// The subtest's evidence-backed teardown has now lifted the fence. The same
+	// retained completion must stop replaying the stale hold notice.
+	w := httptest.NewRecorder()
+	h.handleGetUpdateStatus(w, httptest.NewRequest(http.MethodGet, "/v1/dashboard/settings/update/status", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	lowered := strings.ToLower(w.Body.String())
+	assert.Contains(t, lowered, "restart sage to apply")
+	assert.NotContains(t, lowered, "do not quit or restart")
+}
