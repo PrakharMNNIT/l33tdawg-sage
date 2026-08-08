@@ -77,11 +77,9 @@ func newClearInboxServer(t *testing.T, stub *inboxReplyPointerStub, replyCount i
 
 const inboxProbeNewestCompletedAt = "2026-08-08T00:05:00Z"
 
-// pendingStatePhrases are the words that turn a factual archive total into an
-// assertion that work is owed. retained_reply_count can never decrease — no
-// read state exists, ExpirePipelines touches only pending/claimed rows, and
-// PurgePipelines exempts every msg-* id — so any of these would be re-asserted
-// on every inbox call, forever, about replies the agent has already read.
+// pendingStatePhrases are the words that turn a factual retained archive size
+// into an assertion that work is owed. No read state exists, so any of these
+// could be re-asserted about replies the agent has already read.
 var pendingStatePhrases = []string{
 	"are waiting", "is waiting", "waiting.", "Read them", "read them",
 	"pending", "you must", "action required", "requires",
@@ -103,19 +101,18 @@ func TestSageInboxSurfacesReplyPointerOnAnOtherwiseClearInbox(t *testing.T) {
 	items, _ := response["items"].([]any)
 	require.Empty(t, items, "replies must never enter sage_inbox.items[]")
 	require.Equal(t, 2, response["retained_reply_count"])
-	require.Equal(t, true, response["retained_reply_count_is_lifetime_total"],
-		"the count is an archive size and must be labelled as one on the wire")
+	require.Equal(t, false, response["retained_reply_count_is_unread"],
+		"the count is an archive snapshot and must not be labelled unread")
 	note, ok := response["replies_note"].(string)
 	require.True(t, ok, "a non-zero reply count must name the explicit read")
 	require.Contains(t, note, "sage_message_replies")
 	require.Contains(t, note, "not new work",
 		"the pointer must not read as an alert about work owed")
-	require.Contains(t, note, "lifetime total")
+	require.Contains(t, note, "current retained archive size")
 	require.NotContains(t, response, "replies_check_error")
 
-	// The high-water mark is what lets an agent catch up: it feeds it back as
-	// 'since' and gets a genuinely empty page, which a monotonic count alone can
-	// never produce.
+	// The high-water mark lets an agent poll with an inclusive boundary. Equal
+	// millisecond rows may repeat so that a later reply can never be hidden.
 	require.Equal(t, inboxProbeNewestCompletedAt, response["newest_reply_completed_at"])
 
 	encoded, err := json.Marshal(response)
@@ -131,11 +128,9 @@ func TestSageInboxSurfacesReplyPointerOnAnOtherwiseClearInbox(t *testing.T) {
 // TestSageInboxReplyPointerNeverAssertsRepliesArePending is the regression for
 // the release's own stated design: retained_reply_count is "a retained total,
 // not an unread counter … it must not be treated as an alert about work owed".
-// Nothing can ever move a row out of the counted set, so a pointer that says
-// replies "are waiting" and orders the agent to "read them" re-issues that
-// order on every inbox call for the life of the database — including for
-// replies the agent read and acted on days ago. The model reads the runtime
-// string, not the doc, so the string is what this test pins.
+// A pointer that says replies "are waiting" and orders the agent to "read them"
+// can re-issue work about replies the agent already handled. The model reads
+// the runtime string, not the doc, so the string is what this test pins.
 func TestSageInboxReplyPointerNeverAssertsRepliesArePending(t *testing.T) {
 	stub := &inboxReplyPointerStub{}
 	s := newClearInboxServer(t, stub, 57, true)
@@ -148,11 +143,11 @@ func TestSageInboxReplyPointerNeverAssertsRepliesArePending(t *testing.T) {
 	note := response["replies_note"].(string)
 	for _, phrase := range pendingStatePhrases {
 		require.NotContains(t, note, phrase,
-			"%q asserts pending work about a total that can never decrease", phrase)
+			"%q asserts pending work about a passive retained archive snapshot", phrase)
 	}
 	require.NotContains(t, response, "replies_action",
 		"naming the field an 'action' is itself the pending-state claim")
-	require.Contains(t, note, "never decreases")
+	require.Contains(t, note, "not an unread count")
 	require.Contains(t, note, "already read",
 		"the pointer must say the total includes replies the agent has already handled")
 
@@ -169,7 +164,7 @@ func TestSageInboxReplyPointerNeverAssertsRepliesArePending(t *testing.T) {
 	// The pointer must not advertise a number the tool it names cannot deliver
 	// in one call without also naming the way to reach the rest.
 	require.Contains(t, note, "newest_reply_completed_at",
-		"a count of 57 against a 20-row page cap is only satisfiable with a catch-up filter")
+		"a count of 57 against a 20-row page cap needs an explicit polling watermark")
 }
 
 // TestSageInboxReplyPointerReportsZeroWithoutSuggestingAction keeps the common
@@ -243,17 +238,10 @@ func TestSageInboxDefersReplyPointerWhenTheLimitIsFilled(t *testing.T) {
 	require.Len(t, stub.calls(), 2, "receive + legacy inbox only")
 }
 
-// TestSageInboxReplyPointerCatchUpInstructionIsTrue is the regression for a
-// pointer that told the agent to do something guaranteed to return nothing.
-//
-// newest_reply_completed_at is the completed_at of the newest retained reply AS
-// OF THIS RESPONSE, and sage_message_replies filters STRICTLY AFTER 'since'. So
-// the only value of that field the reader holds — the one in the same response
-// — deterministically yields an empty page, at every point in time, including
-// for an agent that has never read a reply. A note instructing that echo sends
-// the agent to a false zero and then, via the empty-page message, on to a
-// deliberately payload-free tool. The model acts on the runtime string, not on
-// the doc, so the string is what this test pins.
+// TestSageInboxReplyPointerCatchUpInstructionIsTrue pins inclusive polling at
+// the advertised millisecond. Excluding equality loses a reply that lands after
+// the probe but shares its SQLite timestamp; inclusion may repeat a boundary
+// row, which callers can safely deduplicate by message_id.
 func TestSageInboxReplyPointerCatchUpInstructionIsTrue(t *testing.T) {
 	stub := &inboxReplyPointerStub{}
 	s := newClearInboxServer(t, stub, 1, true)
@@ -264,8 +252,7 @@ func TestSageInboxReplyPointerCatchUpInstructionIsTrue(t *testing.T) {
 	highWater := response["newest_reply_completed_at"].(string)
 	note := response["replies_note"].(string)
 
-	// Demonstrate the dead end the note must not send the agent into: the one
-	// retained reply completed exactly at the advertised high-water mark.
+	// A reply at the exact advertised high-water millisecond must remain visible.
 	replyMux := http.NewServeMux()
 	replyMux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
@@ -283,31 +270,17 @@ func TestSageInboxReplyPointerCatchUpInstructionIsTrue(t *testing.T) {
 	echoed, err := replyServer.toolMessageReplies(context.Background(),
 		map[string]any{"since": highWater})
 	require.NoError(t, err)
-	require.Equal(t, 0, echoed.(map[string]any)["count"],
-		"precondition: 'since' is strictly-after, so echoing the value in this response can only return nothing")
+	require.Equal(t, 1, echoed.(map[string]any)["count"],
+		"inclusive since must not hide a later reply that shares the recorded millisecond")
 
 	unfiltered, err := replyServer.toolMessageReplies(context.Background(), map[string]any{})
 	require.NoError(t, err)
 	require.Equal(t, 1, unfiltered.(map[string]any)["count"],
-		"precondition: the reply IS readable — only the echoed 'since' hides it")
+		"the unfiltered projection remains equivalent for this one-row fixture")
 
-	// The note must therefore never present that echo as the way to catch up.
-	require.NotContains(t, note, "pass newest_reply_completed_at as 'since'",
-		"this instruction returns an empty page every time it is followed")
-	require.Contains(t, note, "with no arguments",
-		"the note must name a call that actually returns the replies it is counting")
-	require.Contains(t, note, "EARLIER",
-		"only a value recorded on a previous call can act as a catch-up watermark")
-	require.Contains(t, note, "empty page",
-		"the note must say outright that echoing this response's value returns nothing")
-
-	// And the empty-page message must route the reader back to an unfiltered
-	// reply read, not only to the payload-free status tool.
-	emptyMessage := echoed.(map[string]any)["message"].(string)
-	require.Contains(t, emptyMessage, "no arguments",
-		"an empty filtered page must name the unfiltered read that does return the reply")
-	require.Contains(t, emptyMessage, "never returns a reply body",
-		"sage_message_status must not be offered as a way to read a reply")
+	require.Contains(t, note, "inclusive")
+	require.Contains(t, note, "same millisecond")
+	require.Contains(t, note, "deduplicate by message_id")
 }
 
 // TestSageInboxReplyPointerRejectsAKeylessBearerCallerBeforeSigning is the
@@ -344,7 +317,7 @@ func TestSageInboxReplyPointerRejectsAKeylessBearerCallerBeforeSigning(t *testin
 	response, ok := toolResult.(map[string]any)
 	require.True(t, ok)
 	for _, leaked := range []string{
-		"retained_reply_count", "retained_reply_count_is_lifetime_total",
+		"retained_reply_count", "retained_reply_count_is_unread",
 		"newest_reply_completed_at", "replies_note",
 	} {
 		require.NotContains(t, response, leaked,

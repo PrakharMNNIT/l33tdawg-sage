@@ -452,7 +452,7 @@ func TestSageMessageRepliesSinceFiltersClientSideWithoutServerState(t *testing.T
 	require.NoError(t, err)
 	response := result.(map[string]any)
 	items := replyItems(response)
-	require.Len(t, items, 1, "only replies completed strictly after 'since' are returned")
+	require.Len(t, items, 1, "only replies completed at or after 'since' are returned")
 	require.Equal(t, "msg-new", items[0]["message_id"])
 	require.Equal(t, 1, response["count"])
 	require.Equal(t, "2026-08-08T00:05:00Z", response["since"])
@@ -467,6 +467,68 @@ func TestSageMessageRepliesSinceFiltersClientSideWithoutServerState(t *testing.T
 
 	_, err = s.toolMessageReplies(context.Background(), map[string]any{"since": "not-a-timestamp"})
 	require.Error(t, err, "an unparseable 'since' must fail loudly, never silently return everything")
+}
+
+func TestSageMessageRepliesInclusiveSincePagesEverySameMillisecondReply(t *testing.T) {
+	const (
+		stamp = "2026-08-08T00:05:00.123Z"
+		total = 25
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		requireSignedToolRequest(t, r)
+		start := total - 1
+		if before := r.URL.Query().Get("before"); before != "" {
+			_, id, err := splitReplyCursor(before)
+			require.NoError(t, err)
+			_, err = fmt.Sscanf(id, "msg-same-%02d", &start)
+			require.NoError(t, err)
+			start--
+		}
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		require.NoError(t, err)
+		items := make([]map[string]any, 0, limit)
+		for i := start; i >= 0 && len(items) < limit; i-- {
+			items = append(items, map[string]any{
+				"pipe_id": fmt.Sprintf("msg-same-%02d", i), "to_agent": "recipient",
+				"replied_by": "recipient", "result": fmt.Sprintf("reply-%02d", i),
+				"status": "completed", "completed_at": stamp,
+			})
+		}
+		response := map[string]any{"items": items, "count": len(items)}
+		if len(items) > 0 {
+			response["next_before"] = stamp + "|" + items[len(items)-1]["pipe_id"].(string)
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, priv)
+
+	seen := make(map[string]struct{}, total)
+	before := ""
+	for pages := 0; pages < 4; pages++ {
+		params := map[string]any{"since": stamp, "limit": 20}
+		if before != "" {
+			params["before"] = before
+		}
+		result, callErr := s.toolMessageReplies(context.Background(), params)
+		require.NoError(t, callErr)
+		response := result.(map[string]any)
+		for _, item := range replyItems(response) {
+			seen[item["message_id"].(string)] = struct{}{}
+		}
+		if response["page_truncated"] != true {
+			break
+		}
+		before = response["next_before"].(string)
+		require.Contains(t, before, stamp+"|",
+			"an equal-millisecond composite cursor must remain usable with inclusive since")
+	}
+	require.Len(t, seen, total,
+		"a later burst sharing the recorded watermark millisecond must remain fully reachable")
 }
 
 // TestSageMessageRepliesNeverAdvertisesACursorItWouldReject pins the
@@ -514,7 +576,7 @@ func TestSageMessageRepliesNeverAdvertisesACursorItWouldReject(t *testing.T) {
 		}
 	})
 
-	t.Run("a server cursor at or before 'since' is withheld", func(t *testing.T) {
+	t.Run("a server cursor older than 'since' is withheld", func(t *testing.T) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
 			requireSignedToolRequest(t, r)
@@ -542,7 +604,7 @@ func TestSageMessageRepliesNeverAdvertisesACursorItWouldReject(t *testing.T) {
 		require.NoError(t, err)
 		response := result.(map[string]any)
 		require.NotContains(t, response, "next_before",
-			"a cursor at or before 'since' describes an empty window; publishing it "+
+			"a cursor older than 'since' describes an empty window; publishing it "+
 				"only invites the combination this tool refuses")
 		require.NotContains(t, response["message"], "This page is full")
 	})

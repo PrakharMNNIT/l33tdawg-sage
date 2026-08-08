@@ -6631,14 +6631,20 @@ func (s *SQLiteStore) GetCompletedForSenderBefore(
 	ctx context.Context, agentID string, before time.Time, beforeID string, limit int,
 ) ([]*PipelineMessage, error) {
 	bound := formatPipelineTimestamp(before)
+	// A bare RFC3339Nano instant may fall between two representable SQLite
+	// milliseconds. In that case rows at the floored millisecond are genuinely
+	// older than the caller's bound and must be included. Composite cursors are
+	// emitted only from stored rows and therefore always land exactly on a
+	// millisecond; the REST layer rejects a sub-millisecond composite cursor.
+	includeBoundMillisecond := beforeID == "" && !before.Equal(before.Truncate(time.Millisecond))
 	rows, err := s.conn.QueryContext(ctx,
 		`SELECT `+completedForSenderColumns+`
 		 FROM pipeline_messages
 		 WHERE from_agent = ? AND source_chain_id = '' AND status = 'completed'
 		   AND completed_at IS NOT NULL
-		   AND (completed_at < ? OR (completed_at = ? AND pipe_id < ?))`+
+		   AND (completed_at < ? OR (completed_at = ? AND (? OR pipe_id < ?)))`+
 			completedForSenderOrder,
-		agentID, bound, bound, beforeID, limit)
+		agentID, bound, bound, includeBoundMillisecond, beforeID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -6651,15 +6657,15 @@ func (s *SQLiteStore) GetCompletedForSenderBefore(
 // only) so the sage_inbox reply pointer can never announce a reply the sender
 // would not be shown. It decrypts nothing and returns no identifiers.
 //
-// The count is a retained total, not an unread counter: nothing ever moves a
-// completed msg-* row out of the set (ExpirePipelines touches only
-// pending/claimed, and PurgePipelines excludes pipe_id LIKE 'msg-%'), so it is
-// strictly non-decreasing for the life of the database. Callers must therefore
-// present it as an archive size, never as pending work.
+// The count is the current retained total, not an unread counter. Canonical
+// msg-* rows remain durable, but this compatibility projection also includes
+// deprecated pipe-* rows and PurgePipelines may age those out. Callers must
+// therefore present it as a snapshot archive size, never as monotonic state or
+// pending work.
 //
 // newest_completed_at is what makes that total actionable without any
-// server-held read state: a caller passes it back as the reply read's `since`
-// and gets a genuinely empty page once it has caught up.
+// server-held read state: a caller passes it back as the reply read's inclusive
+// `since` watermark and deduplicates boundary rows by message id.
 func (s *SQLiteStore) SummarizeCompletedForSender(ctx context.Context, agentID string) (PipelineReplySummary, error) {
 	var summary PipelineReplySummary
 	var newest *string

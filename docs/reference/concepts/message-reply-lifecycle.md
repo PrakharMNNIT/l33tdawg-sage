@@ -43,8 +43,9 @@ through (plus `expired` for a row nobody handled).
 TTL; `ExpireStalePipelines` additionally excludes `pipe_id LIKE 'msg-%'`; and
 `PurgePipelines` deletes only `pipe_id NOT LIKE 'msg-%'` rows. So the retention
 window applies to deprecated `pipe-*` compatibility rows, not to canonical
-messages. That is exactly why `retained_reply_count` is a **lifetime** total
-that can never decrease (§4). Rows are still not a governance record: if you
+messages. Because the compatibility reply projection includes both kinds,
+`retained_reply_count` is the current retained snapshot and may decrease when a
+deprecated row ages out (§4). Rows are still not a governance record: if you
 need durable, consensus-validated knowledge, write a memory or a task.
 
 Sending is durable delivery, not read. Claiming is not comprehension.
@@ -120,8 +121,10 @@ a 403 that would confirm a reply exists:
 - an agent sharing the addressed provider,
 - an unrelated local agent,
 - an agent ID that is a prefix or an extension of the sender's,
-- `root` / the node operator,
-- an unauthenticated caller.
+- an authenticated `root` / node operator.
+
+An unauthenticated caller is instead rejected with HTTP 401 before this
+projection runs.
 
 Pinned by `api/rest/pipe_results_reply_visibility_test.go`
 (`TestPipeResultsIsExactSenderOnlyNotPipeViewAuthorization`).
@@ -205,26 +208,22 @@ This is also why replies never enter `sage_inbox.items[]`:
 `formatMessageInboxItem` (`internal/mcp/tools.go`) unconditionally sets
 `requires_reply: true`. The inbox instead carries a few scalars:
 
-- `retained_reply_count` — a **lifetime archive total, not an unread counter**.
-  It cannot decay: nothing removes a completed `msg-*` row from the counted set
-  (`ExpirePipelines` and `ExpireStalePipelines` touch only `pending`/`claimed`;
-  `PurgePipelines` excludes `pipe_id LIKE 'msg-%'`, which every locally minted
-  and federated-imported id matches), so the number is strictly non-decreasing
-  for the life of the database.
-- `retained_reply_count_is_lifetime_total` — always `true` alongside a non-zero
-  count, so the archive semantics live on the wire rather than only in prose.
+- `retained_reply_count` — the **current retained archive size, not an unread
+  counter**. Canonical `msg-*` replies are durable, but the compatibility
+  projection also includes deprecated `pipe-*` results that may age out, so the
+  snapshot is not universally monotonic.
+- `retained_reply_count_is_unread` — always `false` alongside a non-zero count,
+  so the snapshot-vs-queue distinction lives on the wire rather than only in prose.
 - `newest_reply_completed_at` — the `completed_at` of the newest retained reply
-  **as of this response**. It is a watermark to *record*, not to echo. The reply
-  read filters strictly-after, so passing back the value from the same response
-  returns an empty page every single time, including for an agent that has never
-  read a reply. Record it, and on a later call pass the *previously recorded*
-  value as `since`; a caught-up agent then gets a genuinely empty page, with no
-  server-held read state. `replies_note` states this explicitly, because the
-  model acts on the runtime string rather than on this document. Pinned by
+  **as of this response**. Pass a recorded value as `since` to poll without
+  server-held read state. The boundary is inclusive so a reply landing later in
+  the same millisecond cannot be hidden; boundary replies may repeat and must be
+  deduplicated by `message_id`. `replies_note` states this explicitly, because
+  the model acts on the runtime string rather than on this document. Pinned by
   `TestSageInboxReplyPointerCatchUpInstructionIsTrue`.
 - `replies_note` — present only when the count is non-zero; names
-  `sage_message_replies`, states the total is a lifetime figure including
-  replies already read, and states the replies are not new work.
+  `sage_message_replies`, states the value is a retained snapshot rather than an
+  unread count, and states the replies are not new work.
 - `replies_check_error` — present only when the probe failed. In that case
   `retained_reply_count` is **absent**, so "could not check" is never rendered
   as "you have no replies".
@@ -371,7 +370,7 @@ Pinned by `TestGetCompletedForSenderBeforeReachesRepliesSharingACompletedMillise
 | Stored result size | 256 KiB (`store.MaxPipeContentBytes`, `internal/store/store.go`) | Enforced at the handler and at the `CompletePipeline` store chokepoint; over-cap submission is `413`. |
 | Replies per page | 1–20, default 5 | Out-of-range values clamp to the default, never widen the page. The page cap is **not** a cap on reachability: echoing each page's `next_before` composite cursor pages backward through the entire archive, so no reply is stranded behind the newest page — not even replies sharing one `completed_at` millisecond. |
 | Reply runes rendered to the model | 8,000 (`maxReplyResultRunes`, `internal/mcp/tools.go`) | A full page of maximum-size replies would flood a context window, and a hostile recipient could weaponise that. Truncation is marked with `result_truncated`, `result_runes_returned`, and `result_full_via`, which names `sage_message_history(folder="outbox")` as where the untruncated text still lives. |
-| Retention | canonical `msg-*` replies are retained indefinitely | `ExpirePipelines` touches only `pending`/`claimed`; `ExpireStalePipelines` and `PurgePipelines` both exclude `pipe_id LIKE 'msg-%'`. The transient window applies to deprecated `pipe-*` rows. This is why `retained_reply_count` never decreases. A retained row is still not a governance record — write a memory or a task for that. |
+| Retention | canonical `msg-*` replies are retained indefinitely | `ExpirePipelines` touches only `pending`/`claimed`; `ExpireStalePipelines` and `PurgePipelines` both exclude `pipe_id LIKE 'msg-%'`. Deprecated `pipe-*` rows remain visible through the compatibility reply projection only until their transient retention window expires, so `retained_reply_count` is a current snapshot rather than a universally monotonic lifetime value. A retained row is still not a governance record — write a memory or a task for that. |
 
 ---
 

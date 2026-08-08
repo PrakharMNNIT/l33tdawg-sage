@@ -870,18 +870,19 @@ type PipelineInboxCounter interface {
 // GET /v1/pipe/results?count_only=1. It carries no reply body, no intent, and
 // no message identifier.
 //
-// Count is deliberately a RETAINED TOTAL, not an unread counter: no read state
-// exists anywhere on this path, which is what keeps the probe passive and safe
-// to repeat on every sage_inbox call. Because it can never decrease, a caller
-// must not present it as pending work.
+// Count is deliberately the CURRENT RETAINED TOTAL, not an unread counter: no
+// read state exists anywhere on this path, which is what keeps the probe
+// passive and safe to repeat on every sage_inbox call. Canonical msg-* replies
+// are durable, while deprecated pipe-* compatibility rows may age out, so a
+// caller must neither treat this as monotonic nor present it as pending work.
 //
 // NewestCompletedAt is the high-water mark that makes the retained total
 // actionable without server-held read state: a caller remembers the value it
 // saw on an EARLIER probe and passes that earlier value back as the reply
-// read's `since`, which yields a genuinely empty page once it has caught up.
-// Passing back the value from the same response returns nothing, because the
-// filter is strictly-after and this IS the newest retained reply. It is nil
-// when no reply is retained.
+// read's `since`. The filter is inclusive at the boundary so a reply that lands
+// later in the same SQLite millisecond cannot be hidden; callers may therefore
+// see boundary rows again and should deduplicate by message_id. It is nil when
+// no reply is retained.
 type PipelineReplySummary struct {
 	Count             int
 	NewestCompletedAt *time.Time

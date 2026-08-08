@@ -1779,6 +1779,21 @@ components:
             to_agent, because the transport refuses a result whose remote author
             differs. Omitted when the node cannot attribute the reply; the
             addressee is never substituted for it.
+        authority:
+          type: string
+          description: Derived response authority; "data_only" on completed reply projections.
+        trust:
+          type: string
+          description: Derived trust label such as agent_untrusted or external_untrusted.
+        security_notice:
+          type: string
+          description: Derived instruction-boundary notice for untrusted request/result content.
+        payload_authority:
+          type: string
+          description: Derived authority of retained request context; "request_only" when present.
+        result_authority:
+          type: string
+          description: Derived authority of reply content; "data_only" when present.
         journal_id:
           type: string
         source_chain_id:
@@ -5277,8 +5292,10 @@ paths:
         The sender-exact reply projection. Authorization is exact original
         sender equality, not the pipe-view rule: the recipient that wrote the
         reply, an agent sharing the message to_provider, an unrelated agent, an
-        operator/admin, and an unauthenticated caller all receive an empty list
-        rather than a 403 that would confirm existence. A federated reply that
+        operator/admin all receive an empty list rather than a 403 that would
+        confirm existence when they are authenticated ordinary callers admitted
+        by the agent API boundary. An unauthenticated caller is rejected with
+        401 before this handler runs. A federated reply that
         landed home is returned and labelled external_untrusted; an imported
         foreign work row whose from_agent collides with a local agent id is not.
 
@@ -5329,7 +5346,10 @@ paths:
             completed_at < ? OR (completed_at = ? AND pipe_id < ?).
             A bare RFC3339 timestamp is still accepted and means "strictly older
             than this instant" - a coarse filter that excludes ties, not a pager
-            cursor. An unparseable timestamp half is a 400. Requires the optional
+            cursor. A bare sub-millisecond instant is preserved as a strict time
+            bound; a composite cursor must use exact millisecond precision,
+            matching every server-generated cursor. An unparseable timestamp
+            half or a sub-millisecond composite cursor is a 400. Requires the optional
             store.PipelineReplyPager; a backend without it answers 501 rather
             than pretending nothing older exists. The cursor is client-held and
             the server records nothing, so paging stays passive and replay-safe.
@@ -5342,10 +5362,10 @@ paths:
             Additive v11.18.2 payload-free probe. When set to "1" the response
             is a scalar {count, retained, newest_completed_at} instead of a
             page: no items array, no reply text, no intent, no message
-            identifiers. count is a RETAINED LIFETIME TOTAL, not an unread
-            counter — nothing removes a completed msg-* row from the counted
-            set, so it is strictly non-decreasing and must be rendered as an
-            archive size rather than pending work. Any other value serves the
+            identifiers. count is the CURRENT RETAINED TOTAL, not an unread
+            counter. Canonical msg-* replies are durable, while deprecated
+            pipe-* compatibility results may age out, so the value is neither
+            pending work nor universally monotonic. Any other value serves the
             normal projection.
           schema:
             type: string
@@ -5388,8 +5408,9 @@ paths:
                       count:
                         type: integer
                         description: >-
-                          Retained lifetime total of replies for this exact
-                          sender. Never decreases; not a work queue.
+                          Current retained total of replies for this exact
+                          sender. Not an unread count or work queue; deprecated
+                          compatibility results may age out.
                       retained:
                         type: boolean
                         description: count > 0.
@@ -5398,18 +5419,17 @@ paths:
                         format: date-time
                         description: >-
                           completed_at of the newest retained reply, as of this
-                          response. Omitted when count is 0. It is a watermark to
-                          RECORD, not to echo: the reply read's `since` filter is
-                          strictly-after and this value is the newest retained
-                          reply, so passing back the value from the same response
-                          returns an empty page. Pass a PREVIOUSLY recorded value
-                          as `since` to catch up without any server-held read
-                          state.
+                          response. Omitted when count is 0. Pass a recorded value
+                          as `since` to poll with no server-held read state. The
+                          boundary is inclusive so a reply landing later in the
+                          same millisecond cannot be hidden; boundary replies may
+                          repeat and clients should deduplicate by message id.
         "400":
           description: >-
-            The `before` cursor's timestamp half is not RFC3339. Rejected loudly
-            rather than silently re-serving the newest page, which would look
-            like "nothing older exists".
+            The `before` cursor's timestamp half is not RFC3339, or a composite
+            cursor uses a sub-millisecond timestamp that cannot name an exact
+            stored row. Rejected loudly rather than silently re-serving the
+            newest page, which would look like "nothing older exists".
           content:
             application/problem+json:
               schema:

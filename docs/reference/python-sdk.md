@@ -867,7 +867,9 @@ reply body: `message_status()` is deliberately payload-free.
 - **Exact original sender only.** Authorization is `from_agent` equality in the
   store predicate, not the pipe-view rule. The recipient that wrote the reply,
   an agent sharing the message's `to_provider`, an unrelated agent, an
-  operator/admin, and an unauthenticated caller all get an empty list.
+  operator/admin all get an empty list when authenticated through the agent API
+  boundary. An unauthenticated caller is rejected with HTTP 401 before the
+  projection runs.
 - **Payload-free.** The row carries its retained `intent` but not the original
   request `payload`; that field comes back empty. The `data_only` result and
   `request_only` `payload_authority` labels therefore describe the *result* and
@@ -908,11 +910,12 @@ Not yet exposed by the SDK (see below): the additive `?count_only=1` probe, the
 >    `pipe_results()` always fetches a full page, so a Python poller cannot
 >    cheaply ask "are there replies?" without pulling reply bodies. A
 >    `pipe_results_count()` (or a `count_only: bool = False` parameter returning
->    a distinct model) is needed. Note `count` is a lifetime archive total that
->    never decreases; `newest_completed_at` is the field a poller should compare
->    against, not the count — and it must be compared against a value recorded on
->    an **earlier** call, since `since` is strictly-after and echoing the value
->    from the same response returns nothing.
+>    a distinct model) is needed. Note `count` is the current retained archive
+>    size, not an unread count; canonical `msg-*` replies are durable, while
+>    deprecated compatibility rows may age out. `newest_completed_at` is the
+>    polling watermark. The MCP `since` boundary is inclusive to avoid hiding a
+>    later reply in the same millisecond, so boundary rows may repeat and should
+>    be deduplicated by message id.
 > 2. **No `?before=` support.** Without the backward cursor a Python caller can
 >    only ever reach the newest ≤20 replies: `limit` is capped server-side and
 >    there is no other selector. Add a `before: str | None = None` parameter

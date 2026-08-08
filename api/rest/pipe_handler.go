@@ -1577,6 +1577,9 @@ func parsePipeResultsCursor(raw string) (time.Time, string, error) {
 	if err != nil {
 		return time.Time{}, "", err
 	}
+	if id != "" && !parsed.Equal(parsed.Truncate(time.Millisecond)) {
+		return time.Time{}, "", fmt.Errorf("a composite cursor timestamp must be at millisecond precision")
+	}
 	return parsed, id, nil
 }
 
@@ -1600,10 +1603,10 @@ func formatPipeResultsCursor(item *store.PipelineMessage) string {
 //
 // ?count_only=1 serves the additive payload-free probe used by the sage_inbox
 // reply pointer: a scalar {count, retained, newest_completed_at} with no reply
-// body, no intent, and no message identifiers. The count is a RETAINED TOTAL
-// that never decreases (no read state exists on this path), which is why the
-// probe also returns newest_completed_at: a caller feeds that back as `before`
-// or `since` instead of mistaking a monotonic archive size for pending work.
+// body, no intent, and no message identifiers. The count is a CURRENT
+// RETAINED TOTAL, not an unread counter (no read state exists on this path).
+// Canonical msg-* replies are durable, while deprecated pipe-* rows may age
+// out. The probe also returns newest_completed_at as a polling watermark.
 //
 // ?before=<RFC3339>[|<pipe_id>] pages BACKWARD through the archive. Without it
 // the reachable reply set would be exactly the newest `limit` rows, so every

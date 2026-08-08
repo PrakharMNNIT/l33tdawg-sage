@@ -2458,8 +2458,10 @@ the SQL predicate in `GetCompletedForSender` (`internal/store/sqlite.go`):
 role check and no operator bypass, so the recipient that wrote the reply, an
 agent sharing the message's `to_provider` (which the `GET /v1/pipe/{pipe_id}`
 status route *does* admit), an unrelated agent, an agent ID that is a prefix or
-extension of the sender's, `root`, and an unauthenticated caller all receive an
-empty list — never a 403 that would confirm existence
+extension of the sender's, and `root` all receive an empty list when
+authenticated through the agent API boundary — never a 403 that would confirm
+existence. An unauthenticated caller is rejected with 401 before the projection
+runs
 (`api/rest/pipe_results_reply_visibility_test.go`,
 `TestPipeResultsIsExactSenderOnlyNotPipeViewAuthorization`).
 
@@ -2479,7 +2481,7 @@ whose `from_agent` happens to collide byte-for-byte with a local agent ID
 | Name | Values | Meaning |
 |---|---|---|
 | `limit` | 1–20, default 5 | Page size, newest first by `completed_at DESC, pipe_id DESC`. Out-of-range or unparseable values (`0`, `-1`, `999`, `abc`) fall back to 5 rather than widening the page. |
-| `before` | `<RFC3339>` or `<RFC3339>\|<pipe_id>` | v11.18.2 backward **keyset cursor**. Echo the previous page's `next_before` verbatim to walk backward through the whole archive. The composite form resumes strictly after the named row in the `(completed_at, pipe_id)` total order. A bare timestamp is accepted but means "strictly older than this instant", which **excludes every reply sharing that millisecond** — a coarse filter, not a pager cursor. An unparseable timestamp half is a `400`, never a silent fall back to page one. Requires the optional `store.PipelineReplyPager`; a backend without it answers `501` rather than pretending nothing older exists. |
+| `before` | `<RFC3339>` or `<RFC3339>\|<pipe_id>` | v11.18.2 backward **keyset cursor**. Echo the previous page's `next_before` verbatim to walk backward through the whole archive. The composite form resumes strictly after the named row in the `(completed_at, pipe_id)` total order and must use exact millisecond precision. A bare timestamp is accepted as a strict instant filter, including sub-millisecond instants; a bare bound exactly on a stored millisecond excludes every reply sharing that millisecond, so it is a coarse filter rather than a pager cursor. An invalid timestamp or sub-millisecond composite cursor is a `400`, never a silent fall back to page one. Requires the optional `store.PipelineReplyPager`; a backend without it answers `501` rather than pretending nothing older exists. |
 | `count_only` | `1` | v11.18.2 additive probe. Returns a scalar instead of a page (see below). Any other value is ignored and the normal projection is served. |
 
 Without `before`, the reachable reply set would be exactly the newest `limit`
@@ -2539,26 +2541,23 @@ questions (`api/rest/pipe_results_reply_visibility_test.go`,
 reply text, no intent, no message identifiers; `newest_completed_at` is omitted
 entirely when `count` is 0. `retained` is simply `count > 0`.
 
-`count` is a **retained lifetime total, not an unread counter**. Nothing ever
-removes a row from the counted set — `ExpirePipelines` and
-`ExpireStalePipelines` touch only `pending`/`claimed` rows, and
-`PurgePipelines` excludes `pipe_id LIKE 'msg-%'`, which every locally minted and
-every federated-imported id matches — so the number is strictly non-decreasing
-for the life of the database and can never return to zero. Callers must render
-it as an archive size, never as pending work.
-`newest_completed_at` is what makes it actionable without server-held read
-state — but it is a watermark to **record**, not to echo. The reply read's
-`since` filter is strictly-after and this value *is* the newest retained reply,
-so feeding back the value from the same response returns an empty page every
-time. Record it, and pass the **previously recorded** value as `since` on a
-later call; a caught-up caller then gets a genuinely empty page
+`count` is the **current retained total, not an unread counter**. Canonical
+`msg-*` replies are durable, while this compatibility projection also includes
+deprecated `pipe-*` results that may age out. The snapshot is therefore not
+universally monotonic and callers must never render it as pending work.
+`newest_completed_at` is a polling watermark that requires no server-held read
+state. The MCP reply read applies `since` inclusively because SQLite completion
+timestamps have millisecond resolution: excluding equality could hide a reply
+that lands later in the same millisecond. Boundary rows may repeat and callers
+must deduplicate by message id; an equal-time composite `next_before` remains
+valid when the boundary millisecond spans more than one page
 (`api/rest/pipe_results_count_probe_test.go`).
 
 **Error responses:**
 
 | Status | When | Meaning |
 |---|---|---|
-| `400` | `?before=`'s timestamp half is not RFC3339 | The cursor is rejected loudly; silently serving page one would look like "nothing older exists". |
+| `400` | `?before=`'s timestamp half is not RFC3339, or a composite cursor carries a non-millisecond timestamp | The cursor is rejected loudly; generated composite cursors always name an exact stored millisecond, while a bare sub-millisecond instant remains a valid coarse strict-before filter. |
 | `501` | `?count_only=1` and the active store does not implement the optional `store.PipelineResultCounter` | Capability gap. Reported instead of a `200 {"count":0}` that would let the inbox silently claim there are no replies. |
 | `501` | `?before=` and the active store does not implement the optional `store.PipelineReplyPager` | Capability gap. Reported instead of silently ignoring the cursor and re-serving the newest page. |
 | `501` | `GetCompletedForSender` returns `store.ErrPipelineUnsupported` | The backend has no sender-side reply projection at all. `PostgresStore.GetCompletedForSender` is still a stub (`internal/store/postgres.go`) — along with `InsertPipeline`, `ClaimPipeline`, `CompletePipeline`, and `GetInbox` — so messaging does not function on a Postgres-backed node. The `501` makes that a legible capability gap rather than a `500`. |

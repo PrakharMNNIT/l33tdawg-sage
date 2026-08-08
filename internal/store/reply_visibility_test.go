@@ -320,6 +320,19 @@ func TestGetCompletedForSenderBeforeWithoutAnIDIsAStrictInstantFilter(t *testing
 		"the composite cursor resumes at the next row inside the tied millisecond")
 }
 
+func TestGetCompletedForSenderBeforeBareSubMillisecondBoundIncludesFlooredMillisecond(t *testing.T) {
+	s, ctx := newReplyVisibilityStore(t)
+	seedCompletedLocalReply(t, s, ctx, "msg-subms", replyVisibilitySender, replyVisibilityRecipient)
+	forceCompletedAt(t, s, ctx, "msg-subms", "2026-08-08T00:00:02.123Z")
+
+	bound := parseTime("2026-08-08T00:00:02.1239Z")
+	items, err := s.GetCompletedForSenderBefore(ctx, replyVisibilitySender, bound, "", 10)
+	require.NoError(t, err)
+	require.Len(t, items, 1,
+		"a stored .123Z row is strictly older than a bare .1239Z instant and must not be lost when the bound is normalized")
+	assert.Equal(t, "msg-subms", items[0].PipeID)
+}
+
 // TestPipelineTimestampLayoutMatchesTheStoredFormat guards the one assumption
 // the backward pager's `completed_at < ?` predicate rests on. pipeline_messages
 // timestamps are written only by strftime('%Y-%m-%dT%H:%M:%fZ', ...), and both

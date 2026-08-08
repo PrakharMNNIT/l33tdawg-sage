@@ -43,9 +43,9 @@ func TestSummarizeCompletedForSenderMatchesGetCompletedForSenderScope(t *testing
 	assert.Equal(t, 2, summary.Count)
 	assert.Equal(t, len(items), summary.Count, "the probe and the projection must agree exactly")
 
-	// The high-water mark is what makes a never-decreasing retained total
-	// actionable without any server-held read state: an agent feeds it back as
-	// 'since' and gets a genuinely empty page once it has caught up.
+	// The high-water mark makes the retained snapshot actionable without any
+	// server-held read state. MCP polling uses it as an inclusive `since`
+	// boundary and deduplicates equal-millisecond rows by message id.
 	require.NotNil(t, summary.NewestCompletedAt, "a non-zero probe must name its newest reply instant")
 	require.NotNil(t, items[0].CompletedAt)
 	assert.WithinDuration(t, *items[0].CompletedAt, *summary.NewestCompletedAt, time.Millisecond,
@@ -70,14 +70,14 @@ func TestSummarizeCompletedForSenderMatchesGetCompletedForSenderScope(t *testing
 	assert.Equal(t, "pipe-count-pending", inbox[0].PipeID)
 }
 
-// TestSummarizeCompletedForSenderIsAMonotonicArchiveTotal is the store-level
-// statement of what the sage_inbox pointer is allowed to claim. Reading the
-// replies changes nothing, and no sweeper removes a completed msg-* row
+// TestSummarizeCompletedForSenderKeepsCanonicalReplies is the store-level
+// durability statement for canonical replies. Reading the replies changes
+// nothing, and no sweeper removes a completed msg-* row
 // (ExpirePipelines touches only pending/claimed; PurgePipelines excludes
 // pipe_id LIKE 'msg-%'), so the total is strictly non-decreasing forever. Any
 // caller that renders it as "replies are waiting, read them" is asserting a
 // pending state that can never clear.
-func TestSummarizeCompletedForSenderIsAMonotonicArchiveTotal(t *testing.T) {
+func TestSummarizeCompletedForSenderKeepsCanonicalReplies(t *testing.T) {
 	s, ctx := newReplyVisibilityStore(t)
 
 	// msg-* is the prefix every locally minted id carries (generatePipeID) and
@@ -110,6 +110,23 @@ func TestSummarizeCompletedForSenderIsAMonotonicArchiveTotal(t *testing.T) {
 
 	final, err := s.SummarizeCompletedForSender(ctx, replyVisibilitySender)
 	require.NoError(t, err)
-	assert.Equal(t, 1, final.Count,
-		"the retained total can never return to zero, so it must never be presented as a work queue")
+	assert.Equal(t, 1, final.Count, "canonical msg-* replies remain retained")
+}
+
+func TestSummarizeCompletedForSenderIsCurrentRetainedTotalWhenLegacyRowsPurge(t *testing.T) {
+	s, ctx := newReplyVisibilityStore(t)
+	seedCompletedLocalReply(t, s, ctx, "pipe-legacy-reply", replyVisibilitySender, replyVisibilityRecipient)
+	forceCompletedAt(t, s, ctx, "pipe-legacy-reply", "2026-08-01T00:00:00.000Z")
+
+	before, err := s.SummarizeCompletedForSender(ctx, replyVisibilitySender)
+	require.NoError(t, err)
+	require.Equal(t, 1, before.Count)
+
+	purged, err := s.PurgePipelines(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, 1, purged)
+	after, err := s.SummarizeCompletedForSender(ctx, replyVisibilitySender)
+	require.NoError(t, err)
+	assert.Zero(t, after.Count,
+		"deprecated pipe-* replies age out, so the aggregate is a retained snapshot rather than a lifetime monotonic counter")
 }

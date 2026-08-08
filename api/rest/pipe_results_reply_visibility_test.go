@@ -181,7 +181,6 @@ func TestPipeResultsIsExactSenderOnlyNotPipeViewAuthorization(t *testing.T) {
 		replyRESTSender + "-2",                   // an id extending the sender's
 		strings.TrimSuffix(replyRESTSender, "r"), // an id that is a prefix of the sender's
 		"root",                                   // the conventional operator id
-		"",                                       // an unauthenticated caller
 	} {
 		items, count := decodePipeResults(t, getPipeResultsAs(t, s, other, ""))
 		assert.Empty(t, items, "caller %q must not read another agent's reply", other)
@@ -189,6 +188,14 @@ func TestPipeResultsIsExactSenderOnlyNotPipeViewAuthorization(t *testing.T) {
 		assert.NotContains(t, getPipeResultsAs(t, s, other, "").Body.String(), replyRESTResult,
 			"caller %q must not see the reply body", other)
 	}
+}
+
+func TestPipeResultsRejectsUnauthenticatedCallerAtProductionBoundary(t *testing.T) {
+	s, _ := newPipeServer(t)
+	rec := httptest.NewRecorder()
+	s.setupRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/pipe/results", nil))
+	require.Equal(t, http.StatusUnauthorized, rec.Code,
+		"the production router must reject an unsigned request before sender-exact projection logic runs")
 }
 
 // TestPipeStatusStillReturnsTheReplyBodyToNonSenderParties is the docs-truth
@@ -415,7 +422,11 @@ func TestPipeResultsBeforePagesBackwardThroughEveryReply(t *testing.T) {
 	}
 
 	// A malformed cursor is a loud 400, never a silent fall back to page one.
-	for _, bogus := range []string{"not-a-timestamp", "not-a-timestamp|msg-1"} {
+	for _, bogus := range []string{
+		"not-a-timestamp",
+		"not-a-timestamp|msg-1",
+		"2026-08-08T00:00:00.1239Z|msg-1",
+	} {
 		bad := getPipeResultsAs(t, s, replyRESTSender, "?before="+url.QueryEscape(bogus))
 		require.Equal(t, http.StatusBadRequest, bad.Code,
 			"an unparseable cursor (%q) must not silently return the newest page again", bogus)
