@@ -227,6 +227,18 @@ func forceCompletedAt(t *testing.T, s *SQLiteStore, ctx context.Context, pipeID,
 	require.NoError(t, err)
 }
 
+// forceTerminalAt backdates the column PurgePipelines actually reads. The reply
+// projection orders and pages on completed_at, but retention resolves
+// COALESCE(terminal_at, completed_at, created_at), and terminal_at is stamped
+// by a trigger the moment status becomes completed. A retention test that only
+// moves completed_at is therefore testing nothing about age.
+func forceTerminalAt(t *testing.T, s *SQLiteStore, ctx context.Context, pipeID, terminalAt string) {
+	t.Helper()
+	_, err := s.writeExecContext(ctx,
+		`UPDATE pipeline_messages SET terminal_at = ? WHERE pipe_id = ?`, terminalAt, pipeID)
+	require.NoError(t, err)
+}
+
 // TestGetCompletedForSenderBeforeReachesRepliesSharingACompletedMillisecond is
 // the regression for the cursor defect that stranded ~45% of a burst of
 // replies. completed_at is written by strftime('%Y-%m-%dT%H:%M:%fZ') — MILLISECOND

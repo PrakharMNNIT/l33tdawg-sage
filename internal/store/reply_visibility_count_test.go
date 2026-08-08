@@ -117,6 +117,16 @@ func TestSummarizeCompletedForSenderIsCurrentRetainedTotalWhenLegacyRowsPurge(t 
 	s, ctx := newReplyVisibilityStore(t)
 	seedCompletedLocalReply(t, s, ctx, "pipe-legacy-reply", replyVisibilitySender, replyVisibilityRecipient)
 	forceCompletedAt(t, s, ctx, "pipe-legacy-reply", "2026-08-01T00:00:00.000Z")
+	// Retention is decided by COALESCE(terminal_at, completed_at, created_at),
+	// and the stamp_pipeline_terminal_after_update trigger already set
+	// terminal_at to the real completion instant. Backdating completed_at alone
+	// therefore leaves the row anchored to "now" and makes this test a race
+	// against the clock: PurgePipelines compares the stored millisecond stamp
+	// ("…123Z") against formatTime's RFC3339Nano bound ("…123456789Z") as TEXT,
+	// and 'Z' sorts above every digit, so a row stamped inside the boundary's
+	// own millisecond reads as NEWER than the boundary and survives. Backdate
+	// the column retention actually reads.
+	forceTerminalAt(t, s, ctx, "pipe-legacy-reply", "2026-08-01T00:00:00.000Z")
 
 	before, err := s.SummarizeCompletedForSender(ctx, replyVisibilitySender)
 	require.NoError(t, err)
