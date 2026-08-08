@@ -4759,6 +4759,36 @@ function SynapticLedgerModal({ onClose }) {
 // Software Update Component
 // ============================================================================
 
+const RESTART_SAFETY_RECHECK_MESSAGE = 'SAGE did not complete a verified restart. Check live restart safety, then try the coordinated restart again.';
+const INSTALLED_RESTART_SAFETY_MESSAGE = 'The update is installed. Check live restart safety before restarting SAGE.';
+const SAVED_CHANGE_RESTART_SAFETY_MESSAGE = 'The change is saved. Check live restart safety before restarting SAGE.';
+
+// A completed update is durable, but its restart advice is not: the signer
+// fence can rise or clear after the initial update check. Merge the status
+// endpoint's freshly-composed instruction into the canonical update object so
+// every consumer (the settings panel and the global banner) renders one live
+// answer instead of retaining a contradictory snapshot.
+function mergeLiveUpdateRestartAdvice(current, state) {
+    if (!current || state?.step !== 'complete' || state?.status !== 'done' || !state?.message) {
+        return current;
+    }
+    return {
+        ...current,
+        update_available: false,
+        restart_required: true,
+        update_instructions: state.message,
+    };
+}
+
+// A check response is necessarily a point-in-time snapshot. Manual restart has
+// no enforcement hook, so never retain an actionable "restart now" instruction
+// from that snapshot. The lightweight status poll replaces this neutral copy
+// with live fence-aware advice when a retained completion exists.
+function neutralizeCheckedRestartAdvice(data) {
+    if (!data?.restart_required) return data;
+    return { ...data, update_instructions: INSTALLED_RESTART_SAFETY_MESSAGE };
+}
+
 async function restartAndWaitForNewBoot(expectedVersion = '') {
     const restart = await restartServer();
     if (!restart?.ok) {
@@ -4769,7 +4799,7 @@ async function restartAndWaitForNewBoot(expectedVersion = '') {
     // B accepts POST); using A would incorrectly accept still-running B.
     const previousBootID = restartBaselineBootID(restart);
     if (!previousBootID) {
-        return { ok: false, message: 'SAGE could not verify which process is restarting. Fully quit SAGE, open it again, then check the running version.' };
+        return { ok: false, message: RESTART_SAFETY_RECHECK_MESSAGE };
     }
     for (let attempt = 0; attempt < 120; attempt++) {
 		await new Promise(resolve => setTimeout(resolve, 500));
@@ -4784,7 +4814,7 @@ async function restartAndWaitForNewBoot(expectedVersion = '') {
 			// Expected while the old listener is down and the new process is starting.
 		}
 	}
-	return { ok: false, message: 'SAGE did not return as a new, ready process. Fully quit it, open it again, then use Check for updates.' };
+	return { ok: false, message: RESTART_SAFETY_RECHECK_MESSAGE };
 }
 
 function SoftwareUpdate() {
@@ -4805,7 +4835,7 @@ function SoftwareUpdate() {
         try {
             const data = await checkForUpdate();
             if (data.error) setError(data.error);
-            setUpdateInfo(data);
+            setUpdateInfo(neutralizeCheckedRestartAdvice(data));
         } catch (e) {
             setError('Failed to check for updates');
         }
@@ -4826,6 +4856,7 @@ function SoftwareUpdate() {
 				if (status.in_progress) setUpdating(true);
 				if (state.step === 'complete' && state.status === 'done') {
 					setInstalled(true); setUpdating(false); setCurrentStep(null);
+					setUpdateInfo(prev => mergeLiveUpdateRestartAdvice(prev, state));
 					setSteps(prev => [...prev.filter(s => s.step !== 'complete'), state]);
 				} else if (state.status === 'error') {
 					setError(state.message || 'Update failed'); setUpdating(false);
@@ -5013,7 +5044,7 @@ function SoftwareUpdate() {
 			${updateInfo?.in_app_update_supported === false && (updateInfo?.update_available || (updateInfo?.restart_required && updateInfo?.in_app_restart_supported === false)) && html`
 				<div class="warning-banner" style="margin:12px 0;">
 					${updateInfo?.restart_required
-						? (updateInfo?.update_instructions || 'The update is installed. Check restart safety before restarting SAGE.')
+						? (updateInfo?.update_instructions || INSTALLED_RESTART_SAFETY_MESSAGE)
 						: (updateInfo?.update_instructions || 'Download the signed release, fully quit SAGE, install it, then open SAGE again.')}
 				</div>
 			`}
@@ -5947,7 +5978,7 @@ function EmbeddingsSetupModal({ onClose, onDone }) {
             if (r && r.restart_required) {
                 // Platform without in-process restart (Windows): the switch is
                 // saved; the operator relaunches SAGE manually.
-                setWarn(r.message || 'Semantic memory is on. Quit SAGE and relaunch it to finish switching.');
+                setWarn(r.message || SAVED_CHANGE_RESTART_SAFETY_MESSAGE);
                 setStep('done');
                 setEnabling(false);
                 return;
@@ -5967,7 +5998,7 @@ function EmbeddingsSetupModal({ onClose, onDone }) {
             const latest = await embeddingsStatus().catch(() => null);
             if (latest) setStatus(latest);
             if (!latest || !latest.is_semantic) {
-                setWarn('Semantic memory was saved, but SAGE is still restarting. Close this window and relaunch SAGE if it does not come back automatically.');
+                setWarn('Semantic memory was saved, but ' + RESTART_SAFETY_RECHECK_MESSAGE);
                 setStep('done');
             } else if ((latest.need_reembed || 0) > 0 || (latest.errored || 0) > 0) {
                 setStep('reembed');
@@ -5985,7 +6016,7 @@ function EmbeddingsSetupModal({ onClose, onDone }) {
         setSetupMsg('Switching SAGE to semantic memory.');
         const r = await enableSemanticEmbeddings();
         if (r && r.restart_required) {
-            setWarn(r.message || 'Semantic memory is on. Quit SAGE and relaunch it to finish switching.');
+            setWarn(r.message || SAVED_CHANGE_RESTART_SAFETY_MESSAGE);
             setStepState(p => ({ ...p, enable: 'done' }));
             return false;
         }
@@ -6002,7 +6033,7 @@ function EmbeddingsSetupModal({ onClose, onDone }) {
                 }
             }
         }
-        setWarn('Semantic memory was saved, but SAGE is still restarting. Close this window and relaunch SAGE if it does not come back automatically.');
+        setWarn('Semantic memory was saved, but ' + RESTART_SAFETY_RECHECK_MESSAGE);
         return false;
     };
 
@@ -6350,7 +6381,7 @@ function RestartNodeButton() {
 			}
 			setRestartError(result.message);
 		} catch (e) {
-			setRestartError('SAGE could not restart. Fully quit it and open it again.');
+			setRestartError(RESTART_SAFETY_RECHECK_MESSAGE);
 		}
 		setBusy(false);
     };
@@ -6762,7 +6793,7 @@ function SettingsPage({ onRunSetup, requestedTab }) {
         try {
             const result = await selectEmbeddingProvider('hash');
             if (result?.restart_required) {
-                setEmbeddingSwitchMsg(result.message || 'Hash embeddings saved. Fully quit and reopen SAGE.');
+                setEmbeddingSwitchMsg(result.message || SAVED_CHANGE_RESTART_SAFETY_MESSAGE);
                 setEmbeddingSwitching(false);
                 return;
             }
@@ -6771,7 +6802,7 @@ function SettingsPage({ onRunSetup, requestedTab }) {
                 const status = await embeddingsStatus().catch(() => null);
                 if (status?.provider === 'hash') { window.location.reload(); return; }
             }
-            setEmbeddingSwitchMsg('Hash embeddings were saved. Fully quit and reopen SAGE if it does not return automatically.');
+            setEmbeddingSwitchMsg('Hash embeddings were saved, but ' + RESTART_SAFETY_RECHECK_MESSAGE);
         } catch (e) {
             setEmbeddingSwitchMsg('Could not switch embeddings: ' + (e.message || 'error'));
         }
@@ -14125,7 +14156,7 @@ function NetworkJoinHostPanel() {
                 // saved but nothing will restart — surface the quit-and-reopen
                 // instruction instead of waiting forever.
                 setSwitching(false);
-                setErr(r.message || 'Saved. Fully quit SAGE and open it again to finish switching.');
+                setErr(r.message || SAVED_CHANGE_RESTART_SAFETY_MESSAGE);
             }
         } catch (e) { setErr(e.message); setSwitching(false); }
         // On success the node re-execs — this session drops; we show a restart notice.
@@ -14256,7 +14287,7 @@ function NetworkJoinGuestPanel({ onClose }) {
                 // staged but nothing will restart — surface the quit-and-reopen
                 // instruction instead of hanging on "Restarting…".
                 setRestarting(false);
-                setErr(r.message || 'Saved. Fully quit SAGE and open it again to finish joining.');
+                setErr(r.message || SAVED_CHANGE_RESTART_SAFETY_MESSAGE);
             }
         } catch (e) { setErr(e.message); setRestarting(false); }
     };
@@ -15198,6 +15229,7 @@ function ReembedBanner() {
 }
 
 const UPDATE_BANNER_POLL_MS = 12 * 60 * 60 * 1000;
+const UPDATE_RESTART_ADVICE_POLL_MS = 1500;
 const UPDATE_BANNER_DISMISSED_KEY = 'sage-update-banner-dismissed';
 
 function UpdateBanner({ onOpenUpdates }) {
@@ -15212,13 +15244,35 @@ function UpdateBanner({ onOpenUpdates }) {
                 const data = await checkForUpdate();
                 let dismissed = '';
                 try { dismissed = sessionStorage.getItem(UPDATE_BANNER_DISMISSED_KEY) || ''; } catch (_) {}
-                if (active) setUpdate(buildUpdateBanner(data, dismissed));
+                if (active) setUpdate(buildUpdateBanner(neutralizeCheckedRestartAdvice(data), dismissed));
             } catch (_) {
                 if (active) setUpdate(null);
             }
         };
         check();
         const interval = setInterval(check, UPDATE_BANNER_POLL_MS);
+        return () => { active = false; clearInterval(interval); };
+    }, []);
+
+    // The release check is intentionally infrequent, but restart safety is
+    // process-local and can change at any moment. Refresh only the cheap retained
+    // status and rebuild the banner from that live advice; never poll GitHub on
+    // the signer-fence cadence.
+    useEffect(() => {
+        let active = true;
+        const syncRestartAdvice = async () => {
+            try {
+                const status = await fetchUpdateStatus();
+                if (!active) return;
+                const state = status?.state || {};
+                setUpdate(current => {
+                    const merged = mergeLiveUpdateRestartAdvice(current, state);
+                    return merged === current ? current : buildUpdateBanner(merged);
+                });
+            } catch (_) {}
+        };
+        syncRestartAdvice();
+        const interval = setInterval(syncRestartAdvice, UPDATE_RESTART_ADVICE_POLL_MS);
         return () => { active = false; clearInterval(interval); };
     }, []);
 

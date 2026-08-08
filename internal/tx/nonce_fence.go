@@ -1866,7 +1866,7 @@ type cometTxLookup struct {
 		Hash     string `json:"hash"`
 		Height   int64  `json:"height,string"`
 		TxResult *struct {
-			Code int    `json:"code"`
+			Code *int   `json:"code"`
 			Log  string `json:"log"`
 		} `json:"tx_result"`
 	} `json:"result"`
@@ -1882,11 +1882,11 @@ type cometTxLookup struct {
 type cometBroadcastCommit struct {
 	Result *struct {
 		CheckTx *struct {
-			Code int    `json:"code"`
+			Code *int   `json:"code"`
 			Log  string `json:"log"`
 		} `json:"check_tx"`
 		TxResult *struct {
-			Code int    `json:"code"`
+			Code *int   `json:"code"`
 			Log  string `json:"log"`
 		} `json:"tx_result"`
 		Hash   string `json:"hash"`
@@ -2045,13 +2045,13 @@ func cometIndexedOutcome(ctx context.Context, endpoint string, encoded []byte, h
 			Detail:  "comet tx lookup reported an indexed transaction with no block height: not proof of inclusion",
 		}, nil
 	}
-	if lookup.Result.TxResult == nil {
+	if lookup.Result.TxResult == nil || lookup.Result.TxResult.Code == nil {
 		return TxOutcome{
 			Verdict: TxVerdictUnresolved,
-			Detail:  "comet tx lookup omitted tx_result: not proof of execution",
+			Detail:  "comet tx lookup omitted tx_result or verdict code: not proof of execution",
 		}, nil
 	}
-	if lookup.Result.TxResult.Code != 0 {
+	if *lookup.Result.TxResult.Code != 0 {
 		// In a block and refused by FinalizeBlock. This is REAL PROOF for the
 		// property the fence guards — no later allocation can be overtaken —
 		// but the claim must be stated no wider than that, because an earlier
@@ -2077,7 +2077,7 @@ func cometIndexedOutcome(ctx context.Context, endpoint string, encoded []byte, h
 		return TxOutcome{
 			Verdict: TxVerdictRejected,
 			Detail: fmt.Sprintf("FinalizeBlock code %d at height %d: %s",
-				lookup.Result.TxResult.Code, lookup.Result.Height,
+				*lookup.Result.TxResult.Code, lookup.Result.Height,
 				scrubFenceText(lookup.Result.TxResult.Log, encoded)),
 		}, nil
 	}
@@ -2200,9 +2200,10 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 	if res.Result == nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, false, errors.New("comet re-submit returned no result")
 	}
-	if res.Result.CheckTx == nil || res.Result.TxResult == nil {
+	if res.Result.CheckTx == nil || res.Result.TxResult == nil ||
+		res.Result.CheckTx.Code == nil || res.Result.TxResult.Code == nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, false,
-			errors.New("comet re-submit omitted check_tx or tx_result: not proof of this transaction's fate")
+			errors.New("comet re-submit omitted check_tx or tx_result, or omitted a verdict code: not proof of this transaction's fate")
 	}
 	if !cometReportedHashMatches(res.Result.Hash, wantHash) {
 		return TxOutcome{
@@ -2210,7 +2211,7 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 			Detail:  cometHashMismatchDetail("comet re-submit", res.Result.Hash, wantHash),
 		}, false, nil
 	}
-	if code := res.Result.CheckTx.Code; code != 0 {
+	if code := *res.Result.CheckTx.Code; code != 0 {
 		log := scrubFenceText(res.Result.CheckTx.Log, encoded)
 		if !checkTxRefusalIsPermanent(code) {
 			// Deliberately an UNRESOLVED outcome rather than a verdict. The
@@ -2237,7 +2238,7 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 				code, log),
 		}, true, nil
 	}
-	if res.Result.TxResult.Code != 0 {
+	if *res.Result.TxResult.Code != 0 {
 		if res.Result.Height <= 0 {
 			// A FinalizeBlock code with no height is not the proof it looks
 			// like: without a block there is nothing that says these bytes were
@@ -2245,13 +2246,13 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 			return TxOutcome{
 				Verdict: TxVerdictUnresolved,
 				Detail: fmt.Sprintf("re-submit reported FinalizeBlock code %d with no committed height",
-					res.Result.TxResult.Code),
+					*res.Result.TxResult.Code),
 			}, false, nil
 		}
 		return TxOutcome{
 			Verdict: TxVerdictRejected,
 			Detail: fmt.Sprintf("re-submit rejected in FinalizeBlock (code %d) at height %d: %s",
-				res.Result.TxResult.Code, res.Result.Height, scrubFenceText(res.Result.TxResult.Log, encoded)),
+				*res.Result.TxResult.Code, res.Result.Height, scrubFenceText(res.Result.TxResult.Log, encoded)),
 		}, false, nil
 	}
 	if res.Result.Height <= 0 {

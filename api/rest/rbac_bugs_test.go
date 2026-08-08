@@ -342,10 +342,7 @@ func TestRBACBug1_PUTPermissionEndpoint_AcceptsWildcard(t *testing.T) {
 	var capturedTxHex string
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedTxHex = r.URL.Query().Get("tx")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{"code": 0, "hash": "TX_WILDCARD"},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 

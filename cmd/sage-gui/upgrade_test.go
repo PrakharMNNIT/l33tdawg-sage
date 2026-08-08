@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -470,14 +471,6 @@ func TestPrintUpgradeUsage_CurrentLadder(t *testing.T) {
 	}
 }
 
-// shrinkProposeRetryDelay makes the landed-anyway probe immediate for tests.
-func shrinkProposeRetryDelay(t *testing.T) {
-	t.Helper()
-	old := proposeBroadcastRetryDelay
-	proposeBroadcastRetryDelay = 10 * time.Millisecond
-	t.Cleanup(func() { proposeBroadcastRetryDelay = old })
-}
-
 // writeProposeTestKey writes a throwaway 32-byte agent.key seed for --agent-key.
 func writeProposeTestKey(t *testing.T) string {
 	t.Helper()
@@ -492,33 +485,6 @@ func writeProposeTestKey(t *testing.T) string {
 	return keyFile
 }
 
-// proposeRetryTestServer stubs CometBFT for the broadcast-error retry tests:
-// /abci_info reports app-v6 (target 7 — below the admin gate), and
-// /broadcast_tx_commit replies with handlers[n] on the n-th call.
-func proposeRetryTestServer(t *testing.T, handlers ...http.HandlerFunc) (*httptest.Server, *int) {
-	t.Helper()
-	calls := 0
-	mux := http.NewServeMux()
-	mux.HandleFunc("/abci_info", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{"response": map[string]any{"app_version": "6"}},
-		})
-	})
-	mux.HandleFunc("/broadcast_tx_commit", func(w http.ResponseWriter, r *http.Request) {
-		idx := calls
-		calls++
-		if idx >= len(handlers) {
-			t.Errorf("unexpected broadcast_tx_commit call #%d (only %d scripted)", idx+1, len(handlers))
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		handlers[idx](w, r)
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv, &calls
-}
-
 func requestTxHash(t *testing.T, r *http.Request) string {
 	t.Helper()
 	raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
@@ -529,136 +495,81 @@ func requestTxHash(t *testing.T, r *http.Request) string {
 	return strings.ToUpper(hex.EncodeToString(hash[:]))
 }
 
-func broadcastHTTP500(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusInternalServerError)
-}
+// TestUpgradePropose_AmbiguousBroadcastDoesNotRetryInsideLease pins the fence
+// boundary. A 500 after submission may mean the exact bytes landed. The command
+// must return that ambiguous error with the registration live; it must not send
+// the same bytes again inside the lease, where a mutable CheckTx refusal for
+// the retry could incorrectly retire the possibly-live original registration.
+//
+// The /tx response lets the nonce-fence reconciler prove the first submission
+// committed and exit promptly. A second broadcast is deliberately scripted as
+// a generic CheckTx refusal: reaching it is the unsafe behavior under test.
+func TestUpgradePropose_AmbiguousBroadcastDoesNotRetryInsideLease(t *testing.T) {
+	var mu sync.Mutex
+	broadcastCalls := 0
+	submittedHash := ""
+	reconciled := make(chan struct{}, 1)
 
-// TestUpgradePropose_BroadcastErrorButLanded reproduces the live papercut: the
-// node 500s the broadcast yet the proposal LANDS. The retry probe gets the
-// "already pending" rejection — proof the first broadcast committed the plan —
-// so the command must report SUCCESS with the standard accepted guidance, not
-// hand the operator a scary broadcast error for a proposal that worked.
-func TestUpgradePropose_BroadcastErrorButLanded(t *testing.T) {
-	shrinkProposeRetryDelay(t)
-	srv, calls := proposeRetryTestServer(t,
-		broadcastHTTP500,
-		func(w http.ResponseWriter, r *http.Request) {
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"result": map[string]any{
-					"hash":      requestTxHash(t, r),
-					"height":    "12",
-					"check_tx":  map[string]any{"code": 0},
-					"tx_result": map[string]any{"code": 47, "log": "upgrade plan already pending"},
-				},
-			})
-		},
-	)
-
-	var err error
-	out := captureStdout(t, func() {
-		err = runUpgradePropose([]string{"--target", "7", "--yes", "--rpc", srv.URL, "--agent-key", writeProposeTestKey(t)})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/abci_info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{"response": map[string]any{"app_version": "6"}},
+		})
 	})
-	if err != nil {
-		t.Fatalf("expected success when the landed-anyway probe confirms the plan, got: %v", err)
-	}
-	if *calls != 2 {
-		t.Errorf("broadcast_tx_commit called %d times, want 2 (original + probe)", *calls)
-	}
-	if !strings.Contains(out, "✓ Proposed app-v7") {
-		t.Errorf("missing accepted message; output:\n%s", out)
-	}
-	if !strings.Contains(out, "plan is pending") {
-		t.Errorf("success message should say the plan is pending despite the broadcast error; output:\n%s", out)
-	}
-	if !strings.Contains(out, "sage-gui upgrade status") {
-		t.Errorf("success message should carry the standard track-activation guidance; output:\n%s", out)
-	}
-}
-
-// TestUpgradePropose_BroadcastErrorRetryCommitsClean covers the other recovery
-// branch: the first broadcast genuinely never made it (the 500 hit before
-// commit) and the probe's re-broadcast lands clean — normal success, with the
-// probe's height/hash.
-func TestUpgradePropose_BroadcastErrorRetryCommitsClean(t *testing.T) {
-	shrinkProposeRetryDelay(t)
-	var retryHash string
-	srv, calls := proposeRetryTestServer(t,
-		broadcastHTTP500,
-		func(w http.ResponseWriter, r *http.Request) {
-			retryHash = requestTxHash(t, r)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"result": map[string]any{
-					"hash":      retryHash,
-					"height":    "33",
-					"check_tx":  map[string]any{"code": 0},
-					"tx_result": map[string]any{"code": 0},
-				},
-			})
-		},
-	)
-
-	var err error
-	out := captureStdout(t, func() {
-		err = runUpgradePropose([]string{"--target", "7", "--yes", "--rpc", srv.URL, "--agent-key", writeProposeTestKey(t)})
+	mux.HandleFunc("/broadcast_tx_commit", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		broadcastCalls++
+		call := broadcastCalls
+		submittedHash = requestTxHash(t, r)
+		hash := submittedHash
+		mu.Unlock()
+		if call == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{
+				"hash": hash, "height": "0",
+				"check_tx":  map[string]any{"code": 12, "log": "mutable refusal"},
+				"tx_result": map[string]any{"code": 0},
+			},
+		})
 	})
-	if err != nil {
-		t.Fatalf("expected success when the probe re-broadcast commits clean, got: %v", err)
-	}
-	if *calls != 2 {
-		t.Errorf("broadcast_tx_commit called %d times, want 2", *calls)
-	}
-	if !strings.Contains(out, "accepted at height 33") || !strings.Contains(out, retryHash) {
-		t.Errorf("clean retry should report the probe's height/hash; output:\n%s", out)
-	}
-}
-
-// TestUpgradePropose_BroadcastErrorInconclusive: when the probe can't prove the
-// proposal landed (it errors too), the ORIGINAL broadcast error must surface,
-// with the existing re-check fallback text intact.
-func TestUpgradePropose_BroadcastErrorInconclusive(t *testing.T) {
-	shrinkProposeRetryDelay(t)
-	srv, calls := proposeRetryTestServer(t, broadcastHTTP500, broadcastHTTP500)
+	mux.HandleFunc("/tx", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hash := submittedHash
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{
+				"hash": hash, "height": "12", "tx_result": map[string]any{"code": 0},
+			},
+		})
+		select {
+		case reconciled <- struct{}{}:
+		default:
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
 
 	err := runUpgradePropose([]string{"--target", "7", "--yes", "--rpc", srv.URL, "--agent-key", writeProposeTestKey(t)})
 	if err == nil {
-		t.Fatal("expected the original broadcast error to surface, got nil")
+		t.Fatal("expected the ambiguous first broadcast error to surface, got nil")
 	}
-	if *calls != 2 {
-		t.Errorf("broadcast_tx_commit called %d times, want 2 (original + one probe, never more)", *calls)
+	if !strings.Contains(err.Error(), "500 Internal Server Error") || !strings.Contains(err.Error(), "sage-gui upgrade status") {
+		t.Fatalf("error should carry the first failure and re-check guidance; got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "broadcast:") || !strings.Contains(err.Error(), "500 Internal Server Error") {
-		t.Errorf("error should carry the original broadcast failure; got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "sage-gui upgrade status") {
-		t.Errorf("error should keep the re-check fallback text; got: %v", err)
-	}
-}
 
-// TestUpgradePropose_BroadcastErrorRetryOtherRejection: a probe rejection that
-// is NOT "already pending" (e.g. the code-47 admin gate) proves nothing about
-// the original broadcast — the original error must surface, not the probe's.
-func TestUpgradePropose_BroadcastErrorRetryOtherRejection(t *testing.T) {
-	shrinkProposeRetryDelay(t)
-	srv, _ := proposeRetryTestServer(t,
-		broadcastHTTP500,
-		func(w http.ResponseWriter, r *http.Request) {
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"result": map[string]any{
-					"hash":      requestTxHash(t, r),
-					"height":    "9",
-					"check_tx":  map[string]any{"code": 0},
-					"tx_result": map[string]any{"code": 47, "log": "upgrade propose: under app-v8 only admin agents may propose upgrades"},
-				},
-			})
-		},
-	)
-
-	err := runUpgradePropose([]string{"--target", "7", "--yes", "--rpc", srv.URL, "--agent-key", writeProposeTestKey(t)})
-	if err == nil {
-		t.Fatal("expected the original broadcast error to surface, got nil")
+	select {
+	case <-reconciled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("nonce-fence reconciler did not inspect the exact first submission")
 	}
-	if !strings.Contains(err.Error(), "500 Internal Server Error") {
-		t.Errorf("error should be the original broadcast failure, not the probe rejection; got: %v", err)
+	mu.Lock()
+	gotCalls := broadcastCalls
+	mu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("broadcast_tx_commit called %d times, want only the original submission; generic retry refusal must not be reached", gotCalls)
 	}
 }
 

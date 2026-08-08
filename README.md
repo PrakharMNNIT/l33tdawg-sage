@@ -63,8 +63,8 @@ single bounded JSON document, explicit nested verdicts, the exact transaction
 hash, and a positive committed height for success.
 
 **Update restart advice now follows live fence state.** A completed download no
-longer leaves stale restart guidance behind: status reads and retained update
-events recompute whether restart is currently safe, and the dashboard renders
+longer leaves stale restart guidance behind: retained update status reads
+recompute whether restart is currently safe, and the dashboard renders
 the server-provided instructions. Coordinated restarts are refused when a fence
 is present. Crash, power-loss, cross-restart, and separate-process CLI exposure
 still require durable pre-broadcast intent and remain explicitly out of scope.

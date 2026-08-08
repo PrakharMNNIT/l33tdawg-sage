@@ -39,17 +39,9 @@ func (f *crossSetBarrierFederation) LockAgreementMutation() func() {
 func TestHandleCrossFedSetUsesPolicyWriteBarrierThroughCACommit(t *testing.T) {
 	cometEntered := make(chan struct{})
 	var cometOnce sync.Once
-	comet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	comet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cometOnce.Do(func() { close(cometEntered) })
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": 0, "log": ""},
-				"tx_result": map[string]any{"code": 0, "log": "agreement updated"},
-				"hash":      "TX33NARROW",
-				"height":    "7",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "agreement updated", 7)
 	}))
 	defer comet.Close()
 

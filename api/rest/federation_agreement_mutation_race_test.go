@@ -135,7 +135,8 @@ type agreementMutationRaceRPC struct {
 	err   error
 }
 
-func newAgreementMutationRaceRPC(f *agreementMutationRaceFederation) (*httptest.Server, *agreementMutationRaceRPC) {
+func newAgreementMutationRaceRPC(t *testing.T, f *agreementMutationRaceFederation) (*httptest.Server, *agreementMutationRaceRPC) {
+	t.Helper()
 	rpc := &agreementMutationRaceRPC{
 		setCommitted:    make(chan struct{}),
 		revokeCommitted: make(chan struct{}),
@@ -155,31 +156,20 @@ func newAgreementMutationRaceRPC(f *agreementMutationRaceFederation) (*httptest.
 			return
 		}
 
-		hash := ""
 		switch parsed.Type {
 		case tx.TxTypeCrossFedSet:
 			f.recordEvent("set-tx")
 			rpc.setOnce.Do(func() { close(rpc.setCommitted) })
-			hash = "TX33RACE"
 		case tx.TxTypeCrossFedRevoke:
 			f.recordEvent("revoke-tx")
 			rpc.revokeOnce.Do(func() { close(rpc.revokeCommitted) })
-			hash = "TX34RACE"
 		default:
 			rpc.setError(fmt.Errorf("unexpected transaction type %d", parsed.Type))
 			http.Error(w, "unexpected tx", http.StatusBadRequest)
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": 0, "log": ""},
-				"tx_result": map[string]any{"code": 0, "log": "agreement updated"},
-				"hash":      hash,
-				"height":    "7",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "agreement updated", 7)
 	}))
 	return server, rpc
 }
@@ -285,7 +275,7 @@ func TestCrossFedAgreementLeaseOrdersRevokePurgeBeforeNewSet(t *testing.T) {
 	fed.releaseCACommit() // set promotion is not the blocker in this interleaving
 	calls := make([]*agreementMutationHTTPCall, 0, 2)
 
-	comet, rpc := newAgreementMutationRaceRPC(fed)
+	comet, rpc := newAgreementMutationRaceRPC(t, fed)
 	defer comet.Close()
 	defer cleanupAgreementMutationRace(t, fed, &calls)
 	srv, _, _ := newTestServer(t, comet.URL)
@@ -346,7 +336,7 @@ func TestCrossFedAgreementLeaseOrdersSetCAPromotionBeforeRevoke(t *testing.T) {
 	fed.releasePurge() // CA promotion is the blocker in this interleaving
 	calls := make([]*agreementMutationHTTPCall, 0, 2)
 
-	comet, rpc := newAgreementMutationRaceRPC(fed)
+	comet, rpc := newAgreementMutationRaceRPC(t, fed)
 	defer comet.Close()
 	defer cleanupAgreementMutationRace(t, fed, &calls)
 	srv, _, _ := newTestServer(t, comet.URL)

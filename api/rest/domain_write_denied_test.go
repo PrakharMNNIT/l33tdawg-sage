@@ -29,18 +29,8 @@ func TestSubmitMemoryEffectiveWriteDenialMatrix(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"result": map[string]any{
-						"check_tx": map[string]any{"code": 0, "log": ""},
-						"tx_result": map[string]any{
-							"code": 11,
-							"log":  test.log,
-						},
-						"hash": "DENIED", "height": "1",
-					},
-				})
+			cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeCometCommitFixture(t, w, r, 0, "", 11, test.log, 1)
 			}))
 			defer cometMock.Close()
 
@@ -77,17 +67,9 @@ func TestSubmitMemoryEffectiveWriteDenialMatrix(t *testing.T) {
 }
 
 func TestSubmitMemoryLegacyDenialUsesCanonicalPublicCode(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx": map[string]any{"code": 0, "log": ""},
-				"tx_result": map[string]any{
-					"code": 11,
-					"log":  "access denied: agent 0123456789abcdef cannot write domain private it does not own",
-				},
-				"hash": "DENIED", "height": "1",
-			},
-		})
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 11,
+			"access denied: agent 0123456789abcdef cannot write domain private it does not own", 1)
 	}))
 	defer cometMock.Close()
 
@@ -113,14 +95,8 @@ func TestSubmitMemoryUnknownOrControlPlaneDenialRemainsOpaqueAndUntyped(t *testi
 		"access denied: denial_code=future_code cannot write shared domain LEAK-DOMAIN",
 	} {
 		t.Run(log, func(t *testing.T) {
-			cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"result": map[string]any{
-						"check_tx":  map[string]any{"code": 0, "log": ""},
-						"tx_result": map[string]any{"code": 11, "log": log},
-						"hash":      "DENIED", "height": "1",
-					},
-				})
+			cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeCometCommitFixture(t, w, r, 0, "", 11, log, 1)
 			}))
 			defer cometMock.Close()
 

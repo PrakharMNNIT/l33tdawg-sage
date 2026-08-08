@@ -62,10 +62,10 @@ func TestAgentUpdatePartialBodyPreservesOmittedMetadata(t *testing.T) {
 				require.Equal(t, agentID, parsed.AgentUpdateTx.AgentID)
 				require.Equal(t, test.expectedName, parsed.AgentUpdateTx.Name)
 				require.Equal(t, test.expectedBootBio, parsed.AgentUpdateTx.BootBio)
-				_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"UPDATE","height":"2"}}`)
+				writeCometCommitFixture(t, w, r, 0, "", 0, "", 2)
 			}))
 			defer comet.Close()
-			srv.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
+			srv.cometbftRPC = comet.URL
 
 			req := appV23RESTRequest(http.MethodPut, "/v1/agent/update", agentID, test.body, nil)
 			rec := httptest.NewRecorder()

@@ -128,12 +128,12 @@ func BroadcastCometCommit(ctx context.Context, cometRPC string, signingKey ed255
 		ClearSubmittedTx(signingKey)
 		return result, nil
 	}
+	if envelope.Result.Height <= 0 {
+		return nil, errors.New("broadcast commit response reported no committed height")
+	}
 	if txCode != 0 {
 		ClearSubmittedTx(signingKey)
 		return result, nil
-	}
-	if envelope.Result.Height <= 0 {
-		return nil, errors.New("broadcast commit response reported no committed height")
 	}
 	return result, nil
 }

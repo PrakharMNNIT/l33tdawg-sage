@@ -48,15 +48,7 @@ import (
 func permTestCometMock(t *testing.T, txCode int, txLog string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx":  map[string]interface{}{"code": 0, "log": ""},
-				"tx_result": map[string]interface{}{"code": txCode, "log": txLog},
-				"hash":      "PERMTX0001",
-				"height":    "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", uint32(txCode), txLog, 1)
 	}))
 }
 
@@ -252,15 +244,7 @@ func TestSetPermission_PartialUpdate_PreservesClearance(t *testing.T) {
 	var capturedTxHex string
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedTxHex = r.URL.Query().Get("tx")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx":  map[string]interface{}{"code": 0},
-				"tx_result": map[string]interface{}{"code": 0},
-				"hash":      "PERMTX_PATCH",
-				"height":    "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -306,17 +290,7 @@ func TestSetPermission_UnchangedExplicitZeroOmitsAppV22Extension(t *testing.T) {
 	var capturedTxHex string
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedTxHex = r.URL.Query().Get("tx")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx": map[string]interface{}{"code": 0},
-				"tx_result": map[string]interface{}{
-					"code": 0,
-				},
-				"hash":   "PERMTX_LEGACY_ZERO",
-				"height": "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -348,17 +322,7 @@ func TestSetPermission_OmittedCapabilityUsesAbsentWireAndPreservesCurrentInABCI(
 	var capturedTxHex string
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedTxHex = r.URL.Query().Get("tx")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx": map[string]interface{}{"code": 0},
-				"tx_result": map[string]interface{}{
-					"code": 0,
-				},
-				"hash":   "PERMTX_OMITTED_CAPABILITY",
-				"height": "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -401,16 +365,7 @@ func TestSetPermission_AppV22AnyChangedFieldRequiresGlobalAdmin(t *testing.T) {
 	broadcasts := 0
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		broadcasts++
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx": map[string]interface{}{"code": 0},
-				"tx_result": map[string]interface{}{
-					"code": 0,
-				},
-				"hash": "PERMTX_APPV22",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 

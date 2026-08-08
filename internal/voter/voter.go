@@ -369,8 +369,9 @@ func voteOnPendingMemoriesResult(
 				if encodeErr != nil {
 					return encodeErr
 				}
-				result = broadcastVoteTx(ctx, cfg.CometRPC, encoded, logger)
-				return nil
+				var broadcastErr error
+				result, broadcastErr = broadcastVoteTx(ctx, cfg.CometRPC, cfg.Key, encoded, logger)
+				return broadcastErr
 			})
 			if err != nil {
 				logger.Debug().Err(err).Msg("failed to build or broadcast vote tx under nonce lease")
@@ -452,8 +453,9 @@ func voteOnUpgradeProposalResult(ctx context.Context, app App, cfg Config, selfI
 		if encodeErr != nil {
 			return encodeErr
 		}
-		result = broadcastVoteTx(ctx, cfg.CometRPC, encoded, logger)
-		return nil
+		var broadcastErr error
+		result, broadcastErr = broadcastVoteTx(ctx, cfg.CometRPC, cfg.Key, encoded, logger)
+		return broadcastErr
 	})
 	if err != nil {
 		logger.Debug().Err(err).Msg("failed to build or broadcast gov vote tx under nonce lease")

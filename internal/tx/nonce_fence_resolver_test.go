@@ -386,6 +386,30 @@ func TestCometTxResolver_UnprovenAnswersStayUnresolved(t *testing.T) {
 			want: "omitted check_tx or tx_result",
 		},
 		{
+			name:   "bound resubmit omits checktx verdict code",
+			lookup: func(string) (int, string) { return 500, cometNotFound },
+			submit: func(string) (int, string) {
+				return 200, `{"result":{"check_tx":{},"tx_result":{"code":0},"hash":"` + boundHash + `","height":"12"}}`
+			},
+			want: "verdict code",
+		},
+		{
+			name: "bound indexed lookup omits verdict code",
+			lookup: func(string) (int, string) {
+				return 200, `{"result":{"hash":"` + boundHash + `","height":"12","tx_result":{}}}`
+			},
+			submit: func(string) (int, string) { return 500, cometNotFound },
+			want:   "verdict code",
+		},
+		{
+			name: "bound indexed lookup has null verdict code",
+			lookup: func(string) (int, string) {
+				return 200, `{"result":{"hash":"` + boundHash + `","height":"12","tx_result":{"code":null}}}`
+			},
+			submit: func(string) (int, string) { return 500, cometNotFound },
+			want:   "verdict code",
+		},
+		{
 			name: "bound indexed lookup has null tx result",
 			lookup: func(string) (int, string) {
 				return 200, `{"result":{"hash":"` + boundHash + `","height":"12","tx_result":null}}`

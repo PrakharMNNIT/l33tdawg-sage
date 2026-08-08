@@ -2,6 +2,7 @@ package rest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -82,7 +83,17 @@ func (s *Server) writeConsensusTxError(
 		writeProblem(w, http.StatusInternalServerError, "Encoding error", "Failed to encode transaction.")
 	case consensusTxLease:
 		s.logger.Error().Err(err).Msg("failed to acquire nonce lease for " + operation + " tx")
-		writeProblem(w, http.StatusServiceUnavailable, "Submission unavailable", "Transaction submission was canceled before it began.")
+		switch {
+		case errors.Is(err, tx.ErrSignerFenced):
+			w.Header().Set("Retry-After", "1")
+			writeProblem(w, http.StatusServiceUnavailable, "Signing key temporarily held",
+				"An earlier transaction from this signing key is still being confirmed. Nothing was signed or sent for this request; retry shortly.")
+		case errors.Is(err, tx.ErrSigningQuiesced):
+			writeProblem(w, http.StatusServiceUnavailable, "Signing paused",
+				"Transaction signing is paused for a coordinated restart. Nothing was signed or sent for this request.")
+		default:
+			writeProblem(w, http.StatusServiceUnavailable, "Submission unavailable", "Transaction submission was canceled before it began.")
+		}
 	default:
 		s.logger.Error().Err(err).Msg("failed to broadcast " + operation + " tx")
 		status, publicMsg := broadcastErrorPublic(err)

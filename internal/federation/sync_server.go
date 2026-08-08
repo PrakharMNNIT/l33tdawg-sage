@@ -870,10 +870,21 @@ func (m *Manager) broadcastSyncSubmit(localID string, item *SyncItem) (string, s
 				// on the receiver — a per-attempt consensus cost, so a distinct
 				// outcome the sender attempts-caps (NOT the cheap gate-scope reject).
 				result = SyncOutcomeRejectedWriteAccess
+			case syncBcastNonceRace:
+				// A second bound CheckTx refusal is definitive for these exact
+				// bytes. The shared broadcaster already retired registration;
+				// leave the item retryable without fencing the signer.
+				result = SyncOutcomeRetry
 			default:
 				if broadcastErr != nil {
 					m.logger.Warn().Err(broadcastErr).Str("local", localID).Msg("sync: submit broadcast failed")
 				}
+				// Unknown errors may follow bytes reaching the wire. Returning the
+				// original error lets WithNonceLease consume the live registration
+				// and fence those exact bytes. A hash-bound definitive rejection
+				// has already called ClearSubmittedTx, so the same return remains
+				// retryable without a false fence.
+				return broadcastErr
 			}
 			return nil
 		}

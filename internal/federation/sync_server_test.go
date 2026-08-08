@@ -683,6 +683,25 @@ func TestSyncPushNonceRaceRetriesOnce(t *testing.T) {
 	assert.EqualValues(t, 2, comet.calls.Load(), "one nonce retry with a fresh tx")
 }
 
+func TestSyncSubmitMalformedCometResponseFencesExactSigner(t *testing.T) {
+	comet := &scriptedComet{responses: []string{`{"result":`}}
+	m, _ := newSyncTestManager(t, comet)
+	item := syncItem("m-ambiguous", "hr", "fence ambiguous sync submission")
+
+	outcome, hash := m.broadcastSyncSubmit(syncMemoryID("chain-b", item.OriginMemoryID), &item)
+	assert.Equal(t, SyncOutcomeRetry, outcome)
+	assert.Empty(t, hash)
+
+	wantSigner := hex.EncodeToString(m.agentPub)
+	for _, held := range tx.FencedSigners() {
+		if held.SignerPubKeyHex == wantSigner {
+			require.NotEmpty(t, held.TxHash)
+			return
+		}
+	}
+	t.Fatalf("malformed on-wire response released signer %s instead of fencing it", wantSigner)
+}
+
 // TestT2fWriteNeverWidens is T2(f): the WRITE-never-widens end-to-end invariant
 // (docs/v11.8-PLAN.md §8, plan T2(f)). A synced item is admitted ONLY by the
 // receiver's OWN locally-authorized MemorySubmit (buildSyncSubmitTx), which

@@ -172,17 +172,10 @@ func TestAppV23OrdinaryTaskAPIsRejectRootAndPreserveLocalAdmin(t *testing.T) {
 		require.NoError(t, fixture.badger.SetMemoryAuthorPrincipal(
 			record.MemoryID, record.SubmittingAgent,
 		))
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": 0},
-				"tx_result": map[string]any{"code": 0},
-				"hash":      "APPV23TASK",
-				"height":    "12",
-			},
-		}))
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 12)
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
+	fixture.server.cometbftRPC = comet.URL
 	var heightBytes [8]byte
 	binary.BigEndian.PutUint64(heightBytes[:], 12)
 	require.NoError(t, fixture.badger.SetState("height", heightBytes[:]))
@@ -303,7 +296,7 @@ func TestAppV23TaskSubmitFailsBeforeBroadcastWithoutAssignmentBridge(t *testing.
 		broadcasts++
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
+	fixture.server.cometbftRPC = comet.URL
 
 	body := []byte(`{"content":"must stay assigned","memory_type":"task","domain_tag":"member.home","confidence_score":0.9,"task_status":"planned"}`)
 	req := appV23SignedRESTRouteRequest(
@@ -321,16 +314,11 @@ func TestAppV23TaskSubmitPollsExactProjectionBeforeReportingCreated(t *testing.T
 	fixture := newAppV23RESTRouteFixture(t)
 	cache := &capturingSuppCache{}
 	fixture.server.SetSuppCache(cache)
-	comet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx": map[string]any{"code": 0}, "tx_result": map[string]any{"code": 0},
-				"hash": "DELAYEDTASK", "height": "31",
-			},
-		}))
+	comet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 31)
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
+	fixture.server.cometbftRPC = comet.URL
 
 	readbacks := 0
 	fixture.memories.getOpenTasksHook = func() {
@@ -366,16 +354,11 @@ func TestAppV23TaskSubmitReturnsNonRetryableCommittedUnconfirmed(t *testing.T) {
 	fixture := newAppV23RESTRouteFixture(t)
 	fixture.server.SetSuppCache(&capturingSuppCache{})
 	fixture.memories.getOpenTasksErr = errors.New("projection unavailable")
-	comet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx": map[string]any{"code": 0}, "tx_result": map[string]any{"code": 0},
-				"hash": "UNCONFIRMEDTASK", "height": "32",
-			},
-		}))
+	comet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 32)
 	}))
 	t.Cleanup(comet.Close)
-	fixture.server.cometbftRPC = strictCometFixtureProxy(t, comet.URL)
+	fixture.server.cometbftRPC = comet.URL
 
 	body := []byte(`{"content":"[TASK] reconcile me","memory_type":"task","domain_tag":"member.home","confidence_score":0.9,"task_status":"planned"}`)
 	req := appV23SignedRESTRouteRequest(

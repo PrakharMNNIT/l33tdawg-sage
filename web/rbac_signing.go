@@ -149,11 +149,11 @@ func (h *DashboardHandler) retryGovernanceProofAtCommittedTime(
 type cometCommitResult struct {
 	Result struct {
 		CheckTx *struct {
-			Code int    `json:"code"`
+			Code *int   `json:"code"`
 			Log  string `json:"log"`
 		} `json:"check_tx"`
 		TxResult *struct {
-			Code int    `json:"code"`
+			Code *int   `json:"code"`
 			Log  string `json:"log"`
 		} `json:"tx_result"`
 		Hash   string `json:"hash"`
@@ -318,9 +318,10 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, signin
 	// value structs, a missing or explicit-null check_tx/tx_result silently
 	// zero-valued to code 0; a proxy could therefore pair the correct hash and
 	// height with no execution verdict and manufacture a false success.
-	if result.Result.CheckTx == nil || result.Result.TxResult == nil {
+	if result.Result.CheckTx == nil || result.Result.TxResult == nil ||
+		result.Result.CheckTx.Code == nil || result.Result.TxResult.Code == nil {
 		return "", 0, "", indeterminateCommit(errors.New(
-			"broadcast commit response omitted check_tx or tx_result: cannot prove this transaction's fate"))
+			"broadcast commit response omitted check_tx, tx_result, or verdict code: cannot prove this transaction's fate"))
 	}
 	// From here down the envelope claims a verdict — but NO VERDICT, SUCCESS OR
 	// REJECTION, IS READ FROM AN ENVELOPE WHOSE HASH IS NOT OURS — the rule
@@ -349,7 +350,7 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, signin
 	wantHash := hex.EncodeToString(sentHash[:])
 	gotHash := tx.NormalizeCometHash(result.Result.Hash)
 	bound := tx.CometReportedHashMatches(result.Result.Hash, sentHash)
-	if result.Result.CheckTx.Code != 0 {
+	if *result.Result.CheckTx.Code != 0 {
 		if !bound {
 			// Only hex-filtered prefixes are echoed: both values are remote text.
 			return "", 0, "", indeterminateCommit(fmt.Errorf(
@@ -370,9 +371,9 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, signin
 		// failed. See tx.ClearSubmittedTx.
 		tx.ClearSubmittedTx(signingKey)
 		return "", 0, "", fmt.Errorf("tx rejected in CheckTx (code %d): %s",
-			result.Result.CheckTx.Code, tx.ScrubBroadcastText(result.Result.CheckTx.Log, txBytes))
+			*result.Result.CheckTx.Code, tx.ScrubBroadcastText(result.Result.CheckTx.Log, txBytes))
 	}
-	if result.Result.TxResult.Code != 0 {
+	if *result.Result.TxResult.Code != 0 {
 		// An in-block rejection additionally needs its block: a FinalizeBlock
 		// verdict IS inclusion in a block, so code != 0 at height 0 is a shape
 		// no real node produces. internal/tx's re-submit path treats a
@@ -388,7 +389,7 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, signin
 		// branch above.
 		tx.ClearSubmittedTx(signingKey)
 		return "", 0, "", fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s",
-			result.Result.TxResult.Code, tx.ScrubBroadcastText(result.Result.TxResult.Log, txBytes))
+			*result.Result.TxResult.Code, tx.ScrubBroadcastText(result.Result.TxResult.Log, txBytes))
 	}
 
 	// ZERO CODES ARE NOT PROOF OF COMMIT. Every field above zero-values, so a

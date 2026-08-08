@@ -190,9 +190,8 @@ func TestGovernanceMutationFailsClosedWithoutLiveValidatorKey(t *testing.T) {
 }
 
 func TestGovernanceOperatorIdentityIsCanonicalAndAcceptsUppercaseHeader(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"TXHASH","height":"9"}}`))
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 9)
 	}))
 	defer cometMock.Close()
 
@@ -238,8 +237,7 @@ func TestGovernanceOperatorReceivesCommittedProposalIDAndReusesIt(t *testing.T) 
 			require.NoError(t, marshalErr)
 			require.NoError(t, badgerStore.SetGovProposal(proposalID, state))
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"result":{"check_tx":{"code":0,"log":""},"tx_result":{"code":0,"log":""},"hash":"TXHASH` + strconv.FormatInt(int64(call), 10) + `","height":"` + strconv.FormatInt(40+int64(call), 10) + `"}}`))
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 40+int64(call))
 	}))
 	defer cometMock.Close()
 
@@ -385,9 +383,8 @@ func TestPersistedGovernanceValidatorReadinessTracksExactMembership(t *testing.T
 }
 
 func TestCommittedGovernanceProposalMissingFromConfiguredStoreReturns500(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"COMMITTEDTX","height":"9"}}`))
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 9)
 	}))
 	defer cometMock.Close()
 

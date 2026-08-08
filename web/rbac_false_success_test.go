@@ -63,6 +63,11 @@ func TestBroadcastTxCommit_FalseSuccessShapesAreIndeterminate(t *testing.T) {
 			body:   `{}`,
 		},
 		{
+			name:   "malformed JSON keeps the commit indeterminate",
+			status: 200,
+			body:   `{not-json`,
+		},
+		{
 			// A 500 whose body happens to parse — a proxy artifact. Nothing
 			// below the status line examined the code, so this fell through to
 			// whatever the body claimed. The bytes may well be in a mempool:
@@ -91,6 +96,26 @@ func TestBroadcastTxCommit_FalseSuccessShapesAreIndeterminate(t *testing.T) {
 			name:   "bound success envelope with null txresult",
 			status: 200,
 			body:   `{"result":{"check_tx":{"code":0},"tx_result":null,"hash":"` + boundHash + `","height":"12"}}`,
+		},
+		{
+			name:   "bound success envelope missing checktx code",
+			status: 200,
+			body:   `{"result":{"check_tx":{},"tx_result":{"code":0},"hash":"` + boundHash + `","height":"12"}}`,
+		},
+		{
+			name:   "bound success envelope with null checktx code",
+			status: 200,
+			body:   `{"result":{"check_tx":{"code":null},"tx_result":{"code":0},"hash":"` + boundHash + `","height":"12"}}`,
+		},
+		{
+			name:   "bound success envelope missing txresult code",
+			status: 200,
+			body:   `{"result":{"check_tx":{"code":0},"tx_result":{},"hash":"` + boundHash + `","height":"12"}}`,
+		},
+		{
+			name:   "bound success envelope with null txresult code",
+			status: 200,
+			body:   `{"result":{"check_tx":{"code":0},"tx_result":{"code":null},"hash":"` + boundHash + `","height":"12"}}`,
 		},
 		{
 			// A perfectly-formed envelope about a DIFFERENT transaction — the

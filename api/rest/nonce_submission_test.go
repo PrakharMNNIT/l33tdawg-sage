@@ -4,6 +4,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,4 +130,40 @@ func TestSubmitConsensusTxReportsSubmitFailureAndReleasesLease(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, consensusTxSubmit, stage)
 	require.Greater(t, second.Nonce, first.Nonce, "an ambiguous failed submission must never recycle its nonce")
+}
+
+func TestWriteConsensusTxErrorDistinguishesFenceAndRestartQuiesce(t *testing.T) {
+	s := &Server{logger: zerolog.Nop()}
+	for _, tc := range []struct {
+		name       string
+		err        error
+		title      string
+		detail     string
+		retryAfter string
+	}{
+		{
+			name:       "fenced signer is actionable and retryable",
+			err:        fmt.Errorf("await signer: %w", tx.ErrSignerFenced),
+			title:      "Signing key temporarily held",
+			detail:     "earlier transaction",
+			retryAfter: "1",
+		},
+		{
+			name:   "restart quiesce is not described as a fence",
+			err:    fmt.Errorf("await signer: %w", tx.ErrSigningQuiesced),
+			title:  "Signing paused",
+			detail: "coordinated restart",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			s.writeConsensusTxError(rr, consensusTxLease, "test", tc.err)
+			require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+			require.Equal(t, tc.retryAfter, rr.Header().Get("Retry-After"))
+			require.Contains(t, rr.Body.String(), tc.title)
+			require.Contains(t, rr.Body.String(), tc.detail)
+			require.Contains(t, rr.Body.String(), "Nothing was signed or sent")
+			require.False(t, strings.Contains(rr.Body.String(), "rejected"))
+		})
+	}
 }
