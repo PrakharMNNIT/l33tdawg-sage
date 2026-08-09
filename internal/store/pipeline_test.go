@@ -498,13 +498,13 @@ func TestPipelineExpiry(t *testing.T) {
 	assert.Equal(t, 1, purged)
 }
 
-func TestPurgePipelinesComparesMixedPrecisionTimestampsChronologically(t *testing.T) {
+func TestPurgePipelinesConservativelyFloorsSubMillisecondCutoff(t *testing.T) {
 	ctx := context.Background()
 	s, err := NewSQLiteStore(ctx, ":memory:")
 	require.NoError(t, err)
 	defer s.Close()
 
-	cutoff := time.Date(2026, time.August, 9, 1, 2, 3, 0, time.UTC)
+	cutoff := time.Date(2026, time.August, 9, 1, 2, 3, 500_000, time.UTC)
 	msg := &PipelineMessage{
 		PipeID: "pipe-after-whole-second-cutoff", FromAgent: "agent-alice", ToAgent: "agent-bob",
 		Intent: "test", Payload: "retain me", Status: "pending",
@@ -514,11 +514,11 @@ func TestPurgePipelinesComparesMixedPrecisionTimestampsChronologically(t *testin
 	require.NoError(t, s.ClaimPipeline(ctx, msg.PipeID, msg.ToAgent))
 	require.NoError(t, s.CompletePipeline(ctx, msg.PipeID, msg.ToAgent, "done", ""))
 
-	// RFC3339Nano renders cutoff without a fractional component (..03Z), while
-	// the terminal instant has milliseconds (..03.001Z). Plain TEXT comparison
-	// orders '.' before 'Z' and used to purge this objectively newer row.
+	// SQLite resolves fractional seconds only to milliseconds. A terminal event
+	// objectively newer than the nanosecond cutoff but in its floor millisecond
+	// must never round across the boundary and disappear.
 	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET terminal_at=? WHERE pipe_id=?`,
-		formatTime(cutoff.Add(time.Millisecond)), msg.PipeID)
+		formatTime(cutoff.Add(200*time.Microsecond)), msg.PipeID)
 	require.NoError(t, err)
 	purged, err := s.PurgePipelines(ctx, cutoff)
 	require.NoError(t, err)
@@ -526,14 +526,108 @@ func TestPurgePipelinesComparesMixedPrecisionTimestampsChronologically(t *testin
 	_, err = s.GetPipeline(ctx, msg.PipeID)
 	require.NoError(t, err)
 
-	// The strict retention boundary remains intact: an actually older terminal
-	// instant is reclaimed once it falls before the same cutoff.
+	// An older instant in the same ambiguous millisecond is retained
+	// conservatively. The next sweep reclaims it once the cutoff crosses a
+	// representable millisecond boundary.
 	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET terminal_at=? WHERE pipe_id=?`,
-		formatTime(cutoff.Add(-time.Millisecond)), msg.PipeID)
+		formatTime(cutoff.Add(-200*time.Microsecond)), msg.PipeID)
+	require.NoError(t, err)
+	purged, err = s.PurgePipelines(ctx, cutoff)
+	require.NoError(t, err)
+	require.Zero(t, purged)
+
+	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET terminal_at=? WHERE pipe_id=?`,
+		formatTime(cutoff.Add(-2*time.Millisecond)), msg.PipeID)
 	require.NoError(t, err)
 	purged, err = s.PurgePipelines(ctx, cutoff)
 	require.NoError(t, err)
 	require.Equal(t, 1, purged)
+}
+
+func TestPurgePipelinesUsesTheConservativeBoundaryForOutboxAndParent(t *testing.T) {
+	ctx := context.Background()
+	s, err := NewSQLiteStore(ctx, ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	cutoff := time.Date(2026, time.August, 9, 1, 2, 3, 500_000, time.UTC)
+	proof := testPipelineTransportProof(t)
+	msg := &PipelineMessage{
+		PipeID: "pipe-retention-outbox", FromAgent: proof.AgentID, ToAgent: strings.Repeat("b", 64),
+		DestinationChainID: "peer-chain", FederationPolicyEpoch: "epoch-1",
+		FederationAgreementID: strings.Repeat("c", 64), FederationContactID: strings.Repeat("d", 64),
+		FederationContactRevision: strings.Repeat("e", 64), Payload: "work", Status: "pending",
+		CreatedAt: cutoff.Add(-time.Hour), ExpiresAt: cutoff.Add(time.Hour),
+	}
+	event := &PipelineTransportOutbox{
+		EventID: "event-retention-outbox", PipeID: msg.PipeID, RemoteChainID: msg.DestinationChainID,
+		EventKind: "send", PolicyEpoch: msg.FederationPolicyEpoch, AgreementID: msg.FederationAgreementID,
+		ContactID: msg.FederationContactID, ContactRevision: msg.FederationContactRevision,
+		SourceAgentID: msg.FromAgent, TargetAgentID: msg.ToAgent, Proof: proof,
+		CreatedAt: cutoff.Add(-time.Hour), ExpiresAt: cutoff.Add(time.Hour),
+	}
+	require.NoError(t, s.InsertPipelineWithTransport(ctx, msg, event))
+	require.NoError(t, s.MarkPipelineTransportDelivered(ctx, event.EventID))
+	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET status='expired', terminal_at=? WHERE pipe_id=?`,
+		formatTime(cutoff.Add(200*time.Microsecond)), msg.PipeID)
+	require.NoError(t, err)
+
+	purged, err := s.PurgePipelines(ctx, cutoff)
+	require.NoError(t, err)
+	require.Zero(t, purged)
+	var outboxRows int
+	require.NoError(t, s.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pipeline_transport_outbox WHERE event_id=?`, event.EventID).Scan(&outboxRows))
+	require.Equal(t, 1, outboxRows, "stage one must retain transport metadata with its newer parent")
+
+	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET terminal_at=? WHERE pipe_id=?`,
+		formatTime(cutoff.Add(-2*time.Millisecond)), msg.PipeID)
+	require.NoError(t, err)
+	purged, err = s.PurgePipelines(ctx, cutoff)
+	require.NoError(t, err)
+	require.Equal(t, 1, purged)
+	require.NoError(t, s.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pipeline_transport_outbox WHERE event_id=?`, event.EventID).Scan(&outboxRows))
+	require.Zero(t, outboxRows, "eligible transport metadata and its parent must purge atomically")
+}
+
+func TestPurgePipelinesTreatsAmbiguousOrMalformedReadReceiptAsRetention(t *testing.T) {
+	ctx := context.Background()
+	s, err := NewSQLiteStore(ctx, ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	cutoff := time.Date(2026, time.August, 9, 1, 2, 3, 500_000, time.UTC)
+	msg := &PipelineMessage{
+		PipeID: "pipe-read-receipt-retention", FromAgent: "agent-alice", ToAgent: "agent-bob",
+		Payload: "work", Status: "pending", CreatedAt: cutoff.Add(-time.Hour), ExpiresAt: cutoff.Add(time.Hour),
+	}
+	require.NoError(t, s.InsertPipeline(ctx, msg))
+	require.NoError(t, s.ClaimPipeline(ctx, msg.PipeID, msg.ToAgent))
+	require.NoError(t, s.CompletePipeline(ctx, msg.PipeID, msg.ToAgent, "done", ""))
+	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET terminal_at=? WHERE pipe_id=?`,
+		formatTime(cutoff.Add(-2*time.Millisecond)), msg.PipeID)
+	require.NoError(t, err)
+	_, err = s.writeExecContext(ctx,
+		`INSERT INTO message_read_receipts(message_id,receiver_agent_id,read_at) VALUES(?,?,?)`,
+		msg.PipeID, msg.ToAgent, formatTime(cutoff.Add(200*time.Microsecond)))
+	require.NoError(t, err)
+
+	purged, err := s.PurgePipelines(ctx, cutoff)
+	require.NoError(t, err)
+	require.Zero(t, purged, "a fresh receipt in the cutoff millisecond must retain")
+	_, err = s.writeExecContext(ctx, `UPDATE message_read_receipts SET read_at='not-a-time' WHERE message_id=?`, msg.PipeID)
+	require.NoError(t, err)
+	purged, err = s.PurgePipelines(ctx, cutoff)
+	require.NoError(t, err)
+	require.Zero(t, purged, "malformed retained evidence must fail safe instead of authorizing deletion")
+
+	_, err = s.writeExecContext(ctx, `UPDATE message_read_receipts SET read_at=? WHERE message_id=?`,
+		formatTime(cutoff.Add(-2*time.Millisecond)), msg.PipeID)
+	require.NoError(t, err)
+	purged, err = s.PurgePipelines(ctx, cutoff)
+	require.NoError(t, err)
+	require.Equal(t, 1, purged, "an unambiguously old valid receipt must not retain the parent")
 }
 
 func TestPipelineDirectAgentRouting(t *testing.T) {
