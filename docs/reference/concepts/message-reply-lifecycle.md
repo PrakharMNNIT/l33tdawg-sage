@@ -237,6 +237,13 @@ None of these contributes to `count`, `message_count`, or
 and `reply_items_are_work:false` make that distinction machine-readable. Pinned
 by `internal/mcp/inbox_reply_pointer_test.go`.
 
+The newest timestamp is a candidate watermark, not permission to skip a full
+page. When `reply_page_truncated=true`, callers keep their prior watermark and
+drain the inclusive window using the exact composite `reply_next_before` cursor
+until `page_truncated=false`. `reply_watermark_safe_to_advance` and
+`reply_catch_up_action` make this fail-safe sequence explicit; advancing early
+would strand replies between the returned page tail and the new timestamp.
+
 **The pointer must never assert pendency.** Because the count can never return
 to zero, a string such as "N replies are waiting. Read them with
 sage_message_replies" would re-issue the same order on every inbox call, for the

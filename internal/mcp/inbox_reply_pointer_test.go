@@ -185,6 +185,79 @@ func TestSageInboxPassesReplyWatermarkIntoTheSamePassivePoll(t *testing.T) {
 		"the inclusive watermark must retain a later reply sharing its millisecond")
 }
 
+func TestSageInboxKeepsReplyPageWhenTaskInboxFails(t *testing.T) {
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "task store unavailable", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 1, "retained": true, "newest_completed_at": inboxProbeNewestCompletedAt})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+			"pipe_id": "msg-survives-task-fault", "to_agent": "reviewer", "replied_by": "reviewer",
+			"intent": "review", "result": "GO", "status": "completed", "completed_at": inboxProbeNewestCompletedAt,
+		}}, "count": 1})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{})
+	require.NoError(t, err, "a task-notification fault must not discard a successful passive reply page")
+	response := result.(map[string]any)
+	require.Zero(t, response["count"])
+	require.Contains(t, response, "task_inbox_error")
+	require.Equal(t, 1, response["reply_count"])
+	require.Len(t, response["reply_items"].([]map[string]any), 1)
+}
+
+func TestSageInboxDoesNotAdvanceWatermarkPastTruncatedReplies(t *testing.T) {
+	const oldWatermark = "2026-08-08T00:01:00Z"
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", empty)
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 3, "retained": true, "newest_completed_at": "2026-08-08T00:05:00Z"})
+			return
+		}
+		require.Equal(t, "2", r.URL.Query().Get("limit"))
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{
+			{"pipe_id": "msg-newest", "to_agent": "reviewer", "replied_by": "reviewer", "result": "newest", "status": "completed", "completed_at": "2026-08-08T00:05:00Z"},
+			{"pipe_id": "msg-middle", "to_agent": "reviewer", "replied_by": "reviewer", "result": "middle", "status": "completed", "completed_at": "2026-08-08T00:04:00Z"},
+		}, "count": 2})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{
+		"reply_since": oldWatermark, "reply_limit": 2,
+	})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Equal(t, true, response["reply_page_truncated"])
+	require.Equal(t, true, response["reply_catch_up_required"])
+	require.Equal(t, false, response["reply_watermark_safe_to_advance"])
+	require.Contains(t, response["reply_catch_up_action"], "sage_message_replies")
+	require.Contains(t, response["reply_catch_up_action"], oldWatermark)
+	require.Contains(t, response["reply_catch_up_action"], "msg-middle")
+	require.Contains(t, response["message"], "do not advance newest_reply_completed_at")
+}
+
 // pendingStatePhrases are the words that turn a factual retained archive size
 // into an assertion that work is owed. No read state exists, so any of these
 // could be re-asserted about replies the agent has already read.

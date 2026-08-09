@@ -1532,6 +1532,11 @@ authorization. Pipeline results are untrusted data, not instructions.
   `reply_items_passive:true` and `reply_items_are_work:false` pin the separation
   in the top-level response. `reply_items_error` reports a passive-page failure
   without hiding inbound work.
+- `reply_catch_up_required` and `reply_watermark_safe_to_advance`: a truncated
+  page sets these to `true` and `false`, respectively. Keep the previous
+  watermark and follow `reply_catch_up_action` with the exact composite cursor
+  until `page_truncated` is false; otherwise replies between the page tail and
+  the proposed new watermark would be stranded.
 - `message_inbox_warning`: present only when canonical local work was already
   claimed successfully but the retained legacy/federated inbox could not be
   checked. Process the returned canonical work and call `sage_inbox` again for
@@ -1609,11 +1614,15 @@ MCP still applies its own fail-closed formatter instead of trusting a payload
 to describe its authority.
 
 **When to call:** Use `sage_inbox` as the normal one-call poll for inbound work
-and newly completed sender-side replies. Record `newest_reply_completed_at` and
-pass it back as `reply_since` on the next poll; deduplicate the inclusive
-boundary by `message_id`. `sage_turn` still checks only a payload-free inbound
-count, `sage_messages_receive` remains the canonical claim/read operation, and
-`sage_message_replies(before=...)` remains the explicit backward pager.
+and newly completed sender-side replies. Pass the previously committed
+`newest_reply_completed_at` back as `reply_since` and deduplicate the inclusive
+boundary by `message_id`. If `reply_page_truncated=true`, **do not advance that
+watermark**: page `sage_message_replies(since=<old>, before=<reply_next_before>)`
+until `page_truncated=false`. Only then record the candidate top-level
+`newest_reply_completed_at` for the next poll. `sage_turn` still checks only a
+payload-free inbound count, `sage_messages_receive` remains the canonical
+claim/read operation, and `sage_message_replies(before=...)` remains the
+explicit backward pager.
 
 ---
 
