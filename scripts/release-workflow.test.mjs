@@ -166,6 +166,7 @@ test('metadata, source, race, frontend, and fault checks converge before packagi
     'release-metadata',
     'lint',
     'test',
+    'vulncheck',
     'frontend-static',
     'v119-fault-gates',
   ]);
@@ -180,6 +181,19 @@ test('metadata, source, race, frontend, and fault checks converge before packagi
   ]) {
     assertNeeds(id, ['quality-gate', 'release-metadata']);
   }
+});
+
+test('release and CI vulnerability gates scan the exact mandated Go floor', () => {
+  for (const source of [workflow, ciWorkflow, codeqlWorkflow, faultWorkflow]) {
+    assert.doesNotMatch(source, /^\s+go-version: '1\.25'$/m);
+    assert.match(source, /go-version-file: go\.mod/);
+  }
+  for (const source of [job('vulncheck'), ciJob('vulncheck')]) {
+    assert.match(source, /govulncheck@v1\.6\.0/);
+    assert.match(source, /govulncheck \.\/\.\.\./);
+    assert.match(source, /cd natter\n\s+govulncheck \.\/\.\.\./);
+  }
+  assert.match(rootDockerfile, /^FROM golang:1\.25\.12-alpine AS builder$/m);
 });
 
 test('superseded checks stop spending runner minutes without weakening the newest commit', () => {
