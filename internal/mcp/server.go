@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -30,6 +31,32 @@ import (
 var errMCPFrameTooLarge = errors.New("MCP JSON-RPC frame exceeds 2 MiB")
 
 const maxMCPFrameBytes = 2 << 20
+
+const mcpRuntimeHandoffEnv = "SAGE_MCP_RUNTIME_HANDOFF"
+
+const (
+	mcpRuntimeHandoffParentEnv      = "SAGE_MCP_RUNTIME_HANDOFF_PARENT_PID"
+	mcpRuntimeHandoffInitializedEnv = "SAGE_MCP_RUNTIME_HANDOFF_INITIALIZED"
+)
+
+// mcpExecutableSnapshot identifies the exact on-disk executable that started a
+// stdio MCP session. Desktop upgrades replace the app bundle while long-lived
+// agent sessions can keep the old mapped process alive, leaving tools/list and
+// tool behavior pinned to the previous release. The snapshot lets Run hand the
+// next unread JSON-RPC frame to the replacement executable without claiming or
+// executing that request under the stale schema.
+type mcpExecutableSnapshot struct {
+	path string
+	info os.FileInfo
+}
+
+type mcpExecutableState uint8
+
+const (
+	mcpExecutableUnchanged mcpExecutableState = iota
+	mcpExecutableReplaced
+	mcpExecutableUnavailable
+)
 
 // JSON-RPC types.
 type jsonRPCRequest struct {
@@ -197,6 +224,21 @@ func (s *Server) requireBoundFederatedCaller(ctx context.Context) error {
 // Run starts the stdio MCP server loop.
 func (s *Server) Run(ctx context.Context) error {
 	reader := bufio.NewReaderSize(os.Stdin, 64<<10)
+	executable, err := captureMCPExecutableSnapshot()
+	if err != nil {
+		return fmt.Errorf("SAGE MCP: establish executable handoff fence: %w", err)
+	}
+	lifecycle := newMCPHandoffLifecycle(
+		os.Getenv(mcpRuntimeHandoffEnv),
+		os.Getenv(mcpRuntimeHandoffParentEnv),
+		os.Getenv(mcpRuntimeHandoffInitializedEnv),
+		os.Getppid(),
+	)
+	if lifecycle.takeToolsChangedNotification() {
+		if err := writeMCPToolsChangedNotification(os.Stdout); err != nil {
+			return fmt.Errorf("SAGE MCP: announce upgraded tool registry: %w", err)
+		}
+	}
 	for {
 		line, readErr := readMCPFrame(reader, maxMCPFrameBytes)
 		if errors.Is(readErr, io.EOF) {
@@ -212,6 +254,34 @@ func (s *Server) Run(ctx context.Context) error {
 		if len(line) == 0 {
 			continue
 		}
+		executableState := mcpExecutableUnchanged
+		if executable != nil {
+			executableState = executable.state()
+		}
+		if executableState != mcpExecutableUnchanged {
+			if executableState == mcpExecutableUnavailable {
+				// Once the installed path no longer identifies the runtime that
+				// started this session, fail the held request visibly. Executing it
+				// under known-stale tools would hide the upgrade skew this fence is
+				// designed to expose.
+				return fmt.Errorf("SAGE MCP: installed executable became unavailable during runtime handoff")
+			}
+			fmt.Fprintf(os.Stderr, "SAGE MCP: installed executable changed; handing the pending request to the upgraded runtime\n")
+			// Pass the buffered reader, not raw os.Stdin: ReadSlice may already
+			// have pulled bytes from following frames into reader's buffer.
+			started, err := handoffMCPProcess(ctx, executable.path, os.Args[1:], line, reader, os.Stdout, os.Stderr, os.Environ(), lifecycle.initialized)
+			if started {
+				// Once the replacement owns stdin the current runtime must never
+				// execute the replayed frame, even if the child later exits with an
+				// error. Returning preserves the no-stale-fallback boundary; a child
+				// transport failure remains indeterminate to the caller.
+				return err
+			}
+			// A failed launch leaves the frame unexecuted. Return a transport
+			// failure so the client can reconnect; never fall back to a runtime
+			// already proven stale.
+			return fmt.Errorf("SAGE MCP: upgraded-runtime handoff failed before the replacement acquired stdin: %w", err)
+		}
 
 		var req jsonRPCRequest
 		if err := json.Unmarshal(line, &req); err != nil {
@@ -223,7 +293,138 @@ func (s *Server) Run(ctx context.Context) error {
 		if resp != nil {
 			s.writeResponse(resp)
 		}
+		if req.Method == "notifications/initialized" {
+			lifecycle.initialized = true
+			if lifecycle.takeToolsChangedNotification() {
+				if err := writeMCPToolsChangedNotification(os.Stdout); err != nil {
+					return fmt.Errorf("SAGE MCP: announce upgraded tool registry: %w", err)
+				}
+			}
+		}
 	}
+}
+
+type mcpHandoffLifecycle struct {
+	pendingListChange bool
+	initialized       bool
+}
+
+func newMCPHandoffLifecycle(marker, parentPID, initialized string, actualParentPID int) mcpHandoffLifecycle {
+	expectedParentPID, err := strconv.Atoi(strings.TrimSpace(parentPID))
+	verifiedHandoff := marker == "1" && err == nil && expectedParentPID > 0 && expectedParentPID == actualParentPID
+	return mcpHandoffLifecycle{
+		pendingListChange: verifiedHandoff,
+		initialized:       verifiedHandoff && initialized == "1",
+	}
+}
+
+func (lifecycle *mcpHandoffLifecycle) takeToolsChangedNotification() bool {
+	if lifecycle == nil || !lifecycle.pendingListChange || !lifecycle.initialized {
+		return false
+	}
+	lifecycle.pendingListChange = false
+	return true
+}
+
+func captureMCPExecutableSnapshot() (*mcpExecutableSnapshot, error) {
+	path, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	return captureMCPExecutableSnapshotAt(path)
+}
+
+func captureMCPExecutableSnapshotAt(path string) (*mcpExecutableSnapshot, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("executable path is empty")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("executable path is not a regular file: %s", path)
+	}
+	return &mcpExecutableSnapshot{path: path, info: info}, nil
+}
+
+func (snapshot *mcpExecutableSnapshot) state() mcpExecutableState {
+	if snapshot == nil || snapshot.info == nil || strings.TrimSpace(snapshot.path) == "" {
+		return mcpExecutableUnchanged
+	}
+	current, err := os.Stat(snapshot.path)
+	if err != nil || !current.Mode().IsRegular() {
+		return mcpExecutableUnavailable
+	}
+	if !os.SameFile(snapshot.info, current) ||
+		snapshot.info.Size() != current.Size() ||
+		!snapshot.info.ModTime().Equal(current.ModTime()) {
+		return mcpExecutableReplaced
+	}
+	return mcpExecutableUnchanged
+}
+
+// handoffMCPProcess launches the newly installed executable with the current
+// MCP command line and replays the one frame already removed from the stdio
+// pipe. The child inherits the remaining input and the exact output/error
+// streams. The frame is injected once and is never executed by the old runtime;
+// child failure before a response remains an ordinary indeterminate transport
+// outcome. The old process waits as a stdio pump and exits when the replacement
+// session ends.
+func handoffMCPProcess(
+	ctx context.Context,
+	path string,
+	args []string,
+	firstFrame []byte,
+	stdin io.Reader,
+	stdout io.Writer,
+	stderr io.Writer,
+	environ []string,
+	initialized bool,
+) (bool, error) {
+	if strings.TrimSpace(path) == "" {
+		return false, errors.New("replacement executable path is empty")
+	}
+	replayed := append(append([]byte(nil), firstFrame...), '\n')
+	cmd := exec.CommandContext(ctx, path, args...) //nolint:gosec // exact path captured from os.Executable
+	cmd.Stdin = io.MultiReader(bytes.NewReader(replayed), stdin)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	cmd.Env = withMCPEnvironment(environ, mcpRuntimeHandoffEnv, "1")
+	cmd.Env = withMCPEnvironment(cmd.Env, mcpRuntimeHandoffParentEnv, strconv.Itoa(os.Getpid()))
+	initializedValue := "0"
+	if initialized {
+		initializedValue = "1"
+	}
+	cmd.Env = withMCPEnvironment(cmd.Env, mcpRuntimeHandoffInitializedEnv, initializedValue)
+	if err := cmd.Start(); err != nil {
+		return false, err
+	}
+	return true, cmd.Wait()
+}
+
+func withMCPEnvironment(environ []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(environ)+1)
+	for _, entry := range environ {
+		if strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return append(result, prefix+value)
+}
+
+func writeMCPToolsChangedNotification(writer io.Writer) error {
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/tools/list_changed",
+	})
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(writer, string(payload))
+	return err
 }
 
 // readMCPFrame reads one newline-delimited JSON-RPC frame while enforcing a
@@ -310,7 +511,7 @@ func (s *Server) handleInitialize(ctx context.Context, req *jsonRPCRequest) *jso
 		Result: map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities": map[string]any{
-				"tools": map[string]any{},
+				"tools": map[string]any{"listChanged": true},
 			},
 			"serverInfo": map[string]any{
 				"name":    "sage-mcp",

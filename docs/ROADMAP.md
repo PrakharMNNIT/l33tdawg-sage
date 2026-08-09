@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.4 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.5 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -17,12 +17,31 @@ synthetic applied-upgrade records. Existing app-v22 through app-v26 chains are
 not rewritten. v11.18.3 adds the process-wide signer fence described below;
 v11.18.4 adds one-call reply-aware inbox polling, mandatory exact-toolchain
 vulnerability gates, and conservative millisecond pipeline retention.
-The supported consensus ceiling remains app-v26; **v11.18.4 does not introduce app-v27**.
+v11.18.5 closes the remaining installed-binary/MCP-session skew by handing an
+unread request to the replacement runtime before stale tools can execute it.
+The supported consensus ceiling remains app-v26; **v11.18.5 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.5 patch
+
+v11.18.5 makes the v11.18.4 one-call coordination contract survive later SAGE
+binary upgrades. A long-lived stdio MCP process snapshots its exact executable;
+when that path is replaced, it launches the installed runtime and replays the
+single frame already removed from the pipe before passing through all remaining
+input. The stale process never executes that frame. A child that has acquired
+stdin also prevents fallback execution if it later exits. This is a
+single-injection/no-stale-fallback guarantee, not a new durable exactly-once
+execution protocol; callers still reconcile an indeterminate transport failure.
+
+Every `sage_inbox` response now identifies `sage.inbox.v2`, the live MCP runtime
+version, and that sender replies are embedded. This turns silent schema skew
+into machine-detectable evidence. The first transition from a pre-11.18.5 MCP
+process still needs one session restart; future replacements can hand off
+automatically. There is no consensus change and app-v26 remains the ceiling.
 
 ## v11.18.4 patch
 

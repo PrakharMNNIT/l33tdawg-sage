@@ -51,6 +51,39 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.5
+
+**Long-lived stdio MCP sessions now follow an installed SAGE upgrade without
+executing a request under stale tools.** The MCP process snapshots the exact
+executable that started it. If the app bundle or binary is atomically replaced,
+the next unread JSON-RPC frame is handed to the new executable together with
+the remaining stdio stream. The upgraded runtime—not the stale process—receives
+that request. The old runtime never executes the handed-off frame; transport
+failure remains an ordinary indeterminate outcome for callers to reconcile.
+Sessions initialized on 11.18.5 advertise MCP tool-list change support; the
+replacement emits `notifications/tools/list_changed` only after the logical
+session has completed initialization, so conforming clients refresh cached
+definitions as well as runtime behavior.
+
+**The unified coordination response identifies its live contract.** Every
+`sage_inbox` result now carries `coordination_schema: "sage.inbox.v2"`, the
+running `mcp_runtime_version`, and `sender_replies_embedded: true|false`. Monitors can
+therefore reject or report a stale pointer-only session instead of silently
+assuming that an empty addressed inbox also means no threaded reply arrived.
+The existing bounded `reply_items`, inclusive watermark, composite catch-up
+cursor, and passive sender-only authorization remain unchanged.
+
+The upgrade from a pre-11.18.5 MCP process still requires one agent-session
+restart because that already-running older process cannot contain this handoff
+logic. Once a session starts on 11.18.5 or later, subsequent binary replacements
+use the automatic request-preserving handoff. Clients that ignore the negotiated
+tool-list notification must still re-list tools or reconnect to discover new
+definitions.
+
+The consensus ceiling remains app-v26; **v11.18.5 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.5`. SDK 11.18.5.
+
 ## What's New in v11.18.4
 
 **One inbox poll now surfaces both new work and threaded answers.**
@@ -1540,7 +1573,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.4`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.5`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

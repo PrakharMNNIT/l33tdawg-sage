@@ -95,6 +95,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.2 | Sender-side reply visibility (`sage_message_replies`); no new app version; app-v26 remains the ceiling |
 | v11.18.3 | Signer fence for same-key nonce ordering; no new app version; app-v26 remains the ceiling |
 | v11.18.4 | One-call reply-aware inbox, exact Go vulnerability gates, conservative pipeline retention; no new app version; app-v26 remains the ceiling |
+| v11.18.5 | Request-preserving stdio MCP runtime handoff and machine-readable coordination schema/version evidence; no new app version; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
@@ -642,10 +643,25 @@ sage-gui status             # node health
 Then check that recall works from an actual agent — an MCP `sage_recall` on a
 domain you know has content is the honest end-to-end test.
 
-If your agents were connected over MCP, restart their sessions. A long-lived
-MCP client keeps talking to the node it connected to, and short-lived `sage-gui
-mcp` subprocesses proxy to the running node, so tool descriptions and behaviour
-can look stale until both ends are restarted.
+When crossing from v11.18.4 or earlier to v11.18.5, restart each connected agent
+session once. The already-running older MCP subprocess cannot contain
+v11.18.5's executable-handoff logic, so its cached tool descriptions and
+pointer-only inbox behavior remain stale until that one reconnect. Confirm the
+new session's `sage_inbox` response reports
+`coordination_schema: "sage.inbox.v2"` and `mcp_runtime_version: "11.18.5"`.
+
+After a stdio MCP session starts on v11.18.5 or later, subsequent installed
+binary replacements are detected before the next unread JSON-RPC request is
+executed. That exact frame and the remaining stdio stream are handed to the new
+runtime, so ordinary future upgrades should no longer require a manual agent
+restart merely to refresh runtime behavior. Sessions initialized on v11.18.5
+advertise `tools.listChanged`; the replacement emits
+`notifications/tools/list_changed` once the existing logical session has
+completed initialization, so conforming clients re-list changed tool definitions.
+A client that ignores that notification must explicitly re-list
+or reconnect before relying on newly added tools or arguments. A client or
+operating system that terminates the stdio transport independently may still
+reconnect normally.
 
 If you crossed app-v23, also reissue HTTP MCP bearer tokens — activation revoked
 every legacy keyless bearer:
