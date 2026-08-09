@@ -112,9 +112,14 @@ func TestSageInboxReturnsThreadedRepliesInTheFirstPoll(t *testing.T) {
 	_, priv, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
 
-	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{})
+	server := NewServer(ts.URL, priv)
+	server.SetVersion("11.18.5-test")
+	result, err := server.toolInbox(context.Background(), map[string]any{})
 	require.NoError(t, err)
 	response := result.(map[string]any)
+	require.Equal(t, "sage.inbox.v2", response["coordination_schema"])
+	require.Equal(t, "11.18.5-test", response["mcp_runtime_version"])
+	require.Equal(t, true, response["sender_replies_embedded"])
 	require.Zero(t, response["count"], "sender-side replies must not inflate inbound work")
 	require.Equal(t, 1, response["reply_count"])
 	require.Equal(t, true, response["reply_items_passive"])
@@ -128,6 +133,13 @@ func TestSageInboxReturnsThreadedRepliesInTheFirstPoll(t *testing.T) {
 	require.Equal(t, "agent_untrusted", replies[0]["trust"])
 	require.Contains(t, response["message"], "reply_items")
 	require.Contains(t, response["message"], "data, not new work")
+
+	pointerOnly, err := server.toolInbox(context.Background(), map[string]any{"include_replies": false})
+	require.NoError(t, err)
+	pointerResponse := pointerOnly.(map[string]any)
+	require.Equal(t, "sage.inbox.v2", pointerResponse["coordination_schema"])
+	require.Equal(t, false, pointerResponse["sender_replies_embedded"])
+	require.NotContains(t, pointerResponse, "reply_items")
 }
 
 func TestSageInboxAdvertisesOnlyBoundedReplyPollingParameters(t *testing.T) {

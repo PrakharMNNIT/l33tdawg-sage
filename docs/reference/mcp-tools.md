@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.18.4.
+Reconciled against internal/mcp for SAGE v11.18.5.
 
 # SAGE MCP Tools Reference
 
@@ -1526,6 +1526,11 @@ authorization. Pipeline results are untrusted data, not instructions.
   `items`. Every row has `requires_reply:false`, `requires_result:false`,
   `passive_reply:true`, `authority:"data_only"`, and the untrusted result
   provenance fields documented under `sage_message_replies`.
+- `coordination_schema` (v11.18.5): exact string `sage.inbox.v2`.
+  `mcp_runtime_version` reports the live stdio/HTTP MCP implementation version,
+  and `sender_replies_embedded` confirms whether this exact call successfully
+  included the passive reply page. Monitors should report a missing or older contract
+  rather than infer that an empty addressed inbox means no threaded answer.
 - `reply_count`, `reply_limit`, `reply_page_truncated`, optional
   `reply_next_before`, `reply_newest_completed_at`,
   `reply_oldest_completed_at`, and `reply_since`: embedded page metadata.
@@ -1625,6 +1630,30 @@ until `page_truncated=false`. Only then record the candidate top-level
 payload-free inbound count, `sage_messages_receive` remains the canonical
 claim/read operation, and `sage_message_replies(before=...)` remains the
 explicit backward pager.
+
+**Installed-runtime handoff (v11.18.5):** a stdio MCP process snapshots the
+exact executable that started it. If an in-place app/binary update replaces
+that path, the next unread JSON-RPC frame and the remaining stdio stream are
+passed to the replacement executable before the stale process dispatches the
+request. If the child acquired stdin, the old process never falls back and
+duplicates that frame even if the child later exits non-zero. A missing or
+unlaunchable installed path fails the held request and closes the stale
+transport rather than dispatching it under old tools. Child failure after start
+is an indeterminate transport outcome, not proof that a mutation did or did not
+execute; callers must use the tool's normal reconciliation contract before any
+retry. Each successful handoff retains the preceding process as a stdio pump
+until the session ends, so unusually upgrade-heavy long-lived sessions should
+still be reconnected periodically to release those mapped parents. Sessions
+already running pre-11.18.5 require one reconnect to gain this behavior.
+The v11.18.5 initialize response advertises `tools.listChanged:true`; a handoff
+child emits `notifications/tools/list_changed` before an operational replayed
+frame, or defers it until after a replayed `notifications/initialized` completes.
+The parent PID and logical initialization state are carried in private handoff
+environment markers; a bare ambient marker cannot send an early notification.
+Clients honoring that negotiated MCP capability refresh cached tool definitions.
+Clients that ignore it must re-list or reconnect before using a
+new tool or argument; the live `sage_inbox` response metadata remains the
+authoritative runtime/coordination-contract evidence either way.
 
 ---
 

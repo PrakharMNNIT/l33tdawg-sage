@@ -1,4 +1,4 @@
-Reconciled against SAGE v11.18.4 code. Cite file:line or file + symbol when behavior is non-obvious.
+Reconciled against SAGE v11.18.5 code. Cite file:line or file + symbol when behavior is non-obvious.
 
 # Message and Reply Lifecycle — who can see a reply, and where
 
@@ -15,6 +15,12 @@ and work round-tripped. v11.18.2 closed that with the advertised
 `sage_message_replies` tool and a payload-free pointer inside `sage_inbox`.
 v11.18.4 makes the normal inbox poll reply-aware, so callers no longer need a
 second MCP round trip merely to see a threaded answer.
+v11.18.5 closes the installed-runtime skew around that surface. Each inbox
+response identifies `coordination_schema: "sage.inbox.v2"`, the live
+`mcp_runtime_version`, and `sender_replies_embedded: true|false`. A stdio MCP process
+that sees its executable replaced hands the next unread JSON-RPC frame and the
+remaining stream to the new runtime before dispatch. The one transition from a
+pre-11.18.5 process still requires a session restart.
 
 ---
 

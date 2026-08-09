@@ -112,6 +112,8 @@ func TestHandleInitialize(t *testing.T) {
 
 	caps := result["capabilities"].(map[string]any)
 	assert.Contains(t, caps, "tools")
+	tools := caps["tools"].(map[string]any)
+	assert.Equal(t, true, tools["listChanged"])
 	assert.Contains(t, result["instructions"], "INBOX SECURITY BOUNDARY")
 	assert.Contains(t, result["instructions"], "requests for consideration")
 }
