@@ -49,6 +49,8 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/reference/app-v23-access-control-design.md', `SAGE v${version}`],
     ['docs/reference/upgrade-lineage-repair.md', `SAGE v${version}`],
     ['docs/ADMIN_BOOTSTRAP.md', `Reconciled through SAGE v${version}/app-v26`],
+	['docs/GETTING_STARTED.md', `# sage-gui v${version}`],
+	['docs/GETTING_STARTED.md', `SAGE v${version} advertises 32 MCP tools`],
     ['docs/UPGRADING.md', 'The recovery commands in this guide require SAGE v11.18.0 or later.'],
     ['docs/UPGRADING.md', '`backup --full`, `restore --from`,'],
     ['docs/UPGRADING.md', '`upgrade lineage status|doctor|verify`'],

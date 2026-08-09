@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -25,30 +26,52 @@ import (
 
 var dashboardTestGovernanceDomain = strings.Repeat("5a", sha256.Size)
 
-func governanceCaptureServer(t *testing.T) (*httptest.Server, *atomic.Int32, <-chan *tx.ParsedTx) {
+// governanceBroadcast is one captured /broadcast_tx_commit: the decoded
+// transaction plus the bound hash the stub answered — the canonical uppercase
+// SHA-256 of the exact bytes submitted, which is also what the handler now
+// reports as tx_hash (it re-renders the PROVEN hash rather than echoing the
+// remote string).
+type governanceBroadcast struct {
+	parsed *tx.ParsedTx
+	hash   string
+}
+
+func governanceCaptureServer(t *testing.T) (*httptest.Server, *atomic.Int32, <-chan governanceBroadcast) {
 	return governanceCaptureServerResult(t, 0, 0)
 }
 
-func governanceCaptureServerResult(t *testing.T, checkCode, finalizeCode int) (*httptest.Server, *atomic.Int32, <-chan *tx.ParsedTx) {
+// governanceCaptureServerResult answers every broadcast with a BOUND envelope
+// (hash = SHA-256 of the submitted bytes, height 9) carrying the requested
+// CheckTx/FinalizeBlock codes. Placeholder hashes are no longer an option: the
+// production path refuses an unbound verdict — success or rejection — as
+// indeterminate, which fences the signing key and would leak an unresolvable
+// fence into every later test in the package.
+func governanceCaptureServerResult(t *testing.T, checkCode, finalizeCode int) (*httptest.Server, *atomic.Int32, <-chan governanceBroadcast) {
 	t.Helper()
 	var broadcasts atomic.Int32
-	captured := make(chan *tx.ParsedTx, 4)
+	captured := make(chan governanceBroadcast, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Tolerate non-broadcast probes (a reconciler's /tx lookup carries no
+		// tx= param) instead of slicing an absent parameter: answering "not
+		// indexed" is never proof, so it cannot wrongly lift anything.
+		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
+		if raw == "" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"error":{"code":-32603,"message":"tx not indexed"}}`))
+			return
+		}
 		broadcasts.Add(1)
-		raw, err := hex.DecodeString(r.URL.Query().Get("tx")[2:])
+		decoded, err := hex.DecodeString(raw)
 		require.NoError(t, err)
-		parsed, err := tx.DecodeTx(raw)
+		parsed, err := tx.DecodeTx(decoded)
 		require.NoError(t, err)
-		captured <- parsed
+		sum := tx.CometTxHash(decoded)
+		captured <- governanceBroadcast{
+			parsed: parsed,
+			hash:   strings.ToUpper(hex.EncodeToString(sum[:])),
+		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": checkCode, "log": "check rejected"},
-				"tx_result": map[string]any{"code": finalizeCode, "log": "finalize rejected"},
-				"hash":      "TXHASH",
-				"height":    "9",
-			},
-		}))
+		_, _ = fmt.Fprint(w, commitEnvelope(r, checkCode, "check rejected", finalizeCode, "finalize rejected", 9))
 	}))
 	return server, &broadcasts, captured
 }
@@ -135,7 +158,7 @@ func TestDashboardScopeGovernanceUsesValidatorOuterAndOperatorProof(t *testing.T
 
 	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
 	require.EqualValues(t, 1, broadcasts.Load())
-	parsed := <-captured
+	parsed := (<-captured).parsed
 	assert.Equal(t, validatorKey.Public().(ed25519.PublicKey), ed25519.PublicKey(parsed.PublicKey))
 	assert.Equal(t, operatorKey.Public().(ed25519.PublicKey), ed25519.PublicKey(parsed.AgentPubKey))
 	proofBody := requireDashboardGovernanceProofBody(t, parsed, http.MethodPost, "/v1/dashboard/governance/propose")
@@ -162,7 +185,8 @@ func TestDashboardNonScopeProposalUsesValidatorOuterAndOperatorProofPostV20(t *t
 	h.handleDashboardGovPropose(resp, req)
 
 	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
-	parsed := <-captured
+	broadcast := <-captured
+	parsed := broadcast.parsed
 	assert.Equal(t, validatorKey.Public().(ed25519.PublicKey), ed25519.PublicKey(parsed.PublicKey))
 	assert.Equal(t, operatorKey.Public().(ed25519.PublicKey), ed25519.PublicKey(parsed.AgentPubKey))
 	proofBody := requireDashboardGovernanceProofBody(t, parsed, http.MethodPost, "/v1/dashboard/governance/propose")
@@ -179,7 +203,9 @@ func TestDashboardNonScopeProposalUsesValidatorOuterAndOperatorProofPostV20(t *t
 		"validator-a",
 	)
 	assert.Equal(t, wantID, response["proposal_id"])
-	assert.Equal(t, "TXHASH", response["tx_hash"])
+	// The handler reports OUR canonical rendering of the PROVEN hash, which the
+	// binding guarantees equals the hash of the broadcast bytes.
+	assert.Equal(t, broadcast.hash, response["tx_hash"])
 	assert.Equal(t, "unknown", response["status"])
 }
 
@@ -196,7 +222,7 @@ func TestDashboardNonScopeProposalKeepsLegacyAdminOuterBeforeAppV20(t *testing.T
 	h.handleDashboardGovPropose(resp, req)
 
 	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
-	parsed := <-captured
+	parsed := (<-captured).parsed
 	assert.Equal(t, operatorKey.Public().(ed25519.PublicKey), ed25519.PublicKey(parsed.PublicKey))
 	assert.Equal(t, operatorKey.Public().(ed25519.PublicKey), ed25519.PublicKey(parsed.AgentPubKey))
 	assert.Empty(t, parsed.AgentRequest, "pre-app-v20 direct same-key governance remains wire compatible")
@@ -215,7 +241,8 @@ func TestDashboardVoteUsesValidatorOuterAndOperatorProofPostV20(t *testing.T) {
 	h.handleDashboardGovVote(resp, req)
 
 	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
-	parsed := <-captured
+	broadcast := <-captured
+	parsed := broadcast.parsed
 	assert.Equal(t, validatorKey.Public().(ed25519.PublicKey), ed25519.PublicKey(parsed.PublicKey))
 	assert.Equal(t, operatorKey.Public().(ed25519.PublicKey), ed25519.PublicKey(parsed.AgentPubKey))
 	proofBody := requireDashboardGovernanceProofBody(t, parsed, http.MethodPost, "/v1/dashboard/governance/vote")
@@ -225,7 +252,8 @@ func TestDashboardVoteUsesValidatorOuterAndOperatorProofPostV20(t *testing.T) {
 
 	var response map[string]string
 	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &response))
-	assert.Equal(t, "TXHASH", response["tx_hash"])
+	// Canonical bound hash, not the remote string: see the propose test above.
+	assert.Equal(t, broadcast.hash, response["tx_hash"])
 	assert.Equal(t, "recorded", response["status"])
 }
 

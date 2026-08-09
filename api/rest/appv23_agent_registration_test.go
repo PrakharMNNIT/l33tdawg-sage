@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -42,7 +41,7 @@ func TestAppV23AgentRegisterReturnsCommittedPendingPolicy(t *testing.T) {
 			parsed.AgentRegister.P2PAddress, 7,
 			store.DefaultSelfRegisteredAgentCapabilities,
 		))
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"REGISTER","height":"7"}}`)
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 7)
 	}))
 	defer rpc.Close()
 	srv.cometbftRPC = rpc.URL
@@ -101,7 +100,7 @@ func TestAppV23RejectedPendingAgentSignedRetryReentersReview(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, parsed.AgentRegister)
 		require.Equal(t, retryingID, parsed.AgentRegister.AgentID)
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"RETRY","height":"3"}}`)
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 3)
 	}))
 	defer rpc.Close()
 	srv.cometbftRPC = rpc.URL

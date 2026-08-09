@@ -320,33 +320,6 @@ type MemoryDetailResponse struct {
 	LinkedMemories          []memory.MemoryLink     `json:"linked_memories,omitempty"`
 }
 
-// CometBFT broadcast_tx_commit response structure.
-// Unlike broadcast_tx_sync, this waits for the block to be finalized,
-// ensuring ABCI Commit has flushed writes before we return.
-type cometCommitResponse struct {
-	Result struct {
-		CheckTx struct {
-			Code int    `json:"code"`
-			Log  string `json:"log"`
-		} `json:"check_tx"`
-		TxResult struct {
-			Code int    `json:"code"`
-			Data string `json:"data"`
-			Log  string `json:"log"`
-		} `json:"tx_result"`
-		Hash   string `json:"hash"`
-		Height int64  `json:"height,string"`
-	} `json:"result"`
-	Error *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		// Data carries the actionable detail for mempool rejections —
-		// CometBFT returns message="Internal error" with the real cause
-		// ("mempool is full: number of txs N (max: M)") in error.data.
-		Data string `json:"data"`
-	} `json:"error"`
-}
-
 // --- Domain Access Enforcement -----------------------------------------------
 
 // checkDomainAccess verifies an agent has the required access level for a domain.
@@ -1248,9 +1221,7 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	submitTx := &tx.ParsedTx{
-		Type:      tx.TxTypeMemorySubmit,
-		Nonce:     tx.MonotonicNonce(s.signingKey),
-		Timestamp: time.Now(),
+		Type: tx.TxTypeMemorySubmit,
 		MemorySubmit: &tx.MemorySubmit{
 			MemoryID:        memoryID,
 			ContentHash:     contentHash[:],
@@ -1305,20 +1276,6 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 	// Embed agent's cryptographic proof for on-chain identity verification.
 	s.embedAgentAuth(r.Context(), submitTx)
 
-	// Sign the transaction with the node's signing key.
-	if err = s.signTx(submitTx); err != nil {
-		s.logger.Error().Err(err).Msg("failed to sign submit tx")
-		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
-		return
-	}
-
-	encoded, err := tx.EncodeTx(submitTx)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to encode submit tx")
-		writeProblem(w, http.StatusInternalServerError, "Encoding error", "Failed to encode transaction.")
-		return
-	}
-
 	// Stage supplementary off-chain data (embedding vector, provider, triples)
 	// in the process-local cache. The ABCI app reads this during FinalizeBlock
 	// and includes it in the pending write that Commit flushes to the store.
@@ -1354,8 +1311,23 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 	// Broadcast via CometBFT RPC and wait for block finalization.
 	// broadcast_tx_commit blocks until the block containing this tx is committed,
 	// meaning ABCI Commit has already flushed the memory to the offchain store.
-	txHash, committedHeight, err := s.broadcastTxCommitWithHeight(encoded)
+	var txHash string
+	var committedHeight int64
+	// A memory submit deliberately survives client disconnect through commit and
+	// post-commit tag finalisation (see TestSubmitMemory_TagCtxSurvivesClientDisconnect).
+	// Keep nonce-lease ownership on that same detached lifecycle; using
+	// r.Context() here would turn an already-authorized durable write into a 503
+	// before it reaches the historical background commit path.
+	stage, err := s.submitConsensusTx(context.Background(), submitTx, func(encoded []byte) error {
+		var submitErr error
+		txHash, committedHeight, submitErr = s.broadcastTxCommitWithHeight(encoded)
+		return submitErr
+	})
 	if err != nil {
+		if stage != consensusTxSubmit {
+			s.writeConsensusTxError(w, stage, "submit", err)
+			return
+		}
 		s.logger.Error().Err(err).Msg("failed to broadcast submit tx")
 		if req.IdempotencyKey != "" && s.isPostV23ForNextTx() &&
 			s.writeTaskIdempotencyReplayIfCommitted(
@@ -3361,46 +3333,19 @@ func (s *Server) broadcastTxCommitWithHeight(txBytes []byte) (string, int64, err
 // has rolled back local state. Ordinary REST handlers retain the historical
 // background+timeout behavior through broadcastTxCommitWithHeight.
 func (s *Server) broadcastTxCommitWithHeightContext(parent context.Context, txBytes []byte) (string, int64, error) {
-	txHex := hex.EncodeToString(txBytes)
-	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", s.cometbftRPC, txHex)
-
 	ctx, cancel := context.WithTimeout(parent, broadcastTxCommitTimeout())
 	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G107 -- internal CometBFT RPC
+	result, err := tx.BroadcastCometCommit(ctx, s.cometbftRPC, s.signingKey, txBytes)
 	if err != nil {
-		return "", 0, fmt.Errorf("create broadcast request: %w", err)
+		return "", 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", 0, fmt.Errorf("broadcast tx commit: %w", err)
+	if result.CheckTxCode != 0 {
+		return "", 0, fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.CheckTxCode, result.CheckTxLog)
 	}
-	defer resp.Body.Close()
-
-	var result cometCommitResponse
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", 0, fmt.Errorf("decode broadcast commit response: %w", err)
+	if result.TxResultCode != 0 {
+		return "", 0, fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.TxResultCode, result.TxResultLog)
 	}
-
-	if result.Error != nil {
-		if result.Error.Data != "" {
-			// error.data carries the real cause for mempool rejections
-			// (message is just "Internal error") — fold it in so
-			// broadcastErrorPublic can classify the failure.
-			return "", 0, fmt.Errorf("broadcast error: %s: %s", result.Error.Message, result.Error.Data)
-		}
-		return "", 0, fmt.Errorf("broadcast error: %s", result.Error.Message)
-	}
-
-	if result.Result.CheckTx.Code != 0 {
-		return "", 0, fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.Result.CheckTx.Code, result.Result.CheckTx.Log)
-	}
-
-	if result.Result.TxResult.Code != 0 {
-		return "", 0, fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.Result.TxResult.Code, result.Result.TxResult.Log)
-	}
-
-	return result.Result.Hash, result.Result.Height, nil
+	return result.Hash, result.Height, nil
 }
 
 // broadcastErrorPublic returns the HTTP status and a sanitized public

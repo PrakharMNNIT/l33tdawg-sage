@@ -99,6 +99,15 @@ func scopedProjectionReadinessStatus(records int, vaultLocked bool) metrics.Scop
 
 var errCoordinatedRestart = errors.New("coordinated restart requested")
 
+// signingIdleDrainBudget bounds how long a coordinated restart waits for
+// in-flight signing to finish before it re-evaluates the signer-fence veto.
+// The worst honest case is a background producer two commit-timeouts deep
+// (web's background signing budget, 2×60s by default); three minutes covers
+// that with headroom. Exceeding it does NOT proceed — a submission still in
+// flight after this long is exactly the kind whose fate ends up unobserved, so
+// the restart is abandoned (fail closed) and the updater must ask again.
+const signingIdleDrainBudget = 3 * time.Minute
+
 type preparedRestartRequest struct {
 	release      func()
 	commit       func()
@@ -115,6 +124,13 @@ type runningBinaryPreserver interface {
 }
 
 func prepareAndQueueRestart(ctx context.Context, scheduler snapshotDrainPreparer, requests chan<- preparedRestartRequest, release func()) error {
+	// Checked FIRST, before anything reversible is prepared: a restart that is
+	// going to be refused should not have quiesced the snapshot scheduler or
+	// pinned a recovery binary on the way to being refused. See
+	// signer_fence_restart.go for why a held signer fence vetoes a restart.
+	if err := checkSignerFenceRestartVeto(signerFenceVeto); err != nil {
+		return err
+	}
 	if scheduler == nil {
 		return fmt.Errorf("snapshot scheduler is unavailable")
 	}
@@ -1137,6 +1153,16 @@ func runServe(startupProof string) (rerr error) {
 	// CometBFT RPC URL for tx broadcast — derived from the RPC listen address.
 	cometRPC := cmtRPCClientURL()
 
+	// Process-wide fallback for the signer fence (internal/tx/nonce_fence.go).
+	// A fence raised with no way to reconcile can NEVER be proven, and there is
+	// no safe way out of that state — restarting discards the fence rather than
+	// resolving it, which is how the transaction gets lost. So every adopter that
+	// submits through a nonce lease must have a resolver even when it does not
+	// pass one at the call site. Wiring it here, from the same RPC URL the
+	// broadcasters use, makes an unreconcilable fence unreachable rather than
+	// merely unlikely.
+	tx.SetTxResolverFunc(tx.CometTxResolver(cometRPC))
+
 	// Backfill on_chain_height and first_seen for agents already registered on-chain
 	// but missing these fields in SQLite (upgrade path from v3.5 → v3.7.6+)
 	signingKeyForMigrate := loadNodeSigningKey(cometCfg.PrivValidatorKeyFile(), logger)
@@ -1321,6 +1347,14 @@ func runServe(startupProof string) (rerr error) {
 		return snapshotScheduler.PrepareQuiesce(prepareCtx)
 	}
 	dashboard.RequestRestartPrepared = func(release, commit, abort func()) error {
+		// The UPDATER's path, and therefore the one that matters most: an
+		// automatic version transition is the likeliest restart to happen while
+		// a signing key is fenced, and the only one this node schedules for
+		// itself. The caller still owns the prepared drain on this error and
+		// aborts it. See signer_fence_restart.go.
+		if err := checkSignerFenceRestartVeto(signerFenceVeto); err != nil {
+			return err
+		}
 		if commit == nil || abort == nil {
 			return fmt.Errorf("prepared restart ownership is incomplete")
 		}
@@ -2350,16 +2384,47 @@ func runServe(startupProof string) (rerr error) {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	restarting := false
 	if startupErr == nil {
-		select {
-		case sig := <-quit:
-			logger.Info().Str("signal", sig.String()).Msg("shutting down")
-		case preparedRestart = <-restartRequested:
-			restartFenceRelease = preparedRestart.release
-			preparedRestart.commit()
-			restarting = true
-			logger.Info().Msg("coordinated restart requested — draining node")
-		case serveErr := <-serveErrors:
-			startupErr = serveErr
+	waitForShutdown:
+		for {
+			select {
+			case sig := <-quit:
+				logger.Info().Str("signal", sig.String()).Msg("shutting down")
+				break waitForShutdown
+			case preparedRestart = <-restartRequested:
+				// THE ORDER INSIDE commitRestartAfterSigningDrain CLOSES A
+				// TOCTOU HOLE a cross-review caught. The veto in
+				// prepareAndQueueRestart / RequestRestartPrepared runs at
+				// REQUEST time; a fence raised after it — by a submission that
+				// was in flight when the drain began and was severed by the
+				// HTTP force-close — would be discarded by the exec, which is
+				// the exact loss the veto exists to prevent, manufactured by
+				// the drain itself. So while the restart can still be abandoned
+				// and the node can still serve, the helper quiesces signing,
+				// waits for the in-flight population to reach zero (only then
+				// can the fence map no longer grow), and re-checks the veto.
+				// Failing any step ABANDONS the restart and resumes signing:
+				// fail closed, keep serving, let reconciliation resolve the
+				// fence, and let the updater ask again later. On success,
+				// signing STAYS quiesced — a transaction signed into the
+				// teardown is the likeliest one in this process's life to end
+				// with an outcome nobody observes, and an unobserved outcome at
+				// exactly this moment is the one the in-process fence cannot
+				// carry across the exec. See the helper's doc for the abandon
+				// ordering, which is load-bearing.
+				if vetoErr := commitRestartAfterSigningDrain(&preparedRestart, signerFenceVeto, signingIdleDrainBudget); vetoErr != nil {
+					logger.Error().Err(vetoErr).Msg("coordinated restart abandoned — signing was not provably " +
+						"safe to interrupt; the node keeps serving so reconciliation can resolve the " +
+						"outstanding submission, and the updater may request the restart again")
+					continue
+				}
+				restartFenceRelease = preparedRestart.release
+				restarting = true
+				logger.Info().Msg("coordinated restart requested — draining node")
+				break waitForShutdown
+			case serveErr := <-serveErrors:
+				startupErr = serveErr
+				break waitForShutdown
+			}
 		}
 	}
 	signal.Stop(quit)
@@ -2434,6 +2499,12 @@ func runServe(startupProof string) (rerr error) {
 	// restart. All HTTP handlers have now returned, so the channel is stable:
 	// adopt that request before teardown. Release duplicate fenced requests.
 	adoptQueuedRestartRequests(restartRequested, &preparedRestart, &restarting)
+	if restarting {
+		// Same reason as the select above, for the restart that arrived while a
+		// signal or serve error was winning the race. Idempotent by design, so
+		// the two call sites do not have to coordinate.
+		tx.QuiesceSigningForRestart()
+	}
 	if restartFenceRelease == nil && preparedRestart.release != nil {
 		restartFenceRelease = preparedRestart.release
 	}
@@ -2443,6 +2514,47 @@ func runServe(startupProof string) (rerr error) {
 	// With every HTTP admission point closed and active handler gone, no new
 	// dashboard job can Add to the worker group while it is being joined.
 	stopWorkers()
+	if restarting {
+		// LAST-RESORT TRIPWIRE, not the primary guard. The select above already
+		// quiesced signing, waited for in-flight submissions and re-checked the
+		// veto before committing to this drain, so no fence should be able to
+		// appear between there and here. But a restart can also be ADOPTED after
+		// the drain (adoptQueuedRestartRequests above, when a signal or serve
+		// error won the first select), and that path never ran the ordered
+		// re-check. Every producer is drained now, so fence state is final: a
+		// held fence here fails the shutdown gate. Be precise about what that
+		// buys, because an earlier wording of this comment claimed more: the
+		// shutdownErrs entry makes the failure LOUD (the veto reason naming the
+		// fenced key and transaction lands in the log and the joined error) and
+		// routes a version transition into the final-gate machinery — roll back
+		// the pending update, or exec the verified pre-drain binary — so the
+		// VERSION CHANGE is abandoned. It does NOT preserve the fence: whichever
+		// binary starts next, restored-previous or pinned pre-drain fallback,
+		// the in-memory fence is lost in the exec and the fresh process seeds
+		// from the committed floor past the possibly-in-flight transaction
+		// exactly as the new binary would have (and a plain restart's error
+		// return exits and loses it the same way). The cross-restart residual
+		// documented in nonce_fence.go applies to this path in full; the only
+		// guard that actually preserves a fence is the pre-drain re-check in
+		// the select above, which is why that one may never be weakened as
+		// "redundant with the tripwire".
+		if vetoErr := checkSignerFenceRestartVeto(signerFenceVeto); vetoErr != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("post-drain signer-fence gate: %w", vetoErr))
+		}
+	}
+	// Terminal fence record, on EVERY exit path. Every producer is drained, so
+	// fence state is final: anything still held is about to be discarded by this
+	// exit — a signal or serve error simply ends the process (the veto correctly
+	// cannot apply to a shutdown the operator ordered), and a failed restart
+	// gate still execs or exits as described above. Without this line the last
+	// trace of a dropped fence is a fence_held report up to a full interval old,
+	// and the eventual Code 4 loss has no traceable cause in the log. Emitting
+	// the record changes nothing about the exit.
+	shutdownFenceReason := "process exit (signal or serve error)"
+	if restarting {
+		shutdownFenceReason = "coordinated restart shutdown gate"
+	}
+	tx.ReportFencesDroppedAtShutdown(shutdownFenceReason)
 	// Snapshot workers hold the live Badger handle. Cancel cadence work and
 	// give its context-aware backup stream a short bounded drain before any
 	// shutdown path closes the store underneath it.

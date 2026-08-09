@@ -53,15 +53,18 @@ func captureServer(t *testing.T, cap *capturedTxs) *httptest.Server {
 			return
 		}
 		cap.add(parsed)
-		_, _ = w.Write([]byte(`{"result":{"code":0}}`))
+		hash := tx.CometTxHash(raw)
+		_, _ = w.Write([]byte(`{"result":{"code":0,"hash":"` + strings.ToUpper(hex.EncodeToString(hash[:])) + `"}}`))
 	}))
 }
 
 func unavailableAdmissionServer(requests *atomic.Int64) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
+		raw, _ := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+		hash := tx.CometTxHash(raw)
 		_, _ = w.Write([]byte(
-			`{"result":{"code":112,"log":"transaction admission is unavailable until the local encrypted vault is unlocked"}}`,
+			`{"result":{"code":112,"hash":"` + strings.ToUpper(hex.EncodeToString(hash[:])) + `","log":"transaction admission is unavailable until the local encrypted vault is unlocked"}}`,
 		))
 	}))
 }

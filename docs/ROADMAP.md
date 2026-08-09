@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.2 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.3 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -14,13 +14,29 @@ retaining a compatibility fallback for clients that skip initialization. It
 also corrects the exceptional app-v21 → app-v22 recovery lane so proven
 skip-ahead transitions remain virtual, evidence-bound history rather than
 synthetic applied-upgrade records. Existing app-v22 through app-v26 chains are
-not rewritten. The supported consensus ceiling remains app-v26; **v11.18.2
-does not introduce app-v27**.
+not rewritten. v11.18.3 adds the process-wide signer fence described below.
+The supported consensus ceiling remains app-v26; **v11.18.3 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.3 patch
+
+v11.18.3 closes same-key nonce inversion inside a running daemon. Dashboard,
+REST, federation, voter, and upgrade-watchdog producers share one per-key lease;
+once exact bytes reach CometBFT, any unproven outcome fences that key until
+reconciliation proves the same transaction committed or permanently refused.
+All daemon non-web adopters use the same strict, bounded, single-document Comet
+decoder with exact-hash binding and an explicit positive height for success.
+Live update status recomputes restart advice from the current fence state, and
+coordinated restart remains vetoed while a key is fenced.
+
+The fence is deliberately process-local. A crash, power loss, restart, or a
+standalone CLI process sharing the daemon's key remains outside the guarantee
+until durable pre-broadcast intent lands. The consensus ceiling remains
+app-v26; there is no app-v27.
 
 ## v11.18.2 patch
 

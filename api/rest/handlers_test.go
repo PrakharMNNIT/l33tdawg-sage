@@ -497,6 +497,45 @@ func newTestServer(t *testing.T, cometbftURL string) (*Server, *mockMemoryStore,
 	return srv, memStore, scoreStore
 }
 
+// writeCometCommitFixture emits the same complete, hash-bound envelope a real
+// CometBFT /broadcast_tx_commit response carries. Happy-path fixtures call this
+// explicitly; adversarial fixtures write their malformed response directly so
+// no shared test layer can silently repair the condition they intend to test.
+func writeCometCommitFixture(
+	t *testing.T,
+	w http.ResponseWriter,
+	r *http.Request,
+	checkCode uint32,
+	checkLog string,
+	txCode uint32,
+	txLog string,
+	height int64,
+) {
+	t.Helper()
+	raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+	if err != nil {
+		t.Errorf("decode fixture transaction: %v", err)
+		http.Error(w, "invalid fixture transaction", http.StatusBadRequest)
+		return
+	}
+	sum := tx.CometTxHash(raw)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"result": map[string]any{
+			"check_tx":  map[string]any{"code": checkCode, "log": checkLog},
+			"tx_result": map[string]any{"code": txCode, "log": txLog},
+			"hash":      strings.ToUpper(hex.EncodeToString(sum[:])),
+			"height":    strconv.FormatInt(height, 10),
+		},
+	})
+}
+
+func assertStrictTxHash(t *testing.T, got string) {
+	t.Helper()
+	require.Len(t, got, 64)
+	_, err := hex.DecodeString(got)
+	require.NoError(t, err)
+}
+
 type capturingSuppCache struct {
 	memoryID string
 	data     *memory.SupplementaryData
@@ -581,15 +620,7 @@ func TestReadyEndpoint(t *testing.T) {
 func TestSubmitMemory(t *testing.T) {
 	// Set up a fake CometBFT RPC server that returns broadcast_tx_commit format.
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx":  map[string]interface{}{"code": 0, "log": ""},
-				"tx_result": map[string]interface{}{"code": 0, "data": "", "log": "memory submitted"},
-				"hash":      "ABCDEF1234567890",
-				"height":    "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "memory submitted", 1)
 	}))
 	defer cometMock.Close()
 
@@ -612,7 +643,7 @@ func TestSubmitMemory(t *testing.T) {
 	err := json.Unmarshal(rr.Body.Bytes(), &resp)
 	require.NoError(t, err)
 	assert.NotEmpty(t, resp.MemoryID)
-	assert.Equal(t, "ABCDEF1234567890", resp.TxHash)
+	assertStrictTxHash(t, resp.TxHash)
 	assert.Equal(t, "proposed", resp.Status)
 
 	// Note: memory is no longer stored directly by the REST handler.
@@ -655,11 +686,8 @@ func TestSubmitTaskIdempotencyKeyRequiresAppV23(t *testing.T) {
 }
 
 func TestSubmitMemory_RegeneratesVectorFromActiveProvider(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{
-			"check_tx": map[string]any{"code": 0}, "tx_result": map[string]any{"code": 0},
-			"hash": "ACTIVEVECTOR", "height": "1",
-		}})
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -680,11 +708,8 @@ func TestSubmitMemory_RegeneratesVectorFromActiveProvider(t *testing.T) {
 }
 
 func TestSubmitMemory_DropsClientVectorWhenActiveProviderFails(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{
-			"check_tx": map[string]any{"code": 0}, "tx_result": map[string]any{"code": 0},
-			"hash": "QUEUEDREPAIR", "height": "1",
-		}})
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -704,11 +729,8 @@ func TestSubmitMemory_DropsClientVectorWhenActiveProviderFails(t *testing.T) {
 }
 
 func TestSubmitAgentTaskStagesCreatingAgentAsAssignee(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{
-			"check_tx": map[string]any{"code": 0}, "tx_result": map[string]any{"code": 0},
-			"hash": "TASKHASH", "height": "1",
-		}})
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -728,15 +750,7 @@ func TestSubmitMemory_AttachesTagsAfterCommit(t *testing.T) {
 	// Tags are attached post-commit via store.SetTags — the REST handler
 	// should forward them unchanged after the tx is broadcast.
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx":  map[string]interface{}{"code": 0},
-				"tx_result": map[string]interface{}{"code": 0},
-				"hash":      "TAGGEDTX",
-				"height":    "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -775,10 +789,7 @@ func TestSubmitMemory_AppV20CarriesCanonicalTagsInSignedTransaction(t *testing.T
 			capturedURI = r.RequestURI
 			captured = strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]any{
-			"check_tx": map[string]any{"code": 0}, "tx_result": map[string]any{"code": 0},
-			"hash": "V20TAGS", "height": "2",
-		}})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 2)
 	}))
 	defer cometMock.Close()
 
@@ -824,15 +835,7 @@ func TestSubmitMemory_NoTags_SkipsSetTags(t *testing.T) {
 	// When the client submits without a tags field, the handler must not
 	// call SetTags at all (would clear any existing tags otherwise).
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx":  map[string]interface{}{"code": 0},
-				"tx_result": map[string]interface{}{"code": 0},
-				"hash":      "NOTAGS",
-				"height":    "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -857,15 +860,7 @@ func TestSubmitMemory_NoTags_SkipsSetTags(t *testing.T) {
 // re-proposed as a duplicate instead.
 func TestSubmitMemory_TagCtxSurvivesClientDisconnect(t *testing.T) {
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx":  map[string]interface{}{"code": 0},
-				"tx_result": map[string]interface{}{"code": 0},
-				"hash":      "DROPPEDCLIENT",
-				"height":    "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -1270,14 +1265,7 @@ func TestGetMemory_NotFound(t *testing.T) {
 
 func TestVoteMemory(t *testing.T) {
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"code": 0,
-				"hash": "VOTEHASH123",
-				"log":  "",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -1306,7 +1294,7 @@ func TestVoteMemory(t *testing.T) {
 	var resp VoteResponse
 	err := json.Unmarshal(rr.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "VOTEHASH123", resp.TxHash)
+	assertStrictTxHash(t, resp.TxHash)
 }
 
 func TestVoteMemory_InvalidDecision(t *testing.T) {
@@ -1332,10 +1320,7 @@ func TestForgetMemory_Success(t *testing.T) {
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedTxHex = r.URL.Query().Get("tx")
 		memStore.memories["target"].Status = memory.StatusDeprecated
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{"code": 0, "hash": "FORGETHASH", "log": ""},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -1357,7 +1342,7 @@ func TestForgetMemory_Success(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code, "body=%s", rr.Body.String())
 	var resp ForgetResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
-	assert.Equal(t, "FORGETHASH", resp.TxHash)
+	assertStrictTxHash(t, resp.TxHash)
 	assert.Equal(t, string(memory.StatusDeprecated), resp.Status)
 	assert.NotEmpty(t, capturedTxHex, "broadcast should have been invoked")
 }
@@ -1368,13 +1353,10 @@ func TestForgetMemory_StatusComesFromCanonicalState(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, bs.CloseBadger()) })
 	require.NoError(t, bs.SetMemoryHash("target", []byte("content-hash"), string(memory.StatusCommitted)))
 
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Simulate the consensus commit while deliberately leaving SQL stale.
 		require.NoError(t, bs.SetMemoryHash("target", nil, string(memory.StatusDeprecated)))
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{"code": 0, "hash": "CANONICALHASH", "log": ""},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -1400,10 +1382,7 @@ func TestForgetMemory_DefaultReasonWhenOmitted(t *testing.T) {
 	// The endpoint accepts an empty body and substitutes a default reason —
 	// unlike challenge which requires a non-empty reason.
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{"code": 0, "hash": "FORGETHASH2"},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -1434,10 +1413,7 @@ func TestReinstateMemory_SuccessBuildsAppV17Tx(t *testing.T) {
 	var capturedTxHex string
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedTxHex = strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{"code": 0, "hash": "REINSTATEHASH", "log": ""},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 
@@ -1455,7 +1431,7 @@ func TestReinstateMemory_SuccessBuildsAppV17Tx(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code, "body=%s", rr.Body.String())
 	var resp ReinstateResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
-	assert.Equal(t, "REINSTATEHASH", resp.TxHash)
+	assertStrictTxHash(t, resp.TxHash)
 	assert.Equal(t, "committed", resp.Status)
 
 	raw, err := hex.DecodeString(capturedTxHex)
@@ -2078,10 +2054,7 @@ func TestAgentRegister_Reconcile_SQLiteNameDiffersFromOnChain(t *testing.T) {
 	var broadcastCalled bool
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		broadcastCalled = true
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{"code": 0, "hash": "RECONCILE_TX"},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 

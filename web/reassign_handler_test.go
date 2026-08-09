@@ -41,7 +41,10 @@ func newGrantRPC(t *testing.T, captured **tx.ParsedTx, calls *atomic.Int32) *htt
 		*captured, err = tx.DecodeTx(encoded)
 		require.NoError(t, err)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ABC123","height":"42"}}`)
+		// Bound hash: the broadcast path refuses a success envelope whose hash
+		// is not sha256 of the exact bytes it sent (the stale-proxy shape), so
+		// the stub must answer like a real node.
+		writeCommitOK(w, r)
 	}))
 }
 
@@ -66,7 +69,7 @@ func TestGrantAs_UnownedDomainUsesGenesisAdmin(t *testing.T) {
 	}
 	events := h.SSE.Subscribe()
 	defer h.SSE.Unsubscribe(events)
-	result := h.grantAs("new-research", "agent-b", 1, nil)
+	result := h.grantAs("new-research", "agent-b", 1, nil, nil)
 
 	require.True(t, result.OK, result.Error)
 	assert.Equal(t, int32(1), calls.Load())
@@ -79,13 +82,15 @@ func TestGrantAs_UnownedDomainUsesGenesisAdmin(t *testing.T) {
 	assert.Equal(t, "agent-b", captured.AccessGrant.GranteeID)
 	assert.Equal(t, "new-research", captured.AccessGrant.Domain)
 	assert.Equal(t, uint8(1), captured.AccessGrant.Level)
-	assert.Equal(t, "ABC123", result.TxHash)
+	// The reported hash is the broadcast path's canonical rendering of the
+	// proven hash — 64 uppercase hex — not whatever string a server chose.
+	assert.Regexp(t, "^[0-9A-F]{64}$", result.TxHash)
 	assert.Equal(t, int64(42), result.Height)
 	select {
 	case event := <-events:
 		assert.Contains(t, string(event), "event: access")
 		assert.Contains(t, string(event), `"action":"access_granted"`)
-		assert.Contains(t, string(event), `"tx_hash":"ABC123"`)
+		assert.Contains(t, string(event), `"tx_hash":"`+result.TxHash+`"`)
 	case <-time.After(time.Second):
 		t.Fatal("committed access grant did not emit Chain Activity event")
 	}
@@ -110,7 +115,7 @@ func TestGrantAs_ChildDomainUsesOwningAncestorForModifyLevel(t *testing.T) {
 			return ownerKey, id == ownerID
 		},
 	}
-	result := h.grantAs("research.eurorack", "agent-b", 3, nil)
+	result := h.grantAs("research.eurorack", "agent-b", 3, nil, nil)
 
 	require.True(t, result.OK, result.Error)
 	assert.Equal(t, int32(1), calls.Load())
@@ -126,7 +131,7 @@ func TestGrantAs_SharedDomainNeedsNoOwnerTransaction(t *testing.T) {
 	var calls atomic.Int32
 	h := &DashboardHandler{BadgerStore: bs, CometBFTRPC: "http://unused.invalid"}
 
-	result := h.grantAs("general", "agent-b", 1, nil)
+	result := h.grantAs("general", "agent-b", 1, nil, nil)
 
 	assert.True(t, result.OK)
 	assert.Equal(t, "shared", result.Action)
@@ -138,7 +143,7 @@ func TestGrantAs_SharedDomainRejectsFakeModifySuccess(t *testing.T) {
 	h := &DashboardHandler{BadgerStore: bs, CometBFTRPC: "http://unused.invalid"}
 
 	for _, domain := range []string{"general", "sage-project"} {
-		result := h.grantAs(domain, "agent-b", 3, nil)
+		result := h.grantAs(domain, "agent-b", 3, nil, nil)
 		assert.False(t, result.OK, domain)
 		assert.Equal(t, "shared_modify_unsupported", result.Code, domain)
 		assert.Equal(t, 3, result.Level, domain)
@@ -148,7 +153,7 @@ func TestGrantAs_SharedDomainRejectsFakeModifySuccess(t *testing.T) {
 func TestGrantAs_UnownedDomainWithoutAdminKeyIsActionable(t *testing.T) {
 	h := &DashboardHandler{BadgerStore: newGrantTestBadger(t), CometBFTRPC: "http://unused.invalid"}
 
-	result := h.grantAs("new-research", "agent-b", 1, nil)
+	result := h.grantAs("new-research", "agent-b", 1, nil, nil)
 
 	assert.False(t, result.OK)
 	assert.Equal(t, "admin_key_unavailable", result.Code)
@@ -182,13 +187,13 @@ func TestGrantAs_AdminOverrideLocalAgentPreservesOriginalOwner(t *testing.T) {
 		},
 	}
 
-	preflight := h.grantAs("research.dmt", targetID, 2, nil)
+	preflight := h.grantAs("research.dmt", targetID, 2, nil, nil)
 	assert.False(t, preflight.OK)
 	assert.Equal(t, originalOwner, preflight.OwnerID)
 	assert.True(t, preflight.OverrideAvailable)
 
 	override := &adminOverrideExpectation{Domain: "research.dmt", OwnerID: originalOwner, OwnedDomain: "research.dmt", Level: 2}
-	result := h.grantAs("research.dmt", targetID, 2, override)
+	result := h.grantAs("research.dmt", targetID, 2, override, nil)
 	require.True(t, result.OK, result.Error)
 	assert.Equal(t, originalOwner, result.OwnerID)
 	require.NotNil(t, captured)
@@ -228,7 +233,7 @@ func TestGrantAs_AdminOverrideRejectsStaleOwnerConfirmation(t *testing.T) {
 	}
 
 	expected := &adminOverrideExpectation{Domain: "research.stale", OwnerID: ownerA, OwnedDomain: "research.stale", Level: 2}
-	result := h.grantAs("research.stale", targetID, 2, expected)
+	result := h.grantAs("research.stale", targetID, 2, expected, nil)
 	assert.False(t, result.OK)
 	assert.Equal(t, "owner_changed", result.Code)
 	assert.Equal(t, ownerB, result.OwnerID)
@@ -425,11 +430,10 @@ func TestReassignDomainOwnershipPostAppV20AfterIdleRetriesAtCommittedChainTime(t
 		captured = append(captured, parsed)
 		broadcasts++
 		if broadcasts == 1 {
-			_, _ = fmt.Fprintf(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":109,"log":%q},"hash":"REJECTED","height":"42"}}`,
-				"agent proof rejected: "+governanceProofAheadOfConsensus)
+			writeCommitTxRejected(w, r, 109, "agent proof rejected: "+governanceProofAheadOfConsensus, 42)
 			return
 		}
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0,"log":"purged 1 grants"},"hash":"ABC123","height":"42"}}`)
+		writeCommitOKAt(w, r, 42, "purged 1 grants")
 	}))
 	t.Cleanup(rpc.Close)
 
@@ -524,7 +528,7 @@ func TestCancelActiveProposalPostAppV20UsesChainBoundOperatorProof(t *testing.T)
 		require.NoError(t, decodeErr)
 		captured, decodeErr = tx.DecodeTx(encoded)
 		require.NoError(t, decodeErr)
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ABC123","height":"43"}}`)
+		writeCommitOKAt(w, r, 43, "")
 	}))
 	t.Cleanup(rpc.Close)
 

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,7 +70,7 @@ func TestAppV23RotatedRootPassesRESTControlHandlersWithoutSyntheticMembership(t 
 		mu.Lock()
 		captured = append(captured, parsed)
 		mu.Unlock()
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"CONTROL","height":"3"}}`)
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 3)
 	}))
 	defer rpc.Close()
 	srv.cometbftRPC = rpc.URL

@@ -3,13 +3,11 @@ package rest
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/l33tdawg/sage/internal/tx"
 )
@@ -95,9 +93,7 @@ func (s *Server) handleDomainReassign(w http.ResponseWriter, r *http.Request) {
 	// layer to attest the submitter's role.
 
 	reassignTx := &tx.ParsedTx{
-		Type:      tx.TxTypeDomainReassign,
-		Nonce:     tx.MonotonicNonce(s.signingKey),
-		Timestamp: time.Now(),
+		Type: tx.TxTypeDomainReassign,
 		DomainReassign: &tx.DomainReassign{
 			Domain:          req.Domain,
 			NewOwnerID:      req.NewOwnerID,
@@ -110,25 +106,20 @@ func (s *Server) handleDomainReassign(w http.ResponseWriter, r *http.Request) {
 
 	s.embedAgentAuth(r.Context(), reassignTx)
 
-	err = s.signTx(reassignTx)
+	var txHash, txLog string
+	stage, err := s.submitConsensusTx(r.Context(), reassignTx, func(encoded []byte) error {
+		var submitErr error
+		txHash, txLog, submitErr = s.broadcastTxCommitWithLog(encoded)
+		return submitErr
+	})
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to sign domain reassign tx")
-		writeProblem(w, http.StatusInternalServerError, "Signing error", "Failed to sign transaction.")
-		return
-	}
-
-	encoded, err := tx.EncodeTx(reassignTx)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to encode domain reassign tx")
-		writeProblem(w, http.StatusInternalServerError, "Encoding error", "Failed to encode transaction.")
-		return
-	}
-
-	txHash, txLog, err := s.broadcastTxCommitWithLog(encoded)
-	if err != nil {
-		s.logger.Error().Err(err).Str("domain", req.Domain).Msg("failed to broadcast domain reassign tx")
-		status, publicMsg := domainReassignErrorPublic(err)
-		writeProblem(w, status, "Broadcast error", publicMsg)
+		if stage == consensusTxSubmit {
+			s.logger.Error().Err(err).Str("domain", req.Domain).Msg("failed to broadcast domain reassign tx")
+			status, publicMsg := domainReassignErrorPublic(err)
+			writeProblem(w, status, "Broadcast error", publicMsg)
+		} else {
+			s.writeConsensusTxError(w, stage, "domain reassign", err)
+		}
 		return
 	}
 
@@ -206,38 +197,17 @@ func domainReassignErrorPublic(err error) (int, string) {
 // surfaced on success. Domain reassign needs the success log to parse the
 // purged-grants count; reusing broadcastTxCommit would discard it.
 func (s *Server) broadcastTxCommitWithLog(txBytes []byte) (string, string, error) {
-	txHex := hex.EncodeToString(txBytes)
-	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", s.cometbftRPC, txHex)
-
 	ctx, cancel := context.WithTimeout(context.Background(), broadcastTxCommitTimeout())
 	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G107 -- internal CometBFT RPC
+	result, err := tx.BroadcastCometCommit(ctx, s.cometbftRPC, s.signingKey, txBytes)
 	if err != nil {
-		return "", "", fmt.Errorf("create broadcast request: %w", err)
+		return "", "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("broadcast tx commit: %w", err)
+	if result.CheckTxCode != 0 {
+		return "", "", fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.CheckTxCode, result.CheckTxLog)
 	}
-	defer resp.Body.Close()
-
-	var result cometCommitResponse
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", "", fmt.Errorf("decode broadcast commit response: %w", err)
+	if result.TxResultCode != 0 {
+		return "", "", fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.TxResultCode, result.TxResultLog)
 	}
-
-	if result.Error != nil {
-		return "", "", fmt.Errorf("broadcast error: %s", result.Error.Message)
-	}
-
-	if result.Result.CheckTx.Code != 0 {
-		return "", "", fmt.Errorf("tx rejected in CheckTx (code %d): %s", result.Result.CheckTx.Code, result.Result.CheckTx.Log)
-	}
-
-	if result.Result.TxResult.Code != 0 {
-		return "", "", fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", result.Result.TxResult.Code, result.Result.TxResult.Log)
-	}
-
-	return result.Result.Hash, result.Result.TxResult.Log, nil
+	return result.Hash, result.TxResultLog, nil
 }

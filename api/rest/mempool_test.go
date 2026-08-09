@@ -197,14 +197,7 @@ func TestSubmitMemorySetsMempoolPctHeader(t *testing.T) {
 			fmt.Fprint(w, `{"result":{"n_txs":"2100","total":"2100","total_bytes":"4096"}}`)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result": map[string]interface{}{
-				"check_tx":  map[string]interface{}{"code": 0, "log": ""},
-				"tx_result": map[string]interface{}{"code": 0, "data": "", "log": ""},
-				"hash":      "MEMPOOLPCT",
-				"height":    "1",
-			},
-		})
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 

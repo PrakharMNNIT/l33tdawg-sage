@@ -50,16 +50,19 @@ func TestAgentUpdatePartialBodyPreservesOmittedMetadata(t *testing.T) {
 				0,
 			))
 
+			var wantHash string
 			comet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
 				require.NoError(t, err)
+				sum := tx.CometTxHash(raw)
+				wantHash = strings.ToUpper(hex.EncodeToString(sum[:]))
 				parsed, err := tx.DecodeTx(raw)
 				require.NoError(t, err)
 				require.NotNil(t, parsed.AgentUpdateTx)
 				require.Equal(t, agentID, parsed.AgentUpdateTx.AgentID)
 				require.Equal(t, test.expectedName, parsed.AgentUpdateTx.Name)
 				require.Equal(t, test.expectedBootBio, parsed.AgentUpdateTx.BootBio)
-				_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"UPDATE","height":"2"}}`)
+				writeCometCommitFixture(t, w, r, 0, "", 0, "", 2)
 			}))
 			defer comet.Close()
 			srv.cometbftRPC = comet.URL
@@ -70,8 +73,8 @@ func TestAgentUpdatePartialBodyPreservesOmittedMetadata(t *testing.T) {
 
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			require.JSONEq(t, fmt.Sprintf(
-				`{"agent_id":%q,"name":%q,"status":"updated","tx_hash":"UPDATE"}`,
-				agentID, test.expectedName,
+				`{"agent_id":%q,"name":%q,"status":"updated","tx_hash":%q}`,
+				agentID, test.expectedName, wantHash,
 			), rec.Body.String())
 		})
 	}

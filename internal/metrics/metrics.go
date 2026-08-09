@@ -126,7 +126,71 @@ var (
 		Name: "sage_proposed_pending_count",
 		Help: "Number of memories currently in status='proposed'",
 	})
+
+	// The five series below publish the signer fence (internal/tx/nonce_fence.go).
+	// A fence refuses EVERY signing request for one key until that key's
+	// abandoned transaction is proven committed or proven refused, and nothing —
+	// no timer, no budget — reopens it. That is a deliberate trade of liveness
+	// for correctness, and it is only defensible while the hold is visible: an
+	// invisible fence is a mystery outage for one agent. These are the alarm.
+
+	// NonceFencesActive is the number of signing keys currently fenced. Any
+	// non-zero value means at least one key cannot sign. Steady state is 0.
+	NonceFencesActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "sage_nonce_fences_active",
+		Help: "Number of signing keys currently fenced awaiting proof of an indeterminate submission's fate",
+	})
+
+	// NonceFenceOldestAgeSeconds is how long the longest-held fence has stood.
+	// This is the field to alarm on: fences normally clear in seconds once
+	// reconciliation re-submits, so a value that climbs without bound means
+	// reconciliation cannot reach a verdict and an operator must intervene.
+	NonceFenceOldestAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "sage_nonce_fence_oldest_age_seconds",
+		Help: "Age in seconds of the longest-held signer fence (0 when no key is fenced)",
+	})
+
+	// NonceFenceIndeterminateTotal counts submissions whose outcome this process
+	// never observed — i.e. how often a fence was raised at all. Its rate is the
+	// health of the local CometBFT RPC path, independent of how fences resolve.
+	NonceFenceIndeterminateTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "sage_nonce_fence_indeterminate_total",
+		Help: "Total submissions with an unobserved outcome that fenced their signing key",
+	})
+
+	// NonceFenceReconcileFailuresTotal counts reconciliation attempts that
+	// produced no verdict, labelled by typed cause. The label values are
+	// internal/tx's fenceCause strings — timeout / canceled / transport /
+	// decode / rpc / pending / resolver_panic / no_resolver / no_encoded_tx —
+	// and "pending" is the most common in practice (the node answered but
+	// declined to be definitive). See docs/reference/concepts/
+	// signer-nonce-fence.md for the same list; dashboards must sum over these
+	// values, not a guessed subset. Never labelled with error text: an RPC
+	// error can carry the signed transaction, which must never reach a metric
+	// label.
+	NonceFenceReconcileFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sage_nonce_fence_reconcile_failures_total",
+		Help: "Reconciliation attempts that failed to prove a fenced transaction's fate, by typed cause",
+	}, []string{"cause"})
+
+	// NonceFenceResolvedTotal counts fences that lifted, by proven fate
+	// (committed/rejected). A fence lifts for no other reason, so the sum of
+	// this series against NonceFenceIndeterminateTotal is exactly the number of
+	// still-held fences.
+	NonceFenceResolvedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sage_nonce_fence_resolved_total",
+		Help: "Signer fences lifted, by the proven fate that lifted them",
+	}, []string{"fate"})
 )
+
+// SetNonceFenceGauges publishes the held-fence alarm pair in one shot: how many
+// signing keys are fenced and how long the oldest has been held. Called by
+// internal/tx whenever a fence is raised, lifted, or re-reported, so the gauges
+// track the map rather than a sampling interval.
+func SetNonceFenceGauges(active int, oldestAgeSeconds float64) {
+	NonceFencesActive.Set(float64(active))
+	NonceFenceOldestAgeSeconds.Set(oldestAgeSeconds)
+}
 
 // RecordTx records a transaction metric.
 func RecordTx(txType string, duration time.Duration, err error) {

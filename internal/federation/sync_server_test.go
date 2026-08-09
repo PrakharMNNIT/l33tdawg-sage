@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,10 +34,17 @@ type scriptedComet struct {
 	calls     atomic.Int32
 	responses []string
 	after     func()
+	mu        sync.Mutex
+	txHexes   []string
 }
 
 func (f *scriptedComet) handler() http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if txHex := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"); txHex != "" {
+			f.mu.Lock()
+			f.txHexes = append(f.txHexes, txHex)
+			f.mu.Unlock()
+		}
 		n := int(f.calls.Add(1)) - 1
 		if n >= len(f.responses) {
 			n = len(f.responses) - 1
@@ -43,8 +52,33 @@ func (f *scriptedComet) handler() http.HandlerFunc {
 		if f.after != nil {
 			f.after()
 		}
-		_, _ = w.Write([]byte(f.responses[n]))
+		body := []byte(f.responses[n])
+		var envelope map[string]any
+		if json.Unmarshal(body, &envelope) == nil {
+			if result, ok := envelope["result"].(map[string]any); ok {
+				raw, decErr := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+				if decErr == nil {
+					sum := tx.CometTxHash(raw)
+					result["hash"] = strings.ToUpper(hex.EncodeToString(sum[:]))
+					if _, exists := result["height"]; !exists {
+						result["height"] = "7"
+					}
+					body, _ = json.Marshal(envelope)
+				}
+			}
+		}
+		_, _ = w.Write(body)
 	}
+}
+
+func (f *scriptedComet) distinctTxHexCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	distinct := make(map[string]struct{}, len(f.txHexes))
+	for _, txHex := range f.txHexes {
+		distinct[txHex] = struct{}{}
+	}
+	return len(distinct)
 }
 
 const cometOK = `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"AB12","height":"7"}}`
@@ -667,6 +701,46 @@ func TestSyncPushNonceRaceRetriesOnce(t *testing.T) {
 	assert.EqualValues(t, 2, comet.calls.Load(), "one nonce retry with a fresh tx")
 }
 
+func TestSyncSubmitMalformedCometResponseFencesExactSigner(t *testing.T) {
+	comet := &scriptedComet{responses: []string{`{"result":`}}
+	m, _ := newSyncTestManager(t, comet)
+	item := syncItem("m-ambiguous", "hr", "fence ambiguous sync submission")
+
+	outcome, hash := m.broadcastSyncSubmit(syncMemoryID("chain-b", item.OriginMemoryID), &item)
+	assert.Equal(t, SyncOutcomeRetry, outcome)
+	assert.Empty(t, hash)
+
+	wantSigner := hex.EncodeToString(m.agentPub)
+	for _, held := range tx.FencedSigners() {
+		if held.SignerPubKeyHex == wantSigner {
+			require.NotEmpty(t, held.TxHash)
+			return
+		}
+	}
+	t.Fatalf("malformed on-wire response released signer %s instead of fencing it", wantSigner)
+}
+
+func TestSyncSubmitRPCErrorKeywordsFenceWithoutRetry(t *testing.T) {
+	comet := &scriptedComet{responses: []string{`{"error":{"code":-32603,"message":"nonce too low; already reached terminal status; no write access to domain"}}`}}
+	m, _ := newSyncTestManager(t, comet)
+	item := syncItem("m-rpc-keywords", "hr", "unbound RPC text is never a verdict")
+
+	outcome, hash := m.broadcastSyncSubmit(syncMemoryID("chain-b", item.OriginMemoryID), &item)
+	assert.Equal(t, SyncOutcomeRetry, outcome)
+	assert.Empty(t, hash)
+	assert.Equal(t, 1, comet.distinctTxHexCount(),
+		"unbound error text must not trigger a freshly signed in-lease retry")
+
+	wantSigner := hex.EncodeToString(m.agentPub)
+	for _, held := range tx.FencedSigners() {
+		if held.SignerPubKeyHex == wantSigner {
+			require.NotEmpty(t, held.TxHash)
+			return
+		}
+	}
+	t.Fatalf("keyword-bearing RPC error released signer %s instead of fencing it", wantSigner)
+}
+
 // TestT2fWriteNeverWidens is T2(f): the WRITE-never-widens end-to-end invariant
 // (docs/v11.8-PLAN.md §8, plan T2(f)). A synced item is admitted ONLY by the
 // receiver's OWN locally-authorized MemorySubmit (buildSyncSubmitTx), which
@@ -718,11 +792,11 @@ func TestT2fWriteNeverWidens(t *testing.T) {
 }
 
 func TestClassifySyncBroadcast(t *testing.T) {
-	// Pins the Log-text soft contract with internal/abci/app.go. If a wording
-	// change over there breaks these, update BOTH sides deliberately.
+	// Pins the hash-bound rejection classifier's soft Log contract with
+	// internal/abci/app.go. Untyped text must never be treated as a verdict.
 	cases := []struct {
 		log  string
-		code int
+		code uint32
 		want syncBcastClass
 	}{
 		{`memory abc already reached terminal status "committed"; re-submit rejected`, 11, syncBcastDuplicate},
@@ -733,10 +807,16 @@ func TestClassifySyncBroadcast(t *testing.T) {
 		{"memory submit rejected: a non-empty domain_tag is required (app-v16)", 11, syncBcastRetry},
 	}
 	for _, c := range cases {
-		err := fmt.Errorf("tx rejected in FinalizeBlock (code %d): %s", c.code, c.log)
-		assert.Equal(t, c.want, classifySyncBroadcast(err), c.log)
+		result := &tx.CometCommitResult{TxResultCode: c.code, TxResultLog: c.log}
+		assert.Equal(t, c.want, classifySyncBroadcast(result), c.log)
 	}
-	assert.Equal(t, syncBcastOK, classifySyncBroadcast(nil))
+	assert.Equal(t, syncBcastRetry, classifySyncBroadcast(nil))
+	assert.Equal(t, syncBcastOK, classifySyncBroadcast(&tx.CometCommitResult{}))
+	assert.Equal(t, syncBcastNonceRace, classifySyncBroadcast(&tx.CometCommitResult{CheckTxCode: 4, CheckTxLog: "arbitrary"}))
+	assert.Equal(t, syncBcastRetry, classifySyncBroadcast(&tx.CometCommitResult{CheckTxCode: 11, CheckTxLog: "nonce too low"}),
+		"a non-nonce CheckTx code cannot borrow semantics from its log")
+	assert.Equal(t, syncBcastRetry, classifySyncBroadcast(&tx.CometCommitResult{TxResultCode: 47, TxResultLog: "already reached terminal status"}),
+		"a non-contract FinalizeBlock code cannot borrow semantics from its log")
 }
 
 // seedCommittedMemory inserts a committed row via the ordinary store path

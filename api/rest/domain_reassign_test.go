@@ -25,17 +25,6 @@ const (
 	testProposalID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
 
-// newCometMock returns an httptest.Server that mimics CometBFT's
-// /broadcast_tx_commit shape with the supplied response. Keeps each test
-// focused on the REST surface, not chain machinery.
-func newCometMock(t *testing.T, body string) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(body))
-	}))
-}
-
 // ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
@@ -51,14 +40,9 @@ func newCometMock(t *testing.T, body string) *httptest.Server {
 // point — if the ABCI handler ever changes the format, this test breaks.
 func TestDomainReassign_HappyPath(t *testing.T) {
 	successLog := `domain reassigned: pipeline.failures.boot2root -> ` + testNewOwnerID + ` (purged 7 grants, open_to_shared=false)`
-	cometMock := newCometMock(t, `{
-		"result": {
-			"check_tx":  {"code": 0, "log": ""},
-			"tx_result": {"code": 0, "data": "", "log": "`+successLog+`"},
-			"hash": "DEADBEEFCAFEBABE",
-			"height": "42"
-		}
-	}`)
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 0, successLog, 42)
+	}))
 	defer cometMock.Close()
 
 	srv, _, _ := newTestServer(t, cometMock.URL)
@@ -80,7 +64,9 @@ func TestDomainReassign_HappyPath(t *testing.T) {
 
 	var resp DomainReassignResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
-	assert.Equal(t, "DEADBEEFCAFEBABE", resp.TxHash)
+	assert.Len(t, resp.TxHash, 64)
+	_, err := hex.DecodeString(resp.TxHash)
+	require.NoError(t, err)
 	assert.Equal(t, 7, resp.PurgedGrants, "purged_grants must be parsed from the ABCI success Log")
 }
 
@@ -180,14 +166,9 @@ func TestDomainReassign_BadRequest_MissingProposalID(t *testing.T) {
 // would leak the specific failure into a server-log-only diagnostic and
 // force ops to grep through node logs to see why their admin tx failed.
 func TestDomainReassign_FinalizeBlockRejection_NonexistentProposal(t *testing.T) {
-	cometMock := newCometMock(t, `{
-		"result": {
-			"check_tx":  {"code": 0, "log": ""},
-			"tx_result": {"code": 81, "data": "", "log": "proposal not found: `+testProposalID+`"},
-			"hash": "REJECTED",
-			"height": "0"
-		}
-	}`)
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 0, "", 81, "proposal not found: "+testProposalID, 42)
+	}))
 	defer cometMock.Close()
 
 	srv, _, _ := newTestServer(t, cometMock.URL)
@@ -219,14 +200,9 @@ func TestDomainReassign_FinalizeBlockRejection_NonexistentProposal(t *testing.T)
 // been authorised on this chain yet. Mirrors the ABCI handler's pre-fork
 // gate symmetry.
 func TestDomainReassign_PreFork_UnknownTxType(t *testing.T) {
-	cometMock := newCometMock(t, `{
-		"result": {
-			"check_tx":  {"code": 10, "log": "unknown tx type"},
-			"tx_result": {"code": 0, "data": "", "log": ""},
-			"hash": "",
-			"height": "0"
-		}
-	}`)
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCometCommitFixture(t, w, r, 10, "unknown tx type", 0, "", 0)
+	}))
 	defer cometMock.Close()
 
 	srv, _, _ := newTestServer(t, cometMock.URL)
@@ -289,15 +265,7 @@ func TestGovPropose_PayloadRoundtripIntoTx(t *testing.T) {
 	var capturedTxHex string
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedTxHex = r.URL.Query().Get("tx")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"result": {
-				"check_tx":  {"code": 0, "log": ""},
-				"tx_result": {"code": 0, "log": ""},
-				"hash": "PROPOSEHASH",
-				"height": "1"
-			}
-		}`))
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 1)
 	}))
 	defer cometMock.Close()
 

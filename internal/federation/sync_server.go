@@ -825,53 +825,95 @@ func (m *Manager) admitSyncItem(r *http.Request, ss *store.SQLiteStore, peer *pe
 // with a freshly-encoded tx (never re-broadcast stored bytes: post-v15
 // canonical encoding + nonce monotonicity both reject).
 func (m *Manager) broadcastSyncSubmit(localID string, item *SyncItem) (string, string) {
-	// Bound concurrent blocking broadcasts (shared with receipt pushes).
-	m.broadcastSem <- struct{}{}
-	defer func() { <-m.broadcastSem }()
-
-	for attempt := 0; attempt < 2; attempt++ {
-		encoded, err := m.buildSyncSubmitTx(localID, item)
-		if err != nil {
-			m.logger.Error().Err(err).Str("local", localID).Msg("sync: build submit tx failed")
-			return SyncOutcomeRetry, ""
-		}
-		hash, _, err := m.broadcastTxCommit(encoded)
-		outcome := classifySyncBroadcast(err)
-		if outcome == syncBcastNonceRace && attempt == 0 {
-			continue // fresh nonce on the rebuild
-		}
-		switch outcome {
-		case syncBcastOK:
-			return SyncOutcomeAccepted, hash
-		case syncBcastDuplicate:
-			return SyncOutcomeDuplicate, ""
-		case syncBcastScopeReject:
-			// FinalizeBlock rejected the submit tx for lack of RBAC write access
-			// on the receiver — a per-attempt consensus cost, so a distinct
-			// outcome the sender attempts-caps (NOT the cheap gate-scope reject).
-			return SyncOutcomeRejectedWriteAccess, ""
-		default:
-			if err != nil {
-				m.logger.Warn().Err(err).Str("local", localID).Msg("sync: submit broadcast failed")
-			}
-			return SyncOutcomeRetry, ""
-		}
+	signingKey, signingPub, err := m.localConsensusSigningKey()
+	if err != nil {
+		m.logger.Error().Err(err).Str("local", localID).Msg("sync: resolve submit authority failed")
+		return SyncOutcomeRetry, ""
 	}
-	return SyncOutcomeRetry, ""
+
+	result, resultHash := SyncOutcomeRetry, ""
+	leaseCtx, cancelLease := context.WithTimeout(context.Background(), broadcastTimeout())
+	defer cancelLease()
+	err = tx.WithNonceLease(leaseCtx, signingKey, func(nonce uint64) error {
+		// Preserve distinct-key concurrency: same-key lease waiters must not fill
+		// the shared broadcast pool while another signer could make progress.
+		select {
+		case m.broadcastSem <- struct{}{}:
+			defer func() { <-m.broadcastSem }()
+		case <-leaseCtx.Done():
+			return leaseCtx.Err()
+		}
+		for attempt := 0; attempt < 2; attempt++ {
+			if attempt > 0 {
+				// The lease remains held across the retry, so this fresh allocation
+				// cannot be overtaken by another compliant producer using this key.
+				nonce = tx.MonotonicNonce(signingKey)
+			}
+			encoded, buildErr := m.buildSyncSubmitTxWithSigner(
+				localID, item, signingKey, signingPub, nonce,
+			)
+			if buildErr != nil {
+				return fmt.Errorf("build sync submit tx: %w", buildErr)
+			}
+			commitResult, broadcastErr := tx.BroadcastCometCommit(leaseCtx, m.cometRPC, signingKey, encoded)
+			if broadcastErr != nil {
+				m.logger.Warn().Err(broadcastErr).Str("local", localID).Msg("sync: submit broadcast failed")
+				// Every error return is ambiguous. The shared broadcaster leaves the
+				// exact registration live, so returning it through WithNonceLease
+				// fences those bytes. Never classify server-controlled error text.
+				return broadcastErr
+			}
+			outcome := classifySyncBroadcast(commitResult)
+			if outcome == syncBcastNonceRace && attempt == 0 {
+				continue
+			}
+			switch outcome {
+			case syncBcastOK:
+				result, resultHash = SyncOutcomeAccepted, commitResult.Hash
+			case syncBcastDuplicate:
+				result = SyncOutcomeDuplicate
+			case syncBcastScopeReject:
+				// FinalizeBlock rejected the submit tx for lack of RBAC write access
+				// on the receiver — a per-attempt consensus cost, so a distinct
+				// outcome the sender attempts-caps (NOT the cheap gate-scope reject).
+				result = SyncOutcomeRejectedWriteAccess
+			case syncBcastNonceRace:
+				// A second bound CheckTx refusal is definitive for these exact
+				// bytes. The shared broadcaster already retired registration;
+				// leave the item retryable without fencing the signer.
+				result = SyncOutcomeRetry
+			default:
+				// Every result here is exact-hash-bound and its registration has
+				// already been retired, so an unrecognised consensus refusal remains
+				// retryable without fencing or pretending to be success-equivalent.
+				result = SyncOutcomeRetry
+			}
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		m.logger.Error().Err(err).Str("local", localID).Msg("sync: leased submit broadcast failed")
+		return SyncOutcomeRetry, ""
+	}
+	return result, resultHash
 }
 
-// buildSyncSubmitTx constructs the locally-authorized MemorySubmit for a
-// synced copy. The remote transport identity remains recorded in SyncItem
-// provenance; after app-v23 the new local write is signed by current CEREBRUM
-// Root, never by a retired JOIN-frozen transport credential.
-func (m *Manager) buildSyncSubmitTx(localID string, item *SyncItem) ([]byte, error) {
+// buildSyncSubmitTxWithSigner constructs the locally-authorized MemorySubmit
+// using the exact signer and nonce already reserved by broadcastSyncSubmit's
+// lease. The remote transport identity remains recorded in SyncItem provenance;
+// after app-v23 the new local write is signed by current CEREBRUM Root, never by
+// a retired JOIN-frozen transport credential.
+func (m *Manager) buildSyncSubmitTxWithSigner(
+	localID string,
+	item *SyncItem,
+	signingKey ed25519.PrivateKey,
+	signingPub ed25519.PublicKey,
+	nonce uint64,
+) ([]byte, error) {
 	contentHash, err := hex.DecodeString(item.ContentHash)
 	if err != nil {
 		return nil, fmt.Errorf("decode content hash: %w", err)
-	}
-	signingKey, signingPub, err := m.localConsensusSigningKey()
-	if err != nil {
-		return nil, fmt.Errorf("resolve sync submit authority: %w", err)
 	}
 	body := []byte("sync_admit:" + localID)
 	bodyHash := sha256.Sum256(body)
@@ -887,7 +929,7 @@ func (m *Manager) buildSyncSubmitTx(localID string, item *SyncItem) ([]byte, err
 	}
 	ptx := &tx.ParsedTx{
 		Type:      tx.TxTypeMemorySubmit,
-		Nonce:     tx.MonotonicNonce(signingKey),
+		Nonce:     nonce,
 		Timestamp: time.Now(),
 		MemorySubmit: &tx.MemorySubmit{
 			MemoryID:        localID,
@@ -949,16 +991,35 @@ const (
 	syncBcastRetry
 )
 
-// classifySyncBroadcast maps a broadcastTxCommit error onto an outcome class.
-// ABCI error codes are overloaded (Code 11 spans malformed/authz/terminal),
-// so this branches on Log text — an acknowledged soft contract with
-// internal/abci/app.go's literals, pinned by TestClassifySyncBroadcast so a
-// wording change over there fails loudly over here.
-func classifySyncBroadcast(err error) syncBcastClass {
-	if err == nil {
+// classifySyncBroadcast maps a structurally complete, exact-hash-bound Comet
+// result onto an outcome class. It never accepts an error: JSON-RPC
+// Error.Message and Error.Data are server-controlled and arrive before hash
+// binding, while their submission registration is intentionally still live.
+//
+// ABCI FinalizeBlock code 11 is overloaded, so the bound result's Log remains
+// a soft contract with internal/abci/app.go. A non-nil CometCommitResult is the
+// proof boundary: transport/status/RPC/decode/shape/hash/height errors never
+// reach this function and therefore fence the exact bytes.
+func classifySyncBroadcast(result *tx.CometCommitResult) syncBcastClass {
+	if result == nil {
+		return syncBcastRetry
+	}
+	if result.CheckTxCode != 0 {
+		if result.CheckTxCode == 4 {
+			return syncBcastNonceRace
+		}
+		return syncBcastRetry
+	}
+	if result.TxResultCode == 0 {
 		return syncBcastOK
 	}
-	msg := err.Error()
+	if result.TxResultCode == 4 {
+		return syncBcastNonceRace
+	}
+	if result.TxResultCode != 11 {
+		return syncBcastRetry
+	}
+	msg := result.TxResultLog
 	switch {
 	case strings.Contains(msg, "already reached terminal status"),
 		strings.Contains(msg, "cannot be overwritten by a normal submit"):
@@ -969,8 +1030,6 @@ func classifySyncBroadcast(err error) syncBcastClass {
 		// The operator agent lacks write access to the target domain on THIS
 		// chain — receiver-side configuration, terminal until re-consented.
 		return syncBcastScopeReject
-	case strings.Contains(msg, "nonce too low"), strings.Contains(msg, "nonce 0 not permitted"):
-		return syncBcastNonceRace
 	default:
 		return syncBcastRetry
 	}

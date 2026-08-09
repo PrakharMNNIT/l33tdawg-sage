@@ -1191,7 +1191,7 @@ func TestCreateTaskConsensusFailureDoesNotInsertPhantom(t *testing.T) {
 	h.SigningKey = key
 	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/broadcast_tx_commit", r.URL.Path)
-		_, _ = w.Write([]byte(`{"result":{"check_tx":{"code":0,"log":""},"tx_result":{"code":7,"log":"rejected"},"hash":"abc","height":"1"}}`))
+		writeCommitTxRejected(w, r, 7, "rejected", 1)
 	}))
 	t.Cleanup(rpc.Close)
 	h.CometBFTRPC = rpc.URL
@@ -2023,7 +2023,7 @@ func TestHandleUpdateAgent_SyncBroadcast_Success(t *testing.T) {
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		broadcastSeen = true
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"result":{"code":0,"hash":"ABC123"}}`)
+		fmt.Fprintf(w, `{"result":{"code":0,"hash":"%s"}}`, requestBoundHash(r))
 	}))
 	defer cometMock.Close()
 
@@ -2068,11 +2068,11 @@ func TestHandleUpdateAgent_SyncBroadcast_Success(t *testing.T) {
 func TestHandleUpdateAgent_SyncBroadcast_Failure_ReturnsWarning(t *testing.T) {
 	// When CometBFT broadcast fails, the response should include on_chain_warning
 	// but the SQLite update should still succeed (best-effort).
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simulate CometBFT being down
+	// Simulate CometBFT being down. That outcome is indeterminate and fences
+	// the signing key, so the stub resolves the fence at teardown.
+	cometMock := fenceResolvingRPC(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer cometMock.Close()
+	})
 
 	h, s := newTestHandler(t)
 	h.CometBFTRPC = cometMock.URL
@@ -2142,13 +2142,17 @@ func TestHandleUpdateAgent_NoCometBFT_NoWarning(t *testing.T) {
 func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 	var captured *tx.ParsedTx
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/broadcast_tx_sync" {
+			_, _ = fmt.Fprintf(w, `{"result":{"code":0,"hash":"%s"}}`, requestBoundHash(r))
+			return
+		}
 		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
 		encoded, decErr := hex.DecodeString(raw)
 		require.NoError(t, decErr)
 		captured, decErr = tx.DecodeTx(encoded)
 		require.NoError(t, decErr)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"ABC123","height":"42"}}`)
+		writeCommitOK(w, r)
 	}))
 	defer cometMock.Close()
 
@@ -2185,13 +2189,17 @@ func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 func TestHandleUpdateAgent_AppV22CapabilitiesCommitBeforeSuccess(t *testing.T) {
 	var captured *tx.ParsedTx
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/broadcast_tx_sync" {
+			_, _ = fmt.Fprintf(w, `{"result":{"code":0,"hash":"%s"}}`, requestBoundHash(r))
+			return
+		}
 		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
 		encoded, decErr := hex.DecodeString(raw)
 		require.NoError(t, decErr)
 		captured, decErr = tx.DecodeTx(encoded)
 		require.NoError(t, decErr)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"CAP123","height":"88"}}`)
+		writeCommitOKAt(w, r, 88, "")
 	}))
 	defer cometMock.Close()
 
@@ -2225,10 +2233,11 @@ func TestHandleUpdateAgent_AppV22CapabilitiesCommitBeforeSuccess(t *testing.T) {
 }
 
 func TestHandleUpdateAgent_AppV22CapabilityFailureRestoresProjection(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// A bare 500 is indeterminate (the node may have accepted the permission
+	// tx), so it fences the admin key; resolve that fence at teardown.
+	cometMock := fenceResolvingRPC(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer cometMock.Close()
+	})
 
 	h, s := newTestHandler(t)
 	h.CometBFTRPC = cometMock.URL
@@ -2264,7 +2273,7 @@ func TestHandleUpdateAgent_ZeroCapabilityIsLegacyCompatibleBeforeAppV22(t *testi
 		captured, decErr = tx.DecodeTx(encoded)
 		require.NoError(t, decErr)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"LEGACY0","height":"87"}}`)
+		writeCommitOKAt(w, r, 87, "")
 	}))
 	defer cometMock.Close()
 
@@ -2296,10 +2305,11 @@ func TestHandleUpdateAgent_ZeroCapabilityIsLegacyCompatibleBeforeAppV22(t *testi
 }
 
 func TestHandleUpdateAgent_PermissionFailureRestoresAllPolicyFields(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// Same shape as the capability-failure test above: an indeterminate 500
+	// fences the admin key, and the stub resolves it at teardown.
+	cometMock := fenceResolvingRPC(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer cometMock.Close()
+	})
 
 	h, s := newTestHandler(t)
 	h.CometBFTRPC = cometMock.URL
@@ -2352,9 +2362,9 @@ func TestOverlayOnChainAgentPolicyReplacesStaleSQLiteRBAC(t *testing.T) {
 }
 
 func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
-	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"PERM123","height":"77"}}`)
+		writeCommitOKAt(w, r, 77, "")
 	}))
 	defer cometMock.Close()
 
@@ -2387,7 +2397,7 @@ func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
 		body := string(event)
 		assert.Contains(t, body, "event: access")
 		assert.Contains(t, body, `"action":"permissions_updated"`)
-		assert.Contains(t, body, `"tx_hash":"PERM123"`)
+		assert.Regexp(t, `"tx_hash":"[0-9A-F]{64}"`, body)
 		assert.Contains(t, body, `"height":77`)
 	case <-time.After(time.Second):
 		t.Fatal("committed permission update did not emit Chain Activity event")

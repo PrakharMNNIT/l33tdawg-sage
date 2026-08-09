@@ -223,9 +223,12 @@ func fakeComet(t *testing.T) (*httptest.Server, *[][]byte) {
 		if len(txParam) > 2 && txParam[:2] == "0x" {
 			if raw, err := hex.DecodeString(txParam[2:]); err == nil {
 				captured = append(captured, raw)
+				hash := sha256.Sum256(raw)
+				fmt.Fprintf(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"%X","height":"42"}}`, hash)
+				return
 			}
 		}
-		fmt.Fprint(w, `{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":"CAFE","height":"42"}}`)
+		http.Error(w, "invalid transaction", http.StatusBadRequest)
 	}))
 	t.Cleanup(ts.Close)
 	return ts, &captured
@@ -671,14 +674,15 @@ func TestReceiptExchangeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PushReceipt: %v", err)
 	}
-	if resp.Status != "anchored" || resp.TxHash != "CAFE" {
+	if len(*captured) != 1 {
+		t.Fatalf("expected 1 broadcast tx, got %d", len(*captured))
+	}
+	wantHash := sha256.Sum256((*captured)[0])
+	if resp.Status != "anchored" || resp.TxHash != strings.ToUpper(hex.EncodeToString(wantHash[:])) {
 		t.Fatalf("unexpected push response: %+v", resp)
 	}
 
 	// The broadcast tx must be a well-formed CoCommitAttest bound to A.
-	if len(*captured) != 1 {
-		t.Fatalf("expected 1 broadcast tx, got %d", len(*captured))
-	}
 	ptx, err := tx.DecodeTx((*captured)[0])
 	if err != nil {
 		t.Fatalf("decode broadcast tx: %v", err)

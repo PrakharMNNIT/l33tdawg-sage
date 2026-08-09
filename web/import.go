@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -329,6 +330,22 @@ func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.R
 				},
 			}
 			if _, _, _, commitErr := h.signAndBroadcastAppV23Control(submitTx, controlActor); commitErr != nil {
+				if signerHeldNotSent(commitErr) {
+					// Nothing was signed or sent for this record, and every
+					// later record would hit the same held key — each waiting
+					// out the full signing budget. Stop the batch honestly
+					// instead of reporting per-record "rejections" that never
+					// happened; the operator re-runs the import once the
+					// earlier submission's fate is proven.
+					remaining := len(records) - i
+					skipped += remaining
+					parseErrors = append(parseErrors, fmt.Sprintf(
+						"import stopped at memory %s: not sent — the signing key is waiting for "+
+							"confirmation of an earlier submission whose outcome was lost; the remaining "+
+							"%d record(s) were not attempted. Nothing needs undoing; retry the import shortly.",
+						rec.MemoryID, remaining))
+					break
+				}
 				parseErrors = append(parseErrors,
 					fmt.Sprintf("memory %s: consensus rejected the import", rec.MemoryID))
 				skipped++
@@ -343,12 +360,13 @@ func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.R
 				continue
 			}
 		} else {
-			// Legacy compatibility lane. It remains byte-for-byte unchanged
-			// before app-v23; app-v23 never reaches this fire-and-forget path.
+			// Legacy compatibility lane (pre-app-v23 chains only; app-v23 never
+			// reaches this fire-and-forget path). Broadcast failures stay
+			// fire-and-forget EXCEPT a held signing key, which stops the batch —
+			// see below.
 			if h.CometBFTRPC != "" && h.SigningKey != nil {
 				submitTx := &tx.ParsedTx{
 					Type:      tx.TxTypeMemorySubmit,
-					Nonce:     tx.MonotonicNonce(h.SigningKey),
 					Timestamp: rec.CreatedAt,
 					MemorySubmit: &tx.MemorySubmit{
 						MemoryID: rec.MemoryID, ContentHash: rec.ContentHash,
@@ -357,11 +375,37 @@ func (h *DashboardHandler) processImportRecords(w http.ResponseWriter, r *http.R
 						Content: rec.Content, Classification: tx.ClearanceLevel(1),
 					},
 				}
-				embedDashboardAgentProof(submitTx, h.SigningKey)
-				if signErr := tx.SignTx(submitTx, h.SigningKey); signErr == nil {
-					if encoded, encErr := tx.EncodeTx(submitTx); encErr == nil {
-						_ = broadcastTxSync(h.CometBFTRPC, encoded)
-					}
+				// Leased. An import is the worst case for an unleased nonce: it
+				// broadcasts one transaction per record in a tight loop on a
+				// single key, which is exactly the descending-arrival burst
+				// app-v9 rejects Code 4. The lease makes the emitted order match
+				// the allocated order so the whole batch is admitted.
+				//
+				// The timestamp is the RECORD's creation time and is set here on
+				// purpose: the lease only fills a zero timestamp, so historical
+				// import timestamps survive.
+				signCtx, cancelSign := context.WithTimeout(r.Context(), backgroundSigningBudget())
+				syncErr := h.signAndBroadcastSyncContext(signCtx, submitTx, h.SigningKey)
+				cancelSign()
+				if signerHeldNotSent(syncErr) {
+					// Same loud stop as the app-v23 lane above, for the same
+					// reason. NOTHING was signed or sent for this record — the
+					// key is fenced (or quiesced) — and every later record signs
+					// with the same key, so each one would park behind the hold
+					// for the FULL signing budget: a 50-record import would
+					// crawl for ~100 minutes, count every record "imported"
+					// locally with nothing on-chain, and never say why.
+					// Discarding this error (which an earlier revision did with
+					// `_ =`) is precisely the silent-loss shape the fence's
+					// loud-failure contract exists to prevent.
+					remaining := len(records) - i
+					skipped += remaining
+					parseErrors = append(parseErrors, fmt.Sprintf(
+						"import stopped at memory %s: not sent — the signing key is waiting for "+
+							"confirmation of an earlier submission whose outcome was lost; the remaining "+
+							"%d record(s) were not attempted. Nothing needs undoing; retry the import shortly.",
+						rec.MemoryID, remaining))
+					break
 				}
 			}
 			if insertErr := h.store.InsertMemory(r.Context(), rec); insertErr != nil {

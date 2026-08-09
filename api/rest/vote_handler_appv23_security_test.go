@@ -3,7 +3,6 @@ package rest
 import (
 	"crypto/ed25519"
 	"encoding/hex"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -34,14 +33,7 @@ func TestAppV23MemoryVoteIsLocalOperatorOnlyAndValidatorBound(t *testing.T) {
 		require.NoError(t, decodeErr)
 		captured = append(captured, parsed)
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"result": map[string]any{
-				"check_tx":  map[string]any{"code": 0},
-				"tx_result": map[string]any{"code": 0},
-				"hash":      "APPV23VOTE",
-				"height":    "12",
-			},
-		}))
+		writeCometCommitFixture(t, w, r, 0, "", 0, "", 12)
 	}))
 	t.Cleanup(comet.Close)
 	fixture.server.cometbftRPC = comet.URL

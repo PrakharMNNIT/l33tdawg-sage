@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -250,6 +251,16 @@ func (h *DashboardHandler) reconcileDomainGrants(granteeID, oldBlob, newBlob str
 	}
 
 	var results []grantResult
+	// Signers that already reported not_sent_signer_held in THIS save, keyed by
+	// signing identity (agent id of the key that would sign), so later rows for
+	// the SAME signer short-circuit instead of each re-waiting the full signing
+	// budget on the same fence. Per signing identity and not a single flag,
+	// because different domains resolve to DIFFERENT owning signers: a fence on
+	// one owner's key says nothing about another owner's, and a global flag
+	// silently skipped domains whose unfenced owner could have signed. The
+	// membership check runs inside grantAs/revokeAs AFTER owner resolution —
+	// only there is it known which key would actually sign this row.
+	heldSigners := map[string]bool{}
 	for d := range domains {
 		desired := newLevels[d] // 0 if absent from the new state
 		// Read the current on-chain grant level for this grantee+domain (0 when
@@ -258,19 +269,28 @@ func (h *DashboardHandler) reconcileDomainGrants(granteeID, oldBlob, newBlob str
 		if lvl, _, _, gErr := h.BadgerStore.GetAccessGrant(d, granteeID); gErr == nil {
 			curLevel = int(lvl)
 		}
+		// A row whose signer is already known held STOPS PAYING THE BUDGET. Each
+		// grantAs/revokeAs on a fenced key parks inside signAndBroadcastCommit
+		// for the whole backgroundSigningBudget before returning
+		// not_sent_signer_held, so a five-domain matrix save under one fenced
+		// owner would stall one HTTP request for 5 x 120s = ten minutes with no
+		// interim signal — each row re-waiting on the SAME fence to learn the
+		// same answer. That is the serial batch-crawl web/import.go was
+		// explicitly changed to break out of; this mirrors it. Skipped rows
+		// still get a result row, so the operator sees the complete picture.
 		switch {
 		case desired > 0 && curLevel != desired:
 			var override *adminOverrideExpectation
 			if expected, ok := overrides[d]; ok {
 				override = &expected
 			}
-			results = append(results, h.grantAs(d, granteeID, desired, override))
+			results = append(results, h.grantAs(d, granteeID, desired, override, heldSigners))
 		case desired == 0 && curLevel > 0:
 			var override *adminOverrideExpectation
 			if expected, ok := overrides[d]; ok {
 				override = &expected
 			}
-			results = append(results, h.revokeAs(d, granteeID, override))
+			results = append(results, h.revokeAs(d, granteeID, override, heldSigners))
 		default:
 			// already in the desired on-chain state - no tx
 		}
@@ -278,12 +298,28 @@ func (h *DashboardHandler) reconcileDomainGrants(granteeID, oldBlob, newBlob str
 	return results
 }
 
+// signerAlreadyHeld reports whether this row's resolved signing key already hit
+// a fence earlier in the save, and records the skip as a result row.
+// heldSigners may be nil (callers outside a batch), which disables the
+// short-circuit.
+func signerAlreadyHeld(heldSigners map[string]bool, signerID string) bool {
+	return heldSigners != nil && signerID != "" && heldSigners[signerID]
+}
+
+// recordSignerHeld marks a signing identity as held for the rest of the batch
+// once a row's broadcast came back "not sent: signer held/quiesced".
+func recordSignerHeld(heldSigners map[string]bool, signerID string) {
+	if heldSigners != nil && signerID != "" {
+		heldSigners[signerID] = true
+	}
+}
+
 // grantAs issues an AccessGrant(grantee, domain, level) signed as the effective
 // domain owner. For a genuinely unowned domain, the genesis admin signs the
 // grant and consensus atomically registers that admin as owner before applying
 // the grant. This mirrors processAccessGrant's post-v8 first-grant-wins rule;
 // the dashboard must not reject a flow consensus explicitly supports.
-func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override *adminOverrideExpectation) grantResult {
+func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override *adminOverrideExpectation, heldSigners map[string]bool) grantResult {
 	if h.isSharedDomain(domain) {
 		if level >= 3 {
 			return grantResult{
@@ -361,6 +397,15 @@ func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override
 			OverrideAvailable: overrideAvailable, OverrideReady: overrideAvailable && overrideActive}
 	}
 	signerID := agentIDForKey(ownerKey)
+	// Checked HERE, after owner/override resolution, because only now is it
+	// known which key signs this row: the same save can span domains owned by
+	// different signers, and a fence on one must not skip another's rows.
+	if signerAlreadyHeld(heldSigners, signerID) {
+		return grantResult{Domain: domain, Action: "grant", Level: level, OK: false,
+			Code:    "not_sent_signer_held",
+			Error:   "this domain's signing key is already held for an earlier domain in this save; not attempted",
+			OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
+	}
 	grantTx := &tx.ParsedTx{
 		Type: tx.TxTypeAccessGrant,
 		AccessGrant: &tx.AccessGrant{
@@ -374,6 +419,16 @@ func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override
 	}
 	txHash, height, _, gErr := h.signAndBroadcastCommit(grantTx, ownerKey)
 	if gErr != nil {
+		// A fenced/quiesced signer means the grant was NEVER SIGNED OR SENT, so
+		// it must not carry the grant_rejected verdict: nothing was refused and
+		// nothing needs undoing — retrying the same matrix edit later is exactly
+		// right. The distinct retryable code keeps the UI honest.
+		if signerHeldNotSent(gErr) {
+			recordSignerHeld(heldSigners, signerID)
+			return grantResult{Domain: domain, Action: "grant", Level: level, OK: false,
+				Code: "not_sent_signer_held", Error: gErr.Error(), OwnerID: owner, OwnedDomain: ownedDomain,
+				OwnerLocal: ownerLocal}
+		}
 		return grantResult{Domain: domain, Action: "grant", Level: level, OK: false,
 			Code: "grant_rejected", Error: gErr.Error(), OwnerID: owner, OwnedDomain: ownedDomain,
 			OwnerLocal: ownerLocal}
@@ -386,7 +441,7 @@ func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override
 }
 
 // revokeAs issues an AccessRevoke(grantee, domain) signed as the domain owner.
-func (h *DashboardHandler) revokeAs(domain, granteeID string, override *adminOverrideExpectation) grantResult {
+func (h *DashboardHandler) revokeAs(domain, granteeID string, override *adminOverrideExpectation, heldSigners map[string]bool) grantResult {
 	if h.isSharedDomain(domain) {
 		return grantResult{Domain: domain, Action: "shared", OK: true}
 	}
@@ -437,10 +492,20 @@ func (h *DashboardHandler) revokeAs(domain, granteeID string, override *adminOve
 			OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal,
 			OverrideAvailable: overrideAvailable, OverrideReady: overrideAvailable && overrideActive}
 	}
+	signerID := agentIDForKey(ownerKey)
+	// Same placement as grantAs: only after owner/override resolution is the
+	// signing key for THIS row known, so only here can "already held" be
+	// decided per signer instead of per batch.
+	if signerAlreadyHeld(heldSigners, signerID) {
+		return grantResult{Domain: domain, Action: "revoke", OK: false,
+			Code:    "not_sent_signer_held",
+			Error:   "this domain's signing key is already held for an earlier domain in this save; not attempted",
+			OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
+	}
 	revokeTx := &tx.ParsedTx{
 		Type: tx.TxTypeAccessRevoke,
 		AccessRevoke: &tx.AccessRevoke{
-			RevokerID:           agentIDForKey(ownerKey),
+			RevokerID:           signerID,
 			GranteeID:           granteeID,
 			Domain:              domain,
 			Reason:              "dashboard access matrix update",
@@ -450,6 +515,12 @@ func (h *DashboardHandler) revokeAs(domain, granteeID string, override *adminOve
 	}
 	txHash, height, _, rErr := h.signAndBroadcastCommit(revokeTx, ownerKey)
 	if rErr != nil {
+		// Same split as grantAs: never sent must not read as refused.
+		if signerHeldNotSent(rErr) {
+			recordSignerHeld(heldSigners, signerID)
+			return grantResult{Domain: domain, Action: "revoke", OK: false,
+				Code: "not_sent_signer_held", Error: rErr.Error(), OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
+		}
 		return grantResult{Domain: domain, Action: "revoke", OK: false,
 			Code: "revoke_rejected", Error: rErr.Error(), OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
 	}
@@ -707,6 +778,18 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 				"message": full,
 			})
 		}
+		// failBroadcast is fail for a signing/broadcast error, checked FIRST for
+		// the two "nothing was signed or sent" refusals. Those must be 503 "not
+		// sent, retry" — never the 502 that reads as a consensus verdict —
+		// because a fenced key defers the step, it does not refuse it.
+		failBroadcast := func(name string, bErr error) {
+			if signerHeldNotSent(bErr) {
+				w.Header().Set("Retry-After", strconv.Itoa(fencedSignerRetryAfterSeconds))
+				fail(http.StatusServiceUnavailable, name, "not sent: "+bErr.Error())
+				return
+			}
+			fail(http.StatusBadGateway, name, bErr.Error())
+		}
 
 		adminKey := h.AdminSigningKey
 		if appV23Actor != nil {
@@ -804,7 +887,7 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 			}
 		}
 		if pErr != nil {
-			fail(http.StatusBadGateway, "propose", pErr.Error())
+			failBroadcast("propose", pErr)
 			return
 		}
 		steps = append(steps, reassignStep{Name: "propose", TxHash: proposeHash, OK: true})
@@ -840,7 +923,7 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 				h.cancelActiveProposalWithActor(
 					proposalID, proposerKey, adminKey, postAppV20, appV23Actor,
 				)
-				fail(http.StatusBadGateway, "vote", vErr.Error())
+				failBroadcast("vote", vErr)
 				return
 			}
 			steps = append(steps, reassignStep{Name: "vote", TxHash: voteHash, OK: true})
@@ -872,7 +955,7 @@ func (h *DashboardHandler) handleReassignDomainOwnership(agentStore store.AgentS
 			h.cancelActiveProposalWithActor(
 				proposalID, proposerKey, adminKey, postAppV20, appV23Actor,
 			)
-			fail(http.StatusBadGateway, "reassign", rErr.Error())
+			failBroadcast("reassign", rErr)
 			return
 		}
 		steps = append(steps, reassignStep{Name: "reassign", TxHash: reassignHash, OK: true})

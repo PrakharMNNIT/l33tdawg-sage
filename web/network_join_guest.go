@@ -294,9 +294,12 @@ func (h *DashboardHandler) handleGuestJoinRestart(w http.ResponseWriter, r *http
 		return
 	}
 	if !restartInProcessSupported() || h.RequestRestart == nil {
+		// Through manualRestartAdvice: while a signing key is fenced, "quit and
+		// open it again" is the manual bypass of the restart veto, and the
+		// advice must become the hold notice instead.
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": false, "restart_required": true,
-			"message": "The network is ready to join. Fully quit SAGE and open it again to finish.",
+			"message": "The network is ready to join. " + manualRestartAdvice("Fully quit SAGE and open it again to finish."),
 		})
 		return
 	}

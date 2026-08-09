@@ -12,6 +12,7 @@ const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import
 const mriPageSource = await readFile(new URL('../web/static/mri.html', import.meta.url), 'utf8');
 const federationRouteSource = await readFile(new URL('../web/static/js/federation-route-state.js', import.meta.url), 'utf8');
 const federationPeerCapabilitiesSource = await readFile(new URL('../web/static/js/federation-peer-capabilities.js', import.meta.url), 'utf8');
+const bulkSequenceSource = await readFile(new URL('../web/static/js/bulk-sequence.js', import.meta.url), 'utf8');
 const traySource = await readFile(new URL('../cmd/sage-tray/main.swift', import.meta.url), 'utf8');
 const { MRI_LAYOUT, mriBrainstemBias, mriDepthForAge, mriVerticalPosition } = await import('../web/static/js/mri-layout.js');
 
@@ -1619,15 +1620,47 @@ test('clearing a task column reconciles delayed consensus instead of restoring s
     const tasksPage = appSource.slice(appSource.indexOf('function TasksPage('), appSource.indexOf('function PipelineView('));
     const clearColumn = tasksPage.slice(tasksPage.indexOf('async function clearColumn('), tasksPage.indexOf('async function handleAddTask('));
     assert.match(tasksPage, /const settlingClears = useRef\(new Set\(\)\)/);
-    assert.match(clearColumn, /await Promise\.allSettled\(ids\.map\(id => deleteMemory\(id\)\)\)/,
+    // Sequencing and outcome wording live in bulk-sequence.js so they can be
+    // exercised directly; this page must still route BOTH branches through them.
+    assert.match(clearColumn, /await runSequential\(ids, id => deleteMemory\(id\)\)/,
         'one delayed task must not fail a whole column clear');
+    assert.match(clearColumn, /await runSequential\(ids, id => updateTaskStatus\(id, 'dropped'\)\)/,
+        'a mid-list failure must not discard its siblings the way Promise.all did');
+    assert.doesNotMatch(clearColumn, /Promise\.(all|allSettled)\(/,
+        'concurrent same-key submission is what produced the "nonce too low" consensus rejections');
     assert.match(tasksPage, /async function reconcileClearedTasks\(ids\)/);
-    assert.match(clearColumn, /SAGE is still confirming/,
+    assert.match(clearColumn, /summarizeClearedTasks\(\{ results, remaining, total: count, label: col\.label \}\)/);
+    assert.match(bulkSequenceSource, /SAGE is still confirming/,
         'an indeterminate consensus response must be treated as a pending reconciliation');
-    assert.match(clearColumn, /challenge_opened/,
+    assert.match(bulkSequenceSource, /challenge_opened/,
         'a multi-holder challenge must be explained instead of being called cleared');
     assert.doesNotMatch(clearColumn, /setTasks\(previousTasks\)/,
         'a pre-commit React snapshot must never resurrect cards after an uncertain commit');
+});
+
+test('bulk memory forget submits one memory at a time and reports partial success', () => {
+    const searchPage = appSource.slice(appSource.indexOf('function SearchPage('), appSource.indexOf('function SynapticLedger('));
+    const bulkForget = searchPage.slice(searchPage.indexOf('const bulkForget = async ()'), searchPage.indexOf('const toggleSelectAll ='));
+    assert.match(bulkForget, /await runSequential\(idList, id => deleteMemory\(id\)\)/,
+        'a concurrent same-key forget fan-out loses transactions to the app-v9 nonce gate');
+    assert.doesNotMatch(bulkForget, /Promise\.all\(/);
+    assert.match(bulkForget, /summarizeForgottenMemories\(/,
+        'a partly-failed forget must say how many actually went through');
+});
+
+test('bulk actions that do not fan out keep their own success message', () => {
+    // runBulk now lets a fan-out override the toast by returning { message }.
+    // The other two bulk actions (move domain, add tag) are single all-or-nothing
+    // requests whose JSON response has no `message`, so they must still fall
+    // through to okMsg — drop this branch and "Moved %n memories to X" silently
+    // becomes whatever the endpoint happened to return.
+    const searchPage = appSource.slice(appSource.indexOf('function SearchPage('), appSource.indexOf('function SynapticLedger('));
+    const runBulk = searchPage.slice(searchPage.indexOf('async function runBulk('), searchPage.indexOf('const bulkMoveDomain ='));
+    assert.match(runBulk, /if \(outcome && outcome\.message\) showToast\(outcome\.message, outcome\.tone \|\| 'success'\)/);
+    assert.match(runBulk, /else showToast\(okMsg\.replace\('%n', ids\.length\), 'success'\)/,
+        'a bulk action with no per-id outcome must keep its own success message');
+    assert.match(searchPage, /runBulk\(ids => bulkUpdateMemories\(ids, \{ domain: d \}\), `Moved %n memories to \$\{d\}`\)/);
+    assert.match(searchPage, /runBulk\(ids => bulkUpdateMemories\(ids, \{ addTags: \[t\] \}\), `Tagged %n memories "\$\{t\}"`\)/);
 });
 
 test('settings does not force a full-page render every 100ms', () => {

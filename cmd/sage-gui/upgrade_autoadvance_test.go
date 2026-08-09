@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -54,9 +57,12 @@ func TestPersonalAutoAdvanceCeilingHonorsMandatoryFloor(t *testing.T) {
 func scriptedCommitRPC(t *testing.T, checkCode, txCode uint32, txLog string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+		require.NoError(t, err)
+		hash := sha256.Sum256(raw)
 		resp := map[string]any{
 			"result": map[string]any{
-				"hash":   "AB",
+				"hash":   fmt.Sprintf("%X", hash),
 				"height": "42",
 				"check_tx": map[string]any{
 					"code": checkCode,

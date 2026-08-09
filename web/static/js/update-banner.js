@@ -15,10 +15,10 @@ export function buildUpdateBanner(data, dismissedRelease = '') {
         banner_can_install: canInstall,
         banner_release: release,
         banner_title: restartRequired
-            ? `SAGE ${version || 'update'} is installed and ready to restart`
+            ? `SAGE ${version || 'update'} is installed — restart pending`
             : `SAGE ${version || 'update'} is available`,
         banner_message: restartRequired
-            ? 'Restart SAGE to start using the new release.'
+            ? (data.update_instructions || 'The update is installed. Check restart safety before restarting SAGE.')
             : 'A newer release is ready when you are.',
         banner_action: restartRequired
             ? 'Restart options'
