@@ -498,6 +498,44 @@ func TestPipelineExpiry(t *testing.T) {
 	assert.Equal(t, 1, purged)
 }
 
+func TestPurgePipelinesComparesMixedPrecisionTimestampsChronologically(t *testing.T) {
+	ctx := context.Background()
+	s, err := NewSQLiteStore(ctx, ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	cutoff := time.Date(2026, time.August, 9, 1, 2, 3, 0, time.UTC)
+	msg := &PipelineMessage{
+		PipeID: "pipe-after-whole-second-cutoff", FromAgent: "agent-alice", ToAgent: "agent-bob",
+		Intent: "test", Payload: "retain me", Status: "pending",
+		CreatedAt: cutoff.Add(-time.Hour), ExpiresAt: cutoff.Add(-time.Minute),
+	}
+	require.NoError(t, s.InsertPipeline(ctx, msg))
+	require.NoError(t, s.ClaimPipeline(ctx, msg.PipeID, msg.ToAgent))
+	require.NoError(t, s.CompletePipeline(ctx, msg.PipeID, msg.ToAgent, "done", ""))
+
+	// RFC3339Nano renders cutoff without a fractional component (..03Z), while
+	// the terminal instant has milliseconds (..03.001Z). Plain TEXT comparison
+	// orders '.' before 'Z' and used to purge this objectively newer row.
+	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET terminal_at=? WHERE pipe_id=?`,
+		formatTime(cutoff.Add(time.Millisecond)), msg.PipeID)
+	require.NoError(t, err)
+	purged, err := s.PurgePipelines(ctx, cutoff)
+	require.NoError(t, err)
+	require.Zero(t, purged)
+	_, err = s.GetPipeline(ctx, msg.PipeID)
+	require.NoError(t, err)
+
+	// The strict retention boundary remains intact: an actually older terminal
+	// instant is reclaimed once it falls before the same cutoff.
+	_, err = s.writeExecContext(ctx, `UPDATE pipeline_messages SET terminal_at=? WHERE pipe_id=?`,
+		formatTime(cutoff.Add(-time.Millisecond)), msg.PipeID)
+	require.NoError(t, err)
+	purged, err = s.PurgePipelines(ctx, cutoff)
+	require.NoError(t, err)
+	require.Equal(t, 1, purged)
+}
+
 func TestPipelineDirectAgentRouting(t *testing.T) {
 	ctx := context.Background()
 	s, err := NewSQLiteStore(ctx, ":memory:")

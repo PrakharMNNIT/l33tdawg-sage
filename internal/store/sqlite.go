@@ -6782,9 +6782,9 @@ func (s *SQLiteStore) PurgePipelines(ctx context.Context, olderThan time.Time) (
 			WHERE pipe_id IN (SELECT p.pipe_id FROM pipeline_messages p
 				WHERE p.status IN ('completed','expired','failed')
 				AND p.pipe_id NOT LIKE 'msg-%'
-				AND COALESCE(p.terminal_at,p.completed_at,p.created_at) < ?
+				AND julianday(COALESCE(p.terminal_at,p.completed_at,p.created_at)) < julianday(?)
 				AND NOT EXISTS (SELECT 1 FROM message_read_receipts receipt
-					WHERE receipt.message_id=p.pipe_id AND receipt.read_at >= ?)
+					WHERE receipt.message_id=p.pipe_id AND julianday(receipt.read_at) >= julianday(?))
 				AND NOT EXISTS (SELECT 1 FROM pipeline_transport_outbox keep
 					WHERE keep.pipe_id=p.pipe_id AND (keep.state='pending'
 						OR (keep.state='failed' AND keep.reported_at IS NULL)))
@@ -6797,9 +6797,9 @@ func (s *SQLiteStore) PurgePipelines(ctx context.Context, olderThan time.Time) (
 		res, err := tx.writeExecContext(ctx, `DELETE FROM pipeline_messages
 			WHERE status IN ('completed', 'expired', 'failed')
 			AND pipe_id NOT LIKE 'msg-%'
-			AND COALESCE(terminal_at,completed_at,created_at) < ?
+			AND julianday(COALESCE(terminal_at,completed_at,created_at)) < julianday(?)
 			AND NOT EXISTS (SELECT 1 FROM message_read_receipts receipt
-				WHERE receipt.message_id=pipeline_messages.pipe_id AND receipt.read_at >= ?)
+				WHERE receipt.message_id=pipeline_messages.pipe_id AND julianday(receipt.read_at) >= julianday(?))
 			AND NOT EXISTS (SELECT 1 FROM pipeline_transport_outbox keep
 				WHERE keep.pipe_id=pipeline_messages.pipe_id AND (keep.state='pending'
 					OR (keep.state='failed' AND keep.reported_at IS NULL)))
