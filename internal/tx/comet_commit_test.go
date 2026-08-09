@@ -253,16 +253,27 @@ func TestBroadcastCometCommitReturnsBoundRejectionVerdicts(t *testing.T) {
 		{"finalizeblock", `{"result":{"check_tx":{"code":0},"tx_result":{"code":47,"log":"already pending"},"hash":"` + bound + `","height":"9"}}`, 47},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			_, key, keyErr := ed25519.GenerateKey(nil)
+			if keyErr != nil {
+				t.Fatal(keyErr)
+			}
 			rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = fmt.Fprint(w, tc.body)
 			}))
 			defer rpc.Close()
-			got, err := BroadcastCometCommit(context.Background(), rpc.URL, nil, encoded)
+			got, err := BroadcastCometCommit(context.Background(), rpc.URL, key, encoded)
 			if err != nil || got == nil {
 				t.Fatalf("got result=%+v err=%v", got, err)
 			}
 			if got.CheckTxCode != tc.code && got.TxResultCode != tc.code {
 				t.Fatalf("verdict codes check=%d finalize=%d, want %d", got.CheckTxCode, got.TxResultCode, tc.code)
+			}
+			pub := key.Public().(ed25519.PublicKey)
+			registeredMu.Lock()
+			_, stillRegistered := registeredSubmissions[string(pub)]
+			registeredMu.Unlock()
+			if stillRegistered {
+				t.Fatal("hash-bound rejection left the submission registration live")
 			}
 		})
 	}

@@ -130,6 +130,84 @@ func fencedSignerPresent(key ed25519.PrivateKey) bool {
 	return false
 }
 
+func TestBroadcastTxSyncUnprovenResponsesFenceExactSigner(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body func(*http.Request) string
+	}{
+		{"malformed JSON", func(*http.Request) string { return `{"result":` }},
+		{"missing result", func(*http.Request) string { return `{}` }},
+		{"null result", func(*http.Request) string { return `{"result":null}` }},
+		{"missing code", func(r *http.Request) string {
+			return `{"result":{"hash":"` + requestBoundHash(r) + `"}}`
+		}},
+		{"null code", func(r *http.Request) string {
+			return `{"result":{"code":null,"hash":"` + requestBoundHash(r) + `"}}`
+		}},
+		{"missing hash", func(*http.Request) string {
+			return `{"result":{"code":0}}`
+		}},
+		{"null hash", func(*http.Request) string {
+			return `{"result":{"code":0,"hash":null}}`
+		}},
+		{"wrong hash", func(*http.Request) string {
+			return `{"result":{"code":0,"hash":"AB12"}}`
+		}},
+		{"trailing JSON document", func(r *http.Request) string {
+			valid := `{"result":{"code":0,"hash":"` + requestBoundHash(r) + `"}}`
+			return valid + ` {}`
+		}},
+		{"invalid trailing data", func(r *http.Request) string {
+			valid := `{"result":{"code":0,"hash":"` + requestBoundHash(r) + `"}}`
+			return valid + ` garbage`
+		}},
+		{"oversized body", func(r *http.Request) string {
+			valid := `{"result":{"code":0,"hash":"` + requestBoundHash(r) + `"}}`
+			return valid + strings.Repeat(" ", int(tx.CometRPCMaxResponseBytes)+1)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, key, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
+			rpc := fenceResolvingRPC(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = fmt.Fprint(w, tc.body(r))
+			})
+			h := &DashboardHandler{CometBFTRPC: rpc.URL}
+			err = h.signAndBroadcastSyncContext(
+				context.Background(), accessGrantTx(agentIDForKey(key), "sync-unproven"), key)
+			require.Error(t, err)
+			require.Eventually(t, func() bool { return fencedSignerPresent(key) },
+				5*time.Second, 10*time.Millisecond,
+				"unproven sync response released the exact signer: %v", err)
+		})
+	}
+}
+
+func TestBroadcastTxSyncBoundCheckTxRefusalIsDefinitiveWithoutFence(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"result":{"code":4,"log":"nonce too low","hash":"`+requestBoundHash(r)+`"}}`)
+	}))
+	t.Cleanup(rpc.Close)
+
+	h := &DashboardHandler{CometBFTRPC: rpc.URL}
+	err = h.signAndBroadcastSyncContext(
+		context.Background(), accessGrantTx(agentIDForKey(key), "sync-refused"), key)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CheckTx (code 4)")
+	assert.False(t, fencedSignerPresent(key), "hash-bound CheckTx refusal must retire registration")
+}
+
+func requestBoundHash(r *http.Request) string {
+	raw, err := hex.DecodeString(strings.TrimPrefix(r.URL.Query().Get("tx"), "0x"))
+	if err != nil {
+		return ""
+	}
+	sum := tx.CometTxHash(raw)
+	return strings.ToUpper(hex.EncodeToString(sum[:]))
+}
+
 // TestFencedRequestIsReportedAsNotSentNotAsARejection pins the HTTP contract.
 //
 // tx.ErrSignerFenced means NOTHING WAS SIGNED OR SENT. Reporting it as a
@@ -634,7 +712,7 @@ func TestBackgroundProducersAllocateNoncesUnderTheLease(t *testing.T) {
 		nonces = append(nonces, nonce)
 		signers[signer] = struct{}{}
 		mu.Unlock()
-		_, _ = w.Write([]byte(`{"result":{"code":0}}`))
+		_, _ = fmt.Fprintf(w, `{"result":{"code":0,"hash":"%s"}}`, requestBoundHash(r))
 	}))
 	t.Cleanup(rpc.Close)
 

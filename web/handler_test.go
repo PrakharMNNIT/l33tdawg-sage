@@ -2023,7 +2023,7 @@ func TestHandleUpdateAgent_SyncBroadcast_Success(t *testing.T) {
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		broadcastSeen = true
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"result":{"code":0,"hash":"ABC123"}}`)
+		fmt.Fprintf(w, `{"result":{"code":0,"hash":"%s"}}`, requestBoundHash(r))
 	}))
 	defer cometMock.Close()
 
@@ -2142,6 +2142,10 @@ func TestHandleUpdateAgent_NoCometBFT_NoWarning(t *testing.T) {
 func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 	var captured *tx.ParsedTx
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/broadcast_tx_sync" {
+			_, _ = fmt.Fprintf(w, `{"result":{"code":0,"hash":"%s"}}`, requestBoundHash(r))
+			return
+		}
 		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
 		encoded, decErr := hex.DecodeString(raw)
 		require.NoError(t, decErr)
@@ -2185,6 +2189,10 @@ func TestHandleUpdateAgent_PermissionsSignedByGenesisAdmin(t *testing.T) {
 func TestHandleUpdateAgent_AppV22CapabilitiesCommitBeforeSuccess(t *testing.T) {
 	var captured *tx.ParsedTx
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/broadcast_tx_sync" {
+			_, _ = fmt.Fprintf(w, `{"result":{"code":0,"hash":"%s"}}`, requestBoundHash(r))
+			return
+		}
 		raw := strings.TrimPrefix(r.URL.Query().Get("tx"), "0x")
 		encoded, decErr := hex.DecodeString(raw)
 		require.NoError(t, decErr)

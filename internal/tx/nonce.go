@@ -200,12 +200,14 @@ var (
 // LOWER nonce is rejected Code 4 when it finally arrives — exactly the failure
 // this primitive exists to prevent, reintroduced through its own error path.
 //
-// So the release is CONDITIONAL on what submit reports:
-//   - A nil error, or any ordinary error, releases the slot normally. That
-//     covers pre-send failures (sign, encode) and real consensus rejections
-//     (CheckTx / FinalizeBlock non-zero code) — nothing is in flight, so there
-//     is nothing to protect.
-//   - An error wrapped with Indeterminate FENCES the signing key. Later callers
+// So the release is CONDITIONAL on both submit's error and the registration:
+//   - A nil error releases the slot normally.
+//   - An ordinary error releases only when no live RegisterSubmittedTx record
+//     remains. That covers pre-send failures and hash-bound consensus refusals,
+//     whose broadcaster calls ClearSubmittedTx before returning. If an ordinary
+//     error follows registration without a definitive bound verdict, the live
+//     record fences the exact bytes even when the adopter forgot to wrap it.
+//   - An error wrapped with Indeterminate also FENCES the signing key. Later callers
 //     block on the fence instead of allocating past the abandoned nonce, and
 //     ONLY A PROVEN FATE for that exact transaction lifts it — committed, or
 //     definitively refused by consensus. No timer, no budget and no failed probe

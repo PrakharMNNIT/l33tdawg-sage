@@ -642,18 +642,11 @@ func (h *DashboardHandler) signAndBroadcastCommitPrepared(
 // match the allocated order, which is what CometBFT's per-sender ascending-nonce
 // reaping needs to admit a burst intact.
 //
-// The broadcast is /broadcast_tx_sync, so a clean return means CheckTx has RUN
-// — NOT "committed", and not even "admitted": the response body is deliberately
-// never decoded (see broadcastTxSyncContext), so a 200 whose body carries a
-// non-zero CheckTx code (refused, NOT in the mempool) returns nil exactly like
-// an admission. network_handler.go's handleCreateAgent spells out what that
-// costs a caller that forgets it: a dependent transaction broadcast on the
-// strength of a nil here can reference one that never entered the mempool and
-// be orphaned. What a clean return IS good for is ordering — the lease has
-// serialized this key's broadcasts, and the mempool preserves a single sender's
-// broadcast order. A transport fault here is exactly as ambiguous as one on the
-// commit path: the bytes may already be in the mempool and about to commit. So
-// it fences, identically.
+// The broadcast is /broadcast_tx_sync, so a clean return means CometBFT supplied
+// a complete, exact-hash-bound CheckTx verdict — NOT that the transaction later
+// committed. A non-zero CheckTx code is definitive for these bytes and retires
+// their registration; every transport, status, RPC, decode, shape, trailing-data,
+// or hash-binding failure stays live and fences through WithNonceLease.
 func (h *DashboardHandler) signAndBroadcastSyncContext(ctx context.Context, ptx *tx.ParsedTx, key ed25519.PrivateKey) error {
 	var txErr error
 	leaseErr := tx.WithNonceLease(ctx, key, func(nonce uint64) error {
@@ -688,67 +681,22 @@ func (h *DashboardHandler) signAndBroadcastSyncContext(ctx context.Context, ptx 
 	return txErr
 }
 
-// broadcastTxSyncContext submits via /broadcast_tx_sync and classifies the
-// ambiguity at its origin, the same way broadcastTxCommitWebContext does.
-//
-// EVERY failure this can see is indeterminate, and that is not laziness. The
-// request URL carries the encoded transaction, so by the time any of these
-// errors exists the bytes have been handed to the kernel; a broken connection,
-// an HTTP-level refusal from a proxy, and CometBFT's own 500 for "tx already
-// exists in cache" are all consistent with the transaction sitting in a mempool
-// about to commit. Releasing the key on any of them would let the next caller
-// allocate a higher nonce and overtake it.
-//
-// The CheckTx verdict in the response body is deliberately NOT decoded here.
-// This helper's callers are audit-record producers that never consumed it, and
-// decoding it would create a second place where a non-zero code has to be
-// classified as permanent or transient — a decision that belongs in
-// internal/tx's reconciler, which already has the exact bytes and can re-ask.
-func broadcastTxSyncContext(parent context.Context, cometRPC string, signingKey ed25519.PrivateKey, txBytes []byte) (err error) {
+// broadcastTxSyncContext uses the shared strict sync protocol. Keeping the
+// decoder, single-document check, exact-hash binding, and registration lifecycle
+// in internal/tx prevents web from accepting a merely-HTTP-200 response that
+// proves nothing about these bytes.
+func broadcastTxSyncContext(parent context.Context, cometRPC string, signingKey ed25519.PrivateKey, txBytes []byte) error {
 	if parent == nil {
 		parent = context.Background()
 	}
-	u := fmt.Sprintf("%s/broadcast_tx_sync?tx=0x%s", strings.TrimRight(cometRPC, "/"), hex.EncodeToString(txBytes))
 	ctx, cancel := context.WithTimeout(parent, syncBroadcastTimeout)
 	defer cancel()
-
-	req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, u, nil) // #nosec G107 -- internal CometBFT RPC
-	if reqErr != nil {
-		// Pre-send: the URL was never dialed, so nothing is in flight and this
-		// must NOT fence. Still not %w — the parse error quotes the URL.
-		return fmt.Errorf("create broadcast request: %s", commitTransportCause(reqErr))
+	result, err := tx.BroadcastCometSync(ctx, cometRPC, signingKey, txBytes)
+	if err != nil {
+		return err
 	}
-	// Same post-send panic guard as broadcastTxCommitWebContext, for the same
-	// reason: a panic once the bytes may be on the wire is an unobserved
-	// outcome, not a definitive failure. As there, the registration below
-	// means even an unwinding panic would be fenced on these exact bytes by
-	// the lease's own guard; this recover is the cleaner conversion — a typed
-	// indeterminate error instead of a panic unwinding through a background
-	// producer. Only the panic value's TYPE is reported.
-	onWire := false
-	defer func() {
-		r := recover()
-		if r == nil {
-			return
-		}
-		if !onWire {
-			panic(r)
-		}
-		err = indeterminateCommit(fmt.Errorf("broadcast tx: panicked (%T) after the transaction was handed to the transport", r))
-	}()
-	onWire = true
-	// Same registration as the commit path, at the same instant, for the same
-	// reason: a panic after this function returns but before submit does must
-	// fence these bytes, not release the slot over them.
-	tx.RegisterSubmittedTx(signingKey, txBytes, tx.CometTxResolver(cometRPC))
-	resp, doErr := http.DefaultClient.Do(req)
-	if doErr != nil {
-		// Not %w: see commitTransportCause. The bytes are already gone.
-		return indeterminateCommit(fmt.Errorf("broadcast tx: %s", commitTransportCause(doErr)))
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return indeterminateCommit(fmt.Errorf("broadcast tx: CometBFT returned status %d", resp.StatusCode))
+	if result.CheckTxCode != 0 {
+		return fmt.Errorf("tx rejected by CheckTx (code %d): %s", result.CheckTxCode, result.CheckTxLog)
 	}
 	return nil
 }
