@@ -320,33 +320,6 @@ type MemoryDetailResponse struct {
 	LinkedMemories          []memory.MemoryLink     `json:"linked_memories,omitempty"`
 }
 
-// CometBFT broadcast_tx_commit response structure.
-// Unlike broadcast_tx_sync, this waits for the block to be finalized,
-// ensuring ABCI Commit has flushed writes before we return.
-type cometCommitResponse struct {
-	Result struct {
-		CheckTx struct {
-			Code int    `json:"code"`
-			Log  string `json:"log"`
-		} `json:"check_tx"`
-		TxResult struct {
-			Code int    `json:"code"`
-			Data string `json:"data"`
-			Log  string `json:"log"`
-		} `json:"tx_result"`
-		Hash   string `json:"hash"`
-		Height int64  `json:"height,string"`
-	} `json:"result"`
-	Error *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		// Data carries the actionable detail for mempool rejections —
-		// CometBFT returns message="Internal error" with the real cause
-		// ("mempool is full: number of txs N (max: M)") in error.data.
-		Data string `json:"data"`
-	} `json:"error"`
-}
-
 // --- Domain Access Enforcement -----------------------------------------------
 
 // checkDomainAccess verifies an agent has the required access level for a domain.

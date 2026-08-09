@@ -829,7 +829,7 @@ func emitFenceEvent(event string, fields ...fenceField) {
 	// would otherwise interleave into one line that neither greps nor parses.
 	fenceLogMu.Lock()
 	defer fenceLogMu.Unlock()
-	fmt.Fprint(fenceLogW, b.String())
+	_, _ = fmt.Fprint(fenceLogW, b.String())
 }
 
 // fenceValueNeedsQuoting decides whether a field value goes into the event

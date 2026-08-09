@@ -39,15 +39,6 @@ func broadcastTimeout() time.Duration {
 	return defaultBroadcastTimeout
 }
 
-// broadcastTxCommit submits tx bytes to the local CometBFT RPC and waits for
-// block finalization, returning (txHash, height). CheckTx and FinalizeBlock
-// rejections surface as errors.
-func (m *Manager) broadcastTxCommit(signingKey ed25519.PrivateKey, txBytes []byte) (string, int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), broadcastTimeout())
-	defer cancel()
-	return m.broadcastTxCommitContext(ctx, signingKey, txBytes)
-}
-
 // broadcastTxCommitContext is the context-aware form used by nonce-lease
 // holders. Sharing one deadline across lease acquisition and Comet admission
 // prevents a timed-out waiter from retaining the per-key lease for an
