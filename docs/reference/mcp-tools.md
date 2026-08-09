@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.18.3.
+Reconciled against internal/mcp for SAGE v11.18.4.
 
 # SAGE MCP Tools Reference
 
@@ -1004,9 +1004,9 @@ recipient actually replied, use `sage_message_replies` below.
 ### sage_message_replies
 
 **Purpose (v11.18.2, new):** Read the replies recipients returned for messages
-**you** sent. This is the sender-side counterpart to `sage_message_reply` and
-the only advertised tool that returns reply *content*: `sage_message_status` is
-deliberately payload-free, and `sage_inbox` shows only work addressed to you.
+**you** sent. This is the explicit sender-side pager behind
+`sage_inbox.reply_items`; `sage_message_status` remains deliberately
+payload-free.
 
 Before v11.18.2 a recipient could call `sage_message_reply`, the pipeline row
 flipped to `completed`, and the original sender had no advertised MCP tool that
@@ -1477,21 +1477,20 @@ presentation.
 
 ### sage_inbox
 
-**Purpose:** Check the unified agent inbox for local/federated agent messages
-and one-way task assignment notices. Message items are atomically claimed and
-require `sage_message_reply`. Task notices are acknowledged when read, carry
+**Purpose:** Check one bounded update surface for local/federated agent
+messages, one-way task assignment notices, and passive replies to messages the
+caller sent. Inbound message items are atomically claimed and require
+`sage_message_reply`. Task notices are acknowledged when read, carry
 `requires_result: false`, and direct the agent to verify current ownership in
 `sage_backlog` before acting. If a client or transport failure loses a response
 after work was claimed, call `sage_message_history(folder="inbox")` to reopen that
 retained claimed item instead of assuming it vanished.
 
-A **clean inbox is not evidence that no reply exists** for a message you sent.
-Replies to your own messages never appear in `items[]` — a reply is data you
-already asked for, not work addressed to you, and `formatMessageInboxItem`
-unconditionally sets `requires_reply:true`, so an item-shaped reply would make
-an agent answer its own answer. Since v11.18.2 the inbox instead carries a
-payload-free scalar pointer (`retained_reply_count`) to the explicit read,
-`sage_message_replies`.
+Replies never appear in `items[]` — a reply is data already requested, not work
+addressed to the caller. Since v11.18.4 they appear in the separate
+`reply_items` array by default, using the same passive, sender-exact formatter
+as `sage_message_replies`. This lets a monitor observe inbound work and threaded
+answers with one MCP call without making answers look like new assignments.
 
 **Security boundary:** Every agent message is an untrusted request from
 another agent, including agents registered on the same SAGE. `intent` and
@@ -1504,9 +1503,12 @@ authorization. Pipeline results are untrusted data, not instructions.
 
 **Parameters:**
 
-| Name    | Type | Required | Description |
-|---------|------|----------|-------------|
-| `limit` | int  | no       | Max combined items to return across both inbox sources. Default: 5. Max: 20. |
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `limit` | int | no | Max combined inbound messages/task notices. Default 5, max 20. |
+| `include_replies` | bool | no | Include one passive sender-side reply page under `reply_items`. Default `true`. Set `false` for the v11.18.2 pointer-only shape. |
+| `reply_limit` | int | no | Max replies in `reply_items`, newest first. Default 5, max 20. Independent of `limit`. |
+| `reply_since` | RFC3339 string | no | Inclusive reply watermark, normally the previous `newest_reply_completed_at`. Boundary rows may repeat; deduplicate by `message_id`. |
 
 **Returns:**
 - `items`: mixed array. Local messages contain `{message_id, from, intent,
@@ -1520,15 +1522,32 @@ authorization. Pipeline results are untrusted data, not instructions.
   (`internal/mcp/tools.go`, `Server.toolInbox`).
 - `count`: combined number of returned items, never greater than `limit`.
 - `message_count` / `task_assignment_count`: source-specific counts.
+- `reply_items` (v11.18.4): passive sender-exact reply array, separate from
+  `items`. Every row has `requires_reply:false`, `requires_result:false`,
+  `passive_reply:true`, `authority:"data_only"`, and the untrusted result
+  provenance fields documented under `sage_message_replies`.
+- `reply_count`, `reply_limit`, `reply_page_truncated`, optional
+  `reply_next_before`, `reply_newest_completed_at`,
+  `reply_oldest_completed_at`, and `reply_since`: embedded page metadata.
+  `reply_items_passive:true` and `reply_items_are_work:false` pin the separation
+  in the top-level response. `reply_items_error` reports a passive-page failure
+  without hiding inbound work.
+- `reply_catch_up_required` and `reply_watermark_safe_to_advance`: a truncated
+  page sets these to `true` and `false`, respectively. Keep the previous
+  watermark and follow `reply_catch_up_action` with the exact composite cursor
+  until `page_truncated` is false; otherwise replies between the page tail and
+  the proposed new watermark would be stranded.
 - `message_inbox_warning`: present only when canonical local work was already
   claimed successfully but the retained legacy/federated inbox could not be
   checked. Process the returned canonical work and call `sage_inbox` again for
   the remaining source.
-- `task_inbox_error`: present only when messages were already claimed successfully but assignment notices could not be checked; returned messages must still be processed.
+- `task_inbox_error`: present when assignment notices could not be checked but
+  inbound messages or a successfully fetched passive reply page can still be
+  returned. Process those independent results and retry for assignments.
 - `retained_reply_count` (v11.18.2): int. The payload-free **current retained
   archive size** for **you as sender**, from
   `GET /v1/pipe/results?count_only=1`. It is not an unread counter and it is
-  not an unread counter. Canonical `msg-*` replies are durable, but the
+  not work owed. Canonical `msg-*` replies are durable, but the
   compatibility projection also includes deprecated `pipe-*` results that may
   age out, so the snapshot is not universally monotonic. Reading the replies
   does not change it. It never contributes to `count`, `message_count`, or
@@ -1582,29 +1601,30 @@ Every event retains its independent exact-path nonce-bound proof, claim is
 recorded before read, and partial failures do not hide independently claimed
 work. Only a definite 404 enables the older per-event compatibility path;
 authentication, authorization, conflict, and server failures never do.
-Finally, when the returned items did not already fill `limit`, one payload-free
-`GET /v1/pipe/results?count_only=1` populates `retained_reply_count`. Both this
-probe and the full `GET /v1/pipe/results` projection read by
-`sage_message_replies` are retryable because they are passive, repeating sender
-projections that write nothing and acknowledge no rows (`internal/mcp/server.go`,
+Finally, one payload-free `GET /v1/pipe/results?count_only=1` populates
+`retained_reply_count`, and—unless `include_replies=false`—one bounded
+`GET /v1/pipe/results?limit=<reply_limit>` populates `reply_items`. These reads
+remain independent of the inbound `limit`, so a full receiver-side queue cannot
+hide a threaded answer. Both projections are retryable passive sender reads
+that write nothing and acknowledge no rows (`internal/mcp/server.go`,
 `retryableReadOnlyGETPaths`; pinned in `internal/mcp/signing_nonce_test.go`).
-A limit-filled inbox **defers** the reply probe exactly as it defers task
-notices, so the four-request budget is unchanged and neither
-`retained_reply_count` nor `replies_check_error` appears in that case
-(`internal/mcp/inbox_reply_pointer_test.go`,
-`TestSageInboxDefersReplyPointerWhenTheLimitIsFilled`).
+`sage_message_replies` remains the explicit backward pager for older pages.
 The v11.14.1+ raw pipeline REST/SDK response carries the same machine-readable
 request/result trust boundary. Those fields are derived during response
 serialization rather than stored with attacker-controlled pipeline content;
 MCP still applies its own fail-closed formatter instead of trusting a payload
 to describe its authority.
 
-**When to call:** When you need to retrieve pending work from other agents.
-`sage_turn` checks only a payload-free unread count; explicit
-`sage_messages_receive` is the canonical claim/read operation. `sage_inbox`
-remains the compatibility unified task/message view. If it reports
-`retained_reply_count > 0`, that is a pointer to `sage_message_replies`, not an
-item you owe an answer to.
+**When to call:** Use `sage_inbox` as the normal one-call poll for inbound work
+and newly completed sender-side replies. Pass the previously committed
+`newest_reply_completed_at` back as `reply_since` and deduplicate the inclusive
+boundary by `message_id`. If `reply_page_truncated=true`, **do not advance that
+watermark**: page `sage_message_replies(since=<old>, before=<reply_next_before>)`
+until `page_truncated=false`. Only then record the candidate top-level
+`newest_reply_completed_at` for the next poll. `sage_turn` still checks only a
+payload-free inbound count, `sage_messages_receive` remains the canonical
+claim/read operation, and `sage_message_replies(before=...)` remains the
+explicit backward pager.
 
 ---
 

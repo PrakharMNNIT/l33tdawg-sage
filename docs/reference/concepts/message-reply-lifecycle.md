@@ -1,4 +1,4 @@
-Reconciled against SAGE v11.18.2 code. Cite file:line or file + symbol when behavior is non-obvious.
+Reconciled against SAGE v11.18.4 code. Cite file:line or file + symbol when behavior is non-obvious.
 
 # Message and Reply Lifecycle — who can see a reply, and where
 
@@ -11,8 +11,10 @@ result was reachable only through the passive REST projection
 `GET /v1/pipe/results` — which **no MCP tool called**. `sage_inbox` shows work
 addressed to you, not answers to you. `sage_message_status` is sender-only but
 deliberately payload-free. So in MCP and bookend clients the reply was invisible
-and work round-tripped. v11.18.2 closes that with one advertised tool,
-`sage_message_replies`, and a payload-free pointer inside `sage_inbox`.
+and work round-tripped. v11.18.2 closed that with the advertised
+`sage_message_replies` tool and a payload-free pointer inside `sage_inbox`.
+v11.18.4 makes the normal inbox poll reply-aware, so callers no longer need a
+second MCP round trip merely to see a threaded answer.
 
 ---
 
@@ -31,8 +33,9 @@ and work round-tripped. v11.18.2 closes that with one advertised tool,
                             │                          result stored, encrypted
                             │                          at rest in the content vault
                             ▼
-  sage_message_replies ◄── GET /v1/pipe/results
-  sage_inbox pointer   ◄── GET /v1/pipe/results?count_only=1
+  sage_message_replies   ◄── GET /v1/pipe/results
+  sage_inbox reply_items ◄── GET /v1/pipe/results
+  sage_inbox pointer     ◄── GET /v1/pipe/results?count_only=1
 ```
 
 `pending → claimed → completed` are the only workflow states a reply passes
@@ -59,7 +62,7 @@ correct.
 | Surface | Returns the reply body? | Who can read it there | Returns the original request payload? | Rows |
 |---|---|---|---|---|
 | `sage_message_replies` (v11.18.2) | **yes**, truncated at 8,000 runes | the original sender only | **never** | completed only, fully pageable via the composite `before` cursor |
-| `sage_inbox` | no — scalars only (`retained_reply_count`, `newest_reply_completed_at`) | the original sender only | no | replies are never items |
+| `sage_inbox` (v11.18.4) | **yes**, under separate passive `reply_items` | the original sender only | no | completed only; newest bounded page, independent of inbound work |
 | `sage_message_status` | no, by design | the original sender only | no | one exact ID |
 | `sage_message_history(folder="outbox")` | yes, untruncated | the original sender only | **yes** (`payload_authority:"request_only"`) | pending, claimed, completed, expired |
 | `sage_turn` | no | — | no | payload-free inbox flag only |
@@ -68,10 +71,10 @@ correct.
 
 Three things follow from this table.
 
-**A clean `sage_inbox` is not evidence that no reply exists.** The two surfaces
-answer different questions: the inbox answers "what work is addressed to me?",
-the reply read answers "what came back from what I sent?". Conflating them is
-exactly the failure this release fixes.
+Since v11.18.4 a normal `sage_inbox` call answers both questions without
+conflating them: `items` is work addressed to the caller, while `reply_items`
+is passive data returned from messages the caller sent. The page is bounded;
+use `sage_message_replies(before=...)` for older replies.
 
 **`sage_message_replies` is the payload-free view; the outbox is the full one.**
 Use the tool for the routine read. Drop to `sage_message_history(folder="outbox")`
@@ -206,7 +209,8 @@ read as a fresh request for work), and none of the inbox `from` vocabulary.
 
 This is also why replies never enter `sage_inbox.items[]`:
 `formatMessageInboxItem` (`internal/mcp/tools.go`) unconditionally sets
-`requires_reply: true`. The inbox instead carries a few scalars:
+`requires_reply: true`. Since v11.18.4 the inbox returns them under a separate
+`reply_items` key using `formatMessageReplyItem`, plus the existing scalars:
 
 - `retained_reply_count` — the **current retained archive size, not an unread
   counter**. Canonical `msg-*` replies are durable, but the compatibility
@@ -229,7 +233,16 @@ This is also why replies never enter `sage_inbox.items[]`:
   as "you have no replies".
 
 None of these contributes to `count`, `message_count`, or
-`task_assignment_count`. Pinned by `internal/mcp/inbox_reply_pointer_test.go`.
+`task_assignment_count`; neither does `reply_count`. `reply_items_passive:true`
+and `reply_items_are_work:false` make that distinction machine-readable. Pinned
+by `internal/mcp/inbox_reply_pointer_test.go`.
+
+The newest timestamp is a candidate watermark, not permission to skip a full
+page. When `reply_page_truncated=true`, callers keep their prior watermark and
+drain the inclusive window using the exact composite `reply_next_before` cursor
+until `page_truncated=false`. `reply_watermark_safe_to_advance` and
+`reply_catch_up_action` make this fail-safe sequence explicit; advancing early
+would strand replies between the returned page tail and the new timestamp.
 
 **The pointer must never assert pendency.** Because the count can never return
 to zero, a string such as "N replies are waiting. Read them with

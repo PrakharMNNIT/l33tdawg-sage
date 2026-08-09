@@ -51,6 +51,32 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.4
+
+**One inbox poll now surfaces both new work and threaded answers.**
+`sage_inbox` returns replies to messages you sent under the separate passive
+`reply_items` key by default, while genuine inbound work remains under `items`.
+Reply rows never inflate work counts and explicitly require no reply. Inclusive
+`reply_since` polling prevents same-millisecond loss; truncated pages fail safe
+with an exact composite-cursor catch-up action and forbid advancing the
+watermark until the window is drained.
+
+**Release builders now enforce the patched Go floor.** Root and `natter`
+modules require Go 1.25.12, CI and release jobs resolve that exact `go.mod`
+toolchain, every Go container builder uses 1.25.12, and pinned
+`govulncheck v1.6.0` scans both modules before either CI fan-in or release
+publication can pass.
+
+**Legacy pipeline retention compares time chronologically and conservatively.**
+SQLite purge eligibility no longer relies on variable-width RFC3339 text.
+Cutoffs are floored to SQLite's millisecond precision, so ambiguous
+same-millisecond rows are retained rather than deleted early; malformed read
+evidence also retains fail safe.
+
+The consensus ceiling remains app-v26; **v11.18.4 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.4`. SDK 11.18.4.
+
 ## What's New in v11.18.3
 
 **Same-key consensus submissions now fail closed across every producer in the
@@ -1514,7 +1540,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.3`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.4`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

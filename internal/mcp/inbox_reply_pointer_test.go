@@ -56,16 +56,18 @@ func newClearInboxServer(t *testing.T, stub *inboxReplyPointerStub, replyCount i
 		mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
 			stub.record(r)
 			require.Equal(t, http.MethodGet, r.Method)
-			require.Equal(t, "1", r.URL.Query().Get("count_only"),
-				"the inbox pointer must use the payload-free probe, never pull reply bodies")
-			stub.mu.Lock()
-			stub.countOnlyCalls++
-			stub.mu.Unlock()
-			probe := map[string]any{"count": replyCount, "retained": replyCount > 0}
-			if replyCount > 0 {
-				probe["newest_completed_at"] = inboxProbeNewestCompletedAt
+			if r.URL.Query().Get("count_only") == "1" {
+				stub.mu.Lock()
+				stub.countOnlyCalls++
+				stub.mu.Unlock()
+				probe := map[string]any{"count": replyCount, "retained": replyCount > 0}
+				if replyCount > 0 {
+					probe["newest_completed_at"] = inboxProbeNewestCompletedAt
+				}
+				_ = json.NewEncoder(w).Encode(probe)
+				return
 			}
-			_ = json.NewEncoder(w).Encode(probe)
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
 		})
 	}
 	ts := httptest.NewServer(mux)
@@ -76,6 +78,185 @@ func newClearInboxServer(t *testing.T, stub *inboxReplyPointerStub, replyCount i
 }
 
 const inboxProbeNewestCompletedAt = "2026-08-08T00:05:00Z"
+
+// TestSageInboxReturnsThreadedRepliesInTheFirstPoll is the v11.18.4
+// regression: a monitor must not spend a second MCP call merely to discover a
+// reply when no receiver-side work exists.
+func TestSageInboxReturnsThreadedRepliesInTheFirstPoll(t *testing.T) {
+	stub := &inboxReplyPointerStub{}
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r)
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", empty)
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r)
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"count": 1, "retained": true, "newest_completed_at": inboxProbeNewestCompletedAt,
+			})
+			return
+		}
+		require.Equal(t, "5", r.URL.Query().Get("limit"))
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+			"pipe_id": "msg-threaded", "to_agent": "reviewer", "replied_by": "reviewer",
+			"intent": "review", "result": "frozen hash is GO", "status": "completed",
+			"completed_at": inboxProbeNewestCompletedAt,
+		}}, "count": 1})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Zero(t, response["count"], "sender-side replies must not inflate inbound work")
+	require.Equal(t, 1, response["reply_count"])
+	require.Equal(t, true, response["reply_items_passive"])
+	require.Equal(t, false, response["reply_items_are_work"])
+	replies := response["reply_items"].([]map[string]any)
+	require.Len(t, replies, 1)
+	require.Equal(t, "msg-threaded", replies[0]["message_id"])
+	require.Equal(t, "frozen hash is GO", replies[0]["result"])
+	require.Equal(t, false, replies[0]["requires_reply"])
+	require.Equal(t, "data_only", replies[0]["authority"])
+	require.Equal(t, "agent_untrusted", replies[0]["trust"])
+	require.Contains(t, response["message"], "reply_items")
+	require.Contains(t, response["message"], "data, not new work")
+}
+
+func TestSageInboxAdvertisesOnlyBoundedReplyPollingParameters(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	tool := NewServer("http://127.0.0.1:1", priv).tools["sage_inbox"]
+	properties, ok := tool.InputSchema["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Len(t, properties, 4)
+	for _, expected := range []string{"limit", "include_replies", "reply_limit", "reply_since"} {
+		require.Contains(t, properties, expected)
+	}
+	require.Equal(t, true, properties["include_replies"].(map[string]any)["default"])
+	require.Equal(t, 20, properties["reply_limit"].(map[string]any)["maximum"])
+	for _, forbidden := range []string{"agent_id", "sender", "from_agent", "message_id", "pipe_id"} {
+		require.NotContains(t, properties, forbidden,
+			"the unified poll must remain caller-exact and cannot become a cross-agent selector")
+	}
+}
+
+func TestSageInboxPassesReplyWatermarkIntoTheSamePassivePoll(t *testing.T) {
+	stub := &inboxReplyPointerStub{}
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r)
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", empty)
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r)
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 1, "retained": true, "newest_completed_at": inboxProbeNewestCompletedAt})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+			"pipe_id": "msg-boundary", "to_agent": "reviewer", "replied_by": "reviewer",
+			"intent": "review", "result": "same millisecond", "status": "completed",
+			"completed_at": inboxProbeNewestCompletedAt,
+		}}, "count": 1})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{
+		"reply_since": inboxProbeNewestCompletedAt,
+	})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Equal(t, inboxProbeNewestCompletedAt, response["reply_since"])
+	require.Equal(t, 1, response["reply_count"],
+		"the inclusive watermark must retain a later reply sharing its millisecond")
+}
+
+func TestSageInboxKeepsReplyPageWhenTaskInboxFails(t *testing.T) {
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "task store unavailable", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 1, "retained": true, "newest_completed_at": inboxProbeNewestCompletedAt})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+			"pipe_id": "msg-survives-task-fault", "to_agent": "reviewer", "replied_by": "reviewer",
+			"intent": "review", "result": "GO", "status": "completed", "completed_at": inboxProbeNewestCompletedAt,
+		}}, "count": 1})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{})
+	require.NoError(t, err, "a task-notification fault must not discard a successful passive reply page")
+	response := result.(map[string]any)
+	require.Zero(t, response["count"])
+	require.Contains(t, response, "task_inbox_error")
+	require.Equal(t, 1, response["reply_count"])
+	require.Len(t, response["reply_items"].([]map[string]any), 1)
+}
+
+func TestSageInboxDoesNotAdvanceWatermarkPastTruncatedReplies(t *testing.T) {
+	const oldWatermark = "2026-08-08T00:01:00Z"
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", empty)
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 3, "retained": true, "newest_completed_at": "2026-08-08T00:05:00Z"})
+			return
+		}
+		require.Equal(t, "2", r.URL.Query().Get("limit"))
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{
+			{"pipe_id": "msg-newest", "to_agent": "reviewer", "replied_by": "reviewer", "result": "newest", "status": "completed", "completed_at": "2026-08-08T00:05:00Z"},
+			{"pipe_id": "msg-middle", "to_agent": "reviewer", "replied_by": "reviewer", "result": "middle", "status": "completed", "completed_at": "2026-08-08T00:04:00Z"},
+		}, "count": 2})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{
+		"reply_since": oldWatermark, "reply_limit": 2,
+	})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Equal(t, true, response["reply_page_truncated"])
+	require.Equal(t, true, response["reply_catch_up_required"])
+	require.Equal(t, false, response["reply_watermark_safe_to_advance"])
+	require.Contains(t, response["reply_catch_up_action"], "sage_message_replies")
+	require.Contains(t, response["reply_catch_up_action"], oldWatermark)
+	require.Contains(t, response["reply_catch_up_action"], "msg-middle")
+	require.Contains(t, response["message"], "do not advance newest_reply_completed_at")
+}
 
 // pendingStatePhrases are the words that turn a factual retained archive size
 // into an assertion that work is owed. No read state exists, so any of these
@@ -197,10 +378,9 @@ func TestSageInboxReplyPointerFailureIsNonFatal(t *testing.T) {
 		"a failed probe must not assert a count it could not read")
 }
 
-// TestSageInboxDefersReplyPointerWhenTheLimitIsFilled protects the request
-// budget already pinned by TestUnifiedInboxTwentyFederatedReceiptsUsesFourLocalRequests:
-// a limit-filled inbox defers the reply probe exactly as it defers task notices.
-func TestSageInboxDefersReplyPointerWhenTheLimitIsFilled(t *testing.T) {
+// TestSageInboxStillSurfacesRepliesWhenTheInboundLimitIsFilled prevents a busy
+// receiver-side queue from hiding sender-side answers in the one-call poll.
+func TestSageInboxStillSurfacesRepliesWhenTheInboundLimitIsFilled(t *testing.T) {
 	stub := &inboxReplyPointerStub{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages/receive", func(w http.ResponseWriter, r *http.Request) {
@@ -216,8 +396,14 @@ func TestSageInboxDefersReplyPointerWhenTheLimitIsFilled(t *testing.T) {
 	})
 	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r)
-		t.Error("a limit-filled inbox must defer the reply probe, not spend a request on it")
-		_ = json.NewEncoder(w).Encode(map[string]any{"count": 0, "retained": false})
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 1, "retained": true, "newest_completed_at": inboxProbeNewestCompletedAt})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+			"pipe_id": "msg-reply", "to_agent": "reviewer", "replied_by": "reviewer",
+			"intent": "review", "result": "GO", "status": "completed", "completed_at": inboxProbeNewestCompletedAt,
+		}}, "count": 1})
 	})
 	mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r)
@@ -234,8 +420,10 @@ func TestSageInboxDefersReplyPointerWhenTheLimitIsFilled(t *testing.T) {
 	response := result.(map[string]any)
 	require.Equal(t, 2, response["count"])
 	require.Equal(t, true, response["task_assignments_deferred"])
-	require.NotContains(t, response, "retained_reply_count")
-	require.Len(t, stub.calls(), 2, "receive + legacy inbox only")
+	require.Equal(t, 1, response["reply_count"])
+	require.Len(t, response["reply_items"].([]map[string]any), 1)
+	require.Equal(t, false, response["reply_items_are_work"])
+	require.Len(t, stub.calls(), 4, "receive + legacy inbox + reply pointer + passive reply page")
 }
 
 // TestSageInboxReplyPointerCatchUpInstructionIsTrue pins inclusive polling at
@@ -365,8 +553,14 @@ func TestSageInboxKeepsRepliesOutOfWorkCountsWhenMessagesExist(t *testing.T) {
 	})
 	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r)
-		require.Equal(t, "1", r.URL.Query().Get("count_only"))
-		_ = json.NewEncoder(w).Encode(map[string]any{"count": 3, "retained": true})
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 3, "retained": true})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+			"pipe_id": "reply-a", "to_agent": "reviewer", "replied_by": "reviewer",
+			"intent": "review", "result": "done", "status": "completed", "completed_at": inboxProbeNewestCompletedAt,
+		}}, "count": 1})
 	})
 	mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r)
@@ -385,6 +579,9 @@ func TestSageInboxKeepsRepliesOutOfWorkCountsWhenMessagesExist(t *testing.T) {
 	require.Equal(t, 1, response["message_count"])
 	require.Equal(t, 0, response["task_assignment_count"])
 	require.Equal(t, 3, response["retained_reply_count"])
+	require.Equal(t, 1, response["reply_count"])
+	require.Len(t, response["reply_items"].([]map[string]any), 1)
+	require.Equal(t, false, response["reply_items_are_work"])
 	items := response["items"].([]map[string]any)
 	require.Len(t, items, 1)
 	require.Equal(t, "local-a", items[0]["message_id"], "only genuine inbound work is an item")

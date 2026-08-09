@@ -94,6 +94,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.1 | MCP initialization plus safe schema-v2 skip-ahead lineage recovery; app-v26 remains the ceiling |
 | v11.18.2 | Sender-side reply visibility (`sage_message_replies`); no new app version; app-v26 remains the ceiling |
 | v11.18.3 | Signer fence for same-key nonce ordering; no new app version; app-v26 remains the ceiling |
+| v11.18.4 | One-call reply-aware inbox, exact Go vulnerability gates, conservative pipeline retention; no new app version; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

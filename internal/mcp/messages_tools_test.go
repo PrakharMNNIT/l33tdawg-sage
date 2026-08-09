@@ -538,7 +538,7 @@ func TestUnifiedInboxAtomicallyClaimsAndReadsNegotiatedFederatedReceiptV2(t *tes
 	mu.Unlock()
 }
 
-func TestUnifiedInboxTwentyFederatedReceiptsUsesFourLocalRequests(t *testing.T) {
+func TestUnifiedInboxTwentyFederatedReceiptsUsesSixLocalRequests(t *testing.T) {
 	requests := 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages/receive", func(w http.ResponseWriter, _ *http.Request) {
@@ -597,6 +597,14 @@ func TestUnifiedInboxTwentyFederatedReceiptsUsesFourLocalRequests(t *testing.T) 
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"items": items, "count": len(items)})
 	})
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 0, "retained": false})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
 	mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, _ *http.Request) {
 		requests++
 		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
@@ -614,7 +622,7 @@ func TestUnifiedInboxTwentyFederatedReceiptsUsesFourLocalRequests(t *testing.T) 
 		require.Equal(t, "queued", item["claim_status"])
 		require.Equal(t, "queued", item["read_status"])
 	}
-	require.Equal(t, 4, requests, "receive, legacy inbox, one challenge batch, and one record batch; a full inbox defers task notices")
+	require.Equal(t, 6, requests, "receive, legacy inbox, one challenge batch, one record batch, reply count, and reply page; a full inbox defers only task notices")
 }
 
 func TestFederatedReceiptBatchNeverFallsBackOnAuthorizationFailure(t *testing.T) {
