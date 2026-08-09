@@ -419,7 +419,7 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_message_replies": {
 			Name: "sage_message_replies",
-			Description: "Read the replies recipients returned for messages YOU sent. This is the sender-side counterpart of sage_message_reply and the only advertised tool that returns reply content: sage_message_status is deliberately payload-free and sage_inbox shows only work addressed to you. " +
+			Description: "Read and page the replies recipients returned for messages YOU sent. This is the explicit sender-side pager behind sage_inbox.reply_items; sage_message_status remains deliberately payload-free. " +
 				"Passive and safe to repeat: it claims, acknowledges, and re-queues nothing, so a retry after a lost response returns the identical page. " +
 				"Scope is your exact signed identity — there is no parameter naming another agent or a specific message. " +
 				"Attribute every reply to its replied_by field, not to addressed_to: the agent that answered is not always the agent you addressed. " +
