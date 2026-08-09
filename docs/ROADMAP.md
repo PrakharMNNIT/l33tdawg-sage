@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.3 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.4 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -14,13 +14,34 @@ retaining a compatibility fallback for clients that skip initialization. It
 also corrects the exceptional app-v21 → app-v22 recovery lane so proven
 skip-ahead transitions remain virtual, evidence-bound history rather than
 synthetic applied-upgrade records. Existing app-v22 through app-v26 chains are
-not rewritten. v11.18.3 adds the process-wide signer fence described below.
-The supported consensus ceiling remains app-v26; **v11.18.3 does not introduce app-v27**.
+not rewritten. v11.18.3 adds the process-wide signer fence described below;
+v11.18.4 adds one-call reply-aware inbox polling, mandatory exact-toolchain
+vulnerability gates, and conservative millisecond pipeline retention.
+The supported consensus ceiling remains app-v26; **v11.18.4 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.4 patch
+
+v11.18.4 makes `sage_inbox` the normal one-call coordination poll: inbound work
+stays under `items`, while replies to messages the caller sent appear under
+separate passive `reply_items` and never affect work counts. Inclusive
+watermarks protect same-millisecond replies. A full page exposes an exact
+composite-cursor catch-up action and makes the watermark explicitly unsafe to
+advance until the bounded window is drained. Successfully fetched replies also
+survive an independent task-notification endpoint failure.
+
+The release raises the root and `natter` Go floor to 1.25.12, resolves that
+exact toolchain in CI, release, CodeQL, and consensus fault workflows, pins Go
+container builders to 1.25.12, and makes pinned root+natter `govulncheck` scans
+mandatory before build or publication fan-in. It also fixes legacy
+`PurgePipelines` comparisons: SQLite cutoffs are conservatively normalized to
+millisecond precision, preventing an ambiguous newer terminal row from being
+deleted early while preserving atomic outbox/parent cleanup. There is no new
+consensus application version; app-v26 remains the ceiling.
 
 ## v11.18.3 patch
 
