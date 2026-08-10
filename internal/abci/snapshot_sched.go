@@ -312,6 +312,15 @@ func (s *SnapshotScheduler) TakeVerified(
 		return nil, fmt.Errorf("another snapshot is already in progress; retry after it finishes")
 	}
 	defer s.endFlight()
+	checkContext := func(stage string) error {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("pre-upgrade snapshot canceled %s: %w", stage, err)
+		}
+		return nil
+	}
+	if err := checkContext("before capture"); err != nil {
+		return nil, err
+	}
 
 	snapshotDir := filepath.Join(s.cfg.DataDir, "snapshots", fmt.Sprintf("%d", height))
 	var manifest *snapshot.Manifest
@@ -362,7 +371,15 @@ func (s *SnapshotScheduler) TakeVerified(
 			_ = candidate.Discard()
 		}
 	}
+	if err := checkContext("after capture"); err != nil {
+		discardCandidate()
+		return nil, err
+	}
 	if err := s.verifyTransitionSnapshot(snapshotDir, manifest, height, appHash); err != nil {
+		discardCandidate()
+		return nil, err
+	}
+	if err := checkContext("after verification"); err != nil {
 		discardCandidate()
 		return nil, err
 	}
@@ -372,7 +389,15 @@ func (s *SnapshotScheduler) TakeVerified(
 			return nil, err
 		}
 	}
+	if err := checkContext("after live-state confirmation"); err != nil {
+		discardCandidate()
+		return nil, err
+	}
 	if candidate != nil {
+		if err := checkContext("before publication"); err != nil {
+			discardCandidate()
+			return nil, err
+		}
 		published, err := candidate.Publish()
 		if err != nil {
 			discardCandidate()
@@ -380,12 +405,22 @@ func (s *SnapshotScheduler) TakeVerified(
 		}
 		manifest = published
 	}
+	// Publication is safe and recoverable, but an expired updater request must
+	// never proceed to executable mutation. A deadline racing with the atomic
+	// rename therefore returns cancellation even though the verified recovery
+	// point may already be visible.
+	if err := checkContext("before updater handoff"); err != nil {
+		return nil, err
+	}
 
 	s.mu.Lock()
 	s.lastHeight = height
 	s.lastTime = time.Now()
 	s.mu.Unlock()
 	s.pruneRetention()
+	if err := checkContext("at updater handoff"); err != nil {
+		return nil, err
+	}
 	return manifest, nil
 }
 

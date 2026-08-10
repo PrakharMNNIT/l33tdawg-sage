@@ -17,10 +17,13 @@ import (
 	"time"
 
 	dbm "github.com/cometbft/cometbft-db"
+	abcitypes "github.com/cometbft/cometbft/abci/types"
+	cmtconsensus "github.com/cometbft/cometbft/consensus"
 	cmtcrypto "github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/privval"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
+	cmtproxy "github.com/cometbft/cometbft/proxy"
 	cmtstate "github.com/cometbft/cometbft/state"
 	cmtstore "github.com/cometbft/cometbft/store"
 	cmttypes "github.com/cometbft/cometbft/types"
@@ -31,6 +34,49 @@ import (
 	"github.com/l33tdawg/sage/internal/snapshot"
 	"github.com/l33tdawg/sage/internal/vault"
 )
+
+type restoredReplayProbeApp struct {
+	*abcitypes.BaseApplication
+	mu        sync.Mutex
+	height    int64
+	appHash   []byte
+	nextHash  []byte
+	pending   []byte
+	finalized int
+}
+
+func (a *restoredReplayProbeApp) Info(context.Context, *abcitypes.RequestInfo) (*abcitypes.ResponseInfo, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return &abcitypes.ResponseInfo{LastBlockHeight: a.height, LastBlockAppHash: append([]byte(nil), a.appHash...)}, nil
+}
+
+func (a *restoredReplayProbeApp) FinalizeBlock(_ context.Context, req *abcitypes.RequestFinalizeBlock) (*abcitypes.ResponseFinalizeBlock, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if req.Height != a.height+1 {
+		return nil, fmt.Errorf("replay height=%d, application height=%d", req.Height, a.height)
+	}
+	a.pending = append([]byte(nil), a.nextHash...)
+	a.finalized++
+	results := make([]*abcitypes.ExecTxResult, len(req.Txs))
+	for i := range results {
+		results[i] = &abcitypes.ExecTxResult{Code: abcitypes.CodeTypeOK}
+	}
+	return &abcitypes.ResponseFinalizeBlock{TxResults: results, AppHash: append([]byte(nil), a.pending...)}, nil
+}
+
+func (a *restoredReplayProbeApp) Commit(context.Context, *abcitypes.RequestCommit) (*abcitypes.ResponseCommit, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.pending) == 0 {
+		return nil, errors.New("commit called without a finalized replay block")
+	}
+	a.height++
+	a.appHash = append([]byte(nil), a.pending...)
+	a.pending = nil
+	return &abcitypes.ResponseCommit{}, nil
+}
 
 // seedTestDataDir builds a minimal SAGE data dir that snapshot.Take can
 // consume: badger/, sage.db, cometbft/data + cometbft/config. Returns
@@ -81,6 +127,25 @@ func seedTestDataDir(t *testing.T) (dataDir string, live *badger.DB) {
 }
 
 func seedVerifiedCometState(t *testing.T, dataDir string, height int64, appHash []byte) {
+	seedVerifiedCometStateWithAhead(t, dataDir, height, appHash, 0, nil, nil)
+}
+
+func seedVerifiedCometReplayState(t *testing.T, dataDir string, height int64, appHash []byte, ahead int) {
+	t.Helper()
+	seedVerifiedCometStateWithAhead(t, dataDir, height, appHash, ahead, nil, nil)
+}
+
+func seedVerifiedCometReplayStateWithHeaderHash(t *testing.T, dataDir string, height int64, appHash, replayAppHash []byte) {
+	t.Helper()
+	seedVerifiedCometStateWithAhead(t, dataDir, height, appHash, 1, replayAppHash, nil)
+}
+
+func seedVerifiedCometReplayStateWithEvidence(t *testing.T, dataDir string, height int64, appHash []byte, evidence []cmttypes.Evidence) {
+	t.Helper()
+	seedVerifiedCometStateWithAhead(t, dataDir, height, appHash, 1, nil, evidence)
+}
+
+func seedVerifiedCometStateWithAhead(t *testing.T, dataDir string, height int64, appHash []byte, ahead int, replayAppHash []byte, replayEvidence []cmttypes.Evidence) {
 	t.Helper()
 	configDir := filepath.Join(dataDir, "cometbft", "config")
 	priv := cmtcrypto.GenPrivKey()
@@ -133,6 +198,13 @@ func seedVerifiedCometState(t *testing.T, dataDir string, height int64, appHash 
 	if validateErr := seenCommit.ValidateBasic(); validateErr != nil {
 		t.Fatal(validateErr)
 	}
+	state.LastBlockHeight = height
+	state.LastBlockID = blockID
+	state.LastBlockTime = block.Time
+	state.LastValidators = state.Validators.Copy()
+	state.AppHash = append([]byte(nil), appHash...)
+	capturedState := state
+
 	cometDataDir := filepath.Join(dataDir, "cometbft", "data")
 	blockDB, err := dbm.NewDB("blockstore", dbm.GoLevelDBBackend, cometDataDir)
 	if err != nil {
@@ -140,20 +212,60 @@ func seedVerifiedCometState(t *testing.T, dataDir string, height int64, appHash 
 	}
 	blockStore := cmtstore.NewBlockStore(blockDB)
 	blockStore.SaveBlock(block, parts, seenCommit)
+	blockState := state
+	if replayAppHash != nil {
+		blockState.AppHash = append([]byte(nil), replayAppHash...)
+	}
+	previousCommit := seenCommit
+	for offset := 1; offset <= ahead; offset++ {
+		nextHeight := height + int64(offset)
+		var evidence []cmttypes.Evidence
+		if offset == 1 {
+			evidence = replayEvidence
+		}
+		nextBlock, makeErr := blockState.MakeBlock(nextHeight, nil, previousCommit, evidence, pub.Address())
+		if makeErr != nil {
+			t.Fatal(makeErr)
+		}
+		nextParts, partsErr := nextBlock.MakePartSet(cmttypes.BlockPartSizeBytes)
+		if partsErr != nil {
+			t.Fatal(partsErr)
+		}
+		nextBlockID := cmttypes.BlockID{Hash: nextBlock.Hash(), PartSetHeader: nextParts.Header()}
+		nextVote := &cmttypes.Vote{
+			ValidatorAddress: pub.Address(), ValidatorIndex: 0, Height: nextHeight,
+			Round: 0, Type: cmtproto.PrecommitType, BlockID: nextBlockID, Timestamp: time.Unix(2+int64(offset), 0).UTC(),
+		}
+		nextProtoVote := nextVote.ToProto()
+		if signErr := cmttypes.NewMockPVWithParams(priv, false, false).SignVote(blockState.ChainID, nextProtoVote); signErr != nil {
+			t.Fatal(signErr)
+		}
+		nextSeenCommit := &cmttypes.Commit{
+			Height: nextHeight, Round: 0, BlockID: nextBlockID,
+			Signatures: []cmttypes.CommitSig{{
+				BlockIDFlag: cmttypes.BlockIDFlagCommit, ValidatorAddress: pub.Address(),
+				Timestamp: nextVote.Timestamp, Signature: append([]byte(nil), nextProtoVote.Signature...),
+			}},
+		}
+		if validateErr := nextSeenCommit.ValidateBasic(); validateErr != nil {
+			t.Fatal(validateErr)
+		}
+		blockStore.SaveBlock(nextBlock, nextParts, nextSeenCommit)
+		blockState.LastBlockHeight = nextHeight
+		blockState.LastBlockID = nextBlockID
+		blockState.LastBlockTime = nextBlock.Time
+		blockState.LastValidators = blockState.Validators.Copy()
+		previousCommit = nextSeenCommit
+	}
 	if closeErr := blockStore.Close(); closeErr != nil {
 		t.Fatal(closeErr)
 	}
 
-	state.LastBlockHeight = height
-	state.LastBlockID = blockID
-	state.LastBlockTime = block.Time
-	state.LastValidators = state.Validators.Copy()
-	state.AppHash = append([]byte(nil), appHash...)
 	stateDB, err := dbm.NewDB("state", dbm.GoLevelDBBackend, cometDataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cmtstate.NewStore(stateDB, cmtstate.StoreOptions{}).Save(state); err != nil {
+	if err := cmtstate.NewStore(stateDB, cmtstate.StoreOptions{}).Bootstrap(capturedState); err != nil {
 		t.Fatal(err)
 	}
 	if err := stateDB.Close(); err != nil {
@@ -658,6 +770,229 @@ func TestSnapshotSchedulerTakeVerifiedBindsStateAndRunningBinary(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "snapshots", "77", snapshot.OKSentinel)); err != nil {
 		t.Fatalf("wrong requested hash displaced valid anchor: %v", err)
+	}
+}
+
+func TestTakeVerifiedAcceptsExactCometReplayBoundaryRestoresAndReusesAfterRestart(t *testing.T) {
+	dataDir, db := seedTestDataDir(t)
+	defer func() { _ = db.Close() }()
+	appHash := sha256.Sum256([]byte("smoke:1present"))
+	seedVerifiedCometReplayState(t, dataDir, 77, appHash[:], 1)
+
+	sched := newVerifiedSnapshotScheduler(t, dataDir, db)
+	manifest, err := sched.TakeVerified(context.Background(), 77, appHash[:], "h-plus-one", nil)
+	if err != nil {
+		t.Fatalf("TakeVerified rejected exact H/H+1 replay boundary: %v", err)
+	}
+	if manifest.Height != 77 || !bytes.Equal(manifest.AppHash, appHash[:]) {
+		t.Fatalf("unexpected application recovery tuple: %+v", manifest)
+	}
+
+	snapshotDir := filepath.Join(dataDir, "snapshots", "77")
+	restoredDir := t.TempDir()
+	if height, restoreErr := snapshot.Restore(snapshotDir, restoredDir); restoreErr != nil || height != 77 {
+		t.Fatalf("restore exact H/H+1 snapshot: height=%d err=%v", height, restoreErr)
+	}
+	restoredStateDB, err := dbm.NewDB("state", dbm.GoLevelDBBackend, filepath.Join(restoredDir, "cometbft", "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredStateStore := cmtstate.NewStore(restoredStateDB, cmtstate.StoreOptions{})
+	restoredState, err := restoredStateStore.Load()
+	if err != nil {
+		t.Fatalf("load restored CometBFT state: %v", err)
+	}
+	restoredBlockDB, err := dbm.NewDB("blockstore", dbm.GoLevelDBBackend, filepath.Join(restoredDir, "cometbft", "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredBlocks := cmtstore.NewBlockStore(restoredBlockDB)
+	if restoredState.LastBlockHeight != 77 || restoredBlocks.Height() != 78 {
+		t.Fatalf("restored tuple = state %d / blockstore %d, want 77/78", restoredState.LastBlockHeight, restoredBlocks.Height())
+	}
+
+	// Drive CometBFT's production handshake over the restored databases and a
+	// deterministic ABCI application that honestly reports the captured H
+	// tuple. This exercises the actual ApplyBlock/FinalizeBlock/Commit/state-save
+	// path and proves the recovery point reaches one exact H+1 AppHash.
+	genesis, err := cmttypes.GenesisDocFromFile(filepath.Join(restoredDir, "cometbft", "config", "genesis.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedHash := sha256.Sum256([]byte("restored-replay-height-78"))
+	probeApp := &restoredReplayProbeApp{
+		BaseApplication: abcitypes.NewBaseApplication(),
+		height:          77,
+		appHash:         append([]byte(nil), appHash[:]...),
+		nextHash:        append([]byte(nil), replayedHash[:]...),
+	}
+	appConns := cmtproxy.NewAppConns(cmtproxy.NewLocalClientCreator(probeApp), cmtproxy.NopMetrics())
+	if startErr := appConns.Start(); startErr != nil {
+		t.Fatal(startErr)
+	}
+	handshaker := cmtconsensus.NewHandshaker(restoredStateStore, restoredState, restoredBlocks, genesis)
+	if handshakeErr := handshaker.HandshakeWithContext(context.Background(), appConns); handshakeErr != nil {
+		t.Fatalf("real CometBFT handshake could not replay restored H+1: %v", handshakeErr)
+	}
+	if handshaker.NBlocks() != 1 {
+		t.Fatalf("handshake replayed %d blocks, want exactly one", handshaker.NBlocks())
+	}
+	afterReplay, err := restoredStateStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeApp.mu.Lock()
+	appHeight, appFinalized := probeApp.height, probeApp.finalized
+	appFinalHash := append([]byte(nil), probeApp.appHash...)
+	probeApp.mu.Unlock()
+	replayedMeta := restoredBlocks.LoadBlockMeta(78)
+	if afterReplay.LastBlockHeight != 78 || !bytes.Equal(afterReplay.AppHash, replayedHash[:]) ||
+		replayedMeta == nil || !afterReplay.LastBlockID.Equals(replayedMeta.BlockID) ||
+		appHeight != 78 || appFinalized != 1 || !bytes.Equal(appFinalHash, replayedHash[:]) {
+		t.Fatalf("replayed state/app tuple = state(%d,%x) app(%d,%x,finalized=%d), want exact height 78 hash %x",
+			afterReplay.LastBlockHeight, afterReplay.AppHash, appHeight, appFinalHash, appFinalized, replayedHash)
+	}
+	if stopErr := appConns.Stop(); stopErr != nil {
+		t.Fatal(stopErr)
+	}
+	if closeErr := restoredBlocks.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if closeErr := restoredStateDB.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	// A fresh scheduler (the process-restart shape) must re-verify and reuse
+	// the published snapshot without quarantining or recapturing it.
+	restarted := newVerifiedSnapshotScheduler(t, dataDir, db)
+	if _, restartErr := restarted.TakeVerified(context.Background(), 77, appHash[:], "restart-reuse", nil); restartErr != nil {
+		t.Fatalf("restart could not reuse verified H/H+1 snapshot: %v", restartErr)
+	}
+	entries, err := os.ReadDir(filepath.Join(dataDir, "snapshots"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".invalid-77-") {
+			t.Fatalf("valid H/H+1 snapshot churned into quarantine after restart: %s", entry.Name())
+		}
+	}
+}
+
+func TestTakeVerifiedReplayBoundaryCancelIsReversibleAndRetryable(t *testing.T) {
+	dataDir, db := seedTestDataDir(t)
+	defer func() { _ = db.Close() }()
+	appHash := sha256.Sum256([]byte("smoke:1present"))
+	seedVerifiedCometReplayState(t, dataDir, 77, appHash[:], 1)
+	sched := newVerifiedSnapshotScheduler(t, dataDir, db)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := sched.TakeVerified(canceled, 77, appHash[:], "canceled", nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled capture error = %v, want context cancellation", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "snapshots", "77", snapshot.OKSentinel)); !os.IsNotExist(err) {
+		t.Fatalf("canceled capture published a recovery point: %v", err)
+	}
+	if _, err := sched.TakeVerified(context.Background(), 77, appHash[:], "retry", nil); err != nil {
+		t.Fatalf("retry after canceled H/H+1 capture: %v", err)
+	}
+}
+
+func TestTakeVerifiedCancellationDuringConfirmationCannotPublish(t *testing.T) {
+	dataDir, db := seedTestDataDir(t)
+	defer func() { _ = db.Close() }()
+	appHash := sha256.Sum256([]byte("smoke:1present"))
+	seedVerifiedCometReplayState(t, dataDir, 77, appHash[:], 1)
+	sched := newVerifiedSnapshotScheduler(t, dataDir, db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	confirmed := false
+	_, err := sched.TakeVerified(ctx, 77, appHash[:], "cancel-during-confirm", func(*snapshot.Manifest) error {
+		confirmed = true
+		cancel()
+		return nil
+	})
+	if !confirmed || !errors.Is(err, context.Canceled) {
+		t.Fatalf("confirmation cancellation: confirmed=%v err=%v", confirmed, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dataDir, "snapshots", "77", snapshot.OKSentinel)); !os.IsNotExist(statErr) {
+		t.Fatalf("post-capture cancellation published a recovery point: %v", statErr)
+	}
+	if _, err := sched.TakeVerified(context.Background(), 77, appHash[:], "retry-after-confirm-cancel", nil); err != nil {
+		t.Fatalf("retry after confirmation cancellation: %v", err)
+	}
+}
+
+func TestTakeVerifiedRejectsMalformedAndGreaterThanOneReplayBoundaries(t *testing.T) {
+	appHash := sha256.Sum256([]byte("smoke:1present"))
+	for _, tc := range []struct {
+		name string
+		seed func(*testing.T, string)
+		want string
+	}{
+		{
+			name: "greater than one block ahead",
+			seed: func(t *testing.T, dataDir string) {
+				seedVerifiedCometReplayState(t, dataDir, 77, appHash[:], 2)
+			},
+			want: "only the exact restorable H/H+1 replay boundary is allowed",
+		},
+		{
+			name: "replay header AppHash mismatch",
+			seed: func(t *testing.T, dataDir string) {
+				seedVerifiedCometReplayStateWithHeaderHash(t, dataDir, 77, appHash[:], []byte("wrong-replay-app-hash"))
+			},
+			want: "[provenance_corruption] invalid CometBFT H/H+1 replay provenance (not a transient height race)",
+		},
+		{
+			name: "replay seen commit block ID mismatch",
+			seed: func(t *testing.T, dataDir string) {
+				seedVerifiedCometReplayState(t, dataDir, 77, appHash[:], 1)
+				blockDB, err := dbm.NewDB("blockstore", dbm.GoLevelDBBackend, filepath.Join(dataDir, "cometbft", "data"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				blockStore := cmtstore.NewBlockStore(blockDB)
+				commit := blockStore.LoadSeenCommit(78)
+				if commit == nil {
+					t.Fatal("missing replay seen commit")
+				}
+				commit.BlockID.Hash[0] ^= 0xff
+				if err := blockStore.SaveSeenCommit(78, commit); err != nil {
+					t.Fatal(err)
+				}
+				if err := blockStore.Close(); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "[provenance_corruption] invalid CometBFT H/H+1 replay provenance (not a transient height race)",
+		},
+		{
+			name: "non-empty replay evidence is retryable not silently accepted",
+			seed: func(t *testing.T, dataDir string) {
+				evidence, err := cmttypes.NewMockDuplicateVoteEvidence(1, time.Unix(1, 0).UTC(), "snapshot-test")
+				if err != nil {
+					t.Fatal(err)
+				}
+				seedVerifiedCometReplayStateWithEvidence(t, dataDir, 77, appHash[:], []cmttypes.Evidence{evidence})
+			},
+			want: "[retryable_capture] exact H/H+1 capture cannot yet be proven",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir, db := seedTestDataDir(t)
+			defer func() { _ = db.Close() }()
+			tc.seed(t, dataDir)
+			sched := newVerifiedSnapshotScheduler(t, dataDir, db)
+			_, err := sched.TakeVerified(context.Background(), 77, appHash[:], "invalid-replay-boundary", nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want diagnostic containing %q", err, tc.want)
+			}
+			if _, statErr := os.Stat(filepath.Join(dataDir, "snapshots", "77", snapshot.OKSentinel)); !os.IsNotExist(statErr) {
+				t.Fatalf("invalid replay candidate became visible: %v", statErr)
+			}
+		})
 	}
 }
 
