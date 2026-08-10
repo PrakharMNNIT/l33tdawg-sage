@@ -206,3 +206,12 @@ export function federationConnectionRoute(status) {
   }
   return normalizeFederationRoutePlan({ state: 'unknown' });
 }
+
+export function federationConnectionActionIntent(planOrStatus) {
+  const route = normalizeFederationRoutePlan(planOrStatus);
+  if (route.state === 'legacy_repair_required') return 'pair_again';
+  if (['direct', 'p2p_direct', 'relay', 'degraded', 'old_peer'].includes(route.state)) {
+    return 'toggle_pause';
+  }
+  return 'retry';
+}

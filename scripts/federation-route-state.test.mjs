@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  federationConnectionActionIntent,
   federationConnectionRoute,
   federationRoutePresentation,
   normalizeFederationRoutePlan,
@@ -103,4 +104,11 @@ test('operator Retry diagnostics stay distinct and legacy routes require pairing
     federationRoutePresentation({ state: 'legacy_repair_required' }).detail,
     /pair the two SAGEs again.*will not guess an identity/i,
   );
+});
+
+test('legacy repair routes to re-pair while ordinary failures route to retry', () => {
+  assert.equal(federationConnectionActionIntent({ state: 'legacy_repair_required' }), 'pair_again');
+  assert.equal(federationConnectionActionIntent({ state: 'offline' }), 'retry');
+  assert.equal(federationConnectionActionIntent({ state: 'security_blocked' }), 'retry');
+  assert.equal(federationConnectionActionIntent({ state: 'relay' }), 'toggle_pause');
 });

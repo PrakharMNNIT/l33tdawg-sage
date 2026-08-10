@@ -218,7 +218,10 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 			// HTTPS remains available and is still pinned by the active agreement.
 			routeDial = nil
 		} else {
-			frozenRouteTargets = append([]string(nil), snapshot.Addrs...)
+			// Preserve a non-nil empty slice: nil means a normal caller whose dialer
+			// may load current config, while Retry must stay pinned to exact G even
+			// when G has no usable targets.
+			frozenRouteTargets = append([]string{}, snapshot.Addrs...)
 		}
 	}
 	if routeDial != nil || !p2pOnly {

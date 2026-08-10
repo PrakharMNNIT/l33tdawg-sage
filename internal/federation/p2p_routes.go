@@ -214,14 +214,14 @@ func (m *Manager) ExchangeP2PRoutes(ctx context.Context, remoteChainID string, l
 		return fmt.Errorf("p2p route persistence unavailable")
 	}
 	unlock = ss.LockSyncPolicyRead()
-	_, currentBinding, err := m.currentP2PRouteBinding(ctx, remoteChainID)
+	currentAgreement, currentBinding, err := m.currentP2PRouteBinding(ctx, remoteChainID)
 	if err != nil {
 		unlock()
 		return fmt.Errorf("p2p route binding is no longer active: %w", err)
 	}
-	if currentBinding != expectedBinding {
+	if currentBinding != expectedBinding || !sameRouteAgreement(currentAgreement, agreement) {
 		unlock()
-		return fmt.Errorf("p2p route binding changed before persistence")
+		return fmt.Errorf("p2p route agreement or binding changed before persistence")
 	}
 	err = m.persistRouteSnapshot(remoteChainID, currentBinding, remote)
 	unlock()

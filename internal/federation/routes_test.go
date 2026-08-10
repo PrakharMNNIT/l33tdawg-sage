@@ -556,22 +556,26 @@ func TestRetryPeerStatusFederationOffThenOnKeepsTrustEdge(t *testing.T) {
 	assert.Equal(t, b.chainID, status.ChainID)
 }
 
-func TestRetryPeerStatusHTTP403RouteExchangeStopsBeforeReprobe(t *testing.T) {
-	var routeRequests atomic.Int32
-	a, b, _, statusCalls, binding := newRetryTestPairWithIntercept(t, "", func(w http.ResponseWriter, r *http.Request) bool {
-		if r.URL.Path != "/fed/v1/p2p/routes" {
-			return false
-		}
-		routeRequests.Add(1)
-		http.Error(w, "policy epoch denied", http.StatusForbidden)
-		return true
-	})
-	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
-	_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
-	require.ErrorIs(t, err, ErrRouteExchangeDenied)
-	assert.Equal(t, RouteRecoverySecurityBlocked, RouteRecoveryFailureCode(err))
-	assert.Equal(t, int32(1), routeRequests.Load())
-	assert.Zero(t, statusCalls.Load(), "an authenticated 403 route denial must stop before status re-probe")
+func TestRetryPeerStatusHTTPAuthorizationDenialStopsBeforeReprobe(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var routeRequests atomic.Int32
+			a, b, _, statusCalls, binding := newRetryTestPairWithIntercept(t, "", func(w http.ResponseWriter, r *http.Request) bool {
+				if r.URL.Path != "/fed/v1/p2p/routes" {
+					return false
+				}
+				routeRequests.Add(1)
+				http.Error(w, "policy epoch denied", status)
+				return true
+			})
+			installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
+			_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+			require.ErrorIs(t, err, ErrRouteExchangeDenied)
+			assert.Equal(t, RouteRecoverySecurityBlocked, RouteRecoveryFailureCode(err))
+			assert.Equal(t, int32(1), routeRequests.Load())
+			assert.Zero(t, statusCalls.Load(), "an authenticated route denial must stop before status re-probe")
+		})
+	}
 }
 
 func TestRetryPeerStatusFreezesExactGenerationTargetsBeforeDial(t *testing.T) {
@@ -616,6 +620,37 @@ func TestRetryPeerStatusFreezesExactGenerationTargetsBeforeDial(t *testing.T) {
 	assert.NotEqual(t, g2.Addrs, frozen, "G2 targets must never enter the G recovery request")
 	close(releaseDial)
 	require.NoError(t, <-result)
+}
+
+func TestRetryPeerStatusEmptyFrozenGenerationNeverReloadsNewTargets(t *testing.T) {
+	a, b, _, _, binding := newRetryTestPair(t, joinP2POnlyEndpoint)
+	g := testDirectRouteBundle(t, "192.0.2.42")
+	g2 := testDirectRouteBundle(t, "192.0.2.43")
+	now := time.Now()
+	snapshot := snapshotFromBundle(JoinP2PBundle{
+		PeerID: g.PeerID, Protocol: g.Protocol, Addrs: []string{},
+		Revision: 11, IssuedAt: now.Unix(), ExpiresAt: now.Add(time.Hour).Unix(),
+	}, routeBindingID(binding))
+	a.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle:  func() (JoinP2PBundle, error) { return g, nil },
+		LoadSnapshot: func(string) (RouteSnapshot, bool) { return snapshot, true },
+	})
+	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
+	reloadedCurrent := false
+	var attempted []string
+	a.mgr.SetPeerRouteDialFunc(func(_ context.Context, _ string, targets []string, _ PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+		if targets == nil {
+			reloadedCurrent = true
+			targets = g2.Addrs
+		}
+		attempted = append(attempted, targets...)
+		return PeerRouteDialResult{}, true, errors.New("frozen generation has no route targets")
+	})
+
+	_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+	require.Error(t, err)
+	assert.False(t, reloadedCurrent, "exact-generation empty targets must not collapse to the normal-call nil sentinel")
+	assert.Empty(t, attempted, "G2 targets must never enter an empty G recovery request")
 }
 
 func TestRetryPeerStatusRejectsGenerationChangeDuringStatusResponse(t *testing.T) {
