@@ -827,12 +827,12 @@ func TestTakeVerifiedAcceptsExactCometReplayBoundaryRestoresAndReusesAfterRestar
 		nextHash:        append([]byte(nil), replayedHash[:]...),
 	}
 	appConns := cmtproxy.NewAppConns(cmtproxy.NewLocalClientCreator(probeApp), cmtproxy.NopMetrics())
-	if err := appConns.Start(); err != nil {
-		t.Fatal(err)
+	if startErr := appConns.Start(); startErr != nil {
+		t.Fatal(startErr)
 	}
 	handshaker := cmtconsensus.NewHandshaker(restoredStateStore, restoredState, restoredBlocks, genesis)
-	if err := handshaker.HandshakeWithContext(context.Background(), appConns); err != nil {
-		t.Fatalf("real CometBFT handshake could not replay restored H+1: %v", err)
+	if handshakeErr := handshaker.HandshakeWithContext(context.Background(), appConns); handshakeErr != nil {
+		t.Fatalf("real CometBFT handshake could not replay restored H+1: %v", handshakeErr)
 	}
 	if handshaker.NBlocks() != 1 {
 		t.Fatalf("handshake replayed %d blocks, want exactly one", handshaker.NBlocks())
@@ -852,8 +852,8 @@ func TestTakeVerifiedAcceptsExactCometReplayBoundaryRestoresAndReusesAfterRestar
 		t.Fatalf("replayed state/app tuple = state(%d,%x) app(%d,%x,finalized=%d), want exact height 78 hash %x",
 			afterReplay.LastBlockHeight, afterReplay.AppHash, appHeight, appFinalHash, appFinalized, replayedHash)
 	}
-	if err := appConns.Stop(); err != nil {
-		t.Fatal(err)
+	if stopErr := appConns.Stop(); stopErr != nil {
+		t.Fatal(stopErr)
 	}
 	if closeErr := restoredBlocks.Close(); closeErr != nil {
 		t.Fatal(closeErr)
