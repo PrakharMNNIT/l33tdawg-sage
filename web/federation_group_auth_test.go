@@ -36,6 +36,26 @@ type peerFailureStatusTestDriver struct {
 	route federation.RouteDiagnostics
 }
 
+type peerRetryStatusTestDriver struct {
+	peerStatusTestDriver
+	polls    int
+	retries  int
+	retryErr error
+}
+
+func (d *peerRetryStatusTestDriver) PeerStatus(context.Context, string) (*federation.StatusResponse, error) {
+	d.polls++
+	return &federation.StatusResponse{ChainID: "chain-remote", NetworkName: "polled"}, nil
+}
+
+func (d *peerRetryStatusTestDriver) RetryPeerStatus(context.Context, string) (*federation.StatusResponse, error) {
+	d.retries++
+	if d.retryErr != nil {
+		return nil, d.retryErr
+	}
+	return &federation.StatusResponse{ChainID: "chain-remote", NetworkName: "recovered"}, nil
+}
+
 type groupRefreshTestDriver struct {
 	groupListTestDriver
 	refreshCalls int
@@ -138,6 +158,78 @@ func TestFederationPeerStatusTypesFailureAheadOfHistoricalRoute(t *testing.T) {
 	assert.Empty(t, got.Capabilities, "an unreachable result must not fabricate peer capabilities")
 	assert.Equal(t, federation.RouteKindDirect, got.Route.ActiveKind,
 		"historical diagnostics remain available but must not override the typed failure")
+}
+
+func TestFederationDashboardFailureStatesAreStable(t *testing.T) {
+	tests := []struct {
+		message string
+		want    string
+	}{
+		{"federation transport is disabled", "disabled"},
+		{"peer has no configured p2p route", "route_bundle_missing"},
+		{"p2p route snapshot is expired", "route_bundle_expired"},
+		{"saved direct endpoint is stale", "stale_direct"},
+		{"federation trust generation changed", "trust_generation_mismatch"},
+		{"secure relay unavailable", "relay_unavailable"},
+		{"peer certificate identity mismatch", "security_blocked"},
+		{"legacy federation connection must be paired again to enable secure relay", "legacy_repair_required"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			assert.Equal(t, tc.want, federationDashboardFailureState(errors.New(tc.message), federation.RouteDiagnostics{}))
+		})
+	}
+}
+
+func TestFederationHandlerPreservesTypedManagerRecoveryDiagnostics(t *testing.T) {
+	codes := []string{
+		federation.RouteRecoveryBundleMissing,
+		federation.RouteRecoveryBundleExpired,
+		federation.RouteRecoveryStaleDirect,
+		federation.RouteRecoveryRelayUnavailable,
+		federation.RouteRecoverySecurityBlocked,
+		federation.RouteRecoveryLegacyRepairRequired,
+	}
+	for _, code := range codes {
+		t.Run(code, func(t *testing.T) {
+			h, _ := newTestHandler(t)
+			driver := &peerRetryStatusTestDriver{retryErr: &federation.RouteRecoveryError{
+				Code: code, Err: errors.New("typed manager recovery failure"),
+			}}
+			h.Federation = driver
+			req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/federation/connections/chain-remote/status?retry=1", nil)
+			rr := httptest.NewRecorder()
+			h.handleFedPeerStatus(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code)
+			var response struct {
+				FailureState string `json:"failure_state"`
+			}
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+			assert.Equal(t, code, response.FailureState)
+			assert.Equal(t, 1, driver.retries)
+		})
+	}
+}
+
+func TestFederationPeerStatusSeparatesPollingFromOperatorRetry(t *testing.T) {
+	h, _ := newTestHandler(t)
+	driver := &peerRetryStatusTestDriver{}
+	h.Federation = driver
+
+	poll := httptest.NewRequest(http.MethodGet, "/v1/dashboard/federation/connections/chain-remote/status", nil)
+	pollRecorder := httptest.NewRecorder()
+	h.handleFedPeerStatus(pollRecorder, poll)
+	require.Equal(t, http.StatusOK, pollRecorder.Code)
+	assert.Equal(t, 1, driver.polls)
+	assert.Zero(t, driver.retries)
+
+	retry := httptest.NewRequest(http.MethodGet, "/v1/dashboard/federation/connections/chain-remote/status?retry=1", nil)
+	retryRecorder := httptest.NewRecorder()
+	h.handleFedPeerStatus(retryRecorder, retry)
+	require.Equal(t, http.StatusOK, retryRecorder.Code)
+	assert.Equal(t, 1, driver.polls, "operator Retry must not perform the polling probe first")
+	assert.Equal(t, 1, driver.retries)
+	assert.Contains(t, retryRecorder.Body.String(), "recovered")
 }
 
 func TestFederationGroupRouteAcceptsOnlyOperatorEd25519Signature(t *testing.T) {

@@ -1,7 +1,9 @@
 const ROUTE_STATES = new Set([
   'ready', 'direct', 'p2p_direct', 'relay', 'degraded', 'offline',
   'disabled', 'locked', 'old_peer', 'route_failure', 'trust_failure',
-  'security_blocked', 'unknown',
+  'security_blocked', 'legacy_repair_required', 'trust_generation_mismatch',
+  'route_bundle_missing', 'route_bundle_expired', 'stale_direct',
+  'relay_unavailable', 'unknown',
 ]);
 
 function text(value) {
@@ -81,6 +83,12 @@ export function classifyFederationFailure(error, fallback = 'route_failure') {
   if (ROUTE_STATES.has(explicit)) return explicit;
   const message = `${data.error || ''} ${error && error.error || ''} ${error && error.message || ''}`.toLowerCase();
   if (/vault.*lock|node.*lock|unlock.*sage/.test(message)) return 'locked';
+  if (/legacy federation connection|paired again.*secure relay/.test(message)) return 'legacy_repair_required';
+  if (/trust generation/.test(message)) return 'trust_generation_mismatch';
+  if (/route snapshot.*expired/.test(message)) return 'route_bundle_expired';
+  if (/no configured p2p route|no p2p dialer|route bundle.*missing/.test(message)) return 'route_bundle_missing';
+  if (/relay.*(unavailable|failed)/.test(message)) return 'relay_unavailable';
+  if (/direct.*(stale|unavailable)/.test(message)) return 'stale_direct';
   if (/certificate|spki|pin mismatch|identity mismatch|security block/.test(message)) return 'security_blocked';
   if (/revoked|expired agreement|unknown agreement|trust.*fail|authentication/.test(message)) return 'trust_failure';
   if (/old peer|older peer|unsupported|not implemented/.test(message) || error && error.status === 501) return 'old_peer';
@@ -133,6 +141,24 @@ export function federationRoutePresentation(planOrStatus) {
   if (state === 'security_blocked') {
     return { tone: 'danger', label: 'Security blocked', detail: plan.lastError || 'The peer identity, certificate, or pinned trust proof did not match. SAGE sent no data.' };
   }
+  if (state === 'legacy_repair_required') {
+    return { tone: 'danger', label: 'Pair again required', detail: 'This older connection has no provable authenticated route binding. Pair the two SAGEs again to enable Secure relay; SAGE will not guess an identity.' };
+  }
+  if (state === 'trust_generation_mismatch') {
+    return { tone: 'danger', label: 'Trust changed', detail: 'The saved route belongs to a different trust generation. Review the connection and pair again if the previous link was replaced.' };
+  }
+  if (state === 'route_bundle_expired') {
+    return { tone: 'warn', label: 'Routes expired', detail: plan.lastError || 'The authenticated route snapshot expired and could not be refreshed.' };
+  }
+  if (state === 'route_bundle_missing') {
+    return { tone: 'warn', label: 'Routes missing', detail: plan.lastError || 'No authenticated peer route bundle is available.' };
+  }
+  if (state === 'stale_direct') {
+    return { tone: 'warn', label: 'Direct route stale', detail: plan.lastError || 'The saved Direct endpoint is no longer reachable.' };
+  }
+  if (state === 'relay_unavailable') {
+    return { tone: 'warn', label: 'Secure relay unavailable', detail: plan.lastError || 'No configured Secure relay can currently reach the peer.' };
+  }
   if (state === 'trust_failure') {
     return { tone: 'danger', label: 'Trust check failed', detail: plan.lastError || 'The saved trust agreement is missing, expired, or revoked. Pair again before sharing.' };
   }
@@ -179,4 +205,13 @@ export function federationConnectionRoute(status) {
     });
   }
   return normalizeFederationRoutePlan({ state: 'unknown' });
+}
+
+export function federationConnectionActionIntent(planOrStatus) {
+  const route = normalizeFederationRoutePlan(planOrStatus);
+  if (route.state === 'legacy_repair_required') return 'pair_again';
+  if (['direct', 'p2p_direct', 'relay', 'degraded', 'old_peer'].includes(route.state)) {
+    return 'toggle_pause';
+  }
+  return 'retry';
 }

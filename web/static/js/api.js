@@ -1140,7 +1140,10 @@ export function fedSyncResend(chainId, memoryId) { return fedPost(`/v1/dashboard
 export function fedRevoke(chainId) { return fedPost(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/revoke`); }
 export function fedGetNetworkName() { return fedFetch('/v1/dashboard/federation/network-name'); }
 export function fedSetNetworkName(name) { return fedPut('/v1/dashboard/federation/network-name', { name }); }
-export function fedPeerStatus(chainId) { return fedFetch(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/status`); }
+export function fedPeerStatus(chainId, retry = false) {
+    const suffix = retry ? '?retry=1' : '';
+    return fedFetch(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/status${suffix}`);
+}
 
 // N-member Sharing & Sync group control plane. These routes remain
 // operator-only and SQLite-only; the UI surfaces 403/501 instead of silently

@@ -302,9 +302,11 @@ type Manager struct {
 	routeStatus                   map[string]RouteDiagnostics
 	localRouteRevision            uint64
 	routeRefreshMu                sync.Mutex
-	routeRefreshActive            map[string]bool
+	routeRefreshActive            map[string]*routeRefreshCall
 	routeRefreshLast              map[string]time.Time
 	routeRefreshFn                func(context.Context, string, JoinP2PBundle) error
+	routeRetryMu                  sync.Mutex
+	routeRetryActive              map[string]*peerStatusRetryCall
 	routeRefresherMu              sync.Mutex
 	routeRefresherCancel          context.CancelFunc
 	routeRefresherDone            chan struct{}
@@ -751,8 +753,9 @@ func NewManager(cfg Config) *Manager {
 		joins:                       NewJoinStore(),
 		guestDrafts:                 make(map[string]*guestDraft),
 		routeStatus:                 make(map[string]RouteDiagnostics),
-		routeRefreshActive:          make(map[string]bool),
+		routeRefreshActive:          make(map[string]*routeRefreshCall),
 		routeRefreshLast:            make(map[string]time.Time),
+		routeRetryActive:            make(map[string]*peerStatusRetryCall),
 	}
 	m.transportDisabled.Store(cfg.Disabled)
 	if m.federatedGuestStore == nil {

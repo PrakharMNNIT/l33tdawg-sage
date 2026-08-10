@@ -44,16 +44,16 @@ func (m *Manager) currentP2PRouteBinding(ctx context.Context, remoteChainID stri
 	if ss == nil {
 		return nil, p2pRouteBinding{}, fmt.Errorf("p2p route exchange requires the SQLite store backend")
 	}
-	peerAgentID, err := m.resolvePeerOperatorAgentID(ctx, agreement)
-	if err != nil {
-		return nil, p2pRouteBinding{}, err
-	}
 	control, err := ss.GetSyncControl(ctx, remoteChainID)
 	if err != nil {
 		return nil, p2pRouteBinding{}, fmt.Errorf("read p2p route binding: %w", err)
 	}
 	if control == nil {
 		return nil, p2pRouteBinding{}, fmt.Errorf("connection has no active p2p route binding")
+	}
+	peerAgentID, err := m.resolvePeerOperatorAgentID(ctx, agreement)
+	if err != nil {
+		return nil, p2pRouteBinding{}, err
 	}
 	if control.RemoteChainID != remoteChainID || control.BindingState != "active" ||
 		control.PolicyEpoch == "" || control.RemoteCAPin != hex.EncodeToString(agreement.PeerPubKey) ||
@@ -195,6 +195,10 @@ func (m *Manager) ExchangeP2PRoutes(ctx context.Context, remoteChainID string, l
 	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented {
 		return fmt.Errorf("peer does not support roaming routes")
 	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return routeRecoveryError(RouteRecoverySecurityBlocked,
+			fmt.Errorf("%w (HTTP %d): %s", ErrRouteExchangeDenied, status, truncate(body, 200)))
+	}
 	if status != http.StatusOK {
 		return fmt.Errorf("peer route exchange returned %d: %s", status, truncate(body, 200))
 	}
@@ -210,14 +214,14 @@ func (m *Manager) ExchangeP2PRoutes(ctx context.Context, remoteChainID string, l
 		return fmt.Errorf("p2p route persistence unavailable")
 	}
 	unlock = ss.LockSyncPolicyRead()
-	_, currentBinding, err := m.currentP2PRouteBinding(ctx, remoteChainID)
+	currentAgreement, currentBinding, err := m.currentP2PRouteBinding(ctx, remoteChainID)
 	if err != nil {
 		unlock()
 		return fmt.Errorf("p2p route binding is no longer active: %w", err)
 	}
-	if currentBinding != expectedBinding {
+	if currentBinding != expectedBinding || !sameRouteAgreement(currentAgreement, agreement) {
 		unlock()
-		return fmt.Errorf("p2p route binding changed before persistence")
+		return fmt.Errorf("p2p route agreement or binding changed before persistence")
 	}
 	err = m.persistRouteSnapshot(remoteChainID, currentBinding, remote)
 	unlock()
