@@ -417,3 +417,58 @@ func TestOutboundRouteResponseAfterCompletedRevokeCannotReAddRoute(t *testing.T)
 	assert.False(t, clientRoutePresent, "completed revoke must leave no route installed")
 	routeMu.Unlock()
 }
+
+func TestOutboundRouteResponseAfterAgreementChangeCannotPersistStaleRoute(t *testing.T) {
+	a := newTestChain(t, "route-client-agreement-change")
+	b := newTestChain(t, "route-server-agreement-change")
+	server := startListener(t, b)
+	federate(t, a, b, server.URL, []string{"original"}, 4, 0)
+	federate(t, b, a, "https://unused.invalid", nil, 4, 0)
+	agreement := bindP2PRouteControl(t, a.mgr, b.chainID, hex.EncodeToString(b.agentPub), "epoch-client-server")
+	bindP2PRouteControl(t, b.mgr, a.chainID, hex.EncodeToString(a.agentPub), "epoch-server-client")
+
+	clientBundle := testRouteBundle(t, "203.0.113.50")
+	serverBundle := testRouteBundle(t, "203.0.113.51")
+	responseBlocked := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	b.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return serverBundle, nil },
+		Persist: func(string, []string) error {
+			close(responseBlocked)
+			<-releaseResponse
+			return nil
+		},
+	})
+	clientPersistCalls := 0
+	a.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return clientBundle, nil },
+		Persist: func(string, []string) error {
+			clientPersistCalls++
+			return nil
+		},
+	})
+
+	exchangeDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { exchangeDone <- a.mgr.ExchangeP2PRoutes(ctx, b.chainID, clientBundle) }()
+	select {
+	case <-responseBlocked:
+	case <-ctx.Done():
+		t.Fatal("peer did not reach its delayed route response")
+	}
+
+	require.NoError(t, a.badger.SetCrossFed(
+		b.chainID, agreement.Endpoint, agreement.PeerPubKey, agreement.MaxClearance,
+		agreement.ExpiresAt, []string{"changed"}, agreement.AllowedDepts, agreement.Status,
+	))
+	close(releaseResponse)
+	select {
+	case exchangeErr := <-exchangeDone:
+		require.Error(t, exchangeErr)
+		assert.Contains(t, exchangeErr.Error(), "agreement or binding changed before persistence")
+	case <-ctx.Done():
+		t.Fatal("route exchange did not finish after response was released")
+	}
+	assert.Zero(t, clientPersistCalls, "a response authorized by the old agreement must not reach Persist")
+}

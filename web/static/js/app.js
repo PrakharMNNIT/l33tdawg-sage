@@ -42,6 +42,7 @@ import {
 } from './appv23-linked-messages.js';
 import {
     classifyFederationFailure,
+    federationConnectionActionIntent,
     federationConnectionRoute,
     federationRoutePresentation,
     normalizeFederationRoutePlan,
@@ -18264,6 +18265,7 @@ function federationConnectionAction(route, paused) {
     }
     if (route.state === 'locked') return 'Retry after unlock';
     if (route.state === 'security_blocked' || route.state === 'trust_failure') return 'Review trust';
+    if (route.state === 'legacy_repair_required') return 'Pair again required';
     return 'Retry connection';
 }
 
@@ -18421,7 +18423,7 @@ function FederationPage() {
         const peerName = conn.peer_name || 'Other SAGE';
         setBusyChain(chain);
         try {
-            const status = await fedPeerStatus(chain);
+            const status = await fedPeerStatus(chain, true);
             setConnectionReachability(current => ({ ...current, [chain]: status }));
             if (status.reachable) {
                 const route = federationConnectionRoute(status);
@@ -18525,6 +18527,7 @@ function FederationPage() {
                     const route = federationConnectionRoute(status);
                     const routeView = federationRoutePresentation(route);
                     const routeUsable = ['direct', 'p2p_direct', 'relay', 'degraded', 'old_peer'].includes(route.state);
+                    const actionIntent = federationConnectionActionIntent(route);
                     const actionLabel = status && status.checking
                         ? 'Checking…'
                         : federationConnectionAction(route, c.sharing_paused);
@@ -18546,7 +18549,11 @@ function FederationPage() {
                         <button class="btn fed-conn-off ${!routeUsable || c.sharing_paused ? 'btn-primary' : ''}"
                             disabled=${busyChain === c.remote_chain_id || (status && status.checking)}
                             aria-label=${`${actionLabel} with ${c.peer_name || 'Other SAGE'}`}
-                            onClick=${() => !routeUsable ? reconnect(c) : pause(c, !c.sharing_paused)}>${busyChain === c.remote_chain_id ? 'Working…' : actionLabel}</button>
+                            onClick=${() => actionIntent === 'pair_again'
+                                ? beginGuestRejoin(c)
+                                : actionIntent === 'retry'
+                                    ? reconnect(c)
+                                    : pause(c, !c.sharing_paused)}>${busyChain === c.remote_chain_id ? 'Working…' : actionLabel}</button>
                     </div>
                     ${openChain === c.remote_chain_id && html`<div id=${`fed-connection-${c.remote_chain_id}`}>
                         <${FedPermissionsPanel} conn=${c} connectionStatus=${status} revokeBusy=${busyChain === c.remote_chain_id} onRevoke=${() => revoke(c)} />
