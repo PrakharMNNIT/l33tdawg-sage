@@ -1,3 +1,5 @@
+<!-- Verified against SAGE v11.18.6 federation behavior. -->
+
 # Connect your SAGE to another network
 
 This guide shows you how to link your whole SAGE to someone else's whole SAGE, then independently choose which existing domains may cross that trusted link. The two brains can connect on the same LAN or across the internet. In the app this lives under the **Federation** section (the federation icon in the sidebar). The transport introduced in v11.6 carries the same pinned mTLS protocol over libp2p, with direct-path discovery, NAT traversal, and Circuit Relay v2 fallback. The relay only carries encrypted bytes; it never receives the federation keys or plaintext memories.

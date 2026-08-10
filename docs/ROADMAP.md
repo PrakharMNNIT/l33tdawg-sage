@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.5 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.6 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -19,12 +19,48 @@ v11.18.4 adds one-call reply-aware inbox polling, mandatory exact-toolchain
 vulnerability gates, and conservative millisecond pipeline retention.
 v11.18.5 closes the remaining installed-binary/MCP-session skew by handing an
 unread request to the replacement runtime before stale tools can execute it.
-The supported consensus ceiling remains app-v26; **v11.18.5 does not introduce app-v27**.
+v11.18.6 adds exact CometBFT H and H/H+1 updater snapshot
+provenance/replay-boundary proof, bounded exact-generation federation Retry,
+and safe fingerprinting for memory-reassign failure logs. The supported
+consensus ceiling remains app-v26;
+**v11.18.6 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.6 patch
+
+v11.18.6 makes updater snapshot publication and reuse prove both supported
+CometBFT layouts. Application Badger and persisted consensus state must match
+at `H` and agree on the application hash. A blockstore committed through `H`
+is accepted only after its `H` block ID and seen commit match that state. If
+the blockstore is durably one block ahead at `H+1`, SAGE additionally verifies
+the complete block and part identity, direct-parent and state-derived header
+fields, last and seen commits, validator signatures, and CometBFT's replay-time
+block validation. Regression coverage restores the candidate and runs the real
+CometBFT handshaker, proving exactly one replayed block and safe restart reuse.
+Malformed or more-than-one-ahead provenance is rejected, and an invalid prior
+publication is quarantined before a valid replacement can be published.
+Cancellation always blocks executable updater handoff, although a safe snapshot
+may already have been atomically published. Non-empty `H+1` evidence is
+retryable until application and state catch up.
+
+Federation's operator Retry is now a separate bounded recovery contract rather
+than an alias for ordinary status polling. Concurrent waiters share one refresh
+and one authenticated re-probe, route targets remain frozen to the captured
+JOIN generation, security denials stop the workflow, and agreement/binding
+changes before or during the response invalidate it. Stable typed diagnostics
+drive Retry versus Pair again without retrying generic mutating requests.
+
+Memory-reassignment broadcast-failure logs now use fixed 96-bit truncated
+SHA-256 fingerprints (24 lowercase hexadecimal characters) instead of raw
+request-controlled agent IDs. This closes the two CodeQL log-injection findings
+while retaining a correlation handle. There is no new consensus application
+version. The process-local signer-fence residual is
+unchanged: crash/restart and independent signing processes remain outside the
+guarantee until durable cross-process pre-broadcast intent lands.
 
 ## v11.18.5 patch
 
