@@ -37,6 +37,7 @@ import (
 
 	dbm "github.com/cometbft/cometbft-db"
 	cmtjson "github.com/cometbft/cometbft/libs/json"
+	cmtlog "github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/privval"
 	cmtstate "github.com/cometbft/cometbft/state"
@@ -413,19 +414,112 @@ func verifyCometState(archivePath, backend string, expectedHeight int64, expecte
 	}
 	blockStore := cmtstore.NewBlockStore(blockDB)
 	defer func() { _ = blockStore.Close() }()
-	if blockStore.Height() != expectedHeight {
-		return fmt.Errorf("blockstore height=%d, expected %d", blockStore.Height(), expectedHeight)
+	blockHeight := blockStore.Height()
+	if blockHeight != expectedHeight && blockHeight != expectedHeight+1 {
+		return fmt.Errorf("unsupported or corrupt CometBFT capture: blockstore height=%d, application/state height=%d (only the exact restorable H/H+1 replay boundary is allowed)", blockHeight, expectedHeight)
 	}
+	if err := verifyCommittedCometTip(blockStore, state, expectedHeight); err != nil {
+		return err
+	}
+	if blockHeight == expectedHeight+1 {
+		if err := verifyCometReplayBoundary(blockStore, state, expectedHeight+1, expectedAppHash); err != nil {
+			return fmt.Errorf("invalid CometBFT H/H+1 replay provenance (not a transient height race): %w", err)
+		}
+	}
+	return nil
+}
+
+// verifyCommittedCometTip binds the persisted CometBFT state tuple at H to
+// the exact block ID and seen commit retained in the blockstore. This remains
+// mandatory even when the blockstore has already durably staged H+1.
+func verifyCommittedCometTip(blockStore *cmtstore.BlockStore, state cmtstate.State, expectedHeight int64) error {
 	meta := blockStore.LoadBlockMeta(expectedHeight)
 	if meta == nil || !meta.BlockID.Equals(state.LastBlockID) {
-		return errors.New("blockstore tip does not match state LastBlockID")
+		return errors.New("blockstore committed tip does not match state LastBlockID")
+	}
+	if err := meta.ValidateBasic(); err != nil {
+		return fmt.Errorf("blockstore committed tip metadata is invalid: %w", err)
 	}
 	seenCommit := blockStore.LoadSeenCommit(expectedHeight)
 	if seenCommit == nil || seenCommit.Height != expectedHeight || !seenCommit.BlockID.Equals(state.LastBlockID) {
-		return errors.New("blockstore tip is missing the matching seen commit")
+		return errors.New("blockstore committed tip is missing the matching seen commit")
 	}
 	if err := seenCommit.ValidateBasic(); err != nil {
-		return fmt.Errorf("blockstore tip seen commit is invalid: %w", err)
+		return fmt.Errorf("blockstore committed tip seen commit is invalid: %w", err)
+	}
+	return nil
+}
+
+// verifyCometReplayBoundary proves the one-block-ahead layout CometBFT itself
+// supports during startup handshake: application and state stores are at H,
+// while the blockstore has durably saved the complete, committed block H+1.
+// The restored node can therefore replay exactly one block. Merely observing a
+// height delta of one is insufficient; every identity and state-derived header
+// field needed by replay is checked before the snapshot can be published.
+func verifyCometReplayBoundary(blockStore *cmtstore.BlockStore, state cmtstate.State, replayHeight int64, expectedAppHash []byte) error {
+	meta := blockStore.LoadBlockMeta(replayHeight)
+	if meta == nil {
+		return fmt.Errorf("replay block %d metadata is missing", replayHeight)
+	}
+	if err := meta.ValidateBasic(); err != nil {
+		return fmt.Errorf("replay block %d metadata is invalid: %w", replayHeight, err)
+	}
+	if !meta.BlockID.IsComplete() {
+		return fmt.Errorf("replay block %d has an incomplete block ID", replayHeight)
+	}
+
+	block := blockStore.LoadBlock(replayHeight)
+	if block == nil {
+		return fmt.Errorf("replay block %d is missing", replayHeight)
+	}
+	if err := block.ValidateBasic(); err != nil {
+		return fmt.Errorf("replay block %d is invalid: %w", replayHeight, err)
+	}
+	if block.Height != replayHeight || !bytes.Equal(block.Hash(), meta.BlockID.Hash) {
+		return fmt.Errorf("replay block %d does not match its blockstore identity", replayHeight)
+	}
+	parts, err := block.MakePartSet(cmttypes.BlockPartSizeBytes)
+	if err != nil {
+		return fmt.Errorf("rebuild replay block %d part set: %w", replayHeight, err)
+	}
+	if !parts.Header().Equals(meta.BlockID.PartSetHeader) {
+		return fmt.Errorf("replay block %d part set does not match its block ID", replayHeight)
+	}
+
+	if block.ChainID != state.ChainID || !block.LastBlockID.Equals(state.LastBlockID) {
+		return fmt.Errorf("replay block %d is not the direct successor of state height %d", replayHeight, state.LastBlockHeight)
+	}
+	if !bytes.Equal(block.AppHash, expectedAppHash) ||
+		!bytes.Equal(block.ValidatorsHash, state.Validators.Hash()) ||
+		!bytes.Equal(block.NextValidatorsHash, state.NextValidators.Hash()) ||
+		!bytes.Equal(block.ConsensusHash, state.ConsensusParams.Hash()) ||
+		!bytes.Equal(block.LastResultsHash, state.LastResultsHash) {
+		return fmt.Errorf("replay block %d header does not match the captured application/state tuple", replayHeight)
+	}
+	if block.LastCommit == nil || block.LastCommit.Height != state.LastBlockHeight || !block.LastCommit.BlockID.Equals(state.LastBlockID) {
+		return fmt.Errorf("replay block %d does not carry the exact commit for state height %d", replayHeight, state.LastBlockHeight)
+	}
+	if err := state.LastValidators.VerifyCommit(state.ChainID, state.LastBlockID, state.LastBlockHeight, block.LastCommit); err != nil {
+		return fmt.Errorf("replay block %d last commit does not verify against captured validators: %w", replayHeight, err)
+	}
+
+	seenCommit := blockStore.LoadSeenCommit(replayHeight)
+	if seenCommit == nil || seenCommit.Height != replayHeight || !seenCommit.BlockID.Equals(meta.BlockID) {
+		return fmt.Errorf("replay block %d is missing its exact matching seen commit", replayHeight)
+	}
+	if err := seenCommit.ValidateBasic(); err != nil {
+		return fmt.Errorf("replay block %d seen commit is invalid: %w", replayHeight, err)
+	}
+	if err := state.Validators.VerifyCommit(state.ChainID, meta.BlockID, replayHeight, seenCommit); err != nil {
+		return fmt.Errorf("replay block %d seen commit does not verify against captured validators: %w", replayHeight, err)
+	}
+	// Run CometBFT's own replay-time state validation last. The explicit
+	// diagnostics above identify the common provenance failures; this closes
+	// the remaining proposer, time, evidence, and header invariants without
+	// executing the application or mutating either captured database.
+	blockExecutor := cmtstate.NewBlockExecutor(nil, cmtlog.NewNopLogger(), nil, nil, cmtstate.EmptyEvidencePool{}, nil)
+	if err := blockExecutor.ValidateBlock(state, block); err != nil {
+		return fmt.Errorf("replay block %d fails CometBFT state validation: %w", replayHeight, err)
 	}
 	return nil
 }
