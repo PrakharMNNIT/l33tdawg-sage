@@ -749,10 +749,20 @@ loose height tolerance. Verification binds the state tuple and AppHash at `H`,
 the `H` block ID and seen commit, then proves the `H+1` block bytes/part set,
 direct-parent ID, state-derived header fields, last commit, seen commit, and
 validator signatures before running CometBFT's own replay-time block validator.
-Any drift greater than one or malformed `H+1` provenance fails before snapshot
-publication or executable mutation (`internal/snapshot/verify.go`
+Because CometBFT v0.38's crash replay uses an empty evidence-pool stub rather
+than rechecking the captured evidence database, the offline updater
+conservatively rejects a non-empty `H+1` evidence list and asks the operator to
+retry after application state catches up; it never labels that block verified.
+Diagnostics mark an unreadable/torn live capture or this evidence limitation as
+`[retryable_capture]`, while tuple, height, block, commit, and AppHash
+mismatches are `[provenance_corruption]`. Any drift greater than one or malformed
+`H+1` provenance fails before snapshot publication or executable mutation
+(`internal/snapshot/verify.go`
 `verifyCommittedCometTip`, `verifyCometReplayBoundary`;
-`internal/abci/snapshot_sched.go` `TakeVerified`).
+`internal/abci/snapshot_sched.go` `TakeVerified`). `TakeVerified` also rechecks
+request cancellation after capture, verification, live-state confirmation,
+immediately before publication, and at updater handoff; a canceled request
+cannot return success and a pre-publication cancellation discards its candidate.
 
 Crash replay is height-bound rather than a nonce bypass. Scoped votes store the
 immutable first decision and its FinalizeBlock height atomically; only an exact

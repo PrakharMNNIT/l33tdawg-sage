@@ -97,6 +97,17 @@ type VerifyOptions struct {
 	ExpectedCometAppHash []byte
 }
 
+const (
+	cometDiagnosticRetryableCapture     = "[retryable_capture]"
+	cometDiagnosticProvenanceCorruption = "[provenance_corruption]"
+)
+
+type retryableCometCaptureError struct {
+	reason string
+}
+
+func (e *retryableCometCaptureError) Error() string { return e.reason }
+
 // Verify checks that the snapshot at dir is structurally complete and
 // functionally restorable. It does NOT modify the snapshot directory.
 //
@@ -387,43 +398,47 @@ func verifyCometState(archivePath, backend string, expectedHeight int64, expecte
 	// updater process.
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("open captured CometBFT databases: %v", recovered)
+			err = fmt.Errorf("%s captured CometBFT databases were unreadable during live verification: %v; retry once after the live commit boundary settles (a repeated failure indicates source corruption)", cometDiagnosticRetryableCapture, recovered)
 		}
 	}()
 	stateDB, err := dbm.NewDB("state", dbm.BackendType(backend), root)
 	if err != nil {
-		return fmt.Errorf("open state DB: %w", err)
+		return fmt.Errorf("%s open captured state DB: %w; retry once after the live commit boundary settles (a repeated failure indicates source corruption)", cometDiagnosticRetryableCapture, err)
 	}
 	state, loadErr := cmtstate.NewStore(stateDB, cmtstate.StoreOptions{}).Load()
 	stateCloseErr := stateDB.Close()
 	if loadErr != nil {
-		return fmt.Errorf("load state DB: %w", loadErr)
+		return fmt.Errorf("%s load captured state DB: %w; retry once after the live commit boundary settles (a repeated failure indicates source corruption)", cometDiagnosticRetryableCapture, loadErr)
 	}
 	if stateCloseErr != nil {
 		return fmt.Errorf("close state DB: %w", stateCloseErr)
 	}
 	if state.LastBlockHeight != expectedHeight || !bytes.Equal(state.AppHash, expectedAppHash) {
-		return fmt.Errorf("state tuple is height=%d AppHash=%x, expected height=%d AppHash=%x", state.LastBlockHeight, state.AppHash, expectedHeight, expectedAppHash)
+		return fmt.Errorf("%s state tuple is height=%d AppHash=%x, expected height=%d AppHash=%x", cometDiagnosticProvenanceCorruption, state.LastBlockHeight, state.AppHash, expectedHeight, expectedAppHash)
 	}
 	if !state.LastBlockID.IsComplete() {
-		return errors.New("state has an incomplete LastBlockID")
+		return fmt.Errorf("%s state has an incomplete LastBlockID", cometDiagnosticProvenanceCorruption)
 	}
 	blockDB, err := dbm.NewDB("blockstore", dbm.BackendType(backend), root)
 	if err != nil {
-		return fmt.Errorf("open blockstore DB: %w", err)
+		return fmt.Errorf("%s open captured blockstore DB: %w; retry once after the live commit boundary settles (a repeated failure indicates source corruption)", cometDiagnosticRetryableCapture, err)
 	}
 	blockStore := cmtstore.NewBlockStore(blockDB)
 	defer func() { _ = blockStore.Close() }()
 	blockHeight := blockStore.Height()
 	if blockHeight != expectedHeight && blockHeight != expectedHeight+1 {
-		return fmt.Errorf("unsupported or corrupt CometBFT capture: blockstore height=%d, application/state height=%d (only the exact restorable H/H+1 replay boundary is allowed)", blockHeight, expectedHeight)
+		return fmt.Errorf("%s blockstore height=%d, application/state height=%d (only the exact restorable H/H+1 replay boundary is allowed)", cometDiagnosticProvenanceCorruption, blockHeight, expectedHeight)
 	}
 	if err := verifyCommittedCometTip(blockStore, state, expectedHeight); err != nil {
-		return err
+		return fmt.Errorf("%s committed state provenance: %w", cometDiagnosticProvenanceCorruption, err)
 	}
 	if blockHeight == expectedHeight+1 {
 		if err := verifyCometReplayBoundary(blockStore, state, expectedHeight+1, expectedAppHash); err != nil {
-			return fmt.Errorf("invalid CometBFT H/H+1 replay provenance (not a transient height race): %w", err)
+			var retryable *retryableCometCaptureError
+			if errors.As(err, &retryable) {
+				return fmt.Errorf("%s exact H/H+1 capture cannot yet be proven: %w", cometDiagnosticRetryableCapture, retryable)
+			}
+			return fmt.Errorf("%s invalid CometBFT H/H+1 replay provenance (not a transient height race): %w", cometDiagnosticProvenanceCorruption, err)
 		}
 	}
 	return nil
@@ -475,6 +490,9 @@ func verifyCometReplayBoundary(blockStore *cmtstore.BlockStore, state cmtstate.S
 	if err := block.ValidateBasic(); err != nil {
 		return fmt.Errorf("replay block %d is invalid: %w", replayHeight, err)
 	}
+	if len(block.Evidence.Evidence) != 0 {
+		return &retryableCometCaptureError{reason: fmt.Sprintf("replay block %d contains %d evidence item(s); offline verification deliberately rejects non-empty evidence because CometBFT's replay stub does not re-check captured evidence-pool expiry/duplicate semantics; retry after application/state reaches the block", replayHeight, len(block.Evidence.Evidence))}
+	}
 	if block.Height != replayHeight || !bytes.Equal(block.Hash(), meta.BlockID.Hash) {
 		return fmt.Errorf("replay block %d does not match its blockstore identity", replayHeight)
 	}
@@ -515,8 +533,9 @@ func verifyCometReplayBoundary(blockStore *cmtstore.BlockStore, state cmtstate.S
 	}
 	// Run CometBFT's own replay-time state validation last. The explicit
 	// diagnostics above identify the common provenance failures; this closes
-	// the remaining proposer, time, evidence, and header invariants without
-	// executing the application or mutating either captured database.
+	// the remaining proposer, time, and header invariants without executing the
+	// application or mutating either captured database. Evidence is proven empty
+	// above because this verifier intentionally has no permissive evidence stub.
 	blockExecutor := cmtstate.NewBlockExecutor(nil, cmtlog.NewNopLogger(), nil, nil, cmtstate.EmptyEvidencePool{}, nil)
 	if err := blockExecutor.ValidateBlock(state, block); err != nil {
 		return fmt.Errorf("replay block %d fails CometBFT state validation: %w", replayHeight, err)

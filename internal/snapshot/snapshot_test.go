@@ -13,10 +13,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	dbm "github.com/cometbft/cometbft-db"
 	cmtcrypto "github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/privval"
@@ -432,6 +434,25 @@ func TestTarZstdSubsetHonorsCanceledContext(t *testing.T) {
 	err := tarZstdSubset(ctx, root, []string{"state.db"}, filepath.Join(t.TempDir(), "comet.tar.zst"), Options{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("tar did not stop on canceled snapshot context: %v", err)
+	}
+}
+
+func TestVerifyCometStateClassifiesUnreadableLiveCaptureAsRetryable(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"state.db", "blockstore.db"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("torn live database capture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	archivePath := filepath.Join(t.TempDir(), "unreadable-live-capture.tar.zst")
+	if err := tarZstdSubset(context.Background(), root, []string{"state.db", "blockstore.db"}, archivePath, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	expectedHash := sha256.Sum256([]byte("expected-app-state"))
+	err := verifyCometState(archivePath, string(dbm.GoLevelDBBackend), 77, expectedHash[:])
+	if err == nil || !strings.Contains(err.Error(), cometDiagnosticRetryableCapture) ||
+		!strings.Contains(err.Error(), "repeated failure indicates source corruption") {
+		t.Fatalf("unreadable live capture diagnostic = %v", err)
 	}
 }
 
