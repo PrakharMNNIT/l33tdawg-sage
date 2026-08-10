@@ -51,6 +51,15 @@ var defaultTemplates = []roleTemplate{
 	{Name: "Custom", Role: "member", Bio: "", Clearance: 1, Avatar: "\U0001F916"},
 }
 
+// memoryReassignLogFingerprint keeps request-controlled agent IDs out of log
+// records while preserving a stable value operators can use to correlate
+// repeated failures. The fixed-size lowercase hex representation cannot carry
+// CR/LF or other control characters into a log sink.
+func memoryReassignLogFingerprint(agentID string) string {
+	digest := sha256.Sum256([]byte(agentID))
+	return hex.EncodeToString(digest[:12])
+}
+
 // RegisterNetworkRoutes registers all /v1/dashboard/network/ routes.
 func (h *DashboardHandler) RegisterNetworkRoutes(r chi.Router) {
 	agentStore, ok := h.store.(AgentStoreProvider)
@@ -1673,8 +1682,8 @@ func (h *DashboardHandler) handleMergeAgent(agentStore store.AgentStore) http.Ha
 				// in SQLite.
 				signCtx, cancelSign := context.WithTimeout(context.Background(), backgroundSigningBudget())
 				if bErr := h.signAndBroadcastSyncContext(signCtx, reassignTx, h.SigningKey); bErr != nil {
-					log.Printf("memory-reassign: on-chain audit record broadcast failed for %s -> %s: %v",
-						req.SourceAgentID, req.TargetAgentID, bErr)
+					log.Printf("memory-reassign: on-chain audit record broadcast failed for source_sha256=%s target_sha256=%s: %v",
+						memoryReassignLogFingerprint(req.SourceAgentID), memoryReassignLogFingerprint(req.TargetAgentID), bErr)
 				}
 				cancelSign()
 			})
