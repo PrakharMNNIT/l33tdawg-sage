@@ -51,6 +51,47 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.6
+
+**Updater snapshots now prove both supported CometBFT layouts before they are
+published or reused.** Application Badger and persisted consensus state must
+match at height `H` and agree on the application hash. A blockstore committed
+through `H` is accepted only after its `H` block ID and seen commit match that
+state. If the blockstore is durably one block ahead at `H+1`, SAGE additionally
+verifies the complete block and part identity, direct-parent and state-derived
+header fields, last and seen commits, validator signatures, and CometBFT's
+replay-time block validation. Regression coverage restores the candidate and
+runs the real CometBFT handshaker, proving exactly one replayed block and safe
+restart reuse. Malformed or more-than-one-ahead provenance is rejected, and an
+invalid prior publication is quarantined before a valid replacement can be
+published. Cancellation always blocks executable updater handoff, although a
+safe snapshot may already have been atomically published. Non-empty `H+1`
+evidence is retryable until application and state catch up.
+
+**Federation Retry now performs one bounded, exact-generation recovery
+workflow.** Concurrent operator clicks share the same route refresh and
+authenticated status probe. Direct and relay targets are frozen to the active
+JOIN generation, HTTP `401`/`403` and certificate/identity failures stop before
+re-probing, and a revoke or re-pair during the response invalidates the result.
+Typed dashboard diagnostics distinguish missing or expired route bundles,
+stale Direct routes, unavailable relays, trust-generation changes, and legacy
+connections that must be paired again. Ordinary polling and mutating requests
+do not enter this retry path.
+
+**Memory-reassignment audit failures no longer place request-controlled agent
+IDs in logs.** The source and target are represented by fixed 96-bit truncated
+SHA-256 fingerprints (24 lowercase hexadecimal characters), preserving stable
+incident correlation without allowing CR/LF or other control characters to
+forge log records.
+
+This patch does not change consensus state or application activation. The
+ceiling remains app-v26; **v11.18.6 introduces no app-v27**. The signer fence
+also remains process-local: unresolved submissions still require proof of fate,
+and crash/restart or a separate signing process is not claimed safe until
+durable cross-process pre-broadcast intent exists.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.6`. SDK 11.18.6.
+
 ## What's New in v11.18.5
 
 **Long-lived stdio MCP sessions now follow an installed SAGE upgrade without
@@ -1573,7 +1614,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.5`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.6`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
