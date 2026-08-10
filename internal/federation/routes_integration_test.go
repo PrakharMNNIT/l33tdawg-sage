@@ -46,7 +46,7 @@ func TestMutatingPeerRequestWritesOnceAfterRouteRace(t *testing.T) {
 	federate(t, a, b, "https://192.0.2.1:44444", nil, 4, 0)
 	federate(t, b, a, "https://unused.invalid", nil, 4, 0)
 	var p2pDials atomic.Int32
-	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, chain string, authenticate PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, chain string, _ []string, authenticate PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
 		p2pDials.Add(1)
 		started := time.Now()
 		conn, err := dialTestServer(ctx, server.URL)
@@ -83,7 +83,7 @@ func TestTLSSecurityFailureFallsBackBeforeRequestWrite(t *testing.T) {
 	federate(t, a, b, bad.URL, nil, 4, 0)
 	federate(t, b, a, "https://unused.invalid", nil, 4, 0)
 	var p2pDials atomic.Int32
-	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, chain string, authenticate PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, chain string, _ []string, authenticate PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
 		p2pDials.Add(1)
 		conn, err := dialTestServer(ctx, valid.URL)
 		result, err := authenticate(ctx, PeerRouteDialResult{Conn: conn, Kind: RouteKindRelay, Target: "valid-relay"}, err)

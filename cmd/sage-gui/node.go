@@ -1938,10 +1938,14 @@ func runServe(startupProof string) (rerr error) {
 			logger.Warn().Err(p2pErr).Msg("federation p2p transport unavailable; direct HTTPS remains active")
 		} else {
 			fedP2P = p2pTransport
-			fedMgr.SetPeerRouteDialFunc(func(dialCtx context.Context, remoteChainID string, authenticate federation.PeerRouteAuthenticator) (federation.PeerRouteDialResult, bool, error) {
-				fedP2PRoutesMu.RLock()
-				targets, routeErr := configuredFederationRouteTargets(cfg.Federation, remoteChainID)
-				fedP2PRoutesMu.RUnlock()
+			fedMgr.SetPeerRouteDialFunc(func(dialCtx context.Context, remoteChainID string, frozenTargets []string, authenticate federation.PeerRouteAuthenticator) (federation.PeerRouteDialResult, bool, error) {
+				targets := append([]string(nil), frozenTargets...)
+				var routeErr error
+				if frozenTargets == nil {
+					fedP2PRoutesMu.RLock()
+					targets, routeErr = configuredFederationRouteTargets(cfg.Federation, remoteChainID)
+					fedP2PRoutesMu.RUnlock()
+				}
 				if routeErr != nil {
 					return federation.PeerRouteDialResult{}, true, routeErr
 				}

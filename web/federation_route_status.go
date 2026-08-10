@@ -15,6 +15,9 @@ func federationDashboardFailureState(err error, route federation.RouteDiagnostic
 	if err == nil {
 		return ""
 	}
+	if code := federation.RouteRecoveryFailureCode(err); code != "" {
+		return code
+	}
 	message := strings.ToLower(err.Error())
 	switch {
 	case errors.Is(err, federation.ErrLegacyRouteBinding),

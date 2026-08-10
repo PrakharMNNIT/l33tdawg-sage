@@ -195,6 +195,10 @@ func (m *Manager) ExchangeP2PRoutes(ctx context.Context, remoteChainID string, l
 	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented {
 		return fmt.Errorf("peer does not support roaming routes")
 	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return routeRecoveryError(RouteRecoverySecurityBlocked,
+			fmt.Errorf("%w (HTTP %d): %s", ErrRouteExchangeDenied, status, truncate(body, 200)))
+	}
 	if status != http.StatusOK {
 		return fmt.Errorf("peer route exchange returned %d: %s", status, truncate(body, 200))
 	}

@@ -377,6 +377,10 @@ func TestRouteRefresherStartsOnceAndStopCancelsInflightRefresh(t *testing.T) {
 }
 
 func newRetryTestPair(t *testing.T, endpoint string) (*testChain, *testChain, *httptest.Server, *atomic.Int32, p2pRouteBinding) {
+	return newRetryTestPairWithIntercept(t, endpoint, nil)
+}
+
+func newRetryTestPairWithIntercept(t *testing.T, endpoint string, intercept func(http.ResponseWriter, *http.Request) bool) (*testChain, *testChain, *httptest.Server, *atomic.Int32, p2pRouteBinding) {
 	t.Helper()
 	a := newTestChain(t, "retry-a")
 	b := newTestChain(t, "retry-b")
@@ -387,6 +391,9 @@ func newRetryTestPair(t *testing.T, endpoint string) (*testChain, *testChain, *h
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/fed/v1/status" {
 			statusCalls.Add(1)
+		}
+		if intercept != nil && intercept(w, r) {
+			return
 		}
 		router.ServeHTTP(w, r)
 	}))
@@ -458,7 +465,7 @@ func TestRetryPeerStatusStaleDirectRecoversThroughExactGenerationRelay(t *testin
 	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
 	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
 	var relayDials atomic.Int32
-	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, chain string, authenticate PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, chain string, _ []string, authenticate PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
 		relayDials.Add(1)
 		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
 		return PeerRouteDialResult{Conn: conn, Kind: RouteKindRelay, Target: "authenticated-test-relay"}, true, err
@@ -500,7 +507,7 @@ func TestRetryPeerStatusRejectsLegacyAndStaleGenerationRoutes(t *testing.T) {
 		a.mgr.SetJoinP2PHooks(hooks)
 		a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
 		var routeDials atomic.Int32
-		a.mgr.SetPeerRouteDialFunc(func(context.Context, string, PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+		a.mgr.SetPeerRouteDialFunc(func(context.Context, string, []string, PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
 			routeDials.Add(1)
 			return PeerRouteDialResult{}, true, errors.New("stale route must not be dialed")
 		})
@@ -547,6 +554,158 @@ func TestRetryPeerStatusFederationOffThenOnKeepsTrustEdge(t *testing.T) {
 	status, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
 	require.NoError(t, err)
 	assert.Equal(t, b.chainID, status.ChainID)
+}
+
+func TestRetryPeerStatusHTTP403RouteExchangeStopsBeforeReprobe(t *testing.T) {
+	var routeRequests atomic.Int32
+	a, b, _, statusCalls, binding := newRetryTestPairWithIntercept(t, "", func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/fed/v1/p2p/routes" {
+			return false
+		}
+		routeRequests.Add(1)
+		http.Error(w, "policy epoch denied", http.StatusForbidden)
+		return true
+	})
+	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
+	_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+	require.ErrorIs(t, err, ErrRouteExchangeDenied)
+	assert.Equal(t, RouteRecoverySecurityBlocked, RouteRecoveryFailureCode(err))
+	assert.Equal(t, int32(1), routeRequests.Load())
+	assert.Zero(t, statusCalls.Load(), "an authenticated 403 route denial must stop before status re-probe")
+}
+
+func TestRetryPeerStatusFreezesExactGenerationTargetsBeforeDial(t *testing.T) {
+	a, b, server, _, binding := newRetryTestPair(t, "https://127.0.0.1:1")
+	g := testDirectRouteBundle(t, "192.0.2.40")
+	g2 := testDirectRouteBundle(t, "192.0.2.41")
+	now := time.Now()
+	snapshot := snapshotFromBundle(JoinP2PBundle{
+		PeerID: g.PeerID, Protocol: g.Protocol, Addrs: g.Addrs,
+		Revision: 10, IssuedAt: now.Unix(), ExpiresAt: now.Add(time.Hour).Unix(),
+	}, routeBindingID(binding))
+	var snapshotMu sync.RWMutex
+	a.mgr.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle: func() (JoinP2PBundle, error) { return g, nil },
+		LoadSnapshot: func(string) (RouteSnapshot, bool) {
+			snapshotMu.RLock()
+			defer snapshotMu.RUnlock()
+			return snapshot, true
+		},
+	})
+	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
+	dialStarted := make(chan []string, 1)
+	releaseDial := make(chan struct{})
+	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, _ string, targets []string, _ PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+		dialStarted <- append([]string(nil), targets...)
+		<-releaseDial
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+		return PeerRouteDialResult{Conn: conn, Kind: RouteKindP2PDirect, Target: targets[0]}, true, err
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+		result <- err
+	}()
+	frozen := <-dialStarted
+	snapshotMu.Lock()
+	snapshot.PeerID = g2.PeerID
+	snapshot.Addrs = append([]string(nil), g2.Addrs...)
+	snapshot.Revision++
+	snapshotMu.Unlock()
+	assert.Equal(t, g.Addrs, frozen, "dial must receive the immutable G snapshot copied before the swap")
+	assert.NotEqual(t, g2.Addrs, frozen, "G2 targets must never enter the G recovery request")
+	close(releaseDial)
+	require.NoError(t, <-result)
+}
+
+func TestRetryPeerStatusRejectsGenerationChangeDuringStatusResponse(t *testing.T) {
+	statusStarted := make(chan struct{}, 1)
+	releaseStatus := make(chan struct{})
+	a, b, _, _, binding := newRetryTestPairWithIntercept(t, "", func(_ http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/fed/v1/status" {
+			return false
+		}
+		statusStarted <- struct{}{}
+		<-releaseStatus
+		return false
+	})
+	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
+	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
+	result := make(chan error, 1)
+	go func() {
+		_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+		result <- err
+	}()
+	<-statusStarted
+	ss := a.mgr.syncStore()
+	control, err := ss.GetSyncControl(context.Background(), b.chainID)
+	require.NoError(t, err)
+	require.NotNil(t, control)
+	replacement := *control
+	replacement.PolicyEpoch = "retry-epoch-replaced"
+	require.NoError(t, ss.PurgeSyncPeerState(context.Background(), b.chainID))
+	require.NoError(t, ss.PrepareSyncControl(context.Background(), replacement))
+	require.NoError(t, ss.ActivateSyncControl(context.Background(), b.chainID, replacement.PolicyEpoch))
+	close(releaseStatus)
+	err = <-result
+	require.ErrorIs(t, err, ErrTrustGenerationChanged)
+	assert.Equal(t, RouteRecoveryTrustGenerationMismatch, RouteRecoveryFailureCode(err))
+}
+
+func TestRetryPeerStatusLegacyActiveUnprovableBindingRequiresRepair(t *testing.T) {
+	a := newTestChain(t, "legacy-active-a")
+	b := newTestChain(t, "legacy-active-b")
+	federate(t, a, b, "https://127.0.0.1:1", nil, 4, 0)
+	agreement, err := a.mgr.ActiveAgreement(b.chainID)
+	require.NoError(t, err)
+	ss := a.mgr.syncStore()
+	epoch := "legacy-unfrozen"
+	require.NoError(t, ss.PrepareSyncControl(context.Background(), store.SyncControl{
+		RemoteChainID: b.chainID, Role: "host", ControllerChainID: a.chainID,
+		ControllerAgentID: hex.EncodeToString(a.agentPub), PolicyEpoch: epoch,
+		RemoteCAPin: hex.EncodeToString(agreement.PeerPubKey), PolicyVersion: SyncPolicyVersionLegacy,
+	}))
+	require.NoError(t, ss.ActivateSyncControl(context.Background(), b.chainID, epoch))
+	_, err = a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+	require.ErrorIs(t, err, ErrLegacyRouteBinding)
+	assert.Equal(t, RouteRecoveryLegacyRepairRequired, RouteRecoveryFailureCode(err))
+}
+
+func TestRetryPeerStatusEmitsTypedOperationalDiagnostics(t *testing.T) {
+	tests := []struct {
+		name     string
+		snapshot func(t *testing.T, binding p2pRouteBinding) (RouteSnapshot, bool)
+		want     string
+	}{
+		{name: "missing", want: RouteRecoveryBundleMissing, snapshot: func(*testing.T, p2pRouteBinding) (RouteSnapshot, bool) { return RouteSnapshot{}, false }},
+		{name: "expired", want: RouteRecoveryBundleExpired, snapshot: func(t *testing.T, binding p2pRouteBinding) (RouteSnapshot, bool) {
+			bundle := testDirectRouteBundle(t, "192.0.2.50")
+			return snapshotFromBundle(JoinP2PBundle{PeerID: bundle.PeerID, Protocol: bundle.Protocol, Addrs: bundle.Addrs, Revision: 1, IssuedAt: time.Now().Add(-time.Hour).Unix(), ExpiresAt: time.Now().Add(-time.Minute).Unix()}, routeBindingID(binding)), true
+		}},
+		{name: "stale direct", want: RouteRecoveryStaleDirect, snapshot: func(t *testing.T, binding p2pRouteBinding) (RouteSnapshot, bool) {
+			bundle := testDirectRouteBundle(t, "192.0.2.51")
+			return snapshotFromBundle(JoinP2PBundle{PeerID: bundle.PeerID, Protocol: bundle.Protocol, Addrs: bundle.Addrs, Revision: 1, IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}, routeBindingID(binding)), true
+		}},
+		{name: "relay unavailable", want: RouteRecoveryRelayUnavailable, snapshot: func(t *testing.T, binding p2pRouteBinding) (RouteSnapshot, bool) {
+			bundle := testRouteBundle(t, "203.0.113.52")
+			return snapshotFromBundle(JoinP2PBundle{PeerID: bundle.PeerID, Protocol: bundle.Protocol, Addrs: bundle.Addrs, Revision: 1, IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}, routeBindingID(binding)), true
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b, _, _, binding := newRetryTestPair(t, "https://127.0.0.1:1")
+			local := testDirectRouteBundle(t, "192.0.2.60")
+			snapshot, present := tc.snapshot(t, binding)
+			a.mgr.SetJoinP2PHooks(JoinP2PHooks{
+				LocalBundle:  func() (JoinP2PBundle, error) { return local, nil },
+				LoadSnapshot: func(string) (RouteSnapshot, bool) { return snapshot, present },
+			})
+			a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return errors.New("route refresh unavailable") }
+			_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+			require.Error(t, err)
+			assert.Equal(t, tc.want, RouteRecoveryFailureCode(err))
+		})
+	}
 }
 
 func TestDisabledTransportFailsBeforeDial(t *testing.T) {

@@ -550,6 +550,7 @@ func TestLinkedMessageDirectoryUsesAuthenticatedRelayRoute(t *testing.T) {
 	pair.peer.mgr.SetPeerRouteDialFunc(func(
 		dialCtx context.Context,
 		chain string,
+		_ []string,
 		authenticate PeerRouteAuthenticator,
 	) (PeerRouteDialResult, bool, error) {
 		relayDials.Add(1)

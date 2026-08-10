@@ -206,8 +206,13 @@ operator click joins any refresh already running for that exact active trust
 generation, waits up to the bounded recovery deadline, and performs exactly one
 authenticated re-probe. Expired snapshots remain usable only as hints for the
 same frozen peer identity; Direct and Secure relay candidates still pass the
-pinned federation mTLS check. A route from another trust generation is never
-dialed. If an older active agreement has no authenticated modern route binding,
+pinned federation mTLS check. The exact snapshot target list is copied before
+dial, so a concurrent replacement cannot swap new-generation addresses into an
+old-generation Retry. SAGE revalidates the full agreement and control binding
+again after the status response before reporting success. A route from another
+trust generation is never dialed, and an authenticated 401/403 route-exchange
+denial is a security stop rather than an availability failure. If an older
+active agreement has no authenticated modern route binding,
 CEREBRUM says to pair again to enable Secure relay rather than guessing a peer
 identity. Federation Off, relay outages, expired/missing bundles, identity
 mismatches, and security blocks remain distinct operator diagnostics.

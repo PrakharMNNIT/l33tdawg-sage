@@ -196,9 +196,10 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 	var selectedMu sync.Mutex
 	selected := PeerRouteDialResult{Kind: RouteKindDirect, Target: endpoint.Host}
 	routeDial := m.peerRouteDialFunc()
+	var frozenRouteTargets []string
 	if routeDial == nil {
 		if legacyDial := m.peerDialFunc(); legacyDial != nil {
-			routeDial = func(dialCtx context.Context, chain string, _ PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+			routeDial = func(dialCtx context.Context, chain string, _ []string, _ PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
 				start := time.Now()
 				conn, handled, dialErr := legacyDial(dialCtx, chain)
 				return PeerRouteDialResult{Conn: conn, Kind: RouteKindP2PDirect, Latency: time.Since(start)}, handled, dialErr
@@ -216,6 +217,8 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 			// hint, but never a route learned by another trust generation. Direct
 			// HTTPS remains available and is still pinned by the active agreement.
 			routeDial = nil
+		} else {
+			frozenRouteTargets = append([]string(nil), snapshot.Addrs...)
 		}
 	}
 	if routeDial != nil || !p2pOnly {
@@ -242,7 +245,7 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 				attempts = append(attempts, routeDialAttempt{
 					delay: delay,
 					dial: func(attemptCtx context.Context) (PeerRouteDialResult, error) {
-						result, handled, dialErr := routeDial(attemptCtx, agreement.RemoteChainID, authenticate)
+						result, handled, dialErr := routeDial(attemptCtx, agreement.RemoteChainID, frozenRouteTargets, authenticate)
 						if !handled {
 							return PeerRouteDialResult{}, errors.New("peer has no configured p2p route")
 						}
@@ -351,6 +354,9 @@ func clientRequestsCapability(headers http.Header, capability string) bool {
 func isSecurityTransportError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, ErrRouteExchangeDenied) || RouteRecoveryFailureCode(err) == RouteRecoverySecurityBlocked {
+		return true
 	}
 	var unknownAuthority x509.UnknownAuthorityError
 	var hostname x509.HostnameError
@@ -776,13 +782,14 @@ func (m *Manager) PeerStatus(ctx context.Context, remoteChainID string) (*Status
 // PeerStatus polling deliberately does not enter this workflow.
 func (m *Manager) RetryPeerStatus(ctx context.Context, remoteChainID string) (*StatusResponse, error) {
 	if !m.transportIsEnabled() {
-		return nil, errors.New("federation transport is disabled; turn federation on before retrying")
+		return nil, routeRecoveryError(RouteRecoveryDisabled,
+			errors.New("federation transport is disabled; turn federation on before retrying"))
 	}
-	binding, err := m.routeRefreshBinding(ctx, remoteChainID)
+	agreement, binding, err := m.routeRefreshAgreementBinding(ctx, remoteChainID)
 	if err != nil {
 		return nil, err
 	}
-	key := routeRefreshKey(remoteChainID, binding)
+	key := routeRefreshKey(remoteChainID, agreement, binding)
 	m.routeRetryMu.Lock()
 	if m.routeRetryActive == nil {
 		m.routeRetryActive = make(map[string]*peerStatusRetryCall)
@@ -791,7 +798,7 @@ func (m *Manager) RetryPeerStatus(ctx context.Context, remoteChainID string) (*S
 	if call == nil {
 		call = &peerStatusRetryCall{done: make(chan struct{})}
 		m.routeRetryActive[key] = call
-		go m.runPeerStatusRetry(remoteChainID, binding, key, call)
+		go m.runPeerStatusRetry(remoteChainID, agreement, binding, key, call)
 	}
 	m.routeRetryMu.Unlock()
 
@@ -803,7 +810,7 @@ func (m *Manager) RetryPeerStatus(ctx context.Context, remoteChainID string) (*S
 	}
 }
 
-func (m *Manager) runPeerStatusRetry(remoteChainID string, binding p2pRouteBinding, key string, call *peerStatusRetryCall) {
+func (m *Manager) runPeerStatusRetry(remoteChainID string, expectedAgreement *store.CrossFedRecord, binding p2pRouteBinding, key string, call *peerStatusRetryCall) {
 	defer func() {
 		close(call.done)
 		time.AfterFunc(routeRetryDedupWindow, func() {
@@ -816,9 +823,11 @@ func (m *Manager) runPeerStatusRetry(remoteChainID string, binding p2pRouteBindi
 	}()
 	workflowCtx, cancel := context.WithTimeout(context.Background(), routeRefreshTimeout+6*time.Second)
 	defer cancel()
-	refreshErr := waitRouteRefresh(workflowCtx, m.beginRouteRefresh(context.Background(), remoteChainID, binding))
+	generation := routeBindingID(binding)
+	hint := m.routeRecoveryHint(remoteChainID, generation)
+	refreshErr := waitRouteRefresh(workflowCtx, m.beginRouteRefreshExact(context.Background(), remoteChainID, expectedAgreement, binding))
 	if errors.Is(refreshErr, ErrTrustGenerationChanged) || errors.Is(refreshErr, ErrLegacyRouteBinding) || isSecurityTransportError(refreshErr) {
-		call.err = refreshErr
+		call.err = classifyRouteRecoveryError(refreshErr, hint)
 		return
 	}
 	ss := m.syncStore()
@@ -829,17 +838,28 @@ func (m *Manager) runPeerStatusRetry(remoteChainID string, binding p2pRouteBindi
 	unlock := ss.LockSyncPolicyRead()
 	agreement, current, err := m.currentP2PRouteBinding(workflowCtx, remoteChainID)
 	unlock()
-	if err != nil || current != binding {
-		call.err = fmt.Errorf("%w: active binding changed before authenticated re-probe", ErrTrustGenerationChanged)
+	if err != nil || current != binding || !sameRouteAgreement(agreement, expectedAgreement) {
+		call.err = routeRecoveryError(RouteRecoveryTrustGenerationMismatch,
+			fmt.Errorf("%w: active agreement or binding changed before authenticated re-probe", ErrTrustGenerationChanged))
 		return
 	}
-	status, probeErr := m.fetchPeerStatus(withRouteGeneration(workflowCtx, routeBindingID(binding)), agreement)
+	status, probeErr := m.fetchPeerStatus(withRouteGeneration(workflowCtx, generation), agreement)
 	if probeErr != nil {
+		var combined error
 		if refreshErr != nil {
-			call.err = fmt.Errorf("route refresh failed (%v); authenticated re-probe failed: %w", refreshErr, probeErr)
+			combined = fmt.Errorf("route refresh failed (%v); authenticated re-probe failed: %w", refreshErr, probeErr)
 		} else {
-			call.err = fmt.Errorf("authenticated re-probe failed: %w", probeErr)
+			combined = fmt.Errorf("authenticated re-probe failed: %w", probeErr)
 		}
+		call.err = classifyRouteRecoveryError(combined, m.routeRecoveryHint(remoteChainID, generation))
+		return
+	}
+	unlock = ss.LockSyncPolicyRead()
+	postAgreement, postBinding, postErr := m.currentP2PRouteBinding(workflowCtx, remoteChainID)
+	unlock()
+	if postErr != nil || postBinding != binding || !sameRouteAgreement(postAgreement, expectedAgreement) {
+		call.err = routeRecoveryError(RouteRecoveryTrustGenerationMismatch,
+			fmt.Errorf("%w: active agreement or binding changed during authenticated re-probe", ErrTrustGenerationChanged))
 		return
 	}
 	m.rememberPeerName(remoteChainID, status.NetworkName)

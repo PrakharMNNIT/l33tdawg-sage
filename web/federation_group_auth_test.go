@@ -38,8 +38,9 @@ type peerFailureStatusTestDriver struct {
 
 type peerRetryStatusTestDriver struct {
 	peerStatusTestDriver
-	polls   int
-	retries int
+	polls    int
+	retries  int
+	retryErr error
 }
 
 func (d *peerRetryStatusTestDriver) PeerStatus(context.Context, string) (*federation.StatusResponse, error) {
@@ -49,6 +50,9 @@ func (d *peerRetryStatusTestDriver) PeerStatus(context.Context, string) (*federa
 
 func (d *peerRetryStatusTestDriver) RetryPeerStatus(context.Context, string) (*federation.StatusResponse, error) {
 	d.retries++
+	if d.retryErr != nil {
+		return nil, d.retryErr
+	}
 	return &federation.StatusResponse{ChainID: "chain-remote", NetworkName: "recovered"}, nil
 }
 
@@ -173,6 +177,36 @@ func TestFederationDashboardFailureStatesAreStable(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.want, func(t *testing.T) {
 			assert.Equal(t, tc.want, federationDashboardFailureState(errors.New(tc.message), federation.RouteDiagnostics{}))
+		})
+	}
+}
+
+func TestFederationHandlerPreservesTypedManagerRecoveryDiagnostics(t *testing.T) {
+	codes := []string{
+		federation.RouteRecoveryBundleMissing,
+		federation.RouteRecoveryBundleExpired,
+		federation.RouteRecoveryStaleDirect,
+		federation.RouteRecoveryRelayUnavailable,
+		federation.RouteRecoverySecurityBlocked,
+		federation.RouteRecoveryLegacyRepairRequired,
+	}
+	for _, code := range codes {
+		t.Run(code, func(t *testing.T) {
+			h, _ := newTestHandler(t)
+			driver := &peerRetryStatusTestDriver{retryErr: &federation.RouteRecoveryError{
+				Code: code, Err: errors.New("typed manager recovery failure"),
+			}}
+			h.Federation = driver
+			req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/federation/connections/chain-remote/status?retry=1", nil)
+			rr := httptest.NewRecorder()
+			h.handleFedPeerStatus(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code)
+			var response struct {
+				FailureState string `json:"failure_state"`
+			}
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+			assert.Equal(t, code, response.FailureState)
+			assert.Equal(t, 1, driver.retries)
 		})
 	}
 }

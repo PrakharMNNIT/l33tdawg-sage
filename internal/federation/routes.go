@@ -7,10 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/l33tdawg/sage/internal/store"
 )
 
 const (
@@ -28,7 +32,114 @@ const (
 var (
 	ErrLegacyRouteBinding     = errors.New("legacy federation connection must be paired again to enable secure relay")
 	ErrTrustGenerationChanged = errors.New("federation trust generation changed during route recovery")
+	ErrRouteExchangeDenied    = errors.New("peer denied authenticated route exchange")
 )
+
+const (
+	RouteRecoveryDisabled                = "disabled"
+	RouteRecoveryBundleMissing           = "route_bundle_missing"
+	RouteRecoveryBundleExpired           = "route_bundle_expired"
+	RouteRecoveryStaleDirect             = "stale_direct"
+	RouteRecoveryTrustGenerationMismatch = "trust_generation_mismatch"
+	RouteRecoveryRelayUnavailable        = "relay_unavailable"
+	RouteRecoverySecurityBlocked         = "security_blocked"
+	RouteRecoveryLegacyRepairRequired    = "legacy_repair_required"
+)
+
+type RouteRecoveryError struct {
+	Code string
+	Err  error
+}
+
+func (e *RouteRecoveryError) Error() string {
+	if e == nil || e.Err == nil {
+		return "federation route recovery failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *RouteRecoveryError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func routeRecoveryError(code string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *RouteRecoveryError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &RouteRecoveryError{Code: code, Err: err}
+}
+
+func RouteRecoveryFailureCode(err error) string {
+	var recovery *RouteRecoveryError
+	if errors.As(err, &recovery) {
+		return recovery.Code
+	}
+	return ""
+}
+
+func (m *Manager) routeRecoveryHint(remoteChainID, generation string) string {
+	hooks := m.joinP2PHooks()
+	if hooks.LoadSnapshot == nil {
+		return RouteRecoveryBundleMissing
+	}
+	snapshot, ok := hooks.LoadSnapshot(remoteChainID)
+	if !ok {
+		return RouteRecoveryBundleMissing
+	}
+	if snapshot.Generation != generation {
+		return RouteRecoveryTrustGenerationMismatch
+	}
+	if snapshot.ExpiresAt > 0 && snapshot.ExpiresAt <= time.Now().Unix() {
+		return RouteRecoveryBundleExpired
+	}
+	hasDirect, hasRelay := false, false
+	for _, target := range snapshot.Addrs {
+		if routeKindForTarget(target) == RouteKindRelay {
+			hasRelay = true
+		} else {
+			hasDirect = true
+		}
+	}
+	if hasRelay {
+		return RouteRecoveryRelayUnavailable
+	}
+	if hasDirect {
+		return RouteRecoveryStaleDirect
+	}
+	return RouteRecoveryBundleMissing
+}
+
+func classifyRouteRecoveryError(err error, hint string) error {
+	if err == nil {
+		return nil
+	}
+	if RouteRecoveryFailureCode(err) != "" {
+		return err
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case errors.Is(err, ErrTrustGenerationChanged):
+		return routeRecoveryError(RouteRecoveryTrustGenerationMismatch, err)
+	case errors.Is(err, ErrLegacyRouteBinding):
+		return routeRecoveryError(RouteRecoveryLegacyRepairRequired, err)
+	case isSecurityTransportError(err), strings.Contains(message, "returned 401"), strings.Contains(message, "returned 403"):
+		return routeRecoveryError(RouteRecoverySecurityBlocked, err)
+	case strings.Contains(message, "federation transport is disabled"),
+		strings.Contains(message, "federation is off"):
+		return routeRecoveryError(RouteRecoveryDisabled, err)
+	case hint != "":
+		return routeRecoveryError(hint, err)
+	default:
+		return err
+	}
+}
 
 type routeRefreshCall struct {
 	done chan struct{}
@@ -106,8 +217,10 @@ type PeerRouteDialResult struct {
 type PeerRouteAuthenticator func(context.Context, PeerRouteDialResult, error) (PeerRouteDialResult, error)
 
 // PeerRouteDialFunc selects among a peer's P2P direct and relay candidates.
-// handled=false preserves legacy direct HTTPS behavior.
-type PeerRouteDialFunc func(context.Context, string, PeerRouteAuthenticator) (PeerRouteDialResult, bool, error)
+// frozenTargets is non-nil for an exact-generation Retry and must be used as
+// the complete immutable target set; normal callers pass nil and may read the
+// current configured routes. handled=false preserves legacy Direct HTTPS.
+type PeerRouteDialFunc func(context.Context, string, []string, PeerRouteAuthenticator) (PeerRouteDialResult, bool, error)
 
 type routeDialAttempt struct {
 	delay time.Duration
@@ -383,29 +496,81 @@ func (m *Manager) prepareLocalRouteBundle(bundle JoinP2PBundle) JoinP2PBundle {
 	return bundle
 }
 
-func routeRefreshKey(remoteChainID string, binding p2pRouteBinding) string {
-	return remoteChainID + "\x00" + routeBindingID(binding)
+func routeAgreementID(agreement *store.CrossFedRecord) string {
+	if agreement == nil {
+		return ""
+	}
+	h := sha256.New()
+	values := []string{
+		agreement.RemoteChainID, agreement.Endpoint, hex.EncodeToString(agreement.PeerPubKey),
+		strconv.Itoa(int(agreement.MaxClearance)), strconv.FormatInt(agreement.ExpiresAt, 10), agreement.Status,
+	}
+	values = append(values, agreement.AllowedDomains...)
+	values = append(values, "\x01")
+	values = append(values, agreement.AllowedDepts...)
+	for _, value := range values {
+		h.Write([]byte{0})
+		h.Write([]byte(value))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (m *Manager) routeRefreshBinding(ctx context.Context, remoteChainID string) (p2pRouteBinding, error) {
+func cloneRouteAgreement(agreement *store.CrossFedRecord) *store.CrossFedRecord {
+	if agreement == nil {
+		return nil
+	}
+	clone := *agreement
+	clone.PeerPubKey = append([]byte(nil), agreement.PeerPubKey...)
+	clone.AllowedDomains = append([]string(nil), agreement.AllowedDomains...)
+	clone.AllowedDepts = append([]string(nil), agreement.AllowedDepts...)
+	return &clone
+}
+
+func sameRouteAgreement(a, b *store.CrossFedRecord) bool {
+	return a != nil && b != nil && a.RemoteChainID == b.RemoteChainID && a.Endpoint == b.Endpoint &&
+		slices.Equal(a.PeerPubKey, b.PeerPubKey) && a.MaxClearance == b.MaxClearance &&
+		a.ExpiresAt == b.ExpiresAt && a.Status == b.Status &&
+		slices.Equal(a.AllowedDomains, b.AllowedDomains) && slices.Equal(a.AllowedDepts, b.AllowedDepts)
+}
+
+func routeRefreshKey(remoteChainID string, agreement *store.CrossFedRecord, binding p2pRouteBinding) string {
+	return remoteChainID + "\x00" + routeAgreementID(agreement) + "\x00" + routeBindingID(binding)
+}
+
+func (m *Manager) routeRefreshAgreementBinding(ctx context.Context, remoteChainID string) (*store.CrossFedRecord, p2pRouteBinding, error) {
 	ss := m.syncStore()
 	if ss == nil {
-		return p2pRouteBinding{}, fmt.Errorf("%w: SQLite route binding is unavailable", ErrTrustGenerationChanged)
+		return nil, p2pRouteBinding{}, routeRecoveryError(RouteRecoveryTrustGenerationMismatch,
+			fmt.Errorf("%w: SQLite route binding is unavailable", ErrTrustGenerationChanged))
 	}
 	unlock := ss.LockSyncPolicyRead()
 	defer unlock()
-	_, binding, err := m.currentP2PRouteBinding(ctx, remoteChainID)
+	agreement, binding, err := m.currentP2PRouteBinding(ctx, remoteChainID)
 	if err == nil {
-		return binding, nil
+		return cloneRouteAgreement(agreement), binding, nil
 	}
-	if strings.Contains(err.Error(), "no active p2p route binding") {
-		return p2pRouteBinding{}, fmt.Errorf("%w: this trusted connection predates authenticated roaming routes", ErrLegacyRouteBinding)
+	control, controlErr := ss.GetSyncControl(ctx, remoteChainID)
+	if strings.Contains(err.Error(), "no active p2p route binding") ||
+		(controlErr == nil && control != nil && control.BindingState == "active" && control.PeerAgentID == "") {
+		return nil, p2pRouteBinding{}, routeRecoveryError(RouteRecoveryLegacyRepairRequired,
+			fmt.Errorf("%w: this trusted connection has no provable modern peer route binding", ErrLegacyRouteBinding))
 	}
-	return p2pRouteBinding{}, fmt.Errorf("%w: %v", ErrTrustGenerationChanged, err)
+	return nil, p2pRouteBinding{}, routeRecoveryError(RouteRecoveryTrustGenerationMismatch,
+		fmt.Errorf("%w: %v", ErrTrustGenerationChanged, err))
+}
+
+func (m *Manager) routeRefreshBinding(ctx context.Context, remoteChainID string) (p2pRouteBinding, error) {
+	_, binding, err := m.routeRefreshAgreementBinding(ctx, remoteChainID)
+	return binding, err
 }
 
 func (m *Manager) beginRouteRefresh(parent context.Context, remoteChainID string, binding p2pRouteBinding) *routeRefreshCall {
-	key := routeRefreshKey(remoteChainID, binding)
+	agreement, _, _ := m.routeRefreshAgreementBinding(parent, remoteChainID)
+	return m.beginRouteRefreshExact(parent, remoteChainID, agreement, binding)
+}
+
+func (m *Manager) beginRouteRefreshExact(parent context.Context, remoteChainID string, expectedAgreement *store.CrossFedRecord, binding p2pRouteBinding) *routeRefreshCall {
+	key := routeRefreshKey(remoteChainID, expectedAgreement, binding)
 	m.routeRefreshMu.Lock()
 	if m.routeRefreshActive == nil {
 		m.routeRefreshActive = make(map[string]*routeRefreshCall)
@@ -439,9 +604,10 @@ func (m *Manager) beginRouteRefresh(parent context.Context, remoteChainID string
 		ctx, cancel := context.WithTimeout(parent, routeRefreshTimeout)
 		defer cancel()
 		if m.routeRefreshFn == nil {
-			current, bindingErr := m.routeRefreshBinding(ctx, remoteChainID)
-			if bindingErr != nil || current != binding {
-				call.err = fmt.Errorf("%w: active binding changed before refresh", ErrTrustGenerationChanged)
+			currentAgreement, current, bindingErr := m.routeRefreshAgreementBinding(ctx, remoteChainID)
+			if bindingErr != nil || current != binding || !sameRouteAgreement(currentAgreement, expectedAgreement) {
+				call.err = routeRecoveryError(RouteRecoveryTrustGenerationMismatch,
+					fmt.Errorf("%w: active agreement or binding changed before refresh", ErrTrustGenerationChanged))
 				m.recordRouteFailure(remoteChainID, call.err, true)
 				return
 			}
@@ -476,12 +642,12 @@ func (m *Manager) triggerRouteRefreshWithContext(parent context.Context, remoteC
 	if !m.transportIsEnabled() {
 		return
 	}
-	binding, err := m.routeRefreshBinding(parent, remoteChainID)
+	agreement, binding, err := m.routeRefreshAgreementBinding(parent, remoteChainID)
 	if err != nil {
 		m.recordRouteFailure(remoteChainID, err, errors.Is(err, ErrTrustGenerationChanged))
 		return
 	}
-	call := m.beginRouteRefresh(parent, remoteChainID, binding)
+	call := m.beginRouteRefreshExact(parent, remoteChainID, agreement, binding)
 	if wg != nil {
 		wg.Add(1)
 		go func() {
@@ -496,12 +662,12 @@ func (m *Manager) triggerRouteRefresh(remoteChainID string) {
 }
 
 func (m *Manager) maybeTriggerRouteRefresh(remoteChainID string) {
-	binding, err := m.routeRefreshBinding(context.Background(), remoteChainID)
+	agreement, binding, err := m.routeRefreshAgreementBinding(context.Background(), remoteChainID)
 	if err != nil {
 		m.recordRouteFailure(remoteChainID, err, errors.Is(err, ErrTrustGenerationChanged))
 		return
 	}
-	key := routeRefreshKey(remoteChainID, binding)
+	key := routeRefreshKey(remoteChainID, agreement, binding)
 	now := time.Now()
 	m.routeRefreshMu.Lock()
 	if m.routeRefreshLast == nil {
@@ -513,7 +679,7 @@ func (m *Manager) maybeTriggerRouteRefresh(remoteChainID string) {
 	}
 	m.routeRefreshLast[key] = now
 	m.routeRefreshMu.Unlock()
-	m.beginRouteRefresh(context.Background(), remoteChainID, binding)
+	m.beginRouteRefreshExact(context.Background(), remoteChainID, agreement, binding)
 }
 
 // RefreshPeerRoutes asks every active agreement to exchange the current local
