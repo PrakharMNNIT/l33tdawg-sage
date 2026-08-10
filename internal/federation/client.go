@@ -801,7 +801,11 @@ func (m *Manager) RetryPeerStatus(ctx context.Context, remoteChainID string) (*S
 	if call == nil {
 		call = &peerStatusRetryCall{done: make(chan struct{})}
 		m.routeRetryActive[key] = call
-		go m.runPeerStatusRetry(remoteChainID, agreement, binding, key, call)
+		// The shared retry must survive cancellation of the first waiter so a
+		// concurrent waiter cannot inherit a prematurely canceled generation.
+		// Preserve request values while bounding the detached workflow below.
+		workflowBase := context.WithoutCancel(ctx)
+		go m.runPeerStatusRetry(workflowBase, remoteChainID, agreement, binding, key, call)
 	}
 	m.routeRetryMu.Unlock()
 
@@ -813,7 +817,7 @@ func (m *Manager) RetryPeerStatus(ctx context.Context, remoteChainID string) (*S
 	}
 }
 
-func (m *Manager) runPeerStatusRetry(remoteChainID string, expectedAgreement *store.CrossFedRecord, binding p2pRouteBinding, key string, call *peerStatusRetryCall) {
+func (m *Manager) runPeerStatusRetry(parent context.Context, remoteChainID string, expectedAgreement *store.CrossFedRecord, binding p2pRouteBinding, key string, call *peerStatusRetryCall) {
 	defer func() {
 		close(call.done)
 		time.AfterFunc(routeRetryDedupWindow, func() {
@@ -824,11 +828,11 @@ func (m *Manager) runPeerStatusRetry(remoteChainID string, expectedAgreement *st
 			m.routeRetryMu.Unlock()
 		})
 	}()
-	workflowCtx, cancel := context.WithTimeout(context.Background(), routeRefreshTimeout+6*time.Second)
+	workflowCtx, cancel := context.WithTimeout(parent, routeRefreshTimeout+6*time.Second)
 	defer cancel()
 	generation := routeBindingID(binding)
 	hint := m.routeRecoveryHint(remoteChainID, generation)
-	refreshErr := waitRouteRefresh(workflowCtx, m.beginRouteRefreshExact(context.Background(), remoteChainID, expectedAgreement, binding))
+	refreshErr := waitRouteRefresh(workflowCtx, m.beginRouteRefreshExact(workflowCtx, remoteChainID, expectedAgreement, binding))
 	if errors.Is(refreshErr, ErrTrustGenerationChanged) || errors.Is(refreshErr, ErrLegacyRouteBinding) || isSecurityTransportError(refreshErr) {
 		call.err = classifyRouteRecoveryError(refreshErr, hint)
 		return

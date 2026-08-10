@@ -501,10 +501,11 @@ func routeAgreementID(agreement *store.CrossFedRecord) string {
 		return ""
 	}
 	h := sha256.New()
-	values := []string{
+	values := make([]string, 0, 7+len(agreement.AllowedDomains)+len(agreement.AllowedDepts))
+	values = append(values,
 		agreement.RemoteChainID, agreement.Endpoint, hex.EncodeToString(agreement.PeerPubKey),
 		strconv.Itoa(int(agreement.MaxClearance)), strconv.FormatInt(agreement.ExpiresAt, 10), agreement.Status,
-	}
+	)
 	values = append(values, agreement.AllowedDomains...)
 	values = append(values, "\x01")
 	values = append(values, agreement.AllowedDepts...)
