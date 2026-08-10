@@ -865,8 +865,8 @@ func TestTakeVerifiedAcceptsExactCometReplayBoundaryRestoresAndReusesAfterRestar
 	// A fresh scheduler (the process-restart shape) must re-verify and reuse
 	// the published snapshot without quarantining or recapturing it.
 	restarted := newVerifiedSnapshotScheduler(t, dataDir, db)
-	if _, err := restarted.TakeVerified(context.Background(), 77, appHash[:], "restart-reuse", nil); err != nil {
-		t.Fatalf("restart could not reuse verified H/H+1 snapshot: %v", err)
+	if _, restartErr := restarted.TakeVerified(context.Background(), 77, appHash[:], "restart-reuse", nil); restartErr != nil {
+		t.Fatalf("restart could not reuse verified H/H+1 snapshot: %v", restartErr)
 	}
 	entries, err := os.ReadDir(filepath.Join(dataDir, "snapshots"))
 	if err != nil {
