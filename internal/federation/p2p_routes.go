@@ -44,16 +44,16 @@ func (m *Manager) currentP2PRouteBinding(ctx context.Context, remoteChainID stri
 	if ss == nil {
 		return nil, p2pRouteBinding{}, fmt.Errorf("p2p route exchange requires the SQLite store backend")
 	}
-	peerAgentID, err := m.resolvePeerOperatorAgentID(ctx, agreement)
-	if err != nil {
-		return nil, p2pRouteBinding{}, err
-	}
 	control, err := ss.GetSyncControl(ctx, remoteChainID)
 	if err != nil {
 		return nil, p2pRouteBinding{}, fmt.Errorf("read p2p route binding: %w", err)
 	}
 	if control == nil {
 		return nil, p2pRouteBinding{}, fmt.Errorf("connection has no active p2p route binding")
+	}
+	peerAgentID, err := m.resolvePeerOperatorAgentID(ctx, agreement)
+	if err != nil {
+		return nil, p2pRouteBinding{}, err
 	}
 	if control.RemoteChainID != remoteChainID || control.BindingState != "active" ||
 		control.PolicyEpoch == "" || control.RemoteCAPin != hex.EncodeToString(agreement.PeerPubKey) ||

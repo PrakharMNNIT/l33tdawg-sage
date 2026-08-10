@@ -84,3 +84,23 @@ test('an authenticated active route may say which route is in use', () => {
   assert.equal(view.label, 'Secure relay');
   assert.match(view.detail, /relayed/);
 });
+
+test('operator Retry diagnostics stay distinct and legacy routes require pairing again', () => {
+  const expectations = [
+    ['legacy_repair_required', 'Pair again required'],
+    ['trust_generation_mismatch', 'Trust changed'],
+    ['route_bundle_missing', 'Routes missing'],
+    ['route_bundle_expired', 'Routes expired'],
+    ['stale_direct', 'Direct route stale'],
+    ['relay_unavailable', 'Secure relay unavailable'],
+  ];
+  for (const [failure_state, label] of expectations) {
+    const route = federationConnectionRoute({ reachable: false, failure_state });
+    assert.equal(route.state, failure_state);
+    assert.equal(federationRoutePresentation(route).label, label);
+  }
+  assert.match(
+    federationRoutePresentation({ state: 'legacy_repair_required' }).detail,
+    /pair the two SAGEs again.*will not guess an identity/i,
+  );
+});

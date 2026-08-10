@@ -25,11 +25,39 @@ const (
 	RouteStateUnknown         = "unknown"
 )
 
+var (
+	ErrLegacyRouteBinding     = errors.New("legacy federation connection must be paired again to enable secure relay")
+	ErrTrustGenerationChanged = errors.New("federation trust generation changed during route recovery")
+)
+
+type routeRefreshCall struct {
+	done chan struct{}
+	err  error
+}
+
+type peerStatusRetryCall struct {
+	done   chan struct{}
+	status *StatusResponse
+	err    error
+}
+
+type routeGenerationContextKey struct{}
+
+func withRouteGeneration(ctx context.Context, generation string) context.Context {
+	return context.WithValue(ctx, routeGenerationContextKey{}, generation)
+}
+
+func requiredRouteGeneration(ctx context.Context) string {
+	generation, _ := ctx.Value(routeGenerationContextKey{}).(string)
+	return generation
+}
+
 const (
-	routeCandidateDelay = 175 * time.Millisecond
-	routeRefreshEvery   = 5 * time.Minute
-	routeRefreshTimeout = 8 * time.Second
-	routeSnapshotTTL    = 24 * time.Hour
+	routeCandidateDelay   = 175 * time.Millisecond
+	routeRefreshEvery     = 5 * time.Minute
+	routeRefreshTimeout   = 8 * time.Second
+	routeRetryDedupWindow = time.Second
+	routeSnapshotTTL      = 24 * time.Hour
 )
 
 // RouteSnapshot is the crash-safe, generation-bound connectivity projection
@@ -355,53 +383,112 @@ func (m *Manager) prepareLocalRouteBundle(bundle JoinP2PBundle) JoinP2PBundle {
 	return bundle
 }
 
-func (m *Manager) triggerRouteRefreshWithContext(parent context.Context, remoteChainID string, wg *sync.WaitGroup) {
-	if !m.transportIsEnabled() {
-		return
+func routeRefreshKey(remoteChainID string, binding p2pRouteBinding) string {
+	return remoteChainID + "\x00" + routeBindingID(binding)
+}
+
+func (m *Manager) routeRefreshBinding(ctx context.Context, remoteChainID string) (p2pRouteBinding, error) {
+	ss := m.syncStore()
+	if ss == nil {
+		return p2pRouteBinding{}, fmt.Errorf("%w: SQLite route binding is unavailable", ErrTrustGenerationChanged)
 	}
+	unlock := ss.LockSyncPolicyRead()
+	defer unlock()
+	_, binding, err := m.currentP2PRouteBinding(ctx, remoteChainID)
+	if err == nil {
+		return binding, nil
+	}
+	if strings.Contains(err.Error(), "no active p2p route binding") {
+		return p2pRouteBinding{}, fmt.Errorf("%w: this trusted connection predates authenticated roaming routes", ErrLegacyRouteBinding)
+	}
+	return p2pRouteBinding{}, fmt.Errorf("%w: %v", ErrTrustGenerationChanged, err)
+}
+
+func (m *Manager) beginRouteRefresh(parent context.Context, remoteChainID string, binding p2pRouteBinding) *routeRefreshCall {
+	key := routeRefreshKey(remoteChainID, binding)
 	m.routeRefreshMu.Lock()
 	if m.routeRefreshActive == nil {
-		m.routeRefreshActive = make(map[string]bool)
+		m.routeRefreshActive = make(map[string]*routeRefreshCall)
 	}
-	if m.routeRefreshActive[remoteChainID] {
+	if active := m.routeRefreshActive[key]; active != nil {
 		m.routeRefreshMu.Unlock()
-		return
+		return active
 	}
-	m.routeRefreshActive[remoteChainID] = true
+	call := &routeRefreshCall{done: make(chan struct{})}
+	m.routeRefreshActive[key] = call
 	m.routeRefreshMu.Unlock()
-	if wg != nil {
-		wg.Add(1)
-	}
+
 	go func() {
-		if wg != nil {
-			defer wg.Done()
-		}
 		defer func() {
 			m.routeRefreshMu.Lock()
-			delete(m.routeRefreshActive, remoteChainID)
+			delete(m.routeRefreshActive, key)
 			m.routeRefreshMu.Unlock()
+			close(call.done)
 		}()
 		hooks := m.joinP2PHooks()
 		if hooks.LocalBundle == nil {
+			call.err = errors.New("authenticated route refresh is unavailable")
 			return
 		}
 		local, err := hooks.LocalBundle()
 		if err != nil {
-			m.recordRouteFailure(remoteChainID, fmt.Errorf("prepare local route refresh: %w", err), false)
+			call.err = fmt.Errorf("prepare local route refresh: %w", err)
+			m.recordRouteFailure(remoteChainID, call.err, false)
 			return
 		}
 		ctx, cancel := context.WithTimeout(parent, routeRefreshTimeout)
 		defer cancel()
+		if m.routeRefreshFn == nil {
+			current, bindingErr := m.routeRefreshBinding(ctx, remoteChainID)
+			if bindingErr != nil || current != binding {
+				call.err = fmt.Errorf("%w: active binding changed before refresh", ErrTrustGenerationChanged)
+				m.recordRouteFailure(remoteChainID, call.err, true)
+				return
+			}
+		}
+		ctx = withRouteGeneration(ctx, routeBindingID(binding))
 		local = m.prepareLocalRouteBundle(local)
 		if m.routeRefreshFn != nil {
 			err = m.routeRefreshFn(ctx, remoteChainID, local)
 		} else {
 			err = m.ExchangeP2PRoutes(ctx, remoteChainID, local)
 		}
-		if err != nil && !errors.Is(err, context.Canceled) {
-			m.recordRouteFailure(remoteChainID, fmt.Errorf("refresh peer routes: %w", err), isSecurityTransportError(err))
+		if err != nil {
+			call.err = fmt.Errorf("refresh peer routes: %w", err)
+			if !errors.Is(err, context.Canceled) {
+				m.recordRouteFailure(remoteChainID, call.err, isSecurityTransportError(err))
+			}
 		}
 	}()
+	return call
+}
+
+func waitRouteRefresh(ctx context.Context, call *routeRefreshCall) error {
+	select {
+	case <-call.done:
+		return call.err
+	case <-ctx.Done():
+		return fmt.Errorf("route refresh wait: %w", ctx.Err())
+	}
+}
+
+func (m *Manager) triggerRouteRefreshWithContext(parent context.Context, remoteChainID string, wg *sync.WaitGroup) {
+	if !m.transportIsEnabled() {
+		return
+	}
+	binding, err := m.routeRefreshBinding(parent, remoteChainID)
+	if err != nil {
+		m.recordRouteFailure(remoteChainID, err, errors.Is(err, ErrTrustGenerationChanged))
+		return
+	}
+	call := m.beginRouteRefresh(parent, remoteChainID, binding)
+	if wg != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-call.done
+		}()
+	}
 }
 
 func (m *Manager) triggerRouteRefresh(remoteChainID string) {
@@ -409,18 +496,24 @@ func (m *Manager) triggerRouteRefresh(remoteChainID string) {
 }
 
 func (m *Manager) maybeTriggerRouteRefresh(remoteChainID string) {
+	binding, err := m.routeRefreshBinding(context.Background(), remoteChainID)
+	if err != nil {
+		m.recordRouteFailure(remoteChainID, err, errors.Is(err, ErrTrustGenerationChanged))
+		return
+	}
+	key := routeRefreshKey(remoteChainID, binding)
 	now := time.Now()
 	m.routeRefreshMu.Lock()
 	if m.routeRefreshLast == nil {
 		m.routeRefreshLast = make(map[string]time.Time)
 	}
-	if last := m.routeRefreshLast[remoteChainID]; !last.IsZero() && now.Sub(last) < time.Minute {
+	if last := m.routeRefreshLast[key]; !last.IsZero() && now.Sub(last) < time.Minute {
 		m.routeRefreshMu.Unlock()
 		return
 	}
-	m.routeRefreshLast[remoteChainID] = now
+	m.routeRefreshLast[key] = now
 	m.routeRefreshMu.Unlock()
-	m.triggerRouteRefresh(remoteChainID)
+	m.beginRouteRefresh(context.Background(), remoteChainID, binding)
 }
 
 // RefreshPeerRoutes asks every active agreement to exchange the current local

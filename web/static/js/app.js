@@ -18264,6 +18264,7 @@ function federationConnectionAction(route, paused) {
     }
     if (route.state === 'locked') return 'Retry after unlock';
     if (route.state === 'security_blocked' || route.state === 'trust_failure') return 'Review trust';
+    if (route.state === 'legacy_repair_required') return 'Pair again required';
     return 'Retry connection';
 }
 
@@ -18421,7 +18422,7 @@ function FederationPage() {
         const peerName = conn.peer_name || 'Other SAGE';
         setBusyChain(chain);
         try {
-            const status = await fedPeerStatus(chain);
+            const status = await fedPeerStatus(chain, true);
             setConnectionReachability(current => ({ ...current, [chain]: status }));
             if (status.reachable) {
                 const route = federationConnectionRoute(status);

@@ -201,6 +201,17 @@ losing a relay should change reachability—not trust or domain grants. Unsafe o
 identity-mismatched routes fail closed; operators should not rerun JOIN merely
 to repair an IP address.
 
+**Retry connection** is stronger than the background reachability poll. One
+operator click joins any refresh already running for that exact active trust
+generation, waits up to the bounded recovery deadline, and performs exactly one
+authenticated re-probe. Expired snapshots remain usable only as hints for the
+same frozen peer identity; Direct and Secure relay candidates still pass the
+pinned federation mTLS check. A route from another trust generation is never
+dialed. If an older active agreement has no authenticated modern route binding,
+CEREBRUM says to pair again to enable Secure relay rather than guessing a peer
+identity. Federation Off, relay outages, expired/missing bundles, identity
+mismatches, and security blocks remain distinct operator diagnostics.
+
 ---
 
 ## The two codes, and why there are two

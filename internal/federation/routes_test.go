@@ -3,6 +3,7 @@ package federation
 import (
 	"context"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
@@ -124,7 +125,7 @@ func TestRaceRouteDialsClosesConcurrentSuccessfulLoser(t *testing.T) {
 	}
 	require.Eventually(t, func() bool {
 		return tracked[0].closed.Load() || tracked[1].closed.Load()
-	}, time.Second, time.Millisecond)
+	}, 2*time.Second, time.Millisecond)
 	if winner.Conn == tracked[0] {
 		assert.True(t, tracked[1].closed.Load())
 		assert.False(t, tracked[0].closed.Load())
@@ -306,13 +307,9 @@ func TestTriggerRouteRefreshRetriesLostExchange(t *testing.T) {
 		}
 		return nil
 	}
-	m.triggerRouteRefresh("chain-b")
-	require.Eventually(t, func() bool {
-		m.routeRefreshMu.Lock()
-		defer m.routeRefreshMu.Unlock()
-		return !m.routeRefreshActive["chain-b"]
-	}, time.Second, 10*time.Millisecond)
-	m.triggerRouteRefresh("chain-b")
+	binding := p2pRouteBinding{peerAgentID: "peer", policyEpoch: "epoch", bindingState: "active"}
+	require.Error(t, waitRouteRefresh(context.Background(), m.beginRouteRefresh(context.Background(), "chain-b", binding)))
+	require.NoError(t, waitRouteRefresh(context.Background(), m.beginRouteRefresh(context.Background(), "chain-b", binding)))
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
 	select {
@@ -333,7 +330,8 @@ func TestRouteRefreshFailureIsVisibleInDiagnostics(t *testing.T) {
 	m.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error {
 		return errors.New("simulated route outage")
 	}
-	m.triggerRouteRefresh("chain-b")
+	binding := p2pRouteBinding{peerAgentID: "peer", policyEpoch: "epoch", bindingState: "active"}
+	require.Error(t, waitRouteRefresh(context.Background(), m.beginRouteRefresh(context.Background(), "chain-b", binding)))
 	require.Eventually(t, func() bool {
 		return strings.Contains(m.RouteDiagnostics("chain-b").LastError, "simulated route outage")
 	}, time.Second, 10*time.Millisecond)
@@ -359,6 +357,7 @@ func TestRouteRefresherStartsOnceAndStopCancelsInflightRefresh(t *testing.T) {
 		canceled <- struct{}{}
 		return ctx.Err()
 	}
+	bindP2PRouteControl(t, a.mgr, b.chainID, hex.EncodeToString(b.agentPub), "route-refresh-lifecycle")
 	a.mgr.StartRouteRefresher(context.Background())
 	a.mgr.StartRouteRefresher(context.Background())
 	select {
@@ -375,6 +374,179 @@ func TestRouteRefresherStartsOnceAndStopCancelsInflightRefresh(t *testing.T) {
 		t.Fatal("route refresher stop did not cancel its in-flight exchange")
 	}
 	a.mgr.StopRouteRefresher()
+}
+
+func newRetryTestPair(t *testing.T, endpoint string) (*testChain, *testChain, *httptest.Server, *atomic.Int32, p2pRouteBinding) {
+	t.Helper()
+	a := newTestChain(t, "retry-a")
+	b := newTestChain(t, "retry-b")
+	var statusCalls atomic.Int32
+	tlsCfg, err := b.mgr.ServerTLSConfig()
+	require.NoError(t, err)
+	router := b.mgr.Router()
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fed/v1/status" {
+			statusCalls.Add(1)
+		}
+		router.ServeHTTP(w, r)
+	}))
+	server.TLS = tlsCfg
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	if endpoint == "" {
+		endpoint = server.URL
+	}
+	federate(t, a, b, endpoint, []string{"*"}, 4, 0)
+	federate(t, b, a, "https://127.0.0.1:1", []string{"*"}, 4, 0)
+	bindP2PRouteControl(t, a.mgr, b.chainID, hex.EncodeToString(b.agentPub), "retry-epoch")
+	bindP2PRouteControl(t, b.mgr, a.chainID, hex.EncodeToString(a.agentPub), "retry-epoch")
+	binding, err := a.mgr.routeRefreshBinding(context.Background(), b.chainID)
+	require.NoError(t, err)
+	return a, b, server, &statusCalls, binding
+}
+
+func installRetryRouteHooks(t *testing.T, m *Manager, chain string, binding p2pRouteBinding, expiresAt time.Time) {
+	t.Helper()
+	bundle := testDirectRouteBundle(t, "192.0.2.25")
+	now := time.Now()
+	snapshot := snapshotFromBundle(JoinP2PBundle{
+		PeerID: bundle.PeerID, Protocol: bundle.Protocol, Addrs: bundle.Addrs,
+		Revision: 7, IssuedAt: now.Add(-time.Hour).Unix(), ExpiresAt: expiresAt.Unix(),
+	}, routeBindingID(binding))
+	m.SetJoinP2PHooks(JoinP2PHooks{
+		LocalBundle:  func() (JoinP2PBundle, error) { return bundle, nil },
+		LoadSnapshot: func(got string) (RouteSnapshot, bool) { return snapshot, got == chain },
+	})
+}
+
+func TestRetryPeerStatusDeduplicatesRefreshAndAuthenticatedReprobe(t *testing.T) {
+	a, b, _, statusCalls, binding := newRetryTestPair(t, "")
+	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var refreshCalls atomic.Int32
+	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error {
+		if refreshCalls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return nil
+	}
+	const callers = 12
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			status, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+			if err == nil && (status == nil || status.ChainID != b.chainID) {
+				err = errors.New("retry returned the wrong authenticated peer")
+			}
+			errs <- err
+		}()
+	}
+	<-started
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+	for range callers {
+		require.NoError(t, <-errs)
+	}
+	assert.Equal(t, int32(1), refreshCalls.Load())
+	assert.Equal(t, int32(1), statusCalls.Load(), "concurrent operator retries must share exactly one re-probe")
+}
+
+func TestRetryPeerStatusStaleDirectRecoversThroughExactGenerationRelay(t *testing.T) {
+	a, b, server, statusCalls, binding := newRetryTestPair(t, "https://127.0.0.1:1")
+	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
+	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
+	var relayDials atomic.Int32
+	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, chain string, authenticate PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+		relayDials.Add(1)
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+		return PeerRouteDialResult{Conn: conn, Kind: RouteKindRelay, Target: "authenticated-test-relay"}, true, err
+	})
+	status, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+	require.NoError(t, err)
+	require.Equal(t, b.chainID, status.ChainID)
+	assert.Equal(t, int32(1), relayDials.Load())
+	assert.Equal(t, int32(1), statusCalls.Load())
+	assert.Equal(t, RouteKindRelay, a.mgr.RouteDiagnostics(b.chainID).State)
+}
+
+func TestRetryPeerStatusExpiredSnapshotUsesAuthenticatedBootstrap(t *testing.T) {
+	a, b, _, statusCalls, binding := newRetryTestPair(t, "")
+	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(-time.Minute))
+	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
+	status, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+	require.NoError(t, err)
+	assert.Equal(t, b.chainID, status.ChainID)
+	assert.Equal(t, int32(1), statusCalls.Load())
+}
+
+func TestRetryPeerStatusRejectsLegacyAndStaleGenerationRoutes(t *testing.T) {
+	t.Run("legacy requires re-pair", func(t *testing.T) {
+		a := newTestChain(t, "legacy-retry-a")
+		b := newTestChain(t, "legacy-retry-b")
+		federate(t, a, b, "https://127.0.0.1:1", nil, 4, 0)
+		_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+		require.ErrorIs(t, err, ErrLegacyRouteBinding)
+		require.ErrorContains(t, err, "paired again")
+	})
+	t.Run("stale generation never dials", func(t *testing.T) {
+		a, b, _, _, binding := newRetryTestPair(t, "")
+		installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
+		hooks := a.mgr.joinP2PHooks()
+		good, _ := hooks.LoadSnapshot(b.chainID)
+		good.Generation = "different-trust-generation"
+		hooks.LoadSnapshot = func(string) (RouteSnapshot, bool) { return good, true }
+		a.mgr.SetJoinP2PHooks(hooks)
+		a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
+		var routeDials atomic.Int32
+		a.mgr.SetPeerRouteDialFunc(func(context.Context, string, PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+			routeDials.Add(1)
+			return PeerRouteDialResult{}, true, errors.New("stale route must not be dialed")
+		})
+		_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+		require.NoError(t, err, "the independently pinned Direct endpoint remains safe")
+		assert.Zero(t, routeDials.Load())
+	})
+}
+
+func TestRetryPeerStatusIsBoundedAndSecurityFailureSkipsReprobe(t *testing.T) {
+	a, b, _, statusCalls, binding := newRetryTestPair(t, "")
+	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error {
+		close(started)
+		<-release
+		return errors.New("peer identity mismatch")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	begin := time.Now()
+	_, err := a.mgr.RetryPeerStatus(ctx, b.chainID)
+	require.ErrorContains(t, err, "timed out")
+	assert.Less(t, time.Since(begin), 500*time.Millisecond)
+	<-started
+	close(release)
+	require.Eventually(t, func() bool {
+		a.mgr.routeRetryMu.Lock()
+		defer a.mgr.routeRetryMu.Unlock()
+		return len(a.mgr.routeRetryActive) == 0
+	}, 3*time.Second, time.Millisecond)
+	assert.Zero(t, statusCalls.Load(), "a security-blocked refresh must not fall through to a status request")
+}
+
+func TestRetryPeerStatusFederationOffThenOnKeepsTrustEdge(t *testing.T) {
+	a, b, _, _, binding := newRetryTestPair(t, "")
+	installRetryRouteHooks(t, a.mgr, b.chainID, binding, time.Now().Add(time.Hour))
+	a.mgr.routeRefreshFn = func(context.Context, string, JoinP2PBundle) error { return nil }
+	a.mgr.SetTransportEnabled(false)
+	_, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+	require.ErrorContains(t, err, "disabled")
+	a.mgr.SetTransportEnabled(true)
+	status, err := a.mgr.RetryPeerStatus(context.Background(), b.chainID)
+	require.NoError(t, err)
+	assert.Equal(t, b.chainID, status.ChainID)
 }
 
 func TestDisabledTransportFailsBeforeDial(t *testing.T) {

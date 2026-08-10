@@ -57,6 +57,7 @@ func (h *DashboardHandler) SetFederation(f FederationJoinDriver) { h.Federation 
 const (
 	fedCallTimeout   = 25 * time.Second
 	fedStatusTimeout = 6 * time.Second
+	fedRetryTimeout  = 15 * time.Second
 	// A pasted JOIN enrollment may need several libp2p target attempts before
 	// the host CA can be fetched. Keep that bounded, but give the operator the
 	// promised five-minute window while the pairing screen remains open instead
@@ -984,10 +985,27 @@ func (h *DashboardHandler) handleFedPeerStatus(w http.ResponseWriter, r *http.Re
 	if !h.fedReady(w) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), fedStatusTimeout)
+	timeout := fedStatusTimeout
+	operatorRetry := r.URL.Query().Get("retry") == "1"
+	if operatorRetry {
+		timeout = fedRetryTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	chain := chi.URLParam(r, "chain_id")
-	st, err := h.Federation.PeerStatus(ctx, chain)
+	var st *federation.StatusResponse
+	var err error
+	if operatorRetry {
+		if retryer, ok := h.Federation.(interface {
+			RetryPeerStatus(context.Context, string) (*federation.StatusResponse, error)
+		}); ok {
+			st, err = retryer.RetryPeerStatus(ctx, chain)
+		} else {
+			err = errors.New("authenticated federation route recovery is unavailable")
+		}
+	} else {
+		st, err = h.Federation.PeerStatus(ctx, chain)
+	}
 	if err != nil {
 		out := map[string]any{"remote_chain_id": chain, "reachable": false, "error": err.Error()}
 		var route federation.RouteDiagnostics

@@ -205,6 +205,19 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 			}
 		}
 	}
+	if generation := requiredRouteGeneration(ctx); generation != "" && routeDial != nil {
+		hooks := m.joinP2PHooks()
+		snapshot, ok := RouteSnapshot{}, false
+		if hooks.LoadSnapshot != nil {
+			snapshot, ok = hooks.LoadSnapshot(agreement.RemoteChainID)
+		}
+		if !ok || snapshot.Generation != generation {
+			// A Retry may use an expired snapshot as an authenticated bootstrap
+			// hint, but never a route learned by another trust generation. Direct
+			// HTTPS remains available and is still pinned by the active agreement.
+			routeDial = nil
+		}
+	}
 	if routeDial != nil || !p2pOnly {
 		directDialer := &net.Dialer{}
 		transport.DialTLSContext = func(dialCtx context.Context, network, address string) (net.Conn, error) {
@@ -351,7 +364,9 @@ func isSecurityTransportError(err error) bool {
 	// distinguishable from dial errors by the stable operation/error text.
 	text := strings.ToLower(err.Error())
 	return strings.Contains(text, "tls:") || strings.Contains(text, "x509:") ||
-		strings.Contains(text, "certificate") || strings.Contains(text, "spki")
+		strings.Contains(text, "certificate") || strings.Contains(text, "spki") ||
+		strings.Contains(text, "pin mismatch") || strings.Contains(text, "identity mismatch") ||
+		strings.Contains(text, "authentication failed")
 }
 
 // QueryPeer runs one scoped recall against a remote chain.
@@ -754,6 +769,81 @@ func (m *Manager) PeerStatus(ctx context.Context, remoteChainID string) (*Status
 		}
 	}
 	return out, nil
+}
+
+// RetryPeerStatus is the operator recovery contract. Concurrent clicks share
+// one exact-generation refresh and one authenticated status re-probe. Ordinary
+// PeerStatus polling deliberately does not enter this workflow.
+func (m *Manager) RetryPeerStatus(ctx context.Context, remoteChainID string) (*StatusResponse, error) {
+	if !m.transportIsEnabled() {
+		return nil, errors.New("federation transport is disabled; turn federation on before retrying")
+	}
+	binding, err := m.routeRefreshBinding(ctx, remoteChainID)
+	if err != nil {
+		return nil, err
+	}
+	key := routeRefreshKey(remoteChainID, binding)
+	m.routeRetryMu.Lock()
+	if m.routeRetryActive == nil {
+		m.routeRetryActive = make(map[string]*peerStatusRetryCall)
+	}
+	call := m.routeRetryActive[key]
+	if call == nil {
+		call = &peerStatusRetryCall{done: make(chan struct{})}
+		m.routeRetryActive[key] = call
+		go m.runPeerStatusRetry(remoteChainID, binding, key, call)
+	}
+	m.routeRetryMu.Unlock()
+
+	select {
+	case <-call.done:
+		return call.status, call.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("federation retry timed out: %w", ctx.Err())
+	}
+}
+
+func (m *Manager) runPeerStatusRetry(remoteChainID string, binding p2pRouteBinding, key string, call *peerStatusRetryCall) {
+	defer func() {
+		close(call.done)
+		time.AfterFunc(routeRetryDedupWindow, func() {
+			m.routeRetryMu.Lock()
+			if m.routeRetryActive[key] == call {
+				delete(m.routeRetryActive, key)
+			}
+			m.routeRetryMu.Unlock()
+		})
+	}()
+	workflowCtx, cancel := context.WithTimeout(context.Background(), routeRefreshTimeout+6*time.Second)
+	defer cancel()
+	refreshErr := waitRouteRefresh(workflowCtx, m.beginRouteRefresh(context.Background(), remoteChainID, binding))
+	if errors.Is(refreshErr, ErrTrustGenerationChanged) || errors.Is(refreshErr, ErrLegacyRouteBinding) || isSecurityTransportError(refreshErr) {
+		call.err = refreshErr
+		return
+	}
+	ss := m.syncStore()
+	if ss == nil {
+		call.err = fmt.Errorf("%w: SQLite route binding is unavailable", ErrTrustGenerationChanged)
+		return
+	}
+	unlock := ss.LockSyncPolicyRead()
+	agreement, current, err := m.currentP2PRouteBinding(workflowCtx, remoteChainID)
+	unlock()
+	if err != nil || current != binding {
+		call.err = fmt.Errorf("%w: active binding changed before authenticated re-probe", ErrTrustGenerationChanged)
+		return
+	}
+	status, probeErr := m.fetchPeerStatus(withRouteGeneration(workflowCtx, routeBindingID(binding)), agreement)
+	if probeErr != nil {
+		if refreshErr != nil {
+			call.err = fmt.Errorf("route refresh failed (%v); authenticated re-probe failed: %w", refreshErr, probeErr)
+		} else {
+			call.err = fmt.Errorf("authenticated re-probe failed: %w", probeErr)
+		}
+		return
+	}
+	m.rememberPeerName(remoteChainID, status.NetworkName)
+	call.status = status
 }
 
 // PeerStatusForPipeLookup is the compact counterpart for named recipient

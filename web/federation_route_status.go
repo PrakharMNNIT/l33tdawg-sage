@@ -17,6 +17,22 @@ func federationDashboardFailureState(err error, route federation.RouteDiagnostic
 	}
 	message := strings.ToLower(err.Error())
 	switch {
+	case errors.Is(err, federation.ErrLegacyRouteBinding),
+		strings.Contains(message, "legacy federation connection"):
+		return "legacy_repair_required"
+	case errors.Is(err, federation.ErrTrustGenerationChanged),
+		strings.Contains(message, "trust generation"):
+		return "trust_generation_mismatch"
+	case strings.Contains(message, "route snapshot") && strings.Contains(message, "expired"):
+		return "route_bundle_expired"
+	case strings.Contains(message, "no configured p2p route"),
+		strings.Contains(message, "no p2p dialer"),
+		strings.Contains(message, "route bundle") && strings.Contains(message, "missing"):
+		return "route_bundle_missing"
+	case strings.Contains(message, "relay") && (strings.Contains(message, "unavailable") || strings.Contains(message, "failed")):
+		return "relay_unavailable"
+	case strings.Contains(message, "direct") && (strings.Contains(message, "stale") || strings.Contains(message, "unavailable")):
+		return "stale_direct"
 	case strings.Contains(message, "vault") && strings.Contains(message, "lock"),
 		strings.Contains(message, "node locked"),
 		strings.Contains(message, "unlock this sage"):
