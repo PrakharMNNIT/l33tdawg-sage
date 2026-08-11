@@ -8,9 +8,12 @@ const (
 	// Every strict post-app-v20 block commits as one Badger transaction. These
 	// consensus limits bound both transaction count and raw input retained while
 	// the block is evaluated. The raw-byte ceiling is intentionally independent
-	// of CometBFT's protobuf MaxTxBytes limit; both must be satisfied.
+	// of CometBFT's protobuf MaxTxBytes limit; both must be satisfied. 1.2 MB is
+	// large enough for a fully signed, 1,304-entry SkillRegistry transaction
+	// (currently 1,092,149 bytes) while retaining a deterministic bounded atomic
+	// working set on every validator.
 	maxAppV20AtomicFinalizeEntries = 64
-	maxAppV20AtomicFinalizeTxBytes = 1 << 20
+	maxAppV20AtomicFinalizeTxBytes = 1_200_000
 )
 
 const appV20AtomicFinalizeBudgetCode uint32 = 110

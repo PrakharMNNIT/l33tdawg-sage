@@ -519,6 +519,27 @@ func TestAppV20AtomicFinalizeBudgetRejectsEntryCountBeforeMutation(t *testing.T)
 	assert.Zero(t, nonce)
 }
 
+func TestAppV20AtomicFinalizeBudgetAdmitsGovernedRegistryEnvelope(t *testing.T) {
+	const registryV20RawBytes = 1_092_149
+	require.Less(t, registryV20RawBytes, maxAppV20AtomicFinalizeTxBytes)
+
+	registryTx := make([]byte, registryV20RawBytes)
+	assert.True(t, appV20AtomicFinalizeBudget([][]byte{registryTx}))
+	assert.True(t, validateAppV20Proposal([][]byte{registryTx}))
+	assert.Len(t, prepareAppV20Proposal(
+		[][]byte{registryTx},
+		int64(maxAppV20AtomicFinalizeTxBytes)+1024,
+	), 1)
+
+	tooLarge := make([]byte, maxAppV20AtomicFinalizeTxBytes+1)
+	assert.False(t, appV20AtomicFinalizeBudget([][]byte{tooLarge}))
+	assert.False(t, validateAppV20Proposal([][]byte{tooLarge}))
+	assert.Empty(t, prepareAppV20Proposal(
+		[][]byte{tooLarge},
+		int64(maxAppV20AtomicFinalizeTxBytes)+2048,
+	))
+}
+
 func TestAppV20PrepareAndProcessProposalEnforceGlobalAtomicBudget(t *testing.T) {
 	h := newGovernanceReplayHarness(t)
 	blockTime := time.Unix(15_402, 0).UTC()

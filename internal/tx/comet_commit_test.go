@@ -1,9 +1,12 @@
 package tx
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -61,6 +64,204 @@ func TestBroadcastCometCommitRequiresCompleteBoundProof(t *testing.T) {
 				t.Fatalf("malformed response produced result=%+v err=%v", got, err)
 			}
 		})
+	}
+}
+
+func TestBroadcastCometCommitAcceptsQuotedAndNumericHeights(t *testing.T) {
+	t.Parallel()
+
+	encoded := []byte("height-compatibility")
+	bound := cometHashHexForTest(encoded)
+	for _, tc := range []struct {
+		name   string
+		height string
+	}{
+		{name: "quoted", height: `"7"`},
+		{name: "numeric", height: `7`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w,
+					`{"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":%q,"height":%s}}`,
+					bound, tc.height)
+			}))
+			defer rpc.Close()
+
+			got, err := BroadcastCometCommit(context.Background(), rpc.URL, nil, encoded)
+			if err != nil {
+				t.Fatalf("BroadcastCometCommit: %v", err)
+			}
+			if got.Height != 7 {
+				t.Fatalf("height = %d, want 7", got.Height)
+			}
+		})
+	}
+}
+
+func TestBroadcastCometCommitUsesBoundedJSONRPCPost(t *testing.T) {
+	t.Parallel()
+
+	// Match the exact signed-registry artifact scale that overflowed the old
+	// hex-in-URL transport while remaining below CometBFT's body limit as base64.
+	encoded := bytes.Repeat([]byte("x"), 680_269)
+	bound := cometHashHexForTest(encoded)
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("signed transaction leaked into query: %q", r.URL.RawQuery)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", got)
+		}
+		var request struct {
+			JSONRPC string `json:"jsonrpc"`
+			Method  string `json:"method"`
+			Params  struct {
+				Tx string `json:"tx"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(request.Params.Tx)
+		if err != nil {
+			t.Fatalf("decode request tx: %v", err)
+		}
+		if request.JSONRPC != "2.0" || request.Method != "broadcast_tx_commit" || !bytes.Equal(decoded, encoded) {
+			t.Fatalf("unexpected JSON-RPC request: version=%q method=%q tx_len=%d",
+				request.JSONRPC, request.Method, len(decoded))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w,
+			`{"jsonrpc":"2.0","id":1,"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":%q,"height":7}}`,
+			bound)
+	}))
+	defer rpc.Close()
+
+	got, err := BroadcastCometCommit(context.Background(), rpc.URL, nil, encoded)
+	if err != nil {
+		t.Fatalf("BroadcastCometCommit: %v", err)
+	}
+	if got.Height != 7 {
+		t.Fatalf("height = %d, want 7", got.Height)
+	}
+}
+
+func TestBroadcastCometCommitRejectsOversizedPostBeforeSend(t *testing.T) {
+	t.Parallel()
+
+	pub, key, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := bytes.Repeat([]byte("x"), 800_000)
+	_, err = BroadcastCometCommit(context.Background(), "http://127.0.0.1:1", key, encoded)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 1000000-byte limit") {
+		t.Fatalf("oversized request error = %v", err)
+	}
+	if keyIsFenced(string(pub)) {
+		t.Fatal("pre-send oversized request fenced signing key")
+	}
+}
+
+func TestBroadcastCometCommitHonorsMatchedInternalLimits(t *testing.T) {
+	t.Setenv("SAGE_COMET_MAX_TX_BYTES", "1200000")
+	t.Setenv("SAGE_COMET_RPC_MAX_BODY_BYTES", "1600000")
+
+	// This is the measured SkillRegistry v20 request scale: the 1,456,274-byte
+	// JSON-RPC body bounds the raw signed transaction at 1,092,150 bytes.
+	encoded := bytes.Repeat([]byte("v"), 1_092_150)
+	bound := cometHashHexForTest(encoded)
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.ContentLength; got != 1_456_274 {
+			t.Errorf("Content-Length = %d, want 1456274", got)
+		}
+		var request struct {
+			Params struct {
+				Tx string `json:"tx"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(request.Params.Tx)
+		if err != nil || !bytes.Equal(decoded, encoded) {
+			t.Fatalf("decoded tx len=%d err=%v", len(decoded), err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w,
+			`{"jsonrpc":"2.0","id":1,"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":%q,"height":7}}`,
+			bound)
+	}))
+	defer rpc.Close()
+
+	got, err := BroadcastCometCommit(context.Background(), rpc.URL, nil, encoded)
+	if err != nil || got == nil || got.Height != 7 {
+		t.Fatalf("BroadcastCometCommit result=%+v err=%v", got, err)
+	}
+}
+
+func TestBroadcastCometCommitRejectsInvalidConfiguredLimits(t *testing.T) {
+	t.Setenv("SAGE_COMET_MAX_TX_BYTES", "not-a-number")
+	_, err := BroadcastCometCommit(context.Background(), "http://127.0.0.1:1", nil, []byte("tx"))
+	if err == nil || !strings.Contains(err.Error(), "invalid SAGE_COMET_MAX_TX_BYTES") {
+		t.Fatalf("invalid configured limit error = %v", err)
+	}
+}
+
+func TestBroadcastCometSyncUsesBoundedJSONRPCPost(t *testing.T) {
+	t.Parallel()
+
+	encoded := bytes.Repeat([]byte("s"), 680_269)
+	bound := cometHashHexForTest(encoded)
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.RawQuery != "" {
+			t.Errorf("request = %s %s, want POST without query", r.Method, r.URL.String())
+		}
+		var request struct {
+			Method string `json:"method"`
+			Params struct {
+				Tx string `json:"tx"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(request.Params.Tx)
+		if err != nil || request.Method != "broadcast_tx_sync" || !bytes.Equal(decoded, encoded) {
+			t.Fatalf("unexpected sync request: method=%q len=%d err=%v", request.Method, len(decoded), err)
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":1,"result":{"code":0,"hash":%q}}`, bound)
+	}))
+	defer rpc.Close()
+
+	got, err := BroadcastCometSync(context.Background(), rpc.URL, nil, encoded)
+	if err != nil || got == nil || got.Hash != bound {
+		t.Fatalf("BroadcastCometSync result=%+v err=%v", got, err)
+	}
+}
+
+func TestBroadcastCometCommitScrubsHostileContentType(t *testing.T) {
+	t.Parallel()
+
+	encoded := []byte("content-type-secret")
+	leaked := hex.EncodeToString(encoded)
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; tx=0x"+leaked)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer rpc.Close()
+
+	_, err := BroadcastCometCommit(context.Background(), rpc.URL, nil, encoded)
+	if err == nil {
+		t.Fatal("hostile Content-Type was accepted")
+	}
+	if strings.Contains(err.Error(), leaked) {
+		t.Fatalf("error leaked signed transaction: %v", err)
 	}
 }
 
