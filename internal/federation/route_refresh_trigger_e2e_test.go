@@ -141,9 +141,33 @@ func TestDirectSuccessTriggerAdmitsRefreshWorkerWithWriterHeld(t *testing.T) {
 	}
 }
 
+// watchRouteRefreshWorkersForChain is the zero-assertion counterpart of
+// watchRouteRefreshWorkers: it counts admissions for ONE remote chain only.
+//
+// The filter is load-bearing for a "must stay zero" test. The seam is a package
+// global, so with a reachable peer BOTH chains' managers report through it, and
+// an unrelated admission on the serving side would read as the defect. Scoping
+// to the requesting side's remote chain ID keeps the assertion about the guard
+// under test and nothing else.
+func watchRouteRefreshWorkersForChain(t *testing.T, remoteChainID string) *atomic.Int32 {
+	t.Helper()
+	var entered atomic.Int32
+	setRouteRefreshWorkerEntry(func(chainID string) {
+		if chainID == remoteChainID {
+			entered.Add(1)
+		}
+	})
+	t.Cleanup(func() { setRouteRefreshWorkerEntry(nil) })
+	return &entered
+}
+
 // The route-exchange path must NOT self-trigger a refresh, or an exchange would
 // schedule another exchange. Both production triggers guard on
-// `path != p2pRoutesExchangePath`; this pins that guard.
+// `path != p2pRoutesExchangePath`; this pins the TRANSPORT-ERROR one.
+//
+// It cannot pin the other: an unreachable peer never reaches the Direct-success
+// trigger at all, so deleting that guard leaves this test green. The
+// Direct-success half is covered by the reachable-peer test below.
 func TestRouteExchangePathDoesNotSelfTriggerRefresh(t *testing.T) {
 	a := newTestChain(t, "trigger-noself-a")
 	b := newTestChain(t, "trigger-noself-b")
@@ -160,4 +184,48 @@ func TestRouteExchangePathDoesNotSelfTriggerRefresh(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 	require.Zero(t, entered.Load(), "the route exchange scheduled its own refresh, which recurses")
+}
+
+// The Direct-success half of the no-self-trigger guard (client.go: the
+// `chosen.Kind == RouteKindDirect && routeDial != nil && path !=
+// p2pRoutesExchangePath` branch). This needs the SAME fixture shape as
+// TestDirectSuccessTriggerAdmitsRefreshWorkerWithWriterHeld — a reachable peer
+// so Direct wins, and a non-nil dialer so the branch is entered — but drives
+// the exchange path and asserts the refresh is NOT scheduled.
+//
+// Deleting `&& path != p2pRoutesExchangePath` from the Direct-success trigger
+// makes this test fail; the unreachable-peer test above stays green under that
+// same mutation, which is why both are needed.
+func TestDirectSuccessRouteExchangeDoesNotSelfTriggerRefresh(t *testing.T) {
+	a := newTestChain(t, "trigger-noself-direct-a")
+	b := newTestChain(t, "trigger-noself-direct-b")
+	var served atomic.Int32
+	server := startCountedFederationServer(t, b, &served)
+	federate(t, a, b, server.URL, nil, 4, 0)
+	federate(t, b, a, "https://unused.invalid", nil, 4, 0)
+
+	// Non-nil but always-failing, exactly as in the Direct-success trigger test:
+	// the reachable Direct candidate wins the race while routeDial stays non-nil.
+	a.mgr.SetPeerRouteDialFunc(func(ctx context.Context, chain string, _ []string, _ PeerRouteAuthenticator) (PeerRouteDialResult, bool, error) {
+		return PeerRouteDialResult{}, true, context.DeadlineExceeded
+	})
+
+	entered := watchRouteRefreshWorkersForChain(t, b.chainID)
+
+	agreement, err := a.mgr.ActiveAgreement(b.chainID)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	_, _, _ = a.mgr.doPeerRequest(ctx, agreement, http.MethodPost, p2pRoutesExchangePath, map[string]any{})
+
+	// Without this the test is vacuous: if Direct never won, the guarded branch
+	// was never reached and zero admissions proves nothing. The exchange
+	// handler's own status code is irrelevant — the trigger sits before the
+	// response body is read, so being served at all is what matters.
+	require.Positive(t, served.Load(), "the peer never served the exchange request, so the Direct-success "+
+		"branch was never reached and this test is not exercising its guard")
+
+	time.Sleep(300 * time.Millisecond)
+	require.Zero(t, entered.Load(), "a successful Direct route exchange scheduled another refresh, "+
+		"which schedules another exchange")
 }
