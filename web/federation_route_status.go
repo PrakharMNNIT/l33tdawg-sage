@@ -26,6 +26,34 @@ func federationDashboardFailureState(err error, route federation.RouteDiagnostic
 	case errors.Is(err, federation.ErrTrustGenerationChanged),
 		strings.Contains(message, "trust generation"):
 		return "trust_generation_mismatch"
+	// R3. SECURITY EVIDENCE OUTRANKS ROUTE-AVAILABILITY EVIDENCE, and the order
+	// of these cases is the whole mechanism.
+	//
+	// A single failure routinely carries BOTH kinds of text: doPeerRequest races
+	// a p2p attempt and a direct attempt and joins both errors, so one message
+	// can read "peer has no configured p2p route ... x509: certificate signed by
+	// unknown authority". These security cases used to sit BELOW the
+	// availability cases, so that message matched "no configured p2p route"
+	// first and the dashboard rendered a warn-tone "Routes missing", telling the
+	// operator to go look at their network — when the truth was a pinned-trust
+	// mismatch that SAGE refused to talk to.
+	//
+	// A security verdict that presents as a benign availability gap is the worst
+	// failure this switch can produce, so both security classes are evaluated
+	// before any availability class. Availability text remains in the message
+	// either way; only which verdict is REPORTED changes.
+	case strings.Contains(message, "certificate"),
+		strings.Contains(message, "spki"),
+		strings.Contains(message, "pin mismatch"),
+		strings.Contains(message, "identity mismatch"),
+		strings.Contains(message, "security block"):
+		return "security_blocked"
+	case strings.Contains(message, "revoked"),
+		strings.Contains(message, "expired agreement"),
+		strings.Contains(message, "unknown agreement"),
+		strings.Contains(message, "trust") && strings.Contains(message, "fail"),
+		strings.Contains(message, "authentication"):
+		return "trust_failure"
 	case strings.Contains(message, "route snapshot") && strings.Contains(message, "expired"):
 		return "route_bundle_expired"
 	case strings.Contains(message, "no configured p2p route"),
@@ -40,18 +68,6 @@ func federationDashboardFailureState(err error, route federation.RouteDiagnostic
 		strings.Contains(message, "node locked"),
 		strings.Contains(message, "unlock this sage"):
 		return "locked"
-	case strings.Contains(message, "certificate"),
-		strings.Contains(message, "spki"),
-		strings.Contains(message, "pin mismatch"),
-		strings.Contains(message, "identity mismatch"),
-		strings.Contains(message, "security block"):
-		return "security_blocked"
-	case strings.Contains(message, "revoked"),
-		strings.Contains(message, "expired agreement"),
-		strings.Contains(message, "unknown agreement"),
-		strings.Contains(message, "trust") && strings.Contains(message, "fail"),
-		strings.Contains(message, "authentication"):
-		return "trust_failure"
 	case strings.Contains(message, "old peer"),
 		strings.Contains(message, "older peer"),
 		strings.Contains(message, "unsupported"),
