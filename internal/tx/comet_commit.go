@@ -37,6 +37,80 @@ const maxConfiguredCometBytes = 8_000_000
 // transaction to JSON-RPC POST before its hex query can approach that ceiling.
 const cometRPCMaxSafeURIBytes = 900_000
 
+// cometSubmitClient carries every SUBMISSION. It exists for exactly one reason:
+// to make connection reuse impossible, because reuse is what lets one broadcast
+// be delivered twice.
+//
+// Go's transport transparently re-sends a request when the response headers
+// never arrive, and the conditions line up precisely against the wire shape
+// built below. net/http/request.go isReplayable: a nil-body GET is replayable —
+// and the small-transaction path here IS a nil-body GET. net/http/transport.go
+// mapRoundTripError: a pre-header read failure is downgraded to "nothing
+// written" ONLY when no bytes went out, so it stays retryable in exactly the
+// case where the request DID reach the node and may already have been admitted.
+// shouldRetryRequest then retries, gated on pc.isReused().
+//
+// A duplicate delivery to the SAME node is harmless — CometBFT's mempool cache
+// rejects it before the application sees it, which surfaces as a JSON-RPC error
+// and correctly leaves the registration live to be fenced. The danger is a
+// multi-responder endpoint: the retry opens a NEW connection, which a load
+// balancer may place on a different node, and that node can answer with a
+// hash-bound nonzero CheckTx of its own (a node-local refusal such as a locked
+// vault or unsealed boot state sync). BroadcastCometCommit would then treat that
+// as a definitive refusal and clear the fence — on the evidence of a node that
+// never accepted the bytes — while the first node's copy goes on to commit.
+//
+// Disabling keep-alives makes pc.isReused() false for every submission, which is
+// the gate shouldRetryRequest checks before it ever consults replayability, so
+// the retry cannot occur. HTTP/2 is disabled with it, because DisableKeepAlives
+// governs the HTTP/1 connection pool only: an https endpoint that negotiated h2
+// by ALPN would keep multiplexing over one connection and reintroduce the reuse
+// this exists to remove. The cost is one handshake per broadcast against what is
+// normally a loopback RPC.
+//
+// Nothing is lost by giving up the retry. The benign case it was written for —
+// transport.go errServerClosedIdle, "an unfortunate keep-alive timeout just as
+// the client was writing" — is a race BETWEEN a pooled idle connection and the
+// server's idle timeout. With no pooled idle connection it cannot arise. The
+// same change removes both the hazard and the reason the papering-over existed.
+//
+// NOT the fix: an Idempotency-Key header. It makes a request MORE replayable,
+// not less — isReplayable returns true for it. It is a server-side contract that
+// CometBFT does not implement.
+var cometSubmitClient = newCometSubmitClient()
+
+func newCometSubmitClient() *http.Client {
+	transport := &http.Transport{}
+	// Clone the process defaults where we can, so proxy configuration, dial and
+	// TLS handshake timeouts keep matching every other client in the node. The
+	// assertion is guarded rather than bare: this runs at package init, and a
+	// panic here would kill the process before anything could report why.
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	}
+	transport.DisableKeepAlives = true
+	http1Only := new(http.Protocols)
+	http1Only.SetHTTP1(true)
+	transport.Protocols = http1Only
+	// No Timeout, matching the http.DefaultClient this replaces: every caller
+	// passes a context, and a client-level deadline here would silently cap
+	// broadcast_tx_commit, which legitimately blocks until the tx is in a block.
+	return &http.Client{Transport: transport}
+}
+
+// DoCometSubmission sends one already-built CometBFT submission through the
+// process-wide non-reusing transport. It is exported for the legacy CEREBRUM
+// commit path in web/, which owns additional request-aware error semantics but
+// must share the same delivery guarantee as the strict broadcasters here.
+// Read-only RPCs must keep using their ordinary client: this seam deliberately
+// pays one connection (and, for HTTPS, one TLS handshake) per submission.
+func DoCometSubmission(req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, errors.New("comet submission request is nil")
+	}
+	return cometSubmitClient.Do(req)
+}
+
 func cometBroadcastRequest(ctx context.Context, endpoint, method string, encoded []byte) (*http.Request, error) {
 	maxTxBytes, limitErr := configuredCometByteLimit("SAGE_COMET_MAX_TX_BYTES", CometMaxTxBytes)
 	if limitErr != nil {
@@ -173,7 +247,7 @@ func BroadcastCometCommit(ctx context.Context, cometRPC string, signingKey ed255
 	}
 
 	RegisterSubmittedTx(signingKey, encoded, CometTxResolver(endpoint))
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := DoCometSubmission(req)
 	if err != nil {
 		return nil, fmt.Errorf("broadcast tx commit: %s", classifyFenceCause(err))
 	}
@@ -261,7 +335,7 @@ func BroadcastCometSync(ctx context.Context, cometRPC string, signingKey ed25519
 	}
 
 	RegisterSubmittedTx(signingKey, encoded, CometTxResolver(endpoint))
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := DoCometSubmission(req)
 	if err != nil {
 		return nil, fmt.Errorf("broadcast tx sync: %s", classifyFenceCause(err))
 	}

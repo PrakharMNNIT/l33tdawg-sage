@@ -332,7 +332,7 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_message_send": {
 			Name:        "sage_message_send",
-			Description: "Idempotently send one exact local or federated agent message. The caller-supplied idempotency_key makes a retry return the original message_id instead of creating a duplicate. Use sage_find_agent first when only a human name is known.",
+			Description: "Idempotently send one exact local or federated agent message. The caller-supplied idempotency_key makes a retry return the original message_id instead of creating a duplicate. Use sage_find_agent first when only a human name is known. A successful send also returns a fresh non-claiming snapshot of this caller's own inbox, closing the race where an inbound message arrives just after an earlier empty poll; follow message_inbox_action before reporting that no message arrived.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -4443,6 +4443,32 @@ func randomMessageToken(prefix string) (string, error) {
 	return prefix + hex.EncodeToString(raw), nil
 }
 
+// attachPostSendInboxSnapshot closes the common check-then-send coordination
+// race without claiming somebody else's work. An agent can poll an empty inbox,
+// receive a message a moment later, and then send an outbound status update from
+// the same active session. Returning a fresh sender-exact pointer on that send
+// prevents the earlier empty snapshot from being mistaken for current state.
+//
+// The send is already durable when this probe runs, so a probe failure must not
+// turn success into an indeterminate send or invite an unsafe retry. Report the
+// failure instead of manufacturing unread=false.
+func (s *Server) attachPostSendInboxSnapshot(ctx context.Context, result map[string]any) {
+	var inbox struct {
+		Count  int  `json:"count"`
+		Unread bool `json:"unread"`
+	}
+	if err := s.doSignedJSON(ctx, http.MethodGet, "/v1/pipe/history/inbox?count_only=1", nil, &inbox); err != nil {
+		result["message_inbox_check_error"] = err.Error()
+		return
+	}
+	result["message_inbox_unread"] = inbox.Unread
+	result["message_inbox_unread_count"] = inbox.Count
+	result["message_inbox_checked_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	if inbox.Unread {
+		result["message_inbox_action"] = "New inbound work is visible now. Call sage_inbox with a fresh poll before reporting that no message arrived."
+	}
+}
+
 func (s *Server) toolMessageSend(ctx context.Context, params map[string]any) (any, error) {
 	if err := s.requireBoundFederatedCaller(ctx); err != nil {
 		return nil, err
@@ -4505,6 +4531,7 @@ func (s *Server) toolMessageSend(ctx context.Context, params map[string]any) (an
 		if ttl > 0 {
 			result["expires_at"] = response.ExpiresAt
 		}
+		s.attachPostSendInboxSnapshot(ctx, result)
 		return result, nil
 	}
 	if resolved.ToAgent == "" || resolved.ToProvider != "" {
@@ -4531,6 +4558,7 @@ func (s *Server) toolMessageSend(ctx context.Context, params map[string]any) (an
 	if ttl > 0 {
 		result["expires_at"] = response.ExpiresAt
 	}
+	s.attachPostSendInboxSnapshot(ctx, result)
 	return result, nil
 }
 

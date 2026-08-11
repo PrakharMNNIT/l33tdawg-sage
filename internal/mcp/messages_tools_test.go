@@ -106,6 +106,85 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 	require.Contains(t, status.(map[string]any)["message"], "does not prove comprehension")
 }
 
+func TestMessageSendSurfacesInboundThatArrivedAfterPriorEmptyPoll(t *testing.T) {
+	var inboxChecks int
+	var sendSucceeded bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pipe/history/inbox", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "1", r.URL.Query().Get("count_only"))
+		inboxChecks++
+		if inboxChecks == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 0, "unread": false})
+			return
+		}
+		require.True(t, sendSucceeded, "the refresh must happen after the outbound send commits")
+		_ = json.NewEncoder(w).Encode(map[string]any{"count": 1, "unread": true})
+	})
+	mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
+	mux.HandleFunc("/v1/pipe/updates", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
+	mux.HandleFunc("/v1/pipe/resolve", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"to_agent": "agent-bob"})
+	})
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, _ *http.Request) {
+		sendSucceeded = true
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message_id": "msg-out", "status": "pending"})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, privateKey)
+
+	before := s.checkPipelineInbox(context.Background())
+	require.Equal(t, false, before["message_inbox_unread"])
+	require.Equal(t, 0, before["message_inbox_unread_count"])
+
+	sent, err := s.toolMessageSend(context.Background(), map[string]any{
+		"to": "bob", "payload": "status", "idempotency_key": "post-empty-race",
+	})
+	require.NoError(t, err)
+	result := sent.(map[string]any)
+	require.Equal(t, "msg-out", result["message_id"])
+	require.Equal(t, true, result["message_inbox_unread"])
+	require.Equal(t, 1, result["message_inbox_unread_count"])
+	require.NotEmpty(t, result["message_inbox_checked_at"])
+	require.Contains(t, result["message_inbox_action"], "fresh poll")
+	require.Equal(t, 2, inboxChecks)
+}
+
+func TestMessageSendDoesNotMisreportZeroWhenPostSendInboxCheckFails(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pipe/resolve", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"to_agent": "agent-bob"})
+	})
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message_id": "msg-out", "status": "pending"})
+	})
+	mux.HandleFunc("/v1/pipe/history/inbox", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "inbox unavailable", http.StatusServiceUnavailable)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	sent, err := NewServer(ts.URL, privateKey).toolMessageSend(context.Background(), map[string]any{
+		"to": "bob", "payload": "status", "idempotency_key": "post-send-check-fails",
+	})
+	require.NoError(t, err, "a failed pointer probe must not make a durable send indeterminate")
+	result := sent.(map[string]any)
+	require.Equal(t, "msg-out", result["message_id"])
+	require.Contains(t, result, "message_inbox_check_error")
+	require.NotContains(t, result, "message_inbox_unread")
+	require.NotContains(t, result, "message_inbox_unread_count")
+}
+
 func TestCanonicalMessageToolsHideFederatedPipelineTransport(t *testing.T) {
 	remoteAgent := strings.Repeat("b", 64)
 	var sent map[string]any

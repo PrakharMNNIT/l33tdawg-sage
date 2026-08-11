@@ -909,6 +909,18 @@ contains only `message_id`, `from_agent`, and `sent_at`; it is best-effort,
 ignorable, and is never delivery, read, presence, attention, or workflow
 evidence. Stdio and Streamable HTTP remain poll-on-turn.
 
+Every successful send also performs a fresh, non-claiming check of the sender's
+own inbox after the outbound message is durable. The result includes
+`message_inbox_unread`, `message_inbox_unread_count`, and
+`message_inbox_checked_at`; when work is visible it also includes
+`message_inbox_action`. This closes a concrete check-then-send race: an agent
+may poll empty, receive new work a moment later, and then send an outbound
+status message from the same active session. The post-send pointer makes that
+new work visible without claiming it. If the independent pointer check fails,
+the already durable send still succeeds and returns
+`message_inbox_check_error`; SAGE does not invent an unread=false result or make
+the caller retry an already committed send.
+
 Friendly labels are accepted only when one exact caller-authorized target wins
 across local and federated scope. Any local/local, remote/remote, or local/remote
 collision fails with bounded immutable candidates. A label is never signed or
