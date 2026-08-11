@@ -304,12 +304,19 @@ type Manager struct {
 	routeRefreshMu                sync.Mutex
 	routeRefreshActive            map[string]*routeRefreshCall
 	routeRefreshLast              map[string]time.Time
-	routeRefreshFn                func(context.Context, string, JoinP2PBundle) error
-	routeRetryMu                  sync.Mutex
-	routeRetryActive              map[string]*peerStatusRetryCall
-	routeRefresherMu              sync.Mutex
-	routeRefresherCancel          context.CancelFunc
-	routeRefresherDone            chan struct{}
+	// routeRefreshPending bounds the opportunistic post-request refresh to one
+	// scheduled goroutine per peer. It is deliberately keyed by remote chain ID
+	// alone, not by the agreement/binding pair routeRefreshLast uses, because it
+	// must be checkable WITHOUT consulting the sync-policy gate — see
+	// maybeTriggerRouteRefresh for why touching that gate on the caller's
+	// goroutine deadlocks.
+	routeRefreshPending  map[string]bool
+	routeRefreshFn       func(context.Context, string, JoinP2PBundle) error
+	routeRetryMu         sync.Mutex
+	routeRetryActive     map[string]*peerStatusRetryCall
+	routeRefresherMu     sync.Mutex
+	routeRefresherCancel context.CancelFunc
+	routeRefresherDone   chan struct{}
 
 	joinP2PMu sync.RWMutex
 	joinP2P   JoinP2PHooks
