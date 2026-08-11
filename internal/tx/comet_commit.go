@@ -1,16 +1,88 @@
 package tx
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 )
+
+// CometRPCMaxRequestBytes mirrors CometBFT's production max_body_bytes. The
+// JSON-RPC POST envelope base64-expands the signed transaction, so enforce the
+// limit before handing any bytes to the transport. Oversized requests are a
+// definitive pre-send refusal and must not fence the signing key.
+const CometRPCMaxRequestBytes = 1_000_000
+
+// cometRPCMaxSafeURIBytes leaves headroom below CometBFT's production
+// max_header_bytes for the request line plus ordinary HTTP headers. Preserve
+// the established GET wire shape for small transactions, but move a signed
+// transaction to JSON-RPC POST before its hex query can approach that ceiling.
+const cometRPCMaxSafeURIBytes = 900_000
+
+func cometBroadcastRequest(ctx context.Context, endpoint, method string, encoded []byte) (*http.Request, error) {
+	legacyURL := fmt.Sprintf("%s/%s?tx=0x%s", endpoint, method, hex.EncodeToString(encoded))
+	if len(legacyURL) < cometRPCMaxSafeURIBytes {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, legacyURL, nil) // #nosec G107 -- configured local CometBFT RPC
+		if err != nil {
+			return nil, fmt.Errorf("build Comet RPC request: %s", classifyFenceCause(err))
+		}
+		return req, nil
+	}
+
+	envelope := struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      int    `json:"id"`
+		Method  string `json:"method"`
+		Params  struct {
+			Tx string `json:"tx"`
+		} `json:"params"`
+	}{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  method,
+	}
+	envelope.Params.Tx = base64.StdEncoding.EncodeToString(encoded)
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("encode Comet JSON-RPC request: %w", err)
+	}
+	if len(body) > CometRPCMaxRequestBytes {
+		return nil, fmt.Errorf("comet JSON-RPC request body is %d bytes, exceeds %d-byte limit",
+			len(body), CometRPCMaxRequestBytes)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body)) // #nosec G107 -- configured local CometBFT RPC
+	if err != nil {
+		return nil, fmt.Errorf("build Comet JSON-RPC request: %s", classifyFenceCause(err))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	return req, nil
+}
+
+func validateCometJSONResponse(resp *http.Response) error {
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		return nil // Backward compatibility for older Comet/proxy deployments.
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	// Some older Comet/proxy deployments omit the header, and Go's minimal
+	// httptest-style handlers default valid JSON bodies to text/plain. Preserve
+	// those known-compatible forms while refusing HTML and every other media
+	// type that commonly carries an intermediary error page.
+	if err != nil || (mediaType != "application/json" && mediaType != "text/plain") {
+		return fmt.Errorf("comet RPC returned non-JSON content type %q", contentType)
+	}
+	return nil
+}
 
 // CometCommitResult is a hash-bound, structurally complete CometBFT
 // /broadcast_tx_commit result. It is returned only after the response proves it
@@ -40,8 +112,8 @@ type strictCommitEnvelope struct {
 			Code *uint32 `json:"code"`
 			Log  string  `json:"log"`
 		} `json:"tx_result"`
-		Hash   string `json:"hash"`
-		Height int64  `json:"height,string"`
+		Hash   string      `json:"hash"`
+		Height CometHeight `json:"height"`
 	} `json:"result"`
 	Error *struct {
 		Message string `json:"message"`
@@ -61,10 +133,9 @@ func BroadcastCometCommit(ctx context.Context, cometRPC string, signingKey ed255
 		ctx = context.Background()
 	}
 	endpoint := strings.TrimRight(strings.TrimSpace(cometRPC), "/")
-	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", endpoint, hex.EncodeToString(encoded))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G107 -- configured local CometBFT RPC
+	req, err := cometBroadcastRequest(ctx, endpoint, "broadcast_tx_commit", encoded)
 	if err != nil {
-		return nil, fmt.Errorf("broadcast tx commit: could not build request (%s)", classifyFenceCause(err))
+		return nil, fmt.Errorf("broadcast tx commit: %w", err)
 	}
 
 	RegisterSubmittedTx(signingKey, encoded, CometTxResolver(endpoint))
@@ -76,6 +147,9 @@ func BroadcastCometCommit(ctx context.Context, cometRPC string, signingKey ed255
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("broadcast tx commit: unexpected status %s",
 			ScrubBroadcastText(resp.Status, encoded))
+	}
+	if err := validateCometJSONResponse(resp); err != nil {
+		return nil, fmt.Errorf("broadcast tx commit: %s", ScrubBroadcastText(err.Error(), encoded))
 	}
 
 	limited := &io.LimitedReader{R: resp.Body, N: CometRPCMaxResponseBytes + 1}
@@ -118,7 +192,7 @@ func BroadcastCometCommit(ctx context.Context, cometRPC string, signingKey ed255
 	wantHash := strings.ToUpper(hex.EncodeToString(want[:]))
 	result := &CometCommitResult{
 		Hash:         wantHash,
-		Height:       envelope.Result.Height,
+		Height:       int64(envelope.Result.Height),
 		CheckTxCode:  checkCode,
 		CheckTxLog:   checkLog,
 		TxResultCode: txCode,
@@ -147,10 +221,9 @@ func BroadcastCometSync(ctx context.Context, cometRPC string, signingKey ed25519
 		ctx = context.Background()
 	}
 	endpoint := strings.TrimRight(strings.TrimSpace(cometRPC), "/")
-	url := fmt.Sprintf("%s/broadcast_tx_sync?tx=0x%s", endpoint, hex.EncodeToString(encoded))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) // #nosec G107 -- configured local CometBFT RPC
+	req, err := cometBroadcastRequest(ctx, endpoint, "broadcast_tx_sync", encoded)
 	if err != nil {
-		return nil, fmt.Errorf("broadcast tx sync: could not build request (%s)", classifyFenceCause(err))
+		return nil, fmt.Errorf("broadcast tx sync: %w", err)
 	}
 
 	RegisterSubmittedTx(signingKey, encoded, CometTxResolver(endpoint))
@@ -161,6 +234,9 @@ func BroadcastCometSync(ctx context.Context, cometRPC string, signingKey ed25519
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("broadcast tx sync: unexpected status %s", ScrubBroadcastText(resp.Status, encoded))
+	}
+	if err := validateCometJSONResponse(resp); err != nil {
+		return nil, fmt.Errorf("broadcast tx sync: %s", ScrubBroadcastText(err.Error(), encoded))
 	}
 
 	limited := &io.LimitedReader{R: resp.Body, N: CometRPCMaxResponseBytes + 1}
