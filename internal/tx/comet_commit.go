@@ -12,6 +12,8 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 )
 
@@ -21,6 +23,14 @@ import (
 // definitive pre-send refusal and must not fence the signing key.
 const CometRPCMaxRequestBytes = 1_000_000
 
+// CometMaxTxBytes mirrors CometBFT's default mempool max_tx_bytes. Operators
+// may raise both limits in lockstep for an internal, authenticated RPC plane,
+// but the client remains fail-closed unless its explicit environment matches
+// the CometBFT configuration.
+const CometMaxTxBytes = 1_048_576
+
+const maxConfiguredCometBytes = 8_000_000
+
 // cometRPCMaxSafeURIBytes leaves headroom below CometBFT's production
 // max_header_bytes for the request line plus ordinary HTTP headers. Preserve
 // the established GET wire shape for small transactions, but move a signed
@@ -28,6 +38,14 @@ const CometRPCMaxRequestBytes = 1_000_000
 const cometRPCMaxSafeURIBytes = 900_000
 
 func cometBroadcastRequest(ctx context.Context, endpoint, method string, encoded []byte) (*http.Request, error) {
+	maxTxBytes, limitErr := configuredCometByteLimit("SAGE_COMET_MAX_TX_BYTES", CometMaxTxBytes)
+	if limitErr != nil {
+		return nil, limitErr
+	}
+	if len(encoded) > maxTxBytes {
+		return nil, fmt.Errorf("comet transaction is %d bytes, exceeds %d-byte limit", len(encoded), maxTxBytes)
+	}
+
 	legacyURL := fmt.Sprintf("%s/%s?tx=0x%s", endpoint, method, hex.EncodeToString(encoded))
 	if len(legacyURL) < cometRPCMaxSafeURIBytes {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, legacyURL, nil) // #nosec G107 -- configured local CometBFT RPC
@@ -54,9 +72,13 @@ func cometBroadcastRequest(ctx context.Context, endpoint, method string, encoded
 	if err != nil {
 		return nil, fmt.Errorf("encode Comet JSON-RPC request: %w", err)
 	}
-	if len(body) > CometRPCMaxRequestBytes {
+	maxRequestBytes, err := configuredCometByteLimit("SAGE_COMET_RPC_MAX_BODY_BYTES", CometRPCMaxRequestBytes)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxRequestBytes {
 		return nil, fmt.Errorf("comet JSON-RPC request body is %d bytes, exceeds %d-byte limit",
-			len(body), CometRPCMaxRequestBytes)
+			len(body), maxRequestBytes)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body)) // #nosec G107 -- configured local CometBFT RPC
@@ -66,6 +88,18 @@ func cometBroadcastRequest(ctx context.Context, endpoint, method string, encoded
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	return req, nil
+}
+
+func configuredCometByteLimit(name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < fallback || limit > maxConfiguredCometBytes {
+		return 0, fmt.Errorf("invalid %s: require integer in [%d,%d]", name, fallback, maxConfiguredCometBytes)
+	}
+	return limit, nil
 }
 
 func validateCometJSONResponse(resp *http.Response) error {

@@ -167,6 +167,51 @@ func TestBroadcastCometCommitRejectsOversizedPostBeforeSend(t *testing.T) {
 	}
 }
 
+func TestBroadcastCometCommitHonorsMatchedInternalLimits(t *testing.T) {
+	t.Setenv("SAGE_COMET_MAX_TX_BYTES", "1200000")
+	t.Setenv("SAGE_COMET_RPC_MAX_BODY_BYTES", "1600000")
+
+	// This is the measured SkillRegistry v20 request scale: the 1,456,274-byte
+	// JSON-RPC body bounds the raw signed transaction at 1,092,150 bytes.
+	encoded := bytes.Repeat([]byte("v"), 1_092_150)
+	bound := cometHashHexForTest(encoded)
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.ContentLength; got != 1_456_274 {
+			t.Errorf("Content-Length = %d, want 1456274", got)
+		}
+		var request struct {
+			Params struct {
+				Tx string `json:"tx"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(request.Params.Tx)
+		if err != nil || !bytes.Equal(decoded, encoded) {
+			t.Fatalf("decoded tx len=%d err=%v", len(decoded), err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w,
+			`{"jsonrpc":"2.0","id":1,"result":{"check_tx":{"code":0},"tx_result":{"code":0},"hash":%q,"height":7}}`,
+			bound)
+	}))
+	defer rpc.Close()
+
+	got, err := BroadcastCometCommit(context.Background(), rpc.URL, nil, encoded)
+	if err != nil || got == nil || got.Height != 7 {
+		t.Fatalf("BroadcastCometCommit result=%+v err=%v", got, err)
+	}
+}
+
+func TestBroadcastCometCommitRejectsInvalidConfiguredLimits(t *testing.T) {
+	t.Setenv("SAGE_COMET_MAX_TX_BYTES", "not-a-number")
+	_, err := BroadcastCometCommit(context.Background(), "http://127.0.0.1:1", nil, []byte("tx"))
+	if err == nil || !strings.Contains(err.Error(), "invalid SAGE_COMET_MAX_TX_BYTES") {
+		t.Fatalf("invalid configured limit error = %v", err)
+	}
+}
+
 func TestBroadcastCometSyncUsesBoundedJSONRPCPost(t *testing.T) {
 	t.Parallel()
 
