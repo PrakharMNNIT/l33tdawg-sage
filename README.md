@@ -62,6 +62,9 @@ transaction and JSON-RPC body limits are independently range-checked, capped at
 them must configure matching CometBFT limits. Independently, every validator
 enforces a 1,200,000-byte aggregate raw-transaction budget for app-v20 atomic
 finalization, sufficient for the measured 1,304-entry SkillRegistry transaction.
+Memory content remains bounded at 512 KiB, while the canonical signed
+`AgentRequest` proof has its own 600,000-byte consensus bound, admitting the
+measured 573,723-byte proof without widening the content or aggregate limits.
 Response handling accepts strict quoted or numeric `int64` heights, rejects
 fractional, exponent, null, malformed, and out-of-range heights, and refuses
 unsupported content types.
