@@ -104,7 +104,7 @@ func (m *Manager) Router() http.Handler {
 		r.Post("/fed/v1/sync/group/member-invite/accept", m.handleMemberInviteAccept)
 		r.Post("/fed/v1/sync/group/member-invite/bootstrap", m.handleMemberBootstrap)
 		r.Put("/fed/v1/sync/policy", m.handleSyncPolicy) // v11.6 host-controlled sync
-		r.Post("/fed/v1/p2p/routes", m.handleP2PRoutes)  // v11.6 authenticated LAN roaming upgrade
+		r.Post(p2pRoutesExchangePath, m.handleP2PRoutes) // v11.6 authenticated LAN roaming upgrade
 	})
 	// The pre-agreement JOIN ceremony routes sit behind joinAuth, NOT peerAuth
 	// (no active agreement exists yet during a join).

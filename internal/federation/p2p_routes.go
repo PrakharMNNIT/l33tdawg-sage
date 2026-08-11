@@ -188,7 +188,7 @@ func (m *Manager) ExchangeP2PRoutes(ctx context.Context, remoteChainID string, l
 	if err != nil {
 		return err
 	}
-	body, status, err := m.doPeerRequest(ctx, agreement, http.MethodPost, "/fed/v1/p2p/routes", &local)
+	body, status, err := m.doPeerRequest(ctx, agreement, http.MethodPost, p2pRoutesExchangePath, &local)
 	if err != nil {
 		return err
 	}

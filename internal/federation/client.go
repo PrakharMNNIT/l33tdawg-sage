@@ -206,6 +206,7 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 			}
 		}
 	}
+	generationBlockedP2POnly := false
 	if generation := requiredRouteGeneration(ctx); generation != "" && routeDial != nil {
 		hooks := m.joinP2PHooks()
 		snapshot, ok := RouteSnapshot{}, false
@@ -214,15 +215,60 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 		}
 		if !ok || snapshot.Generation != generation {
 			// A Retry may use an expired snapshot as an authenticated bootstrap
-			// hint, but never a route learned by another trust generation. Direct
-			// HTTPS remains available and is still pinned by the active agreement.
-			routeDial = nil
+			// hint, but never a route learned by another trust generation.
+			//
+			// R2. The original rule ended "Direct HTTPS remains available and is
+			// still pinned by the active agreement", and that is FALSE for a
+			// P2P-only agreement. Its endpoint is the joinP2POnlyEndpoint
+			// sentinel, which join_routes.go documents as never to be attempted
+			// as a TCP fallback, so nulling routeDial leaves no transport at all:
+			// the request falls through to a plain dial of an unroutable address.
+			// That also blocks the route exchange which is the ONLY thing that
+			// could replace the stale snapshot, so the peer can never recover its
+			// generation and stays unreachable until it is paired again.
+			//
+			// So the stale snapshot is admitted as a bootstrap hint for exactly
+			// one path: the authenticated route exchange that upgrades the
+			// generation. Every other request keeps the original rule.
+			//
+			// This does not import stale trust. A snapshot address is a HINT
+			// ABOUT WHERE TO CONNECT, not a credential: the connection is still
+			// completed through the pinned mTLS handshake bound to the CURRENT
+			// agreement, so a stale or reassigned address fails authentication
+			// rather than being trusted. The rule's purpose — no cross-generation
+			// route inside a protected request — is preserved exactly.
+			if p2pOnly && path == p2pRoutesExchangePath {
+				if ok {
+					// A snapshot exists but under another generation: use its
+					// addresses as the bootstrap hint.
+					frozenRouteTargets = append([]string{}, snapshot.Addrs...)
+				}
+				// No snapshot at all leaves frozenRouteTargets nil, which the
+				// dialer reads as "normal caller, may load current config" — the
+				// only route material available to reach the exchange. Both cases
+				// are still completed through the pinned mTLS handshake bound to
+				// the CURRENT agreement, and whatever the exchange returns is
+				// persisted only after p2p_routes.go's exact agreement+binding
+				// revalidation, so nothing enters durable state unverified.
+			} else {
+				routeDial = nil
+				generationBlockedP2POnly = p2pOnly
+			}
 		} else {
 			// Preserve a non-nil empty slice: nil means a normal caller whose dialer
 			// may load current config, while Retry must stay pinned to exact G even
 			// when G has no usable targets.
 			frozenRouteTargets = append([]string{}, snapshot.Addrs...)
 		}
+	}
+	if generationBlockedP2POnly {
+		// Fail with the actual reason instead of dialing the sentinel. Without
+		// this the caller sees a connection error against 127.0.0.1:65535, which
+		// reads as "peer offline" and sends an operator looking at the network
+		// rather than at the trust generation that actually needs repairing.
+		return nil, 0, routeRecoveryError(RouteRecoveryTrustGenerationMismatch,
+			fmt.Errorf("%w: peer %s is p2p-only and has no authenticated route for the required trust generation",
+				ErrTrustGenerationChanged, agreement.RemoteChainID))
 	}
 	if routeDial != nil || !p2pOnly {
 		directDialer := &net.Dialer{}
@@ -286,7 +332,7 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 	if err != nil {
 		securityFailure := isSecurityTransportError(err)
 		m.recordRouteFailure(agreement.RemoteChainID, err, securityFailure)
-		if !securityFailure && path != "/fed/v1/p2p/routes" {
+		if !securityFailure && path != p2pRoutesExchangePath {
 			// UI/status polling must not create a refresh storm while a peer is
 			// offline. One bounded refresh per minute is enough; the lifecycle
 			// ticker and address-change publisher remain correctness backstops.
@@ -301,7 +347,7 @@ func (m *Manager) doPeerRequestWithHeaders(ctx context.Context, agreement *store
 	chosen := selected
 	selectedMu.Unlock()
 	m.recordRouteSuccess(agreement.RemoteChainID, chosen)
-	if chosen.Kind == RouteKindDirect && routeDial != nil && path != "/fed/v1/p2p/routes" {
+	if chosen.Kind == RouteKindDirect && routeDial != nil && path != p2pRoutesExchangePath {
 		m.maybeTriggerRouteRefresh(agreement.RemoteChainID)
 	}
 	defer resp.Body.Close()

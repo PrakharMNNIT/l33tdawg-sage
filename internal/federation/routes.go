@@ -29,6 +29,13 @@ const (
 	RouteStateUnknown         = "unknown"
 )
 
+// p2pRoutesExchangePath is the authenticated route-exchange endpoint. It is a
+// named constant because three separate guards key off it — the two
+// post-request refresh triggers must not recurse into it, and the R2 bootstrap
+// hint admits a stale-generation snapshot for this path ONLY. A literal that
+// drifted from the registered route would silently disable all three.
+const p2pRoutesExchangePath = "/fed/v1/p2p/routes"
+
 var (
 	ErrLegacyRouteBinding     = errors.New("legacy federation connection must be paired again to enable secure relay")
 	ErrTrustGenerationChanged = errors.New("federation trust generation changed during route recovery")
