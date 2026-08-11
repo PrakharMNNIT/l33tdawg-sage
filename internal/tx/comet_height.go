@@ -20,7 +20,7 @@ func (h *CometHeight) UnmarshalJSON(data []byte) error {
 
 	raw := bytes.TrimSpace(data)
 	if len(raw) == 0 {
-		return fmt.Errorf("Comet height is empty")
+		return fmt.Errorf("comet height is empty")
 	}
 
 	var decimal string

@@ -55,7 +55,7 @@ func cometBroadcastRequest(ctx context.Context, endpoint, method string, encoded
 		return nil, fmt.Errorf("encode Comet JSON-RPC request: %w", err)
 	}
 	if len(body) > CometRPCMaxRequestBytes {
-		return nil, fmt.Errorf("Comet JSON-RPC request body is %d bytes, exceeds %d-byte limit",
+		return nil, fmt.Errorf("comet JSON-RPC request body is %d bytes, exceeds %d-byte limit",
 			len(body), CometRPCMaxRequestBytes)
 	}
 
@@ -79,7 +79,7 @@ func validateCometJSONResponse(resp *http.Response) error {
 	// those known-compatible forms while refusing HTML and every other media
 	// type that commonly carries an intermediary error page.
 	if err != nil || (mediaType != "application/json" && mediaType != "text/plain") {
-		return fmt.Errorf("Comet RPC returned non-JSON content type %q", contentType)
+		return fmt.Errorf("comet RPC returned non-JSON content type %q", contentType)
 	}
 	return nil
 }
