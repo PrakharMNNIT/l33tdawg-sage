@@ -85,12 +85,24 @@ export function classifyFederationFailure(error, fallback = 'route_failure') {
   if (/vault.*lock|node.*lock|unlock.*sage/.test(message)) return 'locked';
   if (/legacy federation connection|paired again.*secure relay/.test(message)) return 'legacy_repair_required';
   if (/trust generation/.test(message)) return 'trust_generation_mismatch';
+  // R3. Security evidence outranks route-availability evidence, matching
+  // federationDashboardFailureState in web/federation_route_status.go. The
+  // invariant the two classifiers must share is exactly this relative order:
+  // if they disagree, the dashboard and the server report different verdicts
+  // for the same failure. (The 'locked' case sits earlier here than in the Go
+  // switch. That divergence predates R3 and is left alone; it is a node-state
+  // check, not route-availability text, so it does not affect this ordering.)
+  //
+  // One failure often carries both kinds of text, because a raced p2p+direct
+  // attempt joins both errors into one message. Evaluated in the old order, a
+  // pinned-certificate mismatch that also lacked a p2p route rendered as the
+  // warn-tone 'route_bundle_missing' instead of 'security_blocked'.
+  if (/certificate|spki|pin mismatch|identity mismatch|security block/.test(message)) return 'security_blocked';
+  if (/revoked|expired agreement|unknown agreement|trust.*fail|authentication/.test(message)) return 'trust_failure';
   if (/route snapshot.*expired/.test(message)) return 'route_bundle_expired';
   if (/no configured p2p route|no p2p dialer|route bundle.*missing/.test(message)) return 'route_bundle_missing';
   if (/relay.*(unavailable|failed)/.test(message)) return 'relay_unavailable';
   if (/direct.*(stale|unavailable)/.test(message)) return 'stale_direct';
-  if (/certificate|spki|pin mismatch|identity mismatch|security block/.test(message)) return 'security_blocked';
-  if (/revoked|expired agreement|unknown agreement|trust.*fail|authentication/.test(message)) return 'trust_failure';
   if (/old peer|older peer|unsupported|not implemented/.test(message) || error && error.status === 501) return 'old_peer';
   if (/disabled|federation is off|listener.*off/.test(message)) return 'disabled';
   if (/offline|timed? out|timeout|refused|unreachable|no route|network/.test(message)) return 'offline';

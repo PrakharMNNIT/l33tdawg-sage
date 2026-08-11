@@ -29,6 +29,13 @@ const (
 	RouteStateUnknown         = "unknown"
 )
 
+// p2pRoutesExchangePath is the authenticated route-exchange endpoint. It is a
+// named constant because three separate guards key off it — the two
+// post-request refresh triggers must not recurse into it, and the R2 bootstrap
+// hint admits a stale-generation snapshot for this path ONLY. A literal that
+// drifted from the registered route would silently disable all three.
+const p2pRoutesExchangePath = "/fed/v1/p2p/routes"
+
 var (
 	ErrLegacyRouteBinding     = errors.New("legacy federation connection must be paired again to enable secure relay")
 	ErrTrustGenerationChanged = errors.New("federation trust generation changed during route recovery")
@@ -662,7 +669,95 @@ func (m *Manager) triggerRouteRefresh(remoteChainID string) {
 	m.triggerRouteRefreshWithContext(context.Background(), remoteChainID, nil)
 }
 
+// maybeTriggerRouteRefresh schedules an opportunistic route refresh after a
+// peer request. It is called from INSIDE doPeerRequestWithHeaders, and that is
+// the whole reason it must not do any work on the caller's goroutine.
+//
+// THE DEADLOCK THIS SHAPE EXISTS TO PREVENT. Resolving the agreement/binding
+// takes the sync-policy read lease (routeRefreshAgreementBinding ->
+// LockSyncPolicyRead), and several callers ALREADY hold that same RWMutex read
+// lock across the peer request — e.g. AvailableRecallDomains takes it before
+// doPeerRequest and releases it only after. Taking it again here is a recursive
+// RLock. Go's sync.RWMutex blocks new readers as soon as a writer queues, so:
+// the caller holds RLock, a writer (a journal-pull ingest, a re-pair, a policy
+// change) blocks behind it, this second RLock then blocks behind that writer,
+// and the writer is waiting on the caller's RUnlock that can now never happen.
+// Both goroutines hang forever, and because LockSyncPolicyRead is a bare RLock
+// with no context and no try-variant there is no timeout and no cancellation
+// path out of it. The gate is then wedged for every other reader, including all
+// inbound federation handlers, until the process restarts.
+//
+// p2p_routes.go states the invariant directly: never hold the policy lease
+// across the network request. Doing the lookup on a fresh goroutine keeps that
+// true — the caller returns and releases its RLock, the queued writer drains,
+// and the scheduled goroutine then acquires the lease normally.
+//
+// The admission check below is deliberately cheap and policy-free so it can run
+// on the caller's goroutine, and it bounds this to one pending refresh per peer
+// so a stalled gate cannot accumulate goroutines under request load. The
+// agreement/binding-keyed once-per-minute dedup still applies, inside the
+// goroutine, where consulting the gate is safe.
 func (m *Manager) maybeTriggerRouteRefresh(remoteChainID string) {
+	if !m.transportIsEnabled() {
+		return
+	}
+	m.routeRefreshMu.Lock()
+	if m.routeRefreshPending == nil {
+		m.routeRefreshPending = make(map[string]bool)
+	}
+	if m.routeRefreshPending[remoteChainID] {
+		m.routeRefreshMu.Unlock()
+		return
+	}
+	m.routeRefreshPending[remoteChainID] = true
+	m.routeRefreshMu.Unlock()
+
+	go func() {
+		defer func() {
+			m.routeRefreshMu.Lock()
+			delete(m.routeRefreshPending, remoteChainID)
+			m.routeRefreshMu.Unlock()
+		}()
+		m.runScheduledRouteRefresh(remoteChainID)
+	}()
+}
+
+// routeRefreshWorkerEntry is a TEST SEAM and is nil in production. It fires at
+// the top of runScheduledRouteRefresh, BEFORE the sync-policy read lease is
+// taken.
+//
+// It exists because the admission guard cannot be observed from the
+// routeRefreshPending map: an admitted worker and a rejected duplicate both
+// leave exactly one key under the same chain ID, so len(pending) is 1 either
+// way and is 0 with the guard deleted entirely. A test asserting on that map
+// therefore passes whether the guard works, half-works, or is absent. Counting
+// entries here is the only way to distinguish those, which is what makes the
+// guard's regression test mutation-sensitive.
+var (
+	routeRefreshWorkerEntryMu sync.Mutex
+	routeRefreshWorkerEntryFn func(remoteChainID string)
+)
+
+func setRouteRefreshWorkerEntry(fn func(remoteChainID string)) {
+	routeRefreshWorkerEntryMu.Lock()
+	routeRefreshWorkerEntryFn = fn
+	routeRefreshWorkerEntryMu.Unlock()
+}
+
+func noteRouteRefreshWorkerEntry(remoteChainID string) {
+	routeRefreshWorkerEntryMu.Lock()
+	fn := routeRefreshWorkerEntryFn
+	routeRefreshWorkerEntryMu.Unlock()
+	if fn != nil {
+		fn(remoteChainID)
+	}
+}
+
+// runScheduledRouteRefresh is maybeTriggerRouteRefresh's body, executed on its
+// own goroutine. Everything here may block on the sync-policy gate; nothing
+// here may be called from a goroutine that already holds it.
+func (m *Manager) runScheduledRouteRefresh(remoteChainID string) {
+	noteRouteRefreshWorkerEntry(remoteChainID)
 	agreement, binding, err := m.routeRefreshAgreementBinding(context.Background(), remoteChainID)
 	if err != nil {
 		m.recordRouteFailure(remoteChainID, err, errors.Is(err, ErrTrustGenerationChanged))

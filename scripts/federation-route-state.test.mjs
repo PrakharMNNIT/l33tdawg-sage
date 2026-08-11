@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  classifyFederationFailure,
   federationConnectionActionIntent,
   federationConnectionRoute,
   federationRoutePresentation,
@@ -111,4 +112,66 @@ test('legacy repair routes to re-pair while ordinary failures route to retry', (
   assert.equal(federationConnectionActionIntent({ state: 'offline' }), 'retry');
   assert.equal(federationConnectionActionIntent({ state: 'security_blocked' }), 'retry');
   assert.equal(federationConnectionActionIntent({ state: 'relay' }), 'toggle_pause');
+});
+
+// R3. One federated failure routinely carries BOTH security and
+// route-availability text, because doPeerRequest races a p2p attempt and a
+// direct attempt and joins both errors into a single message. Before R3 the
+// availability regexes were tested first, so a pinned-trust mismatch that also
+// lacked a p2p route was reported as the benign warn-tone 'route_bundle_missing'
+// — telling an operator to look at their network when SAGE had actually refused
+// the peer's identity.
+test('security evidence outranks route-availability text in a combined failure', () => {
+  const combined = 'peer chain-b unreachable: peer has no configured p2p route; '
+    + 'x509: certificate signed by unknown authority';
+
+  assert.equal(classifyFederationFailure({ error: combined }), 'security_blocked');
+});
+
+test('each security marker wins over each availability marker', () => {
+  const securityMarkers = [
+    'x509: certificate signed by unknown authority',
+    'spki pin does not match',
+    'pin mismatch for peer',
+    'identity mismatch on peer certificate',
+  ];
+  const availabilityMarkers = [
+    'peer has no configured p2p route',
+    'no p2p dialer for peer',
+    'route bundle is missing',
+    'relay unavailable',
+    'direct route is stale',
+  ];
+
+  for (const security of securityMarkers) {
+    for (const availability of availabilityMarkers) {
+      assert.equal(
+        classifyFederationFailure({ error: `${availability}; ${security}` }),
+        'security_blocked',
+        `"${availability}" must not outrank "${security}"`,
+      );
+    }
+  }
+});
+
+test('trust failures also outrank route-availability text', () => {
+  assert.equal(
+    classifyFederationFailure({ error: 'peer has no configured p2p route; agreement revoked' }),
+    'trust_failure',
+  );
+});
+
+test('availability text alone still classifies as availability', () => {
+  assert.equal(
+    classifyFederationFailure({ error: 'peer has no configured p2p route' }),
+    'route_bundle_missing',
+  );
+  assert.equal(classifyFederationFailure({ error: 'relay unavailable' }), 'relay_unavailable');
+});
+
+test('a security failure presents as danger, not a routing warning', () => {
+  const combined = 'peer has no configured p2p route; x509: certificate signed by unknown authority';
+  const view = federationRoutePresentation({ state: classifyFederationFailure({ error: combined }) });
+
+  assert.equal(view.tone, 'danger');
 });
