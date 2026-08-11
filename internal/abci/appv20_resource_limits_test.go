@@ -61,6 +61,22 @@ func TestAppV20ResourceLimitsRejectLargeHashInsideSmallEnoughBlock(t *testing.T)
 	commitGovernanceReplayBlock(t, h.app)
 }
 
+func TestAppV20ResourceLimitsUseSeparateAgentRequestProofBound(t *testing.T) {
+	const registryV20AgentRequestBytes = 573_723
+
+	assert.Equal(t, 512<<10, maxAppV20ContentBytes, "memory content keeps its 512 KiB consensus bound")
+	assert.Equal(t, 1_200_000, maxAppV20AtomicFinalizeTxBytes, "aggregate raw transaction bound remains unchanged")
+	require.NoError(t, validateAppV20TxResources(&tx.ParsedTx{
+		AgentRequest: make([]byte, registryV20AgentRequestBytes),
+	}))
+
+	err := validateAppV20TxResources(&tx.ParsedTx{
+		AgentRequest: make([]byte, maxAppV20AgentRequestBytes+1),
+	})
+	require.Error(t, err)
+	assert.Equal(t, "agent request has 600001 bytes, limit 600000", err.Error())
+}
+
 func TestAppV20UpgradeReadinessRejectsOversizedLegacyConsensusState(t *testing.T) {
 	app, admin, _, _ := setupAppV8Chain(t, 5)
 	app.appV19AppliedHeight = 6

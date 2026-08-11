@@ -14,9 +14,13 @@ const (
 	// These consensus bounds keep attacker-controlled strings from multiplying
 	// into oversized Badger keys across a 100-validator stats update. They are
 	// activated only for a block routed through the app-v20 atomic ceremony/path.
-	maxAppV20IdentifierBytes    = 512
-	maxAppV20MetadataBytes      = 64 << 10
-	maxAppV20ContentBytes       = 512 << 10
+	maxAppV20IdentifierBytes = 512
+	maxAppV20MetadataBytes   = 64 << 10
+	maxAppV20ContentBytes    = 512 << 10
+	// AgentRequest is the canonical signed HTTP proof envelope. It includes
+	// request framing around Content, so it needs a separate bound while the
+	// memory-content and aggregate raw-transaction limits remain unchanged.
+	maxAppV20AgentRequestBytes  = 600_000
 	maxAppV20EncodedRecordBytes = 64 << 10
 	maxAppV20CollectionItems    = 64
 	maxAppV20Validators         = 100
@@ -107,14 +111,14 @@ func id(field, value string) struct {
 
 // validateAppV20TxResources bounds every payload field that can become a
 // consensus key, be duplicated into several consensus values, or carry a large
-// metadata allocation. The block's independent 1 MiB raw-byte cap remains the
+// metadata allocation. The block's independent 1.2 MB raw-byte cap remains the
 // aggregate bound. Validation runs before proof claims, nonces, or handlers.
 func validateAppV20TxResources(parsed *tx.ParsedTx) error { //nolint:gocyclo // explicit wire-family audit is safer than reflection
 	if parsed == nil {
 		return nil
 	}
-	if len(parsed.AgentRequest) > maxAppV20ContentBytes {
-		return fmt.Errorf("agent request has %d bytes, limit %d", len(parsed.AgentRequest), maxAppV20ContentBytes)
+	if len(parsed.AgentRequest) > maxAppV20AgentRequestBytes {
+		return fmt.Errorf("agent request has %d bytes, limit %d", len(parsed.AgentRequest), maxAppV20AgentRequestBytes)
 	}
 	if len(parsed.AgentNonce) > maxAppV20IdentifierBytes {
 		return fmt.Errorf("agent nonce has %d bytes, limit %d", len(parsed.AgentNonce), maxAppV20IdentifierBytes)
