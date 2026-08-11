@@ -105,10 +105,19 @@ func TestP2POnlyProtectedRequestStillRefusesCrossGenerationRoute(t *testing.T) {
 		"a protected request used a route learned under a different trust generation")
 }
 
-// The failure must name the actual cause. Before the fix a protected P2P-only
-// request fell through to a TCP dial of 127.0.0.1:65535, so the operator saw a
-// connection error and went looking at the network instead of at the trust
-// generation that actually needed repairing.
+// The failure must name the actual cause.
+//
+// CORRECTION TO MY EARLIER CLAIM, recorded here because the frozen R2 commit
+// message and its code comment both overstate the mechanism and cannot be
+// amended: the pre-fix path did NOT literally open a TCP connection to
+// 127.0.0.1:65535. client.go installs an erroring DialTLSContext for the
+// p2p-only-without-dialer case, which returns ErrPeerOffline "has no p2p
+// dialer" without dialing; the sentinel appears only because net/http wraps
+// that error with the request URL. The defect — the peer is unreachable and
+// cannot recover its generation — is unchanged, but the operator-facing symptom
+// was a peer-offline error carrying the sentinel, not a dial attempt against it.
+// Caught by codex in review. The assertion below is about what the error
+// SURFACES, which is what was always actually wrong with it.
 func TestP2POnlyGenerationMismatchReportsTrustGenerationNotOffline(t *testing.T) {
 	a, b, _, _ := p2pOnlyGenerationFixture(t)
 
@@ -125,7 +134,8 @@ func TestP2POnlyGenerationMismatchReportsTrustGenerationNotOffline(t *testing.T)
 	assert.Equal(t, RouteRecoveryTrustGenerationMismatch, RouteRecoveryFailureCode(reqErr),
 		"expected a trust-generation recovery code, got: %v", reqErr)
 	assert.NotContains(t, reqErr.Error(), "65535",
-		"the p2p-only sentinel address must never be dialed or surfaced as the failure")
+		"the p2p-only sentinel address must never be surfaced as the failure: it tells an operator "+
+			"to look at the network when the trust generation is what needs repairing")
 }
 
 // A matching-generation snapshot is unaffected by the fix: it still pins the

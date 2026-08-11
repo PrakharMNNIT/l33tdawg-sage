@@ -722,10 +722,42 @@ func (m *Manager) maybeTriggerRouteRefresh(remoteChainID string) {
 	}()
 }
 
+// routeRefreshWorkerEntry is a TEST SEAM and is nil in production. It fires at
+// the top of runScheduledRouteRefresh, BEFORE the sync-policy read lease is
+// taken.
+//
+// It exists because the admission guard cannot be observed from the
+// routeRefreshPending map: an admitted worker and a rejected duplicate both
+// leave exactly one key under the same chain ID, so len(pending) is 1 either
+// way and is 0 with the guard deleted entirely. A test asserting on that map
+// therefore passes whether the guard works, half-works, or is absent. Counting
+// entries here is the only way to distinguish those, which is what makes the
+// guard's regression test mutation-sensitive.
+var (
+	routeRefreshWorkerEntryMu sync.Mutex
+	routeRefreshWorkerEntryFn func(remoteChainID string)
+)
+
+func setRouteRefreshWorkerEntry(fn func(remoteChainID string)) {
+	routeRefreshWorkerEntryMu.Lock()
+	routeRefreshWorkerEntryFn = fn
+	routeRefreshWorkerEntryMu.Unlock()
+}
+
+func noteRouteRefreshWorkerEntry(remoteChainID string) {
+	routeRefreshWorkerEntryMu.Lock()
+	fn := routeRefreshWorkerEntryFn
+	routeRefreshWorkerEntryMu.Unlock()
+	if fn != nil {
+		fn(remoteChainID)
+	}
+}
+
 // runScheduledRouteRefresh is maybeTriggerRouteRefresh's body, executed on its
 // own goroutine. Everything here may block on the sync-policy gate; nothing
 // here may be called from a goroutine that already holds it.
 func (m *Manager) runScheduledRouteRefresh(remoteChainID string) {
+	noteRouteRefreshWorkerEntry(remoteChainID)
 	agreement, binding, err := m.routeRefreshAgreementBinding(context.Background(), remoteChainID)
 	if err != nil {
 		m.recordRouteFailure(remoteChainID, err, errors.Is(err, ErrTrustGenerationChanged))

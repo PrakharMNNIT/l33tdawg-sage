@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,15 +133,30 @@ func TestBothRouteRefreshTriggerSitesAreCallerSafe(t *testing.T) {
 	}
 }
 
-// The per-peer admission guard must bound pending refreshes to one goroutine
-// per peer, so a stalled gate cannot accumulate goroutines under request load.
-// Without it, moving the work off-thread would trade a deadlock for a leak.
-func TestRouteRefreshSchedulesAtMostOnePendingRefreshPerPeer(t *testing.T) {
+// The per-peer admission guard must admit exactly ONE worker per peer while a
+// gate is stalled, so moving the refresh off-thread cannot trade a deadlock for
+// a goroutine pile-up under request load.
+//
+// This asserts WORKERS ADMITTED, not len(routeRefreshPending). The map cannot
+// distinguish the cases: an admitted worker and a rejected duplicate both leave
+// one key under the same chain ID, so len is 1 with the guard working AND 1
+// with duplicate-rejection removed, and 0 with the guard deleted outright. An
+// assertion on that map passes under every mutation it is supposed to catch.
+func TestRouteRefreshAdmitsExactlyOneWorkerPerPeerUnderLoad(t *testing.T) {
 	sqlite := policyGateStore(t)
 	m := &Manager{memStore: sqlite}
 
-	// Hold the gate so every scheduled goroutine parks inside the lease and the
-	// pending set cannot drain while we measure it.
+	var entered atomic.Int32
+	firstEntered := make(chan struct{})
+	var once sync.Once
+	setRouteRefreshWorkerEntry(func(string) {
+		entered.Add(1)
+		once.Do(func() { close(firstEntered) })
+	})
+	t.Cleanup(func() { setRouteRefreshWorkerEntry(nil) })
+
+	// Hold the gate so the admitted worker parks inside the lease and cannot
+	// finish and clear its pending slot while the others are still arriving.
 	unlockWriter := sqlite.LockSyncPolicyWrite()
 
 	var wg sync.WaitGroup
@@ -153,34 +169,58 @@ func TestRouteRefreshSchedulesAtMostOnePendingRefreshPerPeer(t *testing.T) {
 	}
 	wg.Wait()
 
-	m.routeRefreshMu.Lock()
-	pending := len(m.routeRefreshPending)
-	m.routeRefreshMu.Unlock()
-
-	if pending > 1 {
-		t.Fatalf("50 concurrent triggers for one peer scheduled %d pending refreshes, want at most 1", pending)
+	// Every caller must have returned — none may block behind the writer.
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no refresh worker was ever admitted")
 	}
 
+	// Give any wrongly-admitted duplicates time to arrive before counting.
+	time.Sleep(200 * time.Millisecond)
+	if got := entered.Load(); got != 1 {
+		t.Fatalf("%d workers entered runScheduledRouteRefresh for one peer, want exactly 1: "+
+			"the admission guard is not rejecting duplicates, so a stalled gate accumulates goroutines", got)
+	}
+
+	// Releasing the writer lets the single worker finish and clean up after
+	// itself, so a later trigger for the same peer is admitted again.
 	unlockWriter()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		m.routeRefreshMu.Lock()
+		n := len(m.routeRefreshPending)
+		m.routeRefreshMu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the pending slot was never released, so this peer can never schedule another refresh")
 }
 
-// The remediation must be CENTRAL, not caller-specific. Four production chains
-// hold the sync-policy read lease across a peer request and therefore reach the
-// inline refresh:
+// SHARED-ENTRY COVERAGE, SOURCE-TRACED — read the limitation before trusting it.
+//
+// This test drives the shared entry point directly. It does NOT execute the
+// four production chains below; their identification is by source reading, not
+// by this test. So it proves the shared helper is safe for any caller holding
+// the policy lease, which is the property the central fix relies on — and it
+// proves nothing about whether those chains still route through the helper.
+// End-to-end execution of the two doPeerRequestWithHeaders trigger sites lives
+// in route_refresh_trigger_e2e_test.go; sync-outbox e2e is not covered.
+//
+// The chains, traced in source at v11.18.6:
 //
 //	client.go:447  /fed/v1/query        (also holds the Badger lease)
 //	client.go:525  /fed/v1/query/available
 //	client.go:658  /fed/v1/query/plan
 //	sync_outbox.go:955 -> push at :1087 -> SyncPush -> doPeerRequest
 //
-// The last one is the sync OUTBOX: it runs on a background cadence rather than
-// a user query, and it holds the domain-ownership lease alongside the policy
-// lease. A fix applied at any single call site would have left the other three
-// deadlocking, which is why the guard lives in maybeTriggerRouteRefresh itself.
-//
-// This test pins that property at the shared entry point: with a policy writer
-// queued, the refresh trigger must not block ANY caller, whatever lease that
-// caller happens to be holding.
+// The last is the sync OUTBOX: a background cadence rather than a user query,
+// holding the domain-ownership lease alongside the policy lease. A fix applied
+// at any single call site would have left the others deadlocking, which is why
+// the guard lives in maybeTriggerRouteRefresh itself — and why an incomplete
+// enumeration (mine originally missed the outbox) stopped mattering.
 func TestRouteRefreshRemediationIsCentralNotCallerSpecific(t *testing.T) {
 	sqlite := policyGateStore(t)
 	m := &Manager{memStore: sqlite}
