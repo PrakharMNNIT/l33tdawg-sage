@@ -30,7 +30,7 @@ func (h *CometHeight) UnmarshalJSON(data []byte) error {
 		}
 	} else {
 		if !json.Valid(raw) {
-			return fmt.Errorf("Comet height is not valid JSON")
+			return fmt.Errorf("comet height is not valid JSON")
 		}
 		decimal = string(raw)
 	}
