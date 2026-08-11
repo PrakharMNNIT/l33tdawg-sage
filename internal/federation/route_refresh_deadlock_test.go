@@ -163,3 +163,53 @@ func TestRouteRefreshSchedulesAtMostOnePendingRefreshPerPeer(t *testing.T) {
 
 	unlockWriter()
 }
+
+// The remediation must be CENTRAL, not caller-specific. Four production chains
+// hold the sync-policy read lease across a peer request and therefore reach the
+// inline refresh:
+//
+//	client.go:447  /fed/v1/query        (also holds the Badger lease)
+//	client.go:525  /fed/v1/query/available
+//	client.go:658  /fed/v1/query/plan
+//	sync_outbox.go:955 -> push at :1087 -> SyncPush -> doPeerRequest
+//
+// The last one is the sync OUTBOX: it runs on a background cadence rather than
+// a user query, and it holds the domain-ownership lease alongside the policy
+// lease. A fix applied at any single call site would have left the other three
+// deadlocking, which is why the guard lives in maybeTriggerRouteRefresh itself.
+//
+// This test pins that property at the shared entry point: with a policy writer
+// queued, the refresh trigger must not block ANY caller, whatever lease that
+// caller happens to be holding.
+func TestRouteRefreshRemediationIsCentralNotCallerSpecific(t *testing.T) {
+	sqlite := policyGateStore(t)
+	m := &Manager{memStore: sqlite}
+
+	unlockWriter := sqlite.LockSyncPolicyWrite()
+	defer unlockWriter()
+
+	// One goroutine per known lock-holding chain, all hitting the shared entry
+	// point while the writer holds the gate.
+	chains := []string{
+		"query-chain",           // client.go:447
+		"query-available-chain", // client.go:525
+		"query-plan-chain",      // client.go:658
+		"sync-outbox-chain",     // sync_outbox.go:955 -> SyncPush
+	}
+	done := make(chan string, len(chains))
+	for _, chain := range chains {
+		go func(c string) {
+			m.maybeTriggerRouteRefresh(c)
+			done <- c
+		}(chain)
+	}
+
+	for range chains {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a lock-holding caller blocked on the route-refresh trigger: the remediation is " +
+				"not central, so at least one of the four known chains can still deadlock")
+		}
+	}
+}
