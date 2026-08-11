@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.6 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.7 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -21,14 +21,55 @@ v11.18.5 closes the remaining installed-binary/MCP-session skew by handing an
 unread request to the replacement runtime before stale tools can execute it.
 v11.18.6 adds exact CometBFT H and H/H+1 updater snapshot
 provenance/replay-boundary proof, bounded exact-generation federation Retry,
-and safe fingerprinting for memory-reassign failure logs. The supported
-consensus ceiling remains app-v26;
-**v11.18.6 does not introduce app-v27**.
+and safe fingerprinting for memory-reassign failure logs. v11.18.7 adds bounded
+JSON-RPC POST transport and independently checked, operator-configurable limits
+for large signed CometBFT transactions, raises the deterministic app-v20
+atomic-finalize limit to 1.2 MB,
+makes route refresh admission deadlock-safe, restores authenticated route
+bootstrap for P2P-only peers across a trust-generation change, and gives
+security evidence precedence in federation diagnostics. The supported
+consensus ceiling remains app-v26; **v11.18.7 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.7 patch
+
+Large signed transactions no longer overflow CometBFT request headers. Smaller
+broadcasts retain the established GET wire shape; larger commit, sync, and
+byte-identical nonce-fence reconciliation requests use bounded JSON-RPC POST.
+Client transaction and JSON-RPC body limits are independently range-checked,
+capped at 8,000,000 bytes, and refuse an oversized request before send.
+Operators raising them must configure matching CometBFT limits. Independently,
+every validator enforces a 1,200,000-byte aggregate raw-transaction budget for
+app-v20 atomic finalization, sufficient for the measured 1,304-entry
+SkillRegistry transaction. Response handling accepts strict quoted or numeric
+`int64` heights, rejects fractional, exponent, null, malformed, and out-of-range
+heights, and refuses unsupported content types.
+
+v11.18.7 removes recursive sync-policy lease acquisition from federation peer
+request completion paths. Refresh admission is policy-free, bounded to one
+pending worker per peer, and resolves the current agreement and binding only in
+the asynchronous worker. Failed-request and successful-Direct triggers remain
+active, while the route-exchange endpoint itself cannot recursively trigger a
+refresh.
+
+P2P-only peers may now use missing or stale route material solely as a
+connection hint for the authenticated `/fed/v1/p2p/routes` bootstrap exchange.
+The current agreement's pinned mTLS identity remains authoritative. All
+protected requests reject missing or cross-generation snapshots with
+`trust_generation_mismatch`. A matching-generation empty target set remains
+explicitly pinned and cannot fall back to current configuration.
+
+Federation route diagnostics classify mixed route-availability plus certificate,
+SPKI, pin, identity-mismatch, or security-block evidence as `security_blocked`;
+revocation, expired or unknown agreement, trust-failure, or authentication
+evidence is classified as `trust_failure`. Both verdict classes outrank route
+availability. This patch introduces no new consensus application version or
+state migration: app-v26 remains the ceiling and v11.18.7 does not introduce
+app-v27.
 
 ## v11.18.6 patch
 

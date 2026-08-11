@@ -51,6 +51,48 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.7
+
+**Large signed transactions now use a bounded CometBFT transport instead of
+overflowing request headers.** Existing smaller broadcasts keep the established
+GET wire shape, while large commit, sync, and byte-identical nonce-fence
+reconciliation requests use JSON-RPC POST with base64 transaction bytes. Client
+transaction and JSON-RPC body limits are independently range-checked, capped at
+8,000,000 bytes, and refuse an oversized request before send. Operators raising
+them must configure matching CometBFT limits. Independently, every validator
+enforces a 1,200,000-byte aggregate raw-transaction budget for app-v20 atomic
+finalization, sufficient for the measured 1,304-entry SkillRegistry transaction.
+Response handling accepts strict quoted or numeric `int64` heights, rejects
+fractional, exponent, null, malformed, and out-of-range heights, and refuses
+unsupported content types.
+
+**Federation route refresh no longer risks recursively acquiring the
+sync-policy read lease from a peer-request caller.** Opportunistic refresh
+admission is policy-free and bounded to one pending refresh per peer; the
+agreement and binding lookup runs asynchronously after the request caller can
+release its lease. Failed-request and successful-Direct triggers remain
+covered, while the route-exchange endpoint does not self-trigger refresh.
+
+**P2P-only peers can recover when their stored route snapshot is missing or
+belongs to an older trust generation.** Only the authenticated
+`/fed/v1/p2p/routes` bootstrap exchange may use stale or current route addresses
+as connection hints; the current agreement's pinned mTLS identity remains
+authoritative. Protected requests reject missing or cross-generation snapshots
+with `trust_generation_mismatch`. A matching-generation empty target set remains
+explicitly pinned and cannot fall back to current configuration.
+
+**Federation diagnostics now give security evidence precedence over route
+availability evidence.** Mixed route-availability plus certificate, SPKI, pin,
+identity-mismatch, or security-block evidence is classified as
+`security_blocked`; revocation, expired or unknown agreement, trust-failure, or
+authentication evidence is classified as `trust_failure`. Both verdict classes
+outrank route availability.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.7 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.7`. SDK 11.18.7.
+
 ## What's New in v11.18.6
 
 **Updater snapshots now prove both supported CometBFT layouts before they are
@@ -1614,7 +1656,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.6`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.7`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
