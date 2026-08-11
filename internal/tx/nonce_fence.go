@@ -314,11 +314,11 @@ func txResolverFallback() TxResolveFunc {
 // cause is derived from err ONCE, at construction, and it is the only thing the
 // fence is allowed to know about the failure. err itself is never read by any
 // fence code path — not stored, not logged, not matched. That is structural
-// rather than a convention because err routinely CONTAINS THE SIGNED
-// TRANSACTION: net/http embeds the full request URL in its errors and a
-// broadcast URL is /broadcast_tx_commit?tx=0x<the whole encoded tx>. Deriving
-// the category here means no later edit to the fence can reintroduce the leak by
-// reaching for a "more helpful" message.
+// rather than a convention because historical GET broadcasters put the signed
+// transaction in the URL and net/http then embedded it in errors. Large
+// broadcasts now use JSON-RPC POST, but deriving the category here means no
+// later transport edit can reintroduce the leak by reaching for a "more
+// helpful" message.
 type indeterminateSubmit struct {
 	err     error
 	cause   fenceCause
@@ -394,10 +394,10 @@ func Indeterminate(err error, encoded []byte, resolve TxResolveFunc) error {
 // fenceCause is the ONLY thing a fence keeps about the error that raised it: a
 // category, never the message.
 //
-// KEEPING THE MESSAGE IS A DATA LEAK, NOT A STYLE CHOICE. Every CometBFT
-// broadcaster in this repo issues GET /broadcast_tx_commit?tx=0x<the entire
-// signed transaction>, and net/http embeds the full request URL in the
-// *url.Error it returns. Storing that error would put the signed bytes in the
+// KEEPING THE MESSAGE IS A DATA LEAK, NOT A STYLE CHOICE. Historical CometBFT
+// broadcasters in this repo issued GET requests containing the entire signed
+// transaction, and net/http embedded the full request URL in the *url.Error it
+// returned. Storing that error would put the signed bytes in the
 // fence record, in FencedSigners(), and in every "still held" line — and because
 // reconciliation now retries for as long as the fence stands, it would repeat
 // them forever and carry them into any support bundle. internal/voter already
@@ -1863,8 +1863,8 @@ func cometHashMismatchDetail(op, reported string, want [sha256.Size]byte) string
 // decoded.
 type cometTxLookup struct {
 	Result *struct {
-		Hash     string `json:"hash"`
-		Height   int64  `json:"height,string"`
+		Hash     string      `json:"hash"`
+		Height   CometHeight `json:"height"`
 		TxResult *struct {
 			Code *int   `json:"code"`
 			Log  string `json:"log"`
@@ -1889,8 +1889,8 @@ type cometBroadcastCommit struct {
 			Code *int   `json:"code"`
 			Log  string `json:"log"`
 		} `json:"tx_result"`
-		Hash   string `json:"hash"`
-		Height int64  `json:"height,string"`
+		Hash   string      `json:"hash"`
+		Height CometHeight `json:"height"`
 	} `json:"result"`
 	Error *struct {
 		Message string `json:"message"`
@@ -2178,10 +2178,9 @@ func checkTxRefusalIsPermanent(code int) bool { return code == checkTxNonceGateC
 // code is examined; a mismatch (or a missing hash) is UNRESOLVED — the fence
 // holds and the next attempt asks again.
 func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) (outcome TxOutcome, superseded bool, err error) {
-	url := fmt.Sprintf("%s/broadcast_tx_commit?tx=0x%s", endpoint, hex.EncodeToString(encoded))
 	wantHash := CometTxHash(encoded)
 	var res cometBroadcastCommit
-	resultOK, err := cometGetJSON(ctx, "comet re-submit", url, encoded, &res)
+	resultOK, err := cometBroadcastJSON(ctx, "comet re-submit", endpoint, "broadcast_tx_commit", encoded, &res)
 	if err != nil {
 		return TxOutcome{Verdict: TxVerdictUnresolved}, false, err
 	}
@@ -2268,18 +2267,15 @@ func cometResubmitOutcome(ctx context.Context, endpoint string, encoded []byte) 
 	}, false, nil
 }
 
-// cometGetJSON issues one RPC and RETURNS NO ERROR THAT COULD CONTAIN THE
-// TRANSACTION.
+// cometGetJSON and cometBroadcastJSON issue one RPC and RETURN NO ERROR THAT
+// COULD CONTAIN THE TRANSACTION.
 //
 // This is the origin of the leak that a cross-review caught, so the fix belongs
-// here rather than only at the fence boundary. The re-submit URL is
-// /broadcast_tx_commit?tx=0x<the entire signed transaction>, and net/http embeds
-// the full request URL in both the *url.Error from Do and the parse error from
-// NewRequestWithContext. Wrapping either with %w — which this function used to
-// do — put the whole signed transaction into the fence record, into every
-// retry's log line, and into any support bundle, repeating for as long as the
-// fence stood. internal/voter/broadcast.go declines to attach these errors for
-// exactly this reason; this is that rule at the fence's RPC boundary.
+// here rather than only at the fence boundary. The historical re-submit GET URL
+// carried the entire signed transaction and net/http embedded that URL in some
+// errors. Re-submission now uses a bounded JSON-RPC POST, but both helpers still
+// reduce transport failures to typed categories so no future request shape can
+// put signed bytes into a fence record or support bundle.
 //
 // What survives is a TYPED CATEGORY (transport / timeout / canceled / decode /
 // rpc) and, for an HTTP-level refusal, the status line. The caller already knows
@@ -2299,6 +2295,18 @@ func cometGetJSON(ctx context.Context, op, url string, encoded []byte, out any) 
 		// NOT %w: url.Error.Error() is `parse "<the whole URL>": ...`.
 		return false, fmt.Errorf("%s: could not build request (%s)", op, classifyFenceCause(err))
 	}
+	return cometDoJSON(op, req, encoded, out)
+}
+
+func cometBroadcastJSON(ctx context.Context, op, endpoint, method string, encoded []byte, out any) (resultOK bool, err error) {
+	req, err := cometBroadcastRequest(ctx, endpoint, method, encoded)
+	if err != nil {
+		return false, fmt.Errorf("%s: could not build request (%s)", op, classifyFenceCause(err))
+	}
+	return cometDoJSON(op, req, encoded, out)
+}
+
+func cometDoJSON(op string, req *http.Request, encoded []byte, out any) (resultOK bool, err error) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		// NOT %w, for the same reason. The category is what the retry loop and
@@ -2312,6 +2320,9 @@ func cometGetJSON(ctx context.Context, op, url string, encoded []byte, out any) 
 		// a hostile proxy writes it freely — scrub it like any other remote
 		// string.
 		return false, fmt.Errorf("%s: comet rpc returned %s", op, scrubFenceText(resp.Status, encoded))
+	}
+	if err := validateCometJSONResponse(resp); err != nil {
+		return false, fmt.Errorf("%s: %s", op, scrubFenceText(err.Error(), encoded))
 	}
 	// The body is read through a hard cap BEFORE the decoder sees it. This loop
 	// retries for as long as a fence stands — that is the design — so an
