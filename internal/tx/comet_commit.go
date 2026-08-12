@@ -108,6 +108,9 @@ func DoCometSubmission(req *http.Request) (*http.Response, error) {
 	if req == nil {
 		return nil, errors.New("comet submission request is nil")
 	}
+	// #nosec G704 -- this sink intentionally targets the operator-configured
+	// CometBFT RPC endpoint; callers supply signed transaction requests, never
+	// an unauthenticated remote user's fetch URL.
 	return cometSubmitClient.Do(req)
 }
 
