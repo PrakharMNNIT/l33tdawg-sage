@@ -957,6 +957,7 @@ func TestTakeVerifiedRejectsMalformedAndGreaterThanOneReplayBoundaries(t *testin
 				commit := blockStore.LoadSeenCommit(78)
 				if commit == nil {
 					t.Fatal("missing replay seen commit")
+					return
 				}
 				commit.BlockID.Hash[0] ^= 0xff
 				if err := blockStore.SaveSeenCommit(78, commit); err != nil {
