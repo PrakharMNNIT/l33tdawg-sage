@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.18.7 lineage implementation (2026-08-11). -->
+<!-- Verified against SAGE v11.18.8 lineage implementation (2026-08-11). -->
 
 # Legacy upgrade-lineage repair (app-v21 → app-v22)
 

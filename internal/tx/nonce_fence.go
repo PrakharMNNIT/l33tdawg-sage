@@ -2295,7 +2295,10 @@ func cometGetJSON(ctx context.Context, op, url string, encoded []byte, out any) 
 		// NOT %w: url.Error.Error() is `parse "<the whole URL>": ...`.
 		return false, fmt.Errorf("%s: could not build request (%s)", op, classifyFenceCause(err))
 	}
-	return cometDoJSON(op, req, encoded, out)
+	// The tx lookup is a pure read and carries no submission, so it keeps the
+	// shared pool: a transparently retried lookup costs nothing and this loop
+	// polls for as long as a fence stands.
+	return cometDoJSON(http.DefaultClient.Do, op, req, encoded, out)
 }
 
 func cometBroadcastJSON(ctx context.Context, op, endpoint, method string, encoded []byte, out any) (resultOK bool, err error) {
@@ -2303,11 +2306,16 @@ func cometBroadcastJSON(ctx context.Context, op, endpoint, method string, encode
 	if err != nil {
 		return false, fmt.Errorf("%s: could not build request (%s)", op, classifyFenceCause(err))
 	}
-	return cometDoJSON(op, req, encoded, out)
+	// This is the reconciler's RE-SUBMIT: the same nil-body GET wire shape as a
+	// first broadcast, so it carries the same at-least-once delivery exposure and
+	// must go out on the non-reusing client. Fixing only comet_commit.go would
+	// leave the fence's own recovery path duplicating the transaction it exists
+	// to resolve.
+	return cometDoJSON(DoCometSubmission, op, req, encoded, out)
 }
 
-func cometDoJSON(op string, req *http.Request, encoded []byte, out any) (resultOK bool, err error) {
-	resp, err := http.DefaultClient.Do(req)
+func cometDoJSON(do func(*http.Request) (*http.Response, error), op string, req *http.Request, encoded []byte, out any) (resultOK bool, err error) {
+	resp, err := do(req)
 	if err != nil {
 		// NOT %w, for the same reason. The category is what the retry loop and
 		// the metrics label actually use.

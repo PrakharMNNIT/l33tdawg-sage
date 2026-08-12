@@ -267,3 +267,64 @@ func TestRestartVetoNeverAdvisesARestart(t *testing.T) {
 		}
 	}
 }
+
+// TestDrainTimeoutStillReportsTheFenceReason pins the reporting order of the two
+// ways the drain-time re-check can refuse.
+//
+// These two are not independent: the fence wait lives INSIDE the nonce lease
+// (internal/tx/nonce.go takes the lease, then waits on awaitFenceLifted), so a
+// caller parked on a fence is, by construction, also a caller keeping
+// WaitForSigningIdle busy. The drain therefore ALWAYS times out in exactly the
+// scenario RestartVetoReason exists to describe, and if the drain error is
+// reported first the operator is told "context deadline exceeded" instead of
+// which key is fenced, on which transaction, for how long.
+//
+// The decision is identical either way — both abandon — so this is purely about
+// which story the operator gets. Reverting to `vetoErr := idleErr` makes this
+// fail with the generic deadline message.
+func TestDrainTimeoutStillReportsTheFenceReason(t *testing.T) {
+	sk := restartTestSigningKey(t)
+	entered := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		_ = tx.WithNonceLease(context.Background(), sk, func(uint64) error {
+			close(entered)
+			<-releaseHolder
+			return nil
+		})
+	}()
+	<-entered
+	defer func() {
+		close(releaseHolder)
+		<-holderDone
+	}()
+
+	const fenceReason = "1 signing key(s) are awaiting proof of an earlier submission's fate — " +
+		"signing key ab12cd34 is fenced on tx DEADBEEF (nonce 7), held for 1m0s"
+
+	var unwound atomic.Int32
+	prepared := preparedRestartRequest{
+		release: func() { unwound.Add(1) },
+		abort:   func() { unwound.Add(1) },
+		commit:  func() { t.Error("the restart committed while a signing key was fenced") },
+	}
+
+	// A short budget: the drain cannot succeed while the holder is parked, so
+	// this is the timing in which the two reasons compete.
+	err := commitRestartAfterSigningDrain(&prepared, func() string { return fenceReason }, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("a fence plus a busy drain did not abandon the restart")
+	}
+	if !strings.Contains(err.Error(), "awaiting proof") {
+		t.Fatalf("the abandonment reported the generic drain timeout instead of the fence that caused it, "+
+			"which is the one message an operator can act on: %v", err)
+	}
+	if strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("the drain timeout masked the fence reason: %v", err)
+	}
+	if unwound.Load() != 2 {
+		t.Fatalf("the abandon did not unwind the prepared drain (abort+release), got %d call(s)", unwound.Load())
+	}
+}
