@@ -298,6 +298,69 @@ func TestMessageReceiveConcurrentTokensNeverReturnSameMessage(t *testing.T) {
 	require.Equal(t, 1, total)
 }
 
+func TestMessageReceiveAttributesWinningSessionAndDeterministicHandoff(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	_, _, err := s.SendLocalMessage(ctx, "send-session", testLocalMessage("msg-session", "alice", "bob", "work"))
+	require.NoError(t, err)
+
+	type result struct {
+		items   []*PipelineMessage
+		session string
+		err     error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, session := range []string{"mcp-supervisor", "mcp-helper"} {
+		wg.Add(1)
+		go func(session string) {
+			defer wg.Done()
+			items, _, callErr := s.ReceiveLocalMessages(ctx, "bob", "", "receive-"+session, 1, session)
+			results <- result{items: items, session: session, err: callErr}
+		}(session)
+	}
+	wg.Wait()
+	close(results)
+
+	winner := ""
+	for got := range results {
+		require.NoError(t, got.err)
+		if len(got.items) == 1 {
+			winner = got.session
+			require.Equal(t, winner, got.items[0].ClaimedSessionID)
+		} else {
+			require.Empty(t, got.items)
+		}
+	}
+	require.NotEmpty(t, winner)
+
+	history, err := s.GetInboxHistory(ctx, "bob", "", 10)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	require.Equal(t, winner, history[0].ClaimedSessionID)
+
+	target := "mcp-supervisor"
+	if winner == target {
+		target = "mcp-helper"
+	}
+	replayed, err := s.HandoffLocalMessageClaim(ctx, "bob", "msg-session", winner, target)
+	require.NoError(t, err)
+	require.False(t, replayed)
+	replayed, err = s.HandoffLocalMessageClaim(ctx, "bob", "msg-session", winner, target)
+	require.NoError(t, err)
+	require.True(t, replayed)
+	_, err = s.HandoffLocalMessageClaim(ctx, "bob", "msg-session", winner, "mcp-third")
+	require.ErrorIs(t, err, ErrMessageReceiveConflict)
+
+	history, err = s.GetInboxHistory(ctx, "bob", "", 10)
+	require.NoError(t, err)
+	require.Equal(t, target, history[0].ClaimedSessionID)
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-session", "stale", winner)
+	require.ErrorIs(t, err, ErrMessageNotFound)
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-session", "done", target)
+	require.NoError(t, err)
+}
+
 func TestMessageReceiveStorageFailureRollsBackRetryToken(t *testing.T) {
 	ctx := context.Background()
 	s := newMessageTestStore(t)

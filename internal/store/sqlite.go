@@ -6398,18 +6398,19 @@ func (s *SQLiteStore) GetInbox(ctx context.Context, agentID, provider string, li
 // completed message until the ordinary pipeline retention sweep purges it.
 func (s *SQLiteStore) GetInboxHistory(ctx context.Context, agentID, provider string, limit int) ([]*PipelineMessage, error) {
 	rows, err := s.conn.QueryContext(ctx,
-		`SELECT pipe_id, from_agent, from_provider, to_agent, to_provider, intent, payload,
+		`SELECT p.pipe_id, p.from_agent, p.from_provider, p.to_agent, p.to_provider, p.intent, p.payload,
 		        COALESCE(result, ''), status, created_at, COALESCE(claimed_by, ''), claimed_at, completed_at, expires_at, COALESCE(journal_id, ''),
 		        source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision,
-		        federation_authorization_mode, federation_linked_relation
-		 FROM pipeline_messages
-		 WHERE destination_chain_id = ''
+		        federation_authorization_mode, federation_linked_relation, COALESCE(r.claimant_session_id, '')
+		 FROM pipeline_messages p
+		 LEFT JOIN message_fetch_receipts r ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
+		 WHERE p.destination_chain_id = ''
 		   AND (
-			to_agent = ?
-			OR (to_agent = '' AND to_provider = ? AND (status = 'pending' OR claimed_by = '' OR claimed_by = ?))
+			p.to_agent = ?
+			OR (p.to_agent = '' AND p.to_provider = ? AND (p.status = 'pending' OR p.claimed_by = '' OR p.claimed_by = ?))
 		   )
-		 ORDER BY created_at DESC LIMIT ?`,
-		agentID, provider, agentID, limit)
+		 ORDER BY p.created_at DESC LIMIT ?`,
+		agentID, agentID, provider, agentID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -6424,7 +6425,7 @@ func (s *SQLiteStore) GetInboxHistory(ctx context.Context, agentID, provider str
 			&m.Intent, &m.Payload, &m.Result, &m.Status, &createdAt, &m.ClaimedBy, &claimedAt, &completedAt,
 			&expiresAt, &m.JournalID, &m.SourceChainID, &m.SourcePipeID, &m.DestinationChainID,
 			&m.FederationPolicyEpoch, &m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision,
-			&m.FederationAuthorizationMode, &m.FederationLinkedRelation); err != nil {
+			&m.FederationAuthorizationMode, &m.FederationLinkedRelation, &m.ClaimedSessionID); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = parseTime(createdAt)

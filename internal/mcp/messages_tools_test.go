@@ -21,6 +21,7 @@ import (
 func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 	var mu sync.Mutex
 	readPaths := make([]string, 0, 2)
+	var claimantSessionID string
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pipe/resolve", func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodPost, r.Method)
@@ -42,10 +43,12 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 		var body map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		require.Equal(t, "stable-receive", body["receive_token"])
+		claimantSessionID, _ = body["claimant_session_id"].(string)
+		require.Regexp(t, `^mcp-[0-9a-f]{32}$`, claimantSessionID)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"items": []map[string]any{
-				{"message_id": "local-a", "from_agent": "alice", "intent": "ask", "payload": "one"},
-				{"message_id": "local-b", "from_agent": "alice", "intent": "ask", "payload": "two"},
+				{"message_id": "local-a", "from_agent": "alice", "intent": "ask", "payload": "one", "claimant_session_id": claimantSessionID},
+				{"message_id": "local-b", "from_agent": "alice", "intent": "ask", "payload": "two", "claimant_session_id": claimantSessionID},
 			},
 			"count": 2,
 		})
@@ -65,6 +68,14 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 	mux.HandleFunc("/v1/messages/local-a/reply", func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodPost, r.Method)
 		_ = json.NewEncoder(w).Encode(map[string]any{"message_id": "local-a", "status": "completed"})
+	})
+	mux.HandleFunc("/v1/messages/local-a/handoff", func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPut, r.Method)
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, "mcp-helper", body["from_session_id"])
+		require.Equal(t, claimantSessionID, body["to_session_id"])
+		_ = json.NewEncoder(w).Encode(map[string]any{"message_id": "local-a", "claimant_session_id": claimantSessionID})
 	})
 	mux.HandleFunc("/v1/messages/msg-1/status", func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodGet, r.Method)
@@ -94,9 +105,17 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 	require.Equal(t, "local-a", items[0]["message_id"])
 	require.NotContains(t, items[0], "pipe_id")
 	require.Equal(t, "confirmed", items[0]["read_status"])
+	require.Equal(t, claimantSessionID, items[0]["claimant_session_id"])
+	require.Equal(t, claimantSessionID, received.(map[string]any)["claimant_session_id"])
 	mu.Lock()
 	require.ElementsMatch(t, []string{"/v1/messages/local-a/read", "/v1/messages/local-b/read"}, readPaths)
 	mu.Unlock()
+
+	handed, err := s.toolMessageHandoff(context.Background(), map[string]any{
+		"message_id": "local-a", "from_session_id": "mcp-helper",
+	})
+	require.NoError(t, err)
+	require.Equal(t, claimantSessionID, handed.(map[string]any)["claimant_session_id"])
 
 	replied, err := s.toolMessageReply(context.Background(), map[string]any{"message_id": "local-a", "result": "done"})
 	require.NoError(t, err)

@@ -34,6 +34,7 @@ func messageRouterAs(s *Server, callerID string, exactProof bool) http.Handler {
 	r.Post("/v1/messages", s.handleMessageSend)
 	r.Post("/v1/messages/receive", s.handleMessagesReceive)
 	r.Post("/v1/messages/{message_id}/reply", s.handleMessageReply)
+	r.Put("/v1/messages/{message_id}/handoff", s.handleMessageHandoff)
 	r.Put("/v1/messages/{message_id}/read", s.handleMessageRead)
 	r.Put("/v1/messages/read-batch", s.handleMessageReadBatch)
 	r.Get("/v1/messages/{message_id}/status", s.handleMessageStatus)
@@ -96,7 +97,7 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 	require.Contains(t, replayedSend.Body.String(), `"idempotent_replay":true`)
 	require.Len(t, notifications, 1, "an idempotent send replay must not emit a second wake-up")
 
-	receiveBody := map[string]any{"receive_token": "one-receive", "limit": 5}
+	receiveBody := map[string]any{"receive_token": "one-receive", "limit": 5, "claimant_session_id": "mcp-helper"}
 	received := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPost, "/v1/messages/receive", receiveBody)
 	require.Equal(t, http.StatusOK, received.Code, received.Body.String())
 	require.Contains(t, received.Body.String(), `"message_id":"`+messageID+`"`)
@@ -105,6 +106,19 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 	require.Equal(t, http.StatusOK, receivedAgain.Code)
 	require.Contains(t, receivedAgain.Body.String(), `"idempotent_replay":true`)
 	require.Contains(t, receivedAgain.Body.String(), messageID)
+	require.Contains(t, receivedAgain.Body.String(), `"claimant_session_id":"mcp-helper"`)
+
+	handoff := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPut,
+		"/v1/messages/"+messageID+"/handoff", map[string]any{
+			"from_session_id": "mcp-helper", "to_session_id": "mcp-supervisor",
+		})
+	require.Equal(t, http.StatusOK, handoff.Code, handoff.Body.String())
+	require.Contains(t, handoff.Body.String(), `"claimant_session_id":"mcp-supervisor"`)
+	staleHandoff := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPut,
+		"/v1/messages/"+messageID+"/handoff", map[string]any{
+			"from_session_id": "mcp-helper", "to_session_id": "mcp-third",
+		})
+	require.Equal(t, http.StatusConflict, staleHandoff.Code, staleHandoff.Body.String())
 
 	read := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPut, "/v1/messages/"+messageID+"/read", map[string]any{})
 	require.Equal(t, http.StatusOK, read.Code, read.Body.String())

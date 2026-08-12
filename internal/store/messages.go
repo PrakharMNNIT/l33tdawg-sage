@@ -17,6 +17,7 @@ const (
 	// MaxMessageTokenBytes bounds caller-controlled idempotency and receive
 	// tokens before hashing/persisting them.
 	MaxMessageTokenBytes             = 256
+	MaxMessageClaimantSessionBytes   = 128
 	maxMessageReceiveBatchesPerAgent = 4096
 	messageReceiveBatchRetention     = 48 * time.Hour
 	// CanonicalMessageLifetime is a storage/transport sentinel for the public
@@ -42,6 +43,7 @@ func (s *SQLiteStore) migrateMessages(ctx context.Context) error {
 			token_hash TEXT NOT NULL,
 			requested_limit INTEGER NOT NULL,
 			claimed_count INTEGER NOT NULL DEFAULT 0,
+			claimant_session_id TEXT NOT NULL DEFAULT 'legacy',
 			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 			PRIMARY KEY (receiver_agent_id, token_hash)
 		)`,
@@ -65,6 +67,7 @@ func (s *SQLiteStore) migrateMessages(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS message_fetch_receipts (
 			message_id TEXT PRIMARY KEY,
 			receiver_agent_id TEXT NOT NULL,
+			claimant_session_id TEXT NOT NULL DEFAULT 'legacy',
 			fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 			FOREIGN KEY (message_id) REFERENCES pipeline_messages(pipe_id) ON DELETE CASCADE
 		)`,
@@ -95,6 +98,10 @@ func (s *SQLiteStore) migrateMessages(ctx context.Context) error {
 	// a misleading successful empty response.
 	_, _ = s.writeExecContext(ctx, `ALTER TABLE message_receive_batches
 		ADD COLUMN claimed_count INTEGER NOT NULL DEFAULT 0`)
+	_, _ = s.writeExecContext(ctx, `ALTER TABLE message_receive_batches
+		ADD COLUMN claimant_session_id TEXT NOT NULL DEFAULT 'legacy'`)
+	_, _ = s.writeExecContext(ctx, `ALTER TABLE message_fetch_receipts
+		ADD COLUMN claimant_session_id TEXT NOT NULL DEFAULT 'legacy'`)
 	if _, err := s.writeExecContext(ctx, `UPDATE message_receive_batches
 		SET claimed_count=(SELECT COUNT(*) FROM message_receive_batch_items i
 			WHERE i.receiver_agent_id=message_receive_batches.receiver_agent_id
@@ -320,6 +327,8 @@ func loadReceiveBatch(ctx context.Context, s *SQLiteStore, receiverID, tokenHash
 		item.Result = ""
 		item.CompletedAt = nil
 		item.JournalID = ""
+		_ = s.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+			WHERE receiver_agent_id=? AND message_id=?`, receiverID, id).Scan(&item.ClaimedSessionID)
 		items = append(items, item)
 	}
 	return items, nil
@@ -368,12 +377,19 @@ func pendingExactLocalMessages(ctx context.Context, s *SQLiteStore, receiverID s
 // ReceiveLocalMessages claims at most limit pending rows and persists the
 // exact ordered batch behind a caller-supplied token. A retry after a lost
 // HTTP response replays that batch and never claims later work.
-func (s *SQLiteStore) ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int) ([]*PipelineMessage, bool, error) {
+func (s *SQLiteStore) ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int, claimantSessionIDs ...string) ([]*PipelineMessage, bool, error) {
 	if agentID == "" || receiveToken == "" || len(receiveToken) > MaxMessageTokenBytes {
 		return nil, false, fmt.Errorf("receive requires an exact agent and a token of at most %d bytes", MaxMessageTokenBytes)
 	}
 	if limit <= 0 || limit > 20 {
 		return nil, false, fmt.Errorf("receive limit must be between 1 and 20")
+	}
+	claimantSessionID := "legacy"
+	if len(claimantSessionIDs) > 0 && strings.TrimSpace(claimantSessionIDs[0]) != "" {
+		claimantSessionID = strings.TrimSpace(claimantSessionIDs[0])
+	}
+	if len(claimantSessionID) > MaxMessageClaimantSessionBytes {
+		return nil, false, fmt.Errorf("claimant session id must be at most %d bytes", MaxMessageClaimantSessionBytes)
 	}
 	tokenHash := messageKeyHash(receiveToken)
 	var items []*PipelineMessage
@@ -414,8 +430,8 @@ func (s *SQLiteStore) ReceiveLocalMessages(ctx context.Context, agentID, provide
 			return ErrMessageReceiveQuota
 		}
 		if _, insertErr := tx.writeExecContext(ctx,
-			`INSERT INTO message_receive_batches(receiver_agent_id,token_hash,requested_limit)
-			 VALUES(?,?,?)`, agentID, tokenHash, limit); insertErr != nil {
+			`INSERT INTO message_receive_batches(receiver_agent_id,token_hash,requested_limit,claimant_session_id)
+			 VALUES(?,?,?,?)`, agentID, tokenHash, limit, claimantSessionID); insertErr != nil {
 			return insertErr
 		}
 		pending, err := pendingExactLocalMessages(ctx, tx, agentID, limit)
@@ -444,14 +460,15 @@ func (s *SQLiteStore) ReceiveLocalMessages(ctx context.Context, agentID, provide
 				return err
 			}
 			if _, err := tx.writeExecContext(ctx,
-				`INSERT OR IGNORE INTO message_fetch_receipts(message_id,receiver_agent_id)
-				 VALUES(?,?)`, item.PipeID, agentID); err != nil {
+				`INSERT OR IGNORE INTO message_fetch_receipts(message_id,receiver_agent_id,claimant_session_id)
+				 VALUES(?,?,?)`, item.PipeID, agentID, claimantSessionID); err != nil {
 				return err
 			}
 			claimed, err := tx.GetPipeline(ctx, item.PipeID)
 			if err != nil {
 				return err
 			}
+			claimed.ClaimedSessionID = claimantSessionID
 			items = append(items, claimed)
 		}
 		if _, err := tx.writeExecContext(ctx,
@@ -462,6 +479,49 @@ func (s *SQLiteStore) ReceiveLocalMessages(ctx context.Context, agentID, provide
 		return nil
 	})
 	return items, replayed, err
+}
+
+// HandoffLocalMessageClaim transfers only the session-level coordination
+// marker for one already-claimed canonical message. Agent authorization and
+// workflow ownership do not change. The compare-and-swap makes concurrent or
+// stale handoffs visible instead of silently stealing work.
+func (s *SQLiteStore) HandoffLocalMessageClaim(ctx context.Context, receiverID, messageID, fromSessionID, toSessionID string) (bool, error) {
+	if receiverID == "" || messageID == "" || fromSessionID == "" || toSessionID == "" ||
+		len(fromSessionID) > MaxMessageClaimantSessionBytes || len(toSessionID) > MaxMessageClaimantSessionBytes {
+		return false, ErrMessageNotFound
+	}
+	var replayed bool
+	err := s.RunInTx(ctx, func(txStore OffchainStore) error {
+		tx := txStore.(*SQLiteStore)
+		var addressed, provider, claimed, status, sourceChain, destinationChain, current string
+		if err := tx.conn.QueryRowContext(ctx, `SELECT p.to_agent,p.to_provider,p.claimed_by,p.status,
+			p.source_chain_id,p.destination_chain_id,r.claimant_session_id
+			FROM pipeline_messages p JOIN message_fetch_receipts r ON r.message_id=p.pipe_id
+			WHERE p.pipe_id=? AND r.receiver_agent_id=?`, messageID, receiverID).
+			Scan(&addressed, &provider, &claimed, &status, &sourceChain, &destinationChain, &current); err != nil {
+			return ErrMessageNotFound
+		}
+		if addressed != receiverID || provider != "" || claimed != receiverID || status != "claimed" || sourceChain != "" || destinationChain != "" {
+			return ErrMessageNotFound
+		}
+		if current == toSessionID {
+			replayed = true
+			return nil
+		}
+		if current != fromSessionID {
+			return ErrMessageReceiveConflict
+		}
+		result, err := tx.writeExecContext(ctx, `UPDATE message_fetch_receipts SET claimant_session_id=?
+			WHERE message_id=? AND receiver_agent_id=? AND claimant_session_id=?`, toSessionID, messageID, receiverID, fromSessionID)
+		if err != nil {
+			return err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return ErrMessageReceiveConflict
+		}
+		return nil
+	})
+	return replayed, err
 }
 
 func hasExactMessageFetch(ctx context.Context, s *SQLiteStore, receiverID, messageID string) (bool, error) {
@@ -514,11 +574,18 @@ func (s *SQLiteStore) AcknowledgeLocalMessageRead(ctx context.Context, receiverI
 // ReplyLocalMessage completes an exact receiver-fetched local message. The
 // same response is idempotent; a different second response is equivocation.
 // Completion and exact read evidence share one transaction.
-func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, messageID, result string) (bool, error) {
+func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, messageID, result string, claimantSessionIDs ...string) (bool, error) {
 	if len(result) > MaxPipeContentBytes {
 		return false, ErrPipeResultTooLarge
 	}
 	resultHash := messageKeyHash(result)
+	claimantSessionID := ""
+	if len(claimantSessionIDs) > 0 {
+		claimantSessionID = strings.TrimSpace(claimantSessionIDs[0])
+	}
+	if len(claimantSessionID) > MaxMessageClaimantSessionBytes {
+		return false, ErrMessageNotFound
+	}
 	var replayed bool
 	err := s.RunInTx(ctx, func(txStore OffchainStore) error {
 		tx := txStore.(*SQLiteStore)
@@ -552,6 +619,13 @@ func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, message
 		fetched, err := hasExactMessageFetch(ctx, tx, receiverID, messageID)
 		if err != nil || !fetched || provider != "" || claimed != receiverID || sourceChain != "" || destinationChain != "" {
 			return ErrMessageNotFound
+		}
+		if claimantSessionID != "" {
+			var currentSessionID string
+			if err := tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+				WHERE receiver_agent_id=? AND message_id=?`, receiverID, messageID).Scan(&currentSessionID); err != nil || currentSessionID != claimantSessionID {
+				return ErrMessageNotFound
+			}
 		}
 		if completeErr := tx.CompletePipeline(ctx, messageID, receiverID, result, ""); completeErr != nil {
 			return ErrMessageNotFound
