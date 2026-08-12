@@ -129,10 +129,16 @@ test('mode switches invalidate initial and reload responses from the old view', 
 });
 
 test('renderer wires mode invalidation into both initial acquisition and reloads', () => {
-  assert.match(mriSource, /const request = graphLoads\.begin\(mode\);[\s\S]*fetchActive\(request\.mode\)/,
-    'every renderer request must capture its source mode');
-  assert.match(mriSource, /graphLoads\.isCurrent\(request, mode\)/,
-    'responses must fail closed after a mode-generation change');
+  const initialStart = mriSource.indexOf('function acquireInitialGraph()');
+  const initialEnd = mriSource.indexOf('\n  acquireInitialGraph();', initialStart);
+  assert.ok(initialStart >= 0 && initialEnd > initialStart, 'initial graph acquisition must remain explicit');
+  const initialAcquire = mriSource.slice(initialStart, initialEnd);
+  assert.match(initialAcquire, /const request = graphLoads\.begin\(mode\);/,
+    'initial acquisition must capture its source mode and generation');
+  assert.match(initialAcquire, /fetchActive\(request\.mode\)/,
+    'initial acquisition must fetch from the captured mode');
+  assert.match(initialAcquire, /graphLoads\.isCurrent\(request, mode\)/,
+    'a stale initial response must fail closed after a mode change');
   assert.match(mriSource, /function setMode\(next\)\{[\s\S]*graphLoads\.invalidate\(\);[\s\S]*else acquireInitialGraph\(\);/,
     'a toggle must invalidate old work and refetch even before Graph exists');
 });
