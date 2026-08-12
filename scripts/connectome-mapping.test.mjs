@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { createGraphLoadCoordinator, mapConnectome } from '../web/static/js/connectome-map.js';
+
+const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 
 // The CEREBRUM connectome view renders the agent message-bus in the brain hull.
 // mapConnectome() is the pure projection from the /network/synapses payload onto
@@ -123,4 +126,13 @@ test('mode switches invalidate initial and reload responses from the old view', 
   assert.equal(loads.isCurrent(slowReload, 'memory'), false,
     'a slow connectome reload must not render after switching back to memory');
   assert.equal(loads.isCurrent(memory, 'memory'), true);
+});
+
+test('renderer wires mode invalidation into both initial acquisition and reloads', () => {
+  assert.match(mriSource, /const request = graphLoads\.begin\(mode\);[\s\S]*fetchActive\(request\.mode\)/,
+    'every renderer request must capture its source mode');
+  assert.match(mriSource, /graphLoads\.isCurrent\(request, mode\)/,
+    'responses must fail closed after a mode-generation change');
+  assert.match(mriSource, /function setMode\(next\)\{[\s\S]*graphLoads\.invalidate\(\);[\s\S]*else acquireInitialGraph\(\);/,
+    'a toggle must invalidate old work and refetch even before Graph exists');
 });

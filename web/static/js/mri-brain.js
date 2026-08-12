@@ -1198,7 +1198,7 @@ export function mountMriBrain(container, opts = {}) {
   // Connectome legend caption — appended once, shown only in connectome mode.
   const modeCap = document.createElement('div');
   modeCap.className = 'panel mode-cap';
-  modeCap.style.cssText = 'position:absolute;left:auto;bottom:12px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
+  modeCap.style.cssText = 'position:absolute;left:auto;bottom:44px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
   modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>hubs sink to the core · click a neuron to light its circle';
   root.appendChild(modeCap);
 
