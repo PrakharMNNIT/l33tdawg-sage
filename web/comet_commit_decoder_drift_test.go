@@ -977,3 +977,88 @@ func TestCometCommitDecoderDrift_VerdictContractsStayDeliberatelySplit(t *testin
 		assert.Equal(t, "applied", out.bLog)
 	})
 }
+
+// TestCometCommitDecoderDrift_RemoteLogsAreScrubbedByBoth pins the
+// ScrubBroadcastText call sites that carry node-supplied logs back to callers.
+// The other log fixtures in this file are scrub-invariant, so this witness
+// deliberately embeds the signed transaction in the shape a reverse proxy can
+// echo from a broadcast request line.
+func TestCometCommitDecoderDrift_RemoteLogsAreScrubbedByBoth(t *testing.T) {
+	signed := []byte("a2a-log-scrub-witness")
+	leakedHex := hex.EncodeToString(signed)
+	leak := "upstream refused: GET /broadcast_tx_commit?tx=0x" + leakedHex
+
+	assertNoLeak := func(t *testing.T, where, got string) {
+		t.Helper()
+		assert.NotContains(t, got, leakedHex,
+			where+" handed back a node-supplied log containing the signed transaction verbatim")
+		assert.NotContains(t, strings.ToUpper(got), strings.ToUpper(leakedHex),
+			where+" leaked the signed transaction in a different hex case")
+	}
+
+	t.Run("CheckTx refusal log", func(t *testing.T) {
+		out := driveBothCommitDecoders(t, signed, http.StatusOK, "application/json",
+			func(r *http.Request) string { return commitEnvelope(r, 2, leak, 0, "", 0) })
+
+		require.NoError(t, out.aErr)
+		require.NotNil(t, out.aResult)
+		assertNoLeak(t, "internal/tx CheckTxLog", out.aResult.CheckTxLog)
+
+		require.Error(t, out.bErr)
+		assertNoLeak(t, "web CheckTx refusal error", out.bErr.Error())
+	})
+
+	t.Run("FinalizeBlock refusal log", func(t *testing.T) {
+		out := driveBothCommitDecoders(t, signed, http.StatusOK, "application/json",
+			func(r *http.Request) string { return commitEnvelope(r, 0, "", 5, leak, 12) })
+
+		require.NoError(t, out.aErr)
+		require.NotNil(t, out.aResult)
+		assertNoLeak(t, "internal/tx TxResultLog", out.aResult.TxResultLog)
+
+		require.Error(t, out.bErr)
+		assertNoLeak(t, "web FinalizeBlock refusal error", out.bErr.Error())
+	})
+
+	t.Run("success log is exactly as remote-controlled as a failure log", func(t *testing.T) {
+		out := driveBothCommitDecoders(t, signed, http.StatusOK, "application/json",
+			func(r *http.Request) string { return commitEnvelopeOK(r, 12, leak) })
+
+		require.NoError(t, out.aErr)
+		require.NotNil(t, out.aResult)
+		require.NoError(t, out.bErr)
+		assertNoLeak(t, "internal/tx TxResultLog on success", out.aResult.TxResultLog)
+		assertNoLeak(t, "web success log", out.bLog)
+		assert.Equal(t, out.aResult.TxResultLog, out.bLog,
+			"the two decoders scrubbed the same node-supplied log differently")
+	})
+}
+
+// TestCometCommitDecoderDrift_AbsentContentTypeIsToleratedByA reaches the
+// backward-compatibility leg that an empty Header value cannot exercise: Go
+// otherwise sniffs the JSON body as text/plain. Decoder A deliberately accepts
+// a genuinely absent Content-Type while decoder B does not inspect the header.
+func TestCometCommitDecoderDrift_AbsentContentTypeIsToleratedByA(t *testing.T) {
+	signed := []byte("a2a-absent-content-type")
+	sum := tx.CometTxHash(signed)
+	bound := strings.ToUpper(hex.EncodeToString(sum[:]))
+
+	rpc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Content-Type"] = nil
+		_, _ = fmt.Fprint(w, commitEnvelopeOK(r, 9, "applied"))
+	}))
+	t.Cleanup(rpc.Close)
+
+	resp, err := http.Get(rpc.URL) //nolint:noctx // probe: prove the header really is absent
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Empty(t, resp.Header.Get("Content-Type"),
+		"the test requires a response with no Content-Type; Go sniffed one instead")
+
+	aResult, aErr := tx.BroadcastCometCommit(context.Background(), rpc.URL, nil, signed)
+	require.NoError(t, aErr,
+		"internal/tx refused a response with no Content-Type despite its compatibility contract")
+	require.NotNil(t, aResult)
+	assert.Equal(t, bound, aResult.Hash)
+	assert.Equal(t, int64(9), aResult.Height)
+}

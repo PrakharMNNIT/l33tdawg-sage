@@ -51,6 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.9
+
+**Ambiguous CometBFT commit and sync outcomes are now typed at the shared
+broadcaster boundary.** Transport, status, RPC, decode, shape, hash-binding, and
+missing-height failures return `ErrSubmitIndeterminate` for valid signing keys,
+while the existing live-registration path remains an independent fence
+backstop. Pre-send request-construction failures remain definitive and do not
+fence a key over bytes that never reached a transport.
+
+**Federation sync now fails closed if its commit broadcaster ever violates its
+contract by returning neither a result nor an error.** The exact signer and
+encoded transaction remain fenced until reconciliation proves their fate,
+instead of releasing the key for a potentially in-flight transaction. A new
+cross-package decoder contract also pins the HTTP prologue shared by
+`internal/tx` and the CEREBRUM web path while recording their deliberate verdict
+and envelope-tolerance differences.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.9 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.9`. SDK 11.18.9.
+
 ## What's New in v11.18.8
 
 **CometBFT transaction submissions no longer permit Go's HTTP transport to
@@ -1685,7 +1707,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.8`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.9`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
