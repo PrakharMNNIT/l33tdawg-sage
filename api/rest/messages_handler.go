@@ -159,8 +159,9 @@ func (s *Server) handleMessagesReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ReceiveToken string `json:"receive_token"`
-		Limit        *int   `json:"limit"`
+		ReceiveToken      string `json:"receive_token"`
+		ClaimantSessionID string `json:"claimant_session_id"`
+		Limit             *int   `json:"limit"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
@@ -172,6 +173,10 @@ func (s *Server) handleMessagesReceive(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.ReceiveToken) > store.MaxMessageTokenBytes {
 		writeProblem(w, http.StatusBadRequest, "Invalid receive token", "receive_token is too long")
+		return
+	}
+	if len(req.ClaimantSessionID) > store.MaxMessageClaimantSessionBytes {
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is too long")
 		return
 	}
 	limit := 5
@@ -194,7 +199,7 @@ func (s *Server) handleMessagesReceive(w http.ResponseWriter, r *http.Request) {
 			provider = agent.Provider
 		}
 	}
-	items, replayed, err := messageStore.ReceiveLocalMessages(r.Context(), agentID, provider, req.ReceiveToken, limit)
+	items, replayed, err := messageStore.ReceiveLocalMessages(r.Context(), agentID, provider, req.ReceiveToken, limit, req.ClaimantSessionID)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrMessageReceiveConflict):
@@ -213,17 +218,18 @@ func (s *Server) handleMessagesReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type receivedMessage struct {
-		MessageID      string    `json:"message_id"`
-		FromAgent      string    `json:"from_agent"`
-		FromProvider   string    `json:"from_provider,omitempty"`
-		Intent         string    `json:"intent,omitempty"`
-		Payload        string    `json:"payload"`
-		Status         string    `json:"status"`
-		CreatedAt      time.Time `json:"created_at"`
-		ExpiresAt      time.Time `json:"expires_at"`
-		Authority      string    `json:"authority"`
-		Trust          string    `json:"trust"`
-		SecurityNotice string    `json:"security_notice"`
+		MessageID         string    `json:"message_id"`
+		FromAgent         string    `json:"from_agent"`
+		FromProvider      string    `json:"from_provider,omitempty"`
+		Intent            string    `json:"intent,omitempty"`
+		Payload           string    `json:"payload"`
+		Status            string    `json:"status"`
+		CreatedAt         time.Time `json:"created_at"`
+		ExpiresAt         time.Time `json:"expires_at"`
+		Authority         string    `json:"authority"`
+		Trust             string    `json:"trust"`
+		SecurityNotice    string    `json:"security_notice"`
+		ClaimantSessionID string    `json:"claimant_session_id,omitempty"`
 	}
 	response := make([]receivedMessage, 0, len(items))
 	for _, item := range items {
@@ -232,12 +238,49 @@ func (s *Server) handleMessagesReceive(w http.ResponseWriter, r *http.Request) {
 			Intent: item.Intent, Payload: item.Payload, Status: item.Status,
 			CreatedAt: item.CreatedAt, ExpiresAt: item.ExpiresAt,
 			Authority: pipeRequestAuthority, Trust: pipeLocalTrust,
-			SecurityNotice: pipeRESTRequestSecurityNotice,
+			SecurityNotice:    pipeRESTRequestSecurityNotice,
+			ClaimantSessionID: item.ClaimedSessionID,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": response, "count": len(response), "idempotent_replay": replayed,
 	})
+}
+
+func (s *Server) handleMessageHandoff(w http.ResponseWriter, r *http.Request) {
+	if !requireExactSignedMessageAction(w, r) {
+		return
+	}
+	var req struct {
+		FromSessionID string `json:"from_session_id"`
+		ToSessionID   string `json:"to_session_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	if req.FromSessionID == "" || req.ToSessionID == "" ||
+		len(req.FromSessionID) > store.MaxMessageClaimantSessionBytes || len(req.ToSessionID) > store.MaxMessageClaimantSessionBytes {
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "from_session_id and to_session_id are required and bounded")
+		return
+	}
+	messageStore, ok := canonicalMessageStore(s)
+	if !ok {
+		writeProblem(w, http.StatusNotImplemented, "Messages unavailable", "The active store does not support canonical messages.")
+		return
+	}
+	replayed, err := messageStore.HandoffLocalMessageClaim(r.Context(), middleware.ContextAgentID(r.Context()),
+		chi.URLParam(r, "message_id"), req.FromSessionID, req.ToSessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrMessageReceiveConflict) {
+			writeProblem(w, http.StatusConflict, "Claimant session changed", "The message is no longer assigned to from_session_id; refresh passive history before retrying.")
+			return
+		}
+		writeProblem(w, http.StatusNotFound, "Message not found", "The message is not available for handoff.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"message_id": chi.URLParam(r, "message_id"),
+		"claimant_session_id": req.ToSessionID, "idempotent_replay": replayed})
 }
 
 func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
@@ -246,7 +289,8 @@ func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
 	}
 	messageID := chi.URLParam(r, "message_id")
 	var req struct {
-		Result string `json:"result"`
+		Result            string `json:"result"`
+		ClaimantSessionID string `json:"claimant_session_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
@@ -256,12 +300,16 @@ func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Missing reply", "result is required")
 		return
 	}
+	if len(req.ClaimantSessionID) > store.MaxMessageClaimantSessionBytes {
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is too long")
+		return
+	}
 	messageStore, ok := canonicalMessageStore(s)
 	if !ok {
 		writeProblem(w, http.StatusNotImplemented, "Messages unavailable", "The active store does not support canonical messages.")
 		return
 	}
-	replayed, err := messageStore.ReplyLocalMessage(r.Context(), middleware.ContextAgentID(r.Context()), messageID, req.Result)
+	replayed, err := messageStore.ReplyLocalMessage(r.Context(), middleware.ContextAgentID(r.Context()), messageID, req.Result, req.ClaimantSessionID)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrMessageReplyConflict):

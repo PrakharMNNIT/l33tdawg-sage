@@ -90,6 +90,22 @@ func TestConversationStateIsIsolatedAndReleased(t *testing.T) {
 	assert.False(t, replacementA.inceptionChecked)
 }
 
+func TestClaimantSessionIdentityIsStablePerConversationAndOpaque(t *testing.T) {
+	s, _ := testServer(t)
+	ctxA := WithConversationID(context.Background(), "sse:A")
+	ctxB := WithConversationID(context.Background(), "sse:B")
+	a1, err := s.claimantSessionID(ctxA)
+	require.NoError(t, err)
+	a2, err := s.claimantSessionID(ctxA)
+	require.NoError(t, err)
+	b, err := s.claimantSessionID(ctxB)
+	require.NoError(t, err)
+	require.Equal(t, a1, a2)
+	require.NotEqual(t, a1, b)
+	require.Regexp(t, `^mcp-[0-9a-f]{32}$`, a1)
+	require.NotContains(t, a1, "sse:A")
+}
+
 func TestHandleInitialize(t *testing.T) {
 	s, _ := testServer(t)
 	req := &jsonRPCRequest{
@@ -281,7 +297,7 @@ func TestHandleToolsList(t *testing.T) {
 
 	result := resp.Result.(map[string]any)
 	tools := result["tools"].([]map[string]any)
-	assert.Len(t, tools, 32)
+	assert.Len(t, tools, 33)
 
 	// Collect tool names
 	names := make(map[string]bool)
@@ -312,7 +328,7 @@ func TestHandleToolsList(t *testing.T) {
 		"sage_backlog", "sage_corroborate", "sage_directory", "sage_domains",
 		"sage_federation", "sage_find_agent", "sage_forget", "sage_gov_propose",
 		"sage_gov_status", "sage_gov_vote", "sage_inbox", "sage_inception",
-		"sage_link", "sage_list", "sage_message_reply", "sage_message_send",
+		"sage_link", "sage_list", "sage_message_handoff", "sage_message_reply", "sage_message_send",
 		"sage_message_history", "sage_message_replies", "sage_message_status",
 		"sage_messages_receive",
 		"sage_recall", "sage_reflect", "sage_register", "sage_reinstate",
@@ -438,7 +454,7 @@ func TestAdvertisedToolsExactlyMatchReferenceHeadings(t *testing.T) {
 	doc, err := os.ReadFile(docPath)
 	require.NoError(t, err)
 	docText := string(doc)
-	assert.Contains(t, docText, "SAGE advertises exactly 32 MCP tools",
+	assert.Contains(t, docText, "SAGE advertises exactly 33 MCP tools",
 		"the human-readable inventory count must match tools/list")
 	assert.Contains(t, docText, "One call consumes at most one bounded peer page",
 		"sage_find_agent must document its advertised peer_cursor contract")

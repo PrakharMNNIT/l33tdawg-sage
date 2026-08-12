@@ -2,7 +2,7 @@ Reconciled against internal/mcp for SAGE v11.18.9.
 
 # SAGE MCP Tools Reference
 
-SAGE advertises exactly 32 MCP tools over JSON-RPC 2.0. Four deprecated
+SAGE advertises exactly 33 MCP tools over JSON-RPC 2.0. Four deprecated
 `sage_pipe*` compatibility names remain callable for one migration window but
 are intentionally absent from `tools/list`, so new clients learn the canonical
 Messages API. Stdio tools sign REST calls with
@@ -962,10 +962,46 @@ enables the per-ID compatibility path; 401/403/5xx failures never fall back.
 
 ---
 
+### sage_message_handoff
+
+**Purpose:** Deterministically transfer one already-claimed canonical local
+message between concurrent MCP runtimes that share the same signed agent
+identity. The caller supplies the `claimant_session_id` currently shown by
+`sage_message_history(folder="inbox")`; SAGE atomically compares that value and
+reassigns the message to the calling MCP session. A stale or concurrent handoff
+returns a conflict instead of silently duplicating ownership. Session IDs are
+opaque coordination metadata, not authorization principals.
+
+**Source:** `internal/mcp/tools.go` (`sage_message_handoff`);
+`api/rest/messages_handler.go` (`handleMessageHandoff`);
+`internal/store/messages.go` (`HandoffLocalMessageClaim`).
+
+| Name | Type | Required | Description |
+|---|---|---:|---|
+| `message_id` | string | yes | Exact claimed local message to transfer. |
+| `from_session_id` | string | yes | Expected current claimant session from passive inbox history. |
+
+**Watcher and voice-bridge contract:** A watcher calls `sage_inbox` normally;
+the first concurrent session to receive a message remains its one handler. An
+empty active poll from a sibling session is not proof that the shared agent has
+no retained work: inspect `sage_message_history(folder="inbox")`, attribute any
+claimed row to its `claimant_session_id`, and call `sage_message_handoff` only
+when takeover is intentional. The compare-and-swap conflict is the signal to
+refresh history, not permission to process a stale copy. SSE
+`notifications/sage_message` is wake-up metadata only and never assigns a
+session. Mynah / SAGE Voice Bridge should normally use its dedicated registered
+agent key; if an operator deliberately runs multiple bridge/watch processes
+under one key, those processes follow this same session-attribution and handoff
+protocol. Display names such as “Mynah” do not define identity.
+
+---
+
 ### sage_message_reply
 
 **Purpose:** Reply to one receiver-local `message_id` returned by
-`sage_messages_receive` or `sage_inbox`. Local replies are idempotent;
+`sage_messages_receive` or `sage_inbox`. The MCP runtime includes its opaque
+claimant session, so a runtime that handed the work away cannot complete the
+still-open message from stale context. Local replies are idempotent;
 federated replies retain the negotiated secure transport and event
 deduplication. Only the exact recipient that fetched and claimed the message
 can reply.
@@ -1996,7 +2032,7 @@ registration name from `sage_register` is untouched.
 
 ## Summary
 
-**32 advertised tools:**
+**33 advertised tools:**
 
 | Category     | Tools |
 |--------------|-------|
@@ -2006,7 +2042,7 @@ registration name from `sage_register` is untouched.
 | Browse       | `sage_list`, `sage_timeline`, `sage_status`, `sage_domains` |
 | Tasks        | `sage_task`, `sage_backlog` |
 | Identity     | `sage_register`, `sage_rename`, `sage_directory` |
-| Messages     | `sage_find_agent`, `sage_message_send`, `sage_messages_receive`, `sage_inbox`, `sage_message_reply`, `sage_message_replies`, `sage_message_status`, `sage_message_history` |
+| Messages     | `sage_find_agent`, `sage_message_send`, `sage_messages_receive`, `sage_inbox`, `sage_message_handoff`, `sage_message_reply`, `sage_message_replies`, `sage_message_status`, `sage_message_history` |
 | Governance   | `sage_gov_propose`, `sage_gov_vote`, `sage_gov_status`, `sage_scope_list`, `sage_scope_get` |
 
 Hidden compatibility dispatch (not returned by `tools/list`): `sage_pipe`,
