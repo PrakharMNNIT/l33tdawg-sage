@@ -622,8 +622,8 @@ func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, message
 		}
 		if claimantSessionID != "" {
 			var currentSessionID string
-			if err := tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
-				WHERE receiver_agent_id=? AND message_id=?`, receiverID, messageID).Scan(&currentSessionID); err != nil || currentSessionID != claimantSessionID {
+			if sessionErr := tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+				WHERE receiver_agent_id=? AND message_id=?`, receiverID, messageID).Scan(&currentSessionID); sessionErr != nil || currentSessionID != claimantSessionID {
 				return ErrMessageNotFound
 			}
 		}
