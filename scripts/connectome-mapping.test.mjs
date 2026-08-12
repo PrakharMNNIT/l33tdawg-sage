@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { mapConnectome } from '../web/static/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome } from '../web/static/js/connectome-map.js';
 
 // The CEREBRUM connectome view renders the agent message-bus in the brain hull.
 // mapConnectome() is the pure projection from the /network/synapses payload onto
@@ -105,4 +105,22 @@ test('a connectome with neurons but zero traffic degrades gracefully', () => {
   assert.equal(g.nodes.length, 2);
   assert.ok(g.nodes.every(n => n._deg === 0 && n._w === 0));
   assert.equal(g.links.length, 0);
+});
+
+test('mode switches invalidate initial and reload responses from the old view', () => {
+  const loads = createGraphLoadCoordinator();
+  const initialMemory = loads.begin('memory');
+  loads.invalidate();
+  const connectome = loads.begin('connectome');
+
+  assert.equal(loads.isCurrent(initialMemory, 'connectome'), false,
+    'a slow initial memory response must not render after switching to connectome');
+  assert.equal(loads.isCurrent(connectome, 'connectome'), true);
+
+  const slowReload = loads.begin('connectome');
+  loads.invalidate();
+  const memory = loads.begin('memory');
+  assert.equal(loads.isCurrent(slowReload, 'memory'), false,
+    'a slow connectome reload must not render after switching back to memory');
+  assert.equal(loads.isCurrent(memory, 'memory'), true);
 });

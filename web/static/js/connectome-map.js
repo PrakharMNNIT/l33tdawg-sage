@@ -50,3 +50,18 @@ export function mapConnectome(g) {
   return { live: true, connectome: true, nodes, links,
     total: nodes.length, domainCounts: null, domainLast: null };
 }
+
+// A mode switch invalidates every request started for the previous view. The
+// renderer uses this tiny coordinator for both its initial acquisition and
+// later reloads so an out-of-order response can never be interpreted under a
+// different mode than the one that requested it.
+export function createGraphLoadCoordinator() {
+  let generation = 0;
+  return {
+    begin(mode) { return { generation: ++generation, mode }; },
+    invalidate() { generation += 1; },
+    isCurrent(request, mode) {
+      return request && request.generation === generation && request.mode === mode;
+    },
+  };
+}

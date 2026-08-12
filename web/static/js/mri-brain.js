@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { mapConnectome } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome } from '/ui/js/connectome-map.js';
 
 const LINK_TYPES = {
   supports:    { color: '#5ee2a0', label: 'supports',    typed: true },
@@ -570,7 +570,8 @@ export function mountMriBrain(container, opts = {}) {
   const baseUrl = fetchUrl;
   const urlFor = () => baseUrl + (currentDomain ? '&domain=' + encodeURIComponent(currentDomain) : '');
   // Mode-aware source: the memory graph (domain-drillable) or the connectome.
-  const fetchActive = () => mode === 'connectome' ? loadSynapses(SYNAPSE_URL) : loadGraph(urlFor());
+  const fetchActive = requestMode => requestMode === 'connectome' ? loadSynapses(SYNAPSE_URL) : loadGraph(urlFor());
+  const graphLoads = createGraphLoadCoordinator();
   let rendered = null;   // last graph data handed to ForceGraph (for neuron focus)
   const subs = [];
   let graphRetryTimer = null;
@@ -701,10 +702,11 @@ export function mountMriBrain(container, opts = {}) {
       return;
     }
     graphLoadInFlight = true;
+    const request = graphLoads.begin(mode);
     // A drill / reload leaves focus mode.
     focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
-    fetchActive().then(d => {
-      if (disposed || !Graph) return;
+    fetchActive(request.mode).then(d => {
+      if (disposed || !Graph || !graphLoads.isCurrent(request, mode)) return;
       clearTimeout(graphRetryTimer);
       resetGraphRetry();
       reportGraphAvailability('ready');
@@ -715,7 +717,7 @@ export function mountMriBrain(container, opts = {}) {
       refreshCounts(d);
       buildLobes(d);
     }).catch(() => {
-      if (disposed) return;
+      if (disposed || !graphLoads.isCurrent(request, mode)) return;
       reportGraphAvailability('unavailable');
       if (!graphReloadPending) scheduleGraphRetry(load);
     }).finally(() => {
@@ -1154,8 +1156,12 @@ export function mountMriBrain(container, opts = {}) {
 
   function acquireInitialGraph() {
     reportGraphAvailability('loading');
-    fetchActive().then(initializeGraph).catch(() => {
-      if (disposed) return;
+    const request = graphLoads.begin(mode);
+    fetchActive(request.mode).then(d => {
+      if (disposed || !graphLoads.isCurrent(request, mode)) return;
+      initializeGraph(d);
+    }).catch(() => {
+      if (disposed || !graphLoads.isCurrent(request, mode)) return;
       const boot = $('.boot');
       if (boot) boot.textContent = '◉ MEMORY GRAPH TEMPORARILY UNAVAILABLE — RETRYING…';
       reportGraphAvailability('unavailable');
@@ -1192,7 +1198,7 @@ export function mountMriBrain(container, opts = {}) {
   // Connectome legend caption — appended once, shown only in connectome mode.
   const modeCap = document.createElement('div');
   modeCap.className = 'panel mode-cap';
-  modeCap.style.cssText = 'position:absolute;left:12px;bottom:12px;top:auto;right:auto;display:none;max-width:236px;font-size:11px;line-height:1.55';
+  modeCap.style.cssText = 'position:absolute;left:auto;bottom:12px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
   modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>hubs sink to the core · click a neuron to light its circle';
   root.appendChild(modeCap);
 
@@ -1210,11 +1216,13 @@ export function mountMriBrain(container, opts = {}) {
   // unchanged whenever mode stays 'memory'.
   function setMode(next){
     if (mode===next || (next==='connectome' && !allowConnectome)) return;
+    graphLoads.invalidate();
     mode = next;
     currentDomain = null;
     focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
     updateModeChrome();
     if (Graph) { load(); zoomOut(); }
+    else acquireInitialGraph();
   }
 
   $('.b-rot').onclick=function(){ scanning=!scanning; if(controls) controls.autoRotate=scanning; this.textContent=scanning?'⏸ pause':'▶ scan'; };
