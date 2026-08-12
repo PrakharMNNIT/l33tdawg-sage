@@ -1,0 +1,108 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { mapConnectome } from '../web/static/js/connectome-map.js';
+
+// The CEREBRUM connectome view renders the agent message-bus in the brain hull.
+// mapConnectome() is the pure projection from the /network/synapses payload onto
+// the MRI render contract; these tests pin the invariants the renderer relies on:
+// neuron degree + synapse weight normalization, ghost-edge rejection, and a safe
+// empty state.
+
+const payload = {
+  neurons: [
+    { agent_id: 'alice', name: 'Alice', role: 'planner', domain: 'ops' },
+    { agent_id: 'bob',   name: 'Bob',   role: 'worker',  domain: 'ops' },
+    { agent_id: 'carol', name: 'Carol', role: 'worker',  domain: 'research' },
+  ],
+  synapses: [
+    { from_agent: 'alice', to_agent: 'bob',   count: 5, last_fired: '2026-08-12T10:00:00Z' },
+    { from_agent: 'bob',   to_agent: 'alice', count: 2, last_fired: '2026-08-12T09:00:00Z' },
+    { from_agent: 'bob',   to_agent: 'carol', count: 1, last_fired: '2026-08-12T08:00:00Z' },
+  ],
+};
+
+test('neurons become nodes with normalized degree (busiest = 1)', () => {
+  const g = mapConnectome(payload);
+  assert.equal(g.nodes.length, 3);
+  const by = Object.fromEntries(g.nodes.map(n => [n.id, n]));
+  // total traffic (in+out): bob 5+2+1=8 (busiest), alice 5+2=7, carol 1
+  assert.equal(by.bob._w, 8);
+  assert.equal(by.alice._w, 7);
+  assert.equal(by.carol._w, 1);
+  assert.equal(by.bob._deg, 1);
+  assert.equal(by.alice._deg, 7 / 8);
+  assert.equal(by.carol._deg, 1 / 8);
+  assert.ok(g.nodes.every(n => n.isNeuron === true));
+});
+
+test('node fields map from the payload with sensible fallbacks', () => {
+  const g = mapConnectome({
+    neurons: [
+      { agent_id: 'x', name: 'X', role: 'r', domain: 'd' },
+      { agent_id: 'y' }, // no name/role/domain
+    ],
+    synapses: [],
+  });
+  const by = Object.fromEntries(g.nodes.map(n => [n.id, n]));
+  assert.equal(by.x.label, 'X');
+  assert.equal(by.x.domain, 'd');
+  assert.equal(by.x.role, 'r');
+  // label falls back to agent_id, domain falls back to role then 'agent'
+  assert.equal(by.y.label, 'y');
+  assert.equal(by.y.domain, 'agent');
+  assert.equal(by.y.role, '');
+});
+
+test('synapses become weighted links normalized by the busiest edge', () => {
+  const g = mapConnectome(payload);
+  assert.equal(g.links.length, 3);
+  const by = Object.fromEntries(g.links.map(l => [`${l.source}>${l.target}`, l]));
+  assert.equal(by['alice>bob'].count, 5);
+  assert.equal(by['alice>bob']._w, 1);        // busiest edge
+  assert.equal(by['bob>alice']._w, 2 / 5);
+  assert.equal(by['bob>carol']._w, 1 / 5);
+  assert.ok(g.links.every(l => l.link_type === 'synapse'));
+  assert.equal(by['alice>bob'].last_fired, '2026-08-12T10:00:00Z');
+});
+
+test('direction is preserved: A->B is distinct from B->A', () => {
+  const g = mapConnectome(payload);
+  const keys = g.links.map(l => `${l.source}>${l.target}`);
+  assert.ok(keys.includes('alice>bob'));
+  assert.ok(keys.includes('bob>alice'));
+});
+
+test('edges to unknown agents are dropped (no ghost nodes)', () => {
+  const g = mapConnectome({
+    neurons: [{ agent_id: 'alice', name: 'Alice' }],
+    synapses: [
+      { from_agent: 'alice', to_agent: 'ghost', count: 9 }, // ghost not registered
+      { from_agent: 'ghost', to_agent: 'alice', count: 9 },
+    ],
+  });
+  assert.equal(g.nodes.length, 1);
+  assert.equal(g.links.length, 0, 'both endpoints must be registered neurons');
+  // a dropped edge must not leak into the neuron's traffic weight
+  assert.equal(g.nodes[0]._w, 0);
+});
+
+test('empty / null / malformed payloads yield a safe empty connectome', () => {
+  for (const p of [null, undefined, {}, { neurons: null, synapses: 'nope' }]) {
+    const g = mapConnectome(p);
+    assert.deepEqual(g.nodes, []);
+    assert.deepEqual(g.links, []);
+    assert.equal(g.total, 0);
+    assert.equal(g.connectome, true);
+  }
+});
+
+test('a connectome with neurons but zero traffic degrades gracefully', () => {
+  const g = mapConnectome({
+    neurons: [{ agent_id: 'a', name: 'A' }, { agent_id: 'b', name: 'B' }],
+    synapses: [],
+  });
+  assert.equal(g.nodes.length, 2);
+  assert.ok(g.nodes.every(n => n._deg === 0 && n._w === 0));
+  assert.equal(g.links.length, 0);
+});
