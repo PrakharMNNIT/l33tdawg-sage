@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -59,4 +60,82 @@ func TestGetPipeSynapses(t *testing.T) {
 
 	_, hasFed := byEdge["alice|remote"]
 	require.False(t, hasFed, "federated edge excluded from the local connectome")
+}
+
+// TestGetPipeSynapsesUsesCoveringIndex pins the query PLAN, not just the result.
+// The aggregation returns identical rows with or without idx_pipe_synapse_local
+// — it just silently becomes a scan plus a temp b-tree over a table that only
+// grows, on an endpoint designed to be polled. A correctness-only test cannot
+// see that regression, which is why this asserts the plan directly.
+//
+// Deliberately NO ANALYZE: a production SAGE node never runs ANALYZE or PRAGMA
+// optimize, so sqlite_stat1 does not exist and the planner is working from no
+// statistics. Running ANALYZE here would test a database shape that SAGE never
+// actually has, and would hide the fact that the plan depends on the INDEXED BY
+// hint. This is the real deployed configuration.
+func TestGetPipeSynapsesUsesCoveringIndex(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	base := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, s.InsertPipeline(ctx, &PipelineMessage{
+			PipeID:    fmt.Sprintf("plan-%d", i),
+			FromAgent: fmt.Sprintf("agent-%d", i%7),
+			ToAgent:   fmt.Sprintf("peer-%d", i%5),
+			Payload:   "hi",
+			Status:    "pending",
+			CreatedAt: base,
+			ExpiresAt: base.Add(time.Hour),
+		}))
+	}
+
+	rows, err := s.conn.QueryContext(ctx,
+		"EXPLAIN QUERY PLAN "+fmt.Sprintf(pipeSynapseAggregation, pipeSynapseIndexHint))
+	require.NoError(t, err)
+	defer rows.Close() //nolint:errcheck
+
+	var plan string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notUsed, &detail))
+		plan += detail + "\n"
+	}
+	require.NoError(t, rows.Err())
+
+	require.Contains(t, plan, "idx_pipe_synapse_local",
+		"connectome aggregation must be served by its partial covering index, plan was:\n"+plan)
+	require.NotContains(t, plan, "TEMP B-TREE",
+		"index order must satisfy GROUP BY without a temp b-tree, plan was:\n"+plan)
+}
+
+// TestGetPipeSynapsesFallsBackWhenIndexMissing covers the degradation path.
+// migratePipeline creates indexes best-effort and discards the error, so the
+// INDEXED BY hint must never become a hard dependency — an INDEXED BY naming an
+// absent index is a query error, and a slower connectome beats a broken one.
+// Dropping the index reproduces exactly that state.
+func TestGetPipeSynapsesFallsBackWhenIndexMissing(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	base := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, s.InsertPipeline(ctx, &PipelineMessage{
+		PipeID: "fb1", FromAgent: "alice", ToAgent: "bob", Payload: "hi",
+		Status: "pending", CreatedAt: base, ExpiresAt: base.Add(time.Hour),
+	}))
+
+	// Precondition: the hinted query works while the index exists.
+	_, err := s.conn.ExecContext(ctx, `DROP INDEX IF EXISTS idx_pipe_synapse_local`)
+	require.NoError(t, err)
+
+	// The hinted form must now genuinely fail, or this test proves nothing.
+	_, hintErr := s.conn.QueryContext(ctx,
+		fmt.Sprintf(pipeSynapseAggregation, pipeSynapseIndexHint))
+	require.Error(t, hintErr, "INDEXED BY on a dropped index must be a query error")
+
+	syn, err := s.GetPipeSynapses(ctx)
+	require.NoError(t, err, "connectome must degrade to an unhinted scan, not fail")
+	require.Len(t, syn, 1)
+	require.Equal(t, int64(1), syn[0].Count)
 }
