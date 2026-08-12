@@ -810,7 +810,16 @@ func TestClassifySyncBroadcast(t *testing.T) {
 		result := &tx.CometCommitResult{TxResultCode: c.code, TxResultLog: c.log}
 		assert.Equal(t, c.want, classifySyncBroadcast(result), c.log)
 	}
-	assert.Equal(t, syncBcastRetry, classifySyncBroadcast(nil))
+	// A3 CHANGED THIS ASSERTION, deliberately. It previously required
+	// syncBcastRetry for a nil result, which pinned the defect in place: the
+	// caller's default arm treats syncBcastRetry as "exact-hash-bound, the
+	// registration was already retired, safe to release the signer", and a nil
+	// result satisfies none of those. The condition is unreachable today
+	// because BroadcastCometCommit never returns (nil, nil), but that is a
+	// guarantee owned by another package, and this classifier's job is to
+	// refuse to infer verdicts it was not given. See
+	// sync_broadcast_nil_result_test.go.
+	assert.Equal(t, syncBcastIndeterminate, classifySyncBroadcast(nil))
 	assert.Equal(t, syncBcastOK, classifySyncBroadcast(&tx.CometCommitResult{}))
 	assert.Equal(t, syncBcastNonceRace, classifySyncBroadcast(&tx.CometCommitResult{CheckTxCode: 4, CheckTxLog: "arbitrary"}))
 	assert.Equal(t, syncBcastRetry, classifySyncBroadcast(&tx.CometCommitResult{CheckTxCode: 11, CheckTxLog: "nonce too low"}),
