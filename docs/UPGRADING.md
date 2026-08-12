@@ -99,6 +99,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.6 | Exact H and H/H+1 updater snapshot provenance/replay-boundary proof, bounded exact-generation federation Retry, and memory-reassign log hardening; no new app version; app-v26 remains the ceiling |
 | v11.18.7 | Bounded large-transaction Comet transport, independently enforced 1.2 MB app-v20 finalize limit, and separate 600,000-byte signed AgentRequest proof bound; deadlock-safe asynchronous federation route refresh; authenticated P2P-only trust-generation bootstrap recovery; security-first federation route diagnostics; no new app version; app-v26 remains the ceiling |
 | v11.18.8 | Non-reusing HTTP/1.1 seam across fenced Comet submissions, signer-fence-first restart diagnostics, unsafe MCP reply-watermark recovery, and post-send passive inbox snapshots; no new app version; app-v26 remains the ceiling |
+| v11.18.10 | Same-agent MCP claimant-session ownership and atomic handoff, stale-session reply rejection, passive recovery, and the CEREBRUM agent-connectome view; no new app version; app-v26 remains the ceiling |
 | v11.18.9 | Typed indeterminate Comet commit/sync outcomes, fail-closed federation nil-result fencing, and cross-package commit-decoder drift contracts; no new app version; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover

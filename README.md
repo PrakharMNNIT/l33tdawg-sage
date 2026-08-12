@@ -51,6 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.10
+
+**Multiple MCP runtimes sharing one agent identity can no longer silently lose
+track of claimed messages.** Every MCP conversation now has an opaque claimant
+session ID. Atomic inbox claims persist that session in passive history, an
+explicit compare-and-swap handoff transfers work between runtimes, and a stale
+former owner is rejected if it tries to reply after ownership moved. Receive
+tokens remain replay-safe after a lost response, while legacy direct REST
+clients retain their existing agent-level compatibility path.
+
+**CEREBRUM can render the agent message bus as a live connectome inside the 3D
+brain.** Registered agents become domain-coloured neurons, directed channels
+become traffic-weighted synapses, and hub agents settle toward the core. The
+view consumes the existing RBAC-filtered synapse projection, drops ghost edges,
+and fences asynchronous mode switches so a slow memory response can never be
+displayed as connectome data.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.10 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.10`. SDK 11.18.10.
+
 ## What's New in v11.18.9
 
 **Ambiguous CometBFT commit and sync outcomes are now typed at the shared
@@ -1707,7 +1729,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.9`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.10`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
