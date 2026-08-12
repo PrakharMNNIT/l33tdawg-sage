@@ -796,21 +796,25 @@ var (
 // PipelineMessage represents an ephemeral agent-to-agent work item.
 // These are NOT memories — they are transient messages that auto-expire.
 type PipelineMessage struct {
-	PipeID       string     `json:"pipe_id"`
-	FromAgent    string     `json:"from_agent"`
-	FromProvider string     `json:"from_provider"`
-	ToAgent      string     `json:"to_agent,omitempty"`
-	ToProvider   string     `json:"to_provider"`
-	Intent       string     `json:"intent"`
-	Payload      string     `json:"payload"`
-	Result       string     `json:"result,omitempty"`
-	Status       string     `json:"status"` // pending, claimed, completed, expired, failed
-	CreatedAt    time.Time  `json:"created_at"`
-	ClaimedBy    string     `json:"claimed_by,omitempty"`
-	ClaimedAt    *time.Time `json:"claimed_at,omitempty"`
-	CompletedAt  *time.Time `json:"completed_at,omitempty"`
-	ExpiresAt    time.Time  `json:"expires_at"`
-	JournalID    string     `json:"journal_id,omitempty"`
+	PipeID       string    `json:"pipe_id"`
+	FromAgent    string    `json:"from_agent"`
+	FromProvider string    `json:"from_provider"`
+	ToAgent      string    `json:"to_agent,omitempty"`
+	ToProvider   string    `json:"to_provider"`
+	Intent       string    `json:"intent"`
+	Payload      string    `json:"payload"`
+	Result       string    `json:"result,omitempty"`
+	Status       string    `json:"status"` // pending, claimed, completed, expired, failed
+	CreatedAt    time.Time `json:"created_at"`
+	ClaimedBy    string    `json:"claimed_by,omitempty"`
+	// ClaimedSessionID is opaque MCP coordination metadata. It distinguishes
+	// concurrent runtimes that intentionally share one signed agent identity;
+	// it is not an authorization principal.
+	ClaimedSessionID string     `json:"claimant_session_id,omitempty"`
+	ClaimedAt        *time.Time `json:"claimed_at,omitempty"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
+	ExpiresAt        time.Time  `json:"expires_at"`
+	JournalID        string     `json:"journal_id,omitempty"`
 	// Federation provenance is additive. Empty fields identify an ordinary
 	// local pipe. Imported work always receives a fresh local PipeID and keeps
 	// the peer's ID in SourcePipeID; outbound work names DestinationChainID so
@@ -949,8 +953,9 @@ type MessageStatus struct {
 type MessageStore interface {
 	SendLocalMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage) (*PipelineMessage, bool, error)
 	SendFederatedMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage, event *PipelineTransportOutbox) (*PipelineMessage, bool, error)
-	ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int) ([]*PipelineMessage, bool, error)
-	ReplyLocalMessage(ctx context.Context, receiverID, messageID, result string) (bool, error)
+	ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int, claimantSessionID ...string) ([]*PipelineMessage, bool, error)
+	HandoffLocalMessageClaim(ctx context.Context, receiverID, messageID, fromSessionID, toSessionID string) (bool, error)
+	ReplyLocalMessage(ctx context.Context, receiverID, messageID, result string, claimantSessionID ...string) (bool, error)
 	AcknowledgeLocalMessageRead(ctx context.Context, receiverID, messageID string) (bool, error)
 	GetMessageStatusForSender(ctx context.Context, senderID, messageID string) (*MessageStatus, error)
 }

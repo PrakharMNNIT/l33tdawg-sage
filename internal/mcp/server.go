@@ -123,10 +123,11 @@ type Server struct {
 }
 
 type conversationState struct {
-	inceptionMu      sync.Mutex
-	inceptionChecked bool
-	autoInceptionMsg string
-	lastUsed         time.Time
+	inceptionMu       sync.Mutex
+	inceptionChecked  bool
+	autoInceptionMsg  string
+	lastUsed          time.Time
+	claimantSessionID string
 }
 
 type conversationIDContextKey struct{}
@@ -148,9 +149,25 @@ func (s *Server) conversation(ctx context.Context) *conversationState {
 		state.lastUsed = time.Now()
 		return state
 	}
-	state := &conversationState{lastUsed: time.Now()}
+	state := &conversationState{lastUsed: time.Now(), claimantSessionID: newMCPClaimantSessionID()}
 	s.conversations[id] = state
 	return state
+}
+
+func newMCPClaimantSessionID() string {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return ""
+	}
+	return "mcp-" + hex.EncodeToString(nonce[:])
+}
+
+func (s *Server) claimantSessionID(ctx context.Context) (string, error) {
+	id := s.conversation(ctx).claimantSessionID
+	if id == "" {
+		return "", errors.New("could not establish MCP claimant session identity")
+	}
+	return id, nil
 }
 
 // ForgetConversation releases state for a transport session that has closed.
@@ -944,7 +961,8 @@ func classifySignedRequestReplay(method, path string) signedRequestReplaySafety 
 		if path == "/v1/messages/read-batch" || path == "/v1/pipe/receipts/batch" {
 			return signedRequestReplaySafe
 		}
-		if matchesSinglePathSegmentWithSuffix(path, "/v1/messages/", "/read") {
+		if matchesSinglePathSegmentWithSuffix(path, "/v1/messages/", "/read") ||
+			matchesSinglePathSegmentWithSuffix(path, "/v1/messages/", "/handoff") {
 			return signedRequestReplaySafe
 		}
 		if matchesSinglePathSegmentWithSuffix(path, "/v1/pipe/", "/receipt/claimed") ||
