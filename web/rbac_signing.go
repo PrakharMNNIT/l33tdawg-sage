@@ -248,7 +248,7 @@ func broadcastTxCommitWebContext(parent context.Context, cometRPC string, signin
 	// its message downstream. By this point the encoded transaction has already
 	// been handed to the kernel: a broken connection, an undecodable body or an
 	// RPC-level error envelope all mean the node may have accepted it anyway.
-	resp, doErr := http.DefaultClient.Do(req)
+	resp, doErr := tx.DoCometSubmission(req)
 	if doErr != nil {
 		// NOT %w on doErr. net/http returns a *url.Error whose message embeds
 		// the request URL, and this request's URL is

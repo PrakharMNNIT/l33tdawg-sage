@@ -129,9 +129,21 @@ func commitRestartAfterSigningDrain(prepared *preparedRestartRequest, veto func(
 	idleCtx, cancelIdle := context.WithTimeout(context.Background(), idleBudget)
 	idleErr := tx.WaitForSigningIdle(idleCtx)
 	cancelIdle()
-	vetoErr := idleErr
+	// The SPECIFIC veto is consulted first, with the drain error as the fallback.
+	//
+	// This changes no decision — both answers abandon, and the unwind below is
+	// identical either way. It changes what the operator is told, and the order
+	// has to be this way round because of where the fence wait lives: it is
+	// INSIDE the nonce lease (internal/tx/nonce.go acquires the lease, then waits
+	// on awaitFenceLifted). A caller parked on a fence therefore keeps
+	// WaitForSigningIdle's population above zero, so in exactly the situation the
+	// veto exists to describe, the drain ALWAYS burns its full budget and fails.
+	// Reporting that first replaced "signing key <k> is fenced on tx <h> (nonce
+	// N), held for <d>" with a bare deadline-exceeded — the generic message, in
+	// the one case where the specific one is what an operator needs to act on.
+	vetoErr := checkSignerFenceRestartVeto(veto)
 	if vetoErr == nil {
-		vetoErr = checkSignerFenceRestartVeto(veto)
+		vetoErr = idleErr
 	}
 	if vetoErr != nil {
 		if prepared.abort != nil {

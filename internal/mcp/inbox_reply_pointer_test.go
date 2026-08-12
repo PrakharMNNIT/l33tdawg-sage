@@ -197,6 +197,167 @@ func TestSageInboxPassesReplyWatermarkIntoTheSamePassivePoll(t *testing.T) {
 		"the inclusive watermark must retain a later reply sharing its millisecond")
 }
 
+func TestSageInboxRecoversReplyHiddenByWatermarkAheadOfArchive(t *testing.T) {
+	const unsafeFutureWatermark = "2026-08-08T00:47:00Z"
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", empty)
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"count": 1, "retained": true, "newest_completed_at": inboxProbeNewestCompletedAt,
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+			"pipe_id": "msg-formal-go", "to_agent": "reviewer", "replied_by": "reviewer",
+			"intent": "review", "result": "GO", "status": "completed",
+			"completed_at": inboxProbeNewestCompletedAt,
+		}}, "count": 1})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{
+		"reply_since": unsafeFutureWatermark,
+	})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Equal(t, true, response["reply_watermark_recovered"])
+	require.Equal(t, unsafeFutureWatermark, response["reply_since_requested"])
+	require.Equal(t, true, response["reply_watermark_safe_to_advance"],
+		"a complete recovered page is a safe new baseline after its rows are processed")
+	require.NotContains(t, response, "reply_since",
+		"the unsafe watermark must not be represented as the filter that produced the recovered page")
+	replies := response["reply_items"].([]map[string]any)
+	require.Len(t, replies, 1,
+		"a watermark ahead of the archive must recover the newest reply instead of returning a false empty page")
+	require.Equal(t, "msg-formal-go", replies[0]["message_id"])
+	require.Equal(t, "GO", replies[0]["result"])
+	require.Contains(t, response["reply_watermark_recovery_action"], "deduplicate")
+	require.Contains(t, response["message"], "could not be trusted")
+}
+
+func TestSageInboxRecoversReplyArrivingAfterAnEmptyPointerSnapshot(t *testing.T) {
+	const unsafeFutureWatermark = "2026-08-08T00:47:00Z"
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", empty)
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("count_only") == "1" {
+			// The pointer read sees an empty archive. The page read immediately
+			// below models a reply completing between these two passive reads.
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 0, "retained": true})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+			"pipe_id": "msg-raced-go", "to_agent": "reviewer", "replied_by": "reviewer",
+			"intent": "review", "result": "GO", "status": "completed",
+			"completed_at": inboxProbeNewestCompletedAt,
+		}}, "count": 1})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{
+		"reply_since": unsafeFutureWatermark,
+	})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Equal(t, true, response["reply_watermark_recovered"])
+	require.Equal(t, true, response["reply_watermark_safe_to_advance"])
+	require.Contains(t, response["reply_watermark_recovery_reason"], "no authoritative reply head")
+	replies := response["reply_items"].([]map[string]any)
+	require.Len(t, replies, 1,
+		"a reply completing after an empty pointer snapshot must remain visible despite an unverifiable future watermark")
+	require.Equal(t, "msg-raced-go", replies[0]["message_id"])
+	require.Equal(t, "GO", replies[0]["result"])
+}
+
+func TestSageInboxDoesNotClaimWatermarkRecoveryWhenReplyPageFails(t *testing.T) {
+	const unsafeFutureWatermark = "2026-08-08T00:47:00Z"
+	mux := http.NewServeMux()
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	}
+	mux.HandleFunc("/v1/messages/receive", empty)
+	mux.HandleFunc("/v1/pipe/inbox", empty)
+	mux.HandleFunc("/v1/dashboard/task-notifications", empty)
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"count": 1, "retained": true, "newest_completed_at": inboxProbeNewestCompletedAt,
+			})
+			return
+		}
+		http.Error(w, "page unavailable", http.StatusServiceUnavailable)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	result, err := NewServer(ts.URL, priv).toolInbox(context.Background(), map[string]any{
+		"reply_since": unsafeFutureWatermark,
+	})
+	require.NoError(t, err, "a passive reply-page failure must not hide inbound work")
+	response := result.(map[string]any)
+	require.Contains(t, response, "reply_items_error")
+	require.NotContains(t, response, "reply_watermark_recovered",
+		"recovery is only true after a valid newest page has actually been returned")
+	require.NotContains(t, response["message"], "was recovered")
+}
+
+func TestSageInboxKeepsRecoveredTruncatedBaselineUnsafeToAdvance(t *testing.T) {
+	const unsafeFutureWatermark = "2026-08-08T00:47:00Z"
+	const cursor = inboxProbeNewestCompletedAt + "|msg-page-one"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("count_only") == "1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"count": 2, "retained": true, "newest_completed_at": inboxProbeNewestCompletedAt,
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{{
+				"pipe_id": "msg-page-one", "to_agent": "reviewer", "replied_by": "reviewer",
+				"intent": "review", "result": "GO", "status": "completed",
+				"completed_at": inboxProbeNewestCompletedAt,
+			}},
+			"count": 2, "next_before": cursor,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	response := NewServer(ts.URL, priv).inboxReplySurface(context.Background(), map[string]any{
+		"reply_since": unsafeFutureWatermark,
+		"reply_limit": 1,
+	})
+	require.Equal(t, true, response["reply_watermark_recovered"])
+	require.Equal(t, true, response["reply_page_truncated"])
+	require.Equal(t, false, response["reply_watermark_safe_to_advance"],
+		"a partial recovered baseline cannot authorize advancing its watermark")
+	require.Equal(t, cursor, response["reply_next_before"])
+	require.Contains(t, response["reply_watermark_recovery_action"], "Drain the recovered baseline")
+	require.Contains(t, response["reply_catch_up_action"], cursor)
+}
+
 func TestSageInboxKeepsReplyPageWhenTaskInboxFails(t *testing.T) {
 	mux := http.NewServeMux()
 	empty := func(w http.ResponseWriter, _ *http.Request) {

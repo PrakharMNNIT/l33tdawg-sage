@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.7 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.9 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -28,12 +28,58 @@ atomic-finalize limit to 1.2 MB,
 makes route refresh admission deadlock-safe, restores authenticated route
 bootstrap for P2P-only peers across a trust-generation change, and gives
 security evidence precedence in federation diagnostics. The supported
-consensus ceiling remains app-v26; **v11.18.7 does not introduce app-v27**.
+v11.18.8 transport seam prevents transparent HTTP redelivery across every
+fenced Comet submission path, preserves signer-fence restart diagnostics, and
+makes MCP reply polling recover from unsafe or unverifiable forward watermarks
+instead of reporting a false empty page. v11.18.9 types every ambiguous shared
+Comet commit or sync outcome as indeterminate, fails closed if federation sync
+ever receives neither a result nor an error, and pins the deliberate decoder
+differences between the shared transaction package and CEREBRUM. The supported
+consensus ceiling remains app-v26; **v11.18.9 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.9 patch
+
+Ambiguous CometBFT commit and sync outcomes are now typed at the shared
+broadcaster boundary. Transport, status, RPC, decode, shape, hash-binding, and
+missing-height failures return `ErrSubmitIndeterminate` for valid signing keys,
+while the existing live-registration path remains an independent fence
+backstop. Pre-send request-construction failures remain definitive because no
+bytes reached a transport.
+
+Federation sync now fails closed if its commit broadcaster violates its
+contract by returning neither a result nor an error. The exact signer and
+encoded transaction remain fenced until reconciliation proves their fate. A
+cross-package decoder contract pins the shared HTTP prologue while recording
+the deliberate verdict and envelope-tolerance differences between
+`internal/tx` and the CEREBRUM web path. This patch introduces no new consensus
+application version or state migration: app-v26 remains the ceiling and
+v11.18.9 does not introduce app-v27.
+
+## v11.18.8 patch
+
+Every fenced CometBFT submission path now uses one shared non-reusing HTTP/1.1
+transport seam. Commit, sync, byte-identical nonce-fence reconciliation, and
+CEREBRUM submissions write the transaction on one connection, preventing Go's
+HTTP transport from transparently replaying the same signed bytes to another
+responder after a reused connection fails while reading its response. An
+indeterminate outcome remains fenced for explicit reconciliation. Restart
+failure reporting preserves the signer-fence veto ahead of a generic drain
+timeout.
+
+MCP coordination now rejects `reply_since` values that are later than the
+authoritative retained-reply head or cannot be validated because no head is
+available. `sage_inbox` recovers the newest passive reply page for
+deduplication, marks complete and truncated baselines consistently, and never
+claims recovery when the page fetch failed. A successful outbound message send
+also performs one bounded sender-exact passive inbox snapshot, surfacing inbound
+work that arrived after an earlier empty poll. This patch introduces no new
+consensus application version or state migration: app-v26 remains the ceiling
+and v11.18.8 does not introduce app-v27.
 
 ## v11.18.7 patch
 

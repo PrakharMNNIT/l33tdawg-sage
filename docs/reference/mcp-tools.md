@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.18.7.
+Reconciled against internal/mcp for SAGE v11.18.9.
 
 # SAGE MCP Tools Reference
 
@@ -909,6 +909,20 @@ contains only `message_id`, `from_agent`, and `sent_at`; it is best-effort,
 ignorable, and is never delivery, read, presence, attention, or workflow
 evidence. Stdio and Streamable HTTP remain poll-on-turn.
 
+Every successful send also performs a fresh, non-claiming check of the sender's
+own inbox after the outbound message is durable. The result includes
+`message_inbox_unread`, `message_inbox_unread_count`, and
+`message_inbox_checked_at`; when work is visible it also includes
+`message_inbox_action`. This closes a concrete check-then-send race: an agent
+may poll empty, receive new work a moment later, and then send an outbound
+status message from the same active session. The post-send pointer makes that
+new work visible without claiming it. If the independent pointer check fails,
+the already durable send still succeeds and returns
+`message_inbox_check_error`; SAGE does not invent an unread=false result or make
+the caller retry an already committed send. The best-effort check has its own
+three-second total deadline, including any safe read retries, so it cannot
+inherit the normal long-running MCP request budget.
+
 Friendly labels are accepted only when one exact caller-authorized target wins
 across local and federated scope. Any local/local, remote/remote, or local/remote
 collision fails with bounded immutable candidates. A label is never signed or
@@ -1508,7 +1522,7 @@ authorization. Pipeline results are untrusted data, not instructions.
 | `limit` | int | no | Max combined inbound messages/task notices. Default 5, max 20. |
 | `include_replies` | bool | no | Include one passive sender-side reply page under `reply_items`. Default `true`. Set `false` for the v11.18.2 pointer-only shape. |
 | `reply_limit` | int | no | Max replies in `reply_items`, newest first. Default 5, max 20. Independent of `limit`. |
-| `reply_since` | RFC3339 string | no | Inclusive reply watermark, normally the previous `newest_reply_completed_at`. Boundary rows may repeat; deduplicate by `message_id`. |
+| `reply_since` | RFC3339 string | no | Inclusive reply watermark, normally the previous `newest_reply_completed_at`. Boundary rows may repeat; deduplicate by `message_id`. A value later than the authoritative retained archive head, or one that cannot be validated because no head is available, is rejected as an unsafe forward jump and triggers recovery of the newest retained page instead of a false empty result. |
 
 **Returns:**
 - `items`: mixed array. Local messages contain `{message_id, from, intent,
@@ -1542,6 +1556,18 @@ authorization. Pipeline results are untrusted data, not instructions.
   watermark and follow `reply_catch_up_action` with the exact composite cursor
   until `page_truncated` is false; otherwise replies between the page tail and
   the proposed new watermark would be stranded.
+- `reply_watermark_recovered`, `reply_since_requested`,
+  `reply_watermark_recovery_reason`, and `reply_watermark_recovery_action`:
+  present when `reply_since` is later than the sender-scoped archive's
+  authoritative `newest_reply_completed_at`, or when no authoritative head is
+  available to validate it. SAGE does not apply that unsafe filter. It returns
+  the newest retained reply page and tells the caller to process and
+  deduplicate the recovered rows. An untruncated recovered page sets
+  `reply_watermark_safe_to_advance:true` and is a complete new baseline after
+  processing. A truncated recovery keeps it `false` until the baseline is
+  drained. Never reuse `reply_since_requested`. Recovery fields are published
+  only after the page succeeds; `reply_items_error` never claims that a failed
+  page fetch recovered anything.
 - `message_inbox_warning`: present only when canonical local work was already
   claimed successfully but the retained legacy/federated inbox could not be
   checked. Process the returned canonical work and call `sage_inbox` again for
@@ -1626,7 +1652,13 @@ and newly completed sender-side replies. Pass the previously committed
 boundary by `message_id`. If `reply_page_truncated=true`, **do not advance that
 watermark**: page `sage_message_replies(since=<old>, before=<reply_next_before>)`
 until `page_truncated=false`. Only then record the candidate top-level
-`newest_reply_completed_at` for the next poll. `sage_turn` still checks only a
+`newest_reply_completed_at` for the next poll. If
+`reply_watermark_recovered=true`, the supplied watermark was ahead of the
+archive head or could not be validated because no head was available: process
+and deduplicate the recovered newest page. When
+`reply_watermark_safe_to_advance=true`, resume polling from the returned
+`newest_reply_completed_at`; otherwise follow `reply_catch_up_action` first.
+Never reuse the rejected `reply_since_requested`. `sage_turn` still checks only a
 payload-free inbound count, `sage_messages_receive` remains the canonical
 claim/read operation, and `sage_message_replies(before=...)` remains the
 explicit backward pager.

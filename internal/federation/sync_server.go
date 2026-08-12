@@ -855,7 +855,11 @@ func (m *Manager) broadcastSyncSubmit(localID string, item *SyncItem) (string, s
 			if buildErr != nil {
 				return fmt.Errorf("build sync submit tx: %w", buildErr)
 			}
-			commitResult, broadcastErr := tx.BroadcastCometCommit(leaseCtx, m.cometRPC, signingKey, encoded)
+			broadcastCommit := tx.BroadcastCometCommit
+			if m.syncBroadcastCommitFn != nil {
+				broadcastCommit = m.syncBroadcastCommitFn
+			}
+			commitResult, broadcastErr := broadcastCommit(leaseCtx, m.cometRPC, signingKey, encoded)
 			if broadcastErr != nil {
 				m.logger.Warn().Err(broadcastErr).Str("local", localID).Msg("sync: submit broadcast failed")
 				// Every error return is ambiguous. The shared broadcaster leaves the
@@ -882,6 +886,13 @@ func (m *Manager) broadcastSyncSubmit(localID string, item *SyncItem) (string, s
 				// bytes. The shared broadcaster already retired registration;
 				// leave the item retryable without fencing the signer.
 				result = SyncOutcomeRetry
+			case syncBcastIndeterminate:
+				// No verdict at all. Return an error so WithNonceLease fences
+				// these exact bytes off the still-live registration, rather
+				// than releasing the signer on an outcome nothing observed.
+				// Returning here is the fail-CLOSED direction: the item stays
+				// retryable, but the key is held until the fate is proven.
+				return tx.Indeterminate(errSyncBroadcastNoResult, encoded, tx.CometTxResolver(m.cometRPC))
 			default:
 				// Every result here is exact-hash-bound and its registration has
 				// already been retired, so an unrecognised consensus refusal remains
@@ -981,6 +992,12 @@ func syncStoredMemoryType(s string) string {
 }
 
 // Broadcast outcome classes for a sync admit.
+// errSyncBroadcastNoResult is returned when the broadcaster hands back neither
+// an error nor a result. It carries no server-controlled text by construction,
+// and it exists as a named value so the fence it raises is greppable rather
+// than anonymous.
+var errSyncBroadcastNoResult = errors.New("sync submit broadcast returned no result and no error")
+
 type syncBcastClass int
 
 const (
@@ -989,6 +1006,12 @@ const (
 	syncBcastScopeReject
 	syncBcastNonceRace
 	syncBcastRetry
+	// syncBcastIndeterminate is the class for a result this function cannot
+	// reason about at all. It exists so that "no proof" can never be spelled
+	// the same way as "proved retryable": every other class in this list is a
+	// statement about a hash-bound consensus verdict, and collapsing an absent
+	// result into one of them is the fail-open this classifier exists to refuse.
+	syncBcastIndeterminate
 )
 
 // classifySyncBroadcast maps a structurally complete, exact-hash-bound Comet
@@ -1002,7 +1025,22 @@ const (
 // reach this function and therefore fence the exact bytes.
 func classifySyncBroadcast(result *tx.CometCommitResult) syncBcastClass {
 	if result == nil {
-		return syncBcastRetry
+		// UNREACHABLE TODAY, AND DELIBERATELY NOT TRUSTED TO STAY THAT WAY.
+		// BroadcastCometCommit never returns (nil, nil): every nil result is
+		// paired with a non-nil error, which the caller returns before reaching
+		// here. But this classifier's entire job is refusing to infer a verdict
+		// it was not given, and a nil result is the purest case of having no
+		// verdict — the registration was never retired and the bytes may be in
+		// a mempool right now.
+		//
+		// It previously returned syncBcastRetry, which the caller's default arm
+		// treats as "exact-hash-bound, registration already retired, safe to
+		// retry without fencing". Every clause of that is false for a nil
+		// result, so a future change to the broadcaster's contract would have
+		// turned this into a silent fail-open that released the signer.
+		// Routing it to its own class makes that impossible without an explicit
+		// edit to the caller's switch.
+		return syncBcastIndeterminate
 	}
 	if result.CheckTxCode != 0 {
 		if result.CheckTxCode == 4 {
