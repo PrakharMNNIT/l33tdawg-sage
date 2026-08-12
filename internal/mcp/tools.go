@@ -4453,11 +4453,14 @@ func randomMessageToken(prefix string) (string, error) {
 // turn success into an indeterminate send or invite an unsafe retry. Report the
 // failure instead of manufacturing unread=false.
 func (s *Server) attachPostSendInboxSnapshot(ctx context.Context, result map[string]any) {
+	probeCtx, cancel := context.WithTimeout(ctx, s.sendProbeTimeout)
+	defer cancel()
+
 	var inbox struct {
 		Count  int  `json:"count"`
 		Unread bool `json:"unread"`
 	}
-	if err := s.doSignedJSON(ctx, http.MethodGet, "/v1/pipe/history/inbox?count_only=1", nil, &inbox); err != nil {
+	if err := s.doSignedJSON(probeCtx, http.MethodGet, "/v1/pipe/history/inbox?count_only=1", nil, &inbox); err != nil {
 		result["message_inbox_check_error"] = err.Error()
 		return
 	}

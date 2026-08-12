@@ -88,8 +88,11 @@ type Server struct {
 	provider   string // Provider identity (e.g. "claude-code", "chatgpt") from SAGE_PROVIDER env var.
 	project    string // Project directory name (e.g. "sage", "levelupctf") — derived from CWD.
 	httpClient *http.Client
-	tools      map[string]Tool
-	stateMu    sync.Mutex // shared in-memory caches
+	// A send is already durable before this best-effort pointer probe begins.
+	// Keep its total retry budget short so it cannot delay a successful send.
+	sendProbeTimeout time.Duration
+	tools            map[string]Tool
+	stateMu          sync.Mutex // shared in-memory caches
 
 	conversationMu sync.Mutex
 	conversations  map[string]*conversationState
@@ -174,6 +177,7 @@ func NewServer(baseURL string, agentKey ed25519.PrivateKey) *Server {
 		agentID:             hex.EncodeToString(pub),
 		provider:            os.Getenv("SAGE_PROVIDER"),
 		httpClient:          mcpHTTPClient(baseURL),
+		sendProbeTimeout:    3 * time.Second,
 		version:             "dev",
 		conversations:       make(map[string]*conversationState),
 		federatedAgentCache: make(map[string]federatedAgentCacheEntry),

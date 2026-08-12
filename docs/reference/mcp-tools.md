@@ -919,7 +919,9 @@ status message from the same active session. The post-send pointer makes that
 new work visible without claiming it. If the independent pointer check fails,
 the already durable send still succeeds and returns
 `message_inbox_check_error`; SAGE does not invent an unread=false result or make
-the caller retry an already committed send.
+the caller retry an already committed send. The best-effort check has its own
+three-second total deadline, including any safe read retries, so it cannot
+inherit the normal long-running MCP request budget.
 
 Friendly labels are accepted only when one exact caller-authorized target wins
 across local and federated scope. Any local/local, remote/remote, or local/remote
