@@ -51,6 +51,32 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.8
+
+**CometBFT transaction submissions no longer permit Go's HTTP transport to
+transparently redeliver a fenced request after a reused connection fails while
+reading the response.** Commit, sync, byte-identical nonce-fence reconciliation,
+and CEREBRUM submission paths now share a non-reusing HTTP/1.1 transport seam.
+Each submission call writes its transaction on one connection and returns an
+indeterminate result instead of silently delivering the same signed bytes to a
+second responder. Restart failure reporting also preserves the signer-fence
+veto ahead of a generic drain timeout.
+
+**MCP reply polling now fails safe when a caller presents an unsafe forward
+watermark.** If `reply_since` is later than the authoritative retained-reply
+head, or no head exists to validate it, `sage_inbox` returns the newest passive
+reply page for deduplication instead of filtering a formal reply into a false
+empty result. Complete recovered pages become a new safe baseline; truncated
+pages require composite-cursor catch-up, and failed page reads never claim
+recovery. A successful outbound `sage_message_send` also performs one bounded,
+sender-exact passive inbox snapshot so an inbound message that arrived after an
+earlier empty poll is surfaced during continued coordination.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.8 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.8`. SDK 11.18.8.
+
 ## What's New in v11.18.7
 
 **Large signed transactions now use a bounded CometBFT transport instead of
@@ -1659,7 +1685,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.7`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.8`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
