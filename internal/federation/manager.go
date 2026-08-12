@@ -343,6 +343,10 @@ type Manager struct {
 	// calls: each blocks up to the commit timeout, so an unbounded push flood
 	// would otherwise pin a goroutine per push. A small pool caps the hold.
 	broadcastSem chan struct{}
+	// syncBroadcastCommitFn is a narrow test seam for an impossible-today
+	// broadcaster contract violation. Nil production always calls the shared
+	// typed broadcaster; tests inject (nil, nil) to pin fail-closed handling.
+	syncBroadcastCommitFn func(context.Context, string, ed25519.PrivateKey, []byte) (*tx.CometCommitResult, error)
 	// legacyPipeStatusFallbackSem serializes the one compatibility path where a
 	// v11.13.0 peer ignores the compact named-lookup status preference and sends
 	// its historical full contact snapshot.

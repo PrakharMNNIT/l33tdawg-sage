@@ -855,7 +855,11 @@ func (m *Manager) broadcastSyncSubmit(localID string, item *SyncItem) (string, s
 			if buildErr != nil {
 				return fmt.Errorf("build sync submit tx: %w", buildErr)
 			}
-			commitResult, broadcastErr := tx.BroadcastCometCommit(leaseCtx, m.cometRPC, signingKey, encoded)
+			broadcastCommit := tx.BroadcastCometCommit
+			if m.syncBroadcastCommitFn != nil {
+				broadcastCommit = m.syncBroadcastCommitFn
+			}
+			commitResult, broadcastErr := broadcastCommit(leaseCtx, m.cometRPC, signingKey, encoded)
 			if broadcastErr != nil {
 				m.logger.Warn().Err(broadcastErr).Str("local", localID).Msg("sync: submit broadcast failed")
 				// Every error return is ambiguous. The shared broadcaster leaves the
@@ -888,7 +892,7 @@ func (m *Manager) broadcastSyncSubmit(localID string, item *SyncItem) (string, s
 				// than releasing the signer on an outcome nothing observed.
 				// Returning here is the fail-CLOSED direction: the item stays
 				// retryable, but the key is held until the fate is proven.
-				return errSyncBroadcastNoResult
+				return tx.Indeterminate(errSyncBroadcastNoResult, encoded, tx.CometTxResolver(m.cometRPC))
 			default:
 				// Every result here is exact-hash-bound and its registration has
 				// already been retired, so an unrecognised consensus refusal remains

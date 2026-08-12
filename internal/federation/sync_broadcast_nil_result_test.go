@@ -1,7 +1,13 @@
 package federation
 
 import (
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/l33tdawg/sage/internal/tx"
 )
@@ -25,6 +31,64 @@ func TestClassifySyncBroadcastNilResultIsIndeterminateNotRetry(t *testing.T) {
 	}
 	if got != syncBcastIndeterminate {
 		t.Fatalf("nil result classified as %v, want syncBcastIndeterminate", got)
+	}
+}
+
+func TestNilSyncBroadcastResultFencesExactSignerAndBytes(t *testing.T) {
+	m, _ := newSyncTestManager(t, &scriptedComet{responses: []string{cometOK}})
+	// Keep reconciliation unable to manufacture proof while the assertions run.
+	m.cometRPC = "http://127.0.0.1:1"
+	var submittedKey ed25519.PrivateKey
+	var submittedBytes []byte
+	m.syncBroadcastCommitFn = func(
+		_ context.Context,
+		_ string,
+		key ed25519.PrivateKey,
+		encoded []byte,
+	) (*tx.CometCommitResult, error) {
+		submittedKey = append(ed25519.PrivateKey(nil), key...)
+		submittedBytes = append([]byte(nil), encoded...)
+		return nil, nil
+	}
+
+	item := syncItem("nil-result", "hr", "fence the exact impossible-result submission")
+	outcome, hash := m.broadcastSyncSubmit(syncMemoryID("chain-b", item.OriginMemoryID), &item)
+	if outcome != SyncOutcomeRetry || hash != "" {
+		t.Fatalf("nil result returned outcome=%q hash=%q, want retry with no hash", outcome, hash)
+	}
+	if !submittedKey.Equal(m.agentKey) {
+		t.Fatal("test seam did not receive the manager's exact signing key")
+	}
+	if len(submittedBytes) == 0 {
+		t.Fatal("test seam received no encoded transaction bytes")
+	}
+	wantHash := tx.CometTxHash(submittedBytes)
+	wantSigner := hex.EncodeToString(m.agentPub)
+	found := false
+	for _, held := range tx.FencedSigners() {
+		if held.SignerPubKeyHex == wantSigner {
+			found = true
+			if held.TxHash != strings.ToUpper(hex.EncodeToString(wantHash[:])) {
+				t.Fatalf("fenced tx hash=%q, want exact submitted bytes hash %X", held.TxHash, wantHash)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("nil result released signer %s instead of fencing it", wantSigner)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	allocated := false
+	err := tx.WithNonceLease(waitCtx, m.agentKey, func(uint64) error {
+		allocated = true
+		return nil
+	})
+	if allocated {
+		t.Fatal("same-key waiter allocated past the nil-result fence")
+	}
+	if !errors.Is(err, tx.ErrSignerFenced) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("same-key waiter got %v, want ErrSignerFenced with deadline cause", err)
 	}
 }
 
