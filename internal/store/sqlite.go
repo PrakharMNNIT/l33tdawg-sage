@@ -6164,6 +6164,19 @@ func (s *SQLiteStore) migratePipeline(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_destination ON pipeline_messages(destination_chain_id, status)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_source ON pipeline_messages(source_chain_id, source_pipe_id)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_source_status ON pipeline_messages(source_chain_id, status)`)
+	// Partial covering index for the CEREBRUM connectome aggregation
+	// (GetPipeSynapses). The general idx_pipe_* indexes are all (col, status)
+	// and cannot serve a GROUP BY on the agent pair, so without this the
+	// endpoint degrades to a full scan plus a temp b-tree on a table that only
+	// grows, on a dashboard designed to be polled. Carrying created_at makes it
+	// covering, so MAX(created_at) and the count both come from index rows and
+	// the table is never touched.
+	//
+	// The WHERE clause must stay byte-identical to the query's restriction or
+	// SQLite silently declines to use the index.
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_synapse_local
+		ON pipeline_messages(from_agent, to_agent, created_at)
+		WHERE from_agent != '' AND to_agent != '' AND from_provider = '' AND to_provider = ''`)
 }
 
 // migratePipelineTerminalRetention makes the terminal-state transition, rather

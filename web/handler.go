@@ -1325,6 +1325,8 @@ func (h *DashboardHandler) RegisterRoutes(r chi.Router) {
 				Get("/v1/dashboard/memory/timeline", h.handleTimeline)
 			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
 				Get("/v1/dashboard/memory/graph", h.handleGraph)
+			r.With(h.cerebrumOperatorGate, h.appV23ProjectionBroadReadGate).
+				Get("/v1/dashboard/network/synapses", h.handleSynapses)
 			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/adoption-progress", h.handleAppV25LegacyAdoptionProgress)
 			r.With(h.cerebrumOperatorGate).Get("/v1/dashboard/memory/adoption-inventory", h.handleAppV26LegacyRecoveryInventory)
 			r.With(h.cerebrumOperatorGate).Post("/v1/dashboard/memory/adoption-retry", h.handleAppV25LegacyAdoptionRetry)
