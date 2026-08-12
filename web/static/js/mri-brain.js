@@ -17,6 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
+import { createGraphLoadCoordinator, mapConnectome } from '/ui/js/connectome-map.js';
 
 const LINK_TYPES = {
   supports:    { color: '#5ee2a0', label: 'supports',    typed: true },
@@ -28,6 +29,10 @@ const LINK_TYPES = {
   parent:      { color: '#243450', label: 'lineage',     typed: false },
   domain:      { color: '#1b2942', label: 'same domain', typed: false },
   focus:       { color: '#39d0ff', label: 'train of thought', typed: false },
+  // Connectome mode: a directed agent→agent message-bus channel. Width/particles
+  // scale with traffic (Hebbian weight), so this one entry is styled dynamically
+  // by the link accessors rather than by a fixed width like the memory link types.
+  synapse:     { color: '#39d0ff', label: 'synapse',     typed: true },
 };
 const PALETTE = ['#ff6b9d','#ffd166','#5ee2a0','#5ab0ff','#c08bff','#ff9f5a','#4dd6c4','#f7748a','#9ad14b','#7aa0ff'];
 function hexToRgb(h){ const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
@@ -276,11 +281,33 @@ async function loadGraph(fetchUrl) {
   }
 }
 
+// Connectome loader: fetch the agent message-bus and hand it to the pure
+// mapConnectome() mapper (connectome-map.js), which projects {neurons, synapses}
+// onto the same internal {nodes, links} contract the memory view renders. A
+// transport/parse failure is surfaced (not treated as an empty brain), matching
+// loadGraph.
+async function loadSynapses(fetchUrl) {
+  try {
+    const r = await fetch(fetchUrl, { credentials: 'same-origin' });
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    return mapConnectome(await r.json());
+  } catch (err) {
+    console.warn('[mri] connectome unavailable:', err.message);
+    throw err;
+  }
+}
+
 export function mountMriBrain(container, opts = {}) {
   injectStyleOnce();
   const fetchUrl = opts.fetchUrl || `/v1/dashboard/memory/graph?status=all&limit=${DEFAULT_MRI_NODE_LIMIT}`;
   const showScan = opts.showScan !== false;
   const showDomainLegend = opts.showDomainLegend !== false;
+  // View mode: 'memory' (the CLS memory graph, default/unchanged) or 'connectome'
+  // (the agent message-bus as neurons + weighted synapses). A HUD toggle swaps
+  // between them at runtime; the memory path is byte-for-byte what it was.
+  const SYNAPSE_URL = opts.synapseUrl || '/v1/dashboard/network/synapses';
+  const allowConnectome = opts.allowConnectome !== false;
+  let mode = opts.mode === 'connectome' ? 'connectome' : 'memory';
 
   const root = document.createElement('div');
   root.className = 'mrib';
@@ -312,6 +339,7 @@ export function mountMriBrain(container, opts = {}) {
       <div><div class="n nc">0</div><div class="l">consolidated</div></div>
       <div class="btn b-rot">⏸ pause</div>
       <div class="btn b-flow">⚡ flow: on</div>
+      ${allowConnectome ? '<div class="btn b-mode">◉ connectome</div>' : ''}
       <label class="sld">skull <input class="b-op" type="range" min="0" max="60" value="8"></label>
     </div>
     <div class="tip"></div>
@@ -386,11 +414,21 @@ export function mountMriBrain(container, opts = {}) {
   // domain brightened toward white by corroboration (so the bloom pass makes
   // consolidated memories glow); alpha = confidence (decay); challenged/
   // deprecated greyed.
-  const nodeVal = n => 1.4 + (n.corroboration_count||0)*1.1 + (n.confidence||0)*0.8 + (n._fresh||0)*2.2;
+  // Memory nodes size by corroboration+confidence+freshness; neurons size by
+  // degree (total traffic) so hubs read as large cells.
+  const nodeVal = n => n.isNeuron
+    ? 1.6 + (n._deg||0)*7
+    : 1.4 + (n.corroboration_count||0)*1.1 + (n.confidence||0)*0.8 + (n._fresh||0)*2.2;
   function nodeColorRGBA(n){
-    // Focus mode: everything outside the clicked memory's train of thought fades
-    // back so the related constellation stands out.
-    if(focusSet && !focusSet.has(n.id)) return 'rgba(96,110,135,0.08)';
+    // Focus mode: everything outside the clicked node's neighbourhood fades back.
+    if(focusSet && !focusSet.has(n.id)) return n.isNeuron ? 'rgba(96,110,135,0.10)' : 'rgba(96,110,135,0.08)';
+    // Neurons: domain hue, brightened toward the glow by degree so hub agents pop.
+    if(n.isNeuron){
+      const [nr,ng,nb]=hexToRgb(domainColor(n.domain));
+      const boost=Math.min(1,(n._deg||0));
+      const br=nr+(255-nr)*boost*0.55, bg=ng+(255-ng)*boost*0.55, bb=nb+(255-nb)*boost*0.55;
+      return `rgba(${br|0},${bg|0},${bb|0},${(0.72+0.28*boost).toFixed(2)})`;
+    }
     if(n.status==='deprecated') return 'rgba(108,120,145,0.30)';
     if(n.status==='challenged') return 'rgba(150,162,185,0.55)';
     const [r,g,b]=hexToRgb(domainColor(n.domain));
@@ -403,6 +441,38 @@ export function mountMriBrain(container, opts = {}) {
     const fr=n._fresh||0;
     if(fr>0){ br+=(90-br)*0.72*fr; bg+=(220-bg)*0.72*fr; bb+=(255-bb)*0.72*fr; a=Math.max(a,0.85+0.15*fr); }
     return `rgba(${br|0},${bg|0},${bb|0},${a.toFixed(2)})`;
+  }
+
+  // Link accessors are mode-aware via the datum's link_type. In the memory view
+  // every link is a typed memory edge (unchanged formulas); in the connectome a
+  // synapse's normalized weight _w drives Hebbian thickness, particle count and
+  // pulse speed — heavier, hotter channels read thicker and fire faster.
+  function linkWidthFor(l){
+    if(l.link_type==='synapse') return 0.25 + (l._w||0)*2.4;
+    return l.link_type==='focus'?0.8 : l.link_type==='contradicts'?0.6 : (LINK_TYPES[l.link_type]||{}).typed?0.35:0.18;
+  }
+  function linkParticlesFor(l){
+    if(l.link_type==='synapse') return flow ? Math.min(6, 1+Math.round((l._w||0)*5)) : 0;
+    return l.link_type==='focus'?3 : (flow&&(LINK_TYPES[l.link_type]||{}).typed?2:0);
+  }
+  function linkParticleSpeedFor(l){
+    if(l.link_type==='synapse') return 0.004 + (l._w||0)*0.02;
+    return 0.006;
+  }
+
+  // Clicking a neuron lights its synaptic neighbourhood (the clicked cell + every
+  // agent it exchanges with); everything else fades via focusSet, reusing the
+  // memory view's focus fade. No network fetch — purely the graph already loaded.
+  function focusNeuron(n){
+    if(!Graph || !rendered) return;
+    const nb=new Set([n.id]);
+    rendered.links.forEach(l=>{
+      const s=(l.source&&l.source.id)||l.source, t=(l.target&&l.target.id)||l.target;
+      if(s===n.id) nb.add(t); else if(t===n.id) nb.add(s);
+    });
+    focusId=n.id; focusSet=nb;
+    Graph.nodeColor(nodeColorRGBA);
+    setFocusMarkerNode(n);
   }
 
   // Deterministic placement — NO force simulation. domain -> azimuthal lobe (each
@@ -456,6 +526,42 @@ export function mountMriBrain(container, opts = {}) {
     });
   }
 
+  // Connectome placement — same deterministic ellipsoid, but neurons have no age.
+  // domain -> azimuthal lobe (as memories), and DEGREE (total traffic) -> radial
+  // depth: hub neurons sink toward the core/stem (the brain's deep structure),
+  // peripheral neurons sit on the cortex. Degree maps onto exactly the radial
+  // scale age uses for memories, so the two views share one spatial language.
+  function placeNeurons(nodes){
+    const ds=[...new Set(nodes.map(n=>n.domain))], nd=Math.max(1,ds.length), di={};
+    ds.forEach((k,i)=>{ di[k]=i; domainColor(k); });
+    nodes.forEach(n=>{
+      const deg=Math.max(0,Math.min(1,n._deg||0));
+      const az=((di[n.domain]||0)/nd)*Math.PI*2 + (hsh(n.id,1)-0.5)*(Math.PI*2/nd)*0.82;
+      const el=(hsh(n.id,2)-0.5)*Math.PI*0.96;
+      const depth=mriDepthForAge(deg,hsh(n.id,3));
+      const ce=Math.cos(el);
+      n.fx=n.x=EX*depth*ce*Math.cos(az);
+      n.fy=n.y=mriVerticalPosition(depth,Math.sin(el),deg);
+      n.fz=n.z=EZ*depth*ce*Math.sin(az);
+    });
+  }
+  const placeActive = nodes => mode==='connectome' ? placeNeurons(nodes) : placeNodes(nodes);
+
+  // ForceGraph3D resolves string link endpoints to node objects lazily, via the
+  // d3 'link' force — which this renderer nulls (node positions are pinned). For
+  // the memory view that is fine (its value is in node placement/glow), but the
+  // connectome's synapses ARE the payload, so resolve their endpoints to the node
+  // objects up front; otherwise every synapse would reference an unresolved id and
+  // render nothing. No-op for the memory view.
+  function resolveConnectomeLinks(d){
+    if (mode !== 'connectome' || !d || !Array.isArray(d.links)) return;
+    const byId = new Map(d.nodes.map(n => [n.id, n]));
+    d.links.forEach(l => {
+      if (typeof l.source === 'string' && byId.has(l.source)) l.source = byId.get(l.source);
+      if (typeof l.target === 'string' && byId.has(l.target)) l.target = byId.get(l.target);
+    });
+  }
+
   let Graph = null, controls = null, disposed = false, flow = true, scanning = true;
   let lastNodeClickAt = 0, graphPointerDown = null;
   let hullMat = null, brainMat = null, surfMat = null, curOpacity = 0.08;
@@ -463,6 +569,10 @@ export function mountMriBrain(container, opts = {}) {
   let currentDomain = null;                 // drill-down lobe (null = overview)
   const baseUrl = fetchUrl;
   const urlFor = () => baseUrl + (currentDomain ? '&domain=' + encodeURIComponent(currentDomain) : '');
+  // Mode-aware source: the memory graph (domain-drillable) or the connectome.
+  const fetchActive = requestMode => requestMode === 'connectome' ? loadSynapses(SYNAPSE_URL) : loadGraph(urlFor());
+  const graphLoads = createGraphLoadCoordinator();
+  let rendered = null;   // last graph data handed to ForceGraph (for neuron focus)
   const subs = [];
   let graphRetryTimer = null;
   let graphRetryDelay = 2000;
@@ -521,6 +631,14 @@ export function mountMriBrain(container, opts = {}) {
   }
 
   function refreshCounts(d){
+    if (mode==='connectome') {
+      // neurons / synapses / hubs (busiest half of the traffic distribution).
+      $('.nn').textContent = fmtN(d.nodes.length);
+      $('.ne').textContent = fmtN(d.links.length);
+      $('.nc').textContent = fmtN(d.nodes.filter(n=>(n._deg||0)>=0.5).length);
+      $('.flag').textContent = d.nodes.length ? '' : (d.live === false ? 'no live data' : 'no agents registered yet');
+      return;
+    }
     // .nn shows the TRUE total (operator view), not just the rendered sample.
     $('.nn').textContent = fmtN(d.total && d.total > d.nodes.length ? d.total : d.nodes.length);
     $('.ne').textContent = fmtN(d.links.length);
@@ -557,12 +675,15 @@ export function mountMriBrain(container, opts = {}) {
       back.onclick = () => { currentDomain = null; load(); zoomOut(); };
       lobes.appendChild(back);
     }
+    // The connectome endpoint is not domain-drillable, so there its lobes are a
+    // pure colour legend; the memory view keeps click-to-drill.
+    const drill = mode !== 'connectome';
     doms.forEach(k => {
       const row = document.createElement('div');
-      row.className = 'row'; row.style.cursor = 'pointer';
+      row.className = 'row'; if (drill) row.style.cursor = 'pointer';
       if (currentDomain === k) row.style.background = 'rgba(57,208,255,0.10)';
       row.innerHTML = `<span class="dot" style="background:${domainColor(k)}"></span><div class="t"><b>${escapeHtml(k)}</b>${dc[k]?` <span style="color:#5d7395">· ${fmtN(dc[k])}</span>`:''}</div>`;
-      row.onclick = () => { if (currentDomain !== k) { currentDomain = k; load(); } };
+      if (drill) row.onclick = () => { if (currentDomain !== k) { currentDomain = k; load(); } };
       lobes.appendChild(row);
     });
     if (all.length > doms.length) {
@@ -581,19 +702,22 @@ export function mountMriBrain(container, opts = {}) {
       return;
     }
     graphLoadInFlight = true;
+    const request = graphLoads.begin(mode);
     // A drill / reload leaves focus mode.
     focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
-    loadGraph(urlFor()).then(d => {
-      if (disposed || !Graph) return;
+    fetchActive(request.mode).then(d => {
+      if (disposed || !Graph || !graphLoads.isCurrent(request, mode)) return;
       clearTimeout(graphRetryTimer);
       resetGraphRetry();
       reportGraphAvailability('ready');
-      placeNodes(d.nodes);
+      placeActive(d.nodes);
+      resolveConnectomeLinks(d);
       Graph.graphData(d);
+      rendered = d;
       refreshCounts(d);
       buildLobes(d);
     }).catch(() => {
-      if (disposed) return;
+      if (disposed || !graphLoads.isCurrent(request, mode)) return;
       reportGraphAvailability('unavailable');
       if (!graphReloadPending) scheduleGraphRetry(load);
     }).finally(() => {
@@ -847,19 +971,21 @@ export function mountMriBrain(container, opts = {}) {
     resetGraphRetry();
     reportGraphAvailability('ready');
     $('.boot').style.display = 'none';
-    placeNodes(data.nodes);
+    placeActive(data.nodes);
+    resolveConnectomeLinks(data);
+    rendered = data;
     Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'))
       .backgroundColor(mriBgColor())
       .graphData(data).nodeId('id').nodeLabel(()=>'' )
       .nodeVal(nodeVal).nodeColor(nodeColorRGBA).nodeRelSize(2.4).nodeResolution(10).nodeOpacity(0.9)
       .linkColor(l=>(LINK_TYPES[l.link_type]||LINK_TYPES.related).color)
-      .linkWidth(l=> l.link_type==='focus'?0.8 : l.link_type==='contradicts'?0.6 : (LINK_TYPES[l.link_type]||{}).typed?0.35:0.18)
+      .linkWidth(linkWidthFor)
       .linkOpacity(0.32)
-      .linkDirectionalParticles(l=> l.link_type==='focus'?3 : (flow&&(LINK_TYPES[l.link_type]||{}).typed?2:0))
-      .linkDirectionalParticleWidth(1.1).linkDirectionalParticleSpeed(0.006)
+      .linkDirectionalParticles(linkParticlesFor)
+      .linkDirectionalParticleWidth(1.1).linkDirectionalParticleSpeed(linkParticleSpeedFor)
       .warmupTicks(1).cooldownTicks(6)
       .onNodeHover(showTip)
-      .onNodeClick(n=>{ lastNodeClickAt = performance.now(); exploreNode(n); })
+      .onNodeClick(n=>{ lastNodeClickAt = performance.now(); if (mode==='connectome') focusNeuron(n); else exploreNode(n); })
       .onBackgroundClick(()=>{ exitFocus(); });
 
     // Positions are pinned by placeNodes() (fx/fy/fz), so disable the force
@@ -1030,8 +1156,12 @@ export function mountMriBrain(container, opts = {}) {
 
   function acquireInitialGraph() {
     reportGraphAvailability('loading');
-    loadGraph(urlFor()).then(initializeGraph).catch(() => {
-      if (disposed) return;
+    const request = graphLoads.begin(mode);
+    fetchActive(request.mode).then(d => {
+      if (disposed || !graphLoads.isCurrent(request, mode)) return;
+      initializeGraph(d);
+    }).catch(() => {
+      if (disposed || !graphLoads.isCurrent(request, mode)) return;
       const boot = $('.boot');
       if (boot) boot.textContent = '◉ MEMORY GRAPH TEMPORARILY UNAVAILABLE — RETRYING…';
       reportGraphAvailability('unavailable');
@@ -1042,6 +1172,11 @@ export function mountMriBrain(container, opts = {}) {
 
   function showTip(n){ const tip=$('.tip'); if(!n){ tip.style.display='none'; return; }
     tip.style.display='block';
+    if(n.isNeuron){
+      tip.innerHTML=`<div class="h">${escapeHtml((n.label||'').slice(0,90))}</div><div class="m">neuron · ${escapeHtml(n.role||'agent')}${n.domain?` · ${escapeHtml(n.domain)}`:''}</div>
+        <div style="margin-top:5px"><span class="chip">traffic ${n._w|0}</span><span class="chip">${(n._deg||0)>=0.5?'hub':'node'}</span></div>`;
+      return;
+    }
     tip.innerHTML=`<div class="h">${escapeHtml((n.label||'').slice(0,90))}</div><div class="m">${escapeHtml(n.domain)} · ${escapeHtml(n.memory_type||'—')} · ${escapeHtml(n.status)}</div>
       <div style="margin-top:5px"><span class="chip">conf ${(+n.confidence).toFixed(2)}</span><span class="chip">corroborated ×${n.corroboration_count|0}</span></div>`; }
   function onMove(e){ const tip=$('.tip'); if(tip.style.display==='block'){ const r=root.getBoundingClientRect();
@@ -1060,9 +1195,40 @@ export function mountMriBrain(container, opts = {}) {
   root.addEventListener('mousemove', onMove);
   root.addEventListener('pointerdown', onGraphPointerDown);
   root.addEventListener('click', onGraphClick);
+  // Connectome legend caption — appended once, shown only in connectome mode.
+  const modeCap = document.createElement('div');
+  modeCap.className = 'panel mode-cap';
+  modeCap.style.cssText = 'position:absolute;left:auto;bottom:44px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
+  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>hubs sink to the core · click a neuron to light its circle';
+  root.appendChild(modeCap);
+
+  // Relabel the stat panel + button and toggle the caption for the active mode.
+  function updateModeChrome(){
+    const btn=$('.b-mode'); if(btn) btn.textContent = mode==='connectome' ? '◈ memory' : '◉ connectome';
+    const set = mode==='connectome' ? ['neurons','synapses','hubs'] : ['memories','synapses','consolidated'];
+    root.querySelectorAll('.hud .l').forEach((el,i)=>{ if(set[i]) el.textContent=set[i]; });
+    modeCap.style.display = mode==='connectome' ? '' : 'none';
+  }
+  updateModeChrome();
+
+  // Swap the active view. Leaves any focus/drill state, relabels the chrome, and
+  // re-runs the load path against the new source. The memory view is byte-for-byte
+  // unchanged whenever mode stays 'memory'.
+  function setMode(next){
+    if (mode===next || (next==='connectome' && !allowConnectome)) return;
+    graphLoads.invalidate();
+    mode = next;
+    currentDomain = null;
+    focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
+    updateModeChrome();
+    if (Graph) { load(); zoomOut(); }
+    else acquireInitialGraph();
+  }
+
   $('.b-rot').onclick=function(){ scanning=!scanning; if(controls) controls.autoRotate=scanning; this.textContent=scanning?'⏸ pause':'▶ scan'; };
-  $('.b-flow').onclick=function(){ flow=!flow; if(Graph) Graph.linkDirectionalParticles(l=>l.link_type==='focus'?3:(flow&&(LINK_TYPES[l.link_type]||{}).typed?2:0)); this.textContent=flow?'⚡ flow: on':'⚡ flow: off'; };
+  $('.b-flow').onclick=function(){ flow=!flow; if(Graph) Graph.linkDirectionalParticles(linkParticlesFor); this.textContent=flow?'⚡ flow: on':'⚡ flow: off'; };
   $('.b-op').oninput=function(){ setHullOpacity(this.value/100); };
+  if (allowConnectome) $('.b-mode').onclick=function(){ setMode(mode==='connectome'?'memory':'connectome'); };
 
   return function cleanup(){
     disposed = true;
