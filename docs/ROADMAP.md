@@ -64,6 +64,11 @@ responses cannot cross the memory/connectome boundary. This patch introduces
 no new consensus application version or state migration: app-v26 remains the
 ceiling and v11.18.10 does not introduce app-v27.
 
+The upgrade watchdog now applies one bounded context across nonce-lease
+acquisition and each of its four CometBFT broadcasts. Deadline expiry after a
+submission begins stays typed indeterminate and retains the exact signer/bytes
+fence; the lease is never released merely because time elapsed.
+
 ## v11.18.9 patch
 
 Ambiguous CometBFT commit and sync outcomes are now typed at the shared

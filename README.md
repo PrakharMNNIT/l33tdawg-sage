@@ -68,6 +68,12 @@ view consumes the existing RBAC-filtered synapse projection, drops ghost edges,
 and fences asynchronous mode switches so a slow memory response can never be
 displayed as connectome data.
 
+**Upgrade-watchdog submissions can no longer hold a signing key's nonce lease
+for the process lifetime when CometBFT wedges.** One bounded context now covers
+both lease acquisition and the broadcast. A deadline after submission remains
+a typed indeterminate outcome, so the exact signer and bytes stay fenced until
+their fate is reconciled; elapsed time never releases the key fail-open.
+
 This patch introduces no new consensus application version or state migration.
 The ceiling remains app-v26; **v11.18.10 introduces no app-v27**.
 
