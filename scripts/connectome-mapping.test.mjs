@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { createGraphLoadCoordinator, mapConnectome } from '../web/static/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity } from '../web/static/js/connectome-map.js';
 
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 
@@ -141,4 +141,61 @@ test('renderer wires mode invalidation into both initial acquisition and reloads
     'a stale initial response must fail closed after a mode change');
   assert.match(mriSource, /function setMode\(next\)\{[\s\S]*graphLoads\.invalidate\(\);[\s\S]*else acquireInitialGraph\(\);/,
     'a toggle must invalidate old work and refetch even before Graph exists');
+});
+
+// Live firing pulses only the synapses that actually carried a message. The
+// server tick is contentless by design, so which edges fired is derived here by
+// diffing two AUTHORIZED snapshots — meaning a client can only ever pulse an
+// edge the RBAC-filtered endpoint was willing to show it.
+test('diffConnectomeActivity reports a brand new synapse as fired', () => {
+  const fired = diffConnectomeActivity(
+    [],
+    [{ source: 'a', target: 'b', count: 1, last_fired: '2026-01-01T00:00:00Z' }],
+  );
+  assert.deepEqual(fired, ['a\u0000b']);
+});
+
+test('diffConnectomeActivity reports a risen count as fired', () => {
+  const prev = [{ source: 'a', target: 'b', count: 1, last_fired: 't1' }];
+  const next = [{ source: 'a', target: 'b', count: 2, last_fired: 't1' }];
+  assert.deepEqual(diffConnectomeActivity(prev, next), ['a\u0000b']);
+});
+
+// Needed because a burst can land inside one timestamp granularity, and a send
+// that coincides with a retention prune can leave the count unmoved.
+test('diffConnectomeActivity reports an advanced last_fired as fired', () => {
+  const prev = [{ source: 'a', target: 'b', count: 5, last_fired: '2026-01-01T00:00:00Z' }];
+  const next = [{ source: 'a', target: 'b', count: 5, last_fired: '2026-01-01T00:00:09Z' }];
+  assert.deepEqual(diffConnectomeActivity(prev, next), ['a\u0000b']);
+});
+
+test('diffConnectomeActivity reports an unchanged synapse as quiet', () => {
+  const same = [{ source: 'a', target: 'b', count: 3, last_fired: 't9' }];
+  assert.deepEqual(diffConnectomeActivity(same, same), []);
+});
+
+// Retained-row pruning lowers a count without any message being sent. Treating
+// that as activity would animate traffic that did not happen.
+test('diffConnectomeActivity does not treat a pruned count as firing', () => {
+  const prev = [{ source: 'a', target: 'b', count: 9, last_fired: 't1' }];
+  const next = [{ source: 'a', target: 'b', count: 2, last_fired: 't1' }];
+  assert.deepEqual(diffConnectomeActivity(prev, next), []);
+});
+
+// After force-simulation binding, link endpoints are node objects rather than
+// id strings. The diff must key identically in both shapes or every edge would
+// read as new on the first pulse after a render.
+test('diffConnectomeActivity keys object endpoints the same as string ids', () => {
+  const prev = [{ source: 'a', target: 'b', count: 4, last_fired: 't1' }];
+  const next = [{ source: { id: 'a' }, target: { id: 'b' }, count: 4, last_fired: 't1' }];
+  assert.deepEqual(diffConnectomeActivity(prev, next), []);
+});
+
+// The renderer subscribes to the contentless tick and refetches the authorized
+// snapshot; it must never read edge data off the event itself.
+test('mri-brain refetches the authorized snapshot on a connectome tick', () => {
+  assert.match(mriSource, /opts\.sse\.on\('connectome'/,
+    'the renderer must subscribe to the connectome tick');
+  assert.match(mriSource, /markConnectomeFiring/,
+    'the fired-edge diff must run on the applied snapshot');
 });

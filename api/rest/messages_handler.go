@@ -132,6 +132,18 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 	if replayed {
 		code = http.StatusOK
 	}
+	if !replayed && s.OnEvent != nil {
+		// Live connectome firing. Emitted ONLY here: after the send has
+		// durably succeeded and only when it is NOT an idempotent replay, so a
+		// retried send cannot pulse an edge twice for one message.
+		//
+		// Deliberately carries nothing — not the endpoints, not the sender's
+		// provider, not the intent, not even a count. See web.EventConnectome
+		// for why an identity-free fan-out must not name an edge that the
+		// RBAC-filtered snapshot would withhold. Clients treat this as
+		// "re-fetch the authorized snapshot", never as data.
+		s.OnEvent(string(connectomeActivityEvent), "", "", "", nil)
+	}
 	if !replayed && s.messageNotifier != nil {
 		// Best effort only: a missing, closed, or backpressured SSE session
 		// cannot change durable send/delivery state and must never fail the send.

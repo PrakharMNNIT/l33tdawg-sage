@@ -65,3 +65,32 @@ export function createGraphLoadCoordinator() {
     },
   };
 }
+
+// diffConnectomeActivity reports which directed edges FIRED between two
+// connectome snapshots, so a live pulse animates the channels that actually
+// carried a message rather than flashing the whole graph.
+//
+// An edge counts as fired when it is new, when its retained count rose, or when
+// its last_fired advanced. All three are needed: count alone misses a send that
+// coincided with a retention prune, and last_fired alone misses a burst that
+// lands within the same timestamp granularity.
+//
+// A DROP IN COUNT IS NOT A FIRING. Retained-row pruning can lower a count
+// without any message being sent, and animating that would report activity that
+// did not happen.
+export function diffConnectomeActivity(prevLinks, nextLinks) {
+  const key = (l) => `${typeof l.source === 'object' ? l.source.id : l.source}\u0000${typeof l.target === 'object' ? l.target.id : l.target}`;
+  const before = new Map();
+  for (const l of (Array.isArray(prevLinks) ? prevLinks : [])) {
+    before.set(key(l), { count: l.count || 0, last: l.last_fired || '' });
+  }
+  const fired = [];
+  for (const l of (Array.isArray(nextLinks) ? nextLinks : [])) {
+    const k = key(l);
+    const was = before.get(k);
+    if (!was) { fired.push(k); continue; }
+    if ((l.count || 0) > was.count) { fired.push(k); continue; }
+    if ((l.last_fired || '') > was.last) { fired.push(k); }
+  }
+  return fired;
+}
