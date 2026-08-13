@@ -2089,9 +2089,9 @@ type armContext struct{ app *SageApp }
 func (c armContext) RoleResolver() func(agentID string) string { return c.app.RoleResolver() }
 
 // ContentValidationEnforcementWarning returns a non-empty operator warning when
-// this node will NOT enforce the Layer-2 content-validation gate on a chain that
-// has already activated it — i.e. the app-v7 fork is live (appV7AppliedHeight > 0)
-// but no validator registry is compiled in. Such a node is internally consistent
+// this node will NOT enforce the Layer-2 content-validation gate while its
+// bounded consensus window is live — app-v7 is active, app-v14 has not yet
+// deactivated it, and no validator registry is compiled in. Such a node is internally consistent
 // and MUST stay bootable (a generic-only fleet is a valid deployment), so this is
 // an advisory, not a fatal guard: returning an error here would brick a healthy
 // app-v7 chain on restart.
@@ -2103,7 +2103,7 @@ func (c armContext) RoleResolver() func(agentID string) string { return c.app.Ro
 // so operators ensure every validator runs the same registry-wired build before
 // activating app-v7. Returns "" when there is nothing to warn about.
 func (app *SageApp) ContentValidationEnforcementWarning() string {
-	if app.appV7AppliedHeight > 0 && app.contentValidators == nil {
+	if app.appV7AppliedHeight > 0 && app.appV14AppliedHeight == 0 && app.contentValidators == nil {
 		return fmt.Sprintf(
 			"content-validation fork app-v7 is active at height %d but this node has no "+
 				"content-validator registry compiled in: it will NOT enforce the Layer-2 gate. "+
