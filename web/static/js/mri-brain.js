@@ -18,6 +18,7 @@
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
 import { createGraphLoadCoordinator, mapConnectome } from '/ui/js/connectome-map.js';
+import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
   supports:    { color: '#5ee2a0', label: 'supports',    typed: true },
@@ -308,6 +309,13 @@ export function mountMriBrain(container, opts = {}) {
   const SYNAPSE_URL = opts.synapseUrl || '/v1/dashboard/network/synapses';
   const allowConnectome = opts.allowConnectome !== false;
   let mode = opts.mode === 'connectome' ? 'connectome' : 'memory';
+  // Per-view skull opacity. The memory graph keeps the anatomical hull prominent
+  // (0.08); the connectome's payload is the WIRING, so it starts dimmer (0.03) so
+  // synapses read on open. These are only INITIAL defaults — a manual SKULL
+  // adjustment is remembered per view and recalled on the next toggle back, so a
+  // round trip never discards the operator's choice (see mode-hull.js).
+  const hullState = createModeHull({ memory: 0.08, connectome: 0.03 });
+  const sliderUnits = o => String(Math.round(o * 100));
 
   const root = document.createElement('div');
   root.className = 'mrib';
@@ -345,6 +353,8 @@ export function mountMriBrain(container, opts = {}) {
     <div class="tip"></div>
     <div class="flag"></div>`;
   container.appendChild(root);
+  // Reflect the active view's skull opacity on the slider from the start.
+  { const _op = root.querySelector('.b-op'); if (_op) _op.value = sliderUnits(hullState.valueFor(mode)); }
   const $ = s => root.querySelector(s);
   const escapeHtml = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -564,7 +574,7 @@ export function mountMriBrain(container, opts = {}) {
 
   let Graph = null, controls = null, disposed = false, flow = true, scanning = true;
   let lastNodeClickAt = 0, graphPointerDown = null;
-  let hullMat = null, brainMat = null, surfMat = null, curOpacity = 0.08;
+  let hullMat = null, brainMat = null, surfMat = null, curOpacity = hullState.valueFor(mode);
   let focusMarker = null, focusRingTexture = null;
   let currentDomain = null;                 // drill-down lobe (null = overview)
   const baseUrl = fetchUrl;
@@ -1221,13 +1231,19 @@ export function mountMriBrain(container, opts = {}) {
     currentDomain = null;
     focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
     updateModeChrome();
+    // Recall this view's remembered skull opacity (its default, or the operator's
+    // last manual choice for this view) and reflect it on the slider, so a round
+    // trip preserves each view's setting independently.
+    const nextOpacity = hullState.valueFor(mode);
+    const opEl = $('.b-op'); if (opEl) opEl.value = sliderUnits(nextOpacity);
+    setHullOpacity(nextOpacity);
     if (Graph) { load(); zoomOut(); }
     else acquireInitialGraph();
   }
 
   $('.b-rot').onclick=function(){ scanning=!scanning; if(controls) controls.autoRotate=scanning; this.textContent=scanning?'⏸ pause':'▶ scan'; };
   $('.b-flow').onclick=function(){ flow=!flow; if(Graph) Graph.linkDirectionalParticles(linkParticlesFor); this.textContent=flow?'⚡ flow: on':'⚡ flow: off'; };
-  $('.b-op').oninput=function(){ setHullOpacity(this.value/100); };
+  $('.b-op').oninput=function(){ const o=this.value/100; setHullOpacity(o); hullState.record(mode, o); };
   if (allowConnectome) $('.b-mode').onclick=function(){ setMode(mode==='connectome'?'memory':'connectome'); };
 
   return function cleanup(){
