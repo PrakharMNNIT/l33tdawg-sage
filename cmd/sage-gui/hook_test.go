@@ -151,6 +151,40 @@ func TestHookSessionStart_MissingKeyReturnsError(t *testing.T) {
 	require.Error(t, err, "no key file → soft-fail back to nudge")
 }
 
+func TestHookInboxStatusIsPayloadFreeAndIdentityScoped(t *testing.T) {
+	var requestedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.RequestURI()
+		assert.NotEmpty(t, r.Header.Get("X-Agent-ID"))
+		_ = json.NewEncoder(w).Encode(map[string]any{"count": 2, "unread": true})
+	}))
+	defer srv.Close()
+	keyPath := withTestSageEnv(t, srv.URL)
+	seed, err := os.ReadFile(keyPath)
+	require.NoError(t, err)
+	pub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+
+	stdout := captureStdout(t, func() { require.NoError(t, runHookInboxStatus()) })
+	assert.Equal(t, "/v1/pipe/history/inbox?count_only=1", requestedPath)
+	assert.Contains(t, stdout, "2 unread item(s)")
+	assert.Contains(t, stdout, hex.EncodeToString(pub))
+	assert.Contains(t, stdout, "Call sage_inbox with a fresh poll")
+	assert.NotContains(t, stdout, "sentinel-payload")
+	assert.NotContains(t, stdout, "message_id")
+}
+
+func TestHookInboxStatusZeroIsSilentAndFailureIsNotZero(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"count": 0, "unread": false})
+	}))
+	withTestSageEnv(t, srv.URL)
+	assert.Empty(t, captureStdout(t, func() { require.NoError(t, runHookInboxStatus()) }))
+	srv.Close()
+	err := runHookInboxStatus()
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "count 0")
+}
+
 func writeHookTestSeed(t *testing.T, path string) []byte {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))

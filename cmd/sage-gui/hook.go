@@ -53,6 +53,11 @@ func runHook() error {
 			return nil
 		}
 		return runHookSessionEnd()
+	case "inbox-status":
+		if len(args) > 1 {
+			return fmt.Errorf("hook inbox-status: unexpected arguments")
+		}
+		return runHookInboxStatus()
 	default:
 		return fmt.Errorf("hook: unknown subcommand %q", args[0])
 	}
@@ -61,6 +66,7 @@ func runHook() error {
 func printHookUsage() {
 	fmt.Fprintln(os.Stdout, "Usage: sage-gui hook session-start [--domain DOMAIN]")
 	fmt.Fprintln(os.Stdout, "       sage-gui hook session-end")
+	fmt.Fprintln(os.Stdout, "       sage-gui hook inbox-status")
 }
 
 func hookSessionStartDomain(args []string) (string, error) {
@@ -87,6 +93,32 @@ const (
 	hookHTTPTimeout = 3 * time.Second
 	hookRecentLimit = 10
 )
+
+// runHookInboxStatus emits a payload-free coordination pointer for the exact
+// ordinary-agent identity used by this hook. It never claims work. Silence
+// means an authoritative zero; failures return non-zero so the shell wrapper
+// can say that the check was unavailable instead of manufacturing a zero.
+func runHookInboxStatus() error {
+	var inbox struct {
+		Count  int  `json:"count"`
+		Unread bool `json:"unread"`
+	}
+	if err := hookSignedJSON(http.MethodGet, "/v1/pipe/history/inbox?count_only=1", nil, &inbox); err != nil {
+		return fmt.Errorf("inbox status unavailable: %w", err)
+	}
+	if !inbox.Unread || inbox.Count <= 0 {
+		return nil
+	}
+	seed, err := loadHookSeed()
+	if err != nil {
+		return fmt.Errorf("resolve hook identity: %w", err)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub, _ := priv.Public().(ed25519.PublicKey) //nolint:errcheck
+	fmt.Printf("SAGE inbox: %d unread item(s) for exact agent %s (runtime %s). Call sage_inbox with a fresh poll before reporting no new messages.\n",
+		inbox.Count, hex.EncodeToString(pub), version)
+	return nil
+}
 
 // runHookSessionStart fetches recent committed memories and prints a context
 // block on stdout. Claude Code injects stdout from SessionStart hooks into the

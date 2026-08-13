@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -113,6 +114,52 @@ func TestHookScripts_BookendModeCheck(t *testing.T) {
 	assert.Contains(t, sageSessionStartTemplate, "bookend")
 	assert.Contains(t, sageUserPromptScript, "memory_mode")
 	assert.Contains(t, sageUserPromptScript, "bookend")
+	assert.Contains(t, sageUserPromptScript, "hook inbox-status")
+	assert.True(t, strings.Index(sageUserPromptScript, "hook inbox-status") < strings.LastIndex(sageUserPromptScript, `MODE" = "bookend`),
+		"bookend must check coordination before suppressing the memory nudge")
+	assert.Contains(t, sageUserPromptScript, "inbox check unavailable")
+}
+
+func TestUserPromptHookModeBehavior(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode            string
+		wantPointer, wantTurn bool
+	}{
+		{name: "full", mode: "full", wantPointer: true, wantTurn: true},
+		{name: "bookend", mode: "bookend", wantPointer: true, wantTurn: false},
+		{name: "on-demand", mode: "on-demand", wantPointer: false, wantTurn: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(home, "memory_mode"), []byte(tc.mode), 0600))
+			fake := filepath.Join(home, "sage-gui")
+			require.NoError(t, os.WriteFile(fake, []byte("#!/bin/bash\n[ \"$1 $2\" = \"hook inbox-status\" ] || exit 9\necho INBOX-POINTER\n"), 0755))
+			script := filepath.Join(home, "user-prompt.sh")
+			rendered := renderHookScript(sageUserPromptScript, fake, "claude-code", filepath.Join(home, "agent.key"))
+			require.NoError(t, os.WriteFile(script, []byte(rendered), 0755))
+			cmd := exec.Command("bash", script) //nolint:gosec // test executes its own fixed script
+			cmd.Env = append(os.Environ(), "SAGE_HOME="+home, "SAGE_GUI_BIN="+fake)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantPointer, strings.Contains(string(out), "INBOX-POINTER"))
+			assert.Equal(t, tc.wantTurn, strings.Contains(string(out), "call sage_turn"))
+		})
+	}
+}
+
+func TestUserPromptHookReportsInboxProbeFailure(t *testing.T) {
+	home := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(home, "memory_mode"), []byte("bookend"), 0600))
+	fake := filepath.Join(home, "sage-gui")
+	require.NoError(t, os.WriteFile(fake, []byte("#!/bin/bash\nexit 1\n"), 0755))
+	script := filepath.Join(home, "user-prompt.sh")
+	require.NoError(t, os.WriteFile(script, []byte(renderHookScript(sageUserPromptScript, fake, "claude-code", filepath.Join(home, "agent.key"))), 0755))
+	cmd := exec.Command("bash", script) //nolint:gosec // test executes its own fixed script
+	cmd.Env = append(os.Environ(), "SAGE_HOME="+home, "SAGE_GUI_BIN="+fake)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "inbox check unavailable")
+	assert.NotContains(t, string(out), "0 unread")
 }
 
 func TestHookScripts_OnDemandModeCheck(t *testing.T) {
@@ -170,8 +217,46 @@ func TestSagePermissionsConfigRemovesRetiredAliases(t *testing.T) {
 	allow, ok := permissions["allow"].([]string)
 	require.True(t, ok)
 	assert.Contains(t, allow, "mcp__sage__sage_inception")
+	for _, tool := range []string{
+		"mcp__sage__sage_inbox", "mcp__sage__sage_messages_receive",
+		"mcp__sage__sage_message_history", "mcp__sage__sage_message_replies",
+		"mcp__sage__sage_message_status",
+	} {
+		assert.Contains(t, allow, tool)
+	}
 	assert.NotContains(t, allow, "mcp__sage__sage_red_pill")
 	assert.Contains(t, allow, "mcp__other__tool", "non-SAGE permissions must be preserved")
+}
+
+func TestSelfHeal_RewritesStaleUserPromptBytes(t *testing.T) {
+	projectDir := t.TempDir()
+	sageHome := t.TempDir()
+	hookDir := filepath.Join(projectDir, ".claude", "hooks")
+	require.NoError(t, os.MkdirAll(hookDir, 0755))
+	binPath, err := os.Executable()
+	require.NoError(t, err)
+	if resolved, symErr := filepath.EvalSymlinks(binPath); symErr == nil {
+		binPath = resolved
+	}
+	identityPath := mcpIdentityPath(filepath.Join(projectDir, ".mcp.json"), sageHome, "claude-code")
+	for name, tpl := range hookScriptSet() {
+		content := renderHookScript(tpl, binPath, "claude-code", identityPath)
+		if name == "sage-user-prompt.sh" {
+			content = strings.ReplaceAll(content, "hook inbox-status", "hook old-silent-version")
+		}
+		require.NoError(t, os.WriteFile(filepath.Join(hookDir, name), []byte(content), 0755))
+	}
+	settingsPath := filepath.Join(projectDir, ".claude", "settings.json")
+	require.NoError(t, os.WriteFile(settingsPath, []byte(`{"custom":"preserve-me","permissions":{"allow":["mcp__other__tool"]}}`), 0600))
+
+	selfHealProject(projectDir, sageHome)
+	got, err := os.ReadFile(filepath.Join(hookDir, "sage-user-prompt.sh"))
+	require.NoError(t, err)
+	assert.Contains(t, string(got), "hook inbox-status")
+	settings, err := os.ReadFile(settingsPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(settings), "preserve-me")
+	assert.Contains(t, string(settings), "mcp__sage__sage_inbox")
 }
 
 // ─── Self-Heal Tests ───
