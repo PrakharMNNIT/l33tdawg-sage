@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -310,8 +311,8 @@ func TestPipeSynapseIndexIsRedefinedAcrossRestarts(t *testing.T) {
 	upgraded, err := NewSQLiteStore(ctx, dbPath)
 	require.NoError(t, err)
 	ddl := indexDDL(upgraded)
-	require.Contains(t, ddl, "source_chain_id", "the upgrade must redefine the index")
-	require.NotContains(t, ddl, "from_provider", "the stale provider restriction must not survive")
+	require.Equal(t, wantSynapseIndexWhere, normalizeIndexWhere(ddl),
+		"the upgraded index must pin the EXACT partial contract, got DDL:\n"+ddl)
 
 	// The upgraded index must actually serve the query, not merely exist.
 	base := time.Now().UTC().Truncate(time.Second)
@@ -346,8 +347,61 @@ func TestPipeSynapseIndexIsRedefinedAcrossRestarts(t *testing.T) {
 	defer restarted.Close() //nolint:errcheck
 	ddl2 := indexDDL(restarted)
 	require.Equal(t, ddl, ddl2, "a second restart must leave the index definition unchanged")
+	require.Equal(t, wantSynapseIndexWhere, normalizeIndexWhere(ddl2),
+		"the exact partial contract must survive a second restart, got DDL:\n"+ddl2)
+
+	// Semantic check after the restarts: the aggregation still answers exactly,
+	// including excluding both federated directions. The DDL assertions above
+	// pin the index CONTRACT; this pins the RESULT, and the two are independent
+	// — a widened partial index still returns correct rows, because the query's
+	// own WHERE does the filtering. That is precisely why the DDL has to be
+	// asserted exactly rather than inferred from query output.
+	seed := time.Now().UTC().Truncate(time.Second)
+	mkRow := func(id, from, to string) *PipelineMessage {
+		return &PipelineMessage{
+			PipeID: id, FromAgent: from, ToAgent: to,
+			Payload: "hi", Status: "pending",
+			CreatedAt: seed, ExpiresAt: seed.Add(time.Hour),
+		}
+	}
+	localRow := mkRow("post-local", "zoe", "yan")
+	localRow.FromProvider = "claude-code" // provider-labelled but local
+	require.NoError(t, restarted.InsertPipeline(ctx, localRow))
+	inbound := mkRow("post-in", "remote-a", "yan")
+	inbound.SourceChainID = "sage-personal-otherchain"
+	require.NoError(t, restarted.InsertPipeline(ctx, inbound))
+	outbound := mkRow("post-out", "zoe", "remote-b")
+	outbound.DestinationChainID = "sage-personal-otherchain"
+	require.NoError(t, restarted.InsertPipeline(ctx, outbound))
 
 	syn, err := restarted.GetPipeSynapses(ctx)
 	require.NoError(t, err)
-	require.NotEmpty(t, syn, "the connectome must still resolve after two restarts")
+	postEdges := make(map[string]bool, len(syn))
+	for _, e := range syn {
+		postEdges[e.FromAgent+"|"+e.ToAgent] = true
+	}
+	require.True(t, postEdges["zoe|yan"], "a provider-labelled local edge must resolve after two restarts")
+	require.False(t, postEdges["remote-a|yan"], "inbound federated must stay excluded after restarts")
+	require.False(t, postEdges["zoe|remote-b"], "outbound federated must stay excluded after restarts")
+}
+
+// wantSynapseIndexWhere is the EXACT partial restriction idx_pipe_synapse_local
+// must carry, whitespace-normalized. Asserted as an equality rather than with
+// Contains/NotContains on purpose: substring checks let a widened predicate
+// through. Dropping the destination_chain_id clause, for instance, still leaves
+// an index that EXPLAIN happily names and that produces correct query results —
+// because the query's own WHERE does the filtering — while silently admitting
+// outbound-federated rows into the index and breaking the partial/covering
+// contract the INDEXED BY hint depends on.
+const wantSynapseIndexWhere = "WHERE from_agent != '' AND to_agent != '' AND source_chain_id = '' AND destination_chain_id = ''"
+
+// normalizeIndexWhere extracts the WHERE clause from an index DDL and collapses
+// whitespace, so the assertion pins semantics rather than the formatting of the
+// CREATE INDEX statement.
+func normalizeIndexWhere(ddl string) string {
+	idx := strings.Index(ddl, "WHERE")
+	if idx < 0 {
+		return "(no WHERE clause: " + strings.Join(strings.Fields(ddl), " ") + ")"
+	}
+	return strings.Join(strings.Fields(ddl[idx:]), " ")
 }
