@@ -855,7 +855,10 @@ jobs:
           cd dist/windows-amd64
           cp "SAGE-${RELEASE_TAG}-Windows-Setup.exe" "SAGE-Windows-Setup.exe"
           for file in "SAGE-${RELEASE_TAG}-Windows-Setup.exe" \
-                      "SAGE-Windows-Setup.exe"; do
+                      "SAGE-Windows-Setup.exe" \
+                      "sage-cli.exe" \
+                      "sage-gui.exe" \
+                      "sage-launcher.exe"; do
             sha256sum "${file}" > "${file}.sha256"
             sha256sum -c "${file}.sha256"
           done
@@ -1180,6 +1183,9 @@ jobs:
             cd staged/release-assets-goreleaser
             sha256sum -c checksums.txt
           )
+          while IFS= read -r executable; do
+            test -s "${executable}.sha256"
+          done < <(find staged/release-assets-windows -maxdepth 1 -type f -name '*.exe' -print | sort)
           while IFS= read -r checksum; do
             (
               cd "$(dirname "${checksum}")"

@@ -1042,6 +1042,32 @@ test('all private artifacts converge at one publication gate', () => {
   assert.match(job('publication-gate'), /remote != local/);
 });
 
+test('every published Windows executable has a verified SHA-256 sidecar', () => {
+  const windows = job('windows-exe');
+  for (const executable of [
+    'SAGE-${RELEASE_TAG}-Windows-Setup.exe',
+    'SAGE-Windows-Setup.exe',
+    'sage-cli.exe',
+    'sage-gui.exe',
+    'sage-launcher.exe',
+  ]) {
+    assert.match(
+      windows,
+      new RegExp(`"${executable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`),
+      `Windows staging must generate a checksum for ${executable}`,
+    );
+  }
+  assert.match(windows, /sha256sum "\$\{file\}" > "\$\{file\}\.sha256"/);
+  assert.match(windows, /sha256sum -c "\$\{file\}\.sha256"/);
+
+  const publication = job('publication-gate');
+  assert.match(
+    publication,
+    /find staged\/release-assets-windows -maxdepth 1 -type f -name '\*\.exe' -print \| sort/,
+  );
+  assert.match(publication, /test -s "\$\{executable\}\.sha256"/);
+});
+
 test('public mutations are serial, resumable, and downstream of the gate', () => {
   assertNeeds('stage-github-release', ['publication-gate', 'release-metadata']);
   assert.match(job('stage-github-release'), /gh release create/);
