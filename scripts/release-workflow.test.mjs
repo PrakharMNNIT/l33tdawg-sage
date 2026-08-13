@@ -1044,6 +1044,10 @@ test('all private artifacts converge at one publication gate', () => {
 
 test('every published Windows executable has a verified SHA-256 sidecar', () => {
   const windows = job('windows-exe');
+  const checksumLoopMatch = windows.match(/for file in ([\s\S]*?); do\n([\s\S]*?)\n\s+done/);
+  assert.ok(checksumLoopMatch, 'missing Windows executable checksum loop');
+  const checksumInputs = checksumLoopMatch[1];
+  const checksumBody = checksumLoopMatch[2];
   for (const executable of [
     'SAGE-${RELEASE_TAG}-Windows-Setup.exe',
     'SAGE-Windows-Setup.exe',
@@ -1052,13 +1056,18 @@ test('every published Windows executable has a verified SHA-256 sidecar', () => 
     'sage-launcher.exe',
   ]) {
     assert.match(
-      windows,
+      checksumInputs,
       new RegExp(`"${executable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`),
       `Windows staging must generate a checksum for ${executable}`,
     );
   }
-  assert.match(windows, /sha256sum "\$\{file\}" > "\$\{file\}\.sha256"/);
-  assert.match(windows, /sha256sum -c "\$\{file\}\.sha256"/);
+  assert.equal(
+    [...checksumInputs.matchAll(/"([^"\n]+\.exe)"/g)].length,
+    5,
+    'Windows checksum loop must contain exactly the five published executables',
+  );
+  assert.match(checksumBody, /sha256sum "\$\{file\}" > "\$\{file\}\.sha256"/);
+  assert.match(checksumBody, /sha256sum -c "\$\{file\}\.sha256"/);
 
   const publication = job('publication-gate');
   assert.match(
