@@ -254,6 +254,7 @@ func TestSelfHeal_RewritesStaleUserPromptBytes(t *testing.T) {
 }`), 0600))
 
 	selfHealProject(projectDir, sageHome)
+	selfHealProject(projectDir, sageHome)
 	got, err := os.ReadFile(filepath.Join(hookDir, "sage-user-prompt.sh"))
 	require.NoError(t, err)
 	assert.Contains(t, string(got), "hook inbox-status")
@@ -264,6 +265,7 @@ func TestSelfHeal_RewritesStaleUserPromptBytes(t *testing.T) {
 	assert.Contains(t, string(settings), "custom-user-hook.sh")
 	assert.Contains(t, string(settings), "sage-custom.sh")
 	assert.Contains(t, string(settings), "custom-notify.sh")
+	assert.Equal(t, 1, strings.Count(string(settings), "sage-user-prompt.sh"), "self-heal must replace, not duplicate, its exact installed hook")
 }
 
 // ─── Self-Heal Tests ───
@@ -277,6 +279,9 @@ func TestSelfHeal_MigratesLegacyTwoScriptInstall(t *testing.T) {
 	require.NoError(t, os.MkdirAll(hookDir, 0755))
 	require.NoError(t, os.WriteFile(filepath.Join(hookDir, "sage-boot.sh"), []byte("#!/bin/bash\necho boot\n"), 0755))
 	require.NoError(t, os.WriteFile(filepath.Join(hookDir, "sage-turn.sh"), []byte("#!/bin/bash\necho turn\n"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(projectDir, ".claude", "settings.json"), []byte(`{
+  "hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/sage-boot.sh\""}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/sage-turn.sh\""}]}]}
+}`), 0600))
 
 	selfHealProject(projectDir, sageHome)
 
@@ -299,6 +304,7 @@ func TestSelfHeal_MigratesLegacyTwoScriptInstall(t *testing.T) {
 	assert.Contains(t, settings, "sage-session-start.sh")
 	assert.Contains(t, settings, "SessionEnd")
 	assert.NotContains(t, settings, "sage-boot.sh", "legacy hook should not be referenced in new config")
+	assert.NotContains(t, settings, "sage-turn.sh", "legacy hook should not be referenced in new config")
 }
 
 func TestSelfHeal_DoesNotRewriteCurrentHooks(t *testing.T) {

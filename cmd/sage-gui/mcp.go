@@ -866,6 +866,11 @@ func isInstalledSageHookCommand(command, hookDirExpr string) bool {
 			return true
 		}
 	}
+	for _, name := range []string{legacyBootScriptName, legacyTurnScriptName} {
+		if command == `bash "`+hookDirExpr+`/`+name+`"` {
+			return true
+		}
+	}
 	return false
 }
 
