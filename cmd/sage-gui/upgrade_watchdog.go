@@ -64,6 +64,13 @@ import (
 // 6<=7 ⇒ stop.)
 const upgradeTargetAppVersion uint64 = 6
 
+// upgradeWatchdogBroadcastTimeout bounds both acquisition of the per-key
+// nonce lease and the CometBFT submission performed while holding it. A
+// deadline that fires after submission begins is typed indeterminate by the
+// shared broadcaster, so the exact key and bytes remain fenced until their
+// fate is reconciled; elapsed time never releases the lease fail-open.
+const upgradeWatchdogBroadcastTimeout = 60 * time.Second
+
 // upgradeWatchdogConfig is everything the watchdog needs. Constructed
 // in runServe after the agent key is loaded and CometBFT is up.
 type upgradeWatchdogConfig struct {
@@ -73,6 +80,11 @@ type upgradeWatchdogConfig struct {
 	CometRPC      string             // e.g. "http://127.0.0.1:26657"
 	TickInterval  time.Duration      // default 30s if zero
 	Logger        zerolog.Logger
+
+	// BroadcastTimeout overrides upgradeWatchdogBroadcastTimeout in tests.
+	// Production leaves it zero so every watchdog submission uses the shared
+	// bounded default.
+	BroadcastTimeout time.Duration
 
 	// ResolveSigningKey returns the signing identity for this individual tx.
 	// The serving node wires this to consensus Root state plus the local key
@@ -115,6 +127,14 @@ type upgradeWatchdogConfig struct {
 	// watchdog goroutine before stores close. Nil keeps the historical detached
 	// goroutine behavior for short-lived tests and CLI callers.
 	StartWorker func(func())
+}
+
+func upgradeWatchdogBroadcastContext(ctx context.Context, cfg upgradeWatchdogConfig) (context.Context, context.CancelFunc) {
+	timeout := cfg.BroadcastTimeout
+	if timeout <= 0 {
+		timeout = upgradeWatchdogBroadcastTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func startUpgradeWorker(cfg upgradeWatchdogConfig, fn func()) {
@@ -356,7 +376,9 @@ func proposeForAutoAdvance(ctx context.Context, cfg upgradeWatchdogConfig, targe
 		return autoAdvanceTransient
 	}
 	var res *broadcastCommitResp
-	err = tx.WithNonceLease(ctx, signingKey, func(nonce uint64) error {
+	broadcastCtx, cancel := upgradeWatchdogBroadcastContext(ctx, cfg)
+	defer cancel()
+	err = tx.WithNonceLease(broadcastCtx, signingKey, func(nonce uint64) error {
 		ptx, buildErr := buildUpgradeProposeTxWithNonce(cfg, target, signingKey, nonce)
 		if buildErr != nil {
 			return fmt.Errorf("build propose tx: %w", buildErr)
@@ -365,7 +387,7 @@ func proposeForAutoAdvance(ctx context.Context, cfg upgradeWatchdogConfig, targe
 		if encodeErr != nil {
 			return fmt.Errorf("encode propose tx: %w", encodeErr)
 		}
-		res, buildErr = broadcastTxCommitWithSigner(ctx, cfg.CometRPC, signingKey, encoded)
+		res, buildErr = broadcastTxCommitWithSigner(broadcastCtx, cfg.CometRPC, signingKey, encoded)
 		return buildErr
 	})
 	if err != nil {
@@ -462,12 +484,14 @@ func ensureOperatorAdminRegistered(ctx context.Context, cfg upgradeWatchdogConfi
 		return
 	}
 	var res *broadcastCommitResp
-	err = tx.WithNonceLease(ctx, signingKey, func(nonce uint64) error {
+	broadcastCtx, cancel := upgradeWatchdogBroadcastContext(ctx, cfg)
+	defer cancel()
+	err = tx.WithNonceLease(broadcastCtx, signingKey, func(nonce uint64) error {
 		encoded, buildErr := buildOperatorRegisterTxWithNonce(signingKey, nonce)
 		if buildErr != nil {
 			return fmt.Errorf("build admin register tx: %w", buildErr)
 		}
-		res, buildErr = broadcastTxCommitWithSigner(ctx, cfg.CometRPC, signingKey, encoded)
+		res, buildErr = broadcastTxCommitWithSigner(broadcastCtx, cfg.CometRPC, signingKey, encoded)
 		return buildErr
 	})
 	if err != nil {
@@ -485,12 +509,14 @@ func sendHeartbeatTx(ctx context.Context, cfg upgradeWatchdogConfig) {
 	if err != nil {
 		return
 	}
-	_ = tx.WithNonceLease(ctx, signingKey, func(nonce uint64) error {
+	broadcastCtx, cancel := upgradeWatchdogBroadcastContext(ctx, cfg)
+	defer cancel()
+	_ = tx.WithNonceLease(broadcastCtx, signingKey, func(nonce uint64) error {
 		encoded, buildErr := buildOperatorRegisterTxWithNonce(signingKey, nonce)
 		if buildErr != nil {
 			return buildErr
 		}
-		_, buildErr = broadcastTxSync(ctx, cfg.CometRPC, signingKey, encoded)
+		_, buildErr = broadcastTxSync(broadcastCtx, cfg.CometRPC, signingKey, encoded)
 		return buildErr
 	})
 }
@@ -616,7 +642,9 @@ func maybeProposeUpgrade(ctx context.Context, cfg upgradeWatchdogConfig) bool {
 		return false
 	}
 	var res *broadcastSyncResp
-	err = tx.WithNonceLease(ctx, signingKey, func(nonce uint64) error {
+	broadcastCtx, cancel := upgradeWatchdogBroadcastContext(ctx, cfg)
+	defer cancel()
+	err = tx.WithNonceLease(broadcastCtx, signingKey, func(nonce uint64) error {
 		parsedTx, buildErr := buildUpgradeProposeTxWithNonce(
 			cfg, upgradeTargetAppVersion, signingKey, nonce,
 		)
@@ -627,7 +655,7 @@ func maybeProposeUpgrade(ctx context.Context, cfg upgradeWatchdogConfig) bool {
 		if encodeErr != nil {
 			return fmt.Errorf("encode propose tx: %w", encodeErr)
 		}
-		res, buildErr = broadcastTxSync(ctx, cfg.CometRPC, signingKey, encoded)
+		res, buildErr = broadcastTxSync(broadcastCtx, cfg.CometRPC, signingKey, encoded)
 		return buildErr
 	})
 	if err != nil {
