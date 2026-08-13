@@ -513,7 +513,7 @@ func installClaudeHooks(projectDir, sageHome string) error {
 		_ = json.Unmarshal(existing, &settings)
 	}
 
-	settings["hooks"] = sageHooksConfig("${CLAUDE_PROJECT_DIR}/.claude/hooks")
+	settings["hooks"] = mergeSageHooksConfig(settings["hooks"], "${CLAUDE_PROJECT_DIR}/.claude/hooks")
 	settings["permissions"] = sagePermissionsConfig(settings)
 
 	data, err := json.MarshalIndent(settings, "", "  ")
@@ -639,7 +639,7 @@ func syncClaudeSettings(projectDir string) error {
 	if readErr == nil {
 		_ = json.Unmarshal(existing, &settings)
 	}
-	settings["hooks"] = sageHooksConfig("${CLAUDE_PROJECT_DIR}/.claude/hooks")
+	settings["hooks"] = mergeSageHooksConfig(settings["hooks"], "${CLAUDE_PROJECT_DIR}/.claude/hooks")
 	settings["permissions"] = sagePermissionsConfig(settings)
 	data, marshalErr := json.MarshalIndent(settings, "", "  ")
 	if marshalErr != nil {
@@ -809,6 +809,33 @@ func sageHooksConfig(hookDirExpr string) map[string]any {
 			map[string]any{"hooks": stop},
 		},
 	}
+}
+
+// mergeSageHooksConfig replaces only installer-owned SAGE hook entries and
+// preserves unrelated user hooks under the same Claude lifecycle events.
+func mergeSageHooksConfig(existing any, hookDirExpr string) map[string]any {
+	merged := make(map[string]any)
+	if current, ok := existing.(map[string]any); ok {
+		for event, value := range current {
+			merged[event] = value
+		}
+	}
+	for event, desired := range sageHooksConfig(hookDirExpr) {
+		var kept []any
+		if entries, ok := merged[event].([]any); ok {
+			for _, entry := range entries {
+				raw, _ := json.Marshal(entry)
+				if !bytes.Contains(raw, []byte("/.claude/hooks/sage-")) {
+					kept = append(kept, entry)
+				}
+			}
+		}
+		if entries, ok := desired.([]any); ok {
+			kept = append(kept, entries...)
+		}
+		merged[event] = kept
+	}
+	return merged
 }
 
 // sagePermissionsConfig returns permissions with SAGE MCP tools allowed,

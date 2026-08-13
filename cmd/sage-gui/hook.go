@@ -100,13 +100,16 @@ const (
 // can say that the check was unavailable instead of manufacturing a zero.
 func runHookInboxStatus() error {
 	var inbox struct {
-		Count  int  `json:"count"`
-		Unread bool `json:"unread"`
+		Count  *int  `json:"count"`
+		Unread *bool `json:"unread"`
 	}
 	if err := hookSignedJSON(http.MethodGet, "/v1/pipe/history/inbox?count_only=1", nil, &inbox); err != nil {
 		return fmt.Errorf("inbox status unavailable: %w", err)
 	}
-	if !inbox.Unread || inbox.Count <= 0 {
+	if inbox.Count == nil || inbox.Unread == nil || *inbox.Count < 0 || (*inbox.Count > 0) != *inbox.Unread {
+		return fmt.Errorf("inbox status unavailable: invalid count probe response")
+	}
+	if *inbox.Count == 0 {
 		return nil
 	}
 	seed, err := loadHookSeed()
@@ -116,7 +119,7 @@ func runHookInboxStatus() error {
 	priv := ed25519.NewKeyFromSeed(seed)
 	pub, _ := priv.Public().(ed25519.PublicKey) //nolint:errcheck
 	fmt.Printf("SAGE inbox: %d unread item(s) for exact agent %s (runtime %s). Call sage_inbox with a fresh poll before reporting no new messages.\n",
-		inbox.Count, hex.EncodeToString(pub), version)
+		*inbox.Count, hex.EncodeToString(pub), version)
 	return nil
 }
 

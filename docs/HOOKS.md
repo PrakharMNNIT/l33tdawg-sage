@@ -17,7 +17,7 @@ The hooks under `.claude/` here are what the SAGE maintainers use day-to-day. Yo
 | `SessionStart` (startup, resume, compact) | `sage-session-start.sh` | **direct-write** | Calls `sage-gui hook session-start`, which pre-fetches recent committed memories and emits them as a context block the agent reads on boot. Falls back to the soft-nudge boot-check if the SAGE node isn't reachable or the agent key isn't readable. |
 | `SessionEnd` | `sage-session-end.sh` | **direct-write** | Calls `sage-gui hook session-end`, which submits a `session-lifecycle` observation memory through full BFT consensus so the timeline shows session bookends. Soft-fails silently if SAGE isn't reachable — never blocks the agent's exit path. |
 | `PreCompact` | `sage-pre-compact.sh` | nudge | Fires right before Claude Code compresses the context. Turn-level detail is about to be discarded — this nudge prompts the agent to call `sage_reflect` (and any `sage_remember` for durable facts) while context is still fresh. |
-| `UserPromptSubmit` | `sage-user-prompt.sh` | nudge | Light reminder to call `sage_turn` early in the response, capturing the new conversational state. |
+| `UserPromptSubmit` | `sage-user-prompt.sh` | passive pointer + nudge | In `full` and `bookend`, calls `sage-gui hook inbox-status` to surface a payload-free exact-agent unread count without claiming work. `full` also reminds the agent to call `sage_turn`; `bookend` suppresses only that memory nudge. Probe failures are reported as unavailable, never as zero. |
 | `Stop` / `SubagentStop` | `sage-stop.sh` | reserved | No-op placeholder. Fires per-turn (and per-subagent), too high-frequency for direct-write without batching. |
 
 ### How the direct-write hooks work
@@ -27,7 +27,7 @@ Both direct-write scripts shell out to the `sage-gui hook` subcommand. The scrip
 1. Resolves the same ordinary-agent Ed25519 key as the paired MCP process (`SAGE_IDENTITY_PATH`, `SAGE_AGENT_KEY`, or the per-workspace identity). A missing or malformed project key fails closed; hooks never fall back to the CEREBRUM Root/operator key.
 2. Builds the canonical signed-request headers SAGE's REST middleware expects (`X-Agent-ID`, `X-Signature`, `X-Timestamp`).
 3. POSTs / GETs against `http://localhost:8080` (override with `SAGE_URL`) with a tight timeout.
-4. Soft-fails silently if any of those steps fail — the agent never sees an error from a missing SAGE node.
+4. Session boundary operations soft-fail through their safe wrapper behavior. The inbox-status wrapper is deliberately fail-visible: it says the check is unavailable and never manufactures a zero count.
 
 Earlier releases shelled out to a bundled `lib/sage_direct.py`. As of **v8.0** the logic ships inside the `sage-gui` binary itself, so the hooks no longer depend on a Python interpreter or `pynacl`.
 
@@ -36,7 +36,7 @@ Earlier releases shelled out to a bundled `lib/sage_direct.py`. As of **v8.0** t
 Every script reads `~/.sage/memory_mode` and adapts:
 
 - **`full`** (default) — all hooks fire; nudges encourage `sage_turn` on every turn.
-- **`bookend`** — SessionStart still prefetches, but the per-turn `sage_turn` nudges are suppressed; the agent only reflects at the end of significant tasks. SessionStart appends a `SAGE MODE: bookend` notice so the agent knows.
+- **`bookend`** — SessionStart still prefetches and UserPromptSubmit still checks the exact-agent inbox, but the per-turn `sage_turn` nudges are suppressed; the agent only reflects at the end of significant tasks. SessionStart appends a `SAGE MODE: bookend` notice so the agent knows.
 - **`on-demand`** — automatic memory calls are skipped entirely; the agent drives `sage_recall` / `sage_reflect` explicitly.
 
 ### Read scope on multi-agent nodes
@@ -65,7 +65,7 @@ Comment out or remove the matching event entry in `.claude/settings.json`. Hooks
 
 ## Mixed model
 
-SAGE ships **two SessionStart/SessionEnd direct-write hooks** plus **nudge hooks** for the events where direct-write would be too noisy (`UserPromptSubmit`, `PreCompact`) or too high-frequency without batching (`Stop` / `SubagentStop`). The mix lets capture happen automatically at the session boundary, while the conversation-level memory remains the agent's job (via `sage_turn`, `sage_reflect`) since only the LLM has enough context to distill what's actually worth remembering. The `memory_mode` flag (above) tunes how aggressively the nudges fire.
+SAGE ships **two SessionStart/SessionEnd direct-write hooks**, a payload-free exact-agent inbox pointer on `UserPromptSubmit`, and **nudge hooks** where direct-write would be too noisy (`UserPromptSubmit`, `PreCompact`) or too high-frequency without batching (`Stop` / `SubagentStop`). The inbox pointer never claims or exposes messages. Conversation-level memory remains the agent's job (via `sage_turn`, `sage_reflect`) since only the LLM has enough context to distill what's worth remembering. The `memory_mode` flag tunes memory nudges independently from coordination visibility.
 
 ## Forward direction
 

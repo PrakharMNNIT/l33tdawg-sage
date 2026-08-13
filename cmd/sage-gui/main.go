@@ -302,6 +302,7 @@ MCP Subcommands:
 Hook Subcommands (invoked by .claude/hooks/*.sh or .codex/hooks/*.sh):
   hook session-start   Pre-fetch recent memories; emit context block on stdout
   hook session-end     Post a session-lifecycle observation
+  hook inbox-status    Emit an exact-agent, payload-free unread-work pointer
 
 Codex Subcommands:
   codex install     Install .codex/config.toml + hooks + AGENTS.md in the current project`)

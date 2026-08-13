@@ -185,6 +185,19 @@ func TestHookInboxStatusZeroIsSilentAndFailureIsNotZero(t *testing.T) {
 	assert.NotContains(t, err.Error(), "count 0")
 }
 
+func TestHookInboxStatusRejectsIncompleteOrInconsistentProbe(t *testing.T) {
+	for _, body := range []string{`{"count":2}`, `{"unread":true}`, `{"count":2,"unread":false}`, `{"count":0,"unread":true}`} {
+		t.Run(body, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
+			defer srv.Close()
+			withTestSageEnv(t, srv.URL)
+			err := runHookInboxStatus()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid count probe response")
+		})
+	}
+}
+
 func writeHookTestSeed(t *testing.T, path string) []byte {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
