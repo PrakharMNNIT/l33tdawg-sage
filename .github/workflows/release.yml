@@ -1184,7 +1184,12 @@ jobs:
             sha256sum -c checksums.txt
           )
           while IFS= read -r executable; do
-            test -s "${executable}.sha256"
+            checksum="${executable}.sha256"
+            test -f "${checksum}" && test ! -L "${checksum}" && test -s "${checksum}"
+            read -r published_hash published_name checksum_extra < "${checksum}"
+            test -z "${checksum_extra:-}"
+            test "${published_name}" = "$(basename "${executable}")"
+            test "${published_hash}" = "$(sha256sum "${executable}" | awk '{print $1}')"
           done < <(find staged/release-assets-windows -maxdepth 1 -type f -name '*.exe' -print | sort)
           while IFS= read -r checksum; do
             (

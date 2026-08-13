@@ -1065,7 +1065,12 @@ test('every published Windows executable has a verified SHA-256 sidecar', () => 
     publication,
     /find staged\/release-assets-windows -maxdepth 1 -type f -name '\*\.exe' -print \| sort/,
   );
-  assert.match(publication, /test -s "\$\{executable\}\.sha256"/);
+  assert.match(publication, /checksum="\$\{executable\}\.sha256"/);
+  assert.match(publication, /test -f "\$\{checksum\}" && test ! -L "\$\{checksum\}" && test -s "\$\{checksum\}"/);
+  assert.match(publication, /read -r published_hash published_name checksum_extra < "\$\{checksum\}"/);
+  assert.match(publication, /test -z "\$\{checksum_extra:-\}"/);
+  assert.match(publication, /test "\$\{published_name\}" = "\$\(basename "\$\{executable\}"\)"/);
+  assert.match(publication, /test "\$\{published_hash\}" = "\$\(sha256sum "\$\{executable\}" \| awk '\{print \$1\}'\)"/);
 });
 
 test('public mutations are serial, resumable, and downstream of the gate', () => {
