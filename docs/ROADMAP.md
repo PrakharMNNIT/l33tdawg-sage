@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.9 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.10 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -35,12 +35,39 @@ instead of reporting a false empty page. v11.18.9 types every ambiguous shared
 Comet commit or sync outcome as indeterminate, fails closed if federation sync
 ever receives neither a result nor an error, and pins the deliberate decoder
 differences between the shared transaction package and CEREBRUM. The supported
-consensus ceiling remains app-v26; **v11.18.9 does not introduce app-v27**.
+v11.18.10 message control plane attributes every claim to an opaque MCP session,
+supports compare-and-swap ownership handoff, rejects replies from a stale former
+owner, and preserves passive recovery after a lost response. CEREBRUM also
+projects its RBAC-filtered agent channels as a traffic-weighted 3D connectome.
+The supported consensus ceiling remains app-v26; **v11.18.10 does not introduce
+app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.10 patch
+
+Canonical message claims now record an opaque claimant-session identity rather
+than only the shared agent identity. Concurrent runtimes still get exactly one
+claim winner; passive history exposes the winning session, an explicit atomic
+handoff compare-and-swaps ownership, and stale sessions cannot complete work
+after handoff. Receive-token replay and legacy direct-client compatibility are
+preserved.
+
+CEREBRUM adds an operator connectome mode backed by the existing
+`/v1/dashboard/network/synapses` projection. Agents render as neurons and
+directed message channels as traffic-weighted synapses, with both-endpoint RBAC
+filtering preserved. Mode requests are generation-fenced so slow or reordered
+responses cannot cross the memory/connectome boundary. This patch introduces
+no new consensus application version or state migration: app-v26 remains the
+ceiling and v11.18.10 does not introduce app-v27.
+
+The upgrade watchdog now applies one bounded context across nonce-lease
+acquisition and each of its four CometBFT broadcasts. Deadline expiry after a
+submission begins stays typed indeterminate and retains the exact signer/bytes
+fence; the lease is never released merely because time elapsed.
 
 ## v11.18.9 patch
 

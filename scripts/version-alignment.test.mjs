@@ -73,6 +73,22 @@ test('release-facing version metadata stays aligned', () => {
   }
 });
 
+test('upgrade release table stays in ascending semantic-version order', () => {
+  const releases = [...read('docs/UPGRADING.md').matchAll(/^\| v(\d+)\.(\d+)\.(\d+) \|/gm)]
+    .map((match) => match.slice(1).map(Number));
+  assert.ok(releases.length > 1, 'docs/UPGRADING.md is missing the release table');
+  for (let index = 1; index < releases.length; index += 1) {
+    const previous = releases[index - 1];
+    const current = releases[index];
+    assert.ok(
+      current[0] > previous[0]
+        || (current[0] === previous[0] && current[1] > previous[1])
+        || (current[0] === previous[0] && current[1] === previous[1] && current[2] > previous[2]),
+      `docs/UPGRADING.md release table is out of order: v${previous.join('.')} before v${current.join('.')}`,
+    );
+  }
+});
+
 test('v11.18 user, recovery, federation, and SDK guides stay aligned', () => {
   const architecture = read('docs/ARCHITECTURE.md');
   const roadmap = read('docs/ROADMAP.md');
