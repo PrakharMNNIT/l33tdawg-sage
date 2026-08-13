@@ -186,7 +186,7 @@ func TestHookInboxStatusZeroIsSilentAndFailureIsNotZero(t *testing.T) {
 }
 
 func TestHookInboxStatusRejectsIncompleteOrInconsistentProbe(t *testing.T) {
-	for _, body := range []string{`{"count":2}`, `{"unread":true}`, `{"count":2,"unread":false}`, `{"count":0,"unread":true}`} {
+	for _, body := range []string{`{"count":2}`, `{"unread":true}`, `{"count":2,"unread":false}`, `{"count":0,"unread":true}`, `{"count":-1,"unread":false}`} {
 		t.Run(body, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
 			defer srv.Close()

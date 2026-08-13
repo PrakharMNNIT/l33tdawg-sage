@@ -250,7 +250,7 @@ func TestSelfHeal_RewritesStaleUserPromptBytes(t *testing.T) {
 	require.NoError(t, os.WriteFile(settingsPath, []byte(`{
   "custom":"preserve-me",
   "permissions":{"allow":["mcp__other__tool"]},
-  "hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"bash custom-user-hook.sh"}]}],"Notification":[{"hooks":[{"type":"command","command":"bash custom-notify.sh"}]}]}
+  "hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/sage-user-prompt.sh\""},{"type":"command","command":"bash custom-user-hook.sh"},{"type":"command","command":"bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/sage-custom.sh\""}]}],"Notification":[{"hooks":[{"type":"command","command":"bash custom-notify.sh"}]}]}
 }`), 0600))
 
 	selfHealProject(projectDir, sageHome)
@@ -262,6 +262,7 @@ func TestSelfHeal_RewritesStaleUserPromptBytes(t *testing.T) {
 	assert.Contains(t, string(settings), "preserve-me")
 	assert.Contains(t, string(settings), "mcp__sage__sage_inbox")
 	assert.Contains(t, string(settings), "custom-user-hook.sh")
+	assert.Contains(t, string(settings), "sage-custom.sh")
 	assert.Contains(t, string(settings), "custom-notify.sh")
 }
 

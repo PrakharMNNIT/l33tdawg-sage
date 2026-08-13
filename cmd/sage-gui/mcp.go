@@ -824,9 +824,31 @@ func mergeSageHooksConfig(existing any, hookDirExpr string) map[string]any {
 		var kept []any
 		if entries, ok := merged[event].([]any); ok {
 			for _, entry := range entries {
-				raw, _ := json.Marshal(entry)
-				if !bytes.Contains(raw, []byte("/.claude/hooks/sage-")) {
+				entryMap, ok := entry.(map[string]any)
+				if !ok {
 					kept = append(kept, entry)
+					continue
+				}
+				hooks, ok := entryMap["hooks"].([]any)
+				if !ok {
+					kept = append(kept, entry)
+					continue
+				}
+				filtered := make([]any, 0, len(hooks))
+				for _, hook := range hooks {
+					hookMap, ok := hook.(map[string]any)
+					command, _ := hookMap["command"].(string)
+					if !ok || !isInstalledSageHookCommand(command, hookDirExpr) {
+						filtered = append(filtered, hook)
+					}
+				}
+				if len(filtered) > 0 {
+					copyEntry := make(map[string]any, len(entryMap))
+					for key, value := range entryMap {
+						copyEntry[key] = value
+					}
+					copyEntry["hooks"] = filtered
+					kept = append(kept, copyEntry)
 				}
 			}
 		}
@@ -836,6 +858,15 @@ func mergeSageHooksConfig(existing any, hookDirExpr string) map[string]any {
 		merged[event] = kept
 	}
 	return merged
+}
+
+func isInstalledSageHookCommand(command, hookDirExpr string) bool {
+	for name := range hookScriptSet() {
+		if command == `bash "`+hookDirExpr+`/`+name+`"` {
+			return true
+		}
+	}
+	return false
 }
 
 // sagePermissionsConfig returns permissions with SAGE MCP tools allowed,
