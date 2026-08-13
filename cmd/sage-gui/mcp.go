@@ -96,10 +96,23 @@ echo "MANDATORY before compaction: Call sage_reflect with a concise summary of (
 
 const sageUserPromptScript = `#!/bin/bash
 # SAGE UserPromptSubmit hook — fires when the user submits a new prompt.
-# Soft nudge so the agent calls sage_turn early in its response.
+# Always surface payload-free coordination in automated modes. Memory cadence
+# remains mode-specific, but bookend must not hide newly delivered work.
 SAGE_HOME="${SAGE_HOME:-$HOME/.sage}"
 MODE=$(cat "$SAGE_HOME/memory_mode" 2>/dev/null || echo "full")
-if [ "$MODE" = "on-demand" ] || [ "$MODE" = "bookend" ]; then
+SAGE_GUI_BIN="${SAGE_GUI_BIN:-__SAGE_GUI_BIN__}"
+SAGE_PROVIDER="__SAGE_PROVIDER__"
+SAGE_IDENTITY_PATH="__SAGE_IDENTITY_PATH__"
+export SAGE_PROVIDER SAGE_IDENTITY_PATH
+if [ "$MODE" = "on-demand" ]; then
+    exit 0
+fi
+if [ -x "$SAGE_GUI_BIN" ]; then
+    if ! "$SAGE_GUI_BIN" hook inbox-status 2>/dev/null; then
+        echo "SAGE inbox check unavailable — do not treat this as zero messages. Call sage_inbox directly."
+    fi
+fi
+if [ "$MODE" = "bookend" ]; then
     exit 0
 fi
 echo "Reminder: call sage_turn early in your response with the topic + an observation of what just happened. Memories you don't store don't survive."
@@ -500,7 +513,7 @@ func installClaudeHooks(projectDir, sageHome string) error {
 		_ = json.Unmarshal(existing, &settings)
 	}
 
-	settings["hooks"] = sageHooksConfig("${CLAUDE_PROJECT_DIR}/.claude/hooks")
+	settings["hooks"] = mergeSageHooksConfig(settings["hooks"], "${CLAUDE_PROJECT_DIR}/.claude/hooks")
 	settings["permissions"] = sagePermissionsConfig(settings)
 
 	data, err := json.MarshalIndent(settings, "", "  ")
@@ -545,10 +558,8 @@ func shellDoubleQuote(value string) string {
 // the current installer's 5-script direct-write set.
 //
 // Decision matrix:
-//   - Any expected script missing OR every existing script lacks the current
-//     binary path → re-write the full set and re-wire settings.json.
-//   - All expected scripts present AND at least one references the right
-//     binary path → leave alone.
+//   - Any expected script missing or differing from the current rendered bytes
+//     rewrites the installer-owned set and re-wires settings.json.
 //
 // We compare against the *current* binary path because users upgrade
 // sage-gui by replacing it in place, but also by installing a new version
@@ -564,9 +575,8 @@ func healHooks(projectDir, hookDir, identityPath string) error {
 	}
 	expected := hookScriptSet()
 	needsRewrite := false
-	hasBinRef := false
 	anyScriptExisted := false
-	for name := range expected {
+	for name, tpl := range expected {
 		path := filepath.Join(hookDir, name)
 		data, readErr := os.ReadFile(path) //nolint:gosec // path is inside project's .claude/hooks
 		if readErr != nil {
@@ -574,10 +584,8 @@ func healHooks(projectDir, hookDir, identityPath string) error {
 			continue
 		}
 		anyScriptExisted = true
-		if strings.Contains(string(data), binPath) {
-			hasBinRef = true
-		}
-		if hookUsesDirectWriteIdentity(name) && (!strings.Contains(string(data), `SAGE_PROVIDER="claude-code"`) || !strings.Contains(string(data), identityPath)) {
+		want := renderHookScript(tpl, binPath, "claude-code", identityPath)
+		if string(data) != want {
 			needsRewrite = true
 		}
 	}
@@ -591,7 +599,7 @@ func healHooks(projectDir, hookDir, identityPath string) error {
 		}
 	}
 
-	if !needsRewrite && hasBinRef && !legacyDetected {
+	if !needsRewrite && !legacyDetected {
 		// Hook bytes can already be current while the generated permissions
 		// still advertise a retired/hidden tool from an older installer. Keep
 		// settings synchronized independently of whether scripts need repair.
@@ -631,7 +639,7 @@ func syncClaudeSettings(projectDir string) error {
 	if readErr == nil {
 		_ = json.Unmarshal(existing, &settings)
 	}
-	settings["hooks"] = sageHooksConfig("${CLAUDE_PROJECT_DIR}/.claude/hooks")
+	settings["hooks"] = mergeSageHooksConfig(settings["hooks"], "${CLAUDE_PROJECT_DIR}/.claude/hooks")
 	settings["permissions"] = sagePermissionsConfig(settings)
 	data, marshalErr := json.MarshalIndent(settings, "", "  ")
 	if marshalErr != nil {
@@ -803,6 +811,69 @@ func sageHooksConfig(hookDirExpr string) map[string]any {
 	}
 }
 
+// mergeSageHooksConfig replaces only installer-owned SAGE hook entries and
+// preserves unrelated user hooks under the same Claude lifecycle events.
+func mergeSageHooksConfig(existing any, hookDirExpr string) map[string]any {
+	merged := make(map[string]any)
+	if current, ok := existing.(map[string]any); ok {
+		for event, value := range current {
+			merged[event] = value
+		}
+	}
+	for event, desired := range sageHooksConfig(hookDirExpr) {
+		var kept []any
+		if entries, ok := merged[event].([]any); ok {
+			for _, entry := range entries {
+				entryMap, ok := entry.(map[string]any)
+				if !ok {
+					kept = append(kept, entry)
+					continue
+				}
+				hooks, ok := entryMap["hooks"].([]any)
+				if !ok {
+					kept = append(kept, entry)
+					continue
+				}
+				filtered := make([]any, 0, len(hooks))
+				for _, hook := range hooks {
+					hookMap, ok := hook.(map[string]any)
+					command, _ := hookMap["command"].(string)
+					if !ok || !isInstalledSageHookCommand(command, hookDirExpr) {
+						filtered = append(filtered, hook)
+					}
+				}
+				if len(filtered) > 0 {
+					copyEntry := make(map[string]any, len(entryMap))
+					for key, value := range entryMap {
+						copyEntry[key] = value
+					}
+					copyEntry["hooks"] = filtered
+					kept = append(kept, copyEntry)
+				}
+			}
+		}
+		if entries, ok := desired.([]any); ok {
+			kept = append(kept, entries...)
+		}
+		merged[event] = kept
+	}
+	return merged
+}
+
+func isInstalledSageHookCommand(command, hookDirExpr string) bool {
+	for name := range hookScriptSet() {
+		if command == `bash "`+hookDirExpr+`/`+name+`"` {
+			return true
+		}
+	}
+	for _, name := range []string{legacyBootScriptName, legacyTurnScriptName} {
+		if command == `bash "`+hookDirExpr+`/`+name+`"` {
+			return true
+		}
+	}
+	return false
+}
+
 // sagePermissionsConfig returns permissions with SAGE MCP tools allowed,
 // preserving any existing permissions the user already has.
 func sagePermissionsConfig(settings map[string]any) map[string]any {
@@ -821,6 +892,11 @@ func sagePermissionsConfig(settings map[string]any) map[string]any {
 		"mcp__sage__sage_register",
 		"mcp__sage__sage_rename",
 		"mcp__sage__sage_timeline",
+		"mcp__sage__sage_inbox",
+		"mcp__sage__sage_messages_receive",
+		"mcp__sage__sage_message_history",
+		"mcp__sage__sage_message_replies",
+		"mcp__sage__sage_message_status",
 	}
 
 	perms := make(map[string]any)
