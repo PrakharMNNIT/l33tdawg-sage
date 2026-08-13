@@ -1042,6 +1042,49 @@ test('all private artifacts converge at one publication gate', () => {
   assert.match(job('publication-gate'), /remote != local/);
 });
 
+test('every published Windows executable has a verified SHA-256 sidecar', () => {
+  const windows = job('windows-exe');
+  const checksumLoopMatch = windows.match(/for file in ([\s\S]*?); do\n([\s\S]*?)\n\s+done/);
+  assert.ok(checksumLoopMatch, 'missing Windows executable checksum loop');
+  const checksumInputs = checksumLoopMatch[1];
+  const checksumBody = checksumLoopMatch[2];
+  for (const executable of [
+    'SAGE-${RELEASE_TAG}-Windows-Setup.exe',
+    'SAGE-Windows-Setup.exe',
+    'sage-cli.exe',
+    'sage-gui.exe',
+    'sage-launcher.exe',
+  ]) {
+    assert.match(
+      checksumInputs,
+      new RegExp(`"${executable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`),
+      `Windows staging must generate a checksum for ${executable}`,
+    );
+  }
+  assert.equal(
+    [...checksumInputs.matchAll(/"([^"\n]+\.exe)"/g)].length,
+    5,
+    'Windows checksum loop must contain exactly the five published executables',
+  );
+  assert.match(checksumBody, /sha256sum "\$\{file\}" > "\$\{file\}\.sha256"/);
+  assert.match(checksumBody, /sha256sum -c "\$\{file\}\.sha256"/);
+
+  const publication = job('publication-gate');
+  assert.match(
+    publication,
+    /find staged\/release-assets-windows -maxdepth 1 -type f -name '\*\.exe' -print \| sort/,
+  );
+  assert.match(publication, /checksum="\$\{executable\}\.sha256"/);
+  assert.match(publication, /^\s+test -f "\$\{checksum\}"$/m);
+  assert.match(publication, /^\s+test ! -L "\$\{checksum\}"$/m);
+  assert.match(publication, /^\s+test -s "\$\{checksum\}"$/m);
+  assert.doesNotMatch(publication, /test -f "\$\{checksum\}"\s*&&/);
+  assert.match(publication, /read -r published_hash published_name checksum_extra < "\$\{checksum\}"/);
+  assert.match(publication, /test -z "\$\{checksum_extra:-\}"/);
+  assert.match(publication, /test "\$\{published_name\}" = "\$\(basename "\$\{executable\}"\)"/);
+  assert.match(publication, /test "\$\{published_hash\}" = "\$\(sha256sum "\$\{executable\}" \| awk '\{print \$1\}'\)"/);
+});
+
 test('public mutations are serial, resumable, and downstream of the gate', () => {
   assertNeeds('stage-github-release', ['publication-gate', 'release-metadata']);
   assert.match(job('stage-github-release'), /gh release create/);
