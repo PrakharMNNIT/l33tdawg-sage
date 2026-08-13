@@ -7733,7 +7733,12 @@ function ChainActivityLog({ sse }) {
                         const info = typeIcons[ev.type] || typeIcons.connection;
                         const isExpanded = expandedEvent === ev.id;
                         const accessDetail = ev.type === 'access' ? ev.data?.data : null;
-                        const hasDetail = ev.data?.data?.full_content || ev.data?.data?.retrieved || accessDetail;
+                        // NOTE: `retrieved` is deliberately absent. Retrieval activity events are
+                        // contentless by design — recall/search/hybrid results are filtered per
+                        // CALLER, while this stream is a global fan-out, so result bodies must
+                        // never be published to it. Keeping the branch alive here would silently
+                        // start rendering plaintext again the moment a payload reappeared.
+                        const hasDetail = ev.data?.data?.full_content || accessDetail;
                         return html`
                             <div class="chain-event ${isExpanded ? 'expanded' : ''}" key=${ev.id}
                                  onClick=${() => hasDetail && setExpandedEvent(isExpanded ? null : ev.id)}>
@@ -7755,20 +7760,6 @@ function ChainActivityLog({ sse }) {
                                         <div style="display:flex;gap:12px;margin-top:4px;">
                                             ${ev.data.data.memory_type ? html`<span style="font-size:10px;color:var(--text-muted);">Type: <strong>${ev.data.data.memory_type}</strong></span>` : ''}
                                             ${ev.data.data.confidence ? html`<span style="font-size:10px;color:var(--text-muted);">Confidence: <strong>${(ev.data.data.confidence * 100).toFixed(0)}%</strong></span>` : ''}
-                                        </div>
-                                    </div>
-                                ` : ''}
-                                ${isExpanded && ev.type === 'recall' && ev.data?.data?.retrieved ? html`
-                                    <div class="chain-event-expand" onClick=${(e) => e.stopPropagation()}>
-                                        <div class="chain-event-expand-label">Retrieved Memories (${ev.data.data.retrieved.length})</div>
-                                        <div class="chain-event-retrieved">
-                                            ${ev.data.data.retrieved.map((m, i) => html`
-                                                <div class="chain-event-retrieved-item" key=${i}>
-                                                    <code>${m.memory_id?.slice(0, 8)}...</code>
-                                                    <span class="chain-event-domain" style="font-size:9px;">${m.domain}</span>
-                                                    <span class="retrieved-content">${m.content?.slice(0, 150)}${m.content?.length > 150 ? '...' : ''}</span>
-                                                </div>
-                                            `)}
                                         </div>
                                     </div>
                                 ` : ''}

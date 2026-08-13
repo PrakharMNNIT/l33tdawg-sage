@@ -1986,24 +1986,15 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 
 	// Emit recall event for SSE chain activity log with full retrieved memory details
 	if s.OnEvent != nil && len(results) > 0 {
-		domain := req.DomainTag
-		if domain == "" && len(results) > 0 {
-			domain = results[0].DomainTag
-		}
-		// Build rich detail for expandable chain activity rows
-		retrieved := make([]map[string]any, 0, len(results))
-		for _, r := range results {
-			retrieved = append(retrieved, map[string]any{
-				"memory_id":  r.MemoryID,
-				"content":    r.Content,
-				"domain":     r.DomainTag,
-				"confidence": r.ConfidenceScore,
-				"type":       r.MemoryType,
-			})
-		}
-		s.OnEvent("recall", "", domain, fmt.Sprintf("%d memories retrieved", len(results)), map[string]any{
-			"retrieved": retrieved,
-		})
+		// CONTENTLESS BY CONSTRUCTION. These results were already filtered by
+		// THIS caller's clearance and domain ACL, and SSEBroadcaster is a global
+		// fan-out with no subscriber identity — web/sse.go Subscribe() takes no
+		// arguments and Broadcast sends identical bytes to every client — so
+		// anything placed here is republished to every connected dashboard.
+		// Only the event type and a result COUNT may cross this boundary: never
+		// memory ids, content, confidence or type, and never the caller-derived
+		// domain, which is itself authorization-scoped metadata.
+		emitContentlessRetrievalActivity(s.OnEvent, "recall", len(results))
 	}
 
 	resp := QueryMemoryResponse{
@@ -2707,23 +2698,15 @@ func (s *Server) handleSearchMemory(w http.ResponseWriter, r *http.Request) {
 
 	// Emit search event for SSE chain activity log
 	if s.OnEvent != nil && len(results) > 0 {
-		domain := req.DomainTag
-		if domain == "" && len(results) > 0 {
-			domain = results[0].DomainTag
-		}
-		retrieved := make([]map[string]any, 0, len(results))
-		for _, r := range results {
-			retrieved = append(retrieved, map[string]any{
-				"memory_id":  r.MemoryID,
-				"content":    r.Content,
-				"domain":     r.DomainTag,
-				"confidence": r.ConfidenceScore,
-				"type":       r.MemoryType,
-			})
-		}
-		s.OnEvent("search", "", domain, fmt.Sprintf("%d memories found via text search", len(results)), map[string]any{
-			"retrieved": retrieved,
-		})
+		// CONTENTLESS BY CONSTRUCTION. These results were already filtered by
+		// THIS caller's clearance and domain ACL, and SSEBroadcaster is a global
+		// fan-out with no subscriber identity — web/sse.go Subscribe() takes no
+		// arguments and Broadcast sends identical bytes to every client — so
+		// anything placed here is republished to every connected dashboard.
+		// Only the event type and a result COUNT may cross this boundary: never
+		// memory ids, content, confidence or type, and never the caller-derived
+		// domain, which is itself authorization-scoped metadata.
+		emitContentlessRetrievalActivity(s.OnEvent, "search", len(results))
 	}
 
 	resp := QueryMemoryResponse{
@@ -3043,23 +3026,15 @@ func (s *Server) handleHybridSearchMemory(w http.ResponseWriter, r *http.Request
 	}
 
 	if s.OnEvent != nil && len(results) > 0 {
-		domain := req.DomainTag
-		if domain == "" {
-			domain = results[0].DomainTag
-		}
-		retrieved := make([]map[string]any, 0, len(results))
-		for _, r := range results {
-			retrieved = append(retrieved, map[string]any{
-				"memory_id":  r.MemoryID,
-				"content":    r.Content,
-				"domain":     r.DomainTag,
-				"confidence": r.ConfidenceScore,
-				"type":       r.MemoryType,
-			})
-		}
-		s.OnEvent("hybrid", "", domain, fmt.Sprintf("%d memories retrieved via hybrid search", len(results)), map[string]any{
-			"retrieved": retrieved,
-		})
+		// CONTENTLESS BY CONSTRUCTION. These results were already filtered by
+		// THIS caller's clearance and domain ACL, and SSEBroadcaster is a global
+		// fan-out with no subscriber identity — web/sse.go Subscribe() takes no
+		// arguments and Broadcast sends identical bytes to every client — so
+		// anything placed here is republished to every connected dashboard.
+		// Only the event type and a result COUNT may cross this boundary: never
+		// memory ids, content, confidence or type, and never the caller-derived
+		// domain, which is itself authorization-scoped metadata.
+		emitContentlessRetrievalActivity(s.OnEvent, "hybrid", len(results))
 	}
 
 	resp := QueryMemoryResponse{
