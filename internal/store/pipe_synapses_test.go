@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -234,31 +235,119 @@ func TestGetPipeSynapsesStillExcludesCrossChainEdges(t *testing.T) {
 	require.Len(t, syn, 1, "exactly the local edge survives, got: %v", edges)
 }
 
-// TestPipeSynapseIndexIsRedefinedOnUpgrade covers the migration hazard rather
-// than the query. A node upgraded from v11.18.9 already has
-// idx_pipe_synapse_local under the OLD partial WHERE, and CREATE INDEX IF NOT
-// EXISTS is a no-op against an existing name. Without the explicit DROP the
-// stale index survives, SQLite declines to use it because its restriction no
-// longer matches the query, and the INDEXED BY hint quietly degrades to a scan
-// on a table that only grows.
-func TestPipeSynapseIndexIsRedefinedOnUpgrade(t *testing.T) {
+// TestCanonicalLocalSendReachesConnectome drives the PRODUCTION WRITER, not
+// InsertPipeline. The bug this file exists to prevent was never about how rows
+// are shaped by hand — it was about what SendLocalMessage actually persists for
+// a normally-installed agent, whose Provider is stamped from SAGE_PROVIDER and
+// arrives as "claude-code" or "codex". A test that inserts its own rows can
+// agree with a broken predicate indefinitely, which is exactly what the
+// original suite did.
+func TestCanonicalLocalSendReachesConnectome(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	// Reproduce the v11.18.9 on-disk state exactly.
-	_, err := s.conn.ExecContext(ctx, `DROP INDEX IF EXISTS idx_pipe_synapse_local`)
+	now := time.Now().UTC()
+	// The exact shape the canonical path produces for an MCP agent: a provider
+	// label on the sender, no chain ids, no to_provider.
+	sent, replayed, err := s.SendLocalMessage(ctx, "idem-connectome-1", &PipelineMessage{
+		FromAgent:    "alice",
+		FromProvider: "claude-code",
+		ToAgent:      "bob",
+		Intent:       "work",
+		Payload:      "hi",
+		Status:       "pending",
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(time.Hour),
+	})
 	require.NoError(t, err)
-	_, err = s.conn.ExecContext(ctx, `CREATE INDEX idx_pipe_synapse_local
+	require.False(t, replayed)
+	require.NotNil(t, sent)
+	require.Equal(t, "claude-code", sent.FromProvider,
+		"precondition: the canonical writer really does persist the provider label")
+
+	syn, err := s.GetPipeSynapses(ctx)
+	require.NoError(t, err)
+	require.Len(t, syn, 1, "a canonical local send must appear in the connectome, got: %v", syn)
+	require.Equal(t, "alice", syn[0].FromAgent)
+	require.Equal(t, "bob", syn[0].ToAgent)
+	require.Equal(t, int64(1), syn[0].Count)
+}
+
+// TestPipeSynapseIndexIsRedefinedAcrossRestarts covers the upgrade hazard the
+// way an upgrade actually happens: a persistent database is CLOSED and REOPENED
+// so the real open path runs the migrations. Calling migratePipeline directly
+// would prove only that the statement executes, not that a v11.18.9 database on
+// disk converges when the new binary opens it.
+//
+// The second reopen is not redundant. CREATE INDEX IF NOT EXISTS is a no-op
+// against an index already present under the same name, so an unconditional
+// DROP must be shown to be idempotent — a restart must not thrash the index or
+// leave it missing.
+func TestPipeSynapseIndexIsRedefinedAcrossRestarts(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "upgrade.db")
+
+	indexDDL := func(s *SQLiteStore) string {
+		var ddl string
+		require.NoError(t, s.conn.QueryRowContext(ctx,
+			`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_pipe_synapse_local'`).Scan(&ddl))
+		return ddl
+	}
+
+	// 1. Stand up a database and put it in the exact v11.18.9 on-disk state.
+	old, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	_, err = old.conn.ExecContext(ctx, `DROP INDEX IF EXISTS idx_pipe_synapse_local`)
+	require.NoError(t, err)
+	_, err = old.conn.ExecContext(ctx, `CREATE INDEX idx_pipe_synapse_local
 		ON pipeline_messages(from_agent, to_agent, created_at)
 		WHERE from_agent != '' AND to_agent != '' AND from_provider = '' AND to_provider = ''`)
 	require.NoError(t, err)
+	require.Contains(t, indexDDL(old), "from_provider", "precondition: the stale index is on disk")
+	require.NoError(t, old.Close())
 
-	// Re-run the migration the way an upgrade does.
-	s.migratePipeline(ctx)
+	// 2. Reopen with the current code — this is the upgrade.
+	upgraded, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	ddl := indexDDL(upgraded)
+	require.Contains(t, ddl, "source_chain_id", "the upgrade must redefine the index")
+	require.NotContains(t, ddl, "from_provider", "the stale provider restriction must not survive")
 
-	var ddl string
-	require.NoError(t, s.conn.QueryRowContext(ctx,
-		`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_pipe_synapse_local'`).Scan(&ddl))
-	require.Contains(t, ddl, "source_chain_id", "the upgraded index must carry the new restriction")
-	require.NotContains(t, ddl, "from_provider", "the stale provider restriction must not survive the upgrade")
+	// The upgraded index must actually serve the query, not merely exist.
+	base := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, upgraded.InsertPipeline(ctx, &PipelineMessage{
+			PipeID:    fmt.Sprintf("up-%d", i),
+			FromAgent: fmt.Sprintf("agent-%d", i%7),
+			ToAgent:   fmt.Sprintf("peer-%d", i%5),
+			Payload:   "hi", Status: "pending",
+			CreatedAt: base, ExpiresAt: base.Add(time.Hour),
+		}))
+	}
+	rows, err := upgraded.conn.QueryContext(ctx,
+		"EXPLAIN QUERY PLAN "+fmt.Sprintf(pipeSynapseAggregation, pipeSynapseIndexHint))
+	require.NoError(t, err)
+	var plan string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notUsed, &detail))
+		plan += detail + "\n"
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	require.Contains(t, plan, "idx_pipe_synapse_local", "upgraded index must serve the query, plan:\n"+plan)
+	require.NotContains(t, plan, "TEMP B-TREE", "plan:\n"+plan)
+	require.NoError(t, upgraded.Close())
+
+	// 3. Restart again: the unconditional DROP must be idempotent.
+	restarted, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	defer restarted.Close() //nolint:errcheck
+	ddl2 := indexDDL(restarted)
+	require.Equal(t, ddl, ddl2, "a second restart must leave the index definition unchanged")
+
+	syn, err := restarted.GetPipeSynapses(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, syn, "the connectome must still resolve after two restarts")
 }
