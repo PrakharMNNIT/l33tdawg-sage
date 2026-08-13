@@ -1185,7 +1185,9 @@ jobs:
           )
           while IFS= read -r executable; do
             checksum="${executable}.sha256"
-            test -f "${checksum}" && test ! -L "${checksum}" && test -s "${checksum}"
+            test -f "${checksum}"
+            test ! -L "${checksum}"
+            test -s "${checksum}"
             read -r published_hash published_name checksum_extra < "${checksum}"
             test -z "${checksum_extra:-}"
             test "${published_name}" = "$(basename "${executable}")"
