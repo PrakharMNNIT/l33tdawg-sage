@@ -6174,9 +6174,21 @@ func (s *SQLiteStore) migratePipeline(ctx context.Context) {
 	//
 	// The WHERE clause must stay byte-identical to the query's restriction or
 	// SQLite silently declines to use the index.
+	// The v11.18.9 definition of this index restricted on empty from_provider/
+	// to_provider, which turned out to exclude almost all local traffic because
+	// those columns carry the agent's provider label rather than a federation
+	// marker. The predicate now keys on the chain ids instead.
+	//
+	// DROP FIRST, DELIBERATELY. CREATE INDEX IF NOT EXISTS is a no-op against an
+	// index that already exists under this name with the OLD partial WHERE, so
+	// without the drop an upgraded node would silently keep a partial index that
+	// no longer matches the query — SQLite would decline to use it and the
+	// INDEXED BY hint would fall back to a full scan. Precedent: the same
+	// drop-then-recreate is used for idx_pipe_transport_proof_once.
+	_, _ = s.writeExecContext(ctx, `DROP INDEX IF EXISTS idx_pipe_synapse_local`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_synapse_local
 		ON pipeline_messages(from_agent, to_agent, created_at)
-		WHERE from_agent != '' AND to_agent != '' AND from_provider = '' AND to_provider = ''`)
+		WHERE from_agent != '' AND to_agent != '' AND source_chain_id = '' AND destination_chain_id = ''`)
 }
 
 // migratePipelineTerminalRetention makes the terminal-state transition, rather
