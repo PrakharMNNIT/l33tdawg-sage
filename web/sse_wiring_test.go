@@ -265,6 +265,92 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 				b.Broadcast(SSEEvent{Type: EventRemember})
 			}`,
 		},
+		{
+			name: "sink after empty infinite loop cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				for true {}
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "unreachable loop break cannot make following emitter reachable",
+			body: `func mutate(b *SSEBroadcaster) {
+				for true { return; break }
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "unselected nested switch break cannot exit outer loop",
+			body: `func mutate(b *SSEBroadcaster) {
+			outer:
+				for true {
+					switch 1 { case 2: break outer }
+				}
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "constant false nested loop break cannot exit outer loop",
+			body: `func mutate(b *SSEBroadcaster) {
+			outer:
+				for true { for false { break outer } }
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "zero length range break cannot exit outer loop",
+			body: `func mutate(b *SSEBroadcaster) {
+				var zero [0]int
+			outer:
+				for true { for range zero { break outer } }
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "zero integer range break cannot exit outer loop",
+			body: `func mutate(b *SSEBroadcaster) {
+			outer:
+				for true { for range 0 { break outer } }
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "sink skipped by forward goto cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				goto done
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			done:
+				_ = 1
+			}`,
+		},
+		{
+			name: "sink after terminating exhaustive constant switch cannot count",
+			body: `func mutate(b *SSEBroadcaster) {
+				switch 1 {
+				case 1: return
+				default: return
+				}
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "constant true return blocks later switch fallthrough emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				switch 1 {
+				case 1: if true { return }; fallthrough
+				case 2: b.Broadcast(SSEEvent{Type: EventRemember})
+				}
+			}`,
+		},
+		{
+			name: "selected switch goto skips following emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				switch 1 { case 1: goto done }
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			done:
+				_ = 1
+			}`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -293,9 +379,130 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 	t.Run("fallthrough into a nonmatching constant case remains reachable", func(t *testing.T) {
 		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
 			switch 1 {
-			case 1: fallthrough
+			case 1: _ = 1; fallthrough
 			case 2: b.Broadcast(SSEEvent{Type: EventRemember})
 			}
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("intra-case goto can reach fallthrough emitter", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			switch 1 {
+			case 1:
+				goto inner
+				return
+			inner:
+				_ = 1
+				fallthrough
+			case 2:
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("goto target remains reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			goto done
+		done:
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("break from constant true loop keeps following emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			for true { break }
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("conditional break from constant true loop keeps following emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, exit bool) {
+			for true {
+				if exit { break }
+			}
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("labeled break from nested loop keeps following emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, exit bool) {
+		outer:
+			for true {
+				for true {
+					if exit { break outer }
+				}
+			}
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("nonzero range break can exit outer loop", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			var one [1]int
+		outer:
+			for true { for range one { break outer } }
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("positive integer range break can exit outer loop", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+		outer:
+			for true { for range 1 { break outer } }
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("selected switch intra-case goto keeps following emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			switch 1 {
+			case 1:
+				goto inner
+			inner:
+				_ = 1
+			}
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("selected switch break keeps following emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			switch 1 {
+			case 1: break
+			default: return
+			}
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("selected labeled-switch break keeps following emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+		done:
+			switch 1 {
+			case 1: break done
+			default: return
+			}
+			b.Broadcast(SSEEvent{Type: EventRemember})
 		}`)
 		require.Empty(t, scan.unresolved)
 		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
@@ -754,39 +961,267 @@ func compileTimeDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]a
 }
 
 func precededByTerminatingStatement(info *types.Info, statements []ast.Stmt, child ast.Node) bool {
-	for _, statement := range statements {
+	childIndex := -1
+	for index, statement := range statements {
+		if statement == child {
+			childIndex = index
+			break
+		}
+	}
+	for index, statement := range statements {
 		if statement == child {
 			return false
 		}
-		if statementDefinitelyTerminates(info, statement) {
-			return true
+		flow := statementFlowFor(info, statement)
+		if flow.kind == flowNext {
+			continue
 		}
+		if flow.kind == flowGoto {
+			targetIndex := gotoTargetIndex(statements, flow.label)
+			if targetIndex <= childIndex && targetIndex > index {
+				continue
+			}
+		}
+		return true
 	}
 	return false
 }
 
-func statementDefinitelyTerminates(info *types.Info, statement ast.Stmt) bool {
+func gotoTargetIndex(statements []ast.Stmt, target string) int {
+	if target == "" {
+		return -1
+	}
+	for index, statement := range statements {
+		label, ok := statement.(*ast.LabeledStmt)
+		if ok && label.Label.Name == target {
+			return index
+		}
+	}
+	return -1
+}
+
+type flowKind uint8
+
+const (
+	flowNext flowKind = iota
+	flowReturn
+	flowBreak
+	flowContinue
+	flowFallthrough
+	flowGoto
+)
+
+type statementFlow struct {
+	kind  flowKind
+	label string
+}
+
+func statementFlowFor(info *types.Info, statement ast.Stmt) statementFlow {
 	switch node := statement.(type) {
 	case *ast.ReturnStmt:
-		return true
+		return statementFlow{kind: flowReturn}
 	case *ast.BranchStmt:
-		return node.Tok == token.BREAK || node.Tok == token.CONTINUE || node.Tok == token.FALLTHROUGH
+		flow := statementFlow{label: ""}
+		if node.Label != nil {
+			flow.label = node.Label.Name
+		}
+		switch node.Tok {
+		case token.BREAK:
+			flow.kind = flowBreak
+		case token.CONTINUE:
+			flow.kind = flowContinue
+		case token.FALLTHROUGH:
+			flow.kind = flowFallthrough
+		case token.GOTO:
+			flow.kind = flowGoto
+		default:
+			flow.kind = flowNext
+		}
+		return flow
 	case *ast.ExprStmt:
 		call, ok := unwrapParens(node.X).(*ast.CallExpr)
 		if !ok {
-			return false
+			return statementFlow{kind: flowNext}
 		}
 		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
-		return ok && builtin.Name() == "panic"
-	case *ast.BlockStmt:
-		return len(node.List) > 0 && statementDefinitelyTerminates(info, node.List[len(node.List)-1])
-	case *ast.IfStmt:
-		if node.Else == nil || !statementDefinitelyTerminates(info, node.Body) {
-			return false
+		if ok && builtin.Name() == "panic" {
+			return statementFlow{kind: flowReturn}
 		}
-		return statementDefinitelyTerminates(info, node.Else)
+	case *ast.BlockStmt:
+		return statementListFlow(info, node.List)
+	case *ast.IfStmt:
+		if condition, known := constantBool(info, node.Cond); known {
+			if condition {
+				return statementFlowFor(info, node.Body)
+			}
+			if node.Else != nil {
+				return statementFlowFor(info, node.Else)
+			}
+			return statementFlow{kind: flowNext}
+		}
+		if node.Else == nil {
+			return statementFlow{kind: flowNext}
+		}
+		thenFlow := statementFlowFor(info, node.Body)
+		elseFlow := statementFlowFor(info, node.Else)
+		if thenFlow == elseFlow {
+			return thenFlow
+		}
+	case *ast.ForStmt:
+		return forStatementFlow(info, node, "")
+	case *ast.SwitchStmt:
+		return constantSwitchFlow(info, node)
+	case *ast.LabeledStmt:
+		if loop, ok := node.Stmt.(*ast.ForStmt); ok {
+			return forStatementFlow(info, loop, node.Label.Name)
+		}
+		flow := statementFlowFor(info, node.Stmt)
+		if flow.kind == flowBreak && flow.label == node.Label.Name {
+			return statementFlow{kind: flowNext}
+		}
+		return flow
 	}
-	return false
+	return statementFlow{kind: flowNext}
+}
+
+func statementListFlow(info *types.Info, statements []ast.Stmt) statementFlow {
+	for statementIndex := 0; statementIndex < len(statements); statementIndex++ {
+		statement := statements[statementIndex]
+		flow := statementFlowFor(info, statement)
+		if flow.kind == flowGoto {
+			targetIndex := gotoTargetIndex(statements, flow.label)
+			if targetIndex > statementIndex {
+				statementIndex = targetIndex - 1
+				continue
+			}
+		}
+		if flow.kind != flowNext {
+			return flow
+		}
+	}
+	return statementFlow{kind: flowNext}
+}
+
+func forStatementFlow(info *types.Info, node *ast.ForStmt, label string) statementFlow {
+	condition := true
+	known := node.Cond == nil
+	if node.Cond != nil {
+		condition, known = constantBool(info, node.Cond)
+	}
+	if !known || !condition {
+		return statementFlow{kind: flowNext}
+	}
+	if loopBodyMayBreak(info, node.Body, label) {
+		return statementFlow{kind: flowNext}
+	}
+	bodyFlow := statementListFlow(info, node.Body.List)
+	if bodyFlow.kind == flowBreak && (bodyFlow.label == "" || bodyFlow.label == label) {
+		return statementFlow{kind: flowNext}
+	}
+	if bodyFlow.kind == flowNext || (bodyFlow.kind == flowContinue && (bodyFlow.label == "" || bodyFlow.label == label)) {
+		return statementFlow{kind: flowContinue}
+	}
+	return bodyFlow
+}
+
+func loopBodyMayBreak(info *types.Info, block *ast.BlockStmt, loopLabel string) bool {
+	if block == nil {
+		return false
+	}
+	var statementMayBreak func(ast.Stmt, bool) bool
+	statementsMayBreak := func(statements []ast.Stmt, nestedBreakable bool) bool {
+		for index := 0; index < len(statements); index++ {
+			statement := statements[index]
+			if statementMayBreak(statement, nestedBreakable) {
+				return true
+			}
+			flow := statementFlowFor(info, statement)
+			if flow.kind == flowGoto {
+				targetIndex := gotoTargetIndex(statements, flow.label)
+				if targetIndex > index {
+					index = targetIndex - 1
+					continue
+				}
+			}
+			if flow.kind != flowNext {
+				return false
+			}
+		}
+		return false
+	}
+	statementMayBreak = func(statement ast.Stmt, nestedBreakable bool) bool {
+		switch node := statement.(type) {
+		case *ast.BranchStmt:
+			if node.Tok != token.BREAK {
+				return false
+			}
+			if node.Label != nil {
+				return loopLabel != "" && node.Label.Name == loopLabel
+			}
+			return !nestedBreakable
+		case *ast.BlockStmt:
+			return statementsMayBreak(node.List, nestedBreakable)
+		case *ast.IfStmt:
+			if condition, known := constantBool(info, node.Cond); known {
+				if condition {
+					return statementMayBreak(node.Body, nestedBreakable)
+				}
+				return node.Else != nil && statementMayBreak(node.Else, nestedBreakable)
+			}
+			return statementMayBreak(node.Body, nestedBreakable) || (node.Else != nil && statementMayBreak(node.Else, nestedBreakable))
+		case *ast.LabeledStmt:
+			return statementMayBreak(node.Stmt, nestedBreakable)
+		case *ast.ForStmt:
+			if condition, known := constantBool(info, node.Cond); known && !condition {
+				return false
+			}
+			return statementMayBreak(node.Body, true)
+		case *ast.RangeStmt:
+			rangeType := info.TypeOf(node.X)
+			if pointer, ok := rangeType.(*types.Pointer); ok {
+				rangeType = pointer.Elem()
+			}
+			if array, ok := rangeType.Underlying().(*types.Array); ok && array.Len() == 0 {
+				return false
+			}
+			if value := info.Types[unwrapParens(node.X)].Value; value != nil {
+				if value.Kind() == constant.String && constant.StringVal(value) == "" {
+					return false
+				}
+				if value.Kind() == constant.Int && constant.Sign(value) <= 0 {
+					return false
+				}
+			}
+			return statementMayBreak(node.Body, true)
+		case *ast.SwitchStmt:
+			clauses, selectedIndex, known := selectedConstantSwitchCase(info, node)
+			if !known {
+				return statementMayBreak(node.Body, true)
+			}
+			if selectedIndex < 0 {
+				return false
+			}
+			for index := selectedIndex; index < len(clauses); index++ {
+				if statementMayBreak(clauses[index], true) {
+					return true
+				}
+				if caseClauseFlow(info, clauses[index]).kind != flowFallthrough {
+					break
+				}
+			}
+			return false
+		case *ast.TypeSwitchStmt:
+			return statementMayBreak(node.Body, true)
+		case *ast.SelectStmt:
+			return statementMayBreak(node.Body, true)
+		case *ast.CaseClause:
+			return statementsMayBreak(node.Body, nestedBreakable)
+		case *ast.CommClause:
+			return statementsMayBreak(node.Body, nestedBreakable)
+		}
+		return false
+	}
+	return statementMayBreak(block, false)
 }
 
 func constantBool(info *types.Info, expr ast.Expr) (bool, bool) {
@@ -801,6 +1236,29 @@ func constantBool(info *types.Info, expr ast.Expr) (bool, bool) {
 }
 
 func switchCaseIsDead(info *types.Info, switchStmt *ast.SwitchStmt, target *ast.CaseClause) bool {
+	clauses, selectedIndex, known := selectedConstantSwitchCase(info, switchStmt)
+	if !known {
+		return false
+	}
+	targetIndex := -1
+	for index, clause := range clauses {
+		if clause == target {
+			targetIndex = index
+			break
+		}
+	}
+	if targetIndex == -1 || selectedIndex == -1 || targetIndex < selectedIndex {
+		return true
+	}
+	for index := selectedIndex; index < targetIndex; index++ {
+		if !caseFallsThrough(info, clauses[index]) {
+			return true
+		}
+	}
+	return false
+}
+
+func selectedConstantSwitchCase(info *types.Info, switchStmt *ast.SwitchStmt) ([]*ast.CaseClause, int, bool) {
 	tag := switchStmt.Tag
 	if tag == nil {
 		tag = ast.NewIdent("true")
@@ -810,22 +1268,18 @@ func switchCaseIsDead(info *types.Info, switchStmt *ast.SwitchStmt, target *ast.
 		tagValue = constant.MakeBool(true)
 	}
 	if tagValue == nil {
-		return false
+		return nil, -1, false
 	}
 	clauses := make([]*ast.CaseClause, 0, len(switchStmt.Body.List))
-	targetIndex := -1
 	defaultIndex := -1
 	selectedIndex := -1
 	for _, clauseNode := range switchStmt.Body.List {
 		clause, ok := clauseNode.(*ast.CaseClause)
 		if !ok {
-			return false
+			return nil, -1, false
 		}
 		index := len(clauses)
 		clauses = append(clauses, clause)
-		if clause == target {
-			targetIndex = index
-		}
 		if len(clause.List) == 0 {
 			defaultIndex = index
 			continue
@@ -833,7 +1287,7 @@ func switchCaseIsDead(info *types.Info, switchStmt *ast.SwitchStmt, target *ast.
 		for _, expr := range clause.List {
 			caseValue := info.Types[unwrapParens(expr)].Value
 			if caseValue == nil {
-				return false
+				return nil, -1, false
 			}
 			if selectedIndex == -1 && constant.Compare(tagValue, token.EQL, caseValue) {
 				selectedIndex = index
@@ -843,23 +1297,53 @@ func switchCaseIsDead(info *types.Info, switchStmt *ast.SwitchStmt, target *ast.
 	if selectedIndex == -1 {
 		selectedIndex = defaultIndex
 	}
-	if targetIndex == -1 || selectedIndex == -1 || targetIndex < selectedIndex {
-		return true
-	}
-	for index := selectedIndex; index < targetIndex; index++ {
-		if !caseFallsThrough(clauses[index]) {
-			return true
-		}
-	}
-	return false
+	return clauses, selectedIndex, true
 }
 
-func caseFallsThrough(clause *ast.CaseClause) bool {
-	if clause == nil || len(clause.Body) != 1 {
-		return false
+func constantSwitchFlow(info *types.Info, switchStmt *ast.SwitchStmt) statementFlow {
+	clauses, selectedIndex, known := selectedConstantSwitchCase(info, switchStmt)
+	if !known || selectedIndex < 0 {
+		return statementFlow{kind: flowNext}
 	}
-	branch, ok := clause.Body[0].(*ast.BranchStmt)
-	return ok && branch.Tok == token.FALLTHROUGH
+	for index := selectedIndex; index < len(clauses); index++ {
+		flow := caseClauseFlow(info, clauses[index])
+		switch flow.kind {
+		case flowFallthrough:
+			continue
+		case flowBreak:
+			if flow.label == "" {
+				return statementFlow{kind: flowNext}
+			}
+			return flow
+		default:
+			return flow
+		}
+	}
+	return statementFlow{kind: flowNext}
+}
+
+func caseFallsThrough(info *types.Info, clause *ast.CaseClause) bool {
+	return caseClauseFlow(info, clause).kind == flowFallthrough
+}
+
+func caseClauseFlow(info *types.Info, clause *ast.CaseClause) statementFlow {
+	if clause == nil {
+		return statementFlow{kind: flowNext}
+	}
+	for statementIndex := 0; statementIndex < len(clause.Body); statementIndex++ {
+		flow := statementFlowFor(info, clause.Body[statementIndex])
+		if flow.kind == flowGoto {
+			targetIndex := gotoTargetIndex(clause.Body, flow.label)
+			if targetIndex > statementIndex {
+				statementIndex = targetIndex - 1
+				continue
+			}
+		}
+		if flow.kind != flowNext {
+			return flow
+		}
+	}
+	return statementFlow{kind: flowNext}
 }
 
 func directBroadcastNames(info *types.Info, call *ast.CallExpr, parents map[ast.Node]ast.Node, objects typedWiringObjects) ([]string, bool, error) {
