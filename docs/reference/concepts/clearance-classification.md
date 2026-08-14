@@ -34,7 +34,7 @@ Agents frequently get this wrong. There are **two distinct paths** that determin
 
 ### Path A: REST submit
 
-`POST /v1/memory/submit` → `handleMemorySubmit` (`api/rest/memory_handler.go:407`):
+`POST /v1/memory/submit` → `handleSubmitMemory` (`api/rest/memory_handler.go:1050`, classification read at `:1212`):
 
 ```go
 // REST passes the caller's classification through verbatim.

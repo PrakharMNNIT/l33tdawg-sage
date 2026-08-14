@@ -46,10 +46,10 @@ No tokens. No gas fees. No cryptocurrency. Just consensus-validated knowledge.
 |-------|-----------|
 | Consensus | CometBFT v0.38.23 (ABCI 2.0, raw -- not Cosmos SDK) |
 | State Machine | Go 1.25.13+ ABCI application |
-| On-chain State | BadgerDB v4.5.0 (content hash, status, classification, votes, grants, appHash) |
+| On-chain State | BadgerDB v4.9.6 (content hash, status, classification, votes, grants, appHash) |
 | Off-chain Storage | SQLite (personal / single-binary) or PostgreSQL 16 + pgvector / HNSW (cluster) -- write-behind projection |
 | Tx Format | Protobuf (deterministic serialization) |
-| REST API | Go chi v5.2.2 (62 endpoints, OpenAPI 3.1) |
+| REST API | Go chi v5.3.1 (112 routes, OpenAPI 3.1) |
 | Agent SDK | Python (httpx + PyNaCl + Pydantic v2) |
 | Embeddings | Pluggable: Ollama nomic-embed-text (768-dim) / OpenAI-compatible (vLLM, LiteLLM) / hash fallback |
 | Monitoring | Prometheus + Grafana (3 dashboards, 5 alert rules) |
@@ -784,7 +784,7 @@ send → pending → claimed → completed
 
 1. **Send** — `POST /v1/messages` requires an exact recipient and a caller-scoped idempotency key. Exact retries return the original message; key reuse with different content conflicts.
 2. **Pending** — The durable row waits in the exact recipient's inbox. A federated send may remain safely queued while the trusted peer is offline.
-3. **Claimed/read** — `POST /v1/messages/receive` claims one ordered batch using a replayable receive token. Exact-recipient read acknowledgement is separate evidence and never means comprehension.
+3. **Claimed/read** — `POST /v1/messages/receive` claims one ordered batch using a replayable receive token, recording the caller's opaque `claimant_session_id` as the owner of that claim. Concurrent runtimes sharing one signed agent identity therefore do not silently take each other's work: a second runtime must take ownership explicitly via `PUT /v1/messages/{id}/handoff`, a compare-and-swap on the current session, and a stale former owner is refused if it replies after ownership moved. Exact-recipient read acknowledgement is separate evidence and never means comprehension.
 4. **Completed** — The exact recipient replies through `POST /v1/messages/{id}/reply`. The sender reads payload-free transport, read, and workflow dimensions from the status projection, and reads the reply **body** from the sender-exact reply projection `GET /v1/pipe/results` (MCP: `sage_message_replies`). That projection is sender-exact: no other agent can read the reply *through it*. It is **not** a confidentiality guarantee for the reply itself — the pre-existing workflow route `GET /v1/pipe/{pipe_id}` authorizes with `callerCanViewPipe` and still returns the completed row's decrypted `result` to the addressed recipient, to any agent sharing the addressed `to_provider`, and to an operator/admin. Treat a reply as confidential from unrelated agents, not from those principals.
 5. **Expired** — If the explicit TTL elapses first, the row is no longer actionable. Expiry is independent of delivery/read evidence.
 
@@ -809,12 +809,13 @@ governed memory; an agent must remember durable knowledge explicitly.
 | `POST` | `/v1/messages/{id}/reply` | Exact-recipient idempotent reply |
 | `PUT` | `/v1/messages/{id}/read` | Exact-recipient read acknowledgement |
 | `PUT` | `/v1/messages/read-batch` | Independently acknowledge up to 20 fetched messages |
+| `PUT` | `/v1/messages/{id}/handoff` | Compare-and-swap transfer of one claimed message from `from_session_id` to the calling session |
 | `GET` | `/v1/messages/{id}/status` | Exact-sender payload-free transport/read/workflow state |
 
 The `/v1/pipe/*` routes remain the compatibility and federated transport
 surface. MCP clients should use `sage_find_agent`, `sage_message_send`,
 `sage_inbox`/`sage_messages_receive`, `sage_message_reply`,
-`sage_message_replies`, `sage_message_status`, and `sage_message_history`.
+`sage_message_replies`, `sage_message_status`, `sage_message_handoff`, and `sage_message_history`.
 
 `sage_message_replies` (v11.18.2) is the sender-side counterpart to
 `sage_message_reply` and the only advertised tool that returns reply content.
@@ -1310,7 +1311,8 @@ sage/
 | `make vet` | Run go vet |
 | `make proto` | Regenerate protobuf code |
 | `make integration` | Run integration tests (requires running network) |
-| `make benchmark` | Run k6 load tests |
+| `make benchmark` | Run the authenticated Ed25519-signed Python load test |
+| `make benchmark-k6` | Run the k6 load test (needs a k6 Ed25519 extension or pre-configured auth) |
 | `make sdk-test` | Run Python SDK tests |
 | `make clean` | Remove build artifacts and generated configs |
 | `make tidy` | Run go mod tidy |

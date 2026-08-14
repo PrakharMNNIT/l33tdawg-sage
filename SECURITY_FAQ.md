@@ -11,7 +11,7 @@ SAGE has two distinct deployment models with fundamentally different threat mode
 | **Who** | One user, one local operator | Multiple agents, teams, organizations |
 | **Trust model** | User IS the only validator | Byzantine fault tolerance across validators |
 | **Database** | Local BadgerDB/SQLite stores in `~/.sage/data/` | BadgerDB consensus state plus off-chain mirror |
-| **Release** | v11.6.1 personal-node surface | v11.6.1 quorum/federation surface |
+| **Release** | v11.18.11 personal-node surface | v11.18.11 quorum/federation surface |
 
 Many concerns raised about the enterprise codebase do not apply to SAGE Personal, and vice versa. Each item below is tagged with which deployment it affects.
 
@@ -108,9 +108,9 @@ The `make byzantine` target and GitHub Actions CI job spin up a 4-validator Dock
 
 The following boundaries describe the current v11 codebase:
 
-**SAGE Personal (sage-gui v11.6.1):**
+**SAGE Personal (sage-gui v11.18.11):**
 - Designed for one operator. The management dashboard/API remains a local surface; anyone with access to the operator session or machine should be treated as trusted.
-- Federation is an explicit network-facing feature, off by default. When enabled it uses a separate pinned-mTLS listener, active on-chain treaty checks, chain-qualified signed requests, and replay protection. v11.6 may carry that same authenticated protocol over libp2p NAT traversal and Circuit Relay v2; the relay sees encrypted traffic and connection metadata, not plaintext memories or federation keys.
+- Federation is an explicit network-facing feature, off by default. When enabled it uses a separate pinned-mTLS listener, active on-chain treaty checks, chain-qualified signed requests, and replay protection. That authenticated protocol now runs over libp2p NAT traversal and Circuit Relay v2; the relay sees encrypted traffic and connection metadata, not plaintext memories or federation keys.
 - SQLite database supports optional AES-256-GCM encryption at rest (Synaptic Ledger). Enable from CEREBRUM Settings → Security.
 
 **SAGE Enterprise:**
@@ -119,7 +119,7 @@ The following boundaries describe the current v11 codebase:
 - REST API supports TLS in quorum mode (v6.5+). Certificates are generated during `quorum-init`/`quorum-join` using a per-quorum ECDSA P-256 CA.
 - No automated key/certificate rotation yet (planned for governance-driven rotation).
 - RBAC is implemented but not battle-tested under adversarial conditions.
-- Federation ships with guided LAN and public-internet/NAT-traversal paths in v11.6. Internet reachability does not make an Enterprise deployment hardened for arbitrary hostile exposure; validator, operator, and relay threat models still require deployment-specific review.
+- Federation ships with guided LAN and public-internet/NAT-traversal paths. Internet reachability does not make an Enterprise deployment hardened for arbitrary hostile exposure; validator, operator, and relay threat models still require deployment-specific review.
 
 We do not recommend running SAGE Enterprise in an adversarial or internet-facing environment without addressing the items listed above.
 
