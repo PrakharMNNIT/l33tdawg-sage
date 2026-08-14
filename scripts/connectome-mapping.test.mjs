@@ -213,6 +213,17 @@ test('connectome tick fires only edges changed since the latest authorized basel
   ), ['a\u0000b']);
 });
 
+test('tick arriving during an ordinary load keeps the pre-tick baseline', () => {
+  const activity = createConnectomeActivityTracker();
+  const before = [{ source: 'a', target: 'b', count: 1, last_fired: 't1' }];
+  const after = [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }];
+  activity.observe(before, false);
+  assert.deepEqual(activity.observe(after, false, true), [],
+    'ordinary response must not pulse or consume a pending tick');
+  assert.deepEqual(activity.observe(after, true), ['a\u0000b'],
+    'queued tick refetch must still observe the firing transition');
+});
+
 // The renderer subscribes to the contentless tick and refetches the authorized
 // snapshot; it must never read edge data off the event itself.
 test('mri-brain refetches the authorized snapshot on a connectome tick', () => {
@@ -220,6 +231,8 @@ test('mri-brain refetches the authorized snapshot on a connectome tick', () => {
     'the renderer must subscribe to the connectome tick');
   assert.match(mriSource, /load\(true\)/,
     'only the connectome tick path may request a firing diff');
-  assert.match(mriSource, /markConnectomeFiring\(d, fromConnectomeTick\)/,
+  assert.match(mriSource, /markConnectomeFiring\(d, fromConnectomeTick, graphReloadPulsePending\)/,
     'the fired-edge diff must run on the applied snapshot');
+  assert.match(mriSource, /scheduleGraphRetry\(\(\) => load\(fromConnectomeTick\)\)/,
+    'a failed tick refetch must preserve its firing intent across retry');
 });

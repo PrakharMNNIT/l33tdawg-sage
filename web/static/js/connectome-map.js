@@ -110,8 +110,12 @@ function snapshotConnectomeLinks(links) {
 export function createConnectomeActivityTracker() {
   let baseline = null;
   return {
-    observe(links, fromConnectomeTick = false) {
+    observe(links, fromConnectomeTick = false, tickPending = false) {
       const next = snapshotConnectomeLinks(links);
+      // A tick that arrived during an ordinary request owns the next baseline
+      // transition. Do not let the older request consume that transition before
+      // the queued tick refetch can turn it into a pulse.
+      if (tickPending && !fromConnectomeTick) return [];
       const fired = baseline !== null && fromConnectomeTick
         ? diffConnectomeActivity(baseline, next)
         : [];

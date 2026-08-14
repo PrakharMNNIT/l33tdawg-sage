@@ -721,9 +721,11 @@ export function mountMriBrain(container, opts = {}) {
   // shown for an edge the snapshot withheld.
   const connectomeActivity = createConnectomeActivityTracker();
   let pulseDecayTimer = null;
-  function markConnectomeFiring(d, fromConnectomeTick){
+  function markConnectomeFiring(d, fromConnectomeTick, tickPending = false){
     if (mode !== 'connectome' || !d || !Array.isArray(d.links)) return;
-    const fired = new Set(connectomeActivity.observe(d.links, fromConnectomeTick));
+    const fired = new Set(connectomeActivity.observe(
+      d.links, fromConnectomeTick, tickPending,
+    ));
     if (!fired.size) return;
     const now = Date.now();
     for (const l of d.links) {
@@ -758,7 +760,7 @@ export function mountMriBrain(container, opts = {}) {
       reportGraphAvailability('ready');
       placeActive(d.nodes);
       resolveConnectomeLinks(d);
-      markConnectomeFiring(d, fromConnectomeTick);
+      markConnectomeFiring(d, fromConnectomeTick, graphReloadPulsePending);
       Graph.graphData(d);
       rendered = d;
       refreshCounts(d);
@@ -766,7 +768,7 @@ export function mountMriBrain(container, opts = {}) {
     }).catch(() => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
       reportGraphAvailability('unavailable');
-      if (!graphReloadPending) scheduleGraphRetry(load);
+      if (!graphReloadPending) scheduleGraphRetry(() => load(fromConnectomeTick));
     }).finally(() => {
       graphLoadInFlight = false;
       if (graphReloadPending && !disposed) {
