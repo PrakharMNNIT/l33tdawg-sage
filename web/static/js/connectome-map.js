@@ -152,3 +152,24 @@ export function createConnectomeReloadIntent() {
     reset() { requestedGeneration = 0; satisfiedGeneration = 0; },
   };
 }
+
+// Resting-weight plasticity ("use it or lose it"): a synapse's RETAINED strength
+// decays from its raw Hebbian weight toward a floor the longer it sits idle, and
+// climbs back as it fires. This is distinct from the transient firing pulse — the
+// pulse is a seconds-long flash on a live message, plasticity is the slow drift of
+// the resting weight over minutes/hours, keyed on how long ago the edge last fired.
+//
+// Returns a 0..1 multiplier to apply to the rendered weight: ~1 for an edge that
+// just fired, decaying with `halfLifeMs` toward `floor` (never below it, so an idle
+// channel dims but does not vanish). Pure — the caller passes `now` — so the decay
+// curve is unit-testable. A missing/invalid last_fired is treated as fully idle.
+export function synapsePlasticity(lastFiredISO, now, opts = {}) {
+  const halfLifeMs = opts.halfLifeMs > 0 ? opts.halfLifeMs : 1800000; // 30 min
+  const floor = opts.floor >= 0 && opts.floor <= 1 ? opts.floor : 0.15;
+  if (!lastFiredISO) return floor;
+  const t = Date.parse(lastFiredISO);
+  if (Number.isNaN(t)) return floor;
+  const age = now - t;
+  if (age <= 0) return 1;                       // fired now (or clock skew) → full strength
+  return floor + (1 - floor) * Math.pow(0.5, age / halfLifeMs);
+}
