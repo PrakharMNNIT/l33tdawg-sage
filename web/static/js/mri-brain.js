@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -467,17 +467,32 @@ export function mountMriBrain(container, opts = {}) {
     if (age < 0 || age > SYNAPSE_PULSE_MS) return 0;
     return 1 - (age / SYNAPSE_PULSE_MS);
   }
+  // Resting-weight plasticity ("use it or lose it"): the RETAINED weight decays
+  // toward a floor while a synapse sits idle and climbs back as it fires, keyed on
+  // last_fired. Distinct from synapsePulse (the seconds-long firing flash) — this is
+  // the slow drift of the resting weight, so idle channels thin and dim while busy
+  // ones stay bright. restingWeight() is what the accessors render instead of raw _w.
+  const PLASTICITY = opts.plasticity || { halfLifeMs: 1800000, floor: 0.15 };
+  const plasticityOf = l => synapsePlasticity(l && l.last_fired, Date.now(), PLASTICITY);
+  const restingWeight = l => (l._w||0) * plasticityOf(l);
   function linkWidthFor(l){
-    if(l.link_type==='synapse') return 0.25 + (l._w||0)*2.4 + synapsePulse(l)*2.0;
+    if(l.link_type==='synapse') return 0.25 + restingWeight(l)*2.4 + synapsePulse(l)*2.0;
     return l.link_type==='focus'?0.8 : l.link_type==='contradicts'?0.6 : (LINK_TYPES[l.link_type]||{}).typed?0.35:0.18;
   }
   function linkParticlesFor(l){
-    if(l.link_type==='synapse') return flow ? Math.min(8, 1+Math.round((l._w||0)*5)+Math.round(synapsePulse(l)*2)) : 0;
+    if(l.link_type==='synapse') return flow ? Math.min(8, 1+Math.round(restingWeight(l)*5)+Math.round(synapsePulse(l)*2)) : 0;
     return l.link_type==='focus'?3 : (flow&&(LINK_TYPES[l.link_type]||{}).typed?2:0);
   }
   function linkParticleSpeedFor(l){
-    if(l.link_type==='synapse') return 0.004 + (l._w||0)*0.02;
+    if(l.link_type==='synapse') return 0.004 + restingWeight(l)*0.02;
     return 0.006;
+  }
+  // Idle synapses also dim: alpha rides the plasticity factor so a cold channel
+  // recedes and a warm one stands out. Non-synapse links keep their typed colour.
+  const SYNAPSE_RGB = '57,208,255';
+  function linkColorFor(l){
+    if(l.link_type==='synapse') return `rgba(${SYNAPSE_RGB},${(0.40 + 0.60*plasticityOf(l)).toFixed(2)})`;
+    return (LINK_TYPES[l.link_type]||LINK_TYPES.related).color;
   }
 
   // Clicking a neuron lights its synaptic neighbourhood (the clicked cell + every
@@ -741,6 +756,21 @@ export function mountMriBrain(container, opts = {}) {
       Graph.linkWidth(linkWidthFor).linkDirectionalParticles(linkParticlesFor);
     }, SYNAPSE_PULSE_MS + 100);
   }
+
+  // Resting-weight plasticity is time-based, so an idle connectome must re-read its
+  // synapse accessors on a slow cadence to visibly settle (thin + dim) even when no
+  // message fires. Cheap — it re-applies the accessor functions; node positions are
+  // pinned — and self-gated to connectome mode, so the memory view never pays for it.
+  const PLASTICITY_REFRESH_MS = 30000;
+  let plasticityTimer = null;
+  function startPlasticityDecay(){
+    if (plasticityTimer) return;
+    plasticityTimer = setInterval(() => {
+      if (disposed || !Graph || mode !== 'connectome') return;
+      Graph.linkWidth(linkWidthFor).linkColor(linkColorFor).linkDirectionalParticles(linkParticlesFor);
+    }, PLASTICITY_REFRESH_MS);
+  }
+  startPlasticityDecay();
 
   const connectomeReloadIntent = createConnectomeReloadIntent();
   function load(fromConnectomeTick = false){
@@ -1031,7 +1061,7 @@ export function mountMriBrain(container, opts = {}) {
       .backgroundColor(mriBgColor())
       .graphData(data).nodeId('id').nodeLabel(()=>'' )
       .nodeVal(nodeVal).nodeColor(nodeColorRGBA).nodeRelSize(2.4).nodeResolution(10).nodeOpacity(0.9)
-      .linkColor(l=>(LINK_TYPES[l.link_type]||LINK_TYPES.related).color)
+      .linkColor(linkColorFor)
       .linkWidth(linkWidthFor)
       .linkOpacity(0.32)
       .linkDirectionalParticles(linkParticlesFor)
@@ -1269,7 +1299,7 @@ export function mountMriBrain(container, opts = {}) {
   const modeCap = document.createElement('div');
   modeCap.className = 'panel mode-cap';
   modeCap.style.cssText = 'position:absolute;left:auto;bottom:44px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
-  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>hubs sink to the core · click a neuron to light its circle';
+  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>idle synapses thin & fade · use it or lose it<br>hubs sink to the core · click a neuron to light its circle';
   root.appendChild(modeCap);
 
   // Relabel the stat panel + button and toggle the caption for the active mode.
@@ -1311,6 +1341,7 @@ export function mountMriBrain(container, opts = {}) {
   return function cleanup(){
     disposed = true;
     clearTimeout(graphRetryTimer);
+    clearInterval(plasticityTimer);
     subs.forEach(u => { try { u && u(); } catch(e){ /* noop */ } });
     root.removeEventListener('mousemove', onMove);
     root.removeEventListener('pointerdown', onGraphPointerDown);
