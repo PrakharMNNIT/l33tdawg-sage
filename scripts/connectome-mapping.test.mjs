@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { createGraphLoadCoordinator, mapConnectome } from '../web/static/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity, createConnectomeActivityTracker, createConnectomeReloadIntent } from '../web/static/js/connectome-map.js';
 
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 
@@ -141,4 +141,150 @@ test('renderer wires mode invalidation into both initial acquisition and reloads
     'a stale initial response must fail closed after a mode change');
   assert.match(mriSource, /function setMode\(next\)\{[\s\S]*graphLoads\.invalidate\(\);[\s\S]*else acquireInitialGraph\(\);/,
     'a toggle must invalidate old work and refetch even before Graph exists');
+});
+
+// Live firing pulses only the synapses that actually carried a message. The
+// server tick is contentless by design, so which edges fired is derived here by
+// diffing two AUTHORIZED snapshots — meaning a client can only ever pulse an
+// edge the RBAC-filtered endpoint was willing to show it.
+test('diffConnectomeActivity reports a brand new synapse as fired', () => {
+  const fired = diffConnectomeActivity(
+    [],
+    [{ source: 'a', target: 'b', count: 1, last_fired: '2026-01-01T00:00:00Z' }],
+  );
+  assert.deepEqual(fired, ['a\u0000b']);
+});
+
+test('diffConnectomeActivity reports a risen count as fired', () => {
+  const prev = [{ source: 'a', target: 'b', count: 1, last_fired: 't1' }];
+  const next = [{ source: 'a', target: 'b', count: 2, last_fired: 't1' }];
+  assert.deepEqual(diffConnectomeActivity(prev, next), ['a\u0000b']);
+});
+
+// Needed because a burst can land inside one timestamp granularity, and a send
+// that coincides with a retention prune can leave the count unmoved.
+test('diffConnectomeActivity reports an advanced last_fired as fired', () => {
+  const prev = [{ source: 'a', target: 'b', count: 5, last_fired: '2026-01-01T00:00:00Z' }];
+  const next = [{ source: 'a', target: 'b', count: 5, last_fired: '2026-01-01T00:00:09Z' }];
+  assert.deepEqual(diffConnectomeActivity(prev, next), ['a\u0000b']);
+});
+
+test('diffConnectomeActivity reports an unchanged synapse as quiet', () => {
+  const same = [{ source: 'a', target: 'b', count: 3, last_fired: 't9' }];
+  assert.deepEqual(diffConnectomeActivity(same, same), []);
+});
+
+// Retained-row pruning lowers a count without any message being sent. Treating
+// that as activity would animate traffic that did not happen.
+test('diffConnectomeActivity does not treat a pruned count as firing', () => {
+  const prev = [{ source: 'a', target: 'b', count: 9, last_fired: 't1' }];
+  const next = [{ source: 'a', target: 'b', count: 2, last_fired: 't1' }];
+  assert.deepEqual(diffConnectomeActivity(prev, next), []);
+});
+
+// After force-simulation binding, link endpoints are node objects rather than
+// id strings. The diff must key identically in both shapes or every edge would
+// read as new on the first pulse after a render.
+test('diffConnectomeActivity keys object endpoints the same as string ids', () => {
+  const prev = [{ source: 'a', target: 'b', count: 4, last_fired: 't1' }];
+  const next = [{ source: { id: 'a' }, target: { id: 'b' }, count: 4, last_fired: 't1' }];
+  assert.deepEqual(diffConnectomeActivity(prev, next), []);
+});
+
+test('initial connectome acquisition establishes a baseline without firing', () => {
+  const activity = createConnectomeActivityTracker();
+  const initial = [{ source: 'a', target: 'b', count: 7, last_fired: 't7' }];
+  assert.deepEqual(activity.observe(initial, false), []);
+});
+
+test('ordinary reload updates the baseline without firing', () => {
+  const activity = createConnectomeActivityTracker();
+  activity.observe([{ source: 'a', target: 'b', count: 1, last_fired: 't1' }], false);
+  assert.deepEqual(activity.observe(
+    [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }], false,
+  ), []);
+});
+
+test('connectome tick fires only edges changed since the latest authorized baseline', () => {
+  const activity = createConnectomeActivityTracker();
+  activity.observe([{ source: 'a', target: 'b', count: 1, last_fired: 't1' }], false);
+  assert.deepEqual(activity.observe(
+    [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }], true,
+  ), ['a\u0000b']);
+});
+
+test('tick arriving during an ordinary load keeps the pre-tick baseline', () => {
+  const activity = createConnectomeActivityTracker();
+  const before = [{ source: 'a', target: 'b', count: 1, last_fired: 't1' }];
+  const after = [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }];
+  activity.observe(before, false);
+  assert.deepEqual(activity.observe(after, false, true), [],
+    'ordinary response must not pulse or consume a pending tick');
+  assert.deepEqual(activity.observe(after, true), ['a\u0000b'],
+    'queued tick refetch must still observe the firing transition');
+});
+
+test('tick intent survives failed retry and an ordinary reload during backoff', () => {
+  const activity = createConnectomeActivityTracker();
+  const intent = createConnectomeReloadIntent();
+  const before = [{ source: 'a', target: 'b', count: 1, last_fired: 't1' }];
+  const after = [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }];
+  activity.observe(before, false);
+
+  intent.requestTick();
+  const failedTickGeneration = intent.begin('connectome');
+  assert.equal(failedTickGeneration, 1);
+  intent.settle('connectome', failedTickGeneration, false);
+  assert.equal(intent.isPending('connectome'), true,
+    'failed tick fetch must retain intent throughout retry backoff');
+
+  // A remember/forget refresh can cancel the retry timer. It must inherit the
+  // pending tick instead of advancing the baseline as an ordinary reload.
+  const ordinaryDuringBackoff = intent.begin('connectome');
+  assert.equal(ordinaryDuringBackoff, 1);
+  assert.deepEqual(activity.observe(after, ordinaryDuringBackoff > 0), ['a\u0000b']);
+  intent.settle('connectome', ordinaryDuringBackoff, true);
+  assert.equal(intent.isPending('connectome'), false);
+  assert.deepEqual(activity.observe(after, intent.begin('connectome')), [],
+    'a satisfied tick must pulse exactly once');
+});
+
+test('a second tick is not acknowledged by an older in-flight generation', () => {
+  const activity = createConnectomeActivityTracker();
+  const intent = createConnectomeReloadIntent();
+  const before = [{ source: 'a', target: 'b', count: 1, last_fired: 't1' }];
+  const afterTick1 = [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }];
+  const afterTick2 = [{ source: 'a', target: 'b', count: 3, last_fired: 't3' }];
+  activity.observe(before, false);
+
+  intent.requestTick();
+  const generation1 = intent.begin('connectome');
+  intent.requestTick();
+  assert.deepEqual(activity.observe(afterTick1, generation1 > 0), ['a\u0000b']);
+  intent.settle('connectome', generation1, true);
+  assert.equal(intent.isPending('connectome'), true,
+    'tick 1 response must not consume tick 2, which arrived after it began');
+
+  const generation2 = intent.begin('connectome');
+  assert.equal(generation2, 2);
+  assert.deepEqual(activity.observe(afterTick2, generation2 > 0), ['a\u0000b']);
+  intent.settle('connectome', generation2, true);
+  assert.equal(intent.isPending('connectome'), false);
+});
+
+// The renderer subscribes to the contentless tick and refetches the authorized
+// snapshot; it must never read edge data off the event itself.
+test('mri-brain refetches the authorized snapshot on a connectome tick', () => {
+  assert.match(mriSource, /opts\.sse\.on\('connectome'/,
+    'the renderer must subscribe to the connectome tick');
+  assert.match(mriSource, /load\(true\)/,
+    'only the connectome tick path may request a firing diff');
+  assert.match(mriSource, /markConnectomeFiring\(d, tickAware, connectomeReloadIntent\.isPending\(request\.mode\) && !tickAware\)/,
+    'the fired-edge diff must run on the applied snapshot');
+  assert.match(mriSource, /if \(fromConnectomeTick\) connectomeReloadIntent\.requestTick\(\)/,
+    'the event must persist tick intent independently of a retry timer');
+  assert.match(mriSource, /scheduleGraphRetry\(load\)/,
+    'retries must consult persistent tick intent when they begin');
+  assert.match(mriSource, /connectomeReloadIntent\.settle\(request\.mode, tickGeneration, true\)/,
+    'a successful production fetch must acknowledge exactly its captured generation');
 });

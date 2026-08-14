@@ -33,6 +33,20 @@ const (
 	// Chain Activity an auditable view of enforced permissions, not merely a
 	// memory-operation feed.
 	EventAccess EventType = "access"
+	// EventConnectome announces that the local agent connectome may have
+	// changed. It is a CACHE-INVALIDATION TICK, not data: it carries no
+	// identifiers, no counts and no text at all.
+	//
+	// The reason it must stay empty is structural. This stream is a global
+	// fan-out with no subscriber identity, while the connectome snapshot at
+	// /v1/dashboard/network/synapses is RBAC-filtered per caller — an edge is
+	// returned only when both endpoints are visible. Putting an edge on the
+	// tick would publish, to every connected client, a relationship the
+	// snapshot would have withheld from most of them. Sending nothing and
+	// letting each client re-fetch through the authorized endpoint keeps that
+	// filter as the single enforcement point, so the guarantee holds by
+	// construction rather than by a second filter kept in sync by hand.
+	EventConnectome EventType = "connectome"
 )
 
 // SSEEvent is an event sent to connected dashboard clients.

@@ -193,7 +193,7 @@ test('release and CI vulnerability gates scan the exact mandated Go floor', () =
     assert.match(source, /govulncheck \.\/\.\.\./);
     assert.match(source, /cd natter\n\s+govulncheck \.\/\.\.\./);
   }
-  assert.match(rootDockerfile, /^FROM golang:1\.25\.12-alpine AS builder$/m);
+  assert.match(rootDockerfile, /^FROM golang:1\.25\.13-alpine AS builder$/m);
 });
 
 test('superseded checks stop spending runner minutes without weakening the newest commit', () => {

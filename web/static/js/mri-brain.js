@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -457,12 +457,22 @@ export function mountMriBrain(container, opts = {}) {
   // every link is a typed memory edge (unchanged formulas); in the connectome a
   // synapse's normalized weight _w drives Hebbian thickness, particle count and
   // pulse speed — heavier, hotter channels read thicker and fire faster.
+  // A synapse that just carried a message is briefly thickened and given extra
+  // particles. The boost decays on its own so a burst reads as firing rather
+  // than as a permanent weight change — the retained weight already covers that.
+  const SYNAPSE_PULSE_MS = 2600;
+  function synapsePulse(l){
+    if (!l || !l._firedAt) return 0;
+    const age = Date.now() - l._firedAt;
+    if (age < 0 || age > SYNAPSE_PULSE_MS) return 0;
+    return 1 - (age / SYNAPSE_PULSE_MS);
+  }
   function linkWidthFor(l){
-    if(l.link_type==='synapse') return 0.25 + (l._w||0)*2.4;
+    if(l.link_type==='synapse') return 0.25 + (l._w||0)*2.4 + synapsePulse(l)*2.0;
     return l.link_type==='focus'?0.8 : l.link_type==='contradicts'?0.6 : (LINK_TYPES[l.link_type]||{}).typed?0.35:0.18;
   }
   function linkParticlesFor(l){
-    if(l.link_type==='synapse') return flow ? Math.min(6, 1+Math.round((l._w||0)*5)) : 0;
+    if(l.link_type==='synapse') return flow ? Math.min(8, 1+Math.round((l._w||0)*5)+Math.round(synapsePulse(l)*2)) : 0;
     return l.link_type==='focus'?3 : (flow&&(LINK_TYPES[l.link_type]||{}).typed?2:0);
   }
   function linkParticleSpeedFor(l){
@@ -706,13 +716,43 @@ export function mountMriBrain(container, opts = {}) {
 
   // Re-fetch (respecting the drill domain) and re-render. Deterministic placement
   // keeps existing nodes put; no re-heat.
-  function load(){
+  // The tracker retains the previous AUTHORIZED snapshot. The diff runs on
+  // what this client was actually allowed to fetch, so a pulse can never be
+  // shown for an edge the snapshot withheld.
+  const connectomeActivity = createConnectomeActivityTracker();
+  let pulseDecayTimer = null;
+  function markConnectomeFiring(d, fromConnectomeTick, tickPending = false){
+    if (mode !== 'connectome' || !d || !Array.isArray(d.links)) return;
+    const fired = new Set(connectomeActivity.observe(
+      d.links, fromConnectomeTick, tickPending,
+    ));
+    if (!fired.size) return;
+    const now = Date.now();
+    for (const l of d.links) {
+      const src = typeof l.source === 'object' ? l.source.id : l.source;
+      const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+      if (fired.has(`${src}\u0000${tgt}`)) l._firedAt = now;
+    }
+    // Re-read the accessors once the pulse has decayed so the boost does not
+    // linger until some unrelated redraw happens to clear it.
+    clearTimeout(pulseDecayTimer);
+    pulseDecayTimer = setTimeout(() => {
+      if (disposed || !Graph) return;
+      Graph.linkWidth(linkWidthFor).linkDirectionalParticles(linkParticlesFor);
+    }, SYNAPSE_PULSE_MS + 100);
+  }
+
+  const connectomeReloadIntent = createConnectomeReloadIntent();
+  function load(fromConnectomeTick = false){
+    if (fromConnectomeTick) connectomeReloadIntent.requestTick();
     if (graphLoadInFlight) {
       graphReloadPending = true;
       return;
     }
     graphLoadInFlight = true;
     const request = graphLoads.begin(mode);
+    const tickGeneration = connectomeReloadIntent.begin(request.mode);
+    const tickAware = tickGeneration > 0;
     // A drill / reload leaves focus mode.
     focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
     fetchActive(request.mode).then(d => {
@@ -722,10 +762,12 @@ export function mountMriBrain(container, opts = {}) {
       reportGraphAvailability('ready');
       placeActive(d.nodes);
       resolveConnectomeLinks(d);
+      markConnectomeFiring(d, tickAware, connectomeReloadIntent.isPending(request.mode) && !tickAware);
       Graph.graphData(d);
       rendered = d;
       refreshCounts(d);
       buildLobes(d);
+      connectomeReloadIntent.settle(request.mode, tickGeneration, true);
     }).catch(() => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
       reportGraphAvailability('unavailable');
@@ -983,6 +1025,7 @@ export function mountMriBrain(container, opts = {}) {
     $('.boot').style.display = 'none';
     placeActive(data.nodes);
     resolveConnectomeLinks(data);
+    markConnectomeFiring(data, false);
     rendered = data;
     Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'))
       .backgroundColor(mriBgColor())
@@ -1161,6 +1204,23 @@ export function mountMriBrain(container, opts = {}) {
       subs.push(() => clearTimeout(t));
       subs.push(opts.sse.on('remember', reload));
       subs.push(opts.sse.on('forget', reload));
+
+      // LIVE CONNECTOME FIRING. The tick carries nothing, so the data comes
+      // from re-fetching the AUTHORIZED snapshot through the existing load
+      // path — the same RBAC-filtered endpoint the view already uses. That
+      // keeps the edge guard the single enforcement point: a client can only
+      // pulse an edge it was allowed to fetch. load() already reports
+      // 'unavailable' and retries if the refetch fails, so a dropped tick or a
+      // failed fetch never leaves the view asserting it is live.
+      let ct = null;
+      const pulse = () => {
+        if (mode !== 'connectome') return;
+        clearTimeout(ct);
+        ct = setTimeout(() => load(true), 900);
+      };
+      subs.push(() => clearTimeout(ct));
+      subs.push(() => clearTimeout(pulseDecayTimer));
+      subs.push(opts.sse.on('connectome', pulse));
     }
   }
 
@@ -1228,6 +1288,8 @@ export function mountMriBrain(container, opts = {}) {
     if (mode===next || (next==='connectome' && !allowConnectome)) return;
     graphLoads.invalidate();
     mode = next;
+    connectomeActivity.reset();
+    connectomeReloadIntent.reset();
     currentDomain = null;
     focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
     updateModeChrome();

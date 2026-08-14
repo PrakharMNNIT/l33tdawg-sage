@@ -257,8 +257,8 @@ with an exact composite-cursor catch-up action and forbid advancing the
 watermark until the window is drained.
 
 **Release builders now enforce the patched Go floor.** Root and `natter`
-modules require Go 1.25.12, CI and release jobs resolve that exact `go.mod`
-toolchain, every Go container builder uses 1.25.12, and pinned
+modules require Go 1.25.13, CI and release jobs resolve that exact `go.mod`
+toolchain, every Go container builder uses 1.25.13, and pinned
 `govulncheck v1.6.0` scans both modules before either CI fan-in or release
 publication can pass.
 

@@ -65,3 +65,90 @@ export function createGraphLoadCoordinator() {
     },
   };
 }
+
+// diffConnectomeActivity reports which directed edges FIRED between two
+// connectome snapshots, so a live pulse animates the channels that actually
+// carried a message rather than flashing the whole graph.
+//
+// An edge counts as fired when it is new, when its retained count rose, or when
+// its last_fired advanced. All three are needed: count alone misses a send that
+// coincided with a retention prune, and last_fired alone misses a burst that
+// lands within the same timestamp granularity.
+//
+// A DROP IN COUNT IS NOT A FIRING. Retained-row pruning can lower a count
+// without any message being sent, and animating that would report activity that
+// did not happen.
+export function diffConnectomeActivity(prevLinks, nextLinks) {
+  const key = (l) => `${typeof l.source === 'object' ? l.source.id : l.source}\u0000${typeof l.target === 'object' ? l.target.id : l.target}`;
+  const before = new Map();
+  for (const l of (Array.isArray(prevLinks) ? prevLinks : [])) {
+    before.set(key(l), { count: l.count || 0, last: l.last_fired || '' });
+  }
+  const fired = [];
+  for (const l of (Array.isArray(nextLinks) ? nextLinks : [])) {
+    const k = key(l);
+    const was = before.get(k);
+    if (!was) { fired.push(k); continue; }
+    if ((l.count || 0) > was.count) { fired.push(k); continue; }
+    if ((l.last_fired || '') > was.last) { fired.push(k); }
+  }
+  return fired;
+}
+
+function snapshotConnectomeLinks(links) {
+  return (Array.isArray(links) ? links : []).map(l => ({
+    source: typeof l.source === 'object' ? l.source.id : l.source,
+    target: typeof l.target === 'object' ? l.target.id : l.target,
+    count: l.count || 0,
+    last_fired: l.last_fired || '',
+  }));
+}
+
+// Tracks the last authorized snapshot while keeping activity semantics tied to
+// an actual connectome invalidation tick. Initial acquisition and ordinary
+// reloads establish/update the baseline but never claim that an edge fired.
+export function createConnectomeActivityTracker() {
+  let baseline = null;
+  return {
+    observe(links, fromConnectomeTick = false, tickPending = false) {
+      const next = snapshotConnectomeLinks(links);
+      // A tick that arrived during an ordinary request owns the next baseline
+      // transition. Do not let the older request consume that transition before
+      // the queued tick refetch can turn it into a pulse.
+      if (tickPending && !fromConnectomeTick) return [];
+      const fired = baseline !== null && fromConnectomeTick
+        ? diffConnectomeActivity(baseline, next)
+        : [];
+      baseline = next;
+      return fired;
+    },
+    reset() { baseline = null; },
+  };
+}
+
+// Retains a connectome invalidation until an authorized snapshot has actually
+// satisfied it. Retry timers are deliberately not the source of truth: an
+// ordinary graph refresh may cancel a timer, but while a tick is pending that
+// refresh becomes the tick-aware fetch and must either pulse or preserve the
+// intent for the next retry.
+export function createConnectomeReloadIntent() {
+  let requestedGeneration = 0;
+  let satisfiedGeneration = 0;
+  return {
+    requestTick() { requestedGeneration += 1; },
+    begin(mode) {
+      return mode === 'connectome' && requestedGeneration > satisfiedGeneration
+        ? requestedGeneration
+        : 0;
+    },
+    settle(mode, generation, succeeded) {
+      if (mode === 'connectome' && generation > 0 && succeeded) {
+        satisfiedGeneration = Math.max(satisfiedGeneration, generation);
+      }
+    },
+    isPending(mode) {
+      return mode === 'connectome' && requestedGeneration > satisfiedGeneration;
+    },
+    reset() { requestedGeneration = 0; satisfiedGeneration = 0; },
+  };
+}

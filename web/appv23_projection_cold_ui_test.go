@@ -52,6 +52,7 @@ func TestMRIGraphFailureIsUnavailableAndNeverSyntheticEmptyData(t *testing.T) {
 	assert.Contains(t, mri, "graphRetryDelay = Math.min(graphRetryDelay * 2, 30000)")
 	assert.Contains(t, mri, "scheduleGraphRetry(acquireInitialGraph)")
 	assert.Contains(t, mri, "scheduleGraphRetry(load)")
+	assert.Contains(t, mri, "connectomeReloadIntent.requestTick()")
 	assert.NotContains(t, mri,
 		"return { live: false, nodes: [], links: [], total: 0",
 		"a transport failure must not masquerade as a successful empty graph")
