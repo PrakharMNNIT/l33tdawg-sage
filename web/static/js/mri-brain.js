@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -742,15 +742,16 @@ export function mountMriBrain(container, opts = {}) {
     }, SYNAPSE_PULSE_MS + 100);
   }
 
-  let graphReloadPulsePending = false;
+  const connectomeReloadIntent = createConnectomeReloadIntent();
   function load(fromConnectomeTick = false){
+    if (fromConnectomeTick) connectomeReloadIntent.requestTick();
     if (graphLoadInFlight) {
       graphReloadPending = true;
-      graphReloadPulsePending = graphReloadPulsePending || fromConnectomeTick;
       return;
     }
     graphLoadInFlight = true;
     const request = graphLoads.begin(mode);
+    const tickAware = connectomeReloadIntent.begin(request.mode);
     // A drill / reload leaves focus mode.
     focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
     fetchActive(request.mode).then(d => {
@@ -760,23 +761,22 @@ export function mountMriBrain(container, opts = {}) {
       reportGraphAvailability('ready');
       placeActive(d.nodes);
       resolveConnectomeLinks(d);
-      markConnectomeFiring(d, fromConnectomeTick, graphReloadPulsePending);
+      markConnectomeFiring(d, tickAware, connectomeReloadIntent.isPending(request.mode) && !tickAware);
       Graph.graphData(d);
       rendered = d;
       refreshCounts(d);
       buildLobes(d);
+      connectomeReloadIntent.settle(request.mode, tickAware, true);
     }).catch(() => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
       reportGraphAvailability('unavailable');
-      if (!graphReloadPending) scheduleGraphRetry(() => load(fromConnectomeTick));
+      if (!graphReloadPending) scheduleGraphRetry(load);
     }).finally(() => {
       graphLoadInFlight = false;
       if (graphReloadPending && !disposed) {
-        const pulsePending = graphReloadPulsePending;
         graphReloadPending = false;
-        graphReloadPulsePending = false;
         clearTimeout(graphRetryTimer);
-        load(pulsePending);
+        load();
       }
     });
   }
@@ -1288,6 +1288,7 @@ export function mountMriBrain(container, opts = {}) {
     graphLoads.invalidate();
     mode = next;
     connectomeActivity.reset();
+    connectomeReloadIntent.reset();
     currentDomain = null;
     focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
     updateModeChrome();

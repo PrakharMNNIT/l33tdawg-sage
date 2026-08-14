@@ -125,3 +125,21 @@ export function createConnectomeActivityTracker() {
     reset() { baseline = null; },
   };
 }
+
+// Retains a connectome invalidation until an authorized snapshot has actually
+// satisfied it. Retry timers are deliberately not the source of truth: an
+// ordinary graph refresh may cancel a timer, but while a tick is pending that
+// refresh becomes the tick-aware fetch and must either pulse or preserve the
+// intent for the next retry.
+export function createConnectomeReloadIntent() {
+  let pending = false;
+  return {
+    requestTick() { pending = true; },
+    begin(mode) { return mode === 'connectome' && pending; },
+    settle(mode, tickAware, succeeded) {
+      if (mode === 'connectome' && tickAware && succeeded) pending = false;
+    },
+    isPending(mode) { return mode === 'connectome' && pending; },
+    reset() { pending = false; },
+  };
+}

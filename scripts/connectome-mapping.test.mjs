@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity, createConnectomeActivityTracker } from '../web/static/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity, createConnectomeActivityTracker, createConnectomeReloadIntent } from '../web/static/js/connectome-map.js';
 
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 
@@ -224,6 +224,31 @@ test('tick arriving during an ordinary load keeps the pre-tick baseline', () => 
     'queued tick refetch must still observe the firing transition');
 });
 
+test('tick intent survives failed retry and an ordinary reload during backoff', () => {
+  const activity = createConnectomeActivityTracker();
+  const intent = createConnectomeReloadIntent();
+  const before = [{ source: 'a', target: 'b', count: 1, last_fired: 't1' }];
+  const after = [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }];
+  activity.observe(before, false);
+
+  intent.requestTick();
+  const failedTickAware = intent.begin('connectome');
+  assert.equal(failedTickAware, true);
+  intent.settle('connectome', failedTickAware, false);
+  assert.equal(intent.isPending('connectome'), true,
+    'failed tick fetch must retain intent throughout retry backoff');
+
+  // A remember/forget refresh can cancel the retry timer. It must inherit the
+  // pending tick instead of advancing the baseline as an ordinary reload.
+  const ordinaryDuringBackoff = intent.begin('connectome');
+  assert.equal(ordinaryDuringBackoff, true);
+  assert.deepEqual(activity.observe(after, ordinaryDuringBackoff), ['a\u0000b']);
+  intent.settle('connectome', ordinaryDuringBackoff, true);
+  assert.equal(intent.isPending('connectome'), false);
+  assert.deepEqual(activity.observe(after, intent.begin('connectome')), [],
+    'a satisfied tick must pulse exactly once');
+});
+
 // The renderer subscribes to the contentless tick and refetches the authorized
 // snapshot; it must never read edge data off the event itself.
 test('mri-brain refetches the authorized snapshot on a connectome tick', () => {
@@ -231,8 +256,10 @@ test('mri-brain refetches the authorized snapshot on a connectome tick', () => {
     'the renderer must subscribe to the connectome tick');
   assert.match(mriSource, /load\(true\)/,
     'only the connectome tick path may request a firing diff');
-  assert.match(mriSource, /markConnectomeFiring\(d, fromConnectomeTick, graphReloadPulsePending\)/,
+  assert.match(mriSource, /markConnectomeFiring\(d, tickAware, connectomeReloadIntent\.isPending\(request\.mode\) && !tickAware\)/,
     'the fired-edge diff must run on the applied snapshot');
-  assert.match(mriSource, /scheduleGraphRetry\(\(\) => load\(fromConnectomeTick\)\)/,
-    'a failed tick refetch must preserve its firing intent across retry');
+  assert.match(mriSource, /if \(fromConnectomeTick\) connectomeReloadIntent\.requestTick\(\)/,
+    'the event must persist tick intent independently of a retry timer');
+  assert.match(mriSource, /scheduleGraphRetry\(load\)/,
+    'retries must consult persistent tick intent when they begin');
 });
