@@ -94,3 +94,30 @@ export function diffConnectomeActivity(prevLinks, nextLinks) {
   }
   return fired;
 }
+
+function snapshotConnectomeLinks(links) {
+  return (Array.isArray(links) ? links : []).map(l => ({
+    source: typeof l.source === 'object' ? l.source.id : l.source,
+    target: typeof l.target === 'object' ? l.target.id : l.target,
+    count: l.count || 0,
+    last_fired: l.last_fired || '',
+  }));
+}
+
+// Tracks the last authorized snapshot while keeping activity semantics tied to
+// an actual connectome invalidation tick. Initial acquisition and ordinary
+// reloads establish/update the baseline but never claim that an edge fired.
+export function createConnectomeActivityTracker() {
+  let baseline = null;
+  return {
+    observe(links, fromConnectomeTick = false) {
+      const next = snapshotConnectomeLinks(links);
+      const fired = baseline !== null && fromConnectomeTick
+        ? diffConnectomeActivity(baseline, next)
+        : [];
+      baseline = next;
+      return fired;
+    },
+    reset() { baseline = null; },
+  };
+}

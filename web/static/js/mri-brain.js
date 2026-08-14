@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -716,19 +716,14 @@ export function mountMriBrain(container, opts = {}) {
 
   // Re-fetch (respecting the drill domain) and re-render. Deterministic placement
   // keeps existing nodes put; no re-heat.
-  // lastConnectomeLinks is the previous AUTHORIZED snapshot. The diff runs on
+  // The tracker retains the previous AUTHORIZED snapshot. The diff runs on
   // what this client was actually allowed to fetch, so a pulse can never be
   // shown for an edge the snapshot withheld.
-  let lastConnectomeLinks = [];
+  const connectomeActivity = createConnectomeActivityTracker();
   let pulseDecayTimer = null;
-  function markConnectomeFiring(d){
+  function markConnectomeFiring(d, fromConnectomeTick){
     if (mode !== 'connectome' || !d || !Array.isArray(d.links)) return;
-    const fired = new Set(diffConnectomeActivity(lastConnectomeLinks, d.links));
-    lastConnectomeLinks = d.links.map(l => ({
-      source: typeof l.source === 'object' ? l.source.id : l.source,
-      target: typeof l.target === 'object' ? l.target.id : l.target,
-      count: l.count || 0, last_fired: l.last_fired || '',
-    }));
+    const fired = new Set(connectomeActivity.observe(d.links, fromConnectomeTick));
     if (!fired.size) return;
     const now = Date.now();
     for (const l of d.links) {
@@ -745,9 +740,11 @@ export function mountMriBrain(container, opts = {}) {
     }, SYNAPSE_PULSE_MS + 100);
   }
 
-  function load(){
+  let graphReloadPulsePending = false;
+  function load(fromConnectomeTick = false){
     if (graphLoadInFlight) {
       graphReloadPending = true;
+      graphReloadPulsePending = graphReloadPulsePending || fromConnectomeTick;
       return;
     }
     graphLoadInFlight = true;
@@ -761,7 +758,7 @@ export function mountMriBrain(container, opts = {}) {
       reportGraphAvailability('ready');
       placeActive(d.nodes);
       resolveConnectomeLinks(d);
-      markConnectomeFiring(d);
+      markConnectomeFiring(d, fromConnectomeTick);
       Graph.graphData(d);
       rendered = d;
       refreshCounts(d);
@@ -773,9 +770,11 @@ export function mountMriBrain(container, opts = {}) {
     }).finally(() => {
       graphLoadInFlight = false;
       if (graphReloadPending && !disposed) {
+        const pulsePending = graphReloadPulsePending;
         graphReloadPending = false;
+        graphReloadPulsePending = false;
         clearTimeout(graphRetryTimer);
-        load();
+        load(pulsePending);
       }
     });
   }
@@ -1023,6 +1022,7 @@ export function mountMriBrain(container, opts = {}) {
     $('.boot').style.display = 'none';
     placeActive(data.nodes);
     resolveConnectomeLinks(data);
+    markConnectomeFiring(data, false);
     rendered = data;
     Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'))
       .backgroundColor(mriBgColor())
@@ -1203,11 +1203,6 @@ export function mountMriBrain(container, opts = {}) {
       subs.push(opts.sse.on('forget', reload));
 
       // LIVE CONNECTOME FIRING. The tick carries nothing, so the data comes
-      // from re-fetching the AUTHORIZED snapshot — the same RBAC-filtered
-      // endpoint the view already uses. That keeps the edge guard the single
-      // enforcement point: a client can only ever pulse an edge it was allowed
-      // to fetch.
-      // LIVE CONNECTOME FIRING. The tick carries nothing, so the data comes
       // from re-fetching the AUTHORIZED snapshot through the existing load
       // path — the same RBAC-filtered endpoint the view already uses. That
       // keeps the edge guard the single enforcement point: a client can only
@@ -1218,7 +1213,7 @@ export function mountMriBrain(container, opts = {}) {
       const pulse = () => {
         if (mode !== 'connectome') return;
         clearTimeout(ct);
-        ct = setTimeout(load, 900);
+        ct = setTimeout(() => load(true), 900);
       };
       subs.push(() => clearTimeout(ct));
       subs.push(() => clearTimeout(pulseDecayTimer));
@@ -1290,6 +1285,7 @@ export function mountMriBrain(container, opts = {}) {
     if (mode===next || (next==='connectome' && !allowConnectome)) return;
     graphLoads.invalidate();
     mode = next;
+    connectomeActivity.reset();
     currentDomain = null;
     focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
     updateModeChrome();

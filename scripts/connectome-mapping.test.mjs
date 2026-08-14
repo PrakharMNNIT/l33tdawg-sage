@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity } from '../web/static/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity, createConnectomeActivityTracker } from '../web/static/js/connectome-map.js';
 
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 
@@ -191,11 +191,35 @@ test('diffConnectomeActivity keys object endpoints the same as string ids', () =
   assert.deepEqual(diffConnectomeActivity(prev, next), []);
 });
 
+test('initial connectome acquisition establishes a baseline without firing', () => {
+  const activity = createConnectomeActivityTracker();
+  const initial = [{ source: 'a', target: 'b', count: 7, last_fired: 't7' }];
+  assert.deepEqual(activity.observe(initial, false), []);
+});
+
+test('ordinary reload updates the baseline without firing', () => {
+  const activity = createConnectomeActivityTracker();
+  activity.observe([{ source: 'a', target: 'b', count: 1, last_fired: 't1' }], false);
+  assert.deepEqual(activity.observe(
+    [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }], false,
+  ), []);
+});
+
+test('connectome tick fires only edges changed since the latest authorized baseline', () => {
+  const activity = createConnectomeActivityTracker();
+  activity.observe([{ source: 'a', target: 'b', count: 1, last_fired: 't1' }], false);
+  assert.deepEqual(activity.observe(
+    [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }], true,
+  ), ['a\u0000b']);
+});
+
 // The renderer subscribes to the contentless tick and refetches the authorized
 // snapshot; it must never read edge data off the event itself.
 test('mri-brain refetches the authorized snapshot on a connectome tick', () => {
   assert.match(mriSource, /opts\.sse\.on\('connectome'/,
     'the renderer must subscribe to the connectome tick');
-  assert.match(mriSource, /markConnectomeFiring/,
+  assert.match(mriSource, /load\(true\)/,
+    'only the connectome tick path may request a firing diff');
+  assert.match(mriSource, /markConnectomeFiring\(d, fromConnectomeTick\)/,
     'the fired-edge diff must run on the applied snapshot');
 });
