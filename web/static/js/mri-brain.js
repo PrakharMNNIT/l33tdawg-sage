@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint, mapEngrams, stripBloom } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -307,6 +307,11 @@ export function mountMriBrain(container, opts = {}) {
   // (the agent message-bus as neurons + weighted synapses). A HUD toggle swaps
   // between them at runtime; the memory path is byte-for-byte what it was.
   const SYNAPSE_URL = opts.synapseUrl || '/v1/dashboard/network/synapses';
+  const ENGRAMS_URL = opts.engramsUrl || '/v1/dashboard/memory/engrams';
+  // Optional deep-link: open straight to one agent's lobe (its engrams bloomed).
+  const focusAgent = opts.focusAgent || '';
+  let autoBloomed = false;
+  let deepLinkTimer = null;
   const allowConnectome = opts.allowConnectome !== false;
   let mode = opts.mode === 'connectome' ? 'connectome' : 'memory';
   // Per-view skull opacity. The memory graph keeps the anatomical hull prominent
@@ -522,6 +527,55 @@ export function mountMriBrain(container, opts = {}) {
       if(s===n.id) nb.add(t); else if(t===n.id) nb.add(s);
     });
     focusId=n.id; focusSet=nb;
+    Graph.nodeColor(nodeColorRGBA);
+    setFocusMarkerNode(n);
+  }
+
+  // Agent-as-lobe (#182): clicking a neuron blooms its authored memories — the
+  // "engrams" that re-anchor to their author. Lights the synaptic circle first
+  // (responsive), then fetches this one agent's memories from /memory/engrams and
+  // orbits them around the neuron as transient (_added) memory nodes tethered by
+  // focus links. Disclosure is the memory graph's, partitioned by author. On-demand
+  // per neuron, so it never fans out across every agent.
+  // Strip any bloomed engrams (_added nodes + focus tethers) and repaint. The
+  // removal is the pure stripBloom() so it can't silently become a no-op.
+  function clearBloom(){
+    if (!Graph) return;
+    Graph.graphData(stripBloom(Graph.graphData()));
+  }
+  async function bloomEngrams(n){
+    if (disposed || !Graph || !rendered || mode !== 'connectome') return;
+    focusNeuron(n);
+    // Clear any prior bloom IMMEDIATELY, before the fetch — so a failed, errored,
+    // or superseded request never strands the previous agent's engrams under this
+    // neuron's focus. Every early-return below leaves the view cleared, not stale.
+    clearBloom();
+    let payload;
+    try {
+      const resp = await fetch(ENGRAMS_URL + '?agent=' + encodeURIComponent(n.id), { credentials: 'same-origin' });
+      if (!resp.ok) return;
+      payload = await resp.json();
+    } catch (e) { console.warn('[mri] engrams unavailable:', e.message); return; }
+    // Superseded (another neuron clicked while this was in flight) or torn down:
+    // drop the stale response rather than bloom it under the wrong focus.
+    if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id) return;
+    const engrams = mapEngrams(payload);
+    const gd = stripBloom(Graph.graphData());
+    const present = new Set(gd.nodes.map(nn => nn.id));
+    const fs = new Set(focusSet || [n.id]);
+    engrams.forEach((em, i) => {
+      if (!present.has(em.id)) {
+        placeNear(em, n, i);
+        gd.nodes.push(em);
+        present.add(em.id);
+      }
+      // endpoints are node OBJECTS so the tether renders under the pinned layout
+      // (string ids go unresolved once the link force is nulled — see #188).
+      gd.links.push({ source: n, target: em, link_type: 'focus' });
+      fs.add(em.id);
+    });
+    focusId = n.id; focusSet = fs;
+    Graph.graphData(gd);
     Graph.nodeColor(nodeColorRGBA);
     setFocusMarkerNode(n);
   }
@@ -1117,7 +1171,7 @@ export function mountMriBrain(container, opts = {}) {
       .linkDirectionalParticleWidth(1.1).linkDirectionalParticleSpeed(linkParticleSpeedFor)
       .warmupTicks(1).cooldownTicks(6)
       .onNodeHover(showTip)
-      .onNodeClick(n=>{ lastNodeClickAt = performance.now(); if (mode==='connectome') focusNeuron(n); else exploreNode(n); })
+      .onNodeClick(n=>{ lastNodeClickAt = performance.now(); if (mode==='connectome') { if (n.isNeuron) bloomEngrams(n); } else exploreNode(n); })
       .onBackgroundClick(()=>{ exitFocus(); });
 
     // Positions are pinned by placeNodes() (fx/fy/fz), so disable the force
@@ -1325,6 +1379,11 @@ export function mountMriBrain(container, opts = {}) {
     fetchActive(request.mode).then(d => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
       initializeGraph(d);
+      // Deep-link: auto-bloom a requested agent's lobe on first connectome paint.
+      if (focusAgent && !autoBloomed && mode === 'connectome' && rendered) {
+        const target = rendered.nodes.find(nd => nd.isNeuron && nd.id === focusAgent);
+        if (target) { autoBloomed = true; deepLinkTimer = setTimeout(() => { if (!disposed) bloomEngrams(target); }, 50); }
+      }
     }).catch(() => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
       const boot = $('.boot');
@@ -1364,7 +1423,7 @@ export function mountMriBrain(container, opts = {}) {
   const modeCap = document.createElement('div');
   modeCap.className = 'panel mode-cap';
   modeCap.style.cssText = 'position:absolute;left:auto;bottom:44px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
-  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>idle synapses thin & fade · use it or lose it<br>new agents grow in · dormant ones grey out<br>hubs sink to the core · click a neuron to light its circle';
+  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>idle synapses thin & fade · use it or lose it<br>new agents grow in · dormant ones grey out<br>hubs sink to the core · click a neuron → its memories bloom';
   root.appendChild(modeCap);
 
   // Relabel the stat panel + button and toggle the caption for the active mode.
@@ -1410,6 +1469,7 @@ export function mountMriBrain(container, opts = {}) {
     clearInterval(plasticityTimer);
     clearTimeout(birthDecayTimer);
     clearInterval(dormancyTimer);
+    clearTimeout(deepLinkTimer);
     subs.forEach(u => { try { u && u(); } catch(e){ /* noop */ } });
     root.removeEventListener('mousemove', onMove);
     root.removeEventListener('pointerdown', onGraphPointerDown);
