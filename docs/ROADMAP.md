@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.10 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.11 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -39,13 +39,38 @@ v11.18.10 message control plane attributes every claim to an opaque MCP session,
 supports compare-and-swap ownership handoff, rejects replies from a stale former
 owner, and preserves passive recovery after a lost response. CEREBRUM also
 projects its RBAC-filtered agent channels as a traffic-weighted 3D connectome.
-The supported consensus ceiling remains app-v26; **v11.18.10 does not introduce
-app-v27**.
+v11.18.11 adds operator-only live connectome firing driven by contentless ticks
+and caller-filtered snapshot refetches, strips memory plaintext from retrieval
+activity events, makes bookend inbox visibility payload-free and self-healing,
+and raises every current Go build floor to patched 1.25.13. The supported
+consensus ceiling remains app-v26; **v11.18.11 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.11 patch
+
+CEREBRUM now turns successful local message sends into contentless connectome
+invalidation ticks. The existing operator-only snapshot remains the source of
+truth: the browser refetches it under the current caller's authorization and
+pulses only new synapses. Monotonic generations retain ticks across concurrent
+loads and retry interleavings; initial and ordinary refreshes never produce
+false firing.
+
+Recall, search, and hybrid SSE activity is contentless apart from event type and
+result count, so authorized memory plaintext is no longer duplicated into the
+identity-free broadcaster. Claude bookend hooks now expose a signed,
+payload-free unread pointer that neither claims messages nor reveals IDs or
+content, while preserving unrelated user hooks during upgrade self-heal.
+
+Local connectome locality now follows chain identity rather than provider label,
+the obsolete app-v7 validator warning is suppressed after app-v14, the visual
+skull is dimmer, and Windows executable assets receive checksum sidecars. All
+current builders, CI, and release contracts require patched Go 1.25.13. This
+patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.11 does not introduce app-v27.
 
 ## v11.18.10 patch
 

@@ -14,7 +14,7 @@ And because SAGE uses real consensus infrastructure (not just a JSON file), your
 
 ## Quick Install
 
-### From Source (Go 1.25.7+)
+### From Source (Go 1.25.13+)
 
 ```bash
 git clone https://github.com/l33tdawg/sage.git
@@ -27,7 +27,7 @@ sudo mv sage-gui /usr/local/bin/  # or add to your PATH
 
 ```bash
 sage-gui version
-# sage-gui v11.18.10
+# sage-gui v11.18.11
 ```
 
 ---
@@ -197,7 +197,7 @@ sage-gui setup
 
 ### 3. Start using it
 
-Just chat normally. SAGE v11.18.10 advertises 32 MCP tools. The core workflow is:
+Just chat normally. SAGE v11.18.11 advertises 32 MCP tools. The core workflow is:
 
 | Tool | What it does |
 |------|-------------|

@@ -32,6 +32,7 @@ test('release-facing version metadata stays aligned', () => {
     ['scripts/stage-native-shell-daemon.sh', 'through v11.18.x semver'],
     ['web/static/js/app.js', `const SAGE_VERSION = 'v${version}';`],
     ['README.md', `## What's New in v${version}`],
+    ['README.md', '## What\'s New in v11.18.10'],
     ['README.md', 'App-v23 replaced capability-bit administration'],
     ['README.md', 'App-v24 closes the canonical terminal-hash lifecycle defect'],
     ['README.md', `SDK ${version}.`],
@@ -49,8 +50,18 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/reference/app-v23-access-control-design.md', `SAGE v${version}`],
     ['docs/reference/upgrade-lineage-repair.md', `SAGE v${version}`],
     ['docs/ADMIN_BOOTSTRAP.md', `Reconciled through SAGE v${version}/app-v26`],
+	['docs/GETTING_STARTED.md', 'From Source (Go 1.25.13+)'],
 	['docs/GETTING_STARTED.md', `# sage-gui v${version}`],
 	['docs/GETTING_STARTED.md', `SAGE v${version} advertises 32 MCP tools`],
+    ['docs/ARCHITECTURE.md', 'Go 1.25.13+ ABCI application'],
+    ['docs/ARCHITECTURE.md', '| Go | 1.25.13+ |'],
+    ['docs/reference/concepts/signer-nonce-fence.md', `Status: v${version}.`],
+    ['docs/reference/concepts/signer-nonce-fence.md', `not in v${version}`],
+    ['deploy/federation-acceptance/README.md', `# v${version} federation Docker acceptance`],
+    ['docs/FEDERATION.md', `Verified against SAGE v${version} federation behavior`],
+    ['docs/reference/concepts/message-reply-lifecycle.md', `SAGE v${version} code`],
+    ['docs/UPGRADING.md', `| v${version} | Operator-only live connectome firing`],
+    ['docs/ROADMAP.md', `## v${version} patch`],
     ['docs/UPGRADING.md', 'The recovery commands in this guide require SAGE v11.18.0 or later.'],
     ['docs/UPGRADING.md', '`backup --full`, `restore --from`,'],
     ['docs/UPGRADING.md', '`upgrade lineage status|doctor|verify`'],
@@ -86,6 +97,26 @@ test('upgrade release table stays in ascending semantic-version order', () => {
         || (current[0] === previous[0] && current[1] === previous[1] && current[2] > previous[2]),
       `docs/UPGRADING.md release table is out of order: v${previous.join('.')} before v${current.join('.')}`,
     );
+  }
+});
+
+test('historical v11.18.4 Go floor stays 1.25.12', () => {
+  const section = (path, start, end) => {
+    const body = read(path);
+    const from = body.indexOf(start);
+    assert.notEqual(from, -1, `${path} is missing ${start}`);
+    const to = body.indexOf(end, from + start.length);
+    assert.notEqual(to, -1, `${path} is missing ${end}`);
+    return body.slice(from, to);
+  };
+  for (const [path, start, end] of [
+    ['README.md', "## What's New in v11.18.4", "## What's New in v11.18.3"],
+    ['docs/ROADMAP.md', '## v11.18.4 patch', '## v11.18.3 patch'],
+  ]) {
+    const historical = section(path, start, end);
+    assert.match(historical, /Go floor to 1\.25\.12|modules require Go 1\.25\.12/);
+    assert.match(historical, /container builders (?:to |uses )?1\.25\.12|every Go container builder uses 1\.25\.12/);
+    assert.doesNotMatch(historical, /1\.25\.13/);
   }
 });
 
