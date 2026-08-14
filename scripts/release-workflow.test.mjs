@@ -193,7 +193,26 @@ test('release and CI vulnerability gates scan the exact mandated Go floor', () =
     assert.match(source, /govulncheck \.\/\.\.\./);
     assert.match(source, /cd natter\n\s+govulncheck \.\/\.\.\./);
   }
-  assert.match(rootDockerfile, /^FROM golang:1\.25\.13-alpine AS builder$/m);
+  for (const path of [
+    '../go.mod',
+    '../natter/go.mod',
+  ]) {
+    assert.match(readFileSync(new URL(path, import.meta.url), 'utf8'), /^go 1\.25\.13$/m);
+  }
+  for (const [path, stage] of [
+    ['../Dockerfile', 'builder'],
+    ['../deploy/Dockerfile.node', 'builder'],
+    ['../deploy/Dockerfile.abci', 'source'],
+    ['../deploy/federation-acceptance/Dockerfile.node', 'builder'],
+    ['../deploy/federation-acceptance/Dockerfile.natter', 'build'],
+  ]) {
+    const source = readFileSync(new URL(path, import.meta.url), 'utf8');
+    assert.match(source, new RegExp(`^FROM golang:1\\.25\\.13-alpine AS ${stage}$`, 'm'));
+  }
+  assert.match(
+    readFileSync(new URL('../deploy/init-testnet.sh', import.meta.url), 'utf8'),
+    /golang:1\.25\.13-alpine/,
+  );
 });
 
 test('superseded checks stop spending runner minutes without weakening the newest commit', () => {

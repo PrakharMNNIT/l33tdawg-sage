@@ -51,6 +51,36 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.11
+
+**The CEREBRUM connectome now fires live without widening its operator-only
+boundary.** Successful local message sends emit a contentless invalidation tick;
+the browser then refetches the existing caller-filtered snapshot and pulses only
+newly observed synapses. Monotonic generations preserve later ticks across
+in-flight requests, ordinary reloads, failures, and retries, while initial loads
+and unrelated refreshes never create false activity.
+
+**Dashboard retrieval activity no longer duplicates authorized memory plaintext
+into the global operator stream.** Recall, search, and hybrid events now expose
+only their event type and result count. The obsolete expandable plaintext panel
+is gone, and serialized-frame regressions pin the contentless contract and live,
+non-replayed delivery.
+
+**Claude bookend sessions can discover waiting SAGE messages without claiming or
+revealing them.** A signed, payload-free inbox-status hook reports only the
+current identity and unread count, makes failures visible, preserves unrelated
+user hooks during self-heal, and exposes the read-only message tools needed to
+perform the explicit inbox fetch.
+
+This patch also keys local connectome locality by chain identity, removes a stale
+app-v7 validator warning after app-v14, dims the connectome skull for legibility,
+requires patched Go 1.25.13 throughout current builders and CI, and publishes
+checksum sidecars for Windows executables. It introduces no new consensus
+application version or state migration. The ceiling remains app-v26;
+**v11.18.11 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.11`. SDK 11.18.11.
+
 ## What's New in v11.18.10
 
 **Multiple MCP runtimes sharing one agent identity can no longer silently lose
@@ -257,8 +287,8 @@ with an exact composite-cursor catch-up action and forbid advancing the
 watermark until the window is drained.
 
 **Release builders now enforce the patched Go floor.** Root and `natter`
-modules require Go 1.25.13, CI and release jobs resolve that exact `go.mod`
-toolchain, every Go container builder uses 1.25.13, and pinned
+modules require Go 1.25.12, CI and release jobs resolve that exact `go.mod`
+toolchain, every Go container builder uses 1.25.12, and pinned
 `govulncheck v1.6.0` scans both modules before either CI fan-in or release
 publication can pass.
 
@@ -1735,7 +1765,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.10`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.11`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
