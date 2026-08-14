@@ -2095,6 +2095,23 @@ cache honors a local RBAC or agreement-state change immediately.
 signed caller may currently read. An unregistered caller receives 403;
 malformed or oversize input receives 400.
 
+### Operator dashboard event stream
+
+`GET /v1/dashboard/events` is an operator-only browser SSE stream. It is not an
+ordinary-agent messaging route and does not replace the signed
+`GET /v1/messages/wake` catch-up stream. The dashboard client subscribes to the
+following complete named-event vocabulary:
+
+`remember`, `recall`, `forget`, `vote`, `consensus`, `agent`, `import`,
+`update`, `governance`, `task`, `recovery`, `access`, `connectome`,
+`reinstate`, `cocommit`, `search`, `hybrid`, `pipeline_send`,
+`pipeline_complete`, and `redeploy`.
+
+These names describe events observable by the operator dashboard transport;
+they do not promise a dedicated high-level visual treatment for every event.
+Route-local message wake, MCP, and wizard SSE protocols are intentionally
+outside this registry.
+
 ### Canonical local Messages service (v11.17)
 
 The `/v1/messages` operations are one service over the existing

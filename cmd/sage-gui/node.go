@@ -1433,7 +1433,7 @@ func runServe(startupProof string) (rerr error) {
 	// Bridge REST API events to dashboard SSE for the chain activity log
 	restServer.OnEvent = func(eventType, memoryID, domain, content string, data any) {
 		dashboard.SSE.Broadcast(web.SSEEvent{
-			Type:     web.EventType(eventType),
+			Type:     web.EventTypeFromREST(eventType),
 			MemoryID: memoryID,
 			Domain:   domain,
 			Content:  content,
@@ -1657,7 +1657,7 @@ func runServe(startupProof string) (rerr error) {
 				return
 			case status := <-redeployer.StatusChan():
 				dashboard.SSE.Broadcast(web.SSEEvent{
-					Type: "redeploy",
+					Type: web.EventRedeploy,
 					Data: map[string]any{
 						"active":    status.Active,
 						"operation": status.Operation,

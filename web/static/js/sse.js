@@ -29,7 +29,15 @@ export class SSEClient {
             this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000);
         };
 
-        const eventTypes = ['remember', 'recall', 'forget', 'vote', 'consensus', 'agent', 'access', 'update', 'governance', 'import', 'task', 'recovery', 'connectome'];
+		// Named EventSource messages are delivered only to explicitly registered
+		// listeners. The wiring tests execute this module with a real behavioral
+		// EventSource double and keep these names in lockstep with the Go registry.
+		const eventTypes = [
+			'remember', 'recall', 'forget', 'vote', 'consensus', 'agent',
+			'access', 'update', 'governance', 'import', 'task', 'recovery',
+			'connectome', 'reinstate', 'cocommit', 'search', 'hybrid',
+			'pipeline_send', 'pipeline_complete', 'redeploy',
+		];
         for (const type of eventTypes) {
             this.es.addEventListener(type, (e) => {
                 try {

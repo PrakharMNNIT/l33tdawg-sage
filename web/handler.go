@@ -3601,11 +3601,11 @@ func (h *DashboardHandler) handleDeleteMemory(w http.ResponseWriter, r *http.Req
 			status = "challenge_opened"
 		}
 		if h.SSE != nil {
-			eventType := EventForget
 			if status == "challenge_opened" {
-				eventType = EventTask
+				h.SSE.Broadcast(SSEEvent{Type: EventTask, MemoryID: id})
+			} else {
+				h.SSE.Broadcast(SSEEvent{Type: EventForget, MemoryID: id})
 			}
-			h.SSE.Broadcast(SSEEvent{Type: eventType, MemoryID: id})
 		}
 		writeJSONResp(w, http.StatusOK, map[string]string{"status": status})
 		return
