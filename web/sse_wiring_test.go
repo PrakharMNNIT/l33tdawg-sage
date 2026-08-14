@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/tools/go/cfg"
 	"golang.org/x/tools/go/packages"
 
 	"github.com/stretchr/testify/assert"
@@ -315,6 +316,54 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			}`,
 		},
 		{
+			name: "empty slice range break cannot exit outer loop",
+			body: `func mutate(b *SSEBroadcaster) {
+			outer:
+				for true { for range []int{} { break outer } }
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "sink after empty select cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				select {}
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "mixed return and goto branches skip intervening emitter",
+			body: `func mutate(b *SSEBroadcaster, exit bool) {
+				if exit { return } else { goto done }
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			done:
+				_ = 1
+			}`,
+		},
+		{
+			name: "exhaustive runtime switch returns before emitter",
+			body: `func mutate(b *SSEBroadcaster, value int) {
+				switch value {
+				case 1: return
+				default: return
+				}
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "parenthesized panic terminates before emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				(panic("stop"))
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
+			name: "parenthesized panic in both branches terminates before join emitter",
+			body: `func mutate(b *SSEBroadcaster, cond bool) {
+				if cond { (panic("a")) } else { (panic("b")) }
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
+		{
 			name: "sink skipped by forward goto cannot count as an emitter",
 			body: `func mutate(b *SSEBroadcaster) {
 				goto done
@@ -463,6 +512,76 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
 		outer:
 			for true { for range 1 { break outer } }
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("nonempty slice range break can exit outer loop", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+		outer:
+			for true { for range []int{1} { break outer } }
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("default select keeps following emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			select { default: }
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("goto target emitter remains reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, exit bool) {
+			if exit { return } else { goto done }
+		done:
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("runtime switch fallthrough path keeps emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, value int) {
+			switch value {
+			case 1: return
+			default:
+			}
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("runtime boolean switch default keeps emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, value bool) {
+			switch value {
+			case true: return
+			default: b.Broadcast(SSEEvent{Type: EventRemember})
+			}
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("parenthesized ordinary call keeps emitter reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			(makeEvent(EventRemember))
+			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("single conditional parenthesized panic leaves false path reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, cond bool) {
+			if cond { (panic("stop")) }
 			b.Broadcast(SSEEvent{Type: EventRemember})
 		}`)
 		require.Empty(t, scan.unresolved)
@@ -831,8 +950,8 @@ func scanTypedFile(root, path string, fset *token.FileSet, file *ast.File, info 
 				(objects.onEventField != nil && called == objects.onEventField) ||
 				(objects.retrievalHelper != nil && called == objects.retrievalHelper)
 			if isDashboardSink {
-				if reason, dead := compileTimeDeadPath(info, n, parents); dead {
-					scan.unresolved = append(scan.unresolved, "dashboard SSE sink is compile-time unreachable ("+reason+") at "+position(n.Pos()))
+				if reason, dead := cfgDeadPath(info, n, parents); dead {
+					scan.unresolved = append(scan.unresolved, "dashboard SSE sink is unreachable in function CFG ("+reason+") at "+position(n.Pos()))
 					return false
 				}
 			}
@@ -903,325 +1022,154 @@ func scanTypedFile(root, path string, fset *token.FileSet, file *ast.File, info 
 	})
 }
 
-func isInterfaceBroadcastCall(info *types.Info, call *ast.CallExpr, sseEventType types.Type) bool {
-	sel, ok := unwrapParens(call.Fun).(*ast.SelectorExpr)
-	if !ok || sseEventType == nil {
-		return false
-	}
-	receiverType := info.TypeOf(sel.X)
-	if receiverType == nil {
-		return false
-	}
-	if pointer, pointerTypeOK := receiverType.(*types.Pointer); pointerTypeOK {
-		receiverType = pointer.Elem()
-	}
-	if _, interfaceTypeOK := receiverType.Underlying().(*types.Interface); !interfaceTypeOK {
-		return false
-	}
-	fn, functionOK := selectedObject(info, sel).(*types.Func)
-	if !functionOK || fn.Name() != "Broadcast" {
-		return false
-	}
-	sig, signatureOK := fn.Type().(*types.Signature)
-	return signatureOK && sig.Params().Len() == 1 && types.Identical(sig.Params().At(0).Type(), sseEventType)
-}
-
-func compileTimeDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node) (string, bool) {
-	var switchCase *ast.CaseClause
-	for child, node := sink, parents[sink]; node != nil; child, node = node, parents[node] {
-		switch parent := node.(type) {
-		case *ast.CaseClause:
-			if precededByTerminatingStatement(info, parent.Body, child) {
-				return "preceding unconditional terminator", true
-			}
-			switchCase = parent
-		case *ast.BlockStmt:
-			if precededByTerminatingStatement(info, parent.List, child) {
-				return "preceding unconditional terminator", true
-			}
-		case *ast.IfStmt:
-			condition, constant := constantBool(info, parent.Cond)
-			if constant && ((!condition && child == parent.Body) || (condition && parent.Else != nil && child == parent.Else)) {
-				return "constant if branch", true
-			}
-		case *ast.ForStmt:
-			if child == parent.Body {
-				if condition, constant := constantBool(info, parent.Cond); constant && !condition {
-					return "constant false loop", true
-				}
-			}
-		case *ast.SwitchStmt:
-			if switchCase != nil && switchCaseIsDead(info, parent, switchCase) {
-				return "constant switch case", true
-			}
-			switchCase = nil
+func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node) (string, bool) {
+	var body *ast.BlockStmt
+	for node := sink; node != nil; node = parents[node] {
+		switch function := node.(type) {
+		case *ast.FuncDecl:
+			body = function.Body
+		case *ast.FuncLit:
+			body = function.Body
 		}
-	}
-	return "", false
-}
-
-func precededByTerminatingStatement(info *types.Info, statements []ast.Stmt, child ast.Node) bool {
-	childIndex := -1
-	for index, statement := range statements {
-		if statement == child {
-			childIndex = index
+		if body != nil {
 			break
 		}
 	}
-	for index, statement := range statements {
-		if statement == child {
+	if body == nil {
+		return "sink has no enclosing function body", true
+	}
+
+	graph := cfg.New(body, func(call *ast.CallExpr) bool {
+		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
+		return !ok || builtin.Name() != "panic"
+	})
+	if len(graph.Blocks) == 0 {
+		return "function CFG has no entry block", true
+	}
+	restrictedSwitchCases := map[*ast.CaseClause]bool{}
+	selectedSwitchCases := map[*ast.CaseClause]bool{}
+	fallthroughSources := map[*ast.CaseClause]*ast.CaseClause{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		if literal, ok := node.(*ast.FuncLit); ok && literal.Body != body {
 			return false
 		}
-		flow := statementFlowFor(info, statement)
-		if flow.kind == flowNext {
-			continue
+		switchStmt, ok := node.(*ast.SwitchStmt)
+		if !ok {
+			return true
 		}
-		if flow.kind == flowGoto {
-			targetIndex := gotoTargetIndex(statements, flow.label)
-			if targetIndex <= childIndex && targetIndex > index {
+		clauses, selectedIndex, known := selectedConstantSwitchCase(info, switchStmt)
+		if !known {
+			return true
+		}
+		for _, clause := range clauses {
+			restrictedSwitchCases[clause] = true
+		}
+		for index := 0; index+1 < len(clauses); index++ {
+			clauseBody := clauses[index].Body
+			if len(clauseBody) == 0 {
 				continue
 			}
+			branch, ok := clauseBody[len(clauseBody)-1].(*ast.BranchStmt)
+			if ok && branch.Tok == token.FALLTHROUGH {
+				fallthroughSources[clauses[index+1]] = clauses[index]
+			}
+		}
+		if selectedIndex >= 0 {
+			selectedSwitchCases[clauses[selectedIndex]] = true
 		}
 		return true
+	})
+	reachable := map[*cfg.Block]bool{}
+	queue := []*cfg.Block{graph.Blocks[0]}
+	for len(queue) > 0 {
+		block := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		if reachable[block] {
+			continue
+		}
+		reachable[block] = true
+		successors := block.Succs
+		if parenthesizedBuiltinPanicIndex(info, block) >= 0 {
+			successors = nil
+		} else if block.Kind == cfg.KindRangeLoop && rangeStmtProvablyEmpty(info, block.Stmt) && len(successors) == 2 {
+			successors = successors[1:]
+		} else if len(successors) == 2 && len(block.Nodes) > 0 {
+			if condition, ok := block.Nodes[len(block.Nodes)-1].(ast.Expr); ok {
+				_, isSwitchCaseValue := parents[condition].(*ast.CaseClause)
+				if value, known := constantBool(info, condition); known && !isSwitchCaseValue {
+					if value {
+						successors = successors[:1]
+					} else {
+						successors = successors[1:]
+					}
+				}
+			}
+		}
+		selectedSuccessor := (*cfg.Block)(nil)
+		for _, successor := range successors {
+			if clause, ok := successor.Stmt.(*ast.CaseClause); ok && successor.Kind == cfg.KindSwitchCaseBody && selectedSwitchCases[clause] {
+				selectedSuccessor = successor
+				break
+			}
+		}
+		if selectedSuccessor != nil {
+			successors = []*cfg.Block{selectedSuccessor}
+		}
+		for _, successor := range successors {
+			if clause, ok := successor.Stmt.(*ast.CaseClause); ok && successor.Kind == cfg.KindSwitchCaseBody && restrictedSwitchCases[clause] && !selectedSwitchCases[clause] {
+				fallthroughEdge := cfgBlockBelongsToClause(block, fallthroughSources[clause])
+				if !fallthroughEdge {
+					continue
+				}
+			}
+			queue = append(queue, successor)
+		}
 	}
-	return false
+
+	for block := range reachable {
+		for index, node := range block.Nodes {
+			if node.Pos() <= sink.Pos() && sink.End() <= node.End() {
+				if panicIndex := parenthesizedBuiltinPanicIndex(info, block); panicIndex >= 0 && panicIndex < index {
+					return "parenthesized panic terminates the containing CFG block", true
+				}
+				return "", false
+			}
+		}
+	}
+	return "no reachable CFG block contains the sink", true
 }
 
-func gotoTargetIndex(statements []ast.Stmt, target string) int {
-	if target == "" {
-		return -1
-	}
-	for index, statement := range statements {
-		label, ok := statement.(*ast.LabeledStmt)
-		if ok && label.Label.Name == target {
+func parenthesizedBuiltinPanicIndex(info *types.Info, block *cfg.Block) int {
+	for index, node := range block.Nodes {
+		exprStmt, ok := node.(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		call, ok := unwrapParens(exprStmt.X).(*ast.CallExpr)
+		if !ok || call == exprStmt.X {
+			continue
+		}
+		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
+		if ok && builtin.Name() == "panic" {
 			return index
 		}
 	}
 	return -1
 }
 
-type flowKind uint8
-
-const (
-	flowNext flowKind = iota
-	flowReturn
-	flowBreak
-	flowContinue
-	flowFallthrough
-	flowGoto
-)
-
-type statementFlow struct {
-	kind  flowKind
-	label string
-}
-
-func statementFlowFor(info *types.Info, statement ast.Stmt) statementFlow {
-	switch node := statement.(type) {
-	case *ast.ReturnStmt:
-		return statementFlow{kind: flowReturn}
-	case *ast.BranchStmt:
-		flow := statementFlow{label: ""}
-		if node.Label != nil {
-			flow.label = node.Label.Name
-		}
-		switch node.Tok {
-		case token.BREAK:
-			flow.kind = flowBreak
-		case token.CONTINUE:
-			flow.kind = flowContinue
-		case token.FALLTHROUGH:
-			flow.kind = flowFallthrough
-		case token.GOTO:
-			flow.kind = flowGoto
-		default:
-			flow.kind = flowNext
-		}
-		return flow
-	case *ast.ExprStmt:
-		call, ok := unwrapParens(node.X).(*ast.CallExpr)
-		if !ok {
-			return statementFlow{kind: flowNext}
-		}
-		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
-		if ok && builtin.Name() == "panic" {
-			return statementFlow{kind: flowReturn}
-		}
-	case *ast.BlockStmt:
-		return statementListFlow(info, node.List)
-	case *ast.IfStmt:
-		if condition, known := constantBool(info, node.Cond); known {
-			if condition {
-				return statementFlowFor(info, node.Body)
-			}
-			if node.Else != nil {
-				return statementFlowFor(info, node.Else)
-			}
-			return statementFlow{kind: flowNext}
-		}
-		if node.Else == nil {
-			return statementFlow{kind: flowNext}
-		}
-		thenFlow := statementFlowFor(info, node.Body)
-		elseFlow := statementFlowFor(info, node.Else)
-		if thenFlow == elseFlow {
-			return thenFlow
-		}
-	case *ast.ForStmt:
-		return forStatementFlow(info, node, "")
-	case *ast.SwitchStmt:
-		return constantSwitchFlow(info, node)
-	case *ast.LabeledStmt:
-		if loop, ok := node.Stmt.(*ast.ForStmt); ok {
-			return forStatementFlow(info, loop, node.Label.Name)
-		}
-		flow := statementFlowFor(info, node.Stmt)
-		if flow.kind == flowBreak && flow.label == node.Label.Name {
-			return statementFlow{kind: flowNext}
-		}
-		return flow
-	}
-	return statementFlow{kind: flowNext}
-}
-
-func statementListFlow(info *types.Info, statements []ast.Stmt) statementFlow {
-	for statementIndex := 0; statementIndex < len(statements); statementIndex++ {
-		statement := statements[statementIndex]
-		flow := statementFlowFor(info, statement)
-		if flow.kind == flowGoto {
-			targetIndex := gotoTargetIndex(statements, flow.label)
-			if targetIndex > statementIndex {
-				statementIndex = targetIndex - 1
-				continue
-			}
-		}
-		if flow.kind != flowNext {
-			return flow
-		}
-	}
-	return statementFlow{kind: flowNext}
-}
-
-func forStatementFlow(info *types.Info, node *ast.ForStmt, label string) statementFlow {
-	condition := true
-	known := node.Cond == nil
-	if node.Cond != nil {
-		condition, known = constantBool(info, node.Cond)
-	}
-	if !known || !condition {
-		return statementFlow{kind: flowNext}
-	}
-	if loopBodyMayBreak(info, node.Body, label) {
-		return statementFlow{kind: flowNext}
-	}
-	bodyFlow := statementListFlow(info, node.Body.List)
-	if bodyFlow.kind == flowBreak && (bodyFlow.label == "" || bodyFlow.label == label) {
-		return statementFlow{kind: flowNext}
-	}
-	if bodyFlow.kind == flowNext || (bodyFlow.kind == flowContinue && (bodyFlow.label == "" || bodyFlow.label == label)) {
-		return statementFlow{kind: flowContinue}
-	}
-	return bodyFlow
-}
-
-func loopBodyMayBreak(info *types.Info, block *ast.BlockStmt, loopLabel string) bool {
-	if block == nil {
+func cfgBlockBelongsToClause(block *cfg.Block, clause *ast.CaseClause) bool {
+	if block == nil || clause == nil {
 		return false
 	}
-	var statementMayBreak func(ast.Stmt, bool) bool
-	statementsMayBreak := func(statements []ast.Stmt, nestedBreakable bool) bool {
-		for index := 0; index < len(statements); index++ {
-			statement := statements[index]
-			if statementMayBreak(statement, nestedBreakable) {
-				return true
-			}
-			flow := statementFlowFor(info, statement)
-			if flow.kind == flowGoto {
-				targetIndex := gotoTargetIndex(statements, flow.label)
-				if targetIndex > index {
-					index = targetIndex - 1
-					continue
-				}
-			}
-			if flow.kind != flowNext {
-				return false
-			}
-		}
-		return false
+	if block.Stmt != nil && clause.Pos() <= block.Stmt.Pos() && block.Stmt.End() <= clause.End() {
+		return true
 	}
-	statementMayBreak = func(statement ast.Stmt, nestedBreakable bool) bool {
-		switch node := statement.(type) {
-		case *ast.BranchStmt:
-			if node.Tok != token.BREAK {
-				return false
-			}
-			if node.Label != nil {
-				return loopLabel != "" && node.Label.Name == loopLabel
-			}
-			return !nestedBreakable
-		case *ast.BlockStmt:
-			return statementsMayBreak(node.List, nestedBreakable)
-		case *ast.IfStmt:
-			if condition, known := constantBool(info, node.Cond); known {
-				if condition {
-					return statementMayBreak(node.Body, nestedBreakable)
-				}
-				return node.Else != nil && statementMayBreak(node.Else, nestedBreakable)
-			}
-			return statementMayBreak(node.Body, nestedBreakable) || (node.Else != nil && statementMayBreak(node.Else, nestedBreakable))
-		case *ast.LabeledStmt:
-			return statementMayBreak(node.Stmt, nestedBreakable)
-		case *ast.ForStmt:
-			if condition, known := constantBool(info, node.Cond); known && !condition {
-				return false
-			}
-			return statementMayBreak(node.Body, true)
-		case *ast.RangeStmt:
-			rangeType := info.TypeOf(node.X)
-			if pointer, ok := rangeType.(*types.Pointer); ok {
-				rangeType = pointer.Elem()
-			}
-			if array, ok := rangeType.Underlying().(*types.Array); ok && array.Len() == 0 {
-				return false
-			}
-			if value := info.Types[unwrapParens(node.X)].Value; value != nil {
-				if value.Kind() == constant.String && constant.StringVal(value) == "" {
-					return false
-				}
-				if value.Kind() == constant.Int && constant.Sign(value) <= 0 {
-					return false
-				}
-			}
-			return statementMayBreak(node.Body, true)
-		case *ast.SwitchStmt:
-			clauses, selectedIndex, known := selectedConstantSwitchCase(info, node)
-			if !known {
-				return statementMayBreak(node.Body, true)
-			}
-			if selectedIndex < 0 {
-				return false
-			}
-			for index := selectedIndex; index < len(clauses); index++ {
-				if statementMayBreak(clauses[index], true) {
-					return true
-				}
-				if caseClauseFlow(info, clauses[index]).kind != flowFallthrough {
-					break
-				}
-			}
-			return false
-		case *ast.TypeSwitchStmt:
-			return statementMayBreak(node.Body, true)
-		case *ast.SelectStmt:
-			return statementMayBreak(node.Body, true)
-		case *ast.CaseClause:
-			return statementsMayBreak(node.Body, nestedBreakable)
-		case *ast.CommClause:
-			return statementsMayBreak(node.Body, nestedBreakable)
+	for _, node := range block.Nodes {
+		if clause.Pos() <= node.Pos() && node.End() <= clause.End() {
+			return true
 		}
-		return false
 	}
-	return statementMayBreak(block, false)
+	return false
 }
 
 func constantBool(info *types.Info, expr ast.Expr) (bool, bool) {
@@ -1233,29 +1181,6 @@ func constantBool(info *types.Info, expr ast.Expr) (bool, bool) {
 		return false, false
 	}
 	return constant.BoolVal(value), true
-}
-
-func switchCaseIsDead(info *types.Info, switchStmt *ast.SwitchStmt, target *ast.CaseClause) bool {
-	clauses, selectedIndex, known := selectedConstantSwitchCase(info, switchStmt)
-	if !known {
-		return false
-	}
-	targetIndex := -1
-	for index, clause := range clauses {
-		if clause == target {
-			targetIndex = index
-			break
-		}
-	}
-	if targetIndex == -1 || selectedIndex == -1 || targetIndex < selectedIndex {
-		return true
-	}
-	for index := selectedIndex; index < targetIndex; index++ {
-		if !caseFallsThrough(info, clauses[index]) {
-			return true
-		}
-	}
-	return false
 }
 
 func selectedConstantSwitchCase(info *types.Info, switchStmt *ast.SwitchStmt) ([]*ast.CaseClause, int, bool) {
@@ -1300,50 +1225,54 @@ func selectedConstantSwitchCase(info *types.Info, switchStmt *ast.SwitchStmt) ([
 	return clauses, selectedIndex, true
 }
 
-func constantSwitchFlow(info *types.Info, switchStmt *ast.SwitchStmt) statementFlow {
-	clauses, selectedIndex, known := selectedConstantSwitchCase(info, switchStmt)
-	if !known || selectedIndex < 0 {
-		return statementFlow{kind: flowNext}
+func rangeStmtProvablyEmpty(info *types.Info, statement ast.Stmt) bool {
+	rangeStmt, ok := statement.(*ast.RangeStmt)
+	if !ok {
+		return false
 	}
-	for index := selectedIndex; index < len(clauses); index++ {
-		flow := caseClauseFlow(info, clauses[index])
-		switch flow.kind {
-		case flowFallthrough:
-			continue
-		case flowBreak:
-			if flow.label == "" {
-				return statementFlow{kind: flowNext}
-			}
-			return flow
-		default:
-			return flow
+	rangeType := info.TypeOf(rangeStmt.X)
+	if pointer, ok := rangeType.(*types.Pointer); ok {
+		rangeType = pointer.Elem()
+	}
+	if rangeType != nil {
+		if array, ok := rangeType.Underlying().(*types.Array); ok && array.Len() == 0 {
+			return true
 		}
 	}
-	return statementFlow{kind: flowNext}
+	if literal, ok := unwrapParens(rangeStmt.X).(*ast.CompositeLit); ok && len(literal.Elts) == 0 {
+		switch info.TypeOf(literal).Underlying().(type) {
+		case *types.Slice, *types.Map:
+			return true
+		}
+	}
+	if value := info.Types[unwrapParens(rangeStmt.X)].Value; value != nil {
+		return (value.Kind() == constant.String && constant.StringVal(value) == "") ||
+			(value.Kind() == constant.Int && constant.Sign(value) <= 0)
+	}
+	return false
 }
 
-func caseFallsThrough(info *types.Info, clause *ast.CaseClause) bool {
-	return caseClauseFlow(info, clause).kind == flowFallthrough
-}
-
-func caseClauseFlow(info *types.Info, clause *ast.CaseClause) statementFlow {
-	if clause == nil {
-		return statementFlow{kind: flowNext}
+func isInterfaceBroadcastCall(info *types.Info, call *ast.CallExpr, sseEventType types.Type) bool {
+	sel, ok := unwrapParens(call.Fun).(*ast.SelectorExpr)
+	if !ok || sseEventType == nil {
+		return false
 	}
-	for statementIndex := 0; statementIndex < len(clause.Body); statementIndex++ {
-		flow := statementFlowFor(info, clause.Body[statementIndex])
-		if flow.kind == flowGoto {
-			targetIndex := gotoTargetIndex(clause.Body, flow.label)
-			if targetIndex > statementIndex {
-				statementIndex = targetIndex - 1
-				continue
-			}
-		}
-		if flow.kind != flowNext {
-			return flow
-		}
+	receiverType := info.TypeOf(sel.X)
+	if receiverType == nil {
+		return false
 	}
-	return statementFlow{kind: flowNext}
+	if pointer, pointerTypeOK := receiverType.(*types.Pointer); pointerTypeOK {
+		receiverType = pointer.Elem()
+	}
+	if _, interfaceTypeOK := receiverType.Underlying().(*types.Interface); !interfaceTypeOK {
+		return false
+	}
+	fn, functionOK := selectedObject(info, sel).(*types.Func)
+	if !functionOK || fn.Name() != "Broadcast" {
+		return false
+	}
+	sig, signatureOK := fn.Type().(*types.Signature)
+	return signatureOK && sig.Params().Len() == 1 && types.Identical(sig.Params().At(0).Type(), sseEventType)
 }
 
 func directBroadcastNames(info *types.Info, call *ast.CallExpr, parents map[ast.Node]ast.Node, objects typedWiringObjects) ([]string, bool, error) {
