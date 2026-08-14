@@ -218,6 +218,53 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 				b.Broadcast(makeEvent(runtime))
 			}`,
 		},
+		{
+			name: "literal false branch cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				if false { b.Broadcast(SSEEvent{Type: EventRemember}) }
+			}`,
+		},
+		{
+			name: "named constant false branch cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				const disabled = 1 > 0
+				if !disabled { b.Broadcast(SSEEvent{Type: EventRemember}) }
+			}`,
+		},
+		{
+			name: "constant true else branch cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				if true {} else { b.Broadcast(SSEEvent{Type: EventRemember}) }
+			}`,
+		},
+		{
+			name: "constant false loop cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				for false { b.Broadcast(SSEEvent{Type: EventRemember}) }
+			}`,
+		},
+		{
+			name: "nonmatching constant switch case cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				switch 1 { case 2: b.Broadcast(SSEEvent{Type: EventRemember}) }
+			}`,
+		},
+		{
+			name: "unreachable fallthrough cannot make a later case count",
+			body: `func mutate(b *SSEBroadcaster) {
+				switch 1 {
+				case 1: return; fallthrough
+				case 2: b.Broadcast(SSEEvent{Type: EventRemember})
+				}
+			}`,
+		},
+		{
+			name: "sink after unconditional return cannot count as an emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				return
+				b.Broadcast(SSEEvent{Type: EventRemember})
+			}`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -233,6 +280,44 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 		}`)
 		require.Empty(t, scan.unresolved)
 		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("selected constant switch case remains checkable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			switch 1 { case 1: b.Broadcast(SSEEvent{Type: EventRemember}) }
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("fallthrough into a nonmatching constant case remains reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			switch 1 {
+			case 1: fallthrough
+			case 2: b.Broadcast(SSEEvent{Type: EventRemember})
+			}
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("fallthrough into a constant switch default remains reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			switch 1 {
+			case 1: fallthrough
+			default: b.Broadcast(SSEEvent{Type: EventRemember})
+			}
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("compile-time-dead OnEvent call is rejected", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func emit(s *Server) {
+			if false { s.OnEvent("remember", "", "", "", nil) }
+		}`)
+		require.NotEmpty(t, scan.unresolved)
+		require.Empty(t, scan.emits)
 	})
 
 	t.Run("foreign Broadcast decoy cannot impersonate exact method", func(t *testing.T) {
@@ -535,6 +620,15 @@ func scanTypedFile(root, path string, fset *token.FileSet, file *ast.File, info 
 		switch n := node.(type) {
 		case *ast.CallExpr:
 			called := calledObject(info, n.Fun)
+			isDashboardSink := (objects.broadcastMethod != nil && called == objects.broadcastMethod) ||
+				(objects.onEventField != nil && called == objects.onEventField) ||
+				(objects.retrievalHelper != nil && called == objects.retrievalHelper)
+			if isDashboardSink {
+				if reason, dead := compileTimeDeadPath(info, n, parents); dead {
+					scan.unresolved = append(scan.unresolved, "dashboard SSE sink is compile-time unreachable ("+reason+") at "+position(n.Pos()))
+					return false
+				}
+			}
 			if isInterfaceBroadcastCall(info, n, objects.sseEventType) {
 				scan.unresolved = append(scan.unresolved, "dashboard Broadcast through an interface is forbidden at "+position(n.Pos()))
 				return true
@@ -611,18 +705,161 @@ func isInterfaceBroadcastCall(info *types.Info, call *ast.CallExpr, sseEventType
 	if receiverType == nil {
 		return false
 	}
-	if pointer, ok := receiverType.(*types.Pointer); ok {
+	if pointer, pointerTypeOK := receiverType.(*types.Pointer); pointerTypeOK {
 		receiverType = pointer.Elem()
 	}
-	if _, ok := receiverType.Underlying().(*types.Interface); !ok {
+	if _, interfaceTypeOK := receiverType.Underlying().(*types.Interface); !interfaceTypeOK {
 		return false
 	}
-	fn, ok := selectedObject(info, sel).(*types.Func)
-	if !ok || fn.Name() != "Broadcast" {
+	fn, functionOK := selectedObject(info, sel).(*types.Func)
+	if !functionOK || fn.Name() != "Broadcast" {
 		return false
 	}
-	sig, ok := fn.Type().(*types.Signature)
-	return ok && sig.Params().Len() == 1 && types.Identical(sig.Params().At(0).Type(), sseEventType)
+	sig, signatureOK := fn.Type().(*types.Signature)
+	return signatureOK && sig.Params().Len() == 1 && types.Identical(sig.Params().At(0).Type(), sseEventType)
+}
+
+func compileTimeDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node) (string, bool) {
+	var switchCase *ast.CaseClause
+	for child, node := sink, parents[sink]; node != nil; child, node = node, parents[node] {
+		switch parent := node.(type) {
+		case *ast.CaseClause:
+			if precededByTerminatingStatement(info, parent.Body, child) {
+				return "preceding unconditional terminator", true
+			}
+			switchCase = parent
+		case *ast.BlockStmt:
+			if precededByTerminatingStatement(info, parent.List, child) {
+				return "preceding unconditional terminator", true
+			}
+		case *ast.IfStmt:
+			condition, constant := constantBool(info, parent.Cond)
+			if constant && ((!condition && child == parent.Body) || (condition && parent.Else != nil && child == parent.Else)) {
+				return "constant if branch", true
+			}
+		case *ast.ForStmt:
+			if child == parent.Body {
+				if condition, constant := constantBool(info, parent.Cond); constant && !condition {
+					return "constant false loop", true
+				}
+			}
+		case *ast.SwitchStmt:
+			if switchCase != nil && switchCaseIsDead(info, parent, switchCase) {
+				return "constant switch case", true
+			}
+			switchCase = nil
+		}
+	}
+	return "", false
+}
+
+func precededByTerminatingStatement(info *types.Info, statements []ast.Stmt, child ast.Node) bool {
+	for _, statement := range statements {
+		if statement == child {
+			return false
+		}
+		if statementDefinitelyTerminates(info, statement) {
+			return true
+		}
+	}
+	return false
+}
+
+func statementDefinitelyTerminates(info *types.Info, statement ast.Stmt) bool {
+	switch node := statement.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BranchStmt:
+		return node.Tok == token.BREAK || node.Tok == token.CONTINUE || node.Tok == token.FALLTHROUGH
+	case *ast.ExprStmt:
+		call, ok := unwrapParens(node.X).(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
+		return ok && builtin.Name() == "panic"
+	case *ast.BlockStmt:
+		return len(node.List) > 0 && statementDefinitelyTerminates(info, node.List[len(node.List)-1])
+	case *ast.IfStmt:
+		if node.Else == nil || !statementDefinitelyTerminates(info, node.Body) {
+			return false
+		}
+		return statementDefinitelyTerminates(info, node.Else)
+	}
+	return false
+}
+
+func constantBool(info *types.Info, expr ast.Expr) (bool, bool) {
+	if expr == nil {
+		return false, false
+	}
+	value := info.Types[unwrapParens(expr)].Value
+	if value == nil || value.Kind() != constant.Bool {
+		return false, false
+	}
+	return constant.BoolVal(value), true
+}
+
+func switchCaseIsDead(info *types.Info, switchStmt *ast.SwitchStmt, target *ast.CaseClause) bool {
+	tag := switchStmt.Tag
+	if tag == nil {
+		tag = ast.NewIdent("true")
+	}
+	tagValue := info.Types[unwrapParens(tag)].Value
+	if switchStmt.Tag == nil {
+		tagValue = constant.MakeBool(true)
+	}
+	if tagValue == nil {
+		return false
+	}
+	clauses := make([]*ast.CaseClause, 0, len(switchStmt.Body.List))
+	targetIndex := -1
+	defaultIndex := -1
+	selectedIndex := -1
+	for _, clauseNode := range switchStmt.Body.List {
+		clause, ok := clauseNode.(*ast.CaseClause)
+		if !ok {
+			return false
+		}
+		index := len(clauses)
+		clauses = append(clauses, clause)
+		if clause == target {
+			targetIndex = index
+		}
+		if len(clause.List) == 0 {
+			defaultIndex = index
+			continue
+		}
+		for _, expr := range clause.List {
+			caseValue := info.Types[unwrapParens(expr)].Value
+			if caseValue == nil {
+				return false
+			}
+			if selectedIndex == -1 && constant.Compare(tagValue, token.EQL, caseValue) {
+				selectedIndex = index
+			}
+		}
+	}
+	if selectedIndex == -1 {
+		selectedIndex = defaultIndex
+	}
+	if targetIndex == -1 || selectedIndex == -1 || targetIndex < selectedIndex {
+		return true
+	}
+	for index := selectedIndex; index < targetIndex; index++ {
+		if !caseFallsThrough(clauses[index]) {
+			return true
+		}
+	}
+	return false
+}
+
+func caseFallsThrough(clause *ast.CaseClause) bool {
+	if clause == nil || len(clause.Body) != 1 {
+		return false
+	}
+	branch, ok := clause.Body[0].(*ast.BranchStmt)
+	return ok && branch.Tok == token.FALLTHROUGH
 }
 
 func directBroadcastNames(info *types.Info, call *ast.CallExpr, parents map[ast.Node]ast.Node, objects typedWiringObjects) ([]string, bool, error) {
@@ -852,8 +1089,9 @@ func newTypesInfo() *types.Info {
 
 func typedEventConstants(t *testing.T, pkg *packages.Package, eventType types.Type) []string {
 	t.Helper()
-	var names []string
-	for _, name := range pkg.Types.Scope().Names() {
+	scopeNames := pkg.Types.Scope().Names()
+	names := make([]string, 0, len(scopeNames))
+	for _, name := range scopeNames {
 		obj, ok := pkg.Types.Scope().Lookup(name).(*types.Const)
 		if !ok || !types.Identical(obj.Type(), eventType) {
 			continue
@@ -929,7 +1167,7 @@ func (s typedWiringScan) sitesByName() string {
 	for _, site := range s.emits {
 		grouped[site.name] = append(grouped[site.name], site.pos)
 	}
-	var names []string
+	names := make([]string, 0, len(grouped))
 	for name := range grouped {
 		names = append(names, name)
 	}
