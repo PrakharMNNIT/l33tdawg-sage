@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -424,20 +424,36 @@ export function mountMriBrain(container, opts = {}) {
   // domain brightened toward white by corroboration (so the bloom pass makes
   // consolidated memories glow); alpha = confidence (decay); challenged/
   // deprecated greyed.
+  // Rung 5 — neurogenesis + pruning. A newly-registered agent (id absent from the
+  // previous snapshot) is stamped with _bornAt and briefly swells + glows as it
+  // grows in; the boost decays over NEURON_BIRTH_MS so birth reads as an event, not
+  // a permanent size. Dormancy greys a neuron in proportion to how long its circuit
+  // has been silent (neuronDormancy over _activity), reusing the existing grey.
+  const NEURON_BIRTH_MS = 3200;
+  const NEURON_DORMANCY = opts.neuronDormancy || { liveMs: 3600000, coldMs: 43200000 };
+  function neuronBirthGlow(n){
+    if (!n || !n._bornAt) return 0;
+    const age = Date.now() - n._bornAt;
+    if (age < 0 || age > NEURON_BIRTH_MS) return 0;
+    return 1 - (age / NEURON_BIRTH_MS);
+  }
+  const dormancyOf = n => neuronDormancy(n && n._activity, Date.now(), NEURON_DORMANCY);
+
   // Memory nodes size by corroboration+confidence+freshness; neurons size by
-  // degree (total traffic) so hubs read as large cells.
+  // degree (total traffic) so hubs read as large cells, plus a transient birth swell.
   const nodeVal = n => n.isNeuron
-    ? 1.6 + (n._deg||0)*7
+    ? 1.6 + (n._deg||0)*7 + neuronBirthGlow(n)*4
     : 1.4 + (n.corroboration_count||0)*1.1 + (n.confidence||0)*0.8 + (n._fresh||0)*2.2;
   function nodeColorRGBA(n){
     // Focus mode: everything outside the clicked node's neighbourhood fades back.
     if(focusSet && !focusSet.has(n.id)) return n.isNeuron ? 'rgba(96,110,135,0.10)' : 'rgba(96,110,135,0.08)';
     // Neurons: domain hue, brightened toward the glow by degree so hub agents pop.
     if(n.isNeuron){
-      const [nr,ng,nb]=hexToRgb(domainColor(n.domain));
-      const boost=Math.min(1,(n._deg||0));
-      const br=nr+(255-nr)*boost*0.55, bg=ng+(255-ng)*boost*0.55, bb=nb+(255-nb)*boost*0.55;
-      return `rgba(${br|0},${bg|0},${bb|0},${(0.72+0.28*boost).toFixed(2)})`;
+      // Domain hue brightened by degree, greyed by dormancy (pruning), flared on
+      // birth (neurogenesis) — composed by the pure neuronTint so the blend is
+      // pinned by numbers, not just wiring.
+      const t=neuronTint(hexToRgb(domainColor(n.domain)), n._deg, dormancyOf(n), neuronBirthGlow(n));
+      return `rgba(${t.r},${t.g},${t.b},${t.a})`;
     }
     if(n.status==='deprecated') return 'rgba(108,120,145,0.30)';
     if(n.status==='challenged') return 'rgba(150,162,185,0.55)';
@@ -772,6 +788,37 @@ export function mountMriBrain(container, opts = {}) {
   }
   startPlasticityDecay();
 
+  // Neurogenesis: stamp _bornAt on agents that appeared since the last snapshot so
+  // they grow in, then re-read the node accessors once the birth swell has decayed.
+  // The first snapshot only seeds the baseline (no whole-graph birth flash).
+  const neuronBirths = createNeuronBirthTracker();
+  let birthDecayTimer = null;
+  function markConnectomeBirths(d){
+    if (mode !== 'connectome' || !d || !Array.isArray(d.nodes)) return;
+    const born = new Set(neuronBirths.observe(d.nodes.map(n => n.id)));
+    if (!born.size) return;
+    const now = Date.now();
+    for (const n of d.nodes) { if (born.has(n.id)) n._bornAt = now; }
+    clearTimeout(birthDecayTimer);
+    birthDecayTimer = setTimeout(() => {
+      if (disposed || !Graph) return;
+      Graph.nodeVal(nodeVal).nodeColor(nodeColorRGBA);
+    }, NEURON_BIRTH_MS + 120);
+  }
+  // Dormancy drifts over minutes, so an idle connectome re-reads its node colour on
+  // a slow cadence to let cold agents grey out even with no new events. Self-gated
+  // to connectome mode; cleared on dispose.
+  const DORMANCY_REFRESH_MS = 30000;
+  let dormancyTimer = null;
+  function startDormancyDecay(){
+    if (dormancyTimer) return;
+    dormancyTimer = setInterval(() => {
+      if (disposed || !Graph || mode !== 'connectome') return;
+      Graph.nodeColor(nodeColorRGBA);
+    }, DORMANCY_REFRESH_MS);
+  }
+  startDormancyDecay();
+
   const connectomeReloadIntent = createConnectomeReloadIntent();
   function load(fromConnectomeTick = false){
     if (fromConnectomeTick) connectomeReloadIntent.requestTick();
@@ -793,6 +840,7 @@ export function mountMriBrain(container, opts = {}) {
       placeActive(d.nodes);
       resolveConnectomeLinks(d);
       markConnectomeFiring(d, tickAware, connectomeReloadIntent.isPending(request.mode) && !tickAware);
+      markConnectomeBirths(d);
       Graph.graphData(d);
       rendered = d;
       refreshCounts(d);
@@ -1056,6 +1104,7 @@ export function mountMriBrain(container, opts = {}) {
     placeActive(data.nodes);
     resolveConnectomeLinks(data);
     markConnectomeFiring(data, false);
+    markConnectomeBirths(data);
     rendered = data;
     Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'))
       .backgroundColor(mriBgColor())
@@ -1251,6 +1300,22 @@ export function mountMriBrain(container, opts = {}) {
       subs.push(() => clearTimeout(ct));
       subs.push(() => clearTimeout(pulseDecayTimer));
       subs.push(opts.sse.on('connectome', pulse));
+
+      // NEUROGENESIS. A committed agent registration emits the 'agent' SSE event
+      // but carries no connectome data, so — like a firing tick — the new neuron
+      // arrives by re-fetching the AUTHORIZED snapshot through the existing load
+      // path (same RBAC gate); markConnectomeBirths then stamps whatever id is new.
+      // Connectome-mode only and debounced; load() owns in-flight coalescing and
+      // the unavailable/retry path, so a dropped or failed registration refetch
+      // never leaves the view mid-birth. Cleaned up with the other subs.
+      let at = null;
+      const grow = () => {
+        if (mode !== 'connectome') return;
+        clearTimeout(at);
+        at = setTimeout(() => load(), 900);
+      };
+      subs.push(() => clearTimeout(at));
+      subs.push(opts.sse.on('agent', grow));
     }
   }
 
@@ -1299,7 +1364,7 @@ export function mountMriBrain(container, opts = {}) {
   const modeCap = document.createElement('div');
   modeCap.className = 'panel mode-cap';
   modeCap.style.cssText = 'position:absolute;left:auto;bottom:44px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
-  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>idle synapses thin & fade · use it or lose it<br>hubs sink to the core · click a neuron to light its circle';
+  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>idle synapses thin & fade · use it or lose it<br>new agents grow in · dormant ones grey out<br>hubs sink to the core · click a neuron to light its circle';
   root.appendChild(modeCap);
 
   // Relabel the stat panel + button and toggle the caption for the active mode.
@@ -1320,6 +1385,7 @@ export function mountMriBrain(container, opts = {}) {
     mode = next;
     connectomeActivity.reset();
     connectomeReloadIntent.reset();
+    neuronBirths.reset();
     currentDomain = null;
     focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
     updateModeChrome();
@@ -1342,6 +1408,8 @@ export function mountMriBrain(container, opts = {}) {
     disposed = true;
     clearTimeout(graphRetryTimer);
     clearInterval(plasticityTimer);
+    clearTimeout(birthDecayTimer);
+    clearInterval(dormancyTimer);
     subs.forEach(u => { try { u && u(); } catch(e){ /* noop */ } });
     root.removeEventListener('mousemove', onMove);
     root.removeEventListener('pointerdown', onGraphPointerDown);
