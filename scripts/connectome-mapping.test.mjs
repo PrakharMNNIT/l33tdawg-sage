@@ -232,21 +232,44 @@ test('tick intent survives failed retry and an ordinary reload during backoff', 
   activity.observe(before, false);
 
   intent.requestTick();
-  const failedTickAware = intent.begin('connectome');
-  assert.equal(failedTickAware, true);
-  intent.settle('connectome', failedTickAware, false);
+  const failedTickGeneration = intent.begin('connectome');
+  assert.equal(failedTickGeneration, 1);
+  intent.settle('connectome', failedTickGeneration, false);
   assert.equal(intent.isPending('connectome'), true,
     'failed tick fetch must retain intent throughout retry backoff');
 
   // A remember/forget refresh can cancel the retry timer. It must inherit the
   // pending tick instead of advancing the baseline as an ordinary reload.
   const ordinaryDuringBackoff = intent.begin('connectome');
-  assert.equal(ordinaryDuringBackoff, true);
-  assert.deepEqual(activity.observe(after, ordinaryDuringBackoff), ['a\u0000b']);
+  assert.equal(ordinaryDuringBackoff, 1);
+  assert.deepEqual(activity.observe(after, ordinaryDuringBackoff > 0), ['a\u0000b']);
   intent.settle('connectome', ordinaryDuringBackoff, true);
   assert.equal(intent.isPending('connectome'), false);
   assert.deepEqual(activity.observe(after, intent.begin('connectome')), [],
     'a satisfied tick must pulse exactly once');
+});
+
+test('a second tick is not acknowledged by an older in-flight generation', () => {
+  const activity = createConnectomeActivityTracker();
+  const intent = createConnectomeReloadIntent();
+  const before = [{ source: 'a', target: 'b', count: 1, last_fired: 't1' }];
+  const afterTick1 = [{ source: 'a', target: 'b', count: 2, last_fired: 't2' }];
+  const afterTick2 = [{ source: 'a', target: 'b', count: 3, last_fired: 't3' }];
+  activity.observe(before, false);
+
+  intent.requestTick();
+  const generation1 = intent.begin('connectome');
+  intent.requestTick();
+  assert.deepEqual(activity.observe(afterTick1, generation1 > 0), ['a\u0000b']);
+  intent.settle('connectome', generation1, true);
+  assert.equal(intent.isPending('connectome'), true,
+    'tick 1 response must not consume tick 2, which arrived after it began');
+
+  const generation2 = intent.begin('connectome');
+  assert.equal(generation2, 2);
+  assert.deepEqual(activity.observe(afterTick2, generation2 > 0), ['a\u0000b']);
+  intent.settle('connectome', generation2, true);
+  assert.equal(intent.isPending('connectome'), false);
 });
 
 // The renderer subscribes to the contentless tick and refetches the authorized
@@ -262,4 +285,6 @@ test('mri-brain refetches the authorized snapshot on a connectome tick', () => {
     'the event must persist tick intent independently of a retry timer');
   assert.match(mriSource, /scheduleGraphRetry\(load\)/,
     'retries must consult persistent tick intent when they begin');
+  assert.match(mriSource, /connectomeReloadIntent\.settle\(request\.mode, tickGeneration, true\)/,
+    'a successful production fetch must acknowledge exactly its captured generation');
 });

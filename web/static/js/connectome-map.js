@@ -132,14 +132,23 @@ export function createConnectomeActivityTracker() {
 // refresh becomes the tick-aware fetch and must either pulse or preserve the
 // intent for the next retry.
 export function createConnectomeReloadIntent() {
-  let pending = false;
+  let requestedGeneration = 0;
+  let satisfiedGeneration = 0;
   return {
-    requestTick() { pending = true; },
-    begin(mode) { return mode === 'connectome' && pending; },
-    settle(mode, tickAware, succeeded) {
-      if (mode === 'connectome' && tickAware && succeeded) pending = false;
+    requestTick() { requestedGeneration += 1; },
+    begin(mode) {
+      return mode === 'connectome' && requestedGeneration > satisfiedGeneration
+        ? requestedGeneration
+        : 0;
     },
-    isPending(mode) { return mode === 'connectome' && pending; },
-    reset() { pending = false; },
+    settle(mode, generation, succeeded) {
+      if (mode === 'connectome' && generation > 0 && succeeded) {
+        satisfiedGeneration = Math.max(satisfiedGeneration, generation);
+      }
+    },
+    isPending(mode) {
+      return mode === 'connectome' && requestedGeneration > satisfiedGeneration;
+    },
+    reset() { requestedGeneration = 0; satisfiedGeneration = 0; },
   };
 }

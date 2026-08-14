@@ -751,7 +751,8 @@ export function mountMriBrain(container, opts = {}) {
     }
     graphLoadInFlight = true;
     const request = graphLoads.begin(mode);
-    const tickAware = connectomeReloadIntent.begin(request.mode);
+    const tickGeneration = connectomeReloadIntent.begin(request.mode);
+    const tickAware = tickGeneration > 0;
     // A drill / reload leaves focus mode.
     focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
     fetchActive(request.mode).then(d => {
@@ -766,7 +767,7 @@ export function mountMriBrain(container, opts = {}) {
       rendered = d;
       refreshCounts(d);
       buildLobes(d);
-      connectomeReloadIntent.settle(request.mode, tickAware, true);
+      connectomeReloadIntent.settle(request.mode, tickGeneration, true);
     }).catch(() => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
       reportGraphAvailability('unavailable');
