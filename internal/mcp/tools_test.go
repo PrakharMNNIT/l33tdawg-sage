@@ -6197,3 +6197,95 @@ func TestTaskContentPrefixIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// A task memory must carry task_status in the SIGNED body.
+//
+// REST defaults an omitted task_status to "planned", but it does so by mutating
+// the request AFTER the agent signature covers it; the ABCI proof check then
+// rebuilds the expected tx from the signed bytes (task_status still empty),
+// compares it to the mutated one, and rejects the submission as
+// "delegated agent action mismatch". So omitting the field does not yield a
+// helpful default — it makes every sage_remember(type="task") fail outright for
+// a signed ordinary agent on a post-app-v23 node.
+//
+// This asserts the field is present AND that it is exactly "planned": REST
+// rejects any other initial status, so sending a different one would trade this
+// failure for a 400.
+func TestSageRememberTaskSignsItsInitialStatus(t *testing.T) {
+	var submitted map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"memories": []any{}})
+	})
+	mux.HandleFunc("/v1/memory/pre-validate", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1, 0.2}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&submitted))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "task-memory",
+			"status":    "committed",
+			"tx_hash":   "task-tx",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	_, err := s.toolRemember(context.Background(), map[string]any{
+		"content": "Rebase PR 208 onto current protected main before requesting merge",
+		"type":    "task",
+		"domain":  "trace-spec-crypto-review",
+	})
+	require.NoError(t, err)
+
+	require.NotNil(t, submitted, "the submit request must have been issued")
+	assert.Equal(t, "task", submitted["memory_type"])
+	assert.Equal(t, "planned", submitted["task_status"],
+		"a task must sign its initial status; omitting it makes the node mutate the signed body and the agent proof then fails to verify")
+}
+
+// The converse: a non-task memory must NOT carry task_status. Sending it for a
+// fact or observation would put a field in the signed body that the REST
+// contract does not expect for those types.
+func TestSageRememberNonTaskOmitsTaskStatus(t *testing.T) {
+	var submitted map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"memories": []any{}})
+	})
+	mux.HandleFunc("/v1/memory/pre-validate", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1, 0.2}})
+	})
+	mux.HandleFunc("/v1/memory/submit", func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&submitted))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"memory_id": "fact-memory",
+			"status":    "committed",
+			"tx_hash":   "fact-tx",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	_, err := s.toolRemember(context.Background(), map[string]any{
+		"content": "Broadcast writes identical bytes to every SSE subscriber",
+		"type":    "fact",
+		"domain":  "trace-spec-crypto-review",
+	})
+	require.NoError(t, err)
+
+	require.NotNil(t, submitted)
+	assert.Equal(t, "fact", submitted["memory_type"])
+	_, present := submitted["task_status"]
+	assert.False(t, present, "only a task memory may sign a task_status")
+}

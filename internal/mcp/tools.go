@@ -857,6 +857,28 @@ func (s *Server) toolRemember(ctx context.Context, params map[string]any) (any, 
 		"confidence_score": confidence,
 		"embedding":        embedResp.Embedding,
 	}
+	if memType == "task" {
+		// A task MUST carry its initial status in the SIGNED body.
+		//
+		// REST defaults an omitted task_status to "planned"
+		// (api/rest/memory_handler.go) — but it does so by MUTATING the request
+		// AFTER the agent's signature already covered it. The ABCI proof check
+		// then rebuilds the expected transaction from the signed bytes, where
+		// task_status is still empty, compares it against the mutated one the
+		// node broadcast, and rejects the whole submission as
+		// "delegated agent action mismatch" — surfaced to the caller as
+		// "agent proof does not match the submitted action".
+		//
+		// Omitting it therefore does not get a helpful default; it makes every
+		// sage_remember(type="task") fail outright for a signed ordinary agent
+		// on a post-app-v23 node. sage_task already sends this for the same
+		// reason; this path simply never did.
+		//
+		// "planned" is not a choice here: REST rejects any other initial status
+		// outright, so sending it explicitly matches the server contract
+		// exactly rather than guessing at it.
+		submitBody["task_status"] = "planned"
+	}
 	if len(tags) > 0 {
 		submitBody["tags"] = tags
 	}

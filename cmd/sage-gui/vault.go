@@ -242,13 +242,22 @@ func runImport() error {
 		_ = json.Unmarshal(embedResp, &embedResult)
 
 		// Submit memory.
-		submitReq, _ := json.Marshal(map[string]any{
+		submitBody := map[string]any{
 			"content":          mem.Content,
 			"memory_type":      mem.MemoryType,
 			"domain_tag":       mem.DomainTag,
 			"confidence_score": mem.ConfidenceScore,
 			"embedding":        embedResult.Embedding,
-		})
+		}
+		// A task must carry its initial status in the SIGNED body. REST
+		// defaults an omitted task_status to "planned" by mutating the
+		// request AFTER the signature covers it; the proof check then
+		// rebuilds the expected tx from the signed bytes and rejects the
+		// submission as "agent proof does not match the submitted action".
+		if mem.MemoryType == "task" {
+			submitBody["task_status"] = "planned"
+		}
+		submitReq, _ := json.Marshal(submitBody)
 		_, err = doSignedRequest(baseURL, privKey, "POST", "/v1/memory/submit", submitReq)
 		if err != nil {
 			skipped++

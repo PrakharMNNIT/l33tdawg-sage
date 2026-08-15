@@ -62,7 +62,7 @@ Submit a memory for BFT consensus. Blocks until `broadcast_tx_commit` returns (F
 | `embedding` | []float32 | no | Compatibility field. The node regenerates the vector from `content` with its currently selected provider so stale/foreign vector spaces cannot mix. |
 | `knowledge_triples` | []KnowledgeTriple | no | `{subject, predicate, object}` triples |
 | `parent_hash` | string | no | SHA-256 hex of parent memory for lineage |
-| `task_status` | string | no | New `task` memories must omit this or send `planned`. Agents start or finish an assigned task through the task-status route after creation. |
+| `task_status` | string | **yes for `task`** | A new `task` memory MUST send `planned` explicitly; omitting it is rejected with `400 Missing task status`. The server cannot supply it for you: a signed caller's proof covers the request body, so defaulting it server-side would invalidate that proof and the submission would be rejected at consensus instead. Agents start or finish an assigned task through the task-status route after creation. |
 | `linked_memories` | []string | no | Related memory IDs for legacy/non-idempotent submission paths. App-v23 task creation rejects this field because links are not part of the canonical task transaction; create links separately after the task is confirmed. |
 | `tags` | []string | no | Up to 32 labels of 128 UTF-8 bytes each. Above app-v20 they are sorted/deduplicated into the signed tx; scoped-domain tags are also AppHash-covered and projection-recoverable. Ordinary-domain tags remain node-local. OR-filter on query/search. |
 | `provider` | string | no | Stored off-chain only; not on-chain |

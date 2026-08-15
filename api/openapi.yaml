@@ -340,8 +340,11 @@ components:
           enum:
             - planned
           description: >-
-            New task memories must enter consensus as planned. Omit this field
-            or send planned; use the task-status endpoint after creation.
+            New task memories must enter consensus as planned, and MUST send it
+            explicitly. Omitting it returns 400 Missing task status: a signed
+            caller's agent proof covers the request body, so the server cannot
+            supply the value afterwards without invalidating that proof. Use the
+            task-status endpoint to change it after creation.
         linked_memories:
           type: array
           items:

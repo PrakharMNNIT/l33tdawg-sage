@@ -1099,8 +1099,28 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 		) {
 			return
 		}
+		// FAIL FAST instead of mutating a field the caller already signed.
+		//
+		// This used to default an omitted task_status to "planned". That looks
+		// helpful and is the opposite: the mutation happens AFTER the agent's
+		// signature covers the body, so the transaction broadcast here no
+		// longer matches what was signed. The app-v26 proof check rebuilds the
+		// expected transaction from the signed bytes, finds task_status absent,
+		// and rejects the whole submission — after a broadcast, as an opaque
+		// "agent proof does not match the submitted action" whose own remedy
+		// text ("update or reconnect the client") cannot possibly help.
+		//
+		// A signed caller therefore had no way to write a task at all. Rejecting
+		// at the edge costs the same request and says exactly what is wrong,
+		// and it broadcasts nothing.
+		//
+		// Deliberately NOT normalized server-side: making the proof check accept
+		// an omitted status would change which transactions validate, which is
+		// fork-class and belongs to a future app version, not to a bug fix.
 		if req.TaskStatus == "" {
-			req.TaskStatus = string(memory.TaskStatusPlanned)
+			writeProblem(w, http.StatusBadRequest, "Missing task status",
+				"task_status is required for a new task and must be signed as \"planned\"; the server cannot supply it after the fact without invalidating your agent proof.")
+			return
 		}
 		if req.TaskStatus != string(memory.TaskStatusPlanned) {
 			writeProblem(w, http.StatusBadRequest, "Invalid initial task status", "A new task must enter consensus as planned; its assigned agent may start it after creation.")
