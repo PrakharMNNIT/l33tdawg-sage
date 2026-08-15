@@ -1750,7 +1750,7 @@ components:
           description: Response-only current local display name. Presentation metadata, not authority.
         from_registered_name:
           type: string
-          description: Response-only immutable local registration name. The exact from_agent remains authoritative.
+          description: Response-only saved local registration name for current rows. Legacy rows without one use the current display-name compatibility fallback, so this field is presentation metadata rather than immutable history; exact from_agent remains authoritative.
         from_agent_provider:
           type: string
           description: Response-only current provider for the exact local from_agent; presentation fallback only.
@@ -1764,7 +1764,7 @@ components:
           description: Response-only current local recipient display name. Omitted for a foreign recipient.
         to_registered_name:
           type: string
-          description: Response-only immutable local recipient registration name. Omitted for a foreign recipient.
+          description: Response-only saved local recipient registration name for current rows. Legacy rows without one use the current display-name compatibility fallback; omitted for a foreign recipient.
         to_agent_provider:
           type: string
           description: Response-only current provider for the exact local to_agent; distinct from the persisted to_provider routing selector.
@@ -1924,7 +1924,7 @@ components:
           description: Response-only current local display name. Presentation metadata, not authority.
         from_registered_name:
           type: string
-          description: Response-only immutable local registration name. The exact from_agent remains authoritative.
+          description: Response-only saved local registration name for current rows. Legacy rows without one use the current display-name compatibility fallback, so exact from_agent remains authoritative.
         intent:
           type: string
         payload:

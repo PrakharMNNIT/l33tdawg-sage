@@ -168,10 +168,21 @@ type pipelineAgentPresentation struct {
 	Provider       string
 }
 
-// resolvePipelineAgentPresentations performs at most one exact directory lookup
-// for each distinct ID in a bounded response. A missing/removed agent or a
-// directory failure must not hide already-authorized message work; callers fall
-// back to the persisted provider label and then the bounded exact ID.
+// pipelineAgentDirectoryReader is the narrow, response-only projection used to
+// decorate message rows that the caller has already been authorized to read.
+// Keeping it optional preserves compatibility with alternate AgentStore
+// implementations; those use the bounded exact per-agent compatibility path.
+type pipelineAgentDirectoryReader interface {
+	GetAgentDirectoryEntries(ctx context.Context, agentIDs []string) ([]*store.AgentEntry, error)
+}
+
+const maxPipelinePresentationAgentIDs = 512
+
+// resolvePipelineAgentPresentations performs one bounded, metadata-only exact
+// directory query for the distinct local IDs in an already-authorized response.
+// A missing/removed agent or directory failure must not hide message work.
+// Production stores use the batch projection; alternate stores and batch errors
+// retain the pre-existing bounded exact-GetAgent compatibility path.
 func (s *Server) resolvePipelineAgentPresentations(
 	ctx context.Context, agentIDs ...string,
 ) map[string]pipelineAgentPresentation {
@@ -180,14 +191,42 @@ func (s *Server) resolvePipelineAgentPresentations(
 		return presentations
 	}
 	seen := make(map[string]struct{}, len(agentIDs))
+	selected := make([]string, 0, len(agentIDs))
 	for _, agentID := range agentIDs {
-		if agentID == "" {
+		if agentID == "" || len(selected) >= maxPipelinePresentationAgentIDs {
 			continue
 		}
 		if _, duplicate := seen[agentID]; duplicate {
 			continue
 		}
 		seen[agentID] = struct{}{}
+		selected = append(selected, agentID)
+	}
+	if len(selected) == 0 {
+		return presentations
+	}
+	directory, supportsBatch := s.agentStore.(pipelineAgentDirectoryReader)
+	if supportsBatch {
+		agents, err := directory.GetAgentDirectoryEntries(ctx, selected)
+		if err == nil {
+			for _, agent := range agents {
+				if agent == nil {
+					continue
+				}
+				if _, requested := seen[agent.AgentID]; !requested {
+					continue
+				}
+				presentations[agent.AgentID] = pipelineAgentPresentation{
+					DisplayName:    strings.TrimSpace(agent.Name),
+					RegisteredName: strings.TrimSpace(agent.RegisteredName),
+					Provider:       strings.TrimSpace(agent.Provider),
+				}
+			}
+			return presentations
+		}
+	}
+
+	for _, agentID := range selected {
 		agent, err := s.agentStore.GetAgent(ctx, agentID)
 		if err != nil || agent == nil {
 			continue

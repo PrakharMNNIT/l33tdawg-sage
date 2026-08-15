@@ -4149,6 +4149,70 @@ func (s *SQLiteStore) GetPipeContactAgents(ctx context.Context, agentIDs []strin
 	return out, nil
 }
 
+// GetAgentDirectoryEntries loads one bounded exact-ID metadata projection for
+// response presentation. Unlike GetAgent it never computes derived memory
+// counts. It preserves GetAgent's compatibility semantics: a legacy empty
+// registered_name is represented by the current display name.
+func (s *SQLiteStore) GetAgentDirectoryEntries(ctx context.Context, agentIDs []string) ([]*AgentEntry, error) {
+	if len(agentIDs) == 0 {
+		return nil, nil
+	}
+	if len(agentIDs) > 512 {
+		agentIDs = agentIDs[:512]
+	}
+	seen := make(map[string]struct{}, len(agentIDs))
+	selected := make([]string, 0, len(agentIDs))
+	for _, agentID := range agentIDs {
+		if agentID == "" {
+			continue
+		}
+		if _, duplicate := seen[agentID]; duplicate {
+			continue
+		}
+		seen[agentID] = struct{}{}
+		selected = append(selected, agentID)
+	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(selected))
+	args := make([]any, len(selected))
+	for i, agentID := range selected {
+		placeholders[i] = "?"
+		args[i] = agentID
+	}
+	rows, err := s.conn.QueryContext(ctx, `
+		SELECT agent_id, name, COALESCE(registered_name,''), COALESCE(provider,''), status, removed_at
+		FROM network_agents
+		WHERE agent_id IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY agent_id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load agent directory entries: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanAgentDirectoryEntries(rows)
+}
+
+func scanAgentDirectoryEntries(rows *sql.Rows) ([]*AgentEntry, error) {
+	agents := make([]*AgentEntry, 0)
+	for rows.Next() {
+		agent := &AgentEntry{}
+		var removedAt *string
+		if err := rows.Scan(&agent.AgentID, &agent.Name, &agent.RegisteredName, &agent.Provider, &agent.Status, &removedAt); err != nil {
+			return nil, fmt.Errorf("scan agent directory entry: %w", err)
+		}
+		agent.RemovedAt = parseTimePtr(removedAt)
+		if agent.RegisteredName == "" {
+			agent.RegisteredName = agent.Name
+		}
+		agents = append(agents, agent)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate agent directory entries: %w", err)
+	}
+	return agents, nil
+}
+
 func scanPipeContactLookupAgents(rows *sql.Rows) ([]*AgentEntry, error) {
 	agents := make([]*AgentEntry, 0)
 	for rows.Next() {

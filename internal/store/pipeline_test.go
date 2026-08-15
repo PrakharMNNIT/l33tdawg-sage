@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,60 @@ import (
 
 	"github.com/l33tdawg/sage/internal/vault"
 )
+
+type queryCountingSQLQuerier struct {
+	sqlQuerier
+	queryContextCalls    int
+	queryRowContextCalls int
+}
+
+func (q *queryCountingSQLQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	q.queryContextCalls++
+	return q.sqlQuerier.QueryContext(ctx, query, args...)
+}
+
+func (q *queryCountingSQLQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	q.queryRowContextCalls++
+	return q.sqlQuerier.QueryRowContext(ctx, query, args...)
+}
+
+func TestGetAgentDirectoryEntriesUsesOneMetadataQueryAndMatchesGetAgentLegacySemantics(t *testing.T) {
+	ctx := context.Background()
+	s, err := NewSQLiteStore(ctx, filepath.Join(t.TempDir(), "agent-directory.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	for _, agent := range []*AgentEntry{
+		{AgentID: "agent-a", Name: "Mutable A", RegisteredName: "", Provider: "claude-code", Status: "active"},
+		{AgentID: "agent-b", Name: "Mutable B", RegisteredName: "saved/b", Provider: "codex", Status: "active"},
+		{AgentID: "agent-removed", Name: "Former agent", RegisteredName: "saved/removed", Provider: "codex", Status: "removed"},
+	} {
+		require.NoError(t, s.CreateAgent(ctx, agent))
+	}
+
+	legacyViaGet, err := s.GetAgent(ctx, "agent-a")
+	require.NoError(t, err)
+	require.Equal(t, "Mutable A", legacyViaGet.RegisteredName)
+
+	queries := &queryCountingSQLQuerier{sqlQuerier: s.conn}
+	s.conn = queries
+	entries, err := s.GetAgentDirectoryEntries(ctx, []string{
+		"agent-a", "agent-b", "agent-a", "agent-removed", "agent-unknown",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, queries.queryContextCalls,
+		"a deduplicated exact-ID batch must execute one metadata query")
+	require.Zero(t, queries.queryRowContextCalls,
+		"the projection must not degrade into per-agent query-row reads")
+	require.Len(t, entries, 3,
+		"unknown IDs stay absent while exact historical removed rows remain available")
+	require.Equal(t, "agent-a", entries[0].AgentID)
+	require.Equal(t, legacyViaGet.RegisteredName, entries[0].RegisteredName,
+		"batch and GetAgent must expose identical legacy compatibility semantics")
+	require.Equal(t, "saved/b", entries[1].RegisteredName)
+	require.Equal(t, "agent-removed", entries[2].AgentID,
+		"the exact metadata projection must not add a status filter")
+}
 
 // TestPipelineSizeCaps verifies the E8c size guards at the store boundary,
 // including the off-by-one at exactly the cap (which must pass).

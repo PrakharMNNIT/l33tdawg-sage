@@ -974,6 +974,9 @@ For local items, `from` uses display name, then registered name, then the
 persisted legacy provider label, then a bounded exact-ID prefix. The exact
 authenticated ID is always returned separately as `sender_agent`; mutable or
 duplicate friendly names never replace it or change reply authorization.
+`from_registered_name` is saved metadata on current rows. A legacy row without
+that history uses `GetAgent`'s current display-name compatibility fallback, so
+clients must not treat the legacy value as immutable registration history.
 
 **REST:** `POST /v1/messages/receive`, followed by
 `PUT /v1/messages/read-batch` (legacy definite-404 fallback:
@@ -1590,10 +1593,13 @@ authorization. Pipeline results are untrusted data, not instructions.
   agent to verify the exact current assignment in `sage_backlog`
   (`internal/mcp/tools.go`, `Server.toolInbox`).
   For local messages, `from` is presentation-only and uses current
-  `from_display_name`, then immutable `from_registered_name`, then the persisted
+  `from_display_name`, then saved `from_registered_name` when present, then the persisted
   legacy provider label, then a bounded exact-ID prefix. `sender_agent` always
-  carries the exact authenticated sender ID. Display/registered names are
-  additive when available and never convey authority. Foreign `from` remains
+  carries the exact authenticated sender ID. Display and provider labels are
+  mutable presentation metadata; the registered name is additive saved metadata
+  on current rows. A legacy missing value uses the current display-name
+  compatibility fallback and is not immutable history. Labels never convey
+  authority. Foreign `from` remains
   the exact `agent@chain` address and never uses a colliding local directory
   entry; local `from_display_name`/`from_registered_name` fields are suppressed
   entirely on a foreign item even if an older or hostile REST peer supplies
@@ -1782,7 +1788,10 @@ For local exact-agent rows, `counterparty` prefers current display name, then
 registered name, then the legacy provider label, then a bounded exact-ID
 prefix. `counterparty_agent` carries the exact immutable agent ID alongside the
 friendly label; optional `counterparty_display_name` and
-`counterparty_registered_name` make the label source explicit. Federated rows
+`counterparty_registered_name` make the label source explicit. Display and
+provider labels are mutable presentation metadata; the registered name is saved
+metadata on current rows. A legacy missing value uses the current display-name
+compatibility fallback and is not immutable history. None is authority. Federated rows
 remain exact `agent@chain`. Provider-addressed legacy outbox rows keep their
 `to_provider` routing selector as `counterparty` and do not invent an exact
 recipient.

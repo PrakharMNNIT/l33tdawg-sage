@@ -2134,10 +2134,15 @@ principal.
 Claimed local items returned by `POST /v1/messages/receive` keep the persisted
 `from_agent` and `from_provider` fields unchanged and add response-only
 `from_display_name` and `from_registered_name` from the local agent directory.
-The lookup is deduplicated by exact agent ID within the bounded page. These
-names are presentation metadata, not authorization principals; clients must use
-`from_agent` for attribution and reply by the returned `message_id`. A directory
-miss never hides claimed work and simply omits the additive names.
+One bounded metadata-only query deduplicates exact agent IDs within the page and
+never invokes the derived memory-count projection. These names are presentation
+metadata, not authorization principals; clients must use `from_agent` for
+attribution and reply by the returned `message_id`. `from_registered_name` is a
+saved registration value for current rows. For legacy rows that never stored
+one, it intentionally matches `GetAgent` by using the current display name as a
+compatibility fallback; clients must not treat that legacy value as immutable
+registration history. A directory miss never hides claimed work. A batch-query
+failure retains the bounded exact-agent compatibility lookup.
 
 Every operation requires a fresh nonce-bound request signed by the exact active
 ordinary agent, including send and sender status. Unauthorized and nonexistent
@@ -2283,7 +2288,10 @@ For local parties, the response also adds current `from_display_name`,
 `to_registered_name`, and `to_agent_provider` when the exact directory entries
 are available. These fields do not replace
 `from_agent`, `to_agent`, `from_provider`, or `to_provider`; lookups are
-deduplicated per bounded response and failures fall back without hiding work.
+deduplicated into one bounded metadata-only query per response and failures fall
+back without hiding work. Registered-name fields carry the saved value when
+present. For legacy rows without a saved value they match `GetAgent`'s current
+display-name compatibility fallback and therefore are not immutable history.
 Foreign agent IDs are never decorated from the local directory, even if an ID
 collides.
 Foreign items carry additive immutable provenance including

@@ -440,8 +440,14 @@ class PipeMessage(BaseModel):
     pipe_id: str
     from_agent: str | None = None
     from_provider: str | None = None
+    from_display_name: str | None = None
+    from_registered_name: str | None = None
+    from_agent_provider: str | None = None
     to_agent: str | None = None
     to_provider: str | None = None
+    to_display_name: str | None = None
+    to_registered_name: str | None = None
+    to_agent_provider: str | None = None
     intent: str | None = None
     payload: str | None = None
     result: str | None = None
@@ -536,6 +542,8 @@ class MessageItem(BaseModel):
     message_id: str
     from_agent: str
     from_provider: str | None = None
+    from_display_name: str | None = None
+    from_registered_name: str | None = None
     intent: str | None = None
     payload: str
     status: str

@@ -54,12 +54,26 @@ func addMessageAgent(t *testing.T, s *store.SQLiteStore, id string) {
 
 type countingExactAgentStore struct {
 	store.AgentStore
-	getCalls map[string]int
+	getCalls       map[string]int
+	directoryReads int
+	directoryIDs   [][]string
 }
 
 func (s *countingExactAgentStore) GetAgent(ctx context.Context, agentID string) (*store.AgentEntry, error) {
 	s.getCalls[agentID]++
 	return s.AgentStore.GetAgent(ctx, agentID)
+}
+
+func (s *countingExactAgentStore) GetAgentDirectoryEntries(ctx context.Context, agentIDs []string) ([]*store.AgentEntry, error) {
+	s.directoryReads++
+	s.directoryIDs = append(s.directoryIDs, append([]string(nil), agentIDs...))
+	directory, ok := s.AgentStore.(interface {
+		GetAgentDirectoryEntries(context.Context, []string) ([]*store.AgentEntry, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("directory projection unsupported")
+	}
+	return directory.GetAgentDirectoryEntries(ctx, agentIDs)
 }
 
 func callMessageJSON(t *testing.T, handler http.Handler, method, path string, body any) *httptest.ResponseRecorder {
@@ -202,8 +216,14 @@ func TestCanonicalMessageReceiveEnrichesCurrentNamesWithoutMutatingProviderIdent
 		require.Equal(t, "claude-code/sage", item["from_registered_name"])
 		require.Equal(t, "agent_untrusted", item["trust"])
 	}
-	require.Equal(t, 1, counting.getCalls[senderID],
-		"one bounded page must resolve each distinct sender exactly once")
+	require.Zero(t, counting.getCalls[senderID],
+		"presentation enrichment must not invoke GetAgent's derived memory-count projection")
+	require.Equal(t, map[string]int{recipientID: 1}, counting.getCalls,
+		"canonical receive keeps its one caller-provider routing read but performs no per-item GetAgent reads")
+	require.Equal(t, 1, counting.directoryReads,
+		"one bounded page must use exactly one metadata-only directory query")
+	require.Equal(t, [][]string{{senderID}}, counting.directoryIDs,
+		"duplicate senders in one page must be resolved once by exact ID")
 }
 
 func TestCanonicalFederatedMessageStatusIsSenderOnly(t *testing.T) {

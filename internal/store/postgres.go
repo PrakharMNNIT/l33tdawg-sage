@@ -3195,6 +3195,59 @@ func (s *PostgresStore) ListAgentDirectory(ctx context.Context, limit int) ([]*A
 	return agents, rows.Err()
 }
 
+// GetAgentDirectoryEntries is the bounded exact-ID metadata projection used by
+// response presentation. It avoids GetAgent's derived memory-count work and
+// preserves GetAgent's legacy registered_name compatibility fallback.
+func (s *PostgresStore) GetAgentDirectoryEntries(ctx context.Context, agentIDs []string) ([]*AgentEntry, error) {
+	if len(agentIDs) == 0 {
+		return nil, nil
+	}
+	if len(agentIDs) > 512 {
+		agentIDs = agentIDs[:512]
+	}
+	seen := make(map[string]struct{}, len(agentIDs))
+	selected := make([]string, 0, len(agentIDs))
+	for _, agentID := range agentIDs {
+		if agentID == "" {
+			continue
+		}
+		if _, duplicate := seen[agentID]; duplicate {
+			continue
+		}
+		seen[agentID] = struct{}{}
+		selected = append(selected, agentID)
+	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT a.agent_id, a.name, COALESCE(a.registered_name, ''),
+			COALESCE(a.provider, ''), a.status, a.removed_at
+		FROM agents a
+		WHERE a.agent_id = ANY($1)
+		ORDER BY a.agent_id`, selected)
+	if err != nil {
+		return nil, fmt.Errorf("load agent directory entries: %w", err)
+	}
+	defer rows.Close()
+
+	agents := make([]*AgentEntry, 0, len(selected))
+	for rows.Next() {
+		agent := &AgentEntry{}
+		if scanErr := rows.Scan(
+			&agent.AgentID, &agent.Name, &agent.RegisteredName,
+			&agent.Provider, &agent.Status, &agent.RemovedAt,
+		); scanErr != nil {
+			return nil, fmt.Errorf("scan agent directory entry: %w", scanErr)
+		}
+		if agent.RegisteredName == "" {
+			agent.RegisteredName = agent.Name
+		}
+		agents = append(agents, agent)
+	}
+	return agents, rows.Err()
+}
+
 func (s *PostgresStore) GetAgent(ctx context.Context, agentID string) (*AgentEntry, error) {
 	a, err := scanAgent(s.db.QueryRow(ctx, `SELECT `+agentColumns+`
 		FROM agents a WHERE a.agent_id = $1`, agentID))

@@ -306,6 +306,9 @@ func TestHandleToolsList(t *testing.T) {
 	var sageDirectory map[string]any
 	var sageTask map[string]any
 	var sageTimeline map[string]any
+	var sageMessagesReceive map[string]any
+	var sageInbox map[string]any
+	var sageMessageHistory map[string]any
 	for _, tool := range tools {
 		names[tool["name"].(string)] = true
 		if tool["name"] == "sage_find_agent" {
@@ -322,6 +325,15 @@ func TestHandleToolsList(t *testing.T) {
 		}
 		if tool["name"] == "sage_timeline" {
 			sageTimeline = tool
+		}
+		if tool["name"] == "sage_messages_receive" {
+			sageMessagesReceive = tool
+		}
+		if tool["name"] == "sage_inbox" {
+			sageInbox = tool
+		}
+		if tool["name"] == "sage_message_history" {
+			sageMessageHistory = tool
 		}
 	}
 	expected := []string{
@@ -369,6 +381,24 @@ func TestHandleToolsList(t *testing.T) {
 	assert.True(t, names["sage_corroborate"])
 	assert.True(t, names["sage_link"])
 	assert.True(t, names["sage_rename"])
+
+	for name, tool := range map[string]map[string]any{
+		"sage_messages_receive": sageMessagesReceive,
+		"sage_inbox":            sageInbox,
+	} {
+		require.NotNil(t, tool, name)
+		description := tool["description"].(string)
+		assert.Contains(t, description, "sender_agent")
+		assert.Contains(t, description, "presentation metadata")
+		assert.Contains(t, description, "current display-name compatibility fallback")
+		assert.Contains(t, description, "never")
+	}
+	require.NotNil(t, sageMessageHistory)
+	historyDescription := sageMessageHistory["description"].(string)
+	assert.Contains(t, historyDescription, "counterparty_agent")
+	assert.Contains(t, historyDescription, "agent@chain")
+	assert.Contains(t, historyDescription, "presentation metadata")
+	assert.Contains(t, historyDescription, "current display-name compatibility fallback")
 
 	require.NotNil(t, findAgent)
 	assert.Contains(t, findAgent["description"], "bounded substring lookup")
