@@ -355,8 +355,13 @@ func TestMessageReceiveAttributesWinningSessionAndDeterministicHandoff(t *testin
 	history, err = s.GetInboxHistory(ctx, "bob", "", 10)
 	require.NoError(t, err)
 	require.Equal(t, target, history[0].ClaimedSessionID)
+	// Was ErrMessageNotFound. That expectation encoded the collapsing this
+	// package now avoids: a stale session and an absent message reported the
+	// same error, the REST layer turned both into 404, and the MCP client's
+	// older-node fallback retried the call without a session id — bypassing
+	// this fence. The refusal itself is unchanged; only its precision is.
 	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-session", "stale", winner)
-	require.ErrorIs(t, err, ErrMessageNotFound)
+	require.ErrorIs(t, err, ErrMessageClaimedByOtherSession)
 	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-session", "done", target)
 	require.NoError(t, err)
 }
