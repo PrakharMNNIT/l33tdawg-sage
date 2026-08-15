@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -775,6 +776,476 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			}`,
 		},
 		{
+			name: "pointer alias invoked only by defer cannot affect following false sink",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := false
+				pointer := &dead
+				defer setTrue(pointer)
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "closure alias invoked only by defer cannot affect following false sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				callback := func() { dead = true }
+				defer callback()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "pointer method alias invoked only by defer cannot affect following false sink",
+			body: `type flag bool
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				callback := dead.setTrue
+				defer callback()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "converted pointer method alias invoked only by defer cannot affect following false sink",
+			body: `type flag bool
+			type callback func()
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				stored := callback(dead.setTrue)
+				defer stored()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "composite-held method alias invoked only by defer cannot affect following false sink",
+			body: `type flag bool
+			type holder struct { call func() }
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				stored := holder{call: dead.setTrue}
+				defer stored.call()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "struct field alias assigned before defer cannot affect following false sink",
+			body: `type flag bool
+			type holder struct { call func() }
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				var stored holder
+				stored.call = dead.setTrue
+				defer stored.call()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "array element alias assigned before defer cannot affect following false sink",
+			body: `type flag bool
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				var calls [1]func()
+				calls[0] = dead.setTrue
+				defer calls[0]()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "identity wrapper alias invoked only by defer cannot affect following false sink",
+			body: `type flag bool
+			func (value *flag) setTrue() { *value = true }
+			func identity(callback func()) func() { return callback }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				stored := identity(dead.setTrue)
+				defer stored()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "append-stored method alias invoked only by defer cannot affect following false sink",
+			body: `type flag bool
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				stored := []func(){}
+				stored = append(stored, dead.setTrue)
+				defer stored[0]()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "aggregate alias construction evaluates synchronous sibling before false sink",
+			body: `type holder struct { call func(); ignored bool }
+			func mutate(b *SSEBroadcaster) {
+				dead := true
+				stored := holder{
+					call: func() { dead = true },
+					ignored: func() bool { dead = false; return true }(),
+				}
+				defer stored.call()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "identity alias construction evaluates synchronous sibling before false sink",
+			body: `func identity(callback func(), _ bool) func() { return callback }
+			func mutate(b *SSEBroadcaster) {
+				dead := true
+				stored := identity(
+					func() { dead = true },
+					func() bool { dead = false; return true }(),
+				)
+				defer stored()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "calling unrelated empty aggregate field preserves delayed false source",
+			body: `type flag bool
+			type holder struct { later func(); now func() }
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				stored := holder{later: dead.setTrue, now: func() {}}
+				stored.now()
+				defer stored.later()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "len does not invoke callback aliases before false sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				stored := []func(){func() { dead = true }}
+				_ = len(stored)
+				defer stored[0]()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "delete does not invoke callback aliases before false sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				stored := map[string]func(){"later": func() { dead = true }, "now": func() {}}
+				delete(stored, "now")
+				defer stored["later"]()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "pointer aggregate alias path fails closed before false sink",
+			body: `type holder struct { later func(); now func() }
+			func mutate(b *SSEBroadcaster) {
+				dead := false
+				stored := &holder{later: func() { dead = true }, now: func() {}}
+				stored.now()
+				defer stored.later()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "nested aggregate alias path fails closed before false sink",
+			body: `type callbacks struct { later func(); now func() }
+			type holder struct { inner callbacks }
+			func mutate(b *SSEBroadcaster) {
+				dead := false
+				stored := holder{inner: callbacks{later: func() { dead = true }, now: func() {}}}
+				stored.inner.now()
+				defer stored.inner.later()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "dynamic aggregate alias path fails closed before false sink",
+			body: `func mutate(b *SSEBroadcaster, index int) {
+				dead := false
+				stored := [2]func(){func() {}, func() { dead = true }}
+				stored[index]()
+				defer stored[1]()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "shared slice alias mutation fails closed instead of pruning live sink",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				other := false
+				first := []*bool{&other}
+				second := first
+				first[0] = &live
+				setTrue(second[0])
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "shared map alias mutation fails closed instead of pruning live sink",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				other := false
+				first := map[int]*bool{0: &other}
+				second := first
+				first[0] = &live
+				setTrue(second[0])
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "channel alias round trip fails closed instead of pruning live sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				live := false
+				pointer := &live
+				channel := make(chan *bool, 1)
+				channel <- pointer
+				received := <-channel
+				*received = true
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "nonlocal alias assignment fails closed instead of pruning live sink",
+			body: `var globalAlias *bool
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				pointer := &live
+				globalAlias = pointer
+				*globalAlias = true
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "later map assignment alias key fails closed",
+			body: `func mutateKeys(values map[*bool]struct{}) { for pointer := range values { *pointer = true } }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				pointer := &live
+				values := map[*bool]struct{}{}
+				values[pointer] = struct{}{}
+				mutateKeys(values)
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "unsupported alias taint propagates through boolean copy",
+			body: `type holder struct { later func(); now func() }
+			func mutate(b *SSEBroadcaster) {
+				dead := false
+				stored := &holder{later: func() { dead = true }, now: func() {}}
+				stored.now()
+				alias := dead
+				_ = alias && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "tagless switch case depending on alias taint fails closed",
+			body: `type holder struct { later func(); now func() }
+			func mutate(b *SSEBroadcaster) {
+				dead := false
+				stored := &holder{later: func() { dead = true }, now: func() {}}
+				stored.now()
+				switch {
+				case dead:
+					b.Broadcast(SSEEvent{Type: EventRemember})
+				}
+			}`,
+		},
+		{
+			name: "shared append backing mutation fails closed instead of pruning live sink",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				first := make([]*bool, 0, 1)
+				second := first
+				first = append(first, &live)
+				setTrue(second[:1][0])
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "identity-wrapped append backing mutation fails closed",
+			body: `func identityPointers(values []*bool) []*bool { return values }
+			func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				first := make([]*bool, 0, 1)
+				second := first
+				first = identityPointers(append(first, &live))
+				setTrue(second[:1][0])
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "nested append backing mutation fails closed",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				other := false
+				first := make([]*bool, 0, 2)
+				second := first
+				first = append(append(first, &live), &other)
+				setTrue(second[:1][0])
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "synchronously invoked closure append mutation fails closed",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				pointer := &live
+				first := make([]*bool, 0, 1)
+				second := first
+				first = func() []*bool { return append(first, pointer) }()
+				setTrue(second[:1][0])
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "synchronized goroutine append mutation fails closed",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				pointer := &live
+				first := make([]*bool, 0, 1)
+				second := first
+				done := make(chan struct{})
+				go func() {
+					first = append(first, pointer)
+					close(done)
+				}()
+				<-done
+				setTrue(second[:1][0])
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "synchronous immediate closure can establish false before sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := true
+				func() { dead = false }()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "synchronous deferred argument closure can establish false before sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := true
+				defer func(int) {}(func() int { dead = false; return 0 }())
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "synchronous alias rebind does not mutate old false pointee",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				other := false
+				pointer := &dead
+				rebind := func() { pointer = &other }
+				rebind()
+				_ = pointer
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
 			name: "earlier sibling closure assignment establishes false before sink",
 			body: `func mutate(b *SSEBroadcaster) {
 				dead := true
@@ -1441,6 +1912,141 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 	})
 
 	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "synchronous pointer alias call can establish live sink",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				pointer := &live
+				setTrue(pointer)
+				_ = live && func() bool { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "synchronous closure alias call can establish live sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				live := false
+				callback := func() { live = true }
+				callback()
+				_ = live && func() bool { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "synchronous converted method alias call can establish live sink",
+			body: `type flag bool
+			type callback func()
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := flag(false)
+				stored := callback(live.setTrue)
+				stored()
+				_ = live && func() flag { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "synchronous composite alias call can establish live sink",
+			body: `type flag bool
+			type holder struct { call func() }
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := flag(false)
+				stored := holder{call: live.setTrue}
+				stored.call()
+				_ = live && func() flag { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "deferred closure alias write remains after following live sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				live := true
+				callback := func() { live = false }
+				defer callback()
+				_ = live && func() bool { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "identity alias evaluates synchronous sibling that establishes live sink",
+			body: `func identity(callback func(), _ bool) func() { return callback }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				stored := identity(
+					func() { live = false },
+					func() bool { live = true; return true }(),
+				)
+				defer stored()
+				_ = live && func() bool { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "method alias evaluates synchronous receiver arguments",
+			body: `type flag bool
+			func (*flag) observe() { _ = 1 }
+			func pick(value *flag, _ int) *flag { return value }
+			func mutate(b *SSEBroadcaster) {
+				live := flag(false)
+				observe := pick(&live, func() int { live = true; return 0 }()).observe
+				_ = observe
+				_ = live && func() flag { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "address alias evaluates synchronous index expression",
+			body: `func mutate(b *SSEBroadcaster) {
+				live := false
+				other := false
+				values := []*bool{&other}
+				slot := &values[func() int { live = true; return 0 }()]
+				_ = slot
+				_ = live && func() bool { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "map literal alias key cannot be false-pruned",
+			body: `func mutateKeys(values map[*bool]struct{}) { for pointer := range values { *pointer = true } }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				pointer := &live
+				values := map[*bool]struct{}{pointer: {}}
+				mutateKeys(values)
+				_ = live && func() bool { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "known assignment clears propagated alias taint",
+			body: `type holder struct { later func(); now func() }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				stored := &holder{later: func() { live = true }, now: func() {}}
+				stored.now()
+				alias := live
+				alias = true
+				_ = alias && func() bool { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+		{
+			name: "synchronized goroutine alias call cannot be false-pruned",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				live := false
+				pointer := &live
+				done := make(chan struct{})
+				go func() { setTrue(pointer); close(done) }()
+				<-done
+				_ = live && func() bool { b.Broadcast(SSEEvent{Type: EventRemember}); return true }()
+			}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := scanTypedFixture(t, tc.body)
+			require.Empty(t, scan.unresolved)
+			require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+		})
+	}
+
+	for _, tc := range []struct {
 		name    string
 		initial string
 		write   string
@@ -1970,12 +2576,15 @@ func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node)
 	checkedBoundary := false
 	for {
 		boundary, body := enclosingFunctionBoundary(current, parents)
-		facts, reachesPoint := programPointBooleanFacts(info, body, parents, current.Pos())
+		facts, tainted, reachesPoint := programPointBooleanFacts(info, body, parents, current.Pos())
 		if !reachesPoint {
 			return "an earlier expression at the same program point does not return", true
 		}
 		if reason, dead := shortCircuitDeadPath(info, current, parents, facts); dead {
 			return reason, true
+		}
+		if taintedControlPath(info, current, parents, tainted) {
+			return "sink liveness depends on an unsupported local alias effect", true
 		}
 		if body == nil {
 			if checkedBoundary {
@@ -1995,28 +2604,83 @@ func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node)
 	}
 }
 
+func taintedControlPath(info *types.Info, node ast.Node, parents map[ast.Node]ast.Node, tainted map[types.Object]bool) bool {
+	referencesTaint := func(expression ast.Expr) bool { return expressionReferencesObjects(info, expression, tainted) }
+	for child, parent := node, parents[node]; parent != nil; child, parent = parent, parents[parent] {
+		switch current := parent.(type) {
+		case *ast.BinaryExpr:
+			if (current.Op == token.LAND || current.Op == token.LOR) && current.Y.Pos() <= child.Pos() && child.End() <= current.Y.End() && referencesTaint(current.X) {
+				return true
+			}
+		case *ast.IfStmt:
+			if referencesTaint(current.Cond) && current.Cond.End() <= child.Pos() {
+				return true
+			}
+		case *ast.ForStmt:
+			if current.Cond != nil && referencesTaint(current.Cond) && current.Body.Pos() <= child.Pos() && child.End() <= current.Body.End() {
+				return true
+			}
+		case *ast.SwitchStmt:
+			if current.Tag != nil && referencesTaint(current.Tag) && current.Body.Pos() <= child.Pos() && child.End() <= current.Body.End() {
+				return true
+			}
+		case *ast.CaseClause:
+			if len(current.Body) > 0 && current.Body[0].Pos() <= child.Pos() {
+				for _, expression := range current.List {
+					if referencesTaint(expression) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func expressionReferencesObjects(info *types.Info, expression ast.Expr, objects map[types.Object]bool) bool {
+	if expression == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(expression, func(inner ast.Node) bool {
+		ident, ok := inner.(*ast.Ident)
+		if ok && objects[info.ObjectOf(ident)] {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
 type booleanFactState struct {
 	values  map[types.Object]bool
 	escaped map[types.Object]bool
+	tainted map[types.Object]bool
+	aliases map[types.Object]map[types.Object]bool
+	members map[types.Object]map[string]map[types.Object]bool
 }
 
 func newBooleanFactState() booleanFactState {
 	return booleanFactState{
 		values:  map[types.Object]bool{},
 		escaped: map[types.Object]bool{},
+		tainted: map[types.Object]bool{},
+		aliases: map[types.Object]map[types.Object]bool{},
+		members: map[types.Object]map[string]map[types.Object]bool{},
 	}
 }
 
-func programPointBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node, target token.Pos) (map[types.Object]bool, bool) {
+func programPointBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node, target token.Pos) (map[types.Object]bool, map[types.Object]bool, bool) {
 	if body == nil {
-		return map[types.Object]bool{}, true
+		return map[types.Object]bool{}, map[types.Object]bool{}, true
 	}
 	graph := cfg.New(body, func(call *ast.CallExpr) bool {
 		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
 		return !ok || builtin.Name() != "panic"
 	})
 	if len(graph.Blocks) == 0 {
-		return map[types.Object]bool{}, true
+		return map[types.Object]bool{}, map[types.Object]bool{}, true
 	}
 	restrictedSwitchCases, selectedSwitchCases, fallthroughSources := staticSwitchFactRestrictions(info, body)
 	activePred := map[*cfg.Block]map[*cfg.Block]bool{}
@@ -2090,14 +2754,14 @@ func programPointBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map
 		for _, node := range block.Nodes {
 			if node.Pos() <= target && target <= node.End() {
 				if !transferBooleanFactsBeforeTarget(info, body, parents, node, target, state) {
-					return map[types.Object]bool{}, false
+					return map[types.Object]bool{}, map[types.Object]bool{}, false
 				}
-				return cloneBooleanValues(state.values), true
+				return cloneBooleanValues(state.values), cloneBooleanValues(state.tainted), true
 			}
 			transferBooleanFacts(info, body, parents, node, state)
 		}
 	}
-	return map[types.Object]bool{}, false
+	return map[types.Object]bool{}, map[types.Object]bool{}, false
 }
 
 func booleanFactSuccessors(
@@ -2307,13 +2971,532 @@ func methodBodyIsEmpty(info *types.Info, body *ast.BlockStmt, parents map[ast.No
 	return false
 }
 
-func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node, node ast.Node, state booleanFactState) {
-	markEscaped := func(object types.Object) {
+func identityCallArgument(
+	info *types.Info,
+	body *ast.BlockStmt,
+	parents map[ast.Node]ast.Node,
+	call *ast.CallExpr,
+) (ast.Expr, bool) {
+	function, ok := calledObject(info, call.Fun).(*types.Func)
+	if !ok {
+		return nil, false
+	}
+	var root ast.Node = body
+	for parents[root] != nil {
+		root = parents[root]
+	}
+	file, ok := root.(*ast.File)
+	if !ok {
+		return nil, false
+	}
+	for _, declaration := range file.Decls {
+		decl, ok := declaration.(*ast.FuncDecl)
+		if !ok || info.ObjectOf(decl.Name) != function || decl.Body == nil || len(decl.Body.List) != 1 {
+			continue
+		}
+		returned, ok := decl.Body.List[0].(*ast.ReturnStmt)
+		if !ok || len(returned.Results) != 1 {
+			return nil, false
+		}
+		ident, ok := unwrapParens(returned.Results[0]).(*ast.Ident)
+		if !ok {
+			return nil, false
+		}
+		parameter := info.ObjectOf(ident)
+		signature, ok := function.Type().(*types.Signature)
+		if !ok {
+			return nil, false
+		}
+		for index := 0; index < signature.Params().Len() && index < len(call.Args); index++ {
+			if signature.Params().At(index) == parameter {
+				return call.Args[index], true
+			}
+		}
+		return nil, false
+	}
+	return nil, false
+}
+
+func aliasMemberKey(info *types.Info, expression ast.Expr) (types.Object, string, bool) {
+	expression = unwrapParens(expression)
+	switch current := expression.(type) {
+	case *ast.SelectorExpr:
+		base, ok := unwrapParens(current.X).(*ast.Ident)
+		selection := info.Selections[current]
+		field, fieldOK := selectionObject(selection).(*types.Var)
+		if !ok || !fieldOK || selection.Kind() == types.MethodVal || selection.Kind() == types.MethodExpr {
+			return nil, "", false
+		}
+		return info.ObjectOf(base), "field:" + field.Name(), true
+	case *ast.IndexExpr:
+		base, ok := unwrapParens(current.X).(*ast.Ident)
+		value := info.Types[unwrapParens(current.Index)].Value
+		if !ok || value == nil {
+			return nil, "", false
+		}
+		return info.ObjectOf(base), "index:" + value.ExactString(), true
+	default:
+		return nil, "", false
+	}
+}
+
+func booleanAliasSources(
+	info *types.Info,
+	body *ast.BlockStmt,
+	parents map[ast.Node]ast.Node,
+	expression ast.Expr,
+	aliases map[types.Object]map[types.Object]bool,
+	members map[types.Object]map[string]map[types.Object]bool,
+) map[types.Object]bool {
+	result := map[types.Object]bool{}
+	var collectExpression func(ast.Expr)
+	collectAliases := func(object types.Object) {
 		if object == nil {
 			return
 		}
+		for source := range aliases[object] {
+			result[source] = true
+		}
+	}
+	collectSourceObject := func(object types.Object) {
+		if object != nil && booleanOnlyType(object.Type()) {
+			result[object] = true
+		}
+		collectAliases(object)
+	}
+	collectCapturedWrites := func(literal *ast.FuncLit) {
+		ast.Inspect(literal.Body, func(inner ast.Node) bool {
+			collectAssignedIdent := func(ident *ast.Ident) {
+				object := info.ObjectOf(ident)
+				if object != nil && booleanOnlyType(object.Type()) && (object.Pos() < literal.Pos() || object.Pos() > literal.End()) {
+					result[object] = true
+				}
+			}
+			switch current := inner.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range current.Lhs {
+					ident, _ := unwrapParens(lhs).(*ast.Ident)
+					if ident != nil {
+						collectAssignedIdent(ident)
+					} else {
+						collectExpression(lhs)
+					}
+				}
+			case *ast.IncDecStmt:
+				ident, _ := unwrapParens(current.X).(*ast.Ident)
+				collectAssignedIdent(ident)
+			case *ast.UnaryExpr:
+				if current.Op == token.AND {
+					ident, _ := unwrapParens(current.X).(*ast.Ident)
+					collectAssignedIdent(ident)
+				}
+			case *ast.SelectorExpr:
+				selection := info.Selections[current]
+				method, _ := selectionObject(selection).(*types.Func)
+				signature, _ := methodSignature(method)
+				if signature != nil && signature.Recv() != nil {
+					if _, pointerReceiver := signature.Recv().Type().(*types.Pointer); pointerReceiver && !methodBodyIsEmpty(info, body, parents, method) {
+						if ident, ok := unwrapParens(current.X).(*ast.Ident); ok {
+							collectSourceObject(info.ObjectOf(ident))
+						} else {
+							collectExpression(current.X)
+						}
+					}
+				}
+			case *ast.CallExpr:
+				collectExpression(current.Fun)
+				for _, argument := range current.Args {
+					collectExpression(argument)
+				}
+			}
+			return true
+		})
+	}
+	collectExpression = func(current ast.Expr) {
+		current = unwrapParens(current)
+		if object, key, ok := aliasMemberKey(info, current); ok {
+			if sources, known := members[object][key]; known {
+				for source := range sources {
+					result[source] = true
+				}
+				return
+			}
+		}
+		switch value := current.(type) {
+		case *ast.Ident:
+			collectAliases(info.ObjectOf(value))
+		case *ast.UnaryExpr:
+			if value.Op == token.AND {
+				if ident, ok := unwrapParens(value.X).(*ast.Ident); ok {
+					collectSourceObject(info.ObjectOf(ident))
+				} else {
+					collectExpression(value.X)
+				}
+			}
+		case *ast.FuncLit:
+			collectCapturedWrites(value)
+		case *ast.SelectorExpr:
+			selection := info.Selections[value]
+			method, _ := selectionObject(selection).(*types.Func)
+			signature, _ := methodSignature(method)
+			if signature != nil && signature.Recv() != nil {
+				if _, pointerReceiver := signature.Recv().Type().(*types.Pointer); pointerReceiver && !methodBodyIsEmpty(info, body, parents, method) {
+					if ident, ok := unwrapParens(value.X).(*ast.Ident); ok {
+						collectSourceObject(info.ObjectOf(ident))
+					} else {
+						collectExpression(value.X)
+					}
+					return
+				}
+			}
+			collectExpression(value.X)
+		case *ast.CompositeLit:
+			for _, element := range value.Elts {
+				if keyed, ok := element.(*ast.KeyValueExpr); ok {
+					collectExpression(keyed.Key)
+					collectExpression(keyed.Value)
+					continue
+				}
+				collectExpression(element)
+			}
+		case *ast.CallExpr:
+			if typeValue, isType := info.Types[value.Fun]; isType && typeValue.IsType() && len(value.Args) == 1 {
+				collectExpression(value.Args[0])
+			} else if argument, identity := identityCallArgument(info, body, parents, value); identity {
+				collectExpression(argument)
+			} else if builtin, ok := calledObject(info, value.Fun).(*types.Builtin); ok && builtin.Name() == "append" {
+				for _, argument := range value.Args {
+					collectExpression(argument)
+				}
+			}
+		case *ast.IndexExpr:
+			collectExpression(value.X)
+		case *ast.IndexListExpr:
+			collectExpression(value.X)
+		case *ast.SliceExpr:
+			collectExpression(value.X)
+		case *ast.TypeAssertExpr:
+			collectExpression(value.X)
+		case *ast.StarExpr:
+			collectExpression(value.X)
+		}
+	}
+	collectExpression(expression)
+	return result
+}
+
+func markBooleanAliasInertNodes(
+	info *types.Info,
+	body *ast.BlockStmt,
+	parents map[ast.Node]ast.Node,
+	expression ast.Expr,
+	aliases map[types.Object]map[types.Object]bool,
+	members map[types.Object]map[string]map[types.Object]bool,
+	inert map[ast.Node]bool,
+) {
+	expression = unwrapParens(expression)
+	if len(booleanAliasSources(info, body, parents, expression, aliases, members)) == 0 {
+		return
+	}
+	switch current := expression.(type) {
+	case *ast.UnaryExpr:
+		inert[current] = true
+		markBooleanAliasInertNodes(info, body, parents, current.X, aliases, members, inert)
+	case *ast.FuncLit:
+		inert[current] = true
+	case *ast.SelectorExpr:
+		selection := info.Selections[current]
+		method, _ := selectionObject(selection).(*types.Func)
+		signature, _ := methodSignature(method)
+		if signature != nil && signature.Recv() != nil {
+			if _, pointerReceiver := signature.Recv().Type().(*types.Pointer); pointerReceiver {
+				inert[current] = true
+				markBooleanAliasInertNodes(info, body, parents, current.X, aliases, members, inert)
+				return
+			}
+		}
+		markBooleanAliasInertNodes(info, body, parents, current.X, aliases, members, inert)
+	case *ast.CompositeLit:
+		for _, element := range current.Elts {
+			if keyed, ok := element.(*ast.KeyValueExpr); ok {
+				markBooleanAliasInertNodes(info, body, parents, keyed.Key, aliases, members, inert)
+				markBooleanAliasInertNodes(info, body, parents, keyed.Value, aliases, members, inert)
+				continue
+			}
+			markBooleanAliasInertNodes(info, body, parents, element, aliases, members, inert)
+		}
+	case *ast.CallExpr:
+		if typeValue, isType := info.Types[current.Fun]; isType && typeValue.IsType() && len(current.Args) == 1 {
+			markBooleanAliasInertNodes(info, body, parents, current.Args[0], aliases, members, inert)
+		} else if argument, identity := identityCallArgument(info, body, parents, current); identity {
+			markBooleanAliasInertNodes(info, body, parents, argument, aliases, members, inert)
+		} else if builtin, ok := calledObject(info, current.Fun).(*types.Builtin); ok && builtin.Name() == "append" {
+			for _, argument := range current.Args {
+				markBooleanAliasInertNodes(info, body, parents, argument, aliases, members, inert)
+			}
+		}
+	case *ast.IndexExpr:
+		markBooleanAliasInertNodes(info, body, parents, current.X, aliases, members, inert)
+	case *ast.IndexListExpr:
+		markBooleanAliasInertNodes(info, body, parents, current.X, aliases, members, inert)
+	case *ast.SliceExpr:
+		markBooleanAliasInertNodes(info, body, parents, current.X, aliases, members, inert)
+	case *ast.TypeAssertExpr:
+		markBooleanAliasInertNodes(info, body, parents, current.X, aliases, members, inert)
+	case *ast.StarExpr:
+		markBooleanAliasInertNodes(info, body, parents, current.X, aliases, members, inert)
+	}
+}
+
+func booleanAliasMembers(
+	info *types.Info,
+	body *ast.BlockStmt,
+	parents map[ast.Node]ast.Node,
+	expression ast.Expr,
+	aliases map[types.Object]map[types.Object]bool,
+	members map[types.Object]map[string]map[types.Object]bool,
+) (map[string]map[types.Object]bool, bool) {
+	expression = unwrapParens(expression)
+	if ident, ok := expression.(*ast.Ident); ok {
+		stored, known := members[info.ObjectOf(ident)]
+		return cloneAliasMembers(stored), known
+	}
+	literal, ok := expression.(*ast.CompositeLit)
+	if !ok {
+		return nil, false
+	}
+	result := map[string]map[types.Object]bool{}
+	for index, element := range literal.Elts {
+		key := "index:" + strconv.Itoa(index)
+		value := element
+		if keyed, keyedOK := element.(*ast.KeyValueExpr); keyedOK {
+			value = keyed.Value
+			if ident, identKey := unwrapParens(keyed.Key).(*ast.Ident); identKey {
+				key = "field:" + ident.Name
+			} else if constantValue := info.Types[unwrapParens(keyed.Key)].Value; constantValue != nil {
+				key = "index:" + constantValue.ExactString()
+			}
+		}
+		result[key] = booleanAliasSources(info, body, parents, value, aliases, members)
+	}
+	return result, true
+}
+
+func cloneAliasMembers(source map[string]map[types.Object]bool) map[string]map[types.Object]bool {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]map[types.Object]bool, len(source))
+	for key, sources := range source {
+		clone[key] = cloneBooleanValues(sources)
+	}
+	return clone
+}
+
+func selectionObject(selection *types.Selection) types.Object {
+	if selection == nil {
+		return nil
+	}
+	return selection.Obj()
+}
+
+func assignedAliasContainer(info *types.Info, expression ast.Expr) types.Object {
+	expression = unwrapParens(expression)
+	switch current := expression.(type) {
+	case *ast.SelectorExpr:
+		return assignedAliasContainer(info, current.X)
+	case *ast.IndexExpr:
+		return assignedAliasContainer(info, current.X)
+	case *ast.IndexListExpr:
+		return assignedAliasContainer(info, current.X)
+	case *ast.Ident:
+		return info.ObjectOf(current)
+	default:
+		return nil
+	}
+}
+
+func methodSignature(method *types.Func) (*types.Signature, bool) {
+	if method == nil {
+		return nil, false
+	}
+	signature, ok := method.Type().(*types.Signature)
+	return signature, ok
+}
+
+func aliasExpressionPrecise(info *types.Info, expression ast.Expr, state booleanFactState) bool {
+	expression = unwrapParens(expression)
+	switch current := expression.(type) {
+	case *ast.SelectorExpr:
+		if _, method := selectionObject(info.Selections[current]).(*types.Func); method {
+			return true
+		}
+		object, key, ok := aliasMemberKey(info, expression)
+		if !ok {
+			return false
+		}
+		_, known := state.members[object][key]
+		return known
+	case *ast.IndexExpr:
+		object, key, ok := aliasMemberKey(info, expression)
+		if !ok {
+			return false
+		}
+		_, known := state.members[object][key]
+		return known
+	case *ast.Ident:
+		return true
+	default:
+		return true
+	}
+}
+
+func referenceAggregate(object types.Object) bool {
+	if object == nil || object.Type() == nil {
+		return false
+	}
+	switch object.Type().Underlying().(type) {
+	case *types.Slice, *types.Map:
+		return true
+	default:
+		return false
+	}
+}
+
+func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node, node ast.Node, state booleanFactState) {
+	var markEscaped func(types.Object)
+	markEscaped = func(object types.Object) {
+		if object == nil {
+			return
+		}
+		if state.escaped[object] {
+			return
+		}
 		state.escaped[object] = true
+		for source := range state.aliases[object] {
+			markEscaped(source)
+		}
+		delete(state.aliases, object)
+		delete(state.members, object)
 		delete(state.values, object)
+	}
+	markTainted := func(object types.Object) {
+		if object == nil {
+			return
+		}
+		state.tainted[object] = true
+		delete(state.values, object)
+	}
+	localAliasVariable := func(ident *ast.Ident) (*types.Var, bool) {
+		if ident == nil || ident.Name == "_" {
+			return nil, false
+		}
+		variable, ok := info.ObjectOf(ident).(*types.Var)
+		if !ok || (variable.Pkg() != nil && variable.Parent() == variable.Pkg().Scope()) || state.escaped[variable] {
+			return nil, false
+		}
+		return variable, true
+	}
+	inertAliasNodes := map[ast.Node]bool{}
+	aliasUpdates := map[types.Object]map[types.Object]bool{}
+	aliasAdditions := map[types.Object]map[types.Object]bool{}
+	memberUpdates := map[types.Object]map[string]map[types.Object]bool{}
+	memberUpdateKnown := map[types.Object]bool{}
+	memberAssignments := map[types.Object]map[string]map[types.Object]bool{}
+	recordAlias := func(ident *ast.Ident, expression ast.Expr) bool {
+		variable, ok := localAliasVariable(ident)
+		if !ok {
+			return false
+		}
+		sources := booleanAliasSources(info, body, parents, expression, state.aliases, state.members)
+		if referenceAggregate(variable) {
+			ast.Inspect(expression, func(inner ast.Node) bool {
+				if literal, closure := inner.(*ast.FuncLit); closure {
+					return functionLiteralCallContext(literal, parents) == callSynchronous &&
+						expressionEvaluation(info, literal, parents, state.values) != expressionSkipped
+				}
+				call, ok := inner.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				builtin, builtinOK := calledObject(info, call.Fun).(*types.Builtin)
+				if !builtinOK || builtin.Name() != "append" {
+					return true
+				}
+				for _, appended := range call.Args[1:] {
+					for source := range booleanAliasSources(info, body, parents, appended, state.aliases, state.members) {
+						markTainted(source)
+					}
+				}
+				return true
+			})
+		}
+		aliasUpdates[variable] = sources
+		storedMembers, membersKnown := booleanAliasMembers(info, body, parents, expression, state.aliases, state.members)
+		memberUpdates[variable] = storedMembers
+		memberUpdateKnown[variable] = membersKnown
+		if len(sources) > 0 {
+			markBooleanAliasInertNodes(info, body, parents, expression, state.aliases, state.members, inertAliasNodes)
+		}
+		return true
+	}
+	switch current := node.(type) {
+	case *ast.ValueSpec:
+		if len(current.Names) == len(current.Values) {
+			for index, name := range current.Names {
+				recordAlias(name, current.Values[index])
+			}
+		}
+	case *ast.AssignStmt:
+		if (current.Tok == token.DEFINE || current.Tok == token.ASSIGN) && len(current.Lhs) == len(current.Rhs) {
+			for index, lhs := range current.Lhs {
+				ident, _ := unwrapParens(lhs).(*ast.Ident)
+				if ident != nil {
+					if !recordAlias(ident, current.Rhs[index]) && ident.Name != "_" {
+						for source := range booleanAliasSources(info, body, parents, current.Rhs[index], state.aliases, state.members) {
+							markTainted(source)
+						}
+					}
+					continue
+				}
+				container := assignedAliasContainer(info, lhs)
+				sources := booleanAliasSources(info, body, parents, current.Rhs[index], state.aliases, state.members)
+				if container == nil {
+					continue
+				}
+				if indexed, indexedAssignment := unwrapParens(lhs).(*ast.IndexExpr); indexedAssignment {
+					if _, isMap := container.Type().Underlying().(*types.Map); isMap {
+						keySources := booleanAliasSources(info, body, parents, indexed.Index, state.aliases, state.members)
+						for source := range keySources {
+							sources[source] = true
+						}
+						if len(keySources) > 0 {
+							markBooleanAliasInertNodes(info, body, parents, indexed.Index, state.aliases, state.members, inertAliasNodes)
+						}
+					}
+				}
+				if len(sources) > 0 {
+					if aliasAdditions[container] == nil {
+						aliasAdditions[container] = map[types.Object]bool{}
+					}
+					for source := range sources {
+						aliasAdditions[container][source] = true
+					}
+					markBooleanAliasInertNodes(info, body, parents, current.Rhs[index], state.aliases, state.members, inertAliasNodes)
+					if referenceAggregate(container) {
+						for source := range sources {
+							markTainted(source)
+						}
+					}
+				}
+				if memberObject, key, exactMember := aliasMemberKey(info, lhs); exactMember {
+					if memberAssignments[memberObject] == nil {
+						memberAssignments[memberObject] = map[string]map[types.Object]bool{}
+					}
+					memberAssignments[memberObject][key] = cloneBooleanValues(sources)
+				}
+			}
+		}
 	}
 	markCapturedWrites := func(literal *ast.FuncLit) {
 		ast.Inspect(literal.Body, func(inner ast.Node) bool {
@@ -2359,16 +3542,114 @@ func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast
 					ident, _ := unwrapParens(current.X).(*ast.Ident)
 					markIdent(ident)
 				}
+			case *ast.CallExpr:
+				for source := range booleanAliasSources(info, body, parents, current.Fun, state.aliases, state.members) {
+					markEscaped(source)
+				}
+				for _, argument := range current.Args {
+					for source := range booleanAliasSources(info, body, parents, argument, state.aliases, state.members) {
+						markEscaped(source)
+					}
+				}
 			}
 			return true
 		})
 	}
 	ast.Inspect(node, func(inner ast.Node) bool {
 		switch current := inner.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range current.Lhs {
+				if _, direct := unwrapParens(lhs).(*ast.Ident); direct {
+					continue
+				}
+				containsIndirectWrite := false
+				ast.Inspect(lhs, func(node ast.Node) bool {
+					if _, indirect := node.(*ast.StarExpr); indirect {
+						containsIndirectWrite = true
+					}
+					return true
+				})
+				if !containsIndirectWrite {
+					continue
+				}
+				for source := range booleanAliasSources(info, body, parents, lhs, state.aliases, state.members) {
+					markEscaped(source)
+				}
+			}
+			return true
+		case *ast.IncDecStmt:
+			for source := range booleanAliasSources(info, body, parents, current.X, state.aliases, state.members) {
+				markEscaped(source)
+			}
+			return true
+		case *ast.SendStmt:
+			for source := range booleanAliasSources(info, body, parents, current.Value, state.aliases, state.members) {
+				markTainted(source)
+			}
+			return true
+		case *ast.CallExpr:
+			if typeValue, isType := info.Types[current.Fun]; isType && typeValue.IsType() {
+				return true
+			}
+			if _, identity := identityCallArgument(info, body, parents, current); identity {
+				return true
+			}
+			if builtin, ok := calledObject(info, current.Fun).(*types.Builtin); ok {
+				switch builtin.Name() {
+				case "append", "cap", "clear", "delete", "len":
+					return true
+				}
+			}
+			if _, deferred := parents[current].(*ast.DeferStmt); deferred {
+				return true
+			}
+			if directlyCalledLiteralFromCall(current) == nil {
+				for source := range booleanAliasSources(info, body, parents, current.Fun, state.aliases, state.members) {
+					if aliasExpressionPrecise(info, current.Fun, state) {
+						markEscaped(source)
+					} else {
+						markTainted(source)
+					}
+				}
+			}
+			for _, argument := range current.Args {
+				for source := range booleanAliasSources(info, body, parents, argument, state.aliases, state.members) {
+					if aliasExpressionPrecise(info, argument, state) {
+						markEscaped(source)
+					} else {
+						markTainted(source)
+					}
+				}
+			}
+			return true
 		case *ast.FuncLit:
+			if inertAliasNodes[current] {
+				return false
+			}
 			switch functionLiteralCallContext(current, parents) {
 			case callDeferred:
 				return false
+			case callGoroutine:
+				ast.Inspect(current.Body, func(inner ast.Node) bool {
+					if nested, closure := inner.(*ast.FuncLit); closure {
+						return functionLiteralCallContext(nested, parents) == callSynchronous &&
+							expressionEvaluation(info, nested, parents, state.values) != expressionSkipped
+					}
+					call, ok := inner.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					builtin, builtinOK := calledObject(info, call.Fun).(*types.Builtin)
+					if !builtinOK || builtin.Name() != "append" {
+						return true
+					}
+					for _, appended := range call.Args[1:] {
+						for source := range booleanAliasSources(info, body, parents, appended, state.aliases, state.members) {
+							markTainted(source)
+						}
+					}
+					return true
+				})
 			case callSynchronous:
 				switch expressionEvaluation(info, current, parents, state.values) {
 				case expressionSkipped:
@@ -2385,11 +3666,17 @@ func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast
 			markCapturedWrites(current)
 			return false
 		case *ast.UnaryExpr:
+			if inertAliasNodes[current] {
+				return true
+			}
 			if current.Op == token.AND && !addressValueIsDirectlyDiscarded(current, parents) && !expressionIsOnlyDeferredOperand(info, current, parents) {
 				ident, _ := unwrapParens(current.X).(*ast.Ident)
 				markEscaped(info.ObjectOf(ident))
 			}
 		case *ast.SelectorExpr:
+			if inertAliasNodes[current] {
+				return true
+			}
 			selection := info.Selections[current]
 			if selection == nil {
 				break
@@ -2430,6 +3717,10 @@ func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast
 		}
 		if value, known := definiteBool(info, expr, source.values); known {
 			state.values[variable] = value
+			delete(state.tainted, variable)
+		} else if expressionReferencesObjects(info, expr, source.tainted) {
+			delete(state.values, variable)
+			state.tainted[variable] = true
 		} else {
 			delete(state.values, variable)
 		}
@@ -2472,6 +3763,36 @@ func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast
 		ident, _ := unwrapParens(current.X).(*ast.Ident)
 		if variable, ok := localVar(ident); ok {
 			delete(state.values, variable)
+		}
+	}
+	for variable, sources := range aliasUpdates {
+		if len(sources) == 0 {
+			delete(state.aliases, variable)
+			continue
+		}
+		state.aliases[variable] = cloneBooleanValues(sources)
+	}
+	for variable, known := range memberUpdateKnown {
+		if !known {
+			delete(state.members, variable)
+			continue
+		}
+		state.members[variable] = cloneAliasMembers(memberUpdates[variable])
+	}
+	for variable, sources := range aliasAdditions {
+		if state.aliases[variable] == nil {
+			state.aliases[variable] = map[types.Object]bool{}
+		}
+		for source := range sources {
+			state.aliases[variable][source] = true
+		}
+	}
+	for variable, assignments := range memberAssignments {
+		if state.members[variable] == nil {
+			state.members[variable] = map[string]map[types.Object]bool{}
+		}
+		for key, sources := range assignments {
+			state.members[variable][key] = cloneBooleanValues(sources)
 		}
 	}
 }
@@ -2733,6 +4054,9 @@ func cloneBooleanFacts(source booleanFactState) booleanFactState {
 	return booleanFactState{
 		values:  cloneBooleanValues(source.values),
 		escaped: cloneBooleanValues(source.escaped),
+		tainted: cloneBooleanValues(source.tainted),
+		aliases: cloneBooleanAliases(source.aliases),
+		members: cloneBooleanMembers(source.members),
 	}
 }
 
@@ -2746,14 +4070,92 @@ func intersectBooleanFacts(left, right booleanFactState) booleanFactState {
 	for object := range right.escaped {
 		result.escaped[object] = true
 	}
+	for object := range right.tainted {
+		result.tainted[object] = true
+	}
+	for object, sources := range right.aliases {
+		if result.aliases[object] == nil {
+			result.aliases[object] = map[types.Object]bool{}
+		}
+		for source := range sources {
+			result.aliases[object][source] = true
+		}
+	}
 	for object := range result.escaped {
 		delete(result.values, object)
+		delete(result.aliases, object)
+		delete(result.members, object)
+	}
+	for object := range result.tainted {
+		delete(result.values, object)
+	}
+	for object, storedMembers := range result.members {
+		otherMembers, present := right.members[object]
+		if !present {
+			delete(result.members, object)
+			continue
+		}
+		for key, sources := range storedMembers {
+			if !equalBooleanValues(sources, otherMembers[key]) {
+				delete(storedMembers, key)
+			}
+		}
 	}
 	return result
 }
 
 func equalBooleanFacts(left, right booleanFactState) bool {
-	return equalBooleanValues(left.values, right.values) && equalBooleanValues(left.escaped, right.escaped)
+	return equalBooleanValues(left.values, right.values) &&
+		equalBooleanValues(left.escaped, right.escaped) &&
+		equalBooleanValues(left.tainted, right.tainted) &&
+		equalBooleanAliases(left.aliases, right.aliases) &&
+		equalBooleanMembers(left.members, right.members)
+}
+
+func cloneBooleanAliases(source map[types.Object]map[types.Object]bool) map[types.Object]map[types.Object]bool {
+	clone := make(map[types.Object]map[types.Object]bool, len(source))
+	for object, sources := range source {
+		clone[object] = cloneBooleanValues(sources)
+	}
+	return clone
+}
+
+func equalBooleanAliases(left, right map[types.Object]map[types.Object]bool) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for object, sources := range left {
+		if !equalBooleanValues(sources, right[object]) {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneBooleanMembers(source map[types.Object]map[string]map[types.Object]bool) map[types.Object]map[string]map[types.Object]bool {
+	clone := make(map[types.Object]map[string]map[types.Object]bool, len(source))
+	for object, members := range source {
+		clone[object] = cloneAliasMembers(members)
+	}
+	return clone
+}
+
+func equalBooleanMembers(left, right map[types.Object]map[string]map[types.Object]bool) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for object, leftMembers := range left {
+		rightMembers, present := right[object]
+		if !present || len(leftMembers) != len(rightMembers) {
+			return false
+		}
+		for key, sources := range leftMembers {
+			if !equalBooleanValues(sources, rightMembers[key]) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func cloneBooleanValues(source map[types.Object]bool) map[types.Object]bool {
@@ -2870,7 +4272,7 @@ func cfgBodyDeadPath(info *types.Info, sink ast.Node, body *ast.BlockStmt, paren
 		} else if len(successors) == 2 && len(block.Nodes) > 0 {
 			if condition, ok := block.Nodes[len(block.Nodes)-1].(ast.Expr); ok {
 				_, isSwitchCaseValue := parents[condition].(*ast.CaseClause)
-				facts, _ := programPointBooleanFacts(info, body, parents, condition.Pos())
+				facts, _, _ := programPointBooleanFacts(info, body, parents, condition.Pos())
 				if value, known := definiteBool(info, condition, facts); known && !isSwitchCaseValue {
 					if value {
 						successors = successors[:1]
