@@ -47,7 +47,59 @@ const (
 	// filter as the single enforcement point, so the guarantee holds by
 	// construction rather than by a second filter kept in sync by hand.
 	EventConnectome EventType = "connectome"
+	// EventReinstate is the counterpart of EventForget: a deprecated memory
+	// returned to active service by consensus.
+	EventReinstate EventType = "reinstate"
+	// EventCoCommit is a multi-agent shared commit. It is a commit like
+	// EventRemember, so the dashboard must be able to observe it.
+	EventCoCommit EventType = "cocommit"
+	// EventSearch is a text-search retrieval — the lexical sibling of
+	// EventRecall.
+	EventSearch EventType = "search"
+	// EventHybrid is a combined vector+text retrieval — the hybrid sibling of
+	// EventRecall.
+	EventHybrid EventType = "hybrid"
+	// EventPipelineSend reports a message handed to an agent pipeline.
+	EventPipelineSend EventType = "pipeline_send"
+	// EventPipelineComplete reports an agent pipeline run reaching its end.
+	EventPipelineComplete EventType = "pipeline_complete"
+	// EventRedeploy reports chain-reconfiguration progress for the network page.
+	EventRedeploy EventType = "redeploy"
 )
+
+// AllEventTypes is the canonical registry of every named event emitted on the
+// operator-only dashboard stream. Route-local protocols (message wake, MCP,
+// and wizard SSE) intentionally have separate registries and are excluded.
+var AllEventTypes = []EventType{
+	EventRemember,
+	EventRecall,
+	EventForget,
+	EventVote,
+	EventConsensus,
+	EventAgent,
+	EventImport,
+	EventUpdate,
+	EventGovernance,
+	EventTask,
+	EventRecovery,
+	EventAccess,
+	EventConnectome,
+	EventReinstate,
+	EventCoCommit,
+	EventSearch,
+	EventHybrid,
+	EventPipelineSend,
+	EventPipelineComplete,
+	EventRedeploy,
+}
+
+// EventTypeFromREST is the single audited bridge for REST event names. REST
+// cannot import web, so its OnEvent callback carries a string; the wiring guard
+// verifies every concrete REST emitter against AllEventTypes and fails closed
+// when a Broadcast event cannot be resolved statically.
+func EventTypeFromREST(name string) EventType {
+	return EventType(name)
+}
 
 // SSEEvent is an event sent to connected dashboard clients.
 type SSEEvent struct {
