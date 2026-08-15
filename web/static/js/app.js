@@ -1020,7 +1020,7 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
             </div>
         `}
         ${!collapsed && html`<div class="brain-domain-body">
-            ${showGuide && html`<section class="brain-domain-guide" aria-label="How to read the memory brain">
+            ${showGuide && html`<section class="brain-domain-guide" aria-label="How to read the brain">
                 <p>SAGE captures episodic memories; corroboration and decay shape what consolidates.</p>
                 <div class="brain-domain-guide-grid">
                     <span><b>◍ Size + glow</b> corroboration</span>
@@ -1031,6 +1031,7 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
                     <span><b>◈ Angle</b> domain</span>
                 </div>
                 <p>Click a local domain below to isolate its lobe. Click a memory to follow its train of thought.</p>
+                <p><b>Connectome mode:</b> agents are neurons, domains set their hue, and message traffic drives synapse thickness and pulses. Active hubs sit near the core; click a neuron to bloom its memories.</p>
             </section>`}
             <section aria-labelledby="brain-local-domains">
                 <div class="brain-domain-section-head">

@@ -1419,19 +1419,13 @@ export function mountMriBrain(container, opts = {}) {
   root.addEventListener('mousemove', onMove);
   root.addEventListener('pointerdown', onGraphPointerDown);
   root.addEventListener('click', onGraphClick);
-  // Connectome legend caption — appended once, shown only in connectome mode.
-  const modeCap = document.createElement('div');
-  modeCap.className = 'panel mode-cap';
-  modeCap.style.cssText = 'position:absolute;left:auto;bottom:44px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
-  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>idle synapses thin & fade · use it or lose it<br>new agents grow in · dormant ones grey out<br>hubs sink to the core · click a neuron → its memories bloom';
-  root.appendChild(modeCap);
-
-  // Relabel the stat panel + button and toggle the caption for the active mode.
+  // Relabel the stat panel and button for the active mode. The explanatory
+  // copy lives in CEREBRUM's existing "How to read" guide instead of covering
+  // the graph with a second floating panel.
   function updateModeChrome(){
     const btn=$('.b-mode'); if(btn) btn.textContent = mode==='connectome' ? '◈ memory' : '◉ connectome';
     const set = mode==='connectome' ? ['neurons','synapses','hubs'] : ['memories','synapses','consolidated'];
     root.querySelectorAll('.hud .l').forEach((el,i)=>{ if(set[i]) el.textContent=set[i]; });
-    modeCap.style.display = mode==='connectome' ? '' : 'none';
   }
   updateModeChrome();
 

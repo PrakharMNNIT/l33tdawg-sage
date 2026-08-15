@@ -5,6 +5,7 @@ import test from 'node:test';
 import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity, createConnectomeActivityTracker, createConnectomeReloadIntent } from '../web/static/js/connectome-map.js';
 
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
+const appSource = await readFile(new URL('../web/static/js/app.js', import.meta.url), 'utf8');
 
 // The CEREBRUM connectome view renders the agent message-bus in the brain hull.
 // mapConnectome() is the pure projection from the /network/synapses payload onto
@@ -141,6 +142,13 @@ test('renderer wires mode invalidation into both initial acquisition and reloads
     'a stale initial response must fail closed after a mode change');
   assert.match(mriSource, /function setMode\(next\)\{[\s\S]*graphLoads\.invalidate\(\);[\s\S]*else acquireInitialGraph\(\);/,
     'a toggle must invalidate old work and refetch even before Graph exists');
+});
+
+test('connectome explanation stays in the existing guide instead of covering the graph', () => {
+  assert.doesNotMatch(mriSource, /\bmodeCap\b|mode-cap/,
+    'connectome mode must not create a free-floating explanatory panel');
+  assert.match(appSource, /<b>Connectome mode:<\/b> agents are neurons/,
+    'the existing How to read guide must retain the connectome explanation');
 });
 
 // Live firing pulses only the synapses that actually carried a message. The
