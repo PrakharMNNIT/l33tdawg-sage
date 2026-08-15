@@ -470,6 +470,265 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			}`,
 		},
 		{
+			name: "generic exact boolean constraint skips closure emitter",
+			body: `func mutate[T interface{ bool }](b *SSEBroadcaster, runtime bool) {
+				_ = T(false && runtime) && func() T {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return T(true)
+				}()
+			}`,
+		},
+		{
+			name: "generic boolean comparable intersection skips closure emitter",
+			body: `func mutate[T interface{ ~bool; comparable }](b *SSEBroadcaster, runtime bool) {
+				_ = T(false && runtime) && func() T {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return T(true)
+				}()
+			}`,
+		},
+		{
+			name: "zero value local boolean skips closure emitter",
+			body: `func mutate(b *SSEBroadcaster) {
+				var dead bool
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "later reassignment cannot erase earlier false fact",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				dead := false
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+				dead = runtime
+			}`,
+		},
+		{
+			name: "self assignment preserves local false fact",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				dead = dead
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "forward goto preserves false fact at target",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				goto sink
+				dead = true
+			sink:
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "exhaustive branch join preserves shared false fact",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				dead := true
+				if runtime { dead = false } else { dead = false }
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "sibling branch write cannot erase false fact",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				dead := false
+				if runtime {
+					dead = true
+				} else {
+					_ = dead && func() bool {
+						b.Broadcast(SSEEvent{Type: EventRemember})
+						return true
+					}()
+				}
+			}`,
+		},
+		{
+			name: "constant false branch cannot mutate local false fact",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				if false { dead = true }
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "unselected constant switch case cannot mutate local false fact",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				switch 1 { case 2: dead = true }
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "zero range cannot mutate local false fact",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				for range 0 { dead = true }
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "known single iteration range establishes false fact",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := true
+				for range [1]int{} { dead = false }
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "discarded address does not erase local false fact",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				_ = &dead
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "empty pointer receiver method does not erase local false fact",
+			body: `type flag bool
+			func (*flag) observe() {}
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				dead.observe()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "future address escape cannot erase earlier false fact",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+				_ = &dead
+			}`,
+		},
+		{
+			name: "future closure capture cannot erase earlier false fact",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+				_ = func() { dead = true }
+			}`,
+		},
+		{
+			name: "earlier sibling closure assignment establishes false before sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := true
+				_, _ = func() int { dead = false; return 0 }(), dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "panic in earlier immediate closure prevents later sibling sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				_, _ = func() int {
+					panic("stop")
+					dead = true
+					return 0
+				}(), dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "deferred builtin panic prevents immediate closure return",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				_, _ = func() int {
+					defer panic("stop")
+					dead = true
+					return 0
+				}(), dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "nested terminating immediate closure prevents outer return",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				_, _ = func() int {
+					func() { panic("stop") }()
+					dead = true
+					return 0
+				}(), dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "nested assignment rhs termination prevents outer return",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				_, _ = func() int {
+					_ = func() int { panic("stop") }()
+					dead = true
+					return 0
+				}(), dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "nested termination uses sequential outer local facts",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				_, _ = func() int {
+					run := true
+					_ = run && func() bool { panic("stop") }()
+					dead = true
+					return 0
+				}(), dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
 			name: "immutable local false alias skips closure emitter",
 			body: `func mutate(b *SSEBroadcaster, runtime bool) {
 				dead := false && runtime
@@ -753,6 +1012,19 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
 	})
 
+	for _, constraint := range []string{"bool", "~bool; comparable"} {
+		t.Run("runtime generic constraint "+constraint+" can evaluate closure", func(t *testing.T) {
+			scan := scanTypedFixture(t, `func mutate[T interface{ `+constraint+` }](b *SSEBroadcaster, runtime bool) {
+				_ = T(true && runtime) && func() T {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return T(true)
+				}()
+			}`)
+			require.Empty(t, scan.unresolved)
+			require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+		})
+	}
+
 	t.Run("reassigned local alias remains unknown", func(t *testing.T) {
 		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, runtime bool) {
 			dead := false && runtime
@@ -792,6 +1064,195 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 					return true
 				}()
 			}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("write captured by uninvoked closure remains unknown", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := true
+			_ = func() { live = false }
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("forward goto skips later write before live fact target", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := true
+			goto sink
+			live = false
+		sink:
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("pointer alias mutation prevents false fact pruning", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := false
+			alias := &live
+			live = false
+			*alias = true
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("simultaneous assignment evaluates all right sides from pre-state", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			left, live := true, false
+			left, live = live, left
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("runtime switch paths cannot manufacture a false fact", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, value bool) {
+			live := false
+			switch value {
+			case true: live = false
+			default: live = true
+			}
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("goto executes later-source pointer mutation before sink", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := false
+			goto later
+		sink:
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+			return
+		later:
+			alias := &live
+			*alias = true
+			goto sink
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("loop backedge carries invoked closure mutation to later sink visit", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := false
+			for iteration := 0; iteration < 2; iteration++ {
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+				func() { live = true }()
+			}
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("keyed slice literal is not treated as exactly one iteration", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := true
+			for range []int{1: 0} { live = !live }
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("earlier sibling closure assignment establishes true before sink", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := false
+			_, _ = func() int { live = true; return 0 }(), live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("earlier sibling pointer escape keeps sink potentially live", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func setTrue(value *bool) int { *value = true; return 0 }
+		func mutate(b *SSEBroadcaster) {
+			live := false
+			_, _ = setTrue(&live), live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("skipped earlier immediate closure cannot mutate live fact", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := true
+			_, _ = false && func() bool { live = false; return true }(), live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("terminating literal decision uses state at its expression", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			run := false
+			_ = run && func() bool { panic("stop") }()
+			run = true
+			goto sink
+		sink:
+			_ = run && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("earlier defer may recover nested panic before later sink", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := true
+			_, _ = func() int {
+				defer func() { _ = recover() }()
+				func() { panic("stop") }()
+				live = false
+				return 0
+			}(), live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
 		require.Empty(t, scan.unresolved)
 		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
 	})
@@ -1304,7 +1765,10 @@ func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node)
 	checkedBoundary := false
 	for {
 		boundary, body := enclosingFunctionBoundary(current, parents)
-		facts := immutableBooleanFacts(info, body, parents)
+		facts, reachesPoint := programPointBooleanFacts(info, body, parents, current.Pos())
+		if !reachesPoint {
+			return "an earlier expression at the same program point does not return", true
+		}
 		if reason, dead := shortCircuitDeadPath(info, current, parents, facts); dead {
 			return reason, true
 		}
@@ -1326,73 +1790,389 @@ func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node)
 	}
 }
 
-func immutableBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node) map[types.Object]bool {
-	facts := map[types.Object]bool{}
-	if body == nil {
-		return facts
+type booleanFactState struct {
+	values  map[types.Object]bool
+	escaped map[types.Object]bool
+}
+
+func newBooleanFactState() booleanFactState {
+	return booleanFactState{
+		values:  map[types.Object]bool{},
+		escaped: map[types.Object]bool{},
 	}
-	root := ast.Node(body)
+}
+
+func programPointBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node, target token.Pos) (map[types.Object]bool, bool) {
+	if body == nil {
+		return map[types.Object]bool{}, true
+	}
+	graph := cfg.New(body, func(call *ast.CallExpr) bool {
+		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
+		return !ok || builtin.Name() != "panic"
+	})
+	if len(graph.Blocks) == 0 {
+		return map[types.Object]bool{}, true
+	}
+	restrictedSwitchCases, selectedSwitchCases, fallthroughSources := staticSwitchFactRestrictions(info, body)
+	activePred := map[*cfg.Block]map[*cfg.Block]bool{}
+	inState := map[*cfg.Block]booleanFactState{graph.Blocks[0]: newBooleanFactState()}
+	outState := map[*cfg.Block]booleanFactState{}
+	outTerminates := map[*cfg.Block]bool{}
+	queue := []*cfg.Block{graph.Blocks[0]}
+	queued := map[*cfg.Block]bool{graph.Blocks[0]: true}
+	for len(queue) > 0 {
+		block := queue[0]
+		queue = queue[1:]
+		queued[block] = false
+		if block != graph.Blocks[0] {
+			var incoming booleanFactState
+			haveIncoming := false
+			for predecessor := range activePred[block] {
+				state, ready := outState[predecessor]
+				if !ready {
+					continue
+				}
+				if !haveIncoming {
+					incoming = cloneBooleanFacts(state)
+					haveIncoming = true
+				} else {
+					incoming = intersectBooleanFacts(incoming, state)
+				}
+			}
+			if !haveIncoming {
+				continue
+			}
+			inState[block] = incoming
+		}
+		state := cloneBooleanFacts(inState[block])
+		blockTerminates := false
+		for _, node := range block.Nodes {
+			if nodeHasEvaluatedTerminatingLiteral(info, node, parents, state.values) {
+				transferBooleanFacts(info, body, parents, node, state)
+				blockTerminates = true
+				break
+			}
+			transferBooleanFacts(info, body, parents, node, state)
+		}
+		if existing, present := outState[block]; present && equalBooleanFacts(existing, state) && outTerminates[block] == blockTerminates {
+			continue
+		}
+		outState[block] = state
+		outTerminates[block] = blockTerminates
+		if blockTerminates {
+			continue
+		}
+		for _, successor := range booleanFactSuccessors(info, block, parents, state, restrictedSwitchCases, selectedSwitchCases, fallthroughSources) {
+			if !successor.Live {
+				continue
+			}
+			if activePred[successor] == nil {
+				activePred[successor] = map[*cfg.Block]bool{}
+			}
+			activePred[successor][block] = true
+			if !queued[successor] {
+				queue = append(queue, successor)
+				queued[successor] = true
+			}
+		}
+	}
+	for _, block := range graph.Blocks {
+		state, reachable := inState[block]
+		if !reachable {
+			continue
+		}
+		state = cloneBooleanFacts(state)
+		for _, node := range block.Nodes {
+			if node.Pos() <= target && target <= node.End() {
+				if !transferBooleanFactsBeforeTarget(info, body, parents, node, target, state) {
+					return map[types.Object]bool{}, false
+				}
+				return cloneBooleanValues(state.values), true
+			}
+			transferBooleanFacts(info, body, parents, node, state)
+		}
+	}
+	return map[types.Object]bool{}, false
+}
+
+func booleanFactSuccessors(
+	info *types.Info,
+	block *cfg.Block,
+	parents map[ast.Node]ast.Node,
+	facts booleanFactState,
+	restrictedSwitchCases map[*ast.CaseClause]bool,
+	selectedSwitchCases map[*ast.CaseClause]bool,
+	fallthroughSources map[*ast.CaseClause]*ast.CaseClause,
+) []*cfg.Block {
+	successors := block.Succs
+	if len(successors) == 1 && successors[0].Kind == cfg.KindRangeLoop {
+		loop := successors[0]
+		rangeStmt, _ := loop.Stmt.(*ast.RangeStmt)
+		if rangeStmtProvablyExactlyOne(info, rangeStmt) && cfgBlockInsideRangeBody(block, rangeStmt) && len(loop.Succs) == 2 {
+			return loop.Succs[1:]
+		}
+	}
+	if block.Kind == cfg.KindRangeLoop && rangeStmtProvablyEmpty(info, block.Stmt) && len(successors) == 2 {
+		successors = successors[1:]
+	} else if block.Kind == cfg.KindRangeLoop {
+		rangeStmt, _ := block.Stmt.(*ast.RangeStmt)
+		if rangeStmtProvablyExactlyOne(info, rangeStmt) && len(successors) == 2 {
+			successors = successors[:1]
+		}
+	} else if len(successors) == 2 && len(block.Nodes) > 0 {
+		condition, ok := block.Nodes[len(block.Nodes)-1].(ast.Expr)
+		if ok {
+			if _, isSwitchCaseValue := parents[condition].(*ast.CaseClause); !isSwitchCaseValue {
+				if value, known := definiteBool(info, condition, facts.values); known {
+					if value {
+						successors = successors[:1]
+					} else {
+						successors = successors[1:]
+					}
+				}
+			}
+		}
+	}
+	for _, successor := range successors {
+		clause, ok := successor.Stmt.(*ast.CaseClause)
+		if ok && successor.Kind == cfg.KindSwitchCaseBody && selectedSwitchCases[clause] {
+			return []*cfg.Block{successor}
+		}
+	}
+	filtered := successors[:0]
+	for _, successor := range successors {
+		clause, ok := successor.Stmt.(*ast.CaseClause)
+		if ok && successor.Kind == cfg.KindSwitchCaseBody && restrictedSwitchCases[clause] && !selectedSwitchCases[clause] {
+			if !cfgBlockBelongsToClause(block, fallthroughSources[clause]) {
+				continue
+			}
+		}
+		filtered = append(filtered, successor)
+	}
+	return filtered
+}
+
+func nodeHasEvaluatedTerminatingLiteral(
+	info *types.Info,
+	node ast.Node,
+	parents map[ast.Node]ast.Node,
+	facts map[types.Object]bool,
+) bool {
+	terminates := false
+	ast.Inspect(node, func(inner ast.Node) bool {
+		switch current := inner.(type) {
+		case *ast.CallExpr:
+			if builtin, ok := calledObject(info, current.Fun).(*types.Builtin); ok && builtin.Name() == "panic" {
+				if expressionEvaluation(info, current, parents, facts) == expressionEvaluated {
+					terminates = true
+				}
+				return false
+			}
+			literal := directlyCalledLiteralFromCall(current)
+			if literal == nil {
+				return true
+			}
+			if expressionEvaluation(info, literal, parents, facts) == expressionEvaluated && straightLineFuncLiteralTerminates(info, parents, literal, facts) {
+				terminates = true
+			}
+			return false
+		case *ast.FuncLit:
+			return false
+		default:
+			return true
+		}
+	})
+	return terminates
+}
+
+func cfgBlockInsideRangeBody(block *cfg.Block, rangeStmt *ast.RangeStmt) bool {
+	if block == nil || rangeStmt == nil || rangeStmt.Body == nil {
+		return false
+	}
+	if block.Stmt != nil && rangeStmt.Body.Pos() <= block.Stmt.Pos() && block.Stmt.End() <= rangeStmt.Body.End() {
+		return true
+	}
+	for _, node := range block.Nodes {
+		if rangeStmt.Body.Pos() <= node.Pos() && node.End() <= rangeStmt.Body.End() {
+			return true
+		}
+	}
+	return block.Kind == cfg.KindRangeBody && block.Stmt == rangeStmt
+}
+
+func rangeStmtProvablyExactlyOne(info *types.Info, rangeStmt *ast.RangeStmt) bool {
+	if rangeStmt == nil || rangeStmt.X == nil {
+		return false
+	}
+	valueType := info.TypeOf(unwrapParens(rangeStmt.X))
+	if pointer, ok := valueType.Underlying().(*types.Pointer); ok {
+		valueType = pointer.Elem()
+	}
+	if array, ok := valueType.Underlying().(*types.Array); ok {
+		return array.Len() == 1
+	}
+	return false
+}
+
+func staticSwitchFactRestrictions(info *types.Info, body *ast.BlockStmt) (
+	map[*ast.CaseClause]bool,
+	map[*ast.CaseClause]bool,
+	map[*ast.CaseClause]*ast.CaseClause,
+) {
+	restricted := map[*ast.CaseClause]bool{}
+	selected := map[*ast.CaseClause]bool{}
+	fallthroughSources := map[*ast.CaseClause]*ast.CaseClause{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		if literal, ok := node.(*ast.FuncLit); ok && literal.Body != body {
+			return false
+		}
+		switchStmt, ok := node.(*ast.SwitchStmt)
+		if !ok {
+			return true
+		}
+		clauses, selectedIndex, known := selectedConstantSwitchCase(info, switchStmt)
+		if !known {
+			return true
+		}
+		for index, clause := range clauses {
+			restricted[clause] = true
+			if index+1 < len(clauses) && caseClauseEndsWithFallthrough(clause) {
+				fallthroughSources[clauses[index+1]] = clause
+			}
+		}
+		if selectedIndex >= 0 {
+			selected[clauses[selectedIndex]] = true
+		}
+		return true
+	})
+	return restricted, selected, fallthroughSources
+}
+
+func caseClauseEndsWithFallthrough(clause *ast.CaseClause) bool {
+	if clause == nil || len(clause.Body) == 0 {
+		return false
+	}
+	branch, ok := clause.Body[len(clause.Body)-1].(*ast.BranchStmt)
+	return ok && branch.Tok == token.FALLTHROUGH
+}
+
+func addressValueIsDirectlyDiscarded(address *ast.UnaryExpr, parents map[ast.Node]ast.Node) bool {
+	var expression ast.Expr = address
+	for {
+		parent := parents[expression]
+		paren, ok := parent.(*ast.ParenExpr)
+		if !ok {
+			break
+		}
+		expression = paren
+	}
+	assignment, ok := parents[expression].(*ast.AssignStmt)
+	if !ok || len(assignment.Lhs) != len(assignment.Rhs) {
+		return false
+	}
+	for index, rhs := range assignment.Rhs {
+		if rhs != expression {
+			continue
+		}
+		ident, ok := unwrapParens(assignment.Lhs[index]).(*ast.Ident)
+		return ok && ident.Name == "_"
+	}
+	return false
+}
+
+func methodBodyIsEmpty(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node, method *types.Func) bool {
+	var root ast.Node = body
 	for parents[root] != nil {
 		root = parents[root]
 	}
-	initializers := map[types.Object]ast.Expr{}
-	writes := map[types.Object]int{}
-	addressTaken := map[types.Object]bool{}
-	recordWrite := func(ident *ast.Ident, initializer ast.Expr) {
-		if ident == nil || ident.Name == "_" {
-			return
+	file, ok := root.(*ast.File)
+	if !ok {
+		return false
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && info.ObjectOf(function.Name) == method {
+			return function.Body != nil && len(function.Body.List) == 0
 		}
-		object := info.ObjectOf(ident)
+	}
+	return false
+}
+
+func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node, node ast.Node, state booleanFactState) {
+	markEscaped := func(object types.Object) {
 		if object == nil {
 			return
 		}
-		variable, ok := object.(*types.Var)
-		if !ok || (variable.Pkg() != nil && variable.Parent() == variable.Pkg().Scope()) {
-			return
-		}
-		writes[object]++
-		if initializer != nil && initializers[object] == nil {
-			initializers[object] = initializer
-		}
+		state.escaped[object] = true
+		delete(state.values, object)
 	}
-	ast.Inspect(root, func(node ast.Node) bool {
-		switch current := node.(type) {
-		case *ast.ValueSpec:
-			if len(current.Names) == len(current.Values) {
-				for index, name := range current.Names {
-					recordWrite(name, current.Values[index])
-				}
-			} else {
-				for _, name := range current.Names {
-					recordWrite(name, nil)
+	markCapturedWrites := func(literal *ast.FuncLit) {
+		ast.Inspect(literal.Body, func(inner ast.Node) bool {
+			markIdent := func(ident *ast.Ident) {
+				object := info.ObjectOf(ident)
+				if object != nil && (object.Pos() < literal.Pos() || object.Pos() > literal.End()) {
+					markEscaped(object)
 				}
 			}
-		case *ast.AssignStmt:
-			for index, lhs := range current.Lhs {
-				ident, ok := unwrapParens(lhs).(*ast.Ident)
-				if !ok {
-					continue
+			switch current := inner.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range current.Lhs {
+					ident, _ := unwrapParens(lhs).(*ast.Ident)
+					markIdent(ident)
 				}
-				var initializer ast.Expr
-				if current.Tok == token.DEFINE && len(current.Lhs) == len(current.Rhs) && info.Defs[ident] != nil {
-					initializer = current.Rhs[index]
-				}
-				recordWrite(ident, initializer)
-			}
-		case *ast.IncDecStmt:
-			ident, _ := unwrapParens(current.X).(*ast.Ident)
-			recordWrite(ident, nil)
-		case *ast.RangeStmt:
-			ident, _ := unwrapParens(current.Key).(*ast.Ident)
-			recordWrite(ident, nil)
-			ident, _ = unwrapParens(current.Value).(*ast.Ident)
-			recordWrite(ident, nil)
-		case *ast.UnaryExpr:
-			if current.Op == token.AND {
+			case *ast.IncDecStmt:
 				ident, _ := unwrapParens(current.X).(*ast.Ident)
-				if ident != nil && info.ObjectOf(ident) != nil {
-					addressTaken[info.ObjectOf(ident)] = true
+				markIdent(ident)
+			case *ast.RangeStmt:
+				for _, expression := range []ast.Expr{current.Key, current.Value} {
+					ident, _ := unwrapParens(expression).(*ast.Ident)
+					markIdent(ident)
 				}
+			case *ast.UnaryExpr:
+				if current.Op == token.AND && !addressValueIsDirectlyDiscarded(current, parents) {
+					ident, _ := unwrapParens(current.X).(*ast.Ident)
+					markIdent(ident)
+				}
+			case *ast.SelectorExpr:
+				selection := info.Selections[current]
+				if selection == nil {
+					break
+				}
+				method, ok := selection.Obj().(*types.Func)
+				if !ok {
+					break
+				}
+				signature, ok := method.Type().(*types.Signature)
+				if !ok || signature.Recv() == nil {
+					break
+				}
+				if _, ok := signature.Recv().Type().(*types.Pointer); ok && !methodBodyIsEmpty(info, body, parents, method) {
+					ident, _ := unwrapParens(current.X).(*ast.Ident)
+					markIdent(ident)
+				}
+			}
+			return true
+		})
+	}
+	ast.Inspect(node, func(inner ast.Node) bool {
+		switch current := inner.(type) {
+		case *ast.FuncLit:
+			if directlyCalledFuncLiteral(current, parents) {
+				switch expressionEvaluation(info, current, parents, state.values) {
+				case expressionSkipped:
+					return false
+				case expressionEvaluated:
+					if supported, _ := transferStraightLineFuncLiteral(info, body, parents, current, state); supported {
+						return false
+					}
+				}
+			}
+			markCapturedWrites(current)
+			return false
+		case *ast.UnaryExpr:
+			if current.Op == token.AND && !addressValueIsDirectlyDiscarded(current, parents) {
+				ident, _ := unwrapParens(current.X).(*ast.Ident)
+				markEscaped(info.ObjectOf(ident))
 			}
 		case *ast.SelectorExpr:
 			selection := info.Selections[current]
@@ -1407,34 +2187,337 @@ func immutableBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[as
 			if !ok || signature.Recv() == nil {
 				break
 			}
-			if _, ok := signature.Recv().Type().(*types.Pointer); !ok {
-				break
+			if _, ok := signature.Recv().Type().(*types.Pointer); ok && !methodBodyIsEmpty(info, body, parents, method) {
+				ident, _ := unwrapParens(current.X).(*ast.Ident)
+				markEscaped(info.ObjectOf(ident))
 			}
-			ident, _ := unwrapParens(current.X).(*ast.Ident)
-			if ident != nil && info.ObjectOf(ident) != nil {
-				addressTaken[info.ObjectOf(ident)] = true
+		case *ast.Ident:
+			rangeStmt, ok := parents[current].(*ast.RangeStmt)
+			if ok && (rangeStmt.Key == current || rangeStmt.Value == current) {
+				markEscaped(info.ObjectOf(current))
 			}
 		}
 		return true
 	})
-
-	for changed := true; changed; {
-		changed = false
-		for object, initializer := range initializers {
-			if writes[object] != 1 || addressTaken[object] {
-				continue
-			}
-			value, known := definiteBool(info, initializer, facts)
-			if !known {
-				continue
-			}
-			if existing, present := facts[object]; !present || existing != value {
-				facts[object] = value
-				changed = true
-			}
+	localVar := func(ident *ast.Ident) (*types.Var, bool) {
+		if ident == nil || ident.Name == "_" {
+			return nil, false
+		}
+		variable, ok := info.ObjectOf(ident).(*types.Var)
+		if !ok || (variable.Pkg() != nil && variable.Parent() == variable.Pkg().Scope()) || state.escaped[variable] {
+			return nil, false
+		}
+		return variable, true
+	}
+	set := func(variable *types.Var, expr ast.Expr, source booleanFactState) {
+		if variable == nil {
+			return
+		}
+		if value, known := definiteBool(info, expr, source.values); known {
+			state.values[variable] = value
+		} else {
+			delete(state.values, variable)
 		}
 	}
-	return facts
+	switch current := node.(type) {
+	case *ast.ValueSpec:
+		before := cloneBooleanFacts(state)
+		for index, name := range current.Names {
+			variable, ok := localVar(name)
+			if !ok {
+				continue
+			}
+			if len(current.Names) == len(current.Values) {
+				set(variable, current.Values[index], before)
+			} else if len(current.Values) == 0 && booleanOnlyType(variable.Type()) {
+				state.values[variable] = false
+			} else {
+				delete(state.values, variable)
+			}
+		}
+	case *ast.AssignStmt:
+		before := cloneBooleanFacts(state)
+		updates := map[*types.Var]ast.Expr{}
+		for index, lhs := range current.Lhs {
+			ident, _ := unwrapParens(lhs).(*ast.Ident)
+			variable, ok := localVar(ident)
+			if !ok {
+				continue
+			}
+			if (current.Tok == token.DEFINE || current.Tok == token.ASSIGN) && len(current.Lhs) == len(current.Rhs) {
+				updates[variable] = current.Rhs[index]
+			} else {
+				updates[variable] = nil
+			}
+		}
+		for variable, expr := range updates {
+			set(variable, expr, before)
+		}
+	case *ast.IncDecStmt:
+		ident, _ := unwrapParens(current.X).(*ast.Ident)
+		if variable, ok := localVar(ident); ok {
+			delete(state.values, variable)
+		}
+	}
+}
+
+func transferBooleanFactsBeforeTarget(
+	info *types.Info,
+	body *ast.BlockStmt,
+	parents map[ast.Node]ast.Node,
+	node ast.Node,
+	target token.Pos,
+	state booleanFactState,
+) bool {
+	reachesTarget := true
+	ast.Inspect(node, func(inner ast.Node) bool {
+		if inner == nil || inner == node {
+			return true
+		}
+		if inner.Pos() >= target {
+			return false
+		}
+		if inner.End() >= target {
+			return true
+		}
+		switch current := inner.(type) {
+		case *ast.CallExpr:
+			if literal := directlyCalledLiteralFromCall(current); literal != nil {
+				status := expressionEvaluation(info, literal, parents, state.values)
+				if status == expressionSkipped {
+					return false
+				}
+				if status == expressionEvaluated {
+					initialFacts := cloneBooleanValues(state.values)
+					if supported, returns := transferStraightLineFuncLiteral(info, body, parents, literal, state); supported {
+						if !returns {
+							reachesTarget = false
+						}
+						return false
+					}
+					if straightLineFuncLiteralTerminates(info, parents, literal, initialFacts) {
+						reachesTarget = false
+					}
+				}
+				transferBooleanFacts(info, body, parents, current, state)
+				return false
+			}
+			transferBooleanFacts(info, body, parents, current, state)
+			return false
+		case *ast.FuncLit:
+			if expressionEvaluation(info, current, parents, state.values) != expressionSkipped {
+				transferBooleanFacts(info, body, parents, current, state)
+			}
+			return false
+		case *ast.UnaryExpr:
+			if current.Op == token.AND {
+				transferBooleanFacts(info, body, parents, current, state)
+				return false
+			}
+		case *ast.SelectorExpr:
+			selection := info.Selections[current]
+			if selection != nil {
+				if method, ok := selection.Obj().(*types.Func); ok {
+					if signature, ok := method.Type().(*types.Signature); ok && signature.Recv() != nil {
+						if _, ok := signature.Recv().Type().(*types.Pointer); ok {
+							transferBooleanFacts(info, body, parents, current, state)
+							return false
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+	return reachesTarget
+}
+
+type expressionEvaluationStatus uint8
+
+const (
+	expressionEvaluated expressionEvaluationStatus = iota
+	expressionSkipped
+	expressionMaybeEvaluated
+)
+
+func expressionEvaluation(
+	info *types.Info,
+	node ast.Node,
+	parents map[ast.Node]ast.Node,
+	facts map[types.Object]bool,
+) expressionEvaluationStatus {
+	status := expressionEvaluated
+	for child, parent := node, parents[node]; parent != nil; child, parent = parent, parents[parent] {
+		switch ancestor := parent.(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			return status
+		case *ast.BinaryExpr:
+			if ancestor.Y != child || (ancestor.Op != token.LAND && ancestor.Op != token.LOR) {
+				continue
+			}
+			left, known := definiteBool(info, ancestor.X, facts)
+			if known {
+				if (ancestor.Op == token.LAND && !left) || (ancestor.Op == token.LOR && left) {
+					return expressionSkipped
+				}
+				continue
+			}
+			status = expressionMaybeEvaluated
+		}
+	}
+	return status
+}
+
+func directlyCalledFuncLiteral(literal *ast.FuncLit, parents map[ast.Node]ast.Node) bool {
+	var expression ast.Expr = literal
+	for {
+		parent, ok := parents[expression].(*ast.ParenExpr)
+		if !ok {
+			break
+		}
+		expression = parent
+	}
+	call, ok := parents[expression].(*ast.CallExpr)
+	return ok && unwrapParens(call.Fun) == literal
+}
+
+func directlyCalledLiteralFromCall(call *ast.CallExpr) *ast.FuncLit {
+	if call == nil {
+		return nil
+	}
+	literal, _ := unwrapParens(call.Fun).(*ast.FuncLit)
+	return literal
+}
+
+func transferStraightLineFuncLiteral(
+	info *types.Info,
+	body *ast.BlockStmt,
+	parents map[ast.Node]ast.Node,
+	literal *ast.FuncLit,
+	state booleanFactState,
+) (bool, bool) {
+	for index, statement := range literal.Body.List {
+		switch statement.(type) {
+		case *ast.AssignStmt, *ast.IncDecStmt, *ast.DeclStmt, *ast.ExprStmt, *ast.EmptyStmt:
+		case *ast.ReturnStmt:
+			if index != len(literal.Body.List)-1 {
+				return false, true
+			}
+		default:
+			return false, true
+		}
+	}
+	for _, statement := range literal.Body.List {
+		if nodeHasEvaluatedTerminatingLiteral(info, statement, parents, state.values) {
+			transferBooleanFacts(info, body, parents, statement, state)
+			return true, false
+		}
+		transferBooleanFacts(info, body, parents, statement, state)
+	}
+	return true, true
+}
+
+func straightLineFuncLiteralTerminates(
+	info *types.Info,
+	parents map[ast.Node]ast.Node,
+	literal *ast.FuncLit,
+	initialFacts map[types.Object]bool,
+) bool {
+	priorDeferredCall := false
+	deferredBuiltinPanic := false
+	state := newBooleanFactState()
+	state.values = cloneBooleanValues(initialFacts)
+	for index, statement := range literal.Body.List {
+		if _, isDefer := statement.(*ast.DeferStmt); !isDefer && nodeHasEvaluatedTerminatingLiteral(info, statement, parents, state.values) {
+			return !priorDeferredCall
+		}
+		switch current := statement.(type) {
+		case *ast.AssignStmt, *ast.IncDecStmt, *ast.DeclStmt, *ast.EmptyStmt:
+		case *ast.ExprStmt:
+			call, ok := unwrapParens(current.X).(*ast.CallExpr)
+			if ok && callDefinitelyTerminates(info, parents, call, state.values) {
+				return !priorDeferredCall
+			}
+		case *ast.ReturnStmt:
+			return deferredBuiltinPanic
+		case *ast.DeferStmt:
+			if callDefinitelyTerminates(info, parents, current.Call, state.values) && !priorDeferredCall {
+				deferredBuiltinPanic = true
+			} else {
+				priorDeferredCall = true
+			}
+		default:
+			return false
+		}
+		if index == len(literal.Body.List)-1 {
+			return deferredBuiltinPanic
+		}
+		transferBooleanFacts(info, literal.Body, parents, statement, state)
+	}
+	return deferredBuiltinPanic
+}
+
+func callDefinitelyTerminates(
+	info *types.Info,
+	parents map[ast.Node]ast.Node,
+	call *ast.CallExpr,
+	facts map[types.Object]bool,
+) bool {
+	if call == nil {
+		return false
+	}
+	if builtin, ok := calledObject(info, call.Fun).(*types.Builtin); ok && builtin.Name() == "panic" {
+		return true
+	}
+	literal := directlyCalledLiteralFromCall(call)
+	return literal != nil && straightLineFuncLiteralTerminates(info, parents, literal, facts)
+}
+
+func cloneBooleanFacts(source booleanFactState) booleanFactState {
+	return booleanFactState{
+		values:  cloneBooleanValues(source.values),
+		escaped: cloneBooleanValues(source.escaped),
+	}
+}
+
+func intersectBooleanFacts(left, right booleanFactState) booleanFactState {
+	result := cloneBooleanFacts(left)
+	for object, value := range result.values {
+		if other, present := right.values[object]; !present || other != value {
+			delete(result.values, object)
+		}
+	}
+	for object := range right.escaped {
+		result.escaped[object] = true
+	}
+	for object := range result.escaped {
+		delete(result.values, object)
+	}
+	return result
+}
+
+func equalBooleanFacts(left, right booleanFactState) bool {
+	return equalBooleanValues(left.values, right.values) && equalBooleanValues(left.escaped, right.escaped)
+}
+
+func cloneBooleanValues(source map[types.Object]bool) map[types.Object]bool {
+	clone := make(map[types.Object]bool, len(source))
+	for object, value := range source {
+		clone[object] = value
+	}
+	return clone
+}
+
+func equalBooleanValues(left, right map[types.Object]bool) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for object, value := range left {
+		if other, present := right[object]; !present || other != value {
+			return false
+		}
+	}
+	return true
 }
 
 func shortCircuitDeadPath(info *types.Info, node ast.Node, parents map[ast.Node]ast.Node, facts map[types.Object]bool) (string, bool) {
@@ -1474,7 +2557,6 @@ func enclosingFunctionBoundary(node ast.Node, parents map[ast.Node]ast.Node) (as
 }
 
 func cfgBodyDeadPath(info *types.Info, sink ast.Node, body *ast.BlockStmt, parents map[ast.Node]ast.Node) (string, bool) {
-	facts := immutableBooleanFacts(info, body, parents)
 	graph := cfg.New(body, func(call *ast.CallExpr) bool {
 		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
 		return !ok || builtin.Name() != "panic"
@@ -1532,6 +2614,7 @@ func cfgBodyDeadPath(info *types.Info, sink ast.Node, body *ast.BlockStmt, paren
 		} else if len(successors) == 2 && len(block.Nodes) > 0 {
 			if condition, ok := block.Nodes[len(block.Nodes)-1].(ast.Expr); ok {
 				_, isSwitchCaseValue := parents[condition].(*ast.CaseClause)
+				facts, _ := programPointBooleanFacts(info, body, parents, condition.Pos())
 				if value, known := definiteBool(info, condition, facts); known && !isSwitchCaseValue {
 					if value {
 						successors = successors[:1]
@@ -1683,27 +2766,51 @@ func booleanOnlyType(valueType types.Type) bool {
 		return false
 	}
 	constraint, ok := parameter.Constraint().Underlying().(*types.Interface)
-	if !ok || constraint.NumEmbeddeds() == 0 {
+	if !ok {
 		return false
 	}
-	constraint.Complete()
-	foundTerm := false
-	for index := 0; index < constraint.NumEmbeddeds(); index++ {
-		embedded := constraint.EmbeddedType(index)
-		union, ok := embedded.(*types.Union)
-		if !ok {
-			return false
+	foundBoolean, valid := booleanConstraintEvidence(constraint)
+	return valid && foundBoolean
+}
+
+func booleanConstraintEvidence(constraintType types.Type) (bool, bool) {
+	switch constraint := constraintType.(type) {
+	case *types.Union:
+		if constraint.Len() == 0 {
+			return false, false
 		}
-		for termIndex := 0; termIndex < union.Len(); termIndex++ {
-			termType := union.Term(termIndex).Type()
-			basic, ok := termType.Underlying().(*types.Basic)
+		for index := 0; index < constraint.Len(); index++ {
+			basic, ok := constraint.Term(index).Type().Underlying().(*types.Basic)
 			if !ok || basic.Info()&types.IsBoolean == 0 {
-				return false
+				return false, false
 			}
-			foundTerm = true
 		}
+		return true, true
+	case *types.Basic:
+		return constraint.Info()&types.IsBoolean != 0, constraint.Info()&types.IsBoolean != 0
+	case *types.Interface:
+		constraint.Complete()
+		foundBoolean := false
+		for index := 0; index < constraint.NumEmbeddeds(); index++ {
+			embedded := constraint.EmbeddedType(index)
+			found, valid := booleanConstraintEvidence(embedded)
+			if found {
+				foundBoolean = true
+			}
+			if !valid {
+				if _, isInterface := embedded.Underlying().(*types.Interface); isInterface {
+					continue
+				}
+				return false, false
+			}
+		}
+		return foundBoolean, true
+	default:
+		if underlying := constraintType.Underlying(); underlying != constraintType {
+			return booleanConstraintEvidence(underlying)
+		}
+		return false, false
 	}
-	return foundTerm
 }
 
 func selectedConstantSwitchCase(info *types.Info, switchStmt *ast.SwitchStmt) ([]*ast.CaseClause, int, bool) {
