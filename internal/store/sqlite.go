@@ -458,6 +458,14 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain_tag);
 	CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 	CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+	-- Serves the CEREBRUM agent-as-lobe read: each agent's top memories by
+	-- confidence (WHERE submitting_agent = ? ORDER BY confidence_score DESC).
+	-- Composite so the per-agent seek is index-satisfiable (equality on the leading
+	-- column + the ORDER BY on the second) instead of a full scan. NOT partial: the
+	-- query binds submitting_agent as a parameter, and SQLite cannot prove a bound
+	-- parameter satisfies a "submitting_agent != empty" partial predicate at plan
+	-- time, so a partial index would silently go unused for this query.
+	CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories(submitting_agent, confidence_score);
 
 	CREATE TABLE IF NOT EXISTS legacy_memory_recovery (
 		memory_id TEXT PRIMARY KEY,
@@ -1363,6 +1371,7 @@ func (s *SQLiteStore) migrateTaskSupport(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_provider ON memories(provider)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_task_status ON memories(task_status) WHERE task_status != ''`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories(submitting_agent, confidence_score)`)
 }
 
 // --- Helper functions ---

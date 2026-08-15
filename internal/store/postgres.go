@@ -418,6 +418,9 @@ var postgresTaskAssignmentSchema = []string{
 	`ALTER TABLE memories ADD COLUMN IF NOT EXISTS task_board_position BIGINT NOT NULL DEFAULT 0`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_assignee ON memories (assignee) WHERE assignee != ''`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_task_picked_up_by ON memories (task_picked_up_by) WHERE task_picked_up_by != ''`,
+	// CEREBRUM agent-as-lobe: each agent's top memories by confidence
+	// (WHERE submitting_agent = ? ORDER BY confidence_score DESC), index-satisfiable.
+	`CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories (submitting_agent, confidence_score)`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_projection_page ON memories (created_at, memory_id)`,
 	// FindByContentHash became a live query in v11.11 (it previously returned a

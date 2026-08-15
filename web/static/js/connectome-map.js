@@ -218,6 +218,41 @@ export function createNeuronBirthTracker() {
   };
 }
 
+// Strip bloomed engrams (transient _added nodes) and their focus tethers from a
+// {nodes, links} graph, returning the pruned copy. Pure, so the transactional
+// clear is unit-testable — a no-op (returning the input unchanged) fails the
+// assertions, unlike a source-only check of clearBloom.
+export function stripBloom(graphData) {
+  const nodes = (graphData && Array.isArray(graphData.nodes)) ? graphData.nodes : [];
+  const links = (graphData && Array.isArray(graphData.links)) ? graphData.links : [];
+  return {
+    nodes: nodes.filter(n => !n._added),
+    links: links.filter(l => l.link_type !== 'focus'),
+  };
+}
+
+// Maps the /v1/dashboard/memory/engrams payload (one agent's authored memories)
+// into memory node objects that orbit their author neuron in the agent-as-lobe
+// view. Pure. `_added` marks them transient (the renderer strips _added nodes on
+// exit-focus); `_engram` tags them as author-anchored memories. They carry the
+// same memory fields the shared node styling reads, so an engram renders as a
+// memory dot (domain hue, confidence alpha) rather than a neuron.
+export function mapEngrams(g) {
+  const src = (g && Array.isArray(g.engrams)) ? g.engrams : [];
+  return src.map(e => ({
+    id: e.id,
+    domain: e.domain || 'unknown',
+    label: e.content || e.id,
+    status: e.status || 'committed',
+    confidence: typeof e.confidence === 'number' ? e.confidence : 0.5,
+    corroboration_count: e.corroboration_count || 0,
+    memory_type: e.memory_type || '',
+    created_at: e.created_at || '',
+    _added: true,
+    _engram: true,
+  }));
+}
+
 // Pure neuron colour composition, so the dormancy grey and birth flare are pinned
 // by numbers rather than a source grep (a no-op blend fails the assertions).
 // domainRGB [r,g,b] is the base hue; `deg` (0..1 traffic) brightens toward white;
