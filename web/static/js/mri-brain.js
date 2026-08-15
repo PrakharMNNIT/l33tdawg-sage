@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint, mapEngrams, stripBloom } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, createEngramBloomCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint, mapEngrams, stripBloom, applyEngramBloom } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -34,6 +34,12 @@ const LINK_TYPES = {
   // scale with traffic (Hebbian weight), so this one entry is styled dynamically
   // by the link accessors rather than by a fixed width like the memory link types.
   synapse:     { color: '#39d0ff', label: 'synapse',     typed: true },
+  // Connectome mode: a "distributed engram" bridge — a memory (engram) that a
+  // second neuron has also corroborated, drawn from the engram to that
+  // corroborating neuron. One memory bridged to several neurons is the same
+  // knowledge consolidated across cells. Kept faint so the neuron synapses stay
+  // dominant; styled dynamically by the width accessor like the synapse.
+  'engram-bridge': { color: '#d98cff', label: 'distributed engram', typed: false },
 };
 const PALETTE = ['#ff6b9d','#ffd166','#5ee2a0','#5ab0ff','#c08bff','#ff9f5a','#4dd6c4','#f7748a','#9ad14b','#7aa0ff'];
 function hexToRgb(h){ const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
@@ -498,6 +504,7 @@ export function mountMriBrain(container, opts = {}) {
   const restingWeight = l => (l._w||0) * plasticityOf(l);
   function linkWidthFor(l){
     if(l.link_type==='synapse') return 0.25 + restingWeight(l)*2.4 + synapsePulse(l)*2.0;
+    if(l.link_type==='engram-bridge') return 0.5;
     return l.link_type==='focus'?0.8 : l.link_type==='contradicts'?0.6 : (LINK_TYPES[l.link_type]||{}).typed?0.35:0.18;
   }
   function linkParticlesFor(l){
@@ -543,8 +550,20 @@ export function mountMriBrain(container, opts = {}) {
     if (!Graph) return;
     Graph.graphData(stripBloom(Graph.graphData()));
   }
+  // Any graph replacement leaves focus before the replacement fetch settles.
+  // Strip transient nodes/links first: if the fetch fails, clearing focus state
+  // first would make exitFocus() return early and strand the old bloom forever.
+  function leaveFocusForGraphReplacement(){
+    bloomLoads.invalidate();
+    clearBloom();
+    focusId = null; focusSet = null;
+    hideExplorePanel();
+    clearFocusMarker();
+  }
   async function bloomEngrams(n){
     if (disposed || !Graph || !rendered || mode !== 'connectome') return;
+    const agentID = n.agent_id || n.id;
+    const bloomRequest = bloomLoads.begin(agentID);
     focusNeuron(n);
     // Clear any prior bloom IMMEDIATELY, before the fetch — so a failed, errored,
     // or superseded request never strands the previous agent's engrams under this
@@ -552,30 +571,18 @@ export function mountMriBrain(container, opts = {}) {
     clearBloom();
     let payload;
     try {
-      const resp = await fetch(ENGRAMS_URL + '?agent=' + encodeURIComponent(n.id), { credentials: 'same-origin' });
+      const resp = await fetch(ENGRAMS_URL + '?agent=' + encodeURIComponent(agentID), { credentials: 'same-origin' });
       if (!resp.ok) return;
       payload = await resp.json();
     } catch (e) { console.warn('[mri] engrams unavailable:', e.message); return; }
     // Superseded (another neuron clicked while this was in flight) or torn down:
     // drop the stale response rather than bloom it under the wrong focus.
-    if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id) return;
+    if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id ||
+        !bloomLoads.isCurrent(bloomRequest, agentID)) return;
     const engrams = mapEngrams(payload);
-    const gd = stripBloom(Graph.graphData());
-    const present = new Set(gd.nodes.map(nn => nn.id));
-    const fs = new Set(focusSet || [n.id]);
-    engrams.forEach((em, i) => {
-      if (!present.has(em.id)) {
-        placeNear(em, n, i);
-        gd.nodes.push(em);
-        present.add(em.id);
-      }
-      // endpoints are node OBJECTS so the tether renders under the pinned layout
-      // (string ids go unresolved once the link force is nulled — see #188).
-      gd.links.push({ source: n, target: em, link_type: 'focus' });
-      fs.add(em.id);
-    });
-    focusId = n.id; focusSet = fs;
-    Graph.graphData(gd);
+    const composed = applyEngramBloom(Graph.graphData(), engrams, n, focusSet, placeNear);
+    focusId = n.id; focusSet = composed.focusSet;
+    Graph.graphData(composed.graphData);
     Graph.nodeColor(nodeColorRGBA);
     setFocusMarkerNode(n);
   }
@@ -677,6 +684,7 @@ export function mountMriBrain(container, opts = {}) {
   // Mode-aware source: the memory graph (domain-drillable) or the connectome.
   const fetchActive = requestMode => requestMode === 'connectome' ? loadSynapses(SYNAPSE_URL) : loadGraph(urlFor());
   const graphLoads = createGraphLoadCoordinator();
+  const bloomLoads = createEngramBloomCoordinator();
   let rendered = null;   // last graph data handed to ForceGraph (for neuron focus)
   const subs = [];
   let graphRetryTimer = null;
@@ -884,8 +892,8 @@ export function mountMriBrain(container, opts = {}) {
     const request = graphLoads.begin(mode);
     const tickGeneration = connectomeReloadIntent.begin(request.mode);
     const tickAware = tickGeneration > 0;
-    // A drill / reload leaves focus mode.
-    focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
+    // A drill / reload leaves focus mode even when the replacement fetch fails.
+    leaveFocusForGraphReplacement();
     fetchActive(request.mode).then(d => {
       if (disposed || !Graph || !graphLoads.isCurrent(request, mode)) return;
       clearTimeout(graphRetryTimer);
@@ -955,13 +963,11 @@ export function mountMriBrain(container, opts = {}) {
 
   function exitFocus(){
     if (!focusId) return;
+    bloomLoads.invalidate();
     focusId = null; focusSet = null;
     clearFocusMarker();
     if (Graph) {
-      const gd = Graph.graphData();
-      gd.nodes = gd.nodes.filter(n => !n._added);
-      gd.links = gd.links.filter(l => l.link_type !== 'focus');
-      Graph.graphData(gd);
+      Graph.graphData(stripBloom(Graph.graphData()));
       Graph.nodeColor(nodeColorRGBA);
     }
     hideExplorePanel();
@@ -1381,7 +1387,7 @@ export function mountMriBrain(container, opts = {}) {
       initializeGraph(d);
       // Deep-link: auto-bloom a requested agent's lobe on first connectome paint.
       if (focusAgent && !autoBloomed && mode === 'connectome' && rendered) {
-        const target = rendered.nodes.find(nd => nd.isNeuron && nd.id === focusAgent);
+        const target = rendered.nodes.find(nd => nd.isNeuron && (nd.agent_id || nd.id) === focusAgent);
         if (target) { autoBloomed = true; deepLinkTimer = setTimeout(() => { if (!disposed) bloomEngrams(target); }, 50); }
       }
     }).catch(() => {
@@ -1441,12 +1447,13 @@ export function mountMriBrain(container, opts = {}) {
   function setMode(next){
     if (mode===next || (next==='connectome' && !allowConnectome)) return;
     graphLoads.invalidate();
+    bloomLoads.invalidate();
     mode = next;
     connectomeActivity.reset();
     connectomeReloadIntent.reset();
     neuronBirths.reset();
     currentDomain = null;
-    focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
+    leaveFocusForGraphReplacement();
     updateModeChrome();
     // Recall this view's remembered skull opacity (its default, or the operator's
     // last manual choice for this view) and reflect it on the slider, so a round
@@ -1465,6 +1472,7 @@ export function mountMriBrain(container, opts = {}) {
 
   return function cleanup(){
     disposed = true;
+    bloomLoads.invalidate();
     clearTimeout(graphRetryTimer);
     clearInterval(plasticityTimer);
     clearTimeout(birthDecayTimer);

@@ -135,6 +135,17 @@ Memory type, author-supplied confidence, and caller-supplied challenge strength 
 
 `TxTypeMemoryCorroborate` writes a `Corroboration` row to the serving projection and, under app-v10+, one deduplicated `corrob:<memory>:<agent>` marker to AppHash-covered BadgerDB. It does **not** change the memory's lifecycle status. The SQL distinct-agent count drives query-time confidence; the canonical markers are the only corroborations app-v21 may consult during deterministic challenge execution.
 
+The CEREBRUM distributed-engram projection treats those corroborations as
+historical support evidence. A bridge means that a registered, caller-visible
+agent corroborated the memory; it does not assert current possession, liveness,
+or an active message session. The projection reads at most the first 96 raw rows
+ordered by `created_at`, `agent_id`, and row `id`, then visibility-filters and
+deduplicates that prefix to at most 12 named bridges. Eligible identities beyond
+the raw prefix can therefore remain count-only. The full distinct total is
+preserved separately as `corroboration_count`.
+Challenged and deprecated memories do not bloom. A governed reinstatement
+returns the memory to `committed`, making it eligible for the projection again.
+
 ---
 
 ## Node-Local vs. On-Chain Data
