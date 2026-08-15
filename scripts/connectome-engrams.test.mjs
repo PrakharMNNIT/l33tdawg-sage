@@ -179,6 +179,59 @@ test('every renderer focus-exit path strips bridges and invalidates in-flight bl
     'background exit must remove focus and distributed-engram links together');
 });
 
+test('failed graph replacements cannot strand a distributed-engram bloom', async () => {
+  const bloom = {
+    nodes: [{ id: 'agent:alice', isNeuron: true }, { id: 'memory:m1', _added: true }],
+    links: [
+      { source: 'agent:alice', target: 'memory:m1', link_type: 'focus' },
+      { source: 'memory:m1', target: 'agent:bob', link_type: 'engram-bridge' },
+    ],
+  };
+  let graphData = bloom;
+  let focusId = 'agent:alice';
+  let focusSet = new Set(['agent:alice', 'memory:m1', 'agent:bob']);
+  let invalidated = 0;
+  let hidden = 0;
+  let markerCleared = 0;
+  const Graph = { graphData(next) { if (arguments.length) graphData = next; return graphData; } };
+  const bloomLoads = { invalidate() { invalidated++; } };
+  const clearBloom = () => Graph.graphData(stripBloom(Graph.graphData()));
+  const hideExplorePanel = () => { hidden++; };
+  const clearFocusMarker = () => { markerCleared++; };
+  const body = functionBody(mriSource, 'leaveFocusForGraphReplacement');
+  const run = new Function(
+    'bloomLoads', 'clearBloom', 'hideExplorePanel', 'clearFocusMarker', 'focusId', 'focusSet',
+    `${body}\nreturn { focusId, focusSet };`,
+  );
+
+  const state = run(bloomLoads, clearBloom, hideExplorePanel, clearFocusMarker, focusId, focusSet);
+  focusId = state.focusId;
+  focusSet = state.focusSet;
+  await assert.rejects(Promise.reject(new Error('replacement unavailable')));
+
+  assert.equal(focusId, null);
+  assert.equal(focusSet, null);
+  assert.equal(invalidated, 1);
+  assert.equal(hidden, 1);
+  assert.equal(markerCleared, 1);
+  assert.deepEqual(graphData.nodes.map(node => node.id), ['agent:alice']);
+  assert.deepEqual(graphData.links, [], 'focus and engram-bridge artifacts are gone before rejection');
+});
+
+test('reload and mode-switch replacement paths tear down the bloom before fetching', () => {
+  const loadBody = functionBody(mriSource, 'load');
+  const reloadCleanup = loadBody.indexOf('leaveFocusForGraphReplacement()');
+  const reloadFetch = loadBody.indexOf('fetchActive(request.mode)');
+  assert.ok(reloadCleanup !== -1 && reloadFetch !== -1 && reloadCleanup < reloadFetch,
+    'an SSE/domain reload must strip its bloom before the fallible replacement fetch');
+
+  const modeBody = functionBody(mriSource, 'setMode');
+  const modeCleanup = modeBody.indexOf('leaveFocusForGraphReplacement()');
+  const modeFetch = modeBody.indexOf('load()');
+  assert.ok(modeCleanup !== -1 && modeFetch !== -1 && modeCleanup < modeFetch,
+    'a mode switch must strip its bloom before the fallible replacement load');
+});
+
 test('the 50ms deep-link bloom timer is tracked and cleared on dispose', () => {
   assert.match(mriSource, /deepLinkTimer = setTimeout\(\(\) => \{ if \(!disposed\) bloomEngrams/,
     'the deep-link timer must be assigned (trackable) and guard disposed');

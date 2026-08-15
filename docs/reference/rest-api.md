@@ -1004,11 +1004,14 @@ Pre-app-v23 nodes retain their legacy projection behavior.
 
 The engram response is capped at 24 memories in descending confidence order.
 Each item contains the true distinct `corroboration_count`, while
-`corroborators` contains at most 12 identities from a stable, SQL-bounded raw
-prefix. An identity is named only when it is already a registered Connectome
-neuron and is visible to the caller; hidden, external, excess, and unavailable
-identities remain anonymous inside the count. A missing registry or failed
-bounded read withholds all bridge identities without hiding the count. The
+`corroborators` contains at most 12 identities selected from the first 96 raw
+corroboration rows ordered by `created_at`, `agent_id`, then row `id`; that raw
+prefix is bounded in SQL before filtering and deduplication. An identity is
+named only when it is already a registered Connectome neuron and is visible to
+the caller. Hidden, external, duplicate, excess, unavailable, and otherwise
+eligible identities beyond the 96-row prefix remain anonymous inside the true
+distinct count. A missing registry or failed bounded read withholds all bridge
+identities without hiding the count. The
 identity list is historical corroboration evidence, not a claim that the peer
 currently possesses a copy. Challenged and deprecated memories are omitted;
 reinstatement makes a memory eligible again because it is committed. Registered

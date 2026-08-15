@@ -550,6 +550,16 @@ export function mountMriBrain(container, opts = {}) {
     if (!Graph) return;
     Graph.graphData(stripBloom(Graph.graphData()));
   }
+  // Any graph replacement leaves focus before the replacement fetch settles.
+  // Strip transient nodes/links first: if the fetch fails, clearing focus state
+  // first would make exitFocus() return early and strand the old bloom forever.
+  function leaveFocusForGraphReplacement(){
+    bloomLoads.invalidate();
+    clearBloom();
+    focusId = null; focusSet = null;
+    hideExplorePanel();
+    clearFocusMarker();
+  }
   async function bloomEngrams(n){
     if (disposed || !Graph || !rendered || mode !== 'connectome') return;
     const agentID = n.agent_id || n.id;
@@ -882,8 +892,8 @@ export function mountMriBrain(container, opts = {}) {
     const request = graphLoads.begin(mode);
     const tickGeneration = connectomeReloadIntent.begin(request.mode);
     const tickAware = tickGeneration > 0;
-    // A drill / reload leaves focus mode.
-    focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
+    // A drill / reload leaves focus mode even when the replacement fetch fails.
+    leaveFocusForGraphReplacement();
     fetchActive(request.mode).then(d => {
       if (disposed || !Graph || !graphLoads.isCurrent(request, mode)) return;
       clearTimeout(graphRetryTimer);
@@ -1443,7 +1453,7 @@ export function mountMriBrain(container, opts = {}) {
     connectomeReloadIntent.reset();
     neuronBirths.reset();
     currentDomain = null;
-    focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
+    leaveFocusForGraphReplacement();
     updateModeChrome();
     // Recall this view's remembered skull opacity (its default, or the operator's
     // last manual choice for this view) and reflect it on the slider, so a round
