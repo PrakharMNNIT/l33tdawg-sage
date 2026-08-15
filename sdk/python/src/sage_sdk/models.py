@@ -144,6 +144,23 @@ class MemorySubmitRequest(BaseModel):
         else:
             if self.task_status not in (None, TaskStatus.planned):
                 raise ValueError("new tasks must enter consensus as planned")
+            # Normalize an omitted status to planned so it is present in the
+            # SIGNED body.
+            #
+            # The server defaults an omitted task_status to "planned", but it
+            # does so by MUTATING the request after the caller's signature
+            # already covered it; the consensus proof check then rebuilds the
+            # expected transaction from the signed bytes, where task_status is
+            # still absent, and rejects the whole submission as
+            # "agent proof does not match the submitted action".
+            #
+            # Since the payload is serialized with exclude_none=True, leaving
+            # this None drops the field from the wire entirely — so omitting it
+            # does not get a helpful default, it makes the write impossible for
+            # a signed client. planned is not a choice: the check immediately
+            # above is what rejects anything else.
+            if self.task_status is None:
+                self.task_status = TaskStatus.planned
             if self.knowledge_triples or self.linked_memories:
                 raise ValueError(
                     "app-v23 tasks cannot include knowledge_triples or linked_memories"

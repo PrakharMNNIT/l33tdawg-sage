@@ -508,3 +508,59 @@ def test_pipe_message_replied_by_is_none_when_unattributed():
     })
 
     assert reply.replied_by is None
+
+
+def test_task_submission_signs_planned_when_status_omitted():
+    """An omitted task_status must be normalized BEFORE signing.
+
+    The server defaults it to "planned" by mutating the request after the
+    caller's signature covers it; the consensus proof check then rebuilds the
+    expected transaction from the signed bytes, where the field is absent, and
+    rejects the submission as "agent proof does not match the submitted
+    action". Because the payload is serialized with exclude_none=True, leaving
+    it None drops the field from the wire entirely — so this is not cosmetic,
+    it is the difference between a task write working and failing outright.
+    """
+    from sage_sdk.models import MemorySubmitRequest
+
+    req = MemorySubmitRequest(
+        content="rebase before requesting merge",
+        memory_type="task",
+        domain_tag="trace-spec-crypto-review",
+        confidence_score=0.9,
+    )
+    assert req.task_status == "planned"
+
+    body = req.model_dump(mode="json", exclude_none=True, by_alias=True)
+    assert body["task_status"] == "planned", (
+        "task_status must survive exclude_none into the signed body"
+    )
+
+
+def test_explicit_planned_task_status_is_preserved():
+    from sage_sdk.models import MemorySubmitRequest
+
+    req = MemorySubmitRequest(
+        content="explicit status",
+        memory_type="task",
+        domain_tag="trace-spec-crypto-review",
+        confidence_score=0.9,
+        task_status="planned",
+    )
+    assert req.task_status == "planned"
+
+
+def test_non_task_memory_never_gains_a_task_status():
+    """The converse: normalization must not leak into non-task memories."""
+    from sage_sdk.models import MemorySubmitRequest
+
+    req = MemorySubmitRequest(
+        content="Broadcast writes identical bytes to every subscriber",
+        memory_type="fact",
+        domain_tag="trace-spec-crypto-review",
+        confidence_score=0.9,
+    )
+    assert req.task_status is None
+
+    body = req.model_dump(mode="json", exclude_none=True, by_alias=True)
+    assert "task_status" not in body
