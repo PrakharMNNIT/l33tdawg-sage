@@ -648,6 +648,133 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			}`,
 		},
 		{
+			name: "deferred closure write cannot affect following false sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				defer func() { dead = true }()
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "deferred named pointer call cannot affect following false sink",
+			body: `func setTrue(value *bool) { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := false
+				defer setTrue(&dead)
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "parenthesized deferred pointer receiver cannot affect following false sink",
+			body: `type flag bool
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				defer (dead.setTrue)()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "explicit deferred receiver address cannot affect following false sink",
+			body: `type flag bool
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				defer (&dead).setTrue()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "closure stored as deferred argument cannot affect following false sink",
+			body: `func run(callback func()) { callback() }
+			func mutate(b *SSEBroadcaster) {
+				dead := false
+				defer run(func() { dead = true })
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "closure stored by deferred no-op cannot affect following false sink",
+			body: `func mutate(b *SSEBroadcaster) {
+				dead := false
+				defer func(func()) {}(func() { dead = true })
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "pointer method stored as deferred argument cannot affect following false sink",
+			body: `type flag bool
+			func (value *flag) setTrue() { *value = true }
+			func run(callback func()) { callback() }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				defer run(dead.setTrue)
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "pointer method stored by deferred no-op cannot affect following false sink",
+			body: `type flag bool
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				defer func(func()) {}(dead.setTrue)
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "pointer method nested in deferred composite cannot affect following false sink",
+			body: `type flag bool
+			type holder struct { call func() }
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				defer func(holder) {}(holder{call: dead.setTrue})
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "pointer method converted in deferred argument cannot affect following false sink",
+			body: `type flag bool
+			type callback func()
+			func (value *flag) setTrue() { *value = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				defer func(callback) {}(callback(dead.setTrue))
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
 			name: "earlier sibling closure assignment establishes false before sink",
 			body: `func mutate(b *SSEBroadcaster) {
 				dead := true
@@ -1256,6 +1383,84 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 		require.Empty(t, scan.unresolved)
 		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
 	})
+
+	t.Run("deferred closure write runs after following live sink", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := true
+			defer func() { live = false }()
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("deferred named pointer write runs after following live sink", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func setFalse(value *bool) { *value = false }
+		func mutate(b *SSEBroadcaster) {
+			live := true
+			defer setFalse(&live)
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("deferred expression values preserve following live sink", func(t *testing.T) {
+		scan := scanTypedFixture(t, `type flag bool
+		func (value *flag) setFalse() { *value = false }
+		func run(callback func()) { callback() }
+		func mutate(b *SSEBroadcaster) {
+			live := flag(true)
+			defer run(live.setFalse)
+			_ = live && func() flag {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("synchronous deferred argument call can establish live sink", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			live := false
+			defer func(bool) {}(func() bool { live = true; return live }())
+			_ = live && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	for _, tc := range []struct {
+		name    string
+		initial string
+		write   string
+	}{
+		{name: "goroutine may write false after live sink", initial: "true", write: "false"},
+		{name: "goroutine may write true before false sink", initial: "false", write: "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+				live := `+tc.initial+`
+				go func() { live = `+tc.write+` }()
+				_ = live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`)
+			require.Empty(t, scan.unresolved)
+			require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+		})
+	}
 
 	for _, tc := range []struct {
 		name       string
@@ -1962,6 +2167,10 @@ func nodeHasEvaluatedTerminatingLiteral(
 	ast.Inspect(node, func(inner ast.Node) bool {
 		switch current := inner.(type) {
 		case *ast.CallExpr:
+			switch parents[current].(type) {
+			case *ast.DeferStmt, *ast.GoStmt:
+				return true
+			}
 			if builtin, ok := calledObject(info, current.Fun).(*types.Builtin); ok && builtin.Name() == "panic" {
 				if expressionEvaluation(info, current, parents, facts) == expressionEvaluated {
 					terminates = true
@@ -2157,7 +2366,10 @@ func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast
 	ast.Inspect(node, func(inner ast.Node) bool {
 		switch current := inner.(type) {
 		case *ast.FuncLit:
-			if directlyCalledFuncLiteral(current, parents) {
+			switch functionLiteralCallContext(current, parents) {
+			case callDeferred:
+				return false
+			case callSynchronous:
 				switch expressionEvaluation(info, current, parents, state.values) {
 				case expressionSkipped:
 					return false
@@ -2167,10 +2379,13 @@ func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast
 					}
 				}
 			}
+			if expressionIsOnlyDeferredOperand(info, current, parents) {
+				return false
+			}
 			markCapturedWrites(current)
 			return false
 		case *ast.UnaryExpr:
-			if current.Op == token.AND && !addressValueIsDirectlyDiscarded(current, parents) {
+			if current.Op == token.AND && !addressValueIsDirectlyDiscarded(current, parents) && !expressionIsOnlyDeferredOperand(info, current, parents) {
 				ident, _ := unwrapParens(current.X).(*ast.Ident)
 				markEscaped(info.ObjectOf(ident))
 			}
@@ -2187,7 +2402,7 @@ func transferBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast
 			if !ok || signature.Recv() == nil {
 				break
 			}
-			if _, ok := signature.Recv().Type().(*types.Pointer); ok && !methodBodyIsEmpty(info, body, parents, method) {
+			if _, ok := signature.Recv().Type().(*types.Pointer); ok && !expressionIsOnlyDeferredOperand(info, current, parents) && !methodBodyIsEmpty(info, body, parents, method) {
 				ident, _ := unwrapParens(current.X).(*ast.Ident)
 				markEscaped(info.ObjectOf(ident))
 			}
@@ -2283,6 +2498,11 @@ func transferBooleanFactsBeforeTarget(
 		switch current := inner.(type) {
 		case *ast.CallExpr:
 			if literal := directlyCalledLiteralFromCall(current); literal != nil {
+				context := functionLiteralCallContext(literal, parents)
+				if context == callDeferred || context == callGoroutine {
+					transferBooleanFacts(info, body, parents, current, state)
+					return false
+				}
 				status := expressionEvaluation(info, literal, parents, state.values)
 				if status == expressionSkipped {
 					return false
@@ -2368,7 +2588,16 @@ func expressionEvaluation(
 	return status
 }
 
-func directlyCalledFuncLiteral(literal *ast.FuncLit, parents map[ast.Node]ast.Node) bool {
+type directCallContext uint8
+
+const (
+	callNotDirect directCallContext = iota
+	callSynchronous
+	callDeferred
+	callGoroutine
+)
+
+func functionLiteralCallContext(literal *ast.FuncLit, parents map[ast.Node]ast.Node) directCallContext {
 	var expression ast.Expr = literal
 	for {
 		parent, ok := parents[expression].(*ast.ParenExpr)
@@ -2378,7 +2607,34 @@ func directlyCalledFuncLiteral(literal *ast.FuncLit, parents map[ast.Node]ast.No
 		expression = parent
 	}
 	call, ok := parents[expression].(*ast.CallExpr)
-	return ok && unwrapParens(call.Fun) == literal
+	if !ok || unwrapParens(call.Fun) != literal {
+		return callNotDirect
+	}
+	switch parents[call].(type) {
+	case *ast.DeferStmt:
+		return callDeferred
+	case *ast.GoStmt:
+		return callGoroutine
+	default:
+		return callSynchronous
+	}
+}
+
+func expressionIsOnlyDeferredOperand(info *types.Info, expression ast.Expr, parents map[ast.Node]ast.Node) bool {
+	for parent := parents[ast.Node(expression)]; parent != nil; parent = parents[parent] {
+		call, ok := parent.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		if typeValue, isType := info.Types[call.Fun]; isType && typeValue.IsType() && len(call.Args) == 1 {
+			continue
+		}
+		if _, deferred := parents[call].(*ast.DeferStmt); deferred {
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 func directlyCalledLiteralFromCall(call *ast.CallExpr) *ast.FuncLit {
