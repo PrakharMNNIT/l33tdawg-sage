@@ -79,3 +79,29 @@ pipeline-agent boundary. It does not use the dashboard `OnEvent` broadcaster.
 The older HTTP-MCP `notifications/sage_message` bridge remains a separate,
 best-effort compatibility notification for already-open MCP SSE sessions and
 does not define this durable sequence contract.
+
+## Claude wake channel enablement
+
+The Claude host adapter is the one shipped consumer of this route. It is
+**off by default** and is armed only by setting `SAGE_CLAUDE_CHANNEL` for
+`sage-gui mcp`, the stdio MCP server a Claude host launches
+(`cmd/sage-gui/mcp.go:224`). Constructing an MCP `Server` never advertises or
+emits the experimental protocol on its own; enabling is an explicit call
+(`internal/mcp/claude_wake_source.go:84`, `internal/mcp/claude_channel.go:50`).
+
+When armed, the adapter subscribes to this agent's own signed wake stream and
+turns a new durable cursor into a `notifications/claude/channel` JSON-RPC
+notification, so the host can stop polling its inbox on a timer.
+
+The channel is **only a poll accelerator, and it is payload-free**. A wake
+carries `version`, `seq`, and `pending` and nothing else, so the host learns
+that unclaimed work exists and never learns its content, its sender, or how
+many messages are waiting. The host still calls the canonical inbox operation
+to see or claim anything, and that operation remains the only thing that
+affects message lifecycle state.
+
+Two consequences follow from the lease described above. A second runtime for
+the same agent is rejected with 409 rather than silently sharing the wake, so
+the wake accelerates exactly one runtime at a time. And because the channel
+only accelerates polling, failing to arm it is not fatal: a host that cannot
+open the stream still gets an ordinary MCP session and ordinary polling.
