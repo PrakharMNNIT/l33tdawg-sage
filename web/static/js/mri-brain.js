@@ -361,7 +361,7 @@ export function mountMriBrain(container, opts = {}) {
       <div><div class="n nc">0</div><div class="l">consolidated</div></div>
       <button type="button" class="btn b-rot">⏸ pause</button>
       <button type="button" class="btn b-flow">⚡ flow: on</button>
-      ${allowConnectome ? '<button type="button" class="btn b-mode" aria-pressed="false">◉ connectome</button>' : ''}
+      ${allowConnectome ? '<button type="button" class="btn b-mode" aria-label="Connectome view" aria-pressed="false">◉ connectome</button>' : ''}
       <label class="sld">skull <input class="b-op" type="range" min="0" max="60" value="8"></label>
     </div>
     <div class="tip"></div>
@@ -1440,7 +1440,7 @@ export function mountMriBrain(container, opts = {}) {
     const btn=$('.b-mode');
     if(btn) {
       btn.textContent = connectome ? '◈ memory' : '◉ connectome';
-      btn.setAttribute('aria-label', connectome ? 'Show memory view' : 'Show connectome view');
+      btn.setAttribute('aria-label', 'Connectome view');
       btn.setAttribute('aria-pressed', connectome ? 'true' : 'false');
     }
     const title = $('.lg-title'); if (title) title.textContent = connectome ? 'Connectome' : 'Domain tags';

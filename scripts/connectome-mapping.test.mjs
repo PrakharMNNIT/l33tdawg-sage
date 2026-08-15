@@ -157,27 +157,39 @@ test('connectome guidance is reachable without adding another floating panel', (
     'the renderer must retain only its established scan, legend, and HUD panels');
   assert.doesNotMatch(rootTemplate, /\bmodeCap\b|mode-cap/,
     'connectome mode must not create a free-floating explanatory panel');
-  const dynamicRootAppends = [...mriSource.matchAll(/\broot\.appendChild\(([^)]+)\)/g)]
-    .map(match => match[1].trim());
-  assert.deepEqual(dynamicRootAppends, ['p'],
-    'the only dynamic root child may be the established click-to-explore panel');
+  const executableMri = mriSource
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  const childMutations = [...executableMri.matchAll(
+    /\b(root|container)\.(appendChild|append|prepend|insertBefore|replaceChildren|insertAdjacentElement|insertAdjacentHTML|before|after|replaceWith)\s*\(([^;\n]*)\)/g,
+  )].map(match => `${match[1]}.${match[2]}(${match[3].trim()})`);
+  assert.deepEqual(childMutations, ['container.appendChild(root)', 'root.appendChild(p)'],
+    'the mount root and established Explore panel are the only root-level insertions, through any DOM insertion API');
   assert.match(mriSource, /p\.className = 'panel explore'; root\.appendChild\(p\)/,
     'the dynamic-root allow-list must stay bound to the click-to-explore panel');
 
   assert.match(rootTemplate, /class="lg-detail guide-connectome" hidden>[\s\S]*Agents are neurons[\s\S]*Click one to bloom its memories/i,
     'standalone MRI must keep connectome guidance inside its existing reading legend');
-  assert.match(mriPageSource, /mountMriBrain\([\s\S]*showScan: true/,
-    'standalone MRI must continue mounting the renderer with its default reading legend');
+  const standaloneMountStart = mriPageSource.indexOf("mountMriBrain(document.getElementById('mount')");
+  const standaloneMountEnd = mriPageSource.indexOf('});', standaloneMountStart);
+  assert.ok(standaloneMountStart >= 0 && standaloneMountEnd > standaloneMountStart,
+    'standalone MRI mount options must remain inspectable');
+  const standaloneMount = mriPageSource.slice(standaloneMountStart, standaloneMountEnd);
+  assert.match(standaloneMount, /showScan:\s*true/);
+  assert.doesNotMatch(standaloneMount, /showDomainLegend:\s*false|allowConnectome:\s*false/,
+    'standalone MRI must keep both the connectome toggle and its reading guide enabled');
   assert.match(rootTemplate, /<button type="button" class="lg-toggle" aria-expanded="false">/,
     'the standalone reading guide must be keyboard reachable');
-  assert.match(rootTemplate, /<button type="button" class="btn b-mode" aria-pressed="false">/,
+  assert.match(rootTemplate, /<button type="button" class="btn b-mode" aria-label="Connectome view" aria-pressed="false">/,
     'the mode toggle must be a keyboard-reachable button');
-  assert.match(mriSource, /connectomeGuide\.hidden = !connectome/,
-    'mode changes must associate the standalone guide with the active view');
   assert.match(mriSource, /class="sr-status" role="status" aria-live="polite"/,
     'mode changes must have a non-visual screen-reader announcement target');
 
-  assert.match(appSource, /<section class="brain-domain-guide" aria-label="How to read the brain">[\s\S]*<b>Connectome mode:<\/b> agents are neurons/,
+  const guideStart = appSource.indexOf('showGuide && html`<section class="brain-domain-guide"');
+  const guideEnd = appSource.indexOf('</section>`}', guideStart);
+  assert.ok(guideStart >= 0 && guideEnd > guideStart, 'dashboard guide template must remain inspectable');
+  const dashboardGuide = appSource.slice(guideStart, guideEnd);
+  assert.match(dashboardGuide, /<b>Connectome mode:<\/b> agents are neurons/,
     'the dashboard How to read guide must retain the connectome explanation');
   assert.match(appSource, /class="brain-domain-reset"/,
     'the mobile-only action hiding rule needs an explicit Reset target');
@@ -185,6 +197,55 @@ test('connectome guidance is reachable without adding another floating panel', (
     'mobile may hide Reset, not the How to read button');
   assert.doesNotMatch(cssSource, /\.brain-domain-head-actions button:first-child\s*\{\s*display:\s*none;/,
     'mobile must not hide whichever action happens to be first');
+});
+
+test('mode chrome exposes coherent toggle state, active guidance, and live status', () => {
+  const functionBody = name => {
+    const start = mriSource.indexOf(`function ${name}(`);
+    assert.notEqual(start, -1, `${name}() not found`);
+    const open = mriSource.indexOf('{', start);
+    let depth = 0;
+    for (let i = open; i < mriSource.length; i++) {
+      if (mriSource[i] === '{') depth++;
+      else if (mriSource[i] === '}' && --depth === 0) return mriSource.slice(open + 1, i);
+    }
+    assert.fail(`${name}() body did not close`);
+  };
+
+  const body = functionBody('updateModeChrome');
+  const runChrome = new Function('$', 'root', 'mode', 'announce', body);
+  const elements = {
+    '.b-mode': { textContent: '', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
+    '.lg-title': { textContent: '' },
+    '.guide-memory': { hidden: false },
+    '.guide-connectome': { hidden: true },
+    '.sr-status': { textContent: '' },
+  };
+  const labels = [{ textContent: '' }, { textContent: '' }, { textContent: '' }];
+  const root = { querySelectorAll: () => labels };
+  const $ = selector => elements[selector];
+
+  runChrome($, root, 'connectome', true);
+  assert.equal(elements['.b-mode'].attrs['aria-label'], 'Connectome view',
+    'aria-pressed needs a stable toggle name, not a changing action label');
+  assert.equal(elements['.b-mode'].attrs['aria-pressed'], 'true');
+  assert.equal(elements['.guide-memory'].hidden, true);
+  assert.equal(elements['.guide-connectome'].hidden, false);
+  assert.match(elements['.sr-status'].textContent, /Connectome view/);
+  assert.deepEqual(labels.map(label => label.textContent), ['neurons', 'synapses', 'hubs']);
+
+  runChrome($, root, 'memory', true);
+  assert.equal(elements['.b-mode'].attrs['aria-label'], 'Connectome view');
+  assert.equal(elements['.b-mode'].attrs['aria-pressed'], 'false');
+  assert.equal(elements['.guide-memory'].hidden, false);
+  assert.equal(elements['.guide-connectome'].hidden, true);
+  assert.match(elements['.sr-status'].textContent, /Memory view/);
+
+  const executableSetMode = functionBody('setMode')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  assert.match(executableSetMode, /updateModeChrome\(true\);/,
+    'a real mode transition must invoke the announcing path');
 });
 
 // Live firing pulses only the synapses that actually carried a message. The
