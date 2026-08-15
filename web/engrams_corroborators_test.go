@@ -169,6 +169,72 @@ func (s *failingBoundedEngramStore) GetCorroborationsBounded(_ context.Context, 
 	return nil, errors.New("bounded corroboration read unavailable")
 }
 
+// The lobe now batches the corroborator reads, so this is the failure path the handler
+// actually exercises: a batch read error must degrade to no bridges (fail-closed) while the
+// engram and its true corroboration_count still render.
+func (s *failingBoundedEngramStore) GetCorroborationsBoundedBatch(_ context.Context, _ []string, perLimit int) (map[string][]*store.Corroboration, error) {
+	s.calls++
+	s.limits = append(s.limits, perLimit)
+	return nil, errors.New("bounded corroboration batch read unavailable")
+}
+
+// countingBatchEngramStore delegates to the real store but records how the lobe reads
+// corroborators, so a test can prove the read is batched (one query) rather than an N+1.
+type countingBatchEngramStore struct {
+	store.MemoryStore
+	batchCalls int
+	lastIDs    []string
+}
+
+func (s *countingBatchEngramStore) GetCorroborationsBounded(ctx context.Context, id string, limit int) ([]*store.Corroboration, error) {
+	return s.MemoryStore.(boundedEngramCorroborationReader).GetCorroborationsBounded(ctx, id, limit)
+}
+
+func (s *countingBatchEngramStore) GetCorroborationsBoundedBatch(ctx context.Context, ids []string, perLimit int) (map[string][]*store.Corroboration, error) {
+	s.batchCalls++
+	s.lastIDs = ids
+	return s.MemoryStore.(boundedEngramCorroborationReader).GetCorroborationsBoundedBatch(ctx, ids, perLimit)
+}
+
+// TestHandleEngramsBatchesCorroboratorReads pins the N+1 removal: several corroborated engrams
+// in one lobe must be read with a SINGLE batched corroborator query covering all of them, and
+// the bridges must still render exactly as the per-record read produced.
+func TestHandleEngramsBatchesCorroboratorReads(t *testing.T) {
+	h, s := newSynapseTestHandler(t)
+	for i, id := range []string{"alice", "bob", "carol"} {
+		require.NoError(t, h.BadgerStore.RegisterAgent(id, id, "member", "", "test", "", int64(i+1)))
+	}
+	base := time.Now().UTC().Truncate(time.Second)
+	for i, m := range []string{"m1", "m2", "m3"} {
+		seedEngramMemory(t, s, m, "alice", "fact-"+m, "ops", 0.9-float64(i)*0.01, memory.StatusCommitted)
+		seedCorroboration(t, s, m, "bob", base)
+		seedCorroboration(t, s, m, "carol", base.Add(time.Second))
+	}
+
+	counter := &countingBatchEngramStore{MemoryStore: h.store}
+	h.store = counter
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/engrams?agent=alice", nil)
+	rec := httptest.NewRecorder()
+	h.handleEngrams(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var body struct {
+		Engrams []engramNode `json:"engrams"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Engrams, 3)
+	for _, e := range body.Engrams {
+		require.ElementsMatch(t, []string{"bob", "carol"}, e.Corroborators,
+			"bridges still render correctly through the batched read")
+	}
+
+	require.Equal(t, 1, counter.batchCalls,
+		"all corroborated engrams must be read in ONE batched query, not one per engram")
+	require.ElementsMatch(t, []string{"m1", "m2", "m3"}, counter.lastIDs,
+		"the single batch covers every corroborated engram")
+}
+
 // seedCorroboration records that agentID corroborated memID, the off-chain
 // corroborations table the distributed-engram disclosure reads (the same table
 // GetCorroborationCounts already tallies for corroboration_count).

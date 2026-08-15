@@ -107,3 +107,47 @@ func TestPostgresGetCorroborationsTotallyOrdersRows(t *testing.T) {
 			"same-timestamp PostgreSQL rows must be ordered by the agent_id tiebreak, not heap order")
 	}
 }
+
+// TestPostgresGetCorroborationsBoundedBatch exercises the production PostgreSQL windowed batch:
+// per-memory cap + total order across multiple memories in a single query.
+func TestPostgresGetCorroborationsBoundedBatch(t *testing.T) {
+	s := setupTestStore(t)
+	ctx := context.Background()
+	m1, m2 := uuid.NewString(), uuid.NewString()
+	for _, id := range []string{m1, m2} {
+		content := "pg batch engram " + id
+		require.NoError(t, s.InsertMemory(ctx, &memory.MemoryRecord{
+			MemoryID: id, SubmittingAgent: "engram-postgres-test", Content: content,
+			ContentHash: memory.ComputeContentHash(content), MemoryType: memory.TypeFact,
+			DomainTag: "engram-postgres-test", ConfidenceScore: 0.9, Status: memory.StatusCommitted,
+			CreatedAt: time.Now().UTC(),
+		}))
+	}
+	t.Cleanup(func() {
+		for _, id := range []string{m1, m2} {
+			_, _ = s.db.Exec(ctx, `DELETE FROM corroborations WHERE memory_id = $1`, id)
+			_, _ = s.db.Exec(ctx, `DELETE FROM memories WHERE memory_id = $1`, id)
+		}
+	})
+
+	at := time.Unix(1_700_000_000, 0).UTC()
+	for i := 19; i >= 0; i-- {
+		require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: m1, AgentID: fmt.Sprintf("agent-%02d", i), Evidence: "e", CreatedAt: at}))
+	}
+	for i := 0; i < 3; i++ {
+		require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: m2, AgentID: fmt.Sprintf("b-%d", i), Evidence: "e", CreatedAt: at.Add(time.Duration(i) * time.Second)}))
+	}
+
+	got, err := s.GetCorroborationsBoundedBatch(ctx, []string{m1, m2}, 12)
+	require.NoError(t, err)
+	require.Len(t, got[m1], 12, "PostgreSQL caps each memory at perLimit inside the window")
+	for i, c := range got[m1] {
+		require.Equal(t, fmt.Sprintf("agent-%02d", i), c.AgentID,
+			"same-timestamp PostgreSQL rows use the agent_id tiebreak, per memory")
+	}
+	require.Len(t, got[m2], 3)
+	require.Equal(t, "b-0", got[m2][0].AgentID)
+
+	_, err = s.GetCorroborationsBoundedBatch(ctx, []string{m1}, 0)
+	require.Error(t, err, "an invalid PostgreSQL batch bound must fail closed")
+}
