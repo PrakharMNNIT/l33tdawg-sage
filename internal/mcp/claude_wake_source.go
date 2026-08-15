@@ -130,10 +130,11 @@ func (w *restClaudeWakeSource) Subscribe(ctx context.Context, afterSeq uint64) (
 	}
 
 	subscription := &restClaudeWakeSubscription{
-		events: make(chan ClaudeWakeEvent, claudeWakeEventBuffer),
-		body:   resp.Body,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		events:     make(chan ClaudeWakeEvent, claudeWakeEventBuffer),
+		body:       resp.Body,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		readerDone: make(chan struct{}),
 	}
 	go subscription.read()
 	return subscription, nil
@@ -150,6 +151,9 @@ type restClaudeWakeSubscription struct {
 	// sending so that backpressure from a busy adapter can never strand the
 	// reader goroutine past shutdown.
 	done chan struct{}
+	// readerDone is an internal lifecycle signal used to verify that shutdown
+	// releases the reader without a consumer first draining events.
+	readerDone chan struct{}
 
 	closeOnce sync.Once
 }
@@ -173,6 +177,7 @@ func (s *restClaudeWakeSubscription) Close() error {
 // reconnect; it never reconnects on its own.
 func (s *restClaudeWakeSubscription) read() {
 	defer close(s.events)
+	defer close(s.readerDone)
 	// Close is idempotent and always reports nil; the deferred call exists to
 	// release the connection when the stream ends on its own.
 	defer func() { _ = s.Close() }()

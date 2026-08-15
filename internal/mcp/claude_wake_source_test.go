@@ -329,6 +329,15 @@ func TestClaudeWakeSourceCloseReleasesReaderBlockedOnFullBuffer(t *testing.T) {
 		t.Fatal("Close blocked behind a parked reader")
 	}
 
+	// Prove the reader exited before consuming from Events. Draining first would
+	// release a bare blocking send even if Close stopped selecting on done,
+	// making this shutdown regression test pass against the broken code.
+	select {
+	case <-subscription.(*restClaudeWakeSubscription).readerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader goroutine remained blocked until Events was drained")
+	}
+
 	// The reader must finish and close Events even though it was mid-send.
 	drained := make(chan struct{})
 	go func() {
