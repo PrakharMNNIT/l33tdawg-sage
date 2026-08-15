@@ -157,6 +157,12 @@ test('connectome guidance is reachable without adding another floating panel', (
     'the renderer must retain only its established scan, legend, and HUD panels');
   assert.doesNotMatch(rootTemplate, /\bmodeCap\b|mode-cap/,
     'connectome mode must not create a free-floating explanatory panel');
+  const dynamicRootAppends = [...mriSource.matchAll(/\broot\.appendChild\(([^)]+)\)/g)]
+    .map(match => match[1].trim());
+  assert.deepEqual(dynamicRootAppends, ['p'],
+    'the only dynamic root child may be the established click-to-explore panel');
+  assert.match(mriSource, /p\.className = 'panel explore'; root\.appendChild\(p\)/,
+    'the dynamic-root allow-list must stay bound to the click-to-explore panel');
 
   assert.match(rootTemplate, /class="lg-detail guide-connectome" hidden>[\s\S]*Agents are neurons[\s\S]*Click one to bloom its memories/i,
     'standalone MRI must keep connectome guidance inside its existing reading legend');
