@@ -205,7 +205,29 @@ func runMCP() error {
 	if projectDir, cwdErr := os.Getwd(); cwdErr == nil {
 		selfHealProject(projectDir, home, os.Getenv("SAGE_PROVIDER"), keyPath)
 	}
+	// The Claude channel stays opt-in, and a failure to arm it is deliberately
+	// not fatal: the wake channel is an accelerator over polling, so a host
+	// that cannot open the stream must still get an ordinary working MCP
+	// session rather than no session at all.
+	if claudeChannelEnabled() {
+		if err := server.EnableRESTClaudeChannel(); err != nil {
+			fmt.Fprintf(os.Stderr, "SAGE MCP: claude channel disabled: %v\n", err)
+		}
+	}
 	return server.Run(context.Background())
+}
+
+// claudeChannelEnabled reports whether the operator explicitly armed the
+// experimental Claude wake channel. Default-off is the shipped contract of the
+// adapter itself, so absence means off and an unparseable value means off —
+// envBool already warns on the latter rather than guessing.
+func claudeChannelEnabled() bool {
+	raw := os.Getenv("SAGE_CLAUDE_CHANNEL")
+	if strings.TrimSpace(raw) == "" {
+		return false
+	}
+	enabled, ok := envBool("SAGE_CLAUDE_CHANNEL", raw)
+	return ok && enabled
 }
 
 // configuredMCPIdentityEnv separates an explicitly pinned MCP registration
