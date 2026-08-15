@@ -461,6 +461,35 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			}`,
 		},
 		{
+			name: "generic boolean constrained conversion skips closure emitter",
+			body: `func mutate[T interface{ ~bool }](b *SSEBroadcaster, runtime bool) {
+				_ = T(false && runtime) && func() T {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return T(true)
+				}()
+			}`,
+		},
+		{
+			name: "immutable local false alias skips closure emitter",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				dead := false && runtime
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "negated immutable local true alias skips closure emitter",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				live := true || runtime
+				_ = !live && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
 			name: "sink skipped by forward goto cannot count as an emitter",
 			body: `func mutate(b *SSEBroadcaster) {
 				goto done
@@ -712,6 +741,60 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
 		})
 	}
+
+	t.Run("runtime-capable generic boolean conversion can evaluate closure", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate[T interface{ ~bool }](b *SSEBroadcaster, runtime bool) {
+			_ = T(true && runtime) && func() T {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return T(true)
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("reassigned local alias remains unknown", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, runtime bool) {
+			dead := false && runtime
+			dead = runtime
+			_ = dead && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("package variable reassigned in another file remains unknown", func(t *testing.T) {
+		scan := scanTypedFixtureFiles(t, `
+			var dead = false
+			func mutate(b *SSEBroadcaster) {
+				_ = dead && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+			`func enable() { dead = true }`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("pointer receiver method invalidates local boolean fact", func(t *testing.T) {
+		scan := scanTypedFixture(t, `
+			type flag bool
+			func (f *flag) enable() { *f = true }
+			func mutate(b *SSEBroadcaster) {
+				dead := flag(false)
+				dead.enable()
+				_ = dead && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
 
 	for _, tc := range []struct {
 		name       string
@@ -966,13 +1049,29 @@ func fixturePreamble(body string) string {
 }
 
 func scanTypedFixture(t *testing.T, body string) typedWiringScan {
+	return scanTypedFixtureFiles(t, body)
+}
+
+func scanTypedFixtureFiles(t *testing.T, bodies ...string) typedWiringScan {
 	t.Helper()
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "fixture.go", fixturePreamble(body), parser.AllErrors)
-	require.NoError(t, err)
+	files := make([]*ast.File, 0, len(bodies))
+	paths := make([]string, 0, len(bodies))
+	for index, body := range bodies {
+		path := "fixture.go"
+		source := fixturePreamble(body)
+		if index > 0 {
+			path = fmt.Sprintf("fixture_%d.go", index+1)
+			source = "package fixture\n" + body
+		}
+		file, err := parser.ParseFile(fset, path, source, parser.AllErrors)
+		require.NoError(t, err)
+		files = append(files, file)
+		paths = append(paths, path)
+	}
 	info := newTypesInfo()
 	conf := types.Config{Importer: importer.Default()}
-	pkg, err := conf.Check("fixture", fset, []*ast.File{file}, info)
+	pkg, err := conf.Check("fixture", fset, files, info)
 	require.NoError(t, err)
 
 	event := requireNamedTypeFromTypes(t, pkg, "SSEEvent")
@@ -990,7 +1089,9 @@ func scanTypedFixture(t *testing.T, body string) typedWiringScan {
 		sseTypeField:    requireStructField(t, event, "Type"),
 	}
 	var scan typedWiringScan
-	scanTypedFile("", "fixture.go", fset, file, info, objects, &scan)
+	for index, file := range files {
+		scanTypedFile("", paths[index], fset, file, info, objects, &scan)
+	}
 	return scan
 }
 
@@ -1202,10 +1303,11 @@ func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node)
 	current := sink
 	checkedBoundary := false
 	for {
-		if reason, dead := shortCircuitDeadPath(info, current, parents); dead {
+		boundary, body := enclosingFunctionBoundary(current, parents)
+		facts := immutableBooleanFacts(info, body, parents)
+		if reason, dead := shortCircuitDeadPath(info, current, parents, facts); dead {
 			return reason, true
 		}
-		boundary, body := enclosingFunctionBoundary(current, parents)
 		if body == nil {
 			if checkedBoundary {
 				return "", false
@@ -1224,7 +1326,118 @@ func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node)
 	}
 }
 
-func shortCircuitDeadPath(info *types.Info, node ast.Node, parents map[ast.Node]ast.Node) (string, bool) {
+func immutableBooleanFacts(info *types.Info, body *ast.BlockStmt, parents map[ast.Node]ast.Node) map[types.Object]bool {
+	facts := map[types.Object]bool{}
+	if body == nil {
+		return facts
+	}
+	root := ast.Node(body)
+	for parents[root] != nil {
+		root = parents[root]
+	}
+	initializers := map[types.Object]ast.Expr{}
+	writes := map[types.Object]int{}
+	addressTaken := map[types.Object]bool{}
+	recordWrite := func(ident *ast.Ident, initializer ast.Expr) {
+		if ident == nil || ident.Name == "_" {
+			return
+		}
+		object := info.ObjectOf(ident)
+		if object == nil {
+			return
+		}
+		variable, ok := object.(*types.Var)
+		if !ok || (variable.Pkg() != nil && variable.Parent() == variable.Pkg().Scope()) {
+			return
+		}
+		writes[object]++
+		if initializer != nil && initializers[object] == nil {
+			initializers[object] = initializer
+		}
+	}
+	ast.Inspect(root, func(node ast.Node) bool {
+		switch current := node.(type) {
+		case *ast.ValueSpec:
+			if len(current.Names) == len(current.Values) {
+				for index, name := range current.Names {
+					recordWrite(name, current.Values[index])
+				}
+			} else {
+				for _, name := range current.Names {
+					recordWrite(name, nil)
+				}
+			}
+		case *ast.AssignStmt:
+			for index, lhs := range current.Lhs {
+				ident, ok := unwrapParens(lhs).(*ast.Ident)
+				if !ok {
+					continue
+				}
+				var initializer ast.Expr
+				if current.Tok == token.DEFINE && len(current.Lhs) == len(current.Rhs) && info.Defs[ident] != nil {
+					initializer = current.Rhs[index]
+				}
+				recordWrite(ident, initializer)
+			}
+		case *ast.IncDecStmt:
+			ident, _ := unwrapParens(current.X).(*ast.Ident)
+			recordWrite(ident, nil)
+		case *ast.RangeStmt:
+			ident, _ := unwrapParens(current.Key).(*ast.Ident)
+			recordWrite(ident, nil)
+			ident, _ = unwrapParens(current.Value).(*ast.Ident)
+			recordWrite(ident, nil)
+		case *ast.UnaryExpr:
+			if current.Op == token.AND {
+				ident, _ := unwrapParens(current.X).(*ast.Ident)
+				if ident != nil && info.ObjectOf(ident) != nil {
+					addressTaken[info.ObjectOf(ident)] = true
+				}
+			}
+		case *ast.SelectorExpr:
+			selection := info.Selections[current]
+			if selection == nil {
+				break
+			}
+			method, ok := selection.Obj().(*types.Func)
+			if !ok {
+				break
+			}
+			signature, ok := method.Type().(*types.Signature)
+			if !ok || signature.Recv() == nil {
+				break
+			}
+			if _, ok := signature.Recv().Type().(*types.Pointer); !ok {
+				break
+			}
+			ident, _ := unwrapParens(current.X).(*ast.Ident)
+			if ident != nil && info.ObjectOf(ident) != nil {
+				addressTaken[info.ObjectOf(ident)] = true
+			}
+		}
+		return true
+	})
+
+	for changed := true; changed; {
+		changed = false
+		for object, initializer := range initializers {
+			if writes[object] != 1 || addressTaken[object] {
+				continue
+			}
+			value, known := definiteBool(info, initializer, facts)
+			if !known {
+				continue
+			}
+			if existing, present := facts[object]; !present || existing != value {
+				facts[object] = value
+				changed = true
+			}
+		}
+	}
+	return facts
+}
+
+func shortCircuitDeadPath(info *types.Info, node ast.Node, parents map[ast.Node]ast.Node, facts map[types.Object]bool) (string, bool) {
 	for child, parent := node, parents[node]; parent != nil; child, parent = parent, parents[parent] {
 		switch ancestor := parent.(type) {
 		case *ast.FuncDecl, *ast.FuncLit:
@@ -1233,7 +1446,7 @@ func shortCircuitDeadPath(info *types.Info, node ast.Node, parents map[ast.Node]
 			if ancestor.Y != child {
 				continue
 			}
-			left, known := definiteBool(info, ancestor.X)
+			left, known := definiteBool(info, ancestor.X, facts)
 			if !known {
 				continue
 			}
@@ -1261,6 +1474,7 @@ func enclosingFunctionBoundary(node ast.Node, parents map[ast.Node]ast.Node) (as
 }
 
 func cfgBodyDeadPath(info *types.Info, sink ast.Node, body *ast.BlockStmt, parents map[ast.Node]ast.Node) (string, bool) {
+	facts := immutableBooleanFacts(info, body, parents)
 	graph := cfg.New(body, func(call *ast.CallExpr) bool {
 		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
 		return !ok || builtin.Name() != "panic"
@@ -1318,7 +1532,7 @@ func cfgBodyDeadPath(info *types.Info, sink ast.Node, body *ast.BlockStmt, paren
 		} else if len(successors) == 2 && len(block.Nodes) > 0 {
 			if condition, ok := block.Nodes[len(block.Nodes)-1].(ast.Expr); ok {
 				_, isSwitchCaseValue := parents[condition].(*ast.CaseClause)
-				if value, known := definiteBool(info, condition); known && !isSwitchCaseValue {
+				if value, known := definiteBool(info, condition, facts); known && !isSwitchCaseValue {
 					if value {
 						successors = successors[:1]
 					} else {
@@ -1405,29 +1619,30 @@ func constantBool(info *types.Info, expr ast.Expr) (bool, bool) {
 	return constant.BoolVal(value), true
 }
 
-func definiteBool(info *types.Info, expr ast.Expr) (bool, bool) {
+func definiteBool(info *types.Info, expr ast.Expr, factSets ...map[types.Object]bool) (bool, bool) {
 	expr = unwrapParens(expr)
 	if value, known := constantBool(info, expr); known {
 		return value, true
 	}
 	switch node := expr.(type) {
+	case *ast.Ident:
+		if len(factSets) > 0 {
+			value, known := factSets[0][info.ObjectOf(node)]
+			return value, known
+		}
 	case *ast.UnaryExpr:
 		if node.Op == token.NOT {
-			value, known := definiteBool(info, node.X)
+			value, known := definiteBool(info, node.X, factSets...)
 			return !value, known
 		}
 	case *ast.CallExpr:
-		if len(node.Args) != 1 || !info.Types[node.Fun].IsType() {
+		if len(node.Args) != 1 || !info.Types[node.Fun].IsType() || !booleanOnlyType(info.TypeOf(node)) {
 			break
 		}
-		resultType := info.TypeOf(node)
-		basic, ok := resultType.Underlying().(*types.Basic)
-		if ok && basic.Info()&types.IsBoolean != 0 {
-			return definiteBool(info, node.Args[0])
-		}
+		return definiteBool(info, node.Args[0], factSets...)
 	case *ast.BinaryExpr:
-		left, leftKnown := definiteBool(info, node.X)
-		right, rightKnown := definiteBool(info, node.Y)
+		left, leftKnown := definiteBool(info, node.X, factSets...)
+		right, rightKnown := definiteBool(info, node.Y, factSets...)
 		switch node.Op {
 		case token.LAND:
 			if (leftKnown && !left) || (rightKnown && !right) {
@@ -1454,6 +1669,41 @@ func definiteBool(info *types.Info, expr ast.Expr) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func booleanOnlyType(valueType types.Type) bool {
+	if valueType == nil {
+		return false
+	}
+	if basic, ok := valueType.Underlying().(*types.Basic); ok {
+		return basic.Info()&types.IsBoolean != 0
+	}
+	parameter, ok := valueType.(*types.TypeParam)
+	if !ok {
+		return false
+	}
+	constraint, ok := parameter.Constraint().Underlying().(*types.Interface)
+	if !ok || constraint.NumEmbeddeds() == 0 {
+		return false
+	}
+	constraint.Complete()
+	foundTerm := false
+	for index := 0; index < constraint.NumEmbeddeds(); index++ {
+		embedded := constraint.EmbeddedType(index)
+		union, ok := embedded.(*types.Union)
+		if !ok {
+			return false
+		}
+		for termIndex := 0; termIndex < union.Len(); termIndex++ {
+			termType := union.Term(termIndex).Type()
+			basic, ok := termType.Underlying().(*types.Basic)
+			if !ok || basic.Info()&types.IsBoolean == 0 {
+				return false
+			}
+			foundTerm = true
+		}
+	}
+	return foundTerm
 }
 
 func selectedConstantSwitchCase(info *types.Info, switchStmt *ast.SwitchStmt) ([]*ast.CaseClause, int, bool) {
