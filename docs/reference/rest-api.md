@@ -1928,7 +1928,7 @@ vault-backed. A foreign request or result is never automatically journaled,
 embedded, indexed as memory, written to Badger/AppHash, or treated as trusted
 instructions (`internal/store/sqlite.go:4764-4837`,
 `internal/store/pipeline_transport.go:92-176`,
-`api/rest/pipe_handler.go:538-572`).
+`handlePipeSend`, `api/rest/pipe_handler.go:602-977`).
 
 ### `POST /v1/pipe/resolve`
 
@@ -2465,7 +2465,7 @@ Atomically claim a pipeline message (prevents double-processing).
 Submit a result for a claimed message. Purely local completion keeps the
 existing auto-journal summary. Federated completion does not journal and queues
 the result over the original agreement-bound return route
-(`api/rest/pipe_handler.go:538-633`).
+(`handlePipeSend`, `api/rest/pipe_handler.go:602-977`).
 
 **Request body:**
 
