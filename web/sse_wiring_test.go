@@ -416,6 +416,24 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			}`,
 		},
 		{
+			name: "closure emitter after false outcome equality is unreachable",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				_ = ((false && runtime) == true) && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "closure emitter after true outcome false comparison is unreachable",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				_ = ((true || runtime) == false) && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
 			name: "sink skipped by forward goto cannot count as an emitter",
 			body: `func mutate(b *SSEBroadcaster) {
 				goto done
@@ -678,6 +696,25 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 		require.Empty(t, scan.unresolved)
 		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
 	})
+
+	for _, tc := range []struct {
+		name string
+		expr string
+	}{
+		{name: "false outcome equals false evaluates closure", expr: "((false && runtime) == false)"},
+		{name: "symmetric inequality evaluates closure", expr: "(true != (false && runtime))"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, runtime bool) {
+				_ = `+tc.expr+` && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`)
+			require.Empty(t, scan.unresolved)
+			require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+		})
+	}
 
 	t.Run("selected switch intra-case goto keeps following emitter reachable", func(t *testing.T) {
 		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
@@ -1348,6 +1385,14 @@ func definiteBool(info *types.Info, expr ast.Expr) (bool, bool) {
 			}
 			if leftKnown && rightKnown {
 				return false, true
+			}
+		case token.EQL, token.NEQ:
+			if leftKnown && rightKnown {
+				equal := left == right
+				if node.Op == token.NEQ {
+					equal = !equal
+				}
+				return equal, true
 			}
 		}
 	}
