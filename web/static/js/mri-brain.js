@@ -161,6 +161,7 @@ const STYLE = `
 .mrib .hud .l{color:#5d7395;font-size:10px;letter-spacing:1px;text-transform:uppercase}
 .mrib .hud .btn{cursor:pointer;color:#39d0ff;background:transparent;font:inherit;border:1px solid #15233b;border-radius:8px;padding:6px 11px;user-select:none}
 .mrib .hud .btn:hover{background:#0e1b30}
+.mrib .hud .b-mode[aria-pressed="true"]{background:#0e2943;border-color:#39d0ff}
 .mrib .hud .btn:focus-visible,.mrib .lg-toggle:focus-visible{outline:2px solid #39d0ff;outline-offset:2px}
 .mrib .hud .sld{display:flex;align-items:center;gap:7px;color:#5d7395;font-size:10px;letter-spacing:1px;text-transform:uppercase}
 .mrib .hud .sld input{width:84px;accent-color:#39d0ff;cursor:pointer}
@@ -224,6 +225,7 @@ const STYLE = `
 :root[data-theme="light"] .mrib .hud .btn:hover,
 :root[data-theme="light"] .mrib .explore .ex-back:hover,
 :root[data-theme="light"] .mrib .explore .ex-font button:hover:not(:disabled){background:#e9eef4;color:#0e7490}
+:root[data-theme="light"] .mrib .hud .b-mode[aria-pressed="true"]{background:#dff5fb;border-color:#0e7490}
 :root[data-theme="light"] .mrib .legend .cls,
 :root[data-theme="light"] .mrib .legend .row .t span,
 :root[data-theme="light"] .mrib .lobes .more,
@@ -1439,7 +1441,7 @@ export function mountMriBrain(container, opts = {}) {
     const connectome = mode === 'connectome';
     const btn=$('.b-mode');
     if(btn) {
-      btn.textContent = connectome ? '◈ memory' : '◉ connectome';
+      btn.textContent = '◉ connectome';
       btn.setAttribute('aria-label', 'Connectome view');
       btn.setAttribute('aria-pressed', connectome ? 'true' : 'false');
     }

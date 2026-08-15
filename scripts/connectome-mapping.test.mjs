@@ -226,15 +226,20 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
   const $ = selector => elements[selector];
 
   runChrome($, root, 'connectome', true);
+  assert.equal(elements['.b-mode'].textContent, '◉ connectome',
+    'a toggle button keeps one visible label; aria-pressed carries its state');
   assert.equal(elements['.b-mode'].attrs['aria-label'], 'Connectome view',
     'aria-pressed needs a stable toggle name, not a changing action label');
   assert.equal(elements['.b-mode'].attrs['aria-pressed'], 'true');
+  assert.match(mriSource, /\.b-mode\[aria-pressed="true"\]\{[^}]*background:/,
+    'pressed state must remain visible without changing the toggle label');
   assert.equal(elements['.guide-memory'].hidden, true);
   assert.equal(elements['.guide-connectome'].hidden, false);
   assert.match(elements['.sr-status'].textContent, /Connectome view/);
   assert.deepEqual(labels.map(label => label.textContent), ['neurons', 'synapses', 'hubs']);
 
   runChrome($, root, 'memory', true);
+  assert.equal(elements['.b-mode'].textContent, '◉ connectome');
   assert.equal(elements['.b-mode'].attrs['aria-label'], 'Connectome view');
   assert.equal(elements['.b-mode'].attrs['aria-pressed'], 'false');
   assert.equal(elements['.guide-memory'].hidden, false);
