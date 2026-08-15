@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -26,6 +27,72 @@ func TestEngramIndexDeclaredOnBothBackends(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(pgSrc), "idx_memories_submitting_agent ON memories (submitting_agent, confidence_score)",
 		"postgres must declare the submitting_agent index too")
+}
+
+// TestCorroborationIndexDeclaredOnBothBackends mirrors the engram-index guard for
+// idx_corroborations_memory. The corroborations child FK column is not
+// auto-indexed by sqlite, so the CEREBRUM distributed-engram per-memory read
+// (and GetCorroborationCounts) would full-scan without it. It must be declared for
+// NEW databases (initSchema) AND EXISTING ones (the migration mirror) on sqlite,
+// and on postgres.
+func TestCorroborationIndexDeclaredOnBothBackends(t *testing.T) {
+	const idx = "idx_corroborations_memory ON corroborations(memory_id)"
+	sqlSrc, err := os.ReadFile("sqlite.go")
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, strings.Count(string(sqlSrc), idx), 2,
+		"sqlite must declare the corroborations index in BOTH initSchema and the migration mirror")
+
+	pgSrc, err := os.ReadFile("postgres.go")
+	require.NoError(t, err)
+	require.Contains(t, string(pgSrc), "idx_corroborations_memory ON corroborations (memory_id)",
+		"postgres must declare the corroborations index too")
+}
+
+// TestCorroborationIndexServesPerMemoryRead pins the plan for GetCorroborations'
+// query (WHERE memory_id = ? ORDER BY created_at): idx_corroborations_memory must
+// turn the per-memory read into a SEARCH (a seek), not a full scan of every
+// corroboration on the node — which is what the CEREBRUM lobe issues per
+// corroborated engram.
+//
+// Like the engram-index test, this deliberately does NOT ANALYZE: SAGE never runs
+// ANALYZE, so a real node has no sqlite_stat1. A plain equality on a single-column
+// index is used without stats, but pinning it here catches a regression to a scan
+// (which would need an INDEXED BY hint, per PR #181).
+func TestCorroborationIndexServesPerMemoryRead(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	at := time.Unix(1_700_000_000, 0).UTC()
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("m%03d", i)
+		require.NoError(t, s.InsertMemory(ctx, testMemory(id, "author", "content-"+id, "dom")))
+	}
+	for i := 0; i < 200; i++ {
+		require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{
+			MemoryID:  fmt.Sprintf("m%03d", i%20),
+			AgentID:   fmt.Sprintf("agent-%d", i),
+			CreatedAt: at.Add(time.Duration(i) * time.Second),
+		}))
+	}
+
+	rows, err := s.conn.QueryContext(ctx,
+		"EXPLAIN QUERY PLAN SELECT id, memory_id, agent_id, evidence, created_at FROM corroborations WHERE memory_id = ? ORDER BY created_at",
+		"m003")
+	require.NoError(t, err)
+	defer rows.Close() //nolint:errcheck
+	var plan string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notUsed, &detail))
+		plan += detail + "\n"
+	}
+	require.NoError(t, rows.Err())
+
+	require.Contains(t, plan, "idx_corroborations_memory",
+		"the per-memory corroborator read must SEARCH via the index, not a full scan; plan was:\n"+plan)
+	require.NotContains(t, plan, "SCAN corroborations",
+		"a full scan of corroborations per engram is exactly what the index must prevent; plan was:\n"+plan)
 }
 
 // The CEREBRUM agent-as-lobe read is `WHERE submitting_agent = ? [AND status = ?]

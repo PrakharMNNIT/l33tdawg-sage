@@ -227,7 +227,10 @@ export function stripBloom(graphData) {
   const links = (graphData && Array.isArray(graphData.links)) ? graphData.links : [];
   return {
     nodes: nodes.filter(n => !n._added),
-    links: links.filter(l => l.link_type !== 'focus'),
+    // Both bloom artifacts are transient: the 'focus' tethers from the neuron to
+    // its engrams, and the 'engram-bridge' links from an engram to the other
+    // neurons that corroborate it (the distributed engram). Real synapses stay.
+    links: links.filter(l => l.link_type !== 'focus' && l.link_type !== 'engram-bridge'),
   };
 }
 
@@ -246,6 +249,11 @@ export function mapEngrams(g) {
     status: e.status || 'committed',
     confidence: typeof e.confidence === 'number' ? e.confidence : 0.5,
     corroboration_count: e.corroboration_count || 0,
+    // The corroborating neurons the viewer is cleared to see — the endpoints the
+    // agent-as-lobe view bridges this engram to (the "distributed engram"). The
+    // server has already RBAC-filtered these; corroborators the viewer may not see
+    // survive only inside corroboration_count as the anonymous remainder.
+    corroborators: Array.isArray(e.corroborators) ? e.corroborators : [],
     memory_type: e.memory_type || '',
     created_at: e.created_at || '',
     _added: true,

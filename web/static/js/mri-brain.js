@@ -34,6 +34,12 @@ const LINK_TYPES = {
   // scale with traffic (Hebbian weight), so this one entry is styled dynamically
   // by the link accessors rather than by a fixed width like the memory link types.
   synapse:     { color: '#39d0ff', label: 'synapse',     typed: true },
+  // Connectome mode: a "distributed engram" bridge — a memory (engram) that a
+  // second neuron has also corroborated, drawn from the engram to that
+  // corroborating neuron. One memory bridged to several neurons is the same
+  // knowledge consolidated across cells. Kept faint so the neuron synapses stay
+  // dominant; styled dynamically by the width accessor like the synapse.
+  'engram-bridge': { color: '#d98cff', label: 'distributed engram', typed: false },
 };
 const PALETTE = ['#ff6b9d','#ffd166','#5ee2a0','#5ab0ff','#c08bff','#ff9f5a','#4dd6c4','#f7748a','#9ad14b','#7aa0ff'];
 function hexToRgb(h){ const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
@@ -498,6 +504,7 @@ export function mountMriBrain(container, opts = {}) {
   const restingWeight = l => (l._w||0) * plasticityOf(l);
   function linkWidthFor(l){
     if(l.link_type==='synapse') return 0.25 + restingWeight(l)*2.4 + synapsePulse(l)*2.0;
+    if(l.link_type==='engram-bridge') return 0.5;
     return l.link_type==='focus'?0.8 : l.link_type==='contradicts'?0.6 : (LINK_TYPES[l.link_type]||{}).typed?0.35:0.18;
   }
   function linkParticlesFor(l){
@@ -561,18 +568,30 @@ export function mountMriBrain(container, opts = {}) {
     if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id) return;
     const engrams = mapEngrams(payload);
     const gd = stripBloom(Graph.graphData());
-    const present = new Set(gd.nodes.map(nn => nn.id));
+    const nodeById = new Map(gd.nodes.map(nn => [nn.id, nn]));
     const fs = new Set(focusSet || [n.id]);
     engrams.forEach((em, i) => {
-      if (!present.has(em.id)) {
+      if (!nodeById.has(em.id)) {
         placeNear(em, n, i);
         gd.nodes.push(em);
-        present.add(em.id);
+        nodeById.set(em.id, em);
       }
       // endpoints are node OBJECTS so the tether renders under the pinned layout
       // (string ids go unresolved once the link force is nulled — see #188).
       gd.links.push({ source: n, target: em, link_type: 'focus' });
       fs.add(em.id);
+      // Distributed-engram bridges: this memory is also held by other neurons the
+      // viewer is cleared to see (the server already RBAC-filtered em.corroborators).
+      // Bridge the engram to each such corroborating neuron ALREADY rendered in the
+      // connectome — a memory spanning several neurons is one engram distributed
+      // across cells. Endpoints are node OBJECTS (#188). A corroborator absent from
+      // the graph (not a rendered neuron) is never bridged; it stays in the
+      // anonymous corroboration_count.
+      (em.corroborators || []).forEach(cid => {
+        if (cid === n.id) return;
+        const cn = nodeById.get(cid);
+        if (cn && cn.isNeuron) gd.links.push({ source: em, target: cn, link_type: 'engram-bridge' });
+      });
     });
     focusId = n.id; focusSet = fs;
     Graph.graphData(gd);

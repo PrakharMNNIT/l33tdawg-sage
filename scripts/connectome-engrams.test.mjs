@@ -44,6 +44,37 @@ test('an engram is NOT a neuron (renders via the memory node path, not neuronTin
   assert.notEqual(n.isNeuron, true, 'no isNeuron flag → memory styling, not a neuron');
 });
 
+// --- distributed engram (Phase B): corroborator bridges ---
+
+test('mapEngrams carries the server-disclosed corroborators; defaults to []', () => {
+  const [withCorr, without, bad] = mapEngrams({
+    engrams: [
+      { id: 'm1', content: 'shared', corroborators: ['bob', 'carol'] },
+      { id: 'm2', content: 'solo' },
+      { id: 'm3', content: 'malformed', corroborators: 'nope' },
+    ],
+  });
+  assert.deepEqual(withCorr.corroborators, ['bob', 'carol'], 'the RBAC-filtered corroborators pass through');
+  assert.deepEqual(without.corroborators, [], 'a solitary memory defaults to no corroborators');
+  assert.deepEqual(bad.corroborators, [], 'a non-array corroborators field is coerced to []');
+});
+
+test('stripBloom removes engram-bridge links (transient), keeps real synapses', () => {
+  const gd = {
+    nodes: [{ id: 'author', isNeuron: true }, { id: 'peer', isNeuron: true }, { id: 'm1', _added: true }],
+    links: [
+      { source: 'a', target: 'b', link_type: 'synapse' },
+      { source: 'author', target: 'm1', link_type: 'focus' },
+      { source: 'm1', target: 'peer', link_type: 'engram-bridge' },
+    ],
+  };
+  const out = stripBloom(gd);
+  assert.deepEqual(out.links.map(l => l.link_type), ['synapse'],
+    'both focus tethers AND engram-bridges are stripped; the real synapse stays');
+  assert.deepEqual(out.nodes.map(n => n.id), ['author', 'peer'],
+    'permanent neurons kept, transient engram removed');
+});
+
 // --- scoped mri-brain wiring ---
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 function functionBody(src, name) {
@@ -112,4 +143,17 @@ test('only a NEURON click blooms engrams — clicking a bloomed engram does not 
   // node. Guard: connectome click blooms only when n.isNeuron.
   assert.match(mriSource, /mode==='connectome'\)\s*\{\s*if \(n\.isNeuron\) bloomEngrams\(n\); \}\s*else exploreNode\(n\)/,
     'connectome click must bloom only neurons; memory-mode click keeps exploreNode');
+});
+
+test('bloomEngrams bridges an engram to its corroborating NEURONS using node objects', () => {
+  const body = functionBody(mriSource, 'bloomEngrams');
+  // gate: only bridge to a node that is present AND a neuron
+  assert.match(body, /cn && cn\.isNeuron/,
+    'a corroborator is bridged only when it resolves to a rendered NEURON node');
+  assert.match(body, /link_type:\s*'engram-bridge'/, 'the bridge carries the engram-bridge link_type');
+  // endpoints must be node OBJECTS (em and cn), not string ids (#188)
+  assert.match(body, /gd\.links\.push\(\{\s*source:\s*em,\s*target:\s*cn,\s*link_type:\s*'engram-bridge'\s*\}\)/,
+    'source/target must be the engram and neuron OBJECTS so the bridge renders under the pinned layout');
+  // never bridge back to the author neuron itself
+  assert.match(body, /if \(cid === n\.id\) return/, 'a self-bridge to the author neuron is skipped');
 });

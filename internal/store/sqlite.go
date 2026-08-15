@@ -520,6 +520,10 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 		evidence   TEXT,
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	);
+	-- corroborations is read by memory_id (per-memory corroborator set + count for
+	-- the CEREBRUM distributed-engram view, and GetCorroborationCounts); without
+	-- this the child FK column is unindexed and every such read is a full scan.
+	CREATE INDEX IF NOT EXISTS idx_corroborations_memory ON corroborations(memory_id);
 
 	CREATE TABLE IF NOT EXISTS challenges (
 		id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1372,6 +1376,7 @@ func (s *SQLiteStore) migrateTaskSupport(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_provider ON memories(provider)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_task_status ON memories(task_status) WHERE task_status != ''`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories(submitting_agent, confidence_score)`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_corroborations_memory ON corroborations(memory_id)`)
 }
 
 // --- Helper functions ---

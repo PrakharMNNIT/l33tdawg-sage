@@ -421,6 +421,9 @@ var postgresTaskAssignmentSchema = []string{
 	// CEREBRUM agent-as-lobe: each agent's top memories by confidence
 	// (WHERE submitting_agent = ? ORDER BY confidence_score DESC), index-satisfiable.
 	`CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories (submitting_agent, confidence_score)`,
+	// CEREBRUM distributed engrams: per-memory corroborator set + count
+	// (WHERE memory_id = ?), so the read is a seek, not a full scan.
+	`CREATE INDEX IF NOT EXISTS idx_corroborations_memory ON corroborations (memory_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_projection_page ON memories (created_at, memory_id)`,
 	// FindByContentHash became a live query in v11.11 (it previously returned a
