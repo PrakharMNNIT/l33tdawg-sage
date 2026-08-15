@@ -197,7 +197,7 @@ sage-gui setup
 
 ### 3. Start using it
 
-Just chat normally. SAGE v11.18.11 advertises 32 MCP tools. The core workflow is:
+Just chat normally. SAGE v11.18.11 advertises 33 MCP tools. The core workflow is:
 
 | Tool | What it does |
 |------|-------------|
