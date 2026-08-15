@@ -434,6 +434,33 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			}`,
 		},
 		{
+			name: "closure emitter after converted false boolean is unreachable",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				_ = bool(false && runtime) && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "closure emitter under converted false if condition is unreachable",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				if bool(false && runtime) {
+					func() { b.Broadcast(SSEEvent{Type: EventRemember}) }()
+				}
+			}`,
+		},
+		{
+			name: "named boolean conversion skips closure emitter",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				type flag bool
+				_ = flag(false && runtime) && func() flag {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
 			name: "sink skipped by forward goto cannot count as an emitter",
 			body: `func mutate(b *SSEBroadcaster) {
 				goto done
@@ -677,6 +704,27 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
 				_ = `+tc.expr+` func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`)
+			require.Empty(t, scan.unresolved)
+			require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+		})
+	}
+
+	for _, tc := range []struct {
+		name       string
+		expr       string
+		returnType string
+	}{
+		{name: "runtime-capable bool conversion can evaluate closure", expr: "bool(true && runtime)", returnType: "bool"},
+		{name: "definite named boolean conversion evaluates closure", expr: "flag(true || runtime)", returnType: "flag"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, runtime bool) {
+				type flag bool
+				_ = `+tc.expr+` && func() `+tc.returnType+` {
 					b.Broadcast(SSEEvent{Type: EventRemember})
 					return true
 				}()
@@ -1367,6 +1415,15 @@ func definiteBool(info *types.Info, expr ast.Expr) (bool, bool) {
 		if node.Op == token.NOT {
 			value, known := definiteBool(info, node.X)
 			return !value, known
+		}
+	case *ast.CallExpr:
+		if len(node.Args) != 1 || !info.Types[node.Fun].IsType() {
+			break
+		}
+		resultType := info.TypeOf(node)
+		basic, ok := resultType.Underlying().(*types.Basic)
+		if ok && basic.Info()&types.IsBoolean != 0 {
+			return definiteBool(info, node.Args[0])
 		}
 	case *ast.BinaryExpr:
 		left, leftKnown := definiteBool(info, node.X)
