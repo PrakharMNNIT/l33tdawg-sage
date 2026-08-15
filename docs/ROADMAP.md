@@ -71,9 +71,10 @@ Official signed task constructors now include the required initial `planned`
 status; REST rejects an omitted signed task status before broadcast rather than
 constructing a deterministic app-v23-through-app-v26 proof mismatch. Message
 and pipe responses expose exact immutable sender/counterparty IDs beside mutable
-friendly labels through one bounded metadata query, suppress foreign-chain
-collisions, preserve authorized rows on lookup failure, and keep count-only
-responses identity-free.
+friendly labels through one bounded batch metadata query on healthy production
+stores with a bounded exact-ID fallback, suppress foreign-chain collisions,
+preserve authorized rows on lookup failure, and keep count-only responses
+identity-free.
 
 Release-facing documentation now matches the 33-tool MCP inventory and current
 dependency/route contracts. Symbol-anchored code citations are repaired and

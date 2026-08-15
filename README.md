@@ -71,8 +71,9 @@ official task constructor explicitly signs the required initial `planned`
 status, and REST fails fast instead of mutating an omitted signed field into a
 transaction that app-v23 through app-v26 must reject. Authorized message and
 pipe responses retain exact immutable agent IDs alongside mutable presentation
-labels, use one bounded metadata query, suppress foreign-chain label
-collisions, and keep count-only responses identity-free.
+labels, use one bounded batch metadata query on healthy production stores with
+a bounded exact-ID fallback, suppress foreign-chain label collisions, and keep
+count-only responses identity-free.
 
 This patch also repairs release-facing documentation drift, pins the current
 33-tool MCP inventory, and adds fail-closed symbol/citation coverage for the
