@@ -49,8 +49,20 @@ func TestAppV23ConnectomeAndEngramBridgesExcludeInactiveAndPendingAgents(t *test
 
 	activePeer := registerPending("Active peer", 2)
 	activate(activePeer, "active-peer-home", 3)
-	inactivePeer := registerPending("Removed peer", 4)
-	activate(inactivePeer, "removed-peer-home", 5)
+	handoverAdmin := registerPending("Handover admin", 4)
+	activate(handoverAdmin, "handover-admin-home", 5)
+	adminEnrollment, err := fixture.badger.GetAppV23Enrollment(handoverAdmin)
+	require.NoError(t, err)
+	adminRole, err := fixture.badger.GetAppV23Role(handoverAdmin)
+	require.NoError(t, err)
+	require.NoError(t, fixture.badger.SetAppV23Policy(
+		fixture.rootID, handoverAdmin,
+		store.AppV23RoleAdmin, adminEnrollment.Profile, store.AppV23ProfileStandard,
+		4, store.AgentCapabilityReadAllDomains,
+		adminRole.Revision, adminEnrollment.Revision, 6,
+	))
+	inactivePeer := registerPending("Removed peer", 7)
+	activate(inactivePeer, "removed-peer-home", 8)
 	inactiveEnrollment, err := fixture.badger.GetAppV23Enrollment(inactivePeer)
 	require.NoError(t, err)
 	inactiveRole, err := fixture.badger.GetAppV23Role(inactivePeer)
@@ -60,51 +72,95 @@ func TestAppV23ConnectomeAndEngramBridgesExcludeInactiveAndPendingAgents(t *test
 			AgentID: inactivePeer, ApprovedBy: fixture.rootID, RootGeneration: 1,
 			Profile: inactiveEnrollment.Profile, HomeDomain: inactiveEnrollment.HomeDomain,
 			Clearance: inactiveEnrollment.Clearance, Capabilities: inactiveEnrollment.Capabilities,
-			Active: false, UpdatedHeight: 6, RetireOwnedDomainsToRoot: true,
+			Active: false, UpdatedHeight: 9, RetireOwnedDomainsToRoot: true,
 		},
 		inactiveRole.Role, inactiveEnrollment.Revision, inactiveRole.Revision,
 	))
-	pendingPeer := registerPending("Pending peer", 7)
+	pendingPeer := registerPending("Pending peer", 10)
 
 	base := time.Now().UTC().Truncate(time.Second)
 	insertSynapseMessage(t, sqlStore, "active-edge", fixture.agentID, activePeer, base)
-	insertSynapseMessage(t, sqlStore, "inactive-edge", fixture.agentID, inactivePeer, base.Add(time.Second))
-	insertSynapseMessage(t, sqlStore, "pending-edge", fixture.agentID, pendingPeer, base.Add(2*time.Second))
-
-	synapseRec := httptest.NewRecorder()
-	h.handleSynapses(synapseRec, httptest.NewRequest(http.MethodGet, "/v1/dashboard/network/synapses", nil))
-	require.Equal(t, http.StatusOK, synapseRec.Code, synapseRec.Body.String())
-	connectome := decodeSynapseBody(t, synapseRec)
-	neurons := make(map[string]bool, len(connectome.Neurons))
-	for _, neuron := range connectome.Neurons {
-		neurons[neuron.AgentID] = true
-	}
-	require.True(t, neurons[fixture.agentID])
-	require.True(t, neurons[activePeer])
-	require.False(t, neurons[inactivePeer], "a removed enrollment is historical, not a current neuron")
-	require.False(t, neurons[pendingPeer], "a pending registration is not a current neuron")
-	require.False(t, neurons[fixture.rootID], "CEREBRUM Root is not an ordinary Connectome neuron")
-	require.Len(t, connectome.Synapses, 1, "edges touching non-current neurons must be omitted")
-	require.Equal(t, activePeer, connectome.Synapses[0].ToAgent)
+	insertSynapseMessage(t, sqlStore, "admin-edge", fixture.agentID, handoverAdmin, base.Add(time.Second))
+	insertSynapseMessage(t, sqlStore, "inactive-edge", fixture.agentID, inactivePeer, base.Add(2*time.Second))
+	insertSynapseMessage(t, sqlStore, "pending-edge", fixture.agentID, pendingPeer, base.Add(3*time.Second))
 
 	seedEngramMemory(t, sqlStore, "active-memory", fixture.agentID, "historical evidence", "ops", 0.9, memory.StatusCommitted)
 	seedCorroboration(t, sqlStore, "active-memory", activePeer, base)
-	seedCorroboration(t, sqlStore, "active-memory", inactivePeer, base.Add(time.Second))
-	seedCorroboration(t, sqlStore, "active-memory", pendingPeer, base.Add(2*time.Second))
-	engramRec := httptest.NewRecorder()
-	h.handleEngrams(engramRec, httptest.NewRequest(
-		http.MethodGet, "/v1/dashboard/memory/engrams?agent="+fixture.agentID, nil,
-	))
-	require.Equal(t, http.StatusOK, engramRec.Code, engramRec.Body.String())
-	var engrams struct {
-		Engrams []engramNode `json:"engrams"`
+	seedCorroboration(t, sqlStore, "active-memory", handoverAdmin, base.Add(time.Second))
+	seedCorroboration(t, sqlStore, "active-memory", inactivePeer, base.Add(2*time.Second))
+	seedCorroboration(t, sqlStore, "active-memory", pendingPeer, base.Add(3*time.Second))
+
+	readConnectome := func() synapseBody {
+		rec := httptest.NewRecorder()
+		h.handleSynapses(rec, httptest.NewRequest(http.MethodGet, "/v1/dashboard/network/synapses", nil))
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		return decodeSynapseBody(t, rec)
 	}
-	require.NoError(t, json.Unmarshal(engramRec.Body.Bytes(), &engrams))
-	require.Len(t, engrams.Engrams, 1)
-	require.Equal(t, 3, engrams.Engrams[0].CorroborationCount,
+	readEngram := func() engramNode {
+		rec := httptest.NewRecorder()
+		h.handleEngrams(rec, httptest.NewRequest(
+			http.MethodGet, "/v1/dashboard/memory/engrams?agent="+fixture.agentID, nil,
+		))
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		var body struct {
+			Engrams []engramNode `json:"engrams"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+		require.Len(t, body.Engrams, 1)
+		return body.Engrams[0]
+	}
+	assertRoster := func(connectome synapseBody, wantAdmin bool) {
+		neurons := make(map[string]bool, len(connectome.Neurons))
+		for _, neuron := range connectome.Neurons {
+			neurons[neuron.AgentID] = true
+		}
+		require.True(t, neurons[fixture.agentID])
+		require.True(t, neurons[activePeer])
+		require.Equal(t, wantAdmin, neurons[handoverAdmin])
+		require.False(t, neurons[inactivePeer], "a removed enrollment is historical, not a current neuron")
+		require.False(t, neurons[pendingPeer], "a pending registration is not a current neuron")
+		require.False(t, neurons[fixture.rootID], "CEREBRUM Root is not an ordinary Connectome neuron")
+		toAgents := make(map[string]bool, len(connectome.Synapses))
+		for _, edge := range connectome.Synapses {
+			toAgents[edge.ToAgent] = true
+		}
+		require.True(t, toAgents[activePeer])
+		require.Equal(t, wantAdmin, toAgents[handoverAdmin])
+		require.False(t, toAgents[inactivePeer])
+		require.False(t, toAgents[pendingPeer])
+	}
+
+	assertRoster(readConnectome(), true)
+	beforeHandover := readEngram()
+	require.Equal(t, 4, beforeHandover.CorroborationCount)
+	require.ElementsMatch(t, []string{activePeer, handoverAdmin}, beforeHandover.Corroborators)
+
+	_, replacementKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	replacementRoot := agentIDForKey(replacementKey)
+	require.NoError(t, fixture.badger.RotateAppV23RootCredential(1, replacementRoot, 11))
+	assertRoster(readConnectome(), false)
+	afterHandover := readEngram()
+	require.Equal(t, 4, afterHandover.CorroborationCount,
 		"historical distinct evidence remains counted")
-	require.Equal(t, []string{activePeer}, engrams.Engrams[0].Corroborators,
-		"only current rendered neurons may be named as bridge endpoints")
+	require.Equal(t, []string{activePeer}, afterHandover.Corroborators,
+		"a prior-generation Admin is suspended from current bridge endpoints")
+
+	adminEnrollment, err = fixture.badger.GetAppV23Enrollment(handoverAdmin)
+	require.NoError(t, err)
+	adminRole, err = fixture.badger.GetAppV23Role(handoverAdmin)
+	require.NoError(t, err)
+	require.NoError(t, fixture.badger.SetAppV23Policy(
+		replacementRoot, handoverAdmin,
+		store.AppV23RoleAdmin, adminEnrollment.Profile, adminEnrollment.Profile,
+		adminEnrollment.Clearance, adminEnrollment.Capabilities,
+		adminRole.Revision, adminEnrollment.Revision, 12,
+	))
+	assertRoster(readConnectome(), true)
+	afterReauthorization := readEngram()
+	require.Equal(t, 4, afterReauthorization.CorroborationCount)
+	require.ElementsMatch(t, []string{activePeer, handoverAdmin}, afterReauthorization.Corroborators,
+		"current-Root reauthorization restores the Admin as a visible bridge endpoint")
 }
 
 func (s *failingBoundedEngramStore) GetCorroborationsBounded(_ context.Context, _ string, limit int) ([]*store.Corroboration, error) {
