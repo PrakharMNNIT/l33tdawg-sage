@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint, mapEngrams, stripBloom } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, createEngramBloomCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint, mapEngrams, stripBloom, applyEngramBloom } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -552,6 +552,8 @@ export function mountMriBrain(container, opts = {}) {
   }
   async function bloomEngrams(n){
     if (disposed || !Graph || !rendered || mode !== 'connectome') return;
+    const agentID = n.agent_id || n.id;
+    const bloomRequest = bloomLoads.begin(agentID);
     focusNeuron(n);
     // Clear any prior bloom IMMEDIATELY, before the fetch — so a failed, errored,
     // or superseded request never strands the previous agent's engrams under this
@@ -559,42 +561,18 @@ export function mountMriBrain(container, opts = {}) {
     clearBloom();
     let payload;
     try {
-      const resp = await fetch(ENGRAMS_URL + '?agent=' + encodeURIComponent(n.id), { credentials: 'same-origin' });
+      const resp = await fetch(ENGRAMS_URL + '?agent=' + encodeURIComponent(agentID), { credentials: 'same-origin' });
       if (!resp.ok) return;
       payload = await resp.json();
     } catch (e) { console.warn('[mri] engrams unavailable:', e.message); return; }
     // Superseded (another neuron clicked while this was in flight) or torn down:
     // drop the stale response rather than bloom it under the wrong focus.
-    if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id) return;
+    if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id ||
+        !bloomLoads.isCurrent(bloomRequest, agentID)) return;
     const engrams = mapEngrams(payload);
-    const gd = stripBloom(Graph.graphData());
-    const nodeById = new Map(gd.nodes.map(nn => [nn.id, nn]));
-    const fs = new Set(focusSet || [n.id]);
-    engrams.forEach((em, i) => {
-      if (!nodeById.has(em.id)) {
-        placeNear(em, n, i);
-        gd.nodes.push(em);
-        nodeById.set(em.id, em);
-      }
-      // endpoints are node OBJECTS so the tether renders under the pinned layout
-      // (string ids go unresolved once the link force is nulled — see #188).
-      gd.links.push({ source: n, target: em, link_type: 'focus' });
-      fs.add(em.id);
-      // Distributed-engram bridges: this memory is also held by other neurons the
-      // viewer is cleared to see (the server already RBAC-filtered em.corroborators).
-      // Bridge the engram to each such corroborating neuron ALREADY rendered in the
-      // connectome — a memory spanning several neurons is one engram distributed
-      // across cells. Endpoints are node OBJECTS (#188). A corroborator absent from
-      // the graph (not a rendered neuron) is never bridged; it stays in the
-      // anonymous corroboration_count.
-      (em.corroborators || []).forEach(cid => {
-        if (cid === n.id) return;
-        const cn = nodeById.get(cid);
-        if (cn && cn.isNeuron) gd.links.push({ source: em, target: cn, link_type: 'engram-bridge' });
-      });
-    });
-    focusId = n.id; focusSet = fs;
-    Graph.graphData(gd);
+    const composed = applyEngramBloom(Graph.graphData(), engrams, n, focusSet, placeNear);
+    focusId = n.id; focusSet = composed.focusSet;
+    Graph.graphData(composed.graphData);
     Graph.nodeColor(nodeColorRGBA);
     setFocusMarkerNode(n);
   }
@@ -696,6 +674,7 @@ export function mountMriBrain(container, opts = {}) {
   // Mode-aware source: the memory graph (domain-drillable) or the connectome.
   const fetchActive = requestMode => requestMode === 'connectome' ? loadSynapses(SYNAPSE_URL) : loadGraph(urlFor());
   const graphLoads = createGraphLoadCoordinator();
+  const bloomLoads = createEngramBloomCoordinator();
   let rendered = null;   // last graph data handed to ForceGraph (for neuron focus)
   const subs = [];
   let graphRetryTimer = null;
@@ -974,13 +953,11 @@ export function mountMriBrain(container, opts = {}) {
 
   function exitFocus(){
     if (!focusId) return;
+    bloomLoads.invalidate();
     focusId = null; focusSet = null;
     clearFocusMarker();
     if (Graph) {
-      const gd = Graph.graphData();
-      gd.nodes = gd.nodes.filter(n => !n._added);
-      gd.links = gd.links.filter(l => l.link_type !== 'focus');
-      Graph.graphData(gd);
+      Graph.graphData(stripBloom(Graph.graphData()));
       Graph.nodeColor(nodeColorRGBA);
     }
     hideExplorePanel();
@@ -1400,7 +1377,7 @@ export function mountMriBrain(container, opts = {}) {
       initializeGraph(d);
       // Deep-link: auto-bloom a requested agent's lobe on first connectome paint.
       if (focusAgent && !autoBloomed && mode === 'connectome' && rendered) {
-        const target = rendered.nodes.find(nd => nd.isNeuron && nd.id === focusAgent);
+        const target = rendered.nodes.find(nd => nd.isNeuron && (nd.agent_id || nd.id) === focusAgent);
         if (target) { autoBloomed = true; deepLinkTimer = setTimeout(() => { if (!disposed) bloomEngrams(target); }, 50); }
       }
     }).catch(() => {
@@ -1460,6 +1437,7 @@ export function mountMriBrain(container, opts = {}) {
   function setMode(next){
     if (mode===next || (next==='connectome' && !allowConnectome)) return;
     graphLoads.invalidate();
+    bloomLoads.invalidate();
     mode = next;
     connectomeActivity.reset();
     connectomeReloadIntent.reset();
@@ -1484,6 +1462,7 @@ export function mountMriBrain(container, opts = {}) {
 
   return function cleanup(){
     disposed = true;
+    bloomLoads.invalidate();
     clearTimeout(graphRetryTimer);
     clearInterval(plasticityTimer);
     clearTimeout(birthDecayTimer);

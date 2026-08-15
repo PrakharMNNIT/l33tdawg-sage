@@ -999,6 +999,23 @@ Pre-app-v23 nodes retain their legacy projection behavior.
 | `GET /v1/dashboard/memory/adoption-progress` | Root/operator aggregate App-v25 historical-recovery progress. It returns counts and state only—never the hidden records' content, domains, authors, or reasons. |
 | `POST /v1/dashboard/memory/adoption-retry` | Current-Root-only request for a fresh scan of the exact unresolved App-v25 snapshot. Requires the `projection_revision` field (zero is valid for a first upgraded snapshot) and a positive `expected_count`; it never deletes rows or clears earlier dispositions. |
 | `POST /v1/dashboard/memory/adoption-deprecate` | Current-Root-only retirement of the exact unresolved snapshot. Requires the `projection_revision` field (including valid zero), positive `expected_count`, and typed `DEPRECATE <count>` confirmation. Records remain preserved for audit and are skipped by future automatic repair. |
+| `GET /v1/dashboard/network/synapses` | Operator-only Connectome snapshot: registered agent neurons plus directed retained-message traffic, filtered so both edge endpoints are visible to the caller. |
+| `GET /v1/dashboard/memory/engrams?agent={id}` | Operator-only, projection-gated top committed memories authored by one visible neuron, with bounded corroborator bridge identities. |
+
+The engram response is capped at 24 memories in descending confidence order.
+Each item contains the true distinct `corroboration_count`, while
+`corroborators` contains at most 12 identities from a stable, SQL-bounded raw
+prefix. An identity is named only when it is already a registered Connectome
+neuron and is visible to the caller; hidden, external, excess, and unavailable
+identities remain anonymous inside the count. A missing registry or failed
+bounded read withholds all bridge identities without hiding the count. The
+identity list is historical corroboration evidence, not a claim that the peer
+currently possesses a copy. Challenged and deprecated memories are omitted;
+reinstatement makes a memory eligible again because it is committed. Registered
+neurons remain the Connectome identity boundary even when traffic has gone
+dormant—the view represents dormancy by activity, not by rewriting history
+(`handleEngrams`, `web/engrams_handler.go`; `handleSynapses`,
+`web/synapse_handler.go`).
 
 In v11.18.0 CEREBRUM presents this control plane as three explicit tabs:
 **Agents**, **Groups**, and **Federation**. Each tab uses a bounded compact list
@@ -2253,7 +2270,7 @@ address resolved from a bounded legacy-status offline cache can be accepted
 locally while the peer is down. Delivery waits for that peer to return and pass
 the fresh live authorization preflight above.
 
-**Size caps → HTTP 413.** `payload` is capped at 256 KiB and `intent` at 8 KiB (`MaxPipeContentBytes`/`MaxPipeIntentBytes`, `internal/store/store.go:513-515`). The REST handler fast-fails an over-cap request with **413** before the store write; the store enforces the same caps at the `InsertPipeline` chokepoint (`internal/store/sqlite.go:6338` payload, `:6341` intent) as defense in depth, mapping `ErrPipePayloadTooLarge`/`ErrPipeIntentTooLarge` (`store.go:527-529`) to 413.
+**Size caps → HTTP 413.** `payload` is capped at 256 KiB and `intent` at 8 KiB (`MaxPipeContentBytes`/`MaxPipeIntentBytes`, `internal/store/store.go:513-515`). The REST handler fast-fails an over-cap request with **413** before the store write; the store enforces the same caps at the `InsertPipeline` chokepoint (`internal/store/sqlite.go:6367` payload, `:6370` intent) as defense in depth, mapping `ErrPipePayloadTooLarge`/`ErrPipeIntentTooLarge` (`store.go:527-529`) to 413.
 
 **Open-pipe quota → HTTP 429 + `Retry-After`.** A single verified agent identity may hold at most 256 non-terminal (pending or claimed) pipes open at once, and a node caps 10000 across all requesters (`MaxOpenPipesPerAgent`/`MaxOpenPipesGlobal`). An index-backed COUNT and its INSERT run under the same write critical section, so parallel sends cannot race past either cap. Over-quota inserts are rejected as **429 with `Retry-After`** (`ErrPipeQuotaPerAgent`/`ErrPipeQuotaGlobal`), keyed on the Ed25519-verified `from_agent`, not the spoofable rate-limit header. This mirrors the mempool-full recipe (see `GET /v1/chain/backpressure` below): treat it as backpressure and retry after the hinted interval, not as a per-agent rate-limit breach.
 
@@ -2475,7 +2492,7 @@ the result over the original agreement-bound return route
 | `source_pipe_id` | string | for foreign work | Stable source proof/event ID returned with the inbox item; prevents replying against stale foreign metadata |
 | `source_chain_id` | string | for foreign work | Exact local reply-source chain returned as `reply_source_chain_id` by the pipe status preflight; prevents another node relabeling the signed result |
 
-`result` is capped at 256 KiB (`MaxPipeContentBytes`, `store.go:513`); an over-cap submission is rejected **HTTP 413**, enforced both at the handler and at the `CompletePipeline` store chokepoint (`sqlite.go:6604`, mapping `ErrPipeResultTooLarge`).
+`result` is capped at 256 KiB (`MaxPipeContentBytes`, `store.go:513`); an over-cap submission is rejected **HTTP 413**, enforced both at the handler and at the `CompletePipeline` store chokepoint (`sqlite.go:6633`, mapping `ErrPipeResultTooLarge`).
 
 **Response** (HTTP 200):
 `{"status":"completed","journal_id":"<memory_id or empty>","journaled":true|false}`.

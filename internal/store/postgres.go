@@ -421,9 +421,9 @@ var postgresTaskAssignmentSchema = []string{
 	// CEREBRUM agent-as-lobe: each agent's top memories by confidence
 	// (WHERE submitting_agent = ? ORDER BY confidence_score DESC), index-satisfiable.
 	`CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories (submitting_agent, confidence_score)`,
-	// CEREBRUM distributed engrams: per-memory corroborator set + count
-	// (WHERE memory_id = ?), so the read is a seek, not a full scan.
-	`CREATE INDEX IF NOT EXISTS idx_corroborations_memory ON corroborations (memory_id)`,
+	// CEREBRUM distributed engrams: bounded deterministic per-memory prefix.
+	// The memory_id prefix continues to serve the distinct-count aggregation.
+	`CREATE INDEX IF NOT EXISTS idx_corroborations_memory_order ON corroborations (memory_id, created_at, agent_id, id)`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_projection_page ON memories (created_at, memory_id)`,
 	// FindByContentHash became a live query in v11.11 (it previously returned a
@@ -1252,6 +1252,32 @@ func (s *PostgresStore) GetCorroborations(ctx context.Context, memoryID string) 
 		corrs = append(corrs, c)
 	}
 	return corrs, nil
+}
+
+// GetCorroborationsBounded returns a stable raw projection prefix for UI reads.
+// LIMIT applies in PostgreSQL before the caller performs visibility filtering.
+func (s *PostgresStore) GetCorroborationsBounded(ctx context.Context, memoryID string, limit int) ([]*Corroboration, error) {
+	if limit <= 0 {
+		return nil, errors.New("corroboration limit must be positive")
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT id, memory_id, agent_id, evidence, created_at
+		 FROM corroborations WHERE memory_id = $1
+		 ORDER BY created_at, agent_id, id LIMIT $2`, memoryID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get bounded corroborations: %w", err)
+	}
+	defer rows.Close()
+
+	corrs := make([]*Corroboration, 0, limit)
+	for rows.Next() {
+		c := &Corroboration{}
+		if scanErr := rows.Scan(&c.ID, &c.MemoryID, &c.AgentID, &c.Evidence, &c.CreatedAt); scanErr != nil {
+			return nil, fmt.Errorf("scan bounded corroboration: %w", scanErr)
+		}
+		corrs = append(corrs, c)
+	}
+	return corrs, rows.Err()
 }
 
 func (s *PostgresStore) GetPendingByDomain(ctx context.Context, domainTag string, limit int) ([]*memory.MemoryRecord, error) {

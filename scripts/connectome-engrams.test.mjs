@@ -2,7 +2,15 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { mapEngrams, stripBloom } from '../web/static/js/connectome-map.js';
+import {
+  agentNodeID,
+  applyEngramBloom,
+  createEngramBloomCoordinator,
+  engramNodeID,
+  mapConnectome,
+  mapEngrams,
+  stripBloom,
+} from '../web/static/js/connectome-map.js';
 
 // Agent-as-lobe (#182): clicking a neuron blooms its authored memories. mapEngrams
 // projects the /memory/engrams payload into transient memory nodes that orbit the
@@ -24,7 +32,8 @@ test('engrams map to transient memory nodes with sensible fallbacks', () => {
   });
   assert.equal(nodes.length, 2);
   const m1 = nodes[0];
-  assert.equal(m1.id, 'm1');
+  assert.equal(m1.id, 'memory:m1');
+  assert.equal(m1.memory_id, 'm1');
   assert.equal(m1.label, 'a fact');       // label from content
   assert.equal(m1.domain, 'ops');
   assert.equal(m1.confidence, 0.9);
@@ -75,6 +84,39 @@ test('stripBloom removes engram-bridge links (transient), keeps real synapses', 
     'permanent neurons kept, transient engram removed');
 });
 
+test('agent and memory identities are structurally namespaced on an exact raw-ID collision', () => {
+  const rawID = 'same-id';
+  const connectome = mapConnectome({
+    neurons: [{ agent_id: rawID, name: 'Author' }, { agent_id: 'peer', name: 'Peer' }],
+    synapses: [],
+  });
+  const [engram] = mapEngrams({
+    engrams: [{ id: rawID, content: 'memory', corroborators: ['peer'] }],
+  });
+  const author = connectome.nodes.find(node => node.agent_id === rawID);
+  const composed = applyEngramBloom(connectome, [engram], author, new Set([author.id]));
+
+  assert.equal(author.id, agentNodeID(rawID));
+  assert.equal(engram.id, engramNodeID(rawID));
+  assert.notEqual(author.id, engram.id);
+  assert.deepEqual(composed.graphData.nodes.map(node => node.id).sort(),
+    [agentNodeID(rawID), agentNodeID('peer'), engramNodeID(rawID)].sort());
+  const bridge = composed.graphData.links.find(link => link.link_type === 'engram-bridge');
+  assert.equal(bridge.source, engram, 'the bridge must use the inserted memory node object');
+  assert.equal(bridge.target.agent_id, 'peer');
+});
+
+test('bloom generations reject an older response for the same neuron', () => {
+  const loads = createEngramBloomCoordinator();
+  const older = loads.begin('alice');
+  const newer = loads.begin('alice');
+  assert.equal(loads.isCurrent(older, 'alice'), false);
+  assert.equal(loads.isCurrent(newer, 'alice'), true);
+  loads.invalidate();
+  assert.equal(loads.isCurrent(newer, 'alice'), false,
+    'background exit, mode change, or disposal must invalidate the in-flight bloom');
+});
+
 // --- scoped mri-brain wiring ---
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 function functionBody(src, name) {
@@ -91,15 +133,15 @@ function functionBody(src, name) {
 
 test('bloomEngrams fetches one agent from /memory/engrams and maps the result', () => {
   const body = functionBody(mriSource, 'bloomEngrams');
-  assert.match(body, /ENGRAMS_URL \+ '\?agent=' \+ encodeURIComponent\(n\.id\)/,
-    'must fetch a single agent on demand, not the whole brain');
+  assert.match(body, /ENGRAMS_URL \+ '\?agent=' \+ encodeURIComponent\(agentID\)/,
+    'must fetch a single raw agent identity, not the namespaced renderer id');
   assert.match(body, /mapEngrams\(payload\)/, 'must project via mapEngrams');
 });
 
-test('engram tethers use node OBJECTS so they render under the pinned layout', () => {
+test('renderer applies the behavior-tested bloom composition', () => {
   const body = functionBody(mriSource, 'bloomEngrams');
-  assert.match(body, /gd\.links\.push\(\{\s*source:\s*n,\s*target:\s*em,\s*link_type:\s*'focus'\s*\}\)/,
-    'source/target must be node objects (string ids go unresolved once forces are nulled — #188)');
+  assert.match(body, /applyEngramBloom\(Graph\.graphData\(\), engrams, n, focusSet, placeNear\)/,
+    'renderer must use the pure composition whose object endpoints and collisions are tested');
 });
 
 test('stripBloom removes _added engram nodes and focus tethers, keeps everything else', () => {
@@ -126,8 +168,15 @@ test('bloomEngrams clears the prior lobe BEFORE fetching — no stale bloom on f
   const fetchIdx = body.indexOf('await fetch');
   assert.ok(clearIdx !== -1 && fetchIdx !== -1 && clearIdx < fetchIdx,
     'clearBloom() must run before the fetch, so a failed/superseded request leaves nothing stranded');
-  assert.match(body, /focusId !== n\.id\) return/,
-    'a superseded response (another neuron clicked mid-flight) must be dropped, not bloomed');
+  assert.match(body, /!bloomLoads\.isCurrent\(bloomRequest, agentID\)\) return/,
+    'a superseded response, including the same neuron, must be generation-fenced');
+});
+
+test('every renderer focus-exit path strips bridges and invalidates in-flight blooms', () => {
+  const body = functionBody(mriSource, 'exitFocus');
+  assert.match(body, /bloomLoads\.invalidate\(\)/);
+  assert.match(body, /Graph\.graphData\(stripBloom\(Graph\.graphData\(\)\)\)/,
+    'background exit must remove focus and distributed-engram links together');
 });
 
 test('the 50ms deep-link bloom timer is tracked and cleared on dispose', () => {
@@ -145,15 +194,26 @@ test('only a NEURON click blooms engrams — clicking a bloomed engram does not 
     'connectome click must bloom only neurons; memory-mode click keeps exploreNode');
 });
 
-test('bloomEngrams bridges an engram to its corroborating NEURONS using node objects', () => {
-  const body = functionBody(mriSource, 'bloomEngrams');
-  // gate: only bridge to a node that is present AND a neuron
-  assert.match(body, /cn && cn\.isNeuron/,
-    'a corroborator is bridged only when it resolves to a rendered NEURON node');
-  assert.match(body, /link_type:\s*'engram-bridge'/, 'the bridge carries the engram-bridge link_type');
-  // endpoints must be node OBJECTS (em and cn), not string ids (#188)
-  assert.match(body, /gd\.links\.push\(\{\s*source:\s*em,\s*target:\s*cn,\s*link_type:\s*'engram-bridge'\s*\}\)/,
-    'source/target must be the engram and neuron OBJECTS so the bridge renders under the pinned layout');
-  // never bridge back to the author neuron itself
-  assert.match(body, /if \(cid === n\.id\) return/, 'a self-bridge to the author neuron is skipped');
+test('bloom composition bridges only rendered peer neurons and strips on background exit', () => {
+  const connectome = mapConnectome({
+    neurons: [{ agent_id: 'alice' }, { agent_id: 'bob' }],
+    synapses: [{ from_agent: 'alice', to_agent: 'bob', count: 1 }],
+  });
+  const author = connectome.nodes.find(node => node.agent_id === 'alice');
+  const [engram] = mapEngrams({
+    engrams: [{ id: 'm1', corroborators: ['alice', 'bob', 'not-rendered'] }],
+  });
+  const composed = applyEngramBloom(connectome, [engram], author, new Set([author.id]));
+  const bridges = composed.graphData.links.filter(link => link.link_type === 'engram-bridge');
+  assert.equal(bridges.length, 1, 'self and absent corroborators must not create bridges');
+  assert.equal(bridges[0].source, engram);
+  assert.equal(bridges[0].target.agent_id, 'bob');
+  assert.equal(composed.graphData.links.find(link => link.link_type === 'focus').target, engram);
+  assert.equal(composed.focusSet.has(agentNodeID('bob')), true,
+    'a bridged corroborator must stay lit with the distributed engram');
+
+  const exited = stripBloom(composed.graphData);
+  assert.deepEqual(exited.nodes.map(node => node.id).sort(),
+    [agentNodeID('alice'), agentNodeID('bob')].sort());
+  assert.deepEqual(exited.links.map(link => link.link_type), ['synapse']);
 });

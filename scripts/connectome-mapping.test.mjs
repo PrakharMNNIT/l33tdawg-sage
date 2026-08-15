@@ -28,7 +28,7 @@ const payload = {
 test('neurons become nodes with normalized degree (busiest = 1)', () => {
   const g = mapConnectome(payload);
   assert.equal(g.nodes.length, 3);
-  const by = Object.fromEntries(g.nodes.map(n => [n.id, n]));
+  const by = Object.fromEntries(g.nodes.map(n => [n.agent_id, n]));
   // total traffic (in+out): bob 5+2+1=8 (busiest), alice 5+2=7, carol 1
   assert.equal(by.bob._w, 8);
   assert.equal(by.alice._w, 7);
@@ -47,7 +47,7 @@ test('node fields map from the payload with sensible fallbacks', () => {
     ],
     synapses: [],
   });
-  const by = Object.fromEntries(g.nodes.map(n => [n.id, n]));
+  const by = Object.fromEntries(g.nodes.map(n => [n.agent_id, n]));
   assert.equal(by.x.label, 'X');
   assert.equal(by.x.domain, 'd');
   assert.equal(by.x.role, 'r');
@@ -61,19 +61,19 @@ test('synapses become weighted links normalized by the busiest edge', () => {
   const g = mapConnectome(payload);
   assert.equal(g.links.length, 3);
   const by = Object.fromEntries(g.links.map(l => [`${l.source}>${l.target}`, l]));
-  assert.equal(by['alice>bob'].count, 5);
-  assert.equal(by['alice>bob']._w, 1);        // busiest edge
-  assert.equal(by['bob>alice']._w, 2 / 5);
-  assert.equal(by['bob>carol']._w, 1 / 5);
+  assert.equal(by['agent:alice>agent:bob'].count, 5);
+  assert.equal(by['agent:alice>agent:bob']._w, 1);        // busiest edge
+  assert.equal(by['agent:bob>agent:alice']._w, 2 / 5);
+  assert.equal(by['agent:bob>agent:carol']._w, 1 / 5);
   assert.ok(g.links.every(l => l.link_type === 'synapse'));
-  assert.equal(by['alice>bob'].last_fired, '2026-08-12T10:00:00Z');
+  assert.equal(by['agent:alice>agent:bob'].last_fired, '2026-08-12T10:00:00Z');
 });
 
 test('direction is preserved: A->B is distinct from B->A', () => {
   const g = mapConnectome(payload);
   const keys = g.links.map(l => `${l.source}>${l.target}`);
-  assert.ok(keys.includes('alice>bob'));
-  assert.ok(keys.includes('bob>alice'));
+  assert.ok(keys.includes('agent:alice>agent:bob'));
+  assert.ok(keys.includes('agent:bob>agent:alice'));
 });
 
 test('edges to unknown agents are dropped (no ghost nodes)', () => {

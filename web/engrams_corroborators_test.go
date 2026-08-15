@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,18 @@ import (
 	"github.com/l33tdawg/sage/internal/store"
 	"github.com/stretchr/testify/require"
 )
+
+type failingBoundedEngramStore struct {
+	store.MemoryStore
+	calls  int
+	limits []int
+}
+
+func (s *failingBoundedEngramStore) GetCorroborationsBounded(_ context.Context, _ string, limit int) ([]*store.Corroboration, error) {
+	s.calls++
+	s.limits = append(s.limits, limit)
+	return nil, errors.New("bounded corroboration read unavailable")
+}
 
 // seedCorroboration records that agentID corroborated memID, the off-chain
 // corroborations table the distributed-engram disclosure reads (the same table
@@ -113,6 +126,41 @@ func TestHandleEngramsDisclosesAllNeuronCorroboratorsForHumanDashboard(t *testin
 		"even seeAll never names a non-neuron corroborator — the neuron registry is the boundary")
 }
 
+// Bridge eligibility follows the actual Connectome projection, not an unrelated
+// node-local activity/status table. A registered neuron with no retained traffic
+// is dormant but still rendered, so historical corroboration may bridge to it.
+func TestHandleEngramBridgeEndpointsMatchRenderedConnectomeNeurons(t *testing.T) {
+	h, s := newSynapseTestHandler(t)
+	for i, id := range []string{"alice", "bob"} {
+		require.NoError(t, h.BadgerStore.RegisterAgent(id, id, "member", "", "test", "", int64(i+1)))
+	}
+	seedEngramMemory(t, s, "m1", "alice", "a shared fact", "ops", 0.9, memory.StatusCommitted)
+	seedCorroboration(t, s, "m1", "bob", time.Now().UTC())
+
+	synapseRec := httptest.NewRecorder()
+	h.handleSynapses(synapseRec, httptest.NewRequest(http.MethodGet, "/v1/dashboard/network/synapses", nil))
+	require.Equal(t, http.StatusOK, synapseRec.Code, synapseRec.Body.String())
+	connectome := decodeSynapseBody(t, synapseRec)
+	rendered := make(map[string]bool, len(connectome.Neurons))
+	for _, neuron := range connectome.Neurons {
+		rendered[neuron.AgentID] = true
+	}
+	require.True(t, rendered["bob"], "a registered zero-traffic neuron remains visible as dormant")
+
+	engramRec := httptest.NewRecorder()
+	h.handleEngrams(engramRec, httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/engrams?agent=alice", nil))
+	require.Equal(t, http.StatusOK, engramRec.Code, engramRec.Body.String())
+	var body struct {
+		Engrams []engramNode `json:"engrams"`
+	}
+	require.NoError(t, json.Unmarshal(engramRec.Body.Bytes(), &body))
+	require.Len(t, body.Engrams, 1)
+	require.Equal(t, []string{"bob"}, body.Engrams[0].Corroborators)
+	for _, agentID := range body.Engrams[0].Corroborators {
+		require.True(t, rendered[agentID], "every bridge endpoint must exist in the rendered Connectome")
+	}
+}
+
 // TestHandleEngramsWithholdsCorroboratorsWithoutRegistry: with no neuron registry
 // we cannot confirm a corroborator is an already-visible neuron, so we disclose
 // NONE rather than risk naming an unconfirmed identity. The count is unaffected,
@@ -140,6 +188,35 @@ func TestHandleEngramsWithholdsCorroboratorsWithoutRegistry(t *testing.T) {
 	require.Equal(t, 1, body.Engrams[0].CorroborationCount, "the count still reflects the corroboration")
 	require.Empty(t, body.Engrams[0].Corroborators,
 		"without a registry to confirm neuron membership, no corroborator is named")
+}
+
+// A bounded per-engram identity read is optional and fail-closed. The separately
+// batched total remains useful, but a store error must never trigger the legacy
+// unbounded fallback or disclose an identity from a partial result.
+func TestHandleEngramsWithholdsCorroboratorsWhenBoundedReadFails(t *testing.T) {
+	h, s := newSynapseTestHandler(t)
+	require.NoError(t, h.BadgerStore.RegisterAgent("alice", "alice", "member", "", "test", "", 1))
+	require.NoError(t, h.BadgerStore.RegisterAgent("bob", "bob", "member", "", "test", "", 2))
+	seedEngramMemory(t, s, "m1", "alice", "a fact", "ops", 0.9, memory.StatusCommitted)
+	seedCorroboration(t, s, "m1", "bob", time.Now().UTC())
+
+	wrapped := &failingBoundedEngramStore{MemoryStore: h.store}
+	h.store = wrapped
+	req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/engrams?agent=alice", nil)
+	rec := httptest.NewRecorder()
+	h.handleEngrams(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var body struct {
+		Engrams []engramNode `json:"engrams"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Engrams, 1)
+	require.Equal(t, 1, body.Engrams[0].CorroborationCount)
+	require.Empty(t, body.Engrams[0].Corroborators)
+	require.Equal(t, 1, wrapped.calls)
+	require.Equal(t, []int{engramCorroboratorScanLimit}, wrapped.limits,
+		"the handler must request the fixed raw-row cap")
 }
 
 // TestHandleEngramsCapsCorroboratorBridges: a memory corroborated by more neurons

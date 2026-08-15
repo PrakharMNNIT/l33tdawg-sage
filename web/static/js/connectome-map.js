@@ -51,6 +51,12 @@ export function isLater(a, b) {
   return ka.nanos > kb.nanos;                  // fixed 9-digit width → lexical === numeric
 }
 
+// Neurons and memories share one graph, so their renderer IDs must not share a
+// raw keyspace. Prefixing both kinds makes collisions structurally impossible
+// even when a client-selected memory ID exactly equals an agent ID.
+export const agentNodeID = agentID => `agent:${String(agentID || '')}`;
+export const engramNodeID = memoryID => `memory:${String(memoryID || '')}`;
+
 export function mapConnectome(g) {
   const srcNeurons = (g && Array.isArray(g.neurons)) ? g.neurons : [];
   const srcSynapses = (g && Array.isArray(g.synapses)) ? g.synapses : [];
@@ -75,7 +81,8 @@ export function mapConnectome(g) {
   for (const w of Object.values(weight)) { if (w > maxWeight) maxWeight = w; }
 
   const nodes = srcNeurons.map(n => ({
-    id: n.agent_id,
+    id: agentNodeID(n.agent_id),
+    agent_id: n.agent_id,
     domain: n.domain || n.role || 'agent',
     label: n.name || n.agent_id,
     role: n.role || '',
@@ -93,7 +100,7 @@ export function mapConnectome(g) {
   const links = srcSynapses
     .filter(s => ids.has(s.from_agent) && ids.has(s.to_agent))
     .map(s => ({
-      source: s.from_agent, target: s.to_agent, link_type: 'synapse',
+      source: agentNodeID(s.from_agent), target: agentNodeID(s.to_agent), link_type: 'synapse',
       count: s.count || 0, last_fired: s.last_fired || '',
       _w: maxCount ? (s.count || 0) / maxCount : 0,
     }));
@@ -113,6 +120,19 @@ export function createGraphLoadCoordinator() {
     invalidate() { generation += 1; },
     isCurrent(request, mode) {
       return request && request.generation === generation && request.mode === mode;
+    },
+  };
+}
+
+// Each neuron bloom owns one generation. Agent ID alone is not a sufficient
+// fence: two requests for the same neuron can complete in reverse order.
+export function createEngramBloomCoordinator() {
+  let generation = 0;
+  return {
+    begin(agentID) { return { generation: ++generation, agentID }; },
+    invalidate() { generation += 1; },
+    isCurrent(request, agentID) {
+      return request && request.generation === generation && request.agentID === agentID;
     },
   };
 }
@@ -234,6 +254,37 @@ export function stripBloom(graphData) {
   };
 }
 
+// Compose one transient lobe onto a connectome graph. Kept pure (placement is a
+// callback) so cleanup, ID collisions, and bridge endpoints are behaviorally
+// testable without a WebGL renderer.
+export function applyEngramBloom(graphData, engrams, authorNode, focusSet, placeNode = () => {}) {
+  const gd = stripBloom(graphData);
+  const nodeByID = new Map(gd.nodes.map(node => [node.id, node]));
+  const nextFocus = new Set(focusSet || [authorNode.id]);
+
+  (Array.isArray(engrams) ? engrams : []).forEach((candidate, index) => {
+    let engram = nodeByID.get(candidate.id);
+    if (!engram) {
+      engram = candidate;
+      placeNode(engram, authorNode, index);
+      gd.nodes.push(engram);
+      nodeByID.set(engram.id, engram);
+    }
+    gd.links.push({ source: authorNode, target: engram, link_type: 'focus' });
+    nextFocus.add(engram.id);
+    (engram.corroborators || []).forEach(agentID => {
+      if (agentID === authorNode.agent_id) return;
+      const neuron = nodeByID.get(agentNodeID(agentID));
+      if (neuron && neuron.isNeuron) {
+        gd.links.push({ source: engram, target: neuron, link_type: 'engram-bridge' });
+        nextFocus.add(neuron.id);
+      }
+    });
+  });
+
+  return { graphData: gd, focusSet: nextFocus };
+}
+
 // Maps the /v1/dashboard/memory/engrams payload (one agent's authored memories)
 // into memory node objects that orbit their author neuron in the agent-as-lobe
 // view. Pure. `_added` marks them transient (the renderer strips _added nodes on
@@ -243,7 +294,8 @@ export function stripBloom(graphData) {
 export function mapEngrams(g) {
   const src = (g && Array.isArray(g.engrams)) ? g.engrams : [];
   return src.map(e => ({
-    id: e.id,
+    id: engramNodeID(e.id),
+    memory_id: e.id,
     domain: e.domain || 'unknown',
     label: e.content || e.id,
     status: e.status || 'committed',

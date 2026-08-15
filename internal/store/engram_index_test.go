@@ -30,34 +30,38 @@ func TestEngramIndexDeclaredOnBothBackends(t *testing.T) {
 }
 
 // TestCorroborationIndexDeclaredOnBothBackends mirrors the engram-index guard for
-// idx_corroborations_memory. The corroborations child FK column is not
+// idx_corroborations_memory_order. The corroborations child FK column is not
 // auto-indexed by sqlite, so the CEREBRUM distributed-engram per-memory read
 // (and GetCorroborationCounts) would full-scan without it. It must be declared for
 // NEW databases (initSchema) AND EXISTING ones (the migration mirror) on sqlite,
 // and on postgres.
 func TestCorroborationIndexDeclaredOnBothBackends(t *testing.T) {
-	const idx = "idx_corroborations_memory ON corroborations(memory_id)"
+	const idx = "idx_corroborations_memory_order"
 	sqlSrc, err := os.ReadFile("sqlite.go")
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, strings.Count(string(sqlSrc), idx), 2,
 		"sqlite must declare the corroborations index in BOTH initSchema and the migration mirror")
+	require.Contains(t, string(sqlSrc),
+		"WHERE memory_id = ? ORDER BY created_at, agent_id, id LIMIT ?",
+		"sqlite must apply the total order and row bound in SQL")
 
 	pgSrc, err := os.ReadFile("postgres.go")
 	require.NoError(t, err)
-	require.Contains(t, string(pgSrc), "idx_corroborations_memory ON corroborations (memory_id)",
+	require.Contains(t, string(pgSrc), "idx_corroborations_memory_order ON corroborations (memory_id, created_at, agent_id, id)",
 		"postgres must declare the corroborations index too")
+	require.Contains(t, string(pgSrc),
+		"ORDER BY created_at, agent_id, id LIMIT $2",
+		"postgres must keep the same total order and database-side row bound")
 }
 
-// TestCorroborationIndexServesPerMemoryRead pins the plan for GetCorroborations'
-// query (WHERE memory_id = ? ORDER BY created_at): idx_corroborations_memory must
-// turn the per-memory read into a SEARCH (a seek), not a full scan of every
-// corroboration on the node — which is what the CEREBRUM lobe issues per
-// corroborated engram.
+// TestCorroborationIndexServesPerMemoryRead pins the bounded CEREBRUM query:
+// it must seek one memory, satisfy the total order from the composite index,
+// and apply LIMIT without a table scan or temporary sort.
 //
 // Like the engram-index test, this deliberately does NOT ANALYZE: SAGE never runs
-// ANALYZE, so a real node has no sqlite_stat1. A plain equality on a single-column
-// index is used without stats, but pinning it here catches a regression to a scan
-// (which would need an INDEXED BY hint, per PR #181).
+// ANALYZE, so a real node has no sqlite_stat1. Pinning the production query here
+// catches a regression to a scan or a temporary sort (the former needs the same
+// INDEXED BY protection learned in PR #181).
 func TestCorroborationIndexServesPerMemoryRead(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -76,8 +80,10 @@ func TestCorroborationIndexServesPerMemoryRead(t *testing.T) {
 	}
 
 	rows, err := s.conn.QueryContext(ctx,
-		"EXPLAIN QUERY PLAN SELECT id, memory_id, agent_id, evidence, created_at FROM corroborations WHERE memory_id = ? ORDER BY created_at",
-		"m003")
+		`EXPLAIN QUERY PLAN SELECT id, memory_id, agent_id, evidence, created_at
+		 FROM corroborations INDEXED BY idx_corroborations_memory_order
+		 WHERE memory_id = ? ORDER BY created_at, agent_id, id LIMIT ?`,
+		"m003", 12)
 	require.NoError(t, err)
 	defer rows.Close() //nolint:errcheck
 	var plan string
@@ -89,10 +95,34 @@ func TestCorroborationIndexServesPerMemoryRead(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 
-	require.Contains(t, plan, "idx_corroborations_memory",
+	require.Contains(t, plan, "idx_corroborations_memory_order",
 		"the per-memory corroborator read must SEARCH via the index, not a full scan; plan was:\n"+plan)
 	require.NotContains(t, plan, "SCAN corroborations",
 		"a full scan of corroborations per engram is exactly what the index must prevent; plan was:\n"+plan)
+	require.NotContains(t, plan, "USE TEMP B-TREE",
+		"the composite index must satisfy the deterministic order without a temp sort; plan was:\n"+plan)
+}
+
+func TestGetCorroborationsBoundedCapsAndTotallyOrdersRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	at := time.Unix(1_700_000_000, 0).UTC()
+	require.NoError(t, s.InsertMemory(ctx, testMemory("m1", "author", "content-m1", "dom")))
+	for i := 19; i >= 0; i-- {
+		require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{
+			MemoryID: "m1", AgentID: fmt.Sprintf("agent-%02d", i), CreatedAt: at,
+		}))
+	}
+
+	got, err := s.GetCorroborationsBounded(ctx, "m1", 12)
+	require.NoError(t, err)
+	require.Len(t, got, 12, "the database result itself must be capped")
+	for i, corr := range got {
+		require.Equal(t, fmt.Sprintf("agent-%02d", i), corr.AgentID,
+			"same-timestamp rows must use agent_id as a stable tie-breaker")
+	}
+	_, err = s.GetCorroborationsBounded(ctx, "m1", 0)
+	require.Error(t, err, "an absent SQL bound must fail closed")
 }
 
 // The CEREBRUM agent-as-lobe read is `WHERE submitting_agent = ? [AND status = ?]

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -9,6 +10,14 @@ import (
 	"github.com/l33tdawg/sage/internal/memory"
 	"github.com/l33tdawg/sage/internal/store"
 )
+
+// boundedEngramCorroborationReader is deliberately optional: a store that
+// cannot apply the row bound in SQL discloses no bridge identities rather than
+// falling back to an unbounded projection read. The distinct total is fetched
+// separately through the required OffchainStore contract.
+type boundedEngramCorroborationReader interface {
+	GetCorroborationsBounded(ctx context.Context, memoryID string, limit int) ([]*store.Corroboration, error)
+}
 
 // engramNode is one memory authored by an agent — an "engram" that orbits its
 // author neuron in the CEREBRUM agent-as-lobe view.
@@ -58,6 +67,12 @@ const engramRawScanCap = engramFetchLimit * 8
 // of edges; the bridges illustrate that a memory is distributed across cells, and
 // CorroborationCount still carries the true total for the anonymous remainder.
 const engramCorroboratorLimit = 12
+
+// Filtering happens after the SQL read because registry membership lives in
+// Badger. Bound the raw deterministic prefix as well as the rendered bridge
+// count so historical duplicates or very large corroborator sets cannot turn
+// one lobe request into unbounded row materialization.
+const engramCorroboratorScanLimit = engramCorroboratorLimit * 8
 
 // handleEngrams returns ONE agent's authored memories — the "engrams" that
 // re-anchor to their author neuron in the agent-as-lobe view. It is loaded on
@@ -213,6 +228,7 @@ func (h *DashboardHandler) handleEngrams(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
+	corroborationReader, canReadBoundedCorroborations := h.store.(boundedEngramCorroborationReader)
 
 	engrams := make([]engramNode, 0, len(records))
 	for _, rec := range records {
@@ -223,7 +239,7 @@ func (h *DashboardHandler) handleEngrams(w http.ResponseWriter, r *http.Request)
 		// under the same rule the synapse edge guard applies, and (c) not the author
 		// itself; the rest survive only in CorroborationCount as the anonymous "+N".
 		var corroborators []string
-		if neuronSet != nil && corrCounts[rec.MemoryID] > 0 {
+		if neuronSet != nil && canReadBoundedCorroborations && corrCounts[rec.MemoryID] > 0 {
 			// A per-engram corroborator read failure degrades to "no bridges for this
 			// engram" rather than failing the whole lobe — the same fail-closed choice
 			// the missing-registry path makes above, applied per record because this
@@ -231,7 +247,9 @@ func (h *DashboardHandler) handleEngrams(w http.ResponseWriter, r *http.Request)
 			// corroboration_count still conveys the memory is distributed; only the
 			// bridges are withheld. The count is a separate batch read that already
 			// succeeded, so the "held across N" total is unaffected.
-			corrs, cErr := h.store.GetCorroborations(ctx, rec.MemoryID)
+			corrs, cErr := corroborationReader.GetCorroborationsBounded(
+				ctx, rec.MemoryID, engramCorroboratorScanLimit,
+			)
 			if cErr != nil {
 				corrs = nil
 			}
