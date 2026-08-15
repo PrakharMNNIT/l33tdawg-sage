@@ -9,6 +9,43 @@ const appSource = await readFile(new URL('../web/static/js/app.js', import.meta.
 const cssSource = await readFile(new URL('../web/static/css/sage.css', import.meta.url), 'utf8');
 const mriPageSource = await readFile(new URL('../web/static/mri.html', import.meta.url), 'utf8');
 
+function bracedBlock(source, marker, from = 0) {
+  const start = source.indexOf(marker, from);
+  assert.notEqual(start, -1, `${marker} not found`);
+  const open = source.indexOf('{', start + marker.length);
+  assert.notEqual(open, -1, `${marker} block did not open`);
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}' && --depth === 0) {
+      return { body: source.slice(open + 1, i), start, end: i + 1 };
+    }
+  }
+  assert.fail(`${marker} block did not close`);
+}
+
+function cssDeclarations(source, exactSelector) {
+  const executable = source.replace(/\/\*[\s\S]*?\*\//g, '');
+  let cursor = 0;
+  let found = null;
+  while (cursor < executable.length) {
+    const open = executable.indexOf('{', cursor);
+    if (open === -1) break;
+    const close = executable.indexOf('}', open + 1);
+    if (close === -1) break;
+    const boundary = Math.max(executable.lastIndexOf('}', open - 1), executable.lastIndexOf('{', open - 1));
+    const selector = executable.slice(boundary + 1, open).trim();
+    if (selector === exactSelector) found = executable.slice(open + 1, close);
+    cursor = close + 1;
+  }
+  assert.notEqual(found, null, `${exactSelector} rule not found`);
+  return Object.fromEntries(found.split(';').map(part => part.trim()).filter(Boolean).map(part => {
+    const colon = part.indexOf(':');
+    assert.ok(colon > 0, `invalid declaration in ${exactSelector}: ${part}`);
+    return [part.slice(0, colon).trim(), part.slice(colon + 1).trim()];
+  }));
+}
+
 // The CEREBRUM connectome view renders the agent message-bus in the brain hull.
 // mapConnectome() is the pure projection from the /network/synapses payload onto
 // the MRI render contract; these tests pin the invariants the renderer relies on:
@@ -193,10 +230,34 @@ test('connectome guidance is reachable without adding another floating panel', (
     'the dashboard How to read guide must retain the connectome explanation');
   assert.match(appSource, /class="brain-domain-reset"/,
     'the mobile-only action hiding rule needs an explicit Reset target');
-  assert.match(cssSource, /\.brain-domain-head-actions \.brain-domain-reset\s*\{\s*display:\s*none;/,
+  const executableCss = cssSource.replace(/\/\*[\s\S]*?\*\//g, '');
+  const mobileBlocks = [];
+  let mobileCursor = 0;
+  while ((mobileCursor = executableCss.indexOf('@media (max-width: 760px)', mobileCursor)) !== -1) {
+    const block = bracedBlock(executableCss, '@media (max-width: 760px)', mobileCursor);
+    mobileBlocks.push(block.body);
+    mobileCursor = block.end;
+  }
+  const inventoryMobile = mobileBlocks.find(block => block.includes('.brain-domain-head-actions .brain-domain-reset'));
+  assert.ok(inventoryMobile, 'the executable 760px mobile block must target Reset explicitly');
+  assert.equal(cssDeclarations(inventoryMobile, '.brain-domain-head-actions .brain-domain-reset').display, 'none',
     'mobile may hide Reset, not the How to read button');
-  assert.doesNotMatch(cssSource, /\.brain-domain-head-actions button:first-child\s*\{\s*display:\s*none;/,
+  assert.doesNotMatch(executableCss, /\.brain-domain-head-actions button:first-child\s*\{\s*display:\s*none;/,
     'mobile must not hide whichever action happens to be first');
+});
+
+test('mode controls retain visible pressed and keyboard-focus styling in both themes', () => {
+  const styleStart = mriSource.indexOf('const STYLE = `');
+  const styleEnd = mriSource.indexOf('`;\n\nfunction injectStyleOnce', styleStart);
+  assert.ok(styleStart >= 0 && styleEnd > styleStart, 'the executable MRI stylesheet must remain inspectable');
+  const style = mriSource.slice(styleStart, styleEnd);
+  const darkPressed = cssDeclarations(style, '.mrib .hud .b-mode[aria-pressed="true"]');
+  const lightPressed = cssDeclarations(style, ':root[data-theme="light"] .mrib .hud .b-mode[aria-pressed="true"]');
+  const focus = cssDeclarations(style, '.mrib .hud .btn:focus-visible,.mrib .lg-toggle:focus-visible');
+
+  assert.deepEqual(darkPressed, { background: '#0e2943', 'border-color': '#39d0ff' });
+  assert.deepEqual(lightPressed, { background: '#dff5fb', 'border-color': '#0e7490' });
+  assert.deepEqual(focus, { outline: '2px solid #39d0ff', 'outline-offset': '2px' });
 });
 
 test('mode chrome exposes coherent toggle state, active guidance, and live status', () => {
@@ -249,8 +310,23 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
   const executableSetMode = functionBody('setMode')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/.*$/gm, '');
-  assert.match(executableSetMode, /updateModeChrome\(true\);/,
-    'a real mode transition must invoke the announcing path');
+  const modeAnnouncements = [];
+  const runSetMode = new Function(
+    'next', 'mode', 'allowConnectome', 'graphLoads', 'bloomLoads', 'connectomeActivity',
+    'connectomeReloadIntent', 'neuronBirths', 'currentDomain', 'focusId', 'focusSet',
+    'hideExplorePanel', 'clearFocusMarker', 'updateModeChrome', 'hullState', '$',
+    'sliderUnits', 'setHullOpacity', 'Graph', 'load', 'zoomOut', 'acquireInitialGraph',
+    executableSetMode,
+  );
+  const resettable = () => ({ reset() {} });
+  runSetMode(
+    'connectome', 'memory', true, { invalidate() {} }, { invalidate() {} }, resettable(),
+    resettable(), resettable(), null, null, null, () => {}, () => {},
+    announce => modeAnnouncements.push(announce), { valueFor: () => 0.03 }, () => null,
+    value => value, () => {}, null, () => {}, () => {}, () => {},
+  );
+  assert.deepEqual(modeAnnouncements, [true],
+    'the executable mode transition must invoke the announcing chrome path exactly once');
 });
 
 // Live firing pulses only the synapses that actually carried a message. The
