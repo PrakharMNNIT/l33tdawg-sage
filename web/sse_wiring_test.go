@@ -364,6 +364,58 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 			}`,
 		},
 		{
+			name: "closure emitter under constant false outer branch is unreachable",
+			body: `func mutate(b *SSEBroadcaster) {
+				if false {
+					f := func() { b.Broadcast(SSEEvent{Type: EventRemember}) }
+					f()
+				}
+			}`,
+		},
+		{
+			name: "closure emitter constructed after return is unreachable",
+			body: `func mutate(b *SSEBroadcaster) {
+				return
+				_ = func() { b.Broadcast(SSEEvent{Type: EventRemember}) }
+			}`,
+		},
+		{
+			name: "closure emitter in constant false short circuit operand is unreachable",
+			body: `func mutate(b *SSEBroadcaster) {
+				_ = false && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "closure emitter in constant true or operand is unreachable",
+			body: `func mutate(b *SSEBroadcaster) {
+				_ = true || func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return false
+				}()
+			}`,
+		},
+		{
+			name: "closure emitter after nested absorbing false and is unreachable",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				_ = (false && runtime) && func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`,
+		},
+		{
+			name: "closure emitter after nested absorbing true or is unreachable",
+			body: `func mutate(b *SSEBroadcaster, runtime bool) {
+				_ = (true || runtime) || func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return false
+				}()
+			}`,
+		},
+		{
 			name: "sink skipped by forward goto cannot count as an emitter",
 			body: `func mutate(b *SSEBroadcaster) {
 				goto done
@@ -583,6 +635,45 @@ func TestTypedSSEWiringGuardRejectsVerifiedBypassMatrix(t *testing.T) {
 		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, cond bool) {
 			if cond { (panic("stop")) }
 			b.Broadcast(SSEEvent{Type: EventRemember})
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	t.Run("invoked closure emitter in reachable outer block remains reachable", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+			f := func() { b.Broadcast(SSEEvent{Type: EventRemember}) }
+			f()
+		}`)
+		require.Empty(t, scan.unresolved)
+		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+	})
+
+	for _, tc := range []struct {
+		name string
+		expr string
+	}{
+		{name: "constant true and evaluates closure", expr: "true &&"},
+		{name: "constant false or evaluates closure", expr: "false ||"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster) {
+				_ = `+tc.expr+` func() bool {
+					b.Broadcast(SSEEvent{Type: EventRemember})
+					return true
+				}()
+			}`)
+			require.Empty(t, scan.unresolved)
+			require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
+		})
+	}
+
+	t.Run("runtime-capable nested and can evaluate closure", func(t *testing.T) {
+		scan := scanTypedFixture(t, `func mutate(b *SSEBroadcaster, runtime bool) {
+			_ = (true && runtime) && func() bool {
+				b.Broadcast(SSEEvent{Type: EventRemember})
+				return true
+			}()
 		}`)
 		require.Empty(t, scan.unresolved)
 		require.Equal(t, []typedEmitSite{{name: "remember", pos: "fixture.go:1"}}, normalizeFixtureSites(scan.emits))
@@ -1023,22 +1114,68 @@ func scanTypedFile(root, path string, fset *token.FileSet, file *ast.File, info 
 }
 
 func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node) (string, bool) {
-	var body *ast.BlockStmt
-	for node := sink; node != nil; node = parents[node] {
+	current := sink
+	checkedBoundary := false
+	for {
+		if reason, dead := shortCircuitDeadPath(info, current, parents); dead {
+			return reason, true
+		}
+		boundary, body := enclosingFunctionBoundary(current, parents)
+		if body == nil {
+			if checkedBoundary {
+				return "", false
+			}
+			return "sink has no enclosing function body", true
+		}
+		if reason, dead := cfgBodyDeadPath(info, current, body, parents); dead {
+			return reason, true
+		}
+		checkedBoundary = true
+		literal, ok := boundary.(*ast.FuncLit)
+		if !ok {
+			return "", false
+		}
+		current = literal
+	}
+}
+
+func shortCircuitDeadPath(info *types.Info, node ast.Node, parents map[ast.Node]ast.Node) (string, bool) {
+	for child, parent := node, parents[node]; parent != nil; child, parent = parent, parents[parent] {
+		switch ancestor := parent.(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			return "", false
+		case *ast.BinaryExpr:
+			if ancestor.Y != child {
+				continue
+			}
+			left, known := definiteBool(info, ancestor.X)
+			if !known {
+				continue
+			}
+			if ancestor.Op == token.LAND && !left {
+				return "constant-false && left operand skips closure construction", true
+			}
+			if ancestor.Op == token.LOR && left {
+				return "constant-true || left operand skips closure construction", true
+			}
+		}
+	}
+	return "", false
+}
+
+func enclosingFunctionBoundary(node ast.Node, parents map[ast.Node]ast.Node) (ast.Node, *ast.BlockStmt) {
+	for node = parents[node]; node != nil; node = parents[node] {
 		switch function := node.(type) {
 		case *ast.FuncDecl:
-			body = function.Body
+			return function, function.Body
 		case *ast.FuncLit:
-			body = function.Body
-		}
-		if body != nil {
-			break
+			return function, function.Body
 		}
 	}
-	if body == nil {
-		return "sink has no enclosing function body", true
-	}
+	return nil, nil
+}
 
+func cfgBodyDeadPath(info *types.Info, sink ast.Node, body *ast.BlockStmt, parents map[ast.Node]ast.Node) (string, bool) {
 	graph := cfg.New(body, func(call *ast.CallExpr) bool {
 		builtin, ok := calledObject(info, call.Fun).(*types.Builtin)
 		return !ok || builtin.Name() != "panic"
@@ -1096,7 +1233,7 @@ func cfgDeadPath(info *types.Info, sink ast.Node, parents map[ast.Node]ast.Node)
 		} else if len(successors) == 2 && len(block.Nodes) > 0 {
 			if condition, ok := block.Nodes[len(block.Nodes)-1].(ast.Expr); ok {
 				_, isSwitchCaseValue := parents[condition].(*ast.CaseClause)
-				if value, known := constantBool(info, condition); known && !isSwitchCaseValue {
+				if value, known := definiteBool(info, condition); known && !isSwitchCaseValue {
 					if value {
 						successors = successors[:1]
 					} else {
@@ -1181,6 +1318,40 @@ func constantBool(info *types.Info, expr ast.Expr) (bool, bool) {
 		return false, false
 	}
 	return constant.BoolVal(value), true
+}
+
+func definiteBool(info *types.Info, expr ast.Expr) (bool, bool) {
+	expr = unwrapParens(expr)
+	if value, known := constantBool(info, expr); known {
+		return value, true
+	}
+	switch node := expr.(type) {
+	case *ast.UnaryExpr:
+		if node.Op == token.NOT {
+			value, known := definiteBool(info, node.X)
+			return !value, known
+		}
+	case *ast.BinaryExpr:
+		left, leftKnown := definiteBool(info, node.X)
+		right, rightKnown := definiteBool(info, node.Y)
+		switch node.Op {
+		case token.LAND:
+			if (leftKnown && !left) || (rightKnown && !right) {
+				return false, true
+			}
+			if leftKnown && rightKnown {
+				return true, true
+			}
+		case token.LOR:
+			if (leftKnown && left) || (rightKnown && right) {
+				return true, true
+			}
+			if leftKnown && rightKnown {
+				return false, true
+			}
+		}
+	}
+	return false, false
 }
 
 func selectedConstantSwitchCase(info *types.Info, switchStmt *ast.SwitchStmt) ([]*ast.CaseClause, int, bool) {
