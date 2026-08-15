@@ -17,7 +17,7 @@
 
 import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.bundle.js';
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
-import { createGraphLoadCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint, mapEngrams, stripBloom } from '/ui/js/connectome-map.js';
+import { createGraphLoadCoordinator, createEngramBloomCoordinator, mapConnectome, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint, mapEngrams, stripBloom, applyEngramBloom } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
 
 const LINK_TYPES = {
@@ -34,6 +34,12 @@ const LINK_TYPES = {
   // scale with traffic (Hebbian weight), so this one entry is styled dynamically
   // by the link accessors rather than by a fixed width like the memory link types.
   synapse:     { color: '#39d0ff', label: 'synapse',     typed: true },
+  // Connectome mode: a "distributed engram" bridge — a memory (engram) that a
+  // second neuron has also corroborated, drawn from the engram to that
+  // corroborating neuron. One memory bridged to several neurons is the same
+  // knowledge consolidated across cells. Kept faint so the neuron synapses stay
+  // dominant; styled dynamically by the width accessor like the synapse.
+  'engram-bridge': { color: '#d98cff', label: 'distributed engram', typed: false },
 };
 const PALETTE = ['#ff6b9d','#ffd166','#5ee2a0','#5ab0ff','#c08bff','#ff9f5a','#4dd6c4','#f7748a','#9ad14b','#7aa0ff'];
 function hexToRgb(h){ const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
@@ -144,7 +150,7 @@ const STYLE = `
 .mrib .legend.collapsed .lg-detail{display:none}
 .mrib .legend.collapsed{max-height:70%}
 .mrib .lg-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.mrib .lg-toggle{cursor:pointer;color:#39d0ff;font-size:10px;letter-spacing:1px;text-transform:uppercase;border:1px solid #15233b;border-radius:7px;padding:3px 8px;user-select:none;white-space:nowrap}
+.mrib .lg-toggle{cursor:pointer;color:#39d0ff;background:transparent;font:inherit;font-size:10px;letter-spacing:1px;text-transform:uppercase;border:1px solid #15233b;border-radius:7px;padding:3px 8px;user-select:none;white-space:nowrap}
 .mrib .lg-toggle:hover{background:#0e1b30}
 .mrib .lobes .more{color:#5d7395;font-size:11px;margin-top:7px}
 .mrib .legend h4{margin:0 0 4px;font-size:11px;letter-spacing:1.5px;color:#39d0ff;text-transform:uppercase}
@@ -159,8 +165,10 @@ const STYLE = `
 .mrib .hud{bottom:16px;left:16px;padding:10px 14px;display:flex;gap:16px;align-items:center}
 .mrib .hud .n{color:#eaf4ff;font-size:17px;font-weight:700}
 .mrib .hud .l{color:#5d7395;font-size:10px;letter-spacing:1px;text-transform:uppercase}
-.mrib .hud .btn{cursor:pointer;color:#39d0ff;border:1px solid #15233b;border-radius:8px;padding:6px 11px;user-select:none}
+.mrib .hud .btn{cursor:pointer;color:#39d0ff;background:transparent;font:inherit;border:1px solid #15233b;border-radius:8px;padding:6px 11px;user-select:none}
 .mrib .hud .btn:hover{background:#0e1b30}
+.mrib .hud .b-mode[aria-pressed="true"]{background:#0e2943;border-color:#39d0ff}
+.mrib .hud .btn:focus-visible,.mrib .lg-toggle:focus-visible{outline:2px solid #39d0ff;outline-offset:2px}
 .mrib .hud .sld{display:flex;align-items:center;gap:7px;color:#5d7395;font-size:10px;letter-spacing:1px;text-transform:uppercase}
 .mrib .hud .sld input{width:84px;accent-color:#39d0ff;cursor:pointer}
 .mrib .scan{position:absolute;top:16px;left:16px;padding:10px 14px}
@@ -171,6 +179,7 @@ const STYLE = `
 .mrib .tip .m{color:#5d7395;font-size:11px}
 .mrib .tip .chip{font-size:10px;padding:1px 6px;border-radius:6px;background:#0e1b30;color:#aecbf0;margin-right:4px}
 .mrib .flag{position:absolute;bottom:16px;right:16px;color:#3a4a66;font-size:10px;letter-spacing:1px}
+.mrib .sr-status{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .mrib .boot{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#5d7395;letter-spacing:2px;font-size:12px}
 .mrib .explore{--ex-font:12px;display:none;left:16px;right:306px;bottom:14px;height:47%;min-height:210px;max-height:72%;flex-direction:column;padding:0;overflow:hidden}
 .mrib .explore .ex-resize{position:absolute;top:0;left:12px;right:12px;height:10px;cursor:ns-resize;z-index:2}
@@ -222,6 +231,7 @@ const STYLE = `
 :root[data-theme="light"] .mrib .hud .btn:hover,
 :root[data-theme="light"] .mrib .explore .ex-back:hover,
 :root[data-theme="light"] .mrib .explore .ex-font button:hover:not(:disabled){background:#e9eef4;color:#0e7490}
+:root[data-theme="light"] .mrib .hud .b-mode[aria-pressed="true"]{background:#dff5fb;border-color:#0e7490}
 :root[data-theme="light"] .mrib .legend .cls,
 :root[data-theme="light"] .mrib .legend .row .t span,
 :root[data-theme="light"] .mrib .lobes .more,
@@ -329,8 +339,8 @@ export function mountMriBrain(container, opts = {}) {
     <div class="boot">◉ ACQUIRING HIPPOCAMPAL FIELD…</div>
     ${showScan ? '<div class="panel scan"><b>CEREBRUM · MRI</b><div class="s">◉ SCANNING</div></div>' : ''}
     ${showDomainLegend ? `<div class="panel legend">
-      <div class="lg-head"><h4>Domain tags</h4><span class="lg-toggle"></span></div>
-      <div class="lg-detail">
+      <div class="lg-head"><h4 class="lg-title">Domain tags</h4><button type="button" class="lg-toggle" aria-expanded="false"></button></div>
+      <div class="lg-detail guide-memory">
         <div class="cls">A complementary-learning-systems view: SAGE is the <b>hippocampus</b>
           (episodic capture); corroboration + decay is the <b>sleep/consolidation</b> cycle.</div>
         <div class="seg">Nodes — memories</div>
@@ -343,6 +353,13 @@ export function mountMriBrain(container, opts = {}) {
         <div class="row"><span class="k">◈</span><div class="t"><b>Angle = domain</b><br><span>each topic is a radial stream</span></div></div>
         <div class="row"><span class="k">◉</span><div class="t"><b>Click a memory</b><br><span>see its train of thought</span></div></div>
       </div>
+      <div class="lg-detail guide-connectome" hidden>
+        <div class="cls">Agents are neurons, domains set their hue, and message traffic drives synapse thickness and pulses.</div>
+        <div class="seg">Connectome</div>
+        <div class="row"><span class="k">◉</span><div class="t"><b>Neuron = agent</b><br><span>click one to bloom its memories</span></div></div>
+        <div class="row"><span class="k">↝</span><div class="t"><b>Thickness + pulse = traffic</b><br><span>active channels strengthen</span></div></div>
+        <div class="row"><span class="k">⊙</span><div class="t"><b>Depth = activity</b><br><span>active hubs sit near the core</span></div></div>
+      </div>
       <div class="seg">Lobes — domains</div><div class="lobes"></div>
       <div class="lg-detail"><div class="seg">Connectome — typed links</div><div class="linktypes"></div></div>
     </div>` : ''}
@@ -350,13 +367,14 @@ export function mountMriBrain(container, opts = {}) {
       <div><div class="n nn">0</div><div class="l">memories</div></div>
       <div><div class="n ne">0</div><div class="l">synapses</div></div>
       <div><div class="n nc">0</div><div class="l">consolidated</div></div>
-      <div class="btn b-rot">⏸ pause</div>
-      <div class="btn b-flow">⚡ flow: on</div>
-      ${allowConnectome ? '<div class="btn b-mode">◉ connectome</div>' : ''}
+      <button type="button" class="btn b-rot">⏸ pause</button>
+      <button type="button" class="btn b-flow">⚡ flow: on</button>
+      ${allowConnectome ? '<button type="button" class="btn b-mode" aria-label="Connectome view" aria-pressed="false">◉ connectome</button>' : ''}
       <label class="sld">skull <input class="b-op" type="range" min="0" max="60" value="8"></label>
     </div>
     <div class="tip"></div>
-    <div class="flag"></div>`;
+    <div class="flag"></div>
+    <div class="sr-status" role="status" aria-live="polite"></div>`;
   container.appendChild(root);
   // Reflect the active view's skull opacity on the slider from the start.
   { const _op = root.querySelector('.b-op'); if (_op) _op.value = sliderUnits(hullState.valueFor(mode)); }
@@ -372,7 +390,10 @@ export function mountMriBrain(container, opts = {}) {
     const lg = $('.legend'); if (!lg) return;
     lg.classList.toggle('collapsed', legendMode !== 'full');
     const t = $('.lg-toggle');
-    if (t) t.textContent = legendMode === 'full' ? '▴ less' : '▾ how to read';
+    if (t) {
+      t.textContent = legendMode === 'full' ? '▴ less' : '▾ how to read';
+      t.setAttribute('aria-expanded', legendMode === 'full' ? 'true' : 'false');
+    }
   }
   applyLegendMode();
   const lgToggle = $('.lg-toggle');
@@ -498,6 +519,7 @@ export function mountMriBrain(container, opts = {}) {
   const restingWeight = l => (l._w||0) * plasticityOf(l);
   function linkWidthFor(l){
     if(l.link_type==='synapse') return 0.25 + restingWeight(l)*2.4 + synapsePulse(l)*2.0;
+    if(l.link_type==='engram-bridge') return 0.5;
     return l.link_type==='focus'?0.8 : l.link_type==='contradicts'?0.6 : (LINK_TYPES[l.link_type]||{}).typed?0.35:0.18;
   }
   function linkParticlesFor(l){
@@ -543,8 +565,20 @@ export function mountMriBrain(container, opts = {}) {
     if (!Graph) return;
     Graph.graphData(stripBloom(Graph.graphData()));
   }
+  // Any graph replacement leaves focus before the replacement fetch settles.
+  // Strip transient nodes/links first: if the fetch fails, clearing focus state
+  // first would make exitFocus() return early and strand the old bloom forever.
+  function leaveFocusForGraphReplacement(){
+    bloomLoads.invalidate();
+    clearBloom();
+    focusId = null; focusSet = null;
+    hideExplorePanel();
+    clearFocusMarker();
+  }
   async function bloomEngrams(n){
     if (disposed || !Graph || !rendered || mode !== 'connectome') return;
+    const agentID = n.agent_id || n.id;
+    const bloomRequest = bloomLoads.begin(agentID);
     focusNeuron(n);
     // Clear any prior bloom IMMEDIATELY, before the fetch — so a failed, errored,
     // or superseded request never strands the previous agent's engrams under this
@@ -552,30 +586,18 @@ export function mountMriBrain(container, opts = {}) {
     clearBloom();
     let payload;
     try {
-      const resp = await fetch(ENGRAMS_URL + '?agent=' + encodeURIComponent(n.id), { credentials: 'same-origin' });
+      const resp = await fetch(ENGRAMS_URL + '?agent=' + encodeURIComponent(agentID), { credentials: 'same-origin' });
       if (!resp.ok) return;
       payload = await resp.json();
     } catch (e) { console.warn('[mri] engrams unavailable:', e.message); return; }
     // Superseded (another neuron clicked while this was in flight) or torn down:
     // drop the stale response rather than bloom it under the wrong focus.
-    if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id) return;
+    if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id ||
+        !bloomLoads.isCurrent(bloomRequest, agentID)) return;
     const engrams = mapEngrams(payload);
-    const gd = stripBloom(Graph.graphData());
-    const present = new Set(gd.nodes.map(nn => nn.id));
-    const fs = new Set(focusSet || [n.id]);
-    engrams.forEach((em, i) => {
-      if (!present.has(em.id)) {
-        placeNear(em, n, i);
-        gd.nodes.push(em);
-        present.add(em.id);
-      }
-      // endpoints are node OBJECTS so the tether renders under the pinned layout
-      // (string ids go unresolved once the link force is nulled — see #188).
-      gd.links.push({ source: n, target: em, link_type: 'focus' });
-      fs.add(em.id);
-    });
-    focusId = n.id; focusSet = fs;
-    Graph.graphData(gd);
+    const composed = applyEngramBloom(Graph.graphData(), engrams, n, focusSet, placeNear);
+    focusId = n.id; focusSet = composed.focusSet;
+    Graph.graphData(composed.graphData);
     Graph.nodeColor(nodeColorRGBA);
     setFocusMarkerNode(n);
   }
@@ -677,6 +699,7 @@ export function mountMriBrain(container, opts = {}) {
   // Mode-aware source: the memory graph (domain-drillable) or the connectome.
   const fetchActive = requestMode => requestMode === 'connectome' ? loadSynapses(SYNAPSE_URL) : loadGraph(urlFor());
   const graphLoads = createGraphLoadCoordinator();
+  const bloomLoads = createEngramBloomCoordinator();
   let rendered = null;   // last graph data handed to ForceGraph (for neuron focus)
   const subs = [];
   let graphRetryTimer = null;
@@ -884,8 +907,8 @@ export function mountMriBrain(container, opts = {}) {
     const request = graphLoads.begin(mode);
     const tickGeneration = connectomeReloadIntent.begin(request.mode);
     const tickAware = tickGeneration > 0;
-    // A drill / reload leaves focus mode.
-    focusId = null; focusSet = null; hideExplorePanel(); clearFocusMarker();
+    // A drill / reload leaves focus mode even when the replacement fetch fails.
+    leaveFocusForGraphReplacement();
     fetchActive(request.mode).then(d => {
       if (disposed || !Graph || !graphLoads.isCurrent(request, mode)) return;
       clearTimeout(graphRetryTimer);
@@ -955,13 +978,11 @@ export function mountMriBrain(container, opts = {}) {
 
   function exitFocus(){
     if (!focusId) return;
+    bloomLoads.invalidate();
     focusId = null; focusSet = null;
     clearFocusMarker();
     if (Graph) {
-      const gd = Graph.graphData();
-      gd.nodes = gd.nodes.filter(n => !n._added);
-      gd.links = gd.links.filter(l => l.link_type !== 'focus');
-      Graph.graphData(gd);
+      Graph.graphData(stripBloom(Graph.graphData()));
       Graph.nodeColor(nodeColorRGBA);
     }
     hideExplorePanel();
@@ -1381,7 +1402,7 @@ export function mountMriBrain(container, opts = {}) {
       initializeGraph(d);
       // Deep-link: auto-bloom a requested agent's lobe on first connectome paint.
       if (focusAgent && !autoBloomed && mode === 'connectome' && rendered) {
-        const target = rendered.nodes.find(nd => nd.isNeuron && nd.id === focusAgent);
+        const target = rendered.nodes.find(nd => nd.isNeuron && (nd.agent_id || nd.id) === focusAgent);
         if (target) { autoBloomed = true; deepLinkTimer = setTimeout(() => { if (!disposed) bloomEngrams(target); }, 50); }
       }
     }).catch(() => {
@@ -1419,19 +1440,28 @@ export function mountMriBrain(container, opts = {}) {
   root.addEventListener('mousemove', onMove);
   root.addEventListener('pointerdown', onGraphPointerDown);
   root.addEventListener('click', onGraphClick);
-  // Connectome legend caption — appended once, shown only in connectome mode.
-  const modeCap = document.createElement('div');
-  modeCap.className = 'panel mode-cap';
-  modeCap.style.cssText = 'position:absolute;left:auto;bottom:44px;top:auto;right:12px;display:none;max-width:236px;font-size:11px;line-height:1.55';
-  modeCap.innerHTML = '<b>Connectome</b> · the agent message-bus<br>◉ neuron = agent · hue = domain<br>synapse thickness + pulse = traffic (Hebbian)<br>idle synapses thin & fade · use it or lose it<br>new agents grow in · dormant ones grey out<br>hubs sink to the core · click a neuron → its memories bloom';
-  root.appendChild(modeCap);
-
-  // Relabel the stat panel + button and toggle the caption for the active mode.
-  function updateModeChrome(){
-    const btn=$('.b-mode'); if(btn) btn.textContent = mode==='connectome' ? '◈ memory' : '◉ connectome';
+  // Relabel the stat panel and expose mode-specific guidance through the
+  // existing reading panel. Mode changes are announced without placing another
+  // visible panel over the graph.
+  function updateModeChrome(announce=false){
+    const connectome = mode === 'connectome';
+    const btn=$('.b-mode');
+    if(btn) {
+      btn.textContent = '◉ connectome';
+      btn.setAttribute('aria-label', 'Connectome view');
+      btn.setAttribute('aria-pressed', connectome ? 'true' : 'false');
+    }
+    const title = $('.lg-title'); if (title) title.textContent = connectome ? 'Connectome' : 'Domain tags';
+    const memoryGuide = $('.guide-memory'); if (memoryGuide) memoryGuide.hidden = connectome;
+    const connectomeGuide = $('.guide-connectome'); if (connectomeGuide) connectomeGuide.hidden = !connectome;
     const set = mode==='connectome' ? ['neurons','synapses','hubs'] : ['memories','synapses','consolidated'];
     root.querySelectorAll('.hud .l').forEach((el,i)=>{ if(set[i]) el.textContent=set[i]; });
-    modeCap.style.display = mode==='connectome' ? '' : 'none';
+    if (announce) {
+      const status = $('.sr-status');
+      if (status) status.textContent = connectome
+        ? 'Connectome view. Agents are neurons and message traffic drives synapses.'
+        : 'Memory view. Memories are grouped by domain and consolidation.';
+    }
   }
   updateModeChrome();
 
@@ -1441,13 +1471,14 @@ export function mountMriBrain(container, opts = {}) {
   function setMode(next){
     if (mode===next || (next==='connectome' && !allowConnectome)) return;
     graphLoads.invalidate();
+    bloomLoads.invalidate();
     mode = next;
     connectomeActivity.reset();
     connectomeReloadIntent.reset();
     neuronBirths.reset();
     currentDomain = null;
-    focusId=null; focusSet=null; hideExplorePanel(); clearFocusMarker();
-    updateModeChrome();
+    leaveFocusForGraphReplacement();
+    updateModeChrome(true);
     // Recall this view's remembered skull opacity (its default, or the operator's
     // last manual choice for this view) and reflect it on the slider, so a round
     // trip preserves each view's setting independently.
@@ -1465,6 +1496,7 @@ export function mountMriBrain(container, opts = {}) {
 
   return function cleanup(){
     disposed = true;
+    bloomLoads.invalidate();
     clearTimeout(graphRetryTimer);
     clearInterval(plasticityTimer);
     clearTimeout(birthDecayTimer);

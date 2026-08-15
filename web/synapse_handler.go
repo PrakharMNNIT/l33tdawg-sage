@@ -3,6 +3,8 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/l33tdawg/sage/internal/store"
@@ -53,11 +55,15 @@ func (h *DashboardHandler) handleSynapses(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	agents, err := h.BadgerStore.ListRegisteredAgents()
+	agents, err := listCurrentConnectomeAgents(h.BadgerStore)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": "neuron read failed"})
 		return
+	}
+	currentNeurons := make(map[string]bool, len(agents))
+	for _, agent := range agents {
+		currentNeurons[agent.AgentID] = true
 	}
 
 	allowed, seeAll := h.resolveAgentRBAC(r)
@@ -95,6 +101,9 @@ func (h *DashboardHandler) handleSynapses(w http.ResponseWriter, r *http.Request
 			return
 		}
 		for _, e := range edges {
+			if !currentNeurons[e.FromAgent] || !currentNeurons[e.ToAgent] {
+				continue
+			}
 			if !seeAll && (!visible[e.FromAgent] || !visible[e.ToAgent]) {
 				continue
 			}
@@ -106,4 +115,65 @@ func (h *DashboardHandler) handleSynapses(w http.ResponseWriter, r *http.Request
 		"neurons":  neurons,
 		"synapses": synapses,
 	})
+}
+
+// listCurrentConnectomeAgents keeps the immutable registration ledger separate
+// from the current app-v23 serving roster. Before app-v23 activation every
+// registration remains a neuron for compatibility. Once a Root exists, only a
+// complete, active ordinary enrollment may render; pending, removed, and any
+// current or retired Root credential stay outside both the neuron list and the
+// distributed-engram bridge boundary.
+func listCurrentConnectomeAgents(badgerStore *store.BadgerStore) ([]store.OnChainAgent, error) {
+	agents, err := badgerStore.ListRegisteredAgents()
+	if err != nil {
+		return nil, err
+	}
+	root, err := badgerStore.GetAppV23Root()
+	if err != nil {
+		return nil, err
+	}
+	if root == nil {
+		return agents, nil
+	}
+
+	active := make([]store.OnChainAgent, 0, len(agents))
+	for _, agent := range agents {
+		wasRoot, rootErr := badgerStore.IsAppV23RootCredential(agent.AgentID)
+		if rootErr != nil {
+			return nil, rootErr
+		}
+		if wasRoot || agent.AgentID == root.PrincipalID || agent.AgentID == root.CredentialID {
+			continue
+		}
+		enrollment, enrollmentErr := badgerStore.GetAppV23Enrollment(agent.AgentID)
+		role, roleErr := badgerStore.GetAppV23Role(agent.AgentID)
+		if enrollmentErr != nil || roleErr != nil {
+			return nil, errors.Join(enrollmentErr, roleErr)
+		}
+		// A post-activation self-registration remains pending until Root review.
+		if enrollment == nil && role == nil {
+			continue
+		}
+		if enrollment == nil || role == nil ||
+			enrollment.AgentID != agent.AgentID || role.AgentID != agent.AgentID {
+			return nil, fmt.Errorf("incomplete app-v23 Connectome policy for agent %s", agent.AgentID)
+		}
+		if !enrollment.Active {
+			continue
+		}
+		// Root handover suspends every delegated Admin from the previous
+		// generation until the current Root explicitly reauthorizes it.
+		if role.Role == store.AppV23RoleAdmin &&
+			enrollment.RootGeneration != root.Generation {
+			continue
+		}
+		if err := store.ValidateAppV23EnrollmentPolicy(
+			role.Role, enrollment.Profile, enrollment.Capabilities,
+			enrollment.Clearance, enrollment.Active,
+		); err != nil {
+			return nil, fmt.Errorf("invalid app-v23 Connectome policy for agent %s: %w", agent.AgentID, err)
+		}
+		active = append(active, agent)
+	}
+	return active, nil
 }

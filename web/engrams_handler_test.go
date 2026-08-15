@@ -44,6 +44,8 @@ func TestHandleEngrams(t *testing.T) {
 	seedEngramMemory(t, s, "a2", "alice", "beta", "ops", 0.7, memory.StatusCommitted)
 	seedEngramMemory(t, s, "a3", "alice", "gamma", "research", 0.8, memory.StatusCommitted)
 	seedEngramMemory(t, s, "a4", "alice", "draft", "ops", 0.95, memory.StatusProposed) // not committed
+	seedEngramMemory(t, s, "a5", "alice", "disputed", "ops", 0.96, memory.StatusChallenged)
+	seedEngramMemory(t, s, "a6", "alice", "deprecated", "ops", 0.97, memory.StatusDeprecated)
 	seedEngramMemory(t, s, "b1", "bob", "bobmem", "ops", 0.99, memory.StatusCommitted)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/memory/engrams?agent=alice", nil)
@@ -70,6 +72,8 @@ func TestHandleEngrams(t *testing.T) {
 	require.Contains(t, byID, "a2")
 	require.Contains(t, byID, "a3")
 	require.NotContains(t, byID, "a4", "a proposed memory is not a committed engram")
+	require.NotContains(t, byID, "a5", "a challenged memory is withheld until reinstated")
+	require.NotContains(t, byID, "a6", "a deprecated memory is not an active engram")
 	require.NotContains(t, byID, "b1", "another agent's memory must never leak into this lobe")
 
 	// ordered by confidence descending (a1 0.9, a3 0.8, a2 0.7)

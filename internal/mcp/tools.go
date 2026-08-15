@@ -675,6 +675,20 @@ func isLegacySelfPolicyRouteNotFound(err error) bool {
 		!strings.HasPrefix(problem.ContentType, "application/problem+json")
 }
 
+const canonicalNotFoundProblemType = "https://sage.dev/errors/404"
+
+// isLegacyMessagesRouteNotFound recognizes only an older node that lacks the
+// canonical Messages route. A current node intentionally uses the same
+// non-enumerating typed 404 for missing, unauthorized, and stale-session
+// replies; treating that denial as a route miss would let the compatibility
+// pipe endpoint bypass the claimant-session fence.
+func isLegacyMessagesRouteNotFound(err error) bool {
+	if !isAPIStatus(err, http.StatusNotFound) {
+		return false
+	}
+	return !isCanonicalAPIProblem(err, canonicalNotFoundProblemType, http.StatusNotFound)
+}
+
 // resolveWriteDomain preserves an explicitly requested domain exactly. Only an
 // omitted/empty domain is eligible for the app-v23 convenience default: the
 // signed caller's approved owned home domain from its self-scoped profile.
@@ -4836,19 +4850,23 @@ func (s *Server) toolMessageReply(ctx context.Context, params map[string]any) (a
 	body, _ := json.Marshal(map[string]any{"result": result, "claimant_session_id": claimantSessionID})
 	var response map[string]any
 	if err := s.doSignedJSON(ctx, http.MethodPost, "/v1/messages/"+url.PathEscape(messageID)+"/reply", body, &response); err != nil {
-		if !isAPIStatus(err, http.StatusNotFound) {
+		if !isLegacyMessagesRouteNotFound(err) {
 			return nil, fmt.Errorf("message reply: %w", err)
 		}
 		legacy, legacyErr := s.toolPipeResult(ctx, map[string]any{"pipe_id": messageID, "result": result})
 		if legacyErr != nil {
-			return nil, fmt.Errorf("federated message reply: %w", legacyErr)
+			return nil, fmt.Errorf("legacy message reply: %w", legacyErr)
 		}
 		response = legacy.(map[string]any)
 		response["message_id"] = messageID
-		response["scope"] = "federated"
-		response["message"] = "Reply queued over the trusted connection. reply_event_id is the immutable outbound reply receipt; pass it to sage_message_status to inspect delivery without creating another inbox request. Repeating the same federated event is deduplicated by the receiving SAGE."
+		if response["scope"] == "federated" {
+			response["message"] = "Reply queued over the trusted connection. reply_event_id is the immutable outbound reply receipt; pass it to sage_message_status to inspect delivery without creating another inbox request. Repeating the same federated event is deduplicated by the receiving SAGE."
+		} else {
+			response["message"] = "Reply recorded through the legacy local pipeline service."
+		}
 		return response, nil
 	}
+	response["scope"] = "local"
 	response["message"] = "Reply recorded. Repeating this exact reply is safe; a different second reply is rejected."
 	return response, nil
 }
@@ -6394,15 +6412,23 @@ func (s *Server) toolPipeResult(ctx context.Context, params map[string]any) (any
 	}
 	body, _ := json.Marshal(bodyFields)
 	if !federated {
+		claimantSessionID, err := s.claimantSessionID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		canonicalBody, _ := json.Marshal(map[string]any{
+			"result": result, "claimant_session_id": claimantSessionID,
+		})
 		var canonical map[string]any
-		err := s.doSignedJSON(ctx, http.MethodPost, "/v1/messages/"+url.PathEscape(pipeID)+"/reply", body, &canonical)
+		err = s.doSignedJSON(ctx, http.MethodPost, "/v1/messages/"+url.PathEscape(pipeID)+"/reply", canonicalBody, &canonical)
 		if err == nil {
 			return map[string]any{
 				"status": canonical["status"], "journal_id": "", "journaled": false,
+				"scope":   "local",
 				"message": "Result delivered through the idempotent local Messages service. The requesting agent can query exact workflow and read status.",
 			}, nil
 		}
-		if !isAPIStatus(err, http.StatusNotFound) {
+		if !isLegacyMessagesRouteNotFound(err) {
 			return nil, fmt.Errorf("pipeline result: %w", err)
 		}
 		// Definite route miss on an older node: use the compatibility endpoint.
@@ -6425,13 +6451,18 @@ func (s *Server) toolPipeResult(ctx context.Context, params map[string]any) (any
 	} else if resp.Journaled {
 		message += " A local journal entry was created summarizing the exchange."
 	}
+	scope := "local"
+	if federated {
+		scope = "federated"
+	}
 	response := map[string]any{
 		"status":     resp.Status,
 		"journal_id": resp.JournalID,
 		"journaled":  resp.Journaled,
+		"scope":      scope,
 		"message":    message,
 	}
-	if resp.ReplyEventID != "" {
+	if federated && resp.ReplyEventID != "" {
 		response["reply_event_id"] = resp.ReplyEventID
 		response["reply_status"] = resp.ReplyStatus
 	}

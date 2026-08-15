@@ -85,7 +85,7 @@ test('a neuron _activity is the most recent last_fired across its incident edges
       { from_agent: 'b', to_agent: 'a', count: 1, last_fired: '2026-08-14T11:00:00Z' },
     ],
   });
-  const by = Object.fromEntries(g.nodes.map(n => [n.id, n]));
+  const by = Object.fromEntries(g.nodes.map(n => [n.agent_id, n]));
   assert.equal(by.a._activity, '2026-08-14T11:00:00Z', 'latest across both directions');
   assert.equal(by.b._activity, '2026-08-14T11:00:00Z');
   assert.equal(by.lonely._activity, '', 'a neuron with no edges has never fired');
@@ -256,7 +256,7 @@ test('a malformed last_fired never replaces a valid neuron _activity', () => {
       { from_agent: 'b', to_agent: 'a', count: 1, last_fired: '2026-02-30T00:00:00Z' },  // Feb 30 → rolls to Mar 2 (later) if trusted
     ],
   });
-  const a = g.nodes.find(n => n.id === 'a');
+  const a = g.nodes.find(n => n.agent_id === 'a');
   assert.equal(a._activity, '2026-01-01T00:00:00Z', 'the rolled-later impossible date must not win');
 });
 
@@ -273,7 +273,7 @@ test('a neuron _activity picks the true latest instant across varied precision',
       { from_agent: 'b', to_agent: 'a', count: 1, last_fired: '2026-08-14T12:00:00.1Z' },  // 100ms — earlier
     ],
   });
-  const a = g.nodes.find(n => n.id === 'a');
+  const a = g.nodes.find(n => n.agent_id === 'a');
   assert.equal(a._activity, '2026-08-14T12:00:00.12Z', 'must not pick the lexically-larger .1Z');
 });
 

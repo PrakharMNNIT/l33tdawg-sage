@@ -5,6 +5,46 @@ import test from 'node:test';
 import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity, createConnectomeActivityTracker, createConnectomeReloadIntent } from '../web/static/js/connectome-map.js';
 
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
+const appSource = await readFile(new URL('../web/static/js/app.js', import.meta.url), 'utf8');
+const cssSource = await readFile(new URL('../web/static/css/sage.css', import.meta.url), 'utf8');
+const mriPageSource = await readFile(new URL('../web/static/mri.html', import.meta.url), 'utf8');
+
+function bracedBlock(source, marker, from = 0) {
+  const start = source.indexOf(marker, from);
+  assert.notEqual(start, -1, `${marker} not found`);
+  const open = source.indexOf('{', start + marker.length);
+  assert.notEqual(open, -1, `${marker} block did not open`);
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}' && --depth === 0) {
+      return { body: source.slice(open + 1, i), start, end: i + 1 };
+    }
+  }
+  assert.fail(`${marker} block did not close`);
+}
+
+function cssDeclarations(source, exactSelector) {
+  const executable = source.replace(/\/\*[\s\S]*?\*\//g, '');
+  let cursor = 0;
+  let found = null;
+  while (cursor < executable.length) {
+    const open = executable.indexOf('{', cursor);
+    if (open === -1) break;
+    const close = executable.indexOf('}', open + 1);
+    if (close === -1) break;
+    const boundary = Math.max(executable.lastIndexOf('}', open - 1), executable.lastIndexOf('{', open - 1));
+    const selector = executable.slice(boundary + 1, open).trim();
+    if (selector === exactSelector) found = executable.slice(open + 1, close);
+    cursor = close + 1;
+  }
+  assert.notEqual(found, null, `${exactSelector} rule not found`);
+  return Object.fromEntries(found.split(';').map(part => part.trim()).filter(Boolean).map(part => {
+    const colon = part.indexOf(':');
+    assert.ok(colon > 0, `invalid declaration in ${exactSelector}: ${part}`);
+    return [part.slice(0, colon).trim(), part.slice(colon + 1).trim()];
+  }));
+}
 
 // The CEREBRUM connectome view renders the agent message-bus in the brain hull.
 // mapConnectome() is the pure projection from the /network/synapses payload onto
@@ -28,7 +68,7 @@ const payload = {
 test('neurons become nodes with normalized degree (busiest = 1)', () => {
   const g = mapConnectome(payload);
   assert.equal(g.nodes.length, 3);
-  const by = Object.fromEntries(g.nodes.map(n => [n.id, n]));
+  const by = Object.fromEntries(g.nodes.map(n => [n.agent_id, n]));
   // total traffic (in+out): bob 5+2+1=8 (busiest), alice 5+2=7, carol 1
   assert.equal(by.bob._w, 8);
   assert.equal(by.alice._w, 7);
@@ -47,7 +87,7 @@ test('node fields map from the payload with sensible fallbacks', () => {
     ],
     synapses: [],
   });
-  const by = Object.fromEntries(g.nodes.map(n => [n.id, n]));
+  const by = Object.fromEntries(g.nodes.map(n => [n.agent_id, n]));
   assert.equal(by.x.label, 'X');
   assert.equal(by.x.domain, 'd');
   assert.equal(by.x.role, 'r');
@@ -61,19 +101,19 @@ test('synapses become weighted links normalized by the busiest edge', () => {
   const g = mapConnectome(payload);
   assert.equal(g.links.length, 3);
   const by = Object.fromEntries(g.links.map(l => [`${l.source}>${l.target}`, l]));
-  assert.equal(by['alice>bob'].count, 5);
-  assert.equal(by['alice>bob']._w, 1);        // busiest edge
-  assert.equal(by['bob>alice']._w, 2 / 5);
-  assert.equal(by['bob>carol']._w, 1 / 5);
+  assert.equal(by['agent:alice>agent:bob'].count, 5);
+  assert.equal(by['agent:alice>agent:bob']._w, 1);        // busiest edge
+  assert.equal(by['agent:bob>agent:alice']._w, 2 / 5);
+  assert.equal(by['agent:bob>agent:carol']._w, 1 / 5);
   assert.ok(g.links.every(l => l.link_type === 'synapse'));
-  assert.equal(by['alice>bob'].last_fired, '2026-08-12T10:00:00Z');
+  assert.equal(by['agent:alice>agent:bob'].last_fired, '2026-08-12T10:00:00Z');
 });
 
 test('direction is preserved: A->B is distinct from B->A', () => {
   const g = mapConnectome(payload);
   const keys = g.links.map(l => `${l.source}>${l.target}`);
-  assert.ok(keys.includes('alice>bob'));
-  assert.ok(keys.includes('bob>alice'));
+  assert.ok(keys.includes('agent:alice>agent:bob'));
+  assert.ok(keys.includes('agent:bob>agent:alice'));
 });
 
 test('edges to unknown agents are dropped (no ghost nodes)', () => {
@@ -141,6 +181,156 @@ test('renderer wires mode invalidation into both initial acquisition and reloads
     'a stale initial response must fail closed after a mode change');
   assert.match(mriSource, /function setMode\(next\)\{[\s\S]*graphLoads\.invalidate\(\);[\s\S]*else acquireInitialGraph\(\);/,
     'a toggle must invalidate old work and refetch even before Graph exists');
+});
+
+test('connectome guidance is reachable without adding another floating panel', () => {
+  const templateStart = mriSource.indexOf('root.innerHTML = `');
+  const templateEnd = mriSource.indexOf('`;\n  container.appendChild(root);', templateStart);
+  assert.ok(templateStart >= 0 && templateEnd > templateStart, 'renderer root template must remain inspectable');
+  const rootTemplate = mriSource.slice(templateStart, templateEnd);
+
+  const panelClasses = [...rootTemplate.matchAll(/class="panel ([^"]+)"/g)].map(match => match[1]).sort();
+  assert.deepEqual(panelClasses, ['hud', 'legend', 'scan'],
+    'the renderer must retain only its established scan, legend, and HUD panels');
+  assert.doesNotMatch(rootTemplate, /\bmodeCap\b|mode-cap/,
+    'connectome mode must not create a free-floating explanatory panel');
+  const executableMri = mriSource
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  const childMutations = [...executableMri.matchAll(
+    /\b(root|container)\.(appendChild|append|prepend|insertBefore|replaceChildren|insertAdjacentElement|insertAdjacentHTML|before|after|replaceWith)\s*\(([^;\n]*)\)/g,
+  )].map(match => `${match[1]}.${match[2]}(${match[3].trim()})`);
+  assert.deepEqual(childMutations, ['container.appendChild(root)', 'root.appendChild(p)'],
+    'the mount root and established Explore panel are the only root-level insertions, through any DOM insertion API');
+  assert.match(mriSource, /p\.className = 'panel explore'; root\.appendChild\(p\)/,
+    'the dynamic-root allow-list must stay bound to the click-to-explore panel');
+
+  assert.match(rootTemplate, /class="lg-detail guide-connectome" hidden>[\s\S]*Agents are neurons[\s\S]*Click one to bloom its memories/i,
+    'standalone MRI must keep connectome guidance inside its existing reading legend');
+  const standaloneMountStart = mriPageSource.indexOf("mountMriBrain(document.getElementById('mount')");
+  const standaloneMountEnd = mriPageSource.indexOf('});', standaloneMountStart);
+  assert.ok(standaloneMountStart >= 0 && standaloneMountEnd > standaloneMountStart,
+    'standalone MRI mount options must remain inspectable');
+  const standaloneMount = mriPageSource.slice(standaloneMountStart, standaloneMountEnd);
+  assert.match(standaloneMount, /showScan:\s*true/);
+  assert.doesNotMatch(standaloneMount, /showDomainLegend:\s*false|allowConnectome:\s*false/,
+    'standalone MRI must keep both the connectome toggle and its reading guide enabled');
+  assert.match(rootTemplate, /<button type="button" class="lg-toggle" aria-expanded="false">/,
+    'the standalone reading guide must be keyboard reachable');
+  assert.match(rootTemplate, /<button type="button" class="btn b-mode" aria-label="Connectome view" aria-pressed="false">/,
+    'the mode toggle must be a keyboard-reachable button');
+  assert.match(mriSource, /class="sr-status" role="status" aria-live="polite"/,
+    'mode changes must have a non-visual screen-reader announcement target');
+
+  const guideStart = appSource.indexOf('showGuide && html`<section class="brain-domain-guide"');
+  const guideEnd = appSource.indexOf('</section>`}', guideStart);
+  assert.ok(guideStart >= 0 && guideEnd > guideStart, 'dashboard guide template must remain inspectable');
+  const dashboardGuide = appSource.slice(guideStart, guideEnd);
+  assert.match(dashboardGuide, /<b>Connectome mode:<\/b> agents are neurons/,
+    'the dashboard How to read guide must retain the connectome explanation');
+  assert.match(appSource, /class="brain-domain-reset"/,
+    'the mobile-only action hiding rule needs an explicit Reset target');
+  const executableCss = cssSource.replace(/\/\*[\s\S]*?\*\//g, '');
+  const mobileBlocks = [];
+  let mobileCursor = 0;
+  while ((mobileCursor = executableCss.indexOf('@media (max-width: 760px)', mobileCursor)) !== -1) {
+    const block = bracedBlock(executableCss, '@media (max-width: 760px)', mobileCursor);
+    mobileBlocks.push(block.body);
+    mobileCursor = block.end;
+  }
+  const inventoryMobile = mobileBlocks.find(block => block.includes('.brain-domain-head-actions .brain-domain-reset'));
+  assert.ok(inventoryMobile, 'the executable 760px mobile block must target Reset explicitly');
+  assert.equal(cssDeclarations(inventoryMobile, '.brain-domain-head-actions .brain-domain-reset').display, 'none',
+    'mobile may hide Reset, not the How to read button');
+  assert.doesNotMatch(executableCss, /\.brain-domain-head-actions button:first-child\s*\{\s*display:\s*none;/,
+    'mobile must not hide whichever action happens to be first');
+});
+
+test('mode controls retain visible pressed and keyboard-focus styling in both themes', () => {
+  const styleStart = mriSource.indexOf('const STYLE = `');
+  const styleEnd = mriSource.indexOf('`;\n\nfunction injectStyleOnce', styleStart);
+  assert.ok(styleStart >= 0 && styleEnd > styleStart, 'the executable MRI stylesheet must remain inspectable');
+  const style = mriSource.slice(styleStart, styleEnd);
+  const darkPressed = cssDeclarations(style, '.mrib .hud .b-mode[aria-pressed="true"]');
+  const lightPressed = cssDeclarations(style, ':root[data-theme="light"] .mrib .hud .b-mode[aria-pressed="true"]');
+  const focus = cssDeclarations(style, '.mrib .hud .btn:focus-visible,.mrib .lg-toggle:focus-visible');
+
+  assert.deepEqual(darkPressed, { background: '#0e2943', 'border-color': '#39d0ff' });
+  assert.deepEqual(lightPressed, { background: '#dff5fb', 'border-color': '#0e7490' });
+  assert.deepEqual(focus, { outline: '2px solid #39d0ff', 'outline-offset': '2px' });
+});
+
+test('mode chrome exposes coherent toggle state, active guidance, and live status', () => {
+  const functionBody = name => {
+    const start = mriSource.indexOf(`function ${name}(`);
+    assert.notEqual(start, -1, `${name}() not found`);
+    const open = mriSource.indexOf('{', start);
+    let depth = 0;
+    for (let i = open; i < mriSource.length; i++) {
+      if (mriSource[i] === '{') depth++;
+      else if (mriSource[i] === '}' && --depth === 0) return mriSource.slice(open + 1, i);
+    }
+    assert.fail(`${name}() body did not close`);
+  };
+
+  const body = functionBody('updateModeChrome');
+  const runChrome = new Function('$', 'root', 'mode', 'announce', body);
+  const elements = {
+    '.b-mode': { textContent: '', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
+    '.lg-title': { textContent: '' },
+    '.guide-memory': { hidden: false },
+    '.guide-connectome': { hidden: true },
+    '.sr-status': { textContent: '' },
+  };
+  const labels = [{ textContent: '' }, { textContent: '' }, { textContent: '' }];
+  const root = { querySelectorAll: () => labels };
+  const $ = selector => elements[selector];
+
+  runChrome($, root, 'connectome', true);
+  assert.equal(elements['.b-mode'].textContent, '◉ connectome',
+    'a toggle button keeps one visible label; aria-pressed carries its state');
+  assert.equal(elements['.b-mode'].attrs['aria-label'], 'Connectome view',
+    'aria-pressed needs a stable toggle name, not a changing action label');
+  assert.equal(elements['.b-mode'].attrs['aria-pressed'], 'true');
+  assert.match(mriSource, /\.b-mode\[aria-pressed="true"\]\{[^}]*background:/,
+    'pressed state must remain visible without changing the toggle label');
+  assert.equal(elements['.guide-memory'].hidden, true);
+  assert.equal(elements['.guide-connectome'].hidden, false);
+  assert.match(elements['.sr-status'].textContent, /Connectome view/);
+  assert.deepEqual(labels.map(label => label.textContent), ['neurons', 'synapses', 'hubs']);
+
+  runChrome($, root, 'memory', true);
+  assert.equal(elements['.b-mode'].textContent, '◉ connectome');
+  assert.equal(elements['.b-mode'].attrs['aria-label'], 'Connectome view');
+  assert.equal(elements['.b-mode'].attrs['aria-pressed'], 'false');
+  assert.equal(elements['.guide-memory'].hidden, false);
+  assert.equal(elements['.guide-connectome'].hidden, true);
+  assert.match(elements['.sr-status'].textContent, /Memory view/);
+
+  const executableSetMode = functionBody('setMode')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  const modeAnnouncements = [];
+  const runSetMode = new Function(
+    'next', 'mode', 'allowConnectome', 'graphLoads', 'bloomLoads', 'connectomeActivity',
+    'connectomeReloadIntent', 'neuronBirths', 'currentDomain', 'leaveFocusForGraphReplacement',
+    'focusId', 'focusSet',
+    'hideExplorePanel', 'clearFocusMarker', 'updateModeChrome', 'hullState', '$',
+    'sliderUnits', 'setHullOpacity', 'Graph', 'load', 'zoomOut', 'acquireInitialGraph',
+    executableSetMode,
+  );
+  const resettable = () => ({ reset() {} });
+  let focusLeaves = 0;
+  runSetMode(
+    'connectome', 'memory', true, { invalidate() {} }, { invalidate() {} }, resettable(),
+    resettable(), resettable(), null, () => { focusLeaves++; }, null, null, () => {}, () => {},
+    announce => modeAnnouncements.push(announce), { valueFor: () => 0.03 }, () => null,
+    value => value, () => {}, null, () => {}, () => {}, () => {},
+  );
+  assert.deepEqual(modeAnnouncements, [true],
+    'the executable mode transition must invoke the announcing chrome path exactly once');
+  assert.equal(focusLeaves, 1,
+    'the executable mode transition must strip any distributed-engram bloom exactly once');
 });
 
 // Live firing pulses only the synapses that actually carried a message. The

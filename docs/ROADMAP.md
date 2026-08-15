@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.12 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.13 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -47,13 +47,45 @@ projection-safe agent-as-lobe engram view, hardens the exact 20-event operator
 dashboard SSE registry, restores signed task creation across official clients,
 adds exact-agent message presentation without changing claim/read/delivery
 semantics, and repairs release-facing documentation drift with fail-closed
-citation coverage. The supported consensus ceiling remains app-v26;
-**v11.18.12 does not introduce app-v27**.
+citation coverage. v11.18.13 ships Hubanov's distributed-engram bridges with
+deterministic bounded corroborator evidence and lifecycle hardening, removes
+the floating Connectome caption while strengthening mode accessibility, adds
+Claude's explicitly enabled signed production wake source with lossless
+backpressure, and closes the MCP claimant-session compatibility fallback
+bypass. The supported consensus ceiling remains app-v26;
+**v11.18.13 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.13 patch
+
+Hubanov's distributed-engram contribution now blooms a selected agent's visible
+memories with transient links to rendered corroborating neurons. Agent and
+memory graph identities are namespaced, same-neuron requests are generation
+fenced, and every exit or replacement path removes transient nodes and bridges.
+SQLite and PostgreSQL read one deterministically ordered, indexed 96-row
+evidence prefix before authorization and deduplication; the response exposes at
+most 12 bridges and keeps corroboration documented as historical evidence.
+
+The floating Connectome instruction card is removed. Guidance uses the existing
+reading panel, while native controls retain keyboard focus, stable toggle
+semantics, visible dark/light pressed states, intentional mobile Reset behavior,
+and a live assistive status announcement.
+
+Claude's production MCP wake source is opt-in through `SAGE_CLAUDE_CHANNEL` and
+consumes the existing signed, payload-free SSE route with a random process lease
+and resumable cursor. Saturated delivery is lossless and shutdown releases the
+reader before a consumer drains buffered events.
+
+Canonical typed message-reply denials no longer fall through the deprecated
+pipe mutation. The hidden compatibility alias supplies the active claimant
+session, preserves genuine plain-404 old-node fallback, and reports truthful
+local/federated scope. This patch introduces no new consensus application
+version or state migration: app-v26 remains the ceiling and v11.18.13 does not
+introduce app-v27.
 
 ## v11.18.12 patch
 

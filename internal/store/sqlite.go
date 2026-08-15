@@ -520,6 +520,11 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 		evidence   TEXT,
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	);
+	-- CEREBRUM reads one bounded, deterministic corroboration prefix by memory.
+	-- The total-order suffix also lets SQLite satisfy ORDER BY without a temp sort;
+	-- the memory_id prefix continues to serve GetCorroborationCounts.
+	CREATE INDEX IF NOT EXISTS idx_corroborations_memory_order
+		ON corroborations(memory_id, created_at, agent_id, id);
 
 	CREATE TABLE IF NOT EXISTS challenges (
 		id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1372,6 +1377,7 @@ func (s *SQLiteStore) migrateTaskSupport(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_provider ON memories(provider)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_task_status ON memories(task_status) WHERE task_status != ''`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories(submitting_agent, confidence_score)`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_corroborations_memory_order ON corroborations(memory_id, created_at, agent_id, id)`)
 }
 
 // --- Helper functions ---
@@ -2731,6 +2737,36 @@ func (s *SQLiteStore) GetCorroborations(ctx context.Context, memoryID string) ([
 		corrs = append(corrs, c)
 	}
 	return corrs, nil
+}
+
+// GetCorroborationsBounded returns a stable raw projection prefix for UI reads.
+// The SQL LIMIT bounds row materialization before caller-side visibility and
+// duplicate filtering; GetCorroborationCounts remains the source of the true
+// distinct total.
+func (s *SQLiteStore) GetCorroborationsBounded(ctx context.Context, memoryID string, limit int) ([]*Corroboration, error) {
+	if limit <= 0 {
+		return nil, errors.New("corroboration limit must be positive")
+	}
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT id, memory_id, agent_id, evidence, created_at
+		 FROM corroborations INDEXED BY idx_corroborations_memory_order
+		 WHERE memory_id = ? ORDER BY created_at, agent_id, id LIMIT ?`, memoryID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get bounded corroborations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	corrs := make([]*Corroboration, 0, limit)
+	for rows.Next() {
+		c := &Corroboration{}
+		var createdAt string
+		if scanErr := rows.Scan(&c.ID, &c.MemoryID, &c.AgentID, &c.Evidence, &createdAt); scanErr != nil {
+			return nil, fmt.Errorf("scan bounded corroboration: %w", scanErr)
+		}
+		c.CreatedAt = parseTime(createdAt)
+		corrs = append(corrs, c)
+	}
+	return corrs, rows.Err()
 }
 
 func (s *SQLiteStore) GetPendingByDomain(ctx context.Context, domainTag string, limit int) ([]*memory.MemoryRecord, error) {

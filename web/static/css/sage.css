@@ -6160,7 +6160,7 @@ input[type="range"]::-moz-range-thumb {
         min-width: 240px;
     }
     .brain-domain-guide-grid { grid-template-columns: 1fr; }
-    .brain-domain-head-actions button:first-child { display: none; }
+    .brain-domain-head-actions .brain-domain-reset { display: none; }
 }
 
 /* Tasks board first-run empty state (v11 UX uplift) */

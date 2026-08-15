@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.18.12. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
+<!-- Reconciled through SAGE v11.18.13. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
 
 # SAGE Reference — Environment Variables
 
@@ -154,6 +154,7 @@ legacy Ollama vector space over a requested custom one (`cmd/amid/main.go`).
 |----------|--------------|---------|---------|--------|
 | `SAGE_SNAPSHOT_KEEP` | Snapshots to retain (newest N + per-version anchors, which are never pruned). Integer ≥ 1. | `5` | sage-gui | `cmd/sage-gui/node.go:262`, `cmd/sage-gui/snapshot.go:56` |
 | `SAGE_BRANCH_TAG` | Set `0`/`false`/`no` to disable branch tagging of memories. | on | MCP | `internal/mcp/branch.go:27` |
+| `SAGE_CLAUDE_CHANNEL` | Opt-in for the experimental Claude wake channel. When on, `sage-gui mcp` subscribes to this agent's signed `/v1/messages/wake` stream and emits a `notifications/claude/channel` JSON-RPC notification so the host can stop polling. Payload-free: the host learns only a durable wake cursor, never message content or sender. Accepts the usual boolean spellings; an unrecognized value warns and stays off. Failure to arm is non-fatal and leaves an ordinary MCP session. | off | sage-gui MCP (stdio) | `cmd/sage-gui/mcp.go:224`, `internal/mcp/claude_wake_source.go:84` |
 
 ---
 

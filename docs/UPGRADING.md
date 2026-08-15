@@ -103,6 +103,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.10 | Same-agent MCP claimant-session ownership and atomic handoff, stale-session reply rejection, passive recovery, the CEREBRUM agent-connectome view, and bounded upgrade-watchdog broadcasts that retain indeterminate signer fencing; no new app version; app-v26 remains the ceiling |
 | v11.18.11 | Operator-only live connectome firing via contentless ticks and authorized snapshot refetch, contentless retrieval activity, payload-free Claude inbox visibility with hook self-heal, chain-ID locality, Windows executable checksums, and patched Go 1.25.13; no new app version; app-v26 remains the ceiling |
 | v11.18.12 | Projection-safe agent-as-lobe engrams, exact dashboard SSE registry coverage, signed task-status repair across official clients, exact-agent message presentation, and fail-closed documentation citation coverage; no new app version; app-v26 remains the ceiling |
+| v11.18.13 | Hubanov distributed-engram bridges with bounded deterministic corroborator evidence, accessible Connectome guidance without a floating card, Claude signed production wake source with lossless shutdown, and claimant-session-safe reply fallback; no new app version; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
