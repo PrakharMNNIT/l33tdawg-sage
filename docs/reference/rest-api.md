@@ -999,7 +999,7 @@ Pre-app-v23 nodes retain their legacy projection behavior.
 | `GET /v1/dashboard/memory/adoption-progress` | Root/operator aggregate App-v25 historical-recovery progress. It returns counts and state only—never the hidden records' content, domains, authors, or reasons. |
 | `POST /v1/dashboard/memory/adoption-retry` | Current-Root-only request for a fresh scan of the exact unresolved App-v25 snapshot. Requires the `projection_revision` field (zero is valid for a first upgraded snapshot) and a positive `expected_count`; it never deletes rows or clears earlier dispositions. |
 | `POST /v1/dashboard/memory/adoption-deprecate` | Current-Root-only retirement of the exact unresolved snapshot. Requires the `projection_revision` field (including valid zero), positive `expected_count`, and typed `DEPRECATE <count>` confirmation. Records remain preserved for audit and are skipped by future automatic repair. |
-| `GET /v1/dashboard/network/synapses` | Operator-only Connectome snapshot: registered agent neurons plus directed retained-message traffic, filtered so both edge endpoints are visible to the caller. |
+| `GET /v1/dashboard/network/synapses` | Operator-only Connectome snapshot: current active ordinary app-v23 agent neurons plus directed retained-message traffic, filtered so both edge endpoints are visible to the caller. Pending, removed, and Root identities are not rendered. Pre-app-v23 nodes retain the legacy registered-agent roster. |
 | `GET /v1/dashboard/memory/engrams?agent={id}` | Operator-only, projection-gated top committed memories authored by one visible neuron, with bounded corroborator bridge identities. |
 
 The engram response is capped at 24 memories in descending confidence order.
@@ -1007,15 +1007,15 @@ Each item contains the true distinct `corroboration_count`, while
 `corroborators` contains at most 12 identities selected from the first 96 raw
 corroboration rows ordered by `created_at`, `agent_id`, then row `id`; that raw
 prefix is bounded in SQL before filtering and deduplication. An identity is
-named only when it is already a registered Connectome neuron and is visible to
+named only when it is already a current active ordinary Connectome neuron and is visible to
 the caller. Hidden, external, duplicate, excess, unavailable, and otherwise
 eligible identities beyond the 96-row prefix remain anonymous inside the true
 distinct count. A missing registry or failed bounded read withholds all bridge
 identities without hiding the count. The
 identity list is historical corroboration evidence, not a claim that the peer
 currently possesses a copy. Challenged and deprecated memories are omitted;
-reinstatement makes a memory eligible again because it is committed. Registered
-neurons remain the Connectome identity boundary even when traffic has gone
+reinstatement makes a memory eligible again because it is committed. Active
+ordinary neurons remain the Connectome identity boundary even when traffic has gone
 dormant—the view represents dormancy by activity, not by rewriting history
 (`handleEngrams`, `web/engrams_handler.go`; `handleSynapses`,
 `web/synapse_handler.go`).
