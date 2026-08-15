@@ -221,7 +221,7 @@ func (h *DashboardHandler) handleEngrams(w http.ResponseWriter, r *http.Request)
 	// confirm is already a visible neuron; the count still conveys distribution.
 	var neuronSet map[string]bool
 	if h.BadgerStore != nil {
-		if regs, regErr := h.BadgerStore.ListRegisteredAgents(); regErr == nil {
+		if regs, regErr := listCurrentConnectomeAgents(h.BadgerStore); regErr == nil {
 			neuronSet = make(map[string]bool, len(regs))
 			for _, a := range regs {
 				neuronSet[a.AgentID] = true

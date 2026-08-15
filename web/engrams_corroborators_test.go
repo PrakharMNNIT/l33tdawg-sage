@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -18,6 +19,92 @@ type failingBoundedEngramStore struct {
 	store.MemoryStore
 	calls  int
 	limits []int
+}
+
+func TestAppV23ConnectomeAndEngramBridgesExcludeInactiveAndPendingAgents(t *testing.T) {
+	fixture := newAppV23AccessFixture(t)
+	h, sqlStore := newTestHandler(t)
+	h.BadgerStore = fixture.badger
+
+	registerPending := func(name string, height int64) string {
+		_, key, err := ed25519.GenerateKey(nil)
+		require.NoError(t, err)
+		agentID := agentIDForKey(key)
+		require.NoError(t, fixture.badger.RegisterAgentWithCapabilities(
+			agentID, name, store.AppV23RoleMember, "connectome test", "test", "", height,
+			store.DefaultSelfRegisteredAgentCapabilities,
+		))
+		return agentID
+	}
+	activate := func(agentID, home string, height int64) {
+		require.NoError(t, fixture.badger.ApproveAppV23LocalAgent(
+			store.AppV23LocalEnrollment{
+				AgentID: agentID, ApprovedBy: fixture.rootID, RootGeneration: 1,
+				Profile: store.AppV23ProfileStandard, HomeDomain: home,
+				Clearance: 1, Capabilities: 0, Active: true, UpdatedHeight: height,
+			},
+			store.AppV23RoleMember, 0, 0,
+		))
+	}
+
+	activePeer := registerPending("Active peer", 2)
+	activate(activePeer, "active-peer-home", 3)
+	inactivePeer := registerPending("Removed peer", 4)
+	activate(inactivePeer, "removed-peer-home", 5)
+	inactiveEnrollment, err := fixture.badger.GetAppV23Enrollment(inactivePeer)
+	require.NoError(t, err)
+	inactiveRole, err := fixture.badger.GetAppV23Role(inactivePeer)
+	require.NoError(t, err)
+	require.NoError(t, fixture.badger.ApproveAppV23LocalAgent(
+		store.AppV23LocalEnrollment{
+			AgentID: inactivePeer, ApprovedBy: fixture.rootID, RootGeneration: 1,
+			Profile: inactiveEnrollment.Profile, HomeDomain: inactiveEnrollment.HomeDomain,
+			Clearance: inactiveEnrollment.Clearance, Capabilities: inactiveEnrollment.Capabilities,
+			Active: false, UpdatedHeight: 6, RetireOwnedDomainsToRoot: true,
+		},
+		inactiveRole.Role, inactiveEnrollment.Revision, inactiveRole.Revision,
+	))
+	pendingPeer := registerPending("Pending peer", 7)
+
+	base := time.Now().UTC().Truncate(time.Second)
+	insertSynapseMessage(t, sqlStore, "active-edge", fixture.agentID, activePeer, base)
+	insertSynapseMessage(t, sqlStore, "inactive-edge", fixture.agentID, inactivePeer, base.Add(time.Second))
+	insertSynapseMessage(t, sqlStore, "pending-edge", fixture.agentID, pendingPeer, base.Add(2*time.Second))
+
+	synapseRec := httptest.NewRecorder()
+	h.handleSynapses(synapseRec, httptest.NewRequest(http.MethodGet, "/v1/dashboard/network/synapses", nil))
+	require.Equal(t, http.StatusOK, synapseRec.Code, synapseRec.Body.String())
+	connectome := decodeSynapseBody(t, synapseRec)
+	neurons := make(map[string]bool, len(connectome.Neurons))
+	for _, neuron := range connectome.Neurons {
+		neurons[neuron.AgentID] = true
+	}
+	require.True(t, neurons[fixture.agentID])
+	require.True(t, neurons[activePeer])
+	require.False(t, neurons[inactivePeer], "a removed enrollment is historical, not a current neuron")
+	require.False(t, neurons[pendingPeer], "a pending registration is not a current neuron")
+	require.False(t, neurons[fixture.rootID], "CEREBRUM Root is not an ordinary Connectome neuron")
+	require.Len(t, connectome.Synapses, 1, "edges touching non-current neurons must be omitted")
+	require.Equal(t, activePeer, connectome.Synapses[0].ToAgent)
+
+	seedEngramMemory(t, sqlStore, "active-memory", fixture.agentID, "historical evidence", "ops", 0.9, memory.StatusCommitted)
+	seedCorroboration(t, sqlStore, "active-memory", activePeer, base)
+	seedCorroboration(t, sqlStore, "active-memory", inactivePeer, base.Add(time.Second))
+	seedCorroboration(t, sqlStore, "active-memory", pendingPeer, base.Add(2*time.Second))
+	engramRec := httptest.NewRecorder()
+	h.handleEngrams(engramRec, httptest.NewRequest(
+		http.MethodGet, "/v1/dashboard/memory/engrams?agent="+fixture.agentID, nil,
+	))
+	require.Equal(t, http.StatusOK, engramRec.Code, engramRec.Body.String())
+	var engrams struct {
+		Engrams []engramNode `json:"engrams"`
+	}
+	require.NoError(t, json.Unmarshal(engramRec.Body.Bytes(), &engrams))
+	require.Len(t, engrams.Engrams, 1)
+	require.Equal(t, 3, engrams.Engrams[0].CorroborationCount,
+		"historical distinct evidence remains counted")
+	require.Equal(t, []string{activePeer}, engrams.Engrams[0].Corroborators,
+		"only current rendered neurons may be named as bridge endpoints")
 }
 
 func (s *failingBoundedEngramStore) GetCorroborationsBounded(_ context.Context, _ string, limit int) ([]*store.Corroboration, error) {

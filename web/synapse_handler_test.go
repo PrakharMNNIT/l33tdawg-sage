@@ -51,6 +51,9 @@ func decodeSynapseBody(t *testing.T, rec *httptest.ResponseRecorder) synapseBody
 // applies.
 func TestHandleSynapses(t *testing.T) {
 	h, s := newSynapseTestHandler(t)
+	for i, id := range []string{"alice", "bob"} {
+		require.NoError(t, h.BadgerStore.RegisterAgent(id, id, "member", "", "test", "", int64(i+1)))
+	}
 
 	base := time.Now().UTC().Truncate(time.Second)
 	insertSynapseMessage(t, s, "p1", "alice", "bob", base)
