@@ -28,9 +28,10 @@ const (
 	// small fields by design; anything larger is a malformed or hostile stream
 	// rather than a wake this adapter should try to parse.
 	claudeWakeMaxFrameBytes = 8 * 1024
-	// claudeWakeEventBuffer keeps a slow adapter from blocking the reader
-	// goroutine. Wakes coalesce by sequence downstream, so a dropped duplicate
-	// costs nothing; only the highest sequence matters.
+	// claudeWakeEventBuffer absorbs a burst while the adapter is mid-write.
+	// It is a smoothing buffer, not a drop threshold: delivery past it blocks
+	// rather than discarding, because the event that would be discarded is the
+	// newest one and therefore the one that matters.
 	claudeWakeEventBuffer = 8
 )
 
@@ -132,6 +133,7 @@ func (w *restClaudeWakeSource) Subscribe(ctx context.Context, afterSeq uint64) (
 		events: make(chan ClaudeWakeEvent, claudeWakeEventBuffer),
 		body:   resp.Body,
 		cancel: cancel,
+		done:   make(chan struct{}),
 	}
 	go subscription.read()
 	return subscription, nil
@@ -144,6 +146,10 @@ type restClaudeWakeSubscription struct {
 	events chan ClaudeWakeEvent
 	body   io.ReadCloser
 	cancel context.CancelFunc
+	// done is closed exactly once by Close. The reader selects on it while
+	// sending so that backpressure from a busy adapter can never strand the
+	// reader goroutine past shutdown.
+	done chan struct{}
 
 	closeOnce sync.Once
 }
@@ -152,8 +158,10 @@ func (s *restClaudeWakeSubscription) Events() <-chan ClaudeWakeEvent { return s.
 
 func (s *restClaudeWakeSubscription) Close() error {
 	s.closeOnce.Do(func() {
-		// Cancel first: it unblocks a read parked on a quiet stream so the
-		// reader goroutine cannot outlive Close.
+		// Close done first: it releases a reader parked on a full events
+		// buffer. Cancel then unblocks a read parked on a quiet stream. Between
+		// them the reader goroutine cannot outlive Close.
+		close(s.done)
 		s.cancel()
 		_ = s.body.Close()
 	})
@@ -203,12 +211,19 @@ func (s *restClaudeWakeSubscription) read() {
 				Seq:     payload.Seq,
 				Pending: payload.Pending,
 			}
+			// Delivery is lossless. An earlier revision dropped the event
+			// when the buffer was full, reasoning that only the highest
+			// sequence matters — but the event being dropped IS the highest
+			// sequence, and the stream stays open, so nothing later forces a
+			// catch-up. A burst of pending:false frames arriving while the
+			// adapter is blocked on stdout could therefore swallow the
+			// pending:true that follows them and suppress a real wake until
+			// unrelated traffic happened along. Blocking applies backpressure
+			// instead; done releases the reader if Close wins the race.
 			select {
 			case s.events <- event:
-			default:
-				// Buffer full: the adapter is mid-write and already owes a
-				// notification for a sequence at least this recent. Dropping is
-				// safe precisely because wakes carry no content to lose.
+			case <-s.done:
+				return
 			}
 		}
 	}

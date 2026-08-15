@@ -237,3 +237,110 @@ func requireWakeEvent(t *testing.T, subscription ClaudeWakeSubscription) ClaudeW
 		return ClaudeWakeEvent{}
 	}
 }
+
+// Losslessness under saturation. An earlier revision dropped the event when the
+// buffer was full, on the reasoning that only the highest sequence matters —
+// but the dropped event IS the highest sequence, and the stream stays open so
+// nothing forces a catch-up.
+//
+// The test must not begin draining until the buffer has actually saturated,
+// otherwise the consumer keeps pace, the buffer never fills, and the assertion
+// passes against the very drop it exists to forbid. Waiting on the handler to
+// finish writing cannot be the synchronisation either: correct backpressure
+// blocks the handler, so that would deadlock the fixed implementation. Waiting
+// on the buffer to reach capacity is the condition that works for both.
+func TestClaudeWakeSourceDeliversNewestEventUnderBufferSaturation(t *testing.T) {
+	const total = claudeWakeEventBuffer * 4
+	server, _ := testWakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		// A burst of non-pending frames first, exactly the shape that used to
+		// fill the buffer and swallow the pending wake that follows.
+		for seq := 1; seq < total; seq++ {
+			flushWrite(t, w, "event: wake\ndata: {\"version\":1,\"seq\":%d,\"pending\":false}\n\n", seq)
+		}
+		flushWrite(t, w, "event: wake\ndata: {\"version\":1,\"seq\":%d,\"pending\":true}\n\n", total)
+		<-r.Context().Done()
+	})
+	source, err := newRESTClaudeWakeSource(server)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	subscription, err := source.Subscribe(ctx, 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, subscription.Close()) }()
+
+	// Saturate first, draining nothing. Only now is a drop observable.
+	require.Eventually(t, func() bool {
+		return len(subscription.(*restClaudeWakeSubscription).events) == claudeWakeEventBuffer
+	}, 10*time.Second, 10*time.Millisecond, "buffer should saturate while nothing drains")
+
+	deadline := time.After(10 * time.Second)
+	var highest uint64
+	var sawPending bool
+	for highest < total {
+		select {
+		case event, ok := <-subscription.Events():
+			require.True(t, ok, "stream closed before the newest wake arrived")
+			require.GreaterOrEqual(t, event.Seq, highest, "sequences must not go backwards")
+			highest = event.Seq
+			if event.Seq == total {
+				sawPending = event.Pending
+			}
+		case <-deadline:
+			t.Fatalf("newest wake was dropped; highest seen was %d of %d", highest, total)
+		}
+	}
+	require.Equal(t, uint64(total), highest, "the newest cursor must survive a saturated buffer")
+	require.True(t, sawPending, "the surviving newest event must retain pending=true")
+}
+
+// Close must release a reader parked on a full buffer rather than stranding the
+// goroutine, and must stay idempotent while doing it.
+func TestClaudeWakeSourceCloseReleasesReaderBlockedOnFullBuffer(t *testing.T) {
+	server, _ := testWakeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		for seq := 1; seq <= claudeWakeEventBuffer*4; seq++ {
+			flushWrite(t, w, "event: wake\ndata: {\"version\":1,\"seq\":%d,\"pending\":true}\n\n", seq)
+		}
+		<-r.Context().Done()
+	})
+	source, err := newRESTClaudeWakeSource(server)
+	require.NoError(t, err)
+
+	subscription, err := source.Subscribe(context.Background(), 0)
+	require.NoError(t, err)
+
+	// Let the reader fill the buffer and park on the send. Never drain.
+	require.Eventually(t, func() bool {
+		return len(subscription.(*restClaudeWakeSubscription).events) == claudeWakeEventBuffer
+	}, 5*time.Second, 10*time.Millisecond, "buffer should saturate while nothing drains")
+
+	closed := make(chan error, 1)
+	go func() { closed <- subscription.Close() }()
+	select {
+	case closeErr := <-closed:
+		require.NoError(t, closeErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked behind a parked reader")
+	}
+
+	// The reader must finish and close Events even though it was mid-send.
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range subscription.Events() {
+		}
+	}()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader goroutine was stranded; Events never closed")
+	}
+
+	require.NoError(t, subscription.Close())
+}
