@@ -359,6 +359,11 @@ msg = client.pipe_send(
 inbox = client.pipe_inbox(limit=5)
 for msg in inbox.items:
     print(f"From {msg.from_agent}: {msg.payload}")
+# Current nodes may also supply from/to display, saved registered-name, and
+# provider presentation fields. PipeMessage retains them; display/provider
+# values can change. A legacy missing registered name uses the current display
+# name compatibility fallback and is not immutable history. Exact agent IDs and
+# persisted routing selectors remain authoritative.
 
 # Claim a message for processing
 client.pipe_claim(msg.pipe_id)
@@ -407,7 +412,8 @@ sent = client.message_send(
 # ordered claimed batch rather than consuming later messages.
 batch = client.messages_receive("session-2026-08-02-turn-1", limit=5)
 for item in batch.items:
-    pass
+    # Optional from_display_name/from_registered_name are presentation only.
+    print(item.from_agent, item.from_display_name)
 client.messages_mark_read_batch([item.message_id for item in batch.items])
 for item in batch.items:
     client.message_reply(item.message_id, "Reviewed")

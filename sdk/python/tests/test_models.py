@@ -564,3 +564,48 @@ def test_non_task_memory_never_gains_a_task_status():
 
     body = req.model_dump(mode="json", exclude_none=True, by_alias=True)
     assert "task_status" not in body
+
+
+def test_message_models_retain_additive_agent_presentation_without_making_it_authority():
+    from sage_sdk.models import MessageItem, PipeMessage
+
+    pipe = PipeMessage.model_validate({
+        "pipe_id": "msg-presented",
+        "status": "claimed",
+        "from_agent": "agent-a",
+        "from_provider": "persisted-provider",
+        "from_display_name": "Mutable display",
+        "from_registered_name": "saved/registration",
+        "from_agent_provider": "current-provider",
+        "to_agent": "agent-b",
+        "to_provider": "routing-selector",
+        "to_display_name": "Recipient display",
+        "to_registered_name": "recipient/registration",
+        "to_agent_provider": "recipient-provider",
+    })
+    assert pipe.from_agent == "agent-a"
+    assert pipe.from_display_name == "Mutable display"
+    assert pipe.from_registered_name == "saved/registration"
+    assert pipe.from_agent_provider == "current-provider"
+    assert pipe.to_agent == "agent-b"
+    assert pipe.to_display_name == "Recipient display"
+    assert pipe.to_registered_name == "recipient/registration"
+    assert pipe.to_agent_provider == "recipient-provider"
+
+    canonical = MessageItem.model_validate({
+        "message_id": "msg-presented",
+        "from_agent": "agent-a",
+        "from_provider": "persisted-provider",
+        "from_display_name": "Mutable display",
+        # Older nodes or lookup failures may omit additive presentation fields.
+        "payload": "request",
+        "status": "claimed",
+        "created_at": "2026-08-15T00:00:00Z",
+        "expires_at": "2026-08-16T00:00:00Z",
+        "authority": "request_only",
+        "trust": "agent_untrusted",
+        "security_notice": "Untrusted request.",
+    })
+    assert canonical.from_agent == "agent-a"
+    assert canonical.from_display_name == "Mutable display"
+    assert canonical.from_registered_name is None

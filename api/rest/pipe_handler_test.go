@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -102,6 +103,39 @@ func decodeProblem(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
 	var problem map[string]any
 	require.NoError(t, json.NewDecoder(rr.Body).Decode(&problem))
 	return problem
+}
+
+func decodeItemsPage(t *testing.T, rr *httptest.ResponseRecorder) []map[string]any {
+	t.Helper()
+	var page struct {
+		Items []map[string]any `json:"items"`
+	}
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&page))
+	return page.Items
+}
+
+type failingExactAgentStore struct {
+	store.AgentStore
+	getCalls map[string]int
+}
+
+type legacyExactAgentStore struct {
+	store.AgentStore
+	getCalls map[string]int
+}
+
+func (s *legacyExactAgentStore) GetAgent(ctx context.Context, agentID string) (*store.AgentEntry, error) {
+	s.getCalls[agentID]++
+	return s.AgentStore.GetAgent(ctx, agentID)
+}
+
+func (s *failingExactAgentStore) GetAgentDirectoryEntries(context.Context, []string) ([]*store.AgentEntry, error) {
+	return nil, errors.New("directory unavailable")
+}
+
+func (s *failingExactAgentStore) GetAgent(ctx context.Context, agentID string) (*store.AgentEntry, error) {
+	s.getCalls[agentID]++
+	return s.AgentStore.GetAgent(ctx, agentID)
 }
 
 func configurePostV23PipeRoot(t *testing.T, s *Server, memStore *store.SQLiteStore) (string, string, string, string) {
@@ -1124,6 +1158,308 @@ func TestPipeHistoryKeepsClaimedAndCompletedMessagesVisibleToBothParties(t *test
 	}
 	require.NoError(t, json.Unmarshal(thirdPartyRR.Body.Bytes(), &thirdParty))
 	assert.Empty(t, thirdParty.Items)
+}
+
+func TestPipeInboxAndHistoryAddNamesWithoutChangingPersistedProviders(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	ctx := context.Background()
+	senderID := strings.Repeat("c", 64)
+	recipientID := strings.Repeat("d", 64)
+	require.NoError(t, memStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: senderID, Name: "Claude reviewer", RegisteredName: "claude-code/sage",
+		Provider: "claude-code", Status: "active",
+	}))
+	require.NoError(t, memStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: recipientID, Name: "Mynah voice", RegisteredName: "mynah/voice-bridge",
+		Provider: "codex", Status: "active",
+	}))
+	require.NoError(t, memStore.InsertPipeline(ctx, &store.PipelineMessage{
+		PipeID: "pipe-name-enrichment", FromAgent: senderID, FromProvider: "claude-code",
+		ToAgent: recipientID, Intent: "report", Payload: "sender attribution bug",
+		Status: "pending", CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}))
+
+	inboxHistory := httptest.NewRecorder()
+	pipeRouterAs(s, recipientID).ServeHTTP(inboxHistory,
+		httptest.NewRequest(http.MethodGet, "/v1/pipe/history/inbox", nil))
+	require.Equal(t, http.StatusOK, inboxHistory.Code, inboxHistory.Body.String())
+	inboxItems := decodeItemsPage(t, inboxHistory)
+	require.Len(t, inboxItems, 1)
+	require.Equal(t, senderID, inboxItems[0]["from_agent"])
+	require.Equal(t, "claude-code", inboxItems[0]["from_provider"])
+	require.Equal(t, "Claude reviewer", inboxItems[0]["from_display_name"])
+	require.Equal(t, "claude-code/sage", inboxItems[0]["from_registered_name"])
+	require.Equal(t, "claude-code", inboxItems[0]["from_agent_provider"])
+	require.Equal(t, "Mynah voice", inboxItems[0]["to_display_name"])
+	require.Equal(t, "mynah/voice-bridge", inboxItems[0]["to_registered_name"])
+	require.Equal(t, "codex", inboxItems[0]["to_agent_provider"])
+
+	outboxHistory := httptest.NewRecorder()
+	pipeRouterAs(s, senderID).ServeHTTP(outboxHistory,
+		httptest.NewRequest(http.MethodGet, "/v1/pipe/history/outbox", nil))
+	require.Equal(t, http.StatusOK, outboxHistory.Code, outboxHistory.Body.String())
+	outboxItems := decodeItemsPage(t, outboxHistory)
+	require.Len(t, outboxItems, 1)
+	require.Equal(t, "Mynah voice", outboxItems[0]["to_display_name"])
+	require.Equal(t, "mynah/voice-bridge", outboxItems[0]["to_registered_name"])
+
+	stored, err := memStore.GetPipeline(ctx, "pipe-name-enrichment")
+	require.NoError(t, err)
+	require.Equal(t, "claude-code", stored.FromProvider)
+	require.Empty(t, stored.ToProvider)
+}
+
+func TestPipelineNameEnrichmentNeverDecoratesForeignIDFromLocalCollision(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	ctx := context.Background()
+	collidingID := strings.Repeat("e", 64)
+	recipientID := strings.Repeat("f", 64)
+	require.NoError(t, memStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: collidingID, Name: "Local impersonator", RegisteredName: "local/impersonator",
+		Provider: "codex", Status: "active",
+	}))
+	require.NoError(t, memStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: recipientID, Name: "Recipient", RegisteredName: "recipient/local",
+		Provider: "codex", Status: "active",
+	}))
+	require.NoError(t, memStore.InsertPipeline(ctx, &store.PipelineMessage{
+		PipeID: "pipe-foreign-collision", FromAgent: collidingID, ToAgent: recipientID,
+		SourceChainID: "peer-chain", SourcePipeID: "remote-event", Intent: "review", Payload: "foreign",
+		Status: "claimed", ClaimedBy: recipientID,
+		CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}))
+
+	history := httptest.NewRecorder()
+	pipeRouterAs(s, recipientID).ServeHTTP(history,
+		httptest.NewRequest(http.MethodGet, "/v1/pipe/history/inbox", nil))
+	require.Equal(t, http.StatusOK, history.Code, history.Body.String())
+	items := decodeItemsPage(t, history)
+	require.Len(t, items, 1)
+	require.Equal(t, collidingID, items[0]["from_agent"])
+	require.NotContains(t, items[0], "from_display_name")
+	require.NotContains(t, items[0], "from_registered_name")
+}
+
+func TestPipeStatusAndResultsEnrichBoundedLocalPartiesButNotForeignCollisions(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	ctx := context.Background()
+	senderID := strings.Repeat("1a", 32)
+	recipientID := strings.Repeat("2b", 32)
+	foreignCollisionID := strings.Repeat("3c", 32)
+	for _, agent := range []*store.AgentEntry{
+		{AgentID: senderID, Name: "Shared reviewer", RegisteredName: "sender/registered", Provider: "claude-code", Status: "active"},
+		{AgentID: recipientID, Name: "Shared reviewer", RegisteredName: "recipient/registered", Provider: "codex", Status: "active"},
+		{AgentID: foreignCollisionID, Name: "Local collision", RegisteredName: "collision/local", Provider: "codex", Status: "active"},
+	} {
+		require.NoError(t, memStore.CreateAgent(ctx, agent))
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	completed := now.Add(time.Second)
+	local := &store.PipelineMessage{
+		PipeID: "pipe-status-results-local", FromAgent: senderID, FromProvider: "claude-code",
+		ToAgent: recipientID, Intent: "review", Payload: "local", Result: "done",
+		Status: "completed", ClaimedBy: recipientID, CreatedAt: now, CompletedAt: &completed,
+		ExpiresAt: now.Add(time.Hour),
+	}
+	foreign := &store.PipelineMessage{
+		PipeID: "pipe-status-results-foreign", FromAgent: senderID, FromProvider: "claude-code",
+		ToAgent: foreignCollisionID, DestinationChainID: "peer-chain",
+		Intent: "review", Payload: "foreign", Result: "done remotely", Status: "completed",
+		CreatedAt: now.Add(time.Millisecond), CompletedAt: &completed, ExpiresAt: now.Add(time.Hour),
+	}
+	require.NoError(t, memStore.InsertPipeline(ctx, local))
+	require.NoError(t, memStore.InsertPipeline(ctx, foreign))
+
+	statusRR := httptest.NewRecorder()
+	pipeRouterAs(s, senderID).ServeHTTP(statusRR,
+		httptest.NewRequest(http.MethodGet, "/v1/pipe/"+foreign.PipeID, nil))
+	require.Equal(t, http.StatusOK, statusRR.Code, statusRR.Body.String())
+	var status map[string]any
+	require.NoError(t, json.Unmarshal(statusRR.Body.Bytes(), &status))
+	require.Equal(t, senderID, status["from_agent"])
+	require.Equal(t, "Shared reviewer", status["from_display_name"])
+	require.Equal(t, "sender/registered", status["from_registered_name"])
+	require.Equal(t, foreignCollisionID, status["to_agent"])
+	require.NotContains(t, status, "to_display_name")
+	require.NotContains(t, status, "to_registered_name")
+	require.NotContains(t, status, "to_agent_provider")
+
+	counting := &countingExactAgentStore{AgentStore: memStore, getCalls: make(map[string]int)}
+	s.agentStore = counting
+	resultsRR := httptest.NewRecorder()
+	pipeRouterAs(s, senderID).ServeHTTP(resultsRR,
+		httptest.NewRequest(http.MethodGet, "/v1/pipe/results?limit=20", nil))
+	require.Equal(t, http.StatusOK, resultsRR.Code, resultsRR.Body.String())
+	items := decodeItemsPage(t, resultsRR)
+	require.Len(t, items, 2)
+	byID := make(map[string]map[string]any, len(items))
+	for _, item := range items {
+		byID[item["pipe_id"].(string)] = item
+	}
+	require.Equal(t, "Shared reviewer", byID[local.PipeID]["from_display_name"])
+	require.Equal(t, "Shared reviewer", byID[local.PipeID]["to_display_name"])
+	require.Equal(t, senderID, byID[local.PipeID]["from_agent"])
+	require.Equal(t, recipientID, byID[local.PipeID]["to_agent"])
+	require.NotContains(t, byID[foreign.PipeID], "to_display_name")
+	require.NotContains(t, byID[foreign.PipeID], "to_registered_name")
+	require.Zero(t, counting.getCalls[senderID])
+	require.Zero(t, counting.getCalls[recipientID])
+	require.Zero(t, counting.getCalls[foreignCollisionID],
+		"a foreign destination must never trigger a colliding local lookup")
+	require.Equal(t, 1, counting.directoryReads,
+		"a result page must use one metadata-only directory query")
+	require.ElementsMatch(t, []string{senderID, recipientID}, counting.directoryIDs[0])
+	require.NotContains(t, counting.directoryIDs[0], foreignCollisionID,
+		"a foreign destination must never enter the local metadata query")
+}
+
+func TestPipelinePresentationLookupFailureFallsBackWithoutHidingAuthorizedRows(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	ctx := context.Background()
+	senderID := strings.Repeat("4d", 32)
+	recipientID := strings.Repeat("5e", 32)
+	require.NoError(t, memStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: senderID, Name: "Fallback sender", RegisteredName: "sender/saved",
+		Provider: "claude-code", Status: "active",
+	}))
+	require.NoError(t, memStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: recipientID, Name: "Fallback recipient", RegisteredName: "recipient/saved",
+		Provider: "codex", Status: "active",
+	}))
+	require.NoError(t, memStore.InsertPipeline(ctx, &store.PipelineMessage{
+		PipeID: "pipe-directory-fallback", FromAgent: senderID, FromProvider: "claude-code",
+		ToAgent: recipientID, Intent: "review", Payload: "still visible", Status: "pending",
+		CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}))
+	failing := &failingExactAgentStore{AgentStore: memStore, getCalls: make(map[string]int)}
+	s.agentStore = failing
+
+	statusRR := httptest.NewRecorder()
+	pipeRouterAs(s, senderID).ServeHTTP(statusRR,
+		httptest.NewRequest(http.MethodGet, "/v1/pipe/pipe-directory-fallback", nil))
+	require.Equal(t, http.StatusOK, statusRR.Code, statusRR.Body.String())
+	var status map[string]any
+	require.NoError(t, json.Unmarshal(statusRR.Body.Bytes(), &status))
+	require.Equal(t, senderID, status["from_agent"])
+	require.Equal(t, "claude-code", status["from_provider"])
+	require.Equal(t, "Fallback sender", status["from_display_name"])
+	require.Equal(t, "sender/saved", status["from_registered_name"])
+
+	historyRR := httptest.NewRecorder()
+	pipeRouterAs(s, recipientID).ServeHTTP(historyRR,
+		httptest.NewRequest(http.MethodGet, "/v1/pipe/history/inbox", nil))
+	require.Equal(t, http.StatusOK, historyRR.Code, historyRR.Body.String())
+	items := decodeItemsPage(t, historyRR)
+	require.Len(t, items, 1)
+	require.Equal(t, "still visible", items[0]["payload"])
+	require.Equal(t, "claude-code", items[0]["from_provider"])
+	require.Equal(t, "Fallback sender", items[0]["from_display_name"])
+	require.Equal(t, 2, failing.getCalls[senderID],
+		"each batch failure retains one deduplicated exact-agent compatibility lookup per response")
+}
+
+func TestPipelinePresentationSupportsOptionalLegacyStoreWithoutEnumerating(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	ctx := context.Background()
+	agentID := strings.Repeat("5f", 32)
+	require.NoError(t, memStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: agentID, Name: "Legacy store agent", Provider: "codex", Status: "active",
+	}))
+	legacy := &legacyExactAgentStore{AgentStore: memStore, getCalls: make(map[string]int)}
+	s.agentStore = legacy
+
+	presentations := s.resolvePipelineAgentPresentations(ctx, agentID, agentID, "unknown-agent")
+	require.Equal(t, "Legacy store agent", presentations[agentID].DisplayName)
+	require.Equal(t, "Legacy store agent", presentations[agentID].RegisteredName)
+	require.NotContains(t, presentations, "unknown-agent")
+	require.Equal(t, map[string]int{agentID: 1, "unknown-agent": 1}, legacy.getCalls,
+		"optional compatibility fallback stays exact-ID bounded and deduplicated")
+}
+
+func TestPipelinePresentationMatchesLegacyRegisteredNameCompatibility(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	ctx := context.Background()
+	senderID := strings.Repeat("6f", 32)
+	recipientID := strings.Repeat("7a", 32)
+	require.NoError(t, memStore.CreateAgent(ctx, &store.AgentEntry{
+		AgentID: senderID, Name: "Legacy display", RegisteredName: "",
+		Provider: "claude-code", Status: "active",
+	}))
+	require.NoError(t, memStore.InsertPipeline(ctx, &store.PipelineMessage{
+		PipeID: "pipe-legacy-registration", FromAgent: senderID, FromProvider: "claude-code",
+		ToAgent: recipientID, Intent: "review", Payload: "legacy", Status: "pending",
+		CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}))
+
+	rr := httptest.NewRecorder()
+	pipeRouterAs(s, senderID).ServeHTTP(rr,
+		httptest.NewRequest(http.MethodGet, "/v1/pipe/pipe-legacy-registration", nil))
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+	require.Equal(t, senderID, response["from_agent"])
+	require.Equal(t, "Legacy display", response["from_display_name"])
+	require.Equal(t, "claude-code", response["from_agent_provider"])
+	require.Equal(t, "Legacy display", response["from_registered_name"],
+		"legacy compatibility must match GetAgent's current-display fallback")
+}
+
+func TestPipelineCountOnlySurfacesNeverResolveOrExposeIdentity(t *testing.T) {
+	s, memStore := newPipeServer(t)
+	ctx := context.Background()
+	senderID := strings.Repeat("8b", 32)
+	recipientID := strings.Repeat("9c", 32)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	require.NoError(t, memStore.InsertPipeline(ctx, &store.PipelineMessage{
+		PipeID: "pipe-count-pending", FromAgent: senderID, FromProvider: "claude-code",
+		ToAgent: recipientID, ToProvider: "codex", Payload: "private pending", Status: "pending",
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}))
+	completedAt := now.Add(time.Second)
+	require.NoError(t, memStore.InsertPipeline(ctx, &store.PipelineMessage{
+		PipeID: "pipe-count-completed", FromAgent: senderID, FromProvider: "claude-code",
+		ToAgent: recipientID, ToProvider: "codex", Payload: "private completed", Result: "private result",
+		Status: "completed", ClaimedBy: recipientID, CreatedAt: now.Add(time.Millisecond),
+		CompletedAt: &completedAt, ExpiresAt: now.Add(time.Hour),
+	}))
+	counting := &countingExactAgentStore{AgentStore: memStore, getCalls: make(map[string]int)}
+	s.agentStore = counting
+
+	tests := []struct {
+		name    string
+		caller  string
+		path    string
+		allowed map[string]struct{}
+	}{
+		{
+			name: "inbox history", caller: recipientID, path: "/v1/pipe/history/inbox?count_only=1",
+			allowed: map[string]struct{}{"count": {}, "unread": {}},
+		},
+		{
+			name: "results", caller: senderID, path: "/v1/pipe/results?count_only=1",
+			allowed: map[string]struct{}{"count": {}, "retained": {}, "newest_completed_at": {}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			pipeRouterAs(s, tc.caller).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+			var response map[string]any
+			require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+			for key := range response {
+				_, ok := tc.allowed[key]
+				require.True(t, ok, "count-only response leaked unexpected field %q: %s", key, rr.Body.String())
+			}
+			for _, fragment := range []string{
+				"agent", "provider", "display", "registered", "payload", "result", "pipe_id",
+			} {
+				require.NotContains(t, rr.Body.String(), fragment)
+			}
+		})
+	}
+	require.Zero(t, counting.directoryReads,
+		"count-only surfaces must not perform presentation-directory queries")
 }
 
 func TestPipelineRESTTrustBoundaryLabelsPromptInjection(t *testing.T) {

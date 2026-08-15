@@ -182,3 +182,21 @@ func TestHiddenCompatibilityToolsAreUnchangedByReplyVisibility(t *testing.T) {
 			"%s must not point agents at a hidden deprecated alias for reading replies", name)
 	}
 }
+
+func TestAdvertisedMessageIdentityContractsKeepExactIDsAuthoritative(t *testing.T) {
+	s, _ := newAdvertisedToolTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
+	for _, name := range []string{"sage_messages_receive", "sage_inbox"} {
+		tool := s.tools[name]
+		require.Contains(t, tool.Description, "sender_agent", name)
+		require.Contains(t, tool.Description, "presentation metadata", name)
+		require.Contains(t, tool.Description, "current display-name compatibility fallback", name)
+		require.Contains(t, tool.Description, "never", name)
+	}
+	history := s.tools["sage_message_history"]
+	require.Contains(t, history.Description, "counterparty_agent")
+	require.Contains(t, history.Description, "agent@chain")
+	require.Contains(t, history.Description, "presentation metadata")
+	require.Contains(t, history.Description, "current display-name compatibility fallback")
+}

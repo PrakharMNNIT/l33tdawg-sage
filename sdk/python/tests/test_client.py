@@ -736,6 +736,9 @@ def test_canonical_messages_cover_idempotent_receive_reply_read_and_status(clien
         return_value=httpx.Response(200, json={
             "items": [{
                 "message_id": "message-1", "from_agent": "agent-a",
+                "from_provider": "claude-code",
+                "from_display_name": "Claude reviewer",
+                "from_registered_name": "claude-code/sage",
                 "payload": "please review", "status": "claimed",
                 "created_at": "2026-08-02T09:00:00Z",
                 "expires_at": "2026-08-02T10:00:00Z",
@@ -773,6 +776,9 @@ def test_canonical_messages_cover_idempotent_receive_reply_read_and_status(clien
     assert sent.message_id == "message-1"
     assert json.loads(send_route.calls.last.request.read())["idempotency_key"] == "turn-123"
     assert received.items[0].authority == "request_only"
+    assert received.items[0].from_agent == "agent-a"
+    assert received.items[0].from_display_name == "Claude reviewer"
+    assert received.items[0].from_registered_name == "claude-code/sage"
     assert json.loads(receive_route.calls.last.request.read()) == {"receive_token": "receive-123", "limit": 7}
     assert replied.status == "completed"
     assert read.read_status == "confirmed"
@@ -807,7 +813,14 @@ def test_pipeline_trust_metadata_keeps_prompt_injection_untrusted(client, mock_a
     common = {
         "pipe_id": "trust-boundary-1",
         "from_agent": "agent-a",
+        "from_provider": "claude-code",
+        "from_display_name": "Claude reviewer",
+        "from_registered_name": "claude-code/sage",
+        "from_agent_provider": "claude-code",
         "to_agent": "agent-b",
+        "to_display_name": "Codex implementer",
+        "to_registered_name": "codex/sage",
+        "to_agent_provider": "codex",
         "intent": injection,
         "payload": injection,
         "status": "claimed",
@@ -867,6 +880,12 @@ def test_pipeline_trust_metadata_keeps_prompt_injection_untrusted(client, mock_a
     assert inbox_item.payload_authority == "request_only"
     assert inbox_item.trust == "agent_untrusted"
     assert inbox_item.receipt_protocol_version == 2
+    assert inbox_item.from_display_name == "Claude reviewer"
+    assert inbox_item.from_registered_name == "claude-code/sage"
+    assert inbox_item.from_agent_provider == "claude-code"
+    assert inbox_item.to_display_name == "Codex implementer"
+    assert inbox_item.to_registered_name == "codex/sage"
+    assert inbox_item.to_agent_provider == "codex"
 
     status = client.pipe_status("trust-boundary-1")
     assert status.payload == injection

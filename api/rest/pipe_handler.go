@@ -138,6 +138,12 @@ const (
 // persist or submit their own authority.
 type pipelineMessageRESTResponse struct {
 	*store.PipelineMessage
+	FromDisplayName    string `json:"from_display_name,omitempty"`
+	FromRegisteredName string `json:"from_registered_name,omitempty"`
+	FromAgentProvider  string `json:"from_agent_provider,omitempty"`
+	ToDisplayName      string `json:"to_display_name,omitempty"`
+	ToRegisteredName   string `json:"to_registered_name,omitempty"`
+	ToAgentProvider    string `json:"to_agent_provider,omitempty"`
 	ReplySourceChainID string `json:"reply_source_chain_id,omitempty"`
 	Authority          string `json:"authority,omitempty"`
 	Trust              string `json:"trust"`
@@ -151,6 +157,129 @@ type pipelineMessageRESTResponse struct {
 	// agent that never saw the message be presented to the sender as its author.
 	RepliedBy              string `json:"replied_by,omitempty"`
 	ReceiptProtocolVersion int    `json:"receipt_protocol_version,omitempty"`
+}
+
+// pipelineAgentPresentation is response-only directory metadata. Authorization,
+// routing, claiming, and reply attribution continue to use immutable agent IDs
+// and the persisted provider selectors on PipelineMessage.
+type pipelineAgentPresentation struct {
+	DisplayName    string
+	RegisteredName string
+	Provider       string
+}
+
+// pipelineAgentDirectoryReader is the narrow, response-only projection used to
+// decorate message rows that the caller has already been authorized to read.
+// Keeping it optional preserves compatibility with alternate AgentStore
+// implementations; those use the bounded exact per-agent compatibility path.
+type pipelineAgentDirectoryReader interface {
+	GetAgentDirectoryEntries(ctx context.Context, agentIDs []string) ([]*store.AgentEntry, error)
+}
+
+const maxPipelinePresentationAgentIDs = 512
+
+// resolvePipelineAgentPresentations performs one bounded, metadata-only exact
+// directory query for the distinct local IDs in an already-authorized response.
+// A missing/removed agent or directory failure must not hide message work.
+// Production stores use the batch projection; alternate stores and batch errors
+// retain the pre-existing bounded exact-GetAgent compatibility path.
+func (s *Server) resolvePipelineAgentPresentations(
+	ctx context.Context, agentIDs ...string,
+) map[string]pipelineAgentPresentation {
+	presentations := make(map[string]pipelineAgentPresentation)
+	if s.agentStore == nil {
+		return presentations
+	}
+	seen := make(map[string]struct{}, len(agentIDs))
+	selected := make([]string, 0, len(agentIDs))
+	for _, agentID := range agentIDs {
+		if agentID == "" || len(selected) >= maxPipelinePresentationAgentIDs {
+			continue
+		}
+		if _, duplicate := seen[agentID]; duplicate {
+			continue
+		}
+		seen[agentID] = struct{}{}
+		selected = append(selected, agentID)
+	}
+	if len(selected) == 0 {
+		return presentations
+	}
+	directory, supportsBatch := s.agentStore.(pipelineAgentDirectoryReader)
+	if supportsBatch {
+		agents, err := directory.GetAgentDirectoryEntries(ctx, selected)
+		if err == nil {
+			for _, agent := range agents {
+				if agent == nil {
+					continue
+				}
+				if _, requested := seen[agent.AgentID]; !requested {
+					continue
+				}
+				presentations[agent.AgentID] = pipelineAgentPresentation{
+					DisplayName:    strings.TrimSpace(agent.Name),
+					RegisteredName: strings.TrimSpace(agent.RegisteredName),
+					Provider:       strings.TrimSpace(agent.Provider),
+				}
+			}
+			return presentations
+		}
+	}
+
+	for _, agentID := range selected {
+		agent, err := s.agentStore.GetAgent(ctx, agentID)
+		if err != nil || agent == nil {
+			continue
+		}
+		presentations[agentID] = pipelineAgentPresentation{
+			DisplayName:    strings.TrimSpace(agent.Name),
+			RegisteredName: strings.TrimSpace(agent.RegisteredName),
+			Provider:       strings.TrimSpace(agent.Provider),
+		}
+	}
+	return presentations
+}
+
+func pipelineMessageAgentIDs(items []*store.PipelineMessage) []string {
+	agentIDs := make([]string, 0, len(items)*2)
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		// A foreign agent ID is scoped by its chain and must never be decorated
+		// from a colliding local directory row.
+		if item.SourceChainID == "" {
+			agentIDs = append(agentIDs, item.FromAgent)
+		}
+		if item.DestinationChainID == "" {
+			agentIDs = append(agentIDs, item.ToAgent)
+		}
+	}
+	return agentIDs
+}
+
+func enrichPipelineMessageREST(
+	response pipelineMessageRESTResponse,
+	presentations map[string]pipelineAgentPresentation,
+) pipelineMessageRESTResponse {
+	if response.PipelineMessage == nil {
+		return response
+	}
+	if response.SourceChainID == "" {
+		if presentation, ok := presentations[response.FromAgent]; ok {
+			response.FromDisplayName = presentation.DisplayName
+			response.FromRegisteredName = presentation.RegisteredName
+			response.FromAgentProvider = presentation.Provider
+		}
+	}
+	if response.DestinationChainID == "" {
+		if presentation, ok := presentations[response.ToAgent]; ok {
+			response.ToDisplayName = presentation.DisplayName
+			response.ToRegisteredName = presentation.RegisteredName
+			response.ToAgentProvider = presentation.Provider
+		}
+	}
+	return response
 }
 
 // pipeReplyProvenanceAgent names the agent that actually wrote the reply on a
@@ -934,9 +1063,12 @@ func (s *Server) handlePipeInbox(w http.ResponseWriter, r *http.Request) {
 		claimedItems = append(claimedItems, item)
 	}
 
+	presentations := s.resolvePipelineAgentPresentations(
+		r.Context(), pipelineMessageAgentIDs(claimedItems)...,
+	)
 	responseItems := make([]pipelineMessageRESTResponse, 0, len(claimedItems))
 	for _, item := range claimedItems {
-		response := pipelineMessageREST(item, "inbox")
+		response := enrichPipelineMessageREST(pipelineMessageREST(item, "inbox"), presentations)
 		if receiptStore, ok := s.store.(federatedPipeReceiptInboundStore); ok {
 			if _, err := receiptStore.GetFederatedReceiptInbound(r.Context(), item.PipeID); err == nil {
 				response.ReceiptProtocolVersion = federation.PipeReceiptVersion
@@ -1000,9 +1132,13 @@ func (s *Server) handlePipeInboxHistory(w http.ResponseWriter, r *http.Request) 
 		writeProblem(w, http.StatusInternalServerError, "Inbox history query failed", err.Error())
 		return
 	}
+	presentations := s.resolvePipelineAgentPresentations(
+		r.Context(), pipelineMessageAgentIDs(items)...,
+	)
 	responseItems := make([]pipelineMessageRESTResponse, 0, len(items))
 	for _, item := range items {
-		responseItems = append(responseItems, pipelineMessageREST(item, "history"))
+		responseItems = append(responseItems,
+			enrichPipelineMessageREST(pipelineMessageREST(item, "history"), presentations))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": responseItems, "count": len(responseItems)})
 }
@@ -1021,9 +1157,13 @@ func (s *Server) handlePipeOutbox(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusInternalServerError, "Outbox query failed", err.Error())
 		return
 	}
+	presentations := s.resolvePipelineAgentPresentations(
+		r.Context(), pipelineMessageAgentIDs(items)...,
+	)
 	responseItems := make([]pipelineMessageRESTResponse, 0, len(items))
 	for _, item := range items {
-		responseItems = append(responseItems, pipelineMessageREST(item, "history"))
+		responseItems = append(responseItems,
+			enrichPipelineMessageREST(pipelineMessageREST(item, "history"), presentations))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": responseItems, "count": len(responseItems)})
 }
@@ -1557,7 +1697,10 @@ func (s *Server) handlePipeStatus(w http.ResponseWriter, r *http.Request) {
 	if msg.SourceChainID != "" && s.federation != nil {
 		replySourceChainID = s.federation.LocalChainID()
 	}
-	response := pipelineMessageREST(msg, "status")
+	presentations := s.resolvePipelineAgentPresentations(
+		r.Context(), pipelineMessageAgentIDs([]*store.PipelineMessage{msg})...,
+	)
+	response := enrichPipelineMessageREST(pipelineMessageREST(msg, "status"), presentations)
 	response.ReplySourceChainID = replySourceChainID
 	writeJSON(w, http.StatusOK, response)
 }
@@ -1736,9 +1879,13 @@ func (s *Server) handlePipeResults(w http.ResponseWriter, r *http.Request) {
 		items = make([]*store.PipelineMessage, 0)
 	}
 
+	presentations := s.resolvePipelineAgentPresentations(
+		r.Context(), pipelineMessageAgentIDs(items)...,
+	)
 	responseItems := make([]pipelineMessageRESTResponse, 0, len(items))
 	for _, item := range items {
-		responseItems = append(responseItems, pipelineMessageREST(item, "results"))
+		responseItems = append(responseItems,
+			enrichPipelineMessageREST(pipelineMessageREST(item, "results"), presentations))
 	}
 	response := map[string]any{
 		"items": responseItems,
