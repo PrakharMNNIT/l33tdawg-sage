@@ -1041,6 +1041,12 @@ state; no original request workflow/read state or result content is exposed.
 
 **REST:** `POST /v1/messages/{message_id}/reply`.
 
+MCP falls back to the deprecated pipe-result route only when an older node
+returns a non-Problem-Details 404 for the missing Messages route. A current
+typed `https://sage.dev/errors/404` response is an authoritative
+non-enumerating denial, including after a claimant-session handoff, and is
+never retried through the compatibility endpoint.
+
 ---
 
 ### sage_message_status
@@ -1892,6 +1898,12 @@ labels, result bytes, or pipe identifiers; foreign completion returns
 says the result was **queued for delivery**, not delivered; if retry later
 becomes terminal, the completing agent receives a `message_delivery_updates`
 notice on `sage_turn`.
+
+For local canonical messages, this compatibility alias supplies the current
+MCP runtime's claimant session and obeys the same typed-404 fence as
+`sage_message_reply`; it cannot be used by a sibling runtime to complete work
+after that claim was handed away. Responses report the actual `scope` as
+`local` or `federated`, and expose `reply_event_id` only for a federated result.
 
 **REST:** `PUT /v1/pipe/{pipe_id}/result`
 

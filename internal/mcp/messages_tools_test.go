@@ -131,6 +131,165 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 	require.Contains(t, status.(map[string]any)["message"], "does not prove comprehension")
 }
 
+func writeCanonical404ForMCPTest(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type": canonicalNotFoundProblemType, "title": "Message not found",
+		"status": http.StatusNotFound, "detail": "The message is unavailable to this claimant session.",
+	})
+}
+
+func TestMessageReplyCannotFallbackAcrossSameAgentClaimantSessions(t *testing.T) {
+	var claimA string
+	canonicalCalls := 0
+	pipePreflightCalls := 0
+	legacyResultCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/msg-session/reply", func(w http.ResponseWriter, r *http.Request) {
+		canonicalCalls++
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		if body["claimant_session_id"] != claimA {
+			writeCanonical404ForMCPTest(w)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"message_id": "msg-session", "status": "completed"})
+	})
+	mux.HandleFunc("/v1/pipe/msg-session", func(w http.ResponseWriter, _ *http.Request) {
+		pipePreflightCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"pipe_id": "msg-session", "status": "claimed"})
+	})
+	mux.HandleFunc("/v1/pipe/msg-session/result", func(w http.ResponseWriter, _ *http.Request) {
+		legacyResultCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	sessionA := NewServer(ts.URL, privateKey)
+	sessionB := NewServer(ts.URL, privateKey)
+	claimA, err = sessionA.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	claimB, err := sessionB.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	require.NotEqual(t, claimA, claimB)
+
+	_, err = sessionB.toolMessageReply(context.Background(), map[string]any{
+		"message_id": "msg-session", "result": "stale",
+	})
+	require.Error(t, err)
+	require.Equal(t, 1, canonicalCalls, "a typed denial must be the only attempt")
+	require.Zero(t, pipePreflightCalls, "a typed denial must not enter the compatibility path")
+	require.Zero(t, legacyResultCalls, "a sibling session must not bypass through pipe result")
+
+	result, err := sessionA.toolMessageReply(context.Background(), map[string]any{
+		"message_id": "msg-session", "result": "done",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "local", result.(map[string]any)["scope"])
+	require.Equal(t, 2, canonicalCalls)
+	require.Zero(t, pipePreflightCalls)
+	require.Zero(t, legacyResultCalls)
+}
+
+func TestPipeResultAliasCannotOmitOrBypassClaimantSession(t *testing.T) {
+	var claimA, seenSession string
+	canonicalCalls := 0
+	legacyResultCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/pipe/msg-hidden", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"pipe_id": "msg-hidden", "status": "claimed"})
+	})
+	mux.HandleFunc("/v1/messages/msg-hidden/reply", func(w http.ResponseWriter, r *http.Request) {
+		canonicalCalls++
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		seenSession, _ = body["claimant_session_id"].(string)
+		if seenSession != claimA {
+			writeCanonical404ForMCPTest(w)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"message_id": "msg-hidden", "status": "completed"})
+	})
+	mux.HandleFunc("/v1/pipe/msg-hidden/result", func(w http.ResponseWriter, _ *http.Request) {
+		legacyResultCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	sessionA := NewServer(ts.URL, privateKey)
+	sessionB := NewServer(ts.URL, privateKey)
+	claimA, err = sessionA.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	claimB, err := sessionB.claimantSessionID(context.Background())
+	require.NoError(t, err)
+
+	_, err = sessionB.toolPipeResult(context.Background(), map[string]any{
+		"pipe_id": "msg-hidden", "result": "stale",
+	})
+	require.Error(t, err)
+	require.Equal(t, claimB, seenSession, "the hidden alias must send its runtime claimant session")
+	require.Equal(t, 1, canonicalCalls)
+	require.Zero(t, legacyResultCalls, "a canonical typed denial must not fall through")
+
+	result, err := sessionA.toolPipeResult(context.Background(), map[string]any{
+		"pipe_id": "msg-hidden", "result": "done",
+	})
+	require.NoError(t, err)
+	require.Equal(t, claimA, seenSession)
+	require.Equal(t, "local", result.(map[string]any)["scope"])
+	require.Equal(t, 2, canonicalCalls)
+	require.Zero(t, legacyResultCalls)
+}
+
+func TestMessageReplyRetainsPlain404LegacyFallbackAndLocalScope(t *testing.T) {
+	canonicalCalls := 0
+	legacyResultCalls := 0
+	var claimantSessions []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/msg-legacy/reply", func(w http.ResponseWriter, r *http.Request) {
+		canonicalCalls++
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		claimantSession, _ := body["claimant_session_id"].(string)
+		claimantSessions = append(claimantSessions, claimantSession)
+		http.Error(w, "route not found", http.StatusNotFound)
+	})
+	mux.HandleFunc("/v1/pipe/msg-legacy", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"pipe_id": "msg-legacy", "status": "claimed"})
+	})
+	mux.HandleFunc("/v1/pipe/msg-legacy/result", func(w http.ResponseWriter, r *http.Request) {
+		legacyResultCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "completed", "journal_id": "journal-legacy", "journaled": true,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, privateKey)
+
+	result, err := s.toolMessageReply(context.Background(), map[string]any{
+		"message_id": "msg-legacy", "result": "done",
+	})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Equal(t, "local", response["scope"])
+	require.NotContains(t, response, "reply_event_id")
+	require.Contains(t, response["message"], "legacy local pipeline")
+	require.Equal(t, 2, canonicalCalls,
+		"the compatibility helper rechecks canonical Messages before using the old endpoint")
+	require.Equal(t, 1, legacyResultCalls)
+	require.Len(t, claimantSessions, 2)
+	require.NotEmpty(t, claimantSessions[0])
+	require.Equal(t, claimantSessions[0], claimantSessions[1])
+}
+
 func TestMessageSendSurfacesInboundThatArrivedAfterPriorEmptyPoll(t *testing.T) {
 	var inboxChecks int
 	var sendSucceeded bool
