@@ -118,6 +118,26 @@ export function analyze() {
   return results;
 }
 
+// Stable identity for one citation's COVERAGE, deliberately excluding the doc
+// line number: editing prose above a citation must not look like coverage loss.
+export function coverageKey(r) {
+  return `${relative(root, r.doc)}|${r.symbol}|${r.citedPath}`;
+}
+
+// How many citations resolve per key. A key dropping below its baseline count
+// means a citation that USED to be checked is no longer checked -- which the
+// aggregate floor cannot see, because one citation going from resolved to
+// skipped barely moves the total.
+export function coverageCounts(results) {
+  const counts = {};
+  for (const r of results) {
+    if (r.status === 'skipped') continue;
+    const k = coverageKey(r);
+    counts[k] = (counts[k] ?? 0) + 1;
+  }
+  return counts;
+}
+
 export function describe(r) {
   const actual = r.actual.map((s) => `${s.start}-${s.end}`).join(', ');
   const cited = r.cited.end ? `${r.cited.start}-${r.cited.end}` : `${r.cited.start}`;

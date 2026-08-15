@@ -1,6 +1,6 @@
 // Repair drifted `symbol` + `file.go:line` citations in docs/reference/.
 //
-// Usage: node scripts/fix-doc-citations.mjs [--dry-run]
+// Usage: node scripts/fix-doc-citations.mjs [--dry-run] [--update-baseline]
 //
 // SCOPE, AND ITS LIMIT. This repairs WHERE a symbol lives. It cannot verify the
 // prose around the citation, and the difference is load-bearing: a stale line
@@ -13,10 +13,23 @@
 // Fixing the address of a claim is mechanical; fixing the claim is not.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { relative } from 'node:path';
-import { analyze } from './doc-citations.mjs';
+import { analyze, coverageCounts } from './doc-citations.mjs';
 
 const root = new URL('../', import.meta.url).pathname;
 const dryRun = process.argv.includes('--dry-run');
+
+// Regenerate the fail-closed coverage baseline. Separated from repair on
+// purpose: repairing drift is routine, whereas accepting that a citation is no
+// longer checked is a decision someone should make deliberately.
+if (process.argv.includes('--update-baseline')) {
+  const counts = coverageCounts(analyze());
+  writeFileSync(
+    new URL('./doc-citations.baseline.json', import.meta.url),
+    `${JSON.stringify(counts, null, 2)}\n`,
+  );
+  console.log(`baseline updated: ${Object.keys(counts).length} citation key(s)`);
+  process.exit(0);
+}
 
 // These docs quote source comments in the bold form **"..."**. Only that form
 // is treated as a claim about source text; a plain "..." run is ordinary prose
