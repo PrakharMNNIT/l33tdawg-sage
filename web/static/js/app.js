@@ -999,7 +999,7 @@ function BrainDomainInventory({ onInventory, onAvailability, selectedDomain, onS
             <div class="brain-domain-head-actions">
                 ${!collapsed && html`<button type="button" onClick=${toggleGuide}
                     aria-expanded=${showGuide}>${showGuide ? 'Less' : 'How to read'}</button>`}
-                <button type="button" onClick=${resetLayout} title="Reset panel position and size">Reset</button>
+                <button type="button" class="brain-domain-reset" onClick=${resetLayout} title="Reset panel position and size">Reset</button>
                 <button type="button" onClick=${toggle}
                     aria-expanded=${!collapsed}
                     aria-label=${collapsed ? 'Show domain sources' : 'Hide domain sources'}>

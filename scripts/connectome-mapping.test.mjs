@@ -6,6 +6,8 @@ import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity, crea
 
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 const appSource = await readFile(new URL('../web/static/js/app.js', import.meta.url), 'utf8');
+const cssSource = await readFile(new URL('../web/static/css/sage.css', import.meta.url), 'utf8');
+const mriPageSource = await readFile(new URL('../web/static/mri.html', import.meta.url), 'utf8');
 
 // The CEREBRUM connectome view renders the agent message-bus in the brain hull.
 // mapConnectome() is the pure projection from the /network/synapses payload onto
@@ -144,11 +146,39 @@ test('renderer wires mode invalidation into both initial acquisition and reloads
     'a toggle must invalidate old work and refetch even before Graph exists');
 });
 
-test('connectome explanation stays in the existing guide instead of covering the graph', () => {
-  assert.doesNotMatch(mriSource, /\bmodeCap\b|mode-cap/,
+test('connectome guidance is reachable without adding another floating panel', () => {
+  const templateStart = mriSource.indexOf('root.innerHTML = `');
+  const templateEnd = mriSource.indexOf('`;\n  container.appendChild(root);', templateStart);
+  assert.ok(templateStart >= 0 && templateEnd > templateStart, 'renderer root template must remain inspectable');
+  const rootTemplate = mriSource.slice(templateStart, templateEnd);
+
+  const panelClasses = [...rootTemplate.matchAll(/class="panel ([^"]+)"/g)].map(match => match[1]).sort();
+  assert.deepEqual(panelClasses, ['hud', 'legend', 'scan'],
+    'the renderer must retain only its established scan, legend, and HUD panels');
+  assert.doesNotMatch(rootTemplate, /\bmodeCap\b|mode-cap/,
     'connectome mode must not create a free-floating explanatory panel');
-  assert.match(appSource, /<b>Connectome mode:<\/b> agents are neurons/,
-    'the existing How to read guide must retain the connectome explanation');
+
+  assert.match(rootTemplate, /class="lg-detail guide-connectome" hidden>[\s\S]*Agents are neurons[\s\S]*Click one to bloom its memories/i,
+    'standalone MRI must keep connectome guidance inside its existing reading legend');
+  assert.match(mriPageSource, /mountMriBrain\([\s\S]*showScan: true/,
+    'standalone MRI must continue mounting the renderer with its default reading legend');
+  assert.match(rootTemplate, /<button type="button" class="lg-toggle" aria-expanded="false">/,
+    'the standalone reading guide must be keyboard reachable');
+  assert.match(rootTemplate, /<button type="button" class="btn b-mode" aria-pressed="false">/,
+    'the mode toggle must be a keyboard-reachable button');
+  assert.match(mriSource, /connectomeGuide\.hidden = !connectome/,
+    'mode changes must associate the standalone guide with the active view');
+  assert.match(mriSource, /class="sr-status" role="status" aria-live="polite"/,
+    'mode changes must have a non-visual screen-reader announcement target');
+
+  assert.match(appSource, /<section class="brain-domain-guide" aria-label="How to read the brain">[\s\S]*<b>Connectome mode:<\/b> agents are neurons/,
+    'the dashboard How to read guide must retain the connectome explanation');
+  assert.match(appSource, /class="brain-domain-reset"/,
+    'the mobile-only action hiding rule needs an explicit Reset target');
+  assert.match(cssSource, /\.brain-domain-head-actions \.brain-domain-reset\s*\{\s*display:\s*none;/,
+    'mobile may hide Reset, not the How to read button');
+  assert.doesNotMatch(cssSource, /\.brain-domain-head-actions button:first-child\s*\{\s*display:\s*none;/,
+    'mobile must not hide whichever action happens to be first');
 });
 
 // Live firing pulses only the synapses that actually carried a message. The
