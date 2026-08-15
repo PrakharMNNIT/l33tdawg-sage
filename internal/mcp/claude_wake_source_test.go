@@ -305,7 +305,13 @@ func TestClaudeWakeSourceCloseReleasesReaderBlockedOnFullBuffer(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 		for seq := 1; seq <= claudeWakeEventBuffer*4; seq++ {
-			flushWrite(t, w, "event: wake\ndata: {\"version\":1,\"seq\":%d,\"pending\":true}\n\n", seq)
+			// Close intentionally tears down the response while this producer may
+			// still be filling the socket. A post-close broken pipe is the expected
+			// server-side observation, not a test failure.
+			if _, writeErr := fmt.Fprintf(w, "event: wake\ndata: {\"version\":1,\"seq\":%d,\"pending\":true}\n\n", seq); writeErr != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
 		}
 		<-r.Context().Done()
 	})
