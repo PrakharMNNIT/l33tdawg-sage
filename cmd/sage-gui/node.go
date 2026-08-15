@@ -3830,13 +3830,22 @@ func autoImport(ctx context.Context, cfg *Config, embedProvider embedding.Provid
 			continue
 		}
 
-		body, _ := json.Marshal(map[string]any{
+		submitBody := map[string]any{
 			"content":          mem.Content,
 			"memory_type":      mem.Type,
 			"domain_tag":       mem.Domain,
 			"confidence_score": mem.Confidence,
 			"embedding":        emb,
-		})
+		}
+		// A task must carry its initial status in the SIGNED body. REST
+		// defaults an omitted task_status to "planned" by mutating the
+		// request AFTER the signature covers it; the proof check then
+		// rebuilds the expected tx from the signed bytes and rejects the
+		// submission as "agent proof does not match the submitted action".
+		if mem.Type == "task" {
+			submitBody["task_status"] = "planned"
+		}
+		body, _ := json.Marshal(submitBody)
 
 		if err := submitSigned(baseURL+"/v1/memory/submit", body, agentID, priv); err != nil {
 			logger.Debug().Err(err).Msg("auto-import submit failed")

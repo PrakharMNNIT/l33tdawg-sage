@@ -209,13 +209,24 @@ async function getEmbedding(text, baseUrl) {
 
 async function submitMemory(content, domain, memType, confidence, baseUrl) {
   const { embedding } = await getEmbedding(content, baseUrl);
-  return signedFetch("POST", baseUrl, "/v1/memory/submit", {
+  const body = {
     content,
     memory_type: memType,
     domain_tag: domain,
     confidence_score: confidence,
     embedding
-  });
+  };
+  // A task must carry its initial status in the SIGNED body. The server
+  // defaults an omitted task_status to "planned", but it does so by MUTATING
+  // the request after the signature already covers it; the consensus proof
+  // check then rebuilds the expected transaction from the signed bytes, where
+  // the field is absent, and rejects the whole submission as
+  // "agent proof does not match the submitted action". Omitting it does not
+  // get a helpful default — it makes the write impossible.
+  if (memType === "task") {
+    body.task_status = "planned";
+  }
+  return signedFetch("POST", baseUrl, "/v1/memory/submit", body);
 }
 
 async function queryMemories(queryText, domain, topK, minConfidence, baseUrl) {
