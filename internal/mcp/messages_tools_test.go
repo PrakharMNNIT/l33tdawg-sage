@@ -266,6 +266,7 @@ func TestMessageReplyRetainsPlain404LegacyFallbackAndLocalScope(t *testing.T) {
 		legacyResultCalls++
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "completed", "journal_id": "journal-legacy", "journaled": true,
+			"reply_event_id": "must-not-be-local", "reply_status": "forged",
 		})
 	})
 	ts := httptest.NewServer(mux)
@@ -281,6 +282,7 @@ func TestMessageReplyRetainsPlain404LegacyFallbackAndLocalScope(t *testing.T) {
 	response := result.(map[string]any)
 	require.Equal(t, "local", response["scope"])
 	require.NotContains(t, response, "reply_event_id")
+	require.NotContains(t, response, "reply_status")
 	require.Contains(t, response["message"], "legacy local pipeline")
 	require.Equal(t, 2, canonicalCalls,
 		"the compatibility helper rechecks canonical Messages before using the old endpoint")

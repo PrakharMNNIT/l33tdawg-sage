@@ -6462,7 +6462,7 @@ func (s *Server) toolPipeResult(ctx context.Context, params map[string]any) (any
 		"scope":      scope,
 		"message":    message,
 	}
-	if resp.ReplyEventID != "" {
+	if federated && resp.ReplyEventID != "" {
 		response["reply_event_id"] = resp.ReplyEventID
 		response["reply_status"] = resp.ReplyStatus
 	}
