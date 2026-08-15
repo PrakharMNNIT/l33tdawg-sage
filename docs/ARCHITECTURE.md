@@ -49,7 +49,7 @@ No tokens. No gas fees. No cryptocurrency. Just consensus-validated knowledge.
 | On-chain State | BadgerDB v4.9.6 (content hash, status, classification, votes, grants, appHash) |
 | Off-chain Storage | SQLite (personal / single-binary) or PostgreSQL 16 + pgvector / HNSW (cluster) -- write-behind projection |
 | Tx Format | Protobuf (deterministic serialization) |
-| REST API | Go chi v5.3.1 (112 routes, OpenAPI 3.1) |
+| REST API | Go chi v5.3.1 (OpenAPI 3.1) |
 | Agent SDK | Python (httpx + PyNaCl + Pydantic v2) |
 | Embeddings | Pluggable: Ollama nomic-embed-text (768-dim) / OpenAI-compatible (vLLM, LiteLLM) / hash fallback |
 | Monitoring | Prometheus + Grafana (3 dashboards, 5 alert rules) |
@@ -1117,15 +1117,22 @@ Runs pytest tests with mocked HTTP (no running network needed):
 cd sdk/python && pip install -e ".[dev]" && pytest -v
 ```
 
-### Load Testing (k6)
+### Load Testing
 
-Requires [k6](https://k6.io/) installed and a running network:
+Two separate targets against a running network:
 
 ```bash
-make benchmark
+make benchmark      # authenticated Ed25519-signed Python load test
+make benchmark-k6   # k6 load test
 ```
 
-Runs `test/benchmark/load.js` against the network to measure throughput and latency.
+`make benchmark` runs `test/benchmark/load_test.py`, which signs every request with
+Ed25519 the way a real agent does — it needs `httpx` and `pynacl`, not k6, and it is
+the target that exercises the authenticated path.
+
+`make benchmark-k6` runs `test/benchmark/load.js` and requires
+[k6](https://k6.io/) plus either a k6 Ed25519 extension or a pre-configured auth
+bypass, because k6 cannot sign SAGE requests on its own.
 
 ### Linting
 
@@ -1281,7 +1288,7 @@ sage/
 ├── test/
 │   ├── integration/                  # Memory lifecycle, consensus, PoE tests
 │   ├── byzantine/                    # BFT fault tolerance tests
-│   └── benchmark/                    # k6 load tests
+│   └── benchmark/                    # load tests (signed Python + k6)
 ├── papers/                           # Research papers (PDFs, CC BY 4.0)
 ├── .github/workflows/ci.yml          # CI: lint, test, build, docker, sdk-test
 ├── Makefile                          # Build/test/deploy targets
