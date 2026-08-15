@@ -165,7 +165,9 @@ func (s *restClaudeWakeSubscription) Close() error {
 // reconnect; it never reconnects on its own.
 func (s *restClaudeWakeSubscription) read() {
 	defer close(s.events)
-	defer s.Close()
+	// Close is idempotent and always reports nil; the deferred call exists to
+	// release the connection when the stream ends on its own.
+	defer func() { _ = s.Close() }()
 
 	scanner := bufio.NewScanner(s.body)
 	scanner.Buffer(make([]byte, 0, 4096), claudeWakeMaxFrameBytes)
