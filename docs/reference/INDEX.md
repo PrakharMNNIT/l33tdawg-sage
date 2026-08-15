@@ -1,4 +1,4 @@
-<!-- Reference index reconciled for SAGE v11.18.11. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
+<!-- Reference index reconciled for SAGE v11.18.12. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
 
 
 # SAGE Reference — Agent Integration Index
@@ -34,7 +34,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | [`concepts/consensus-confidence-decay.md`](concepts/consensus-confidence-decay.md) | CometBFT BFT path, "CometBFT-committed" vs "SAGE-committed", quorum, PoE weights, epochs. |
 | [`concepts/block-production-and-idle.md`](concepts/block-production-and-idle.md) | Why an idle chain mints **no** blocks (SAGE has no heartbeat), when a block *is* minted, and how to tell healthy-idle from actually-stuck. Read this before alarming on a frozen block height. |
 | [`concepts/voter-operations.md`](concepts/voter-operations.md) | How `proposed` memories become `committed` (the per-node auto-voter), how to *guarantee* auto-commit (`--require-voter` / `voter:` config), the stuck-memory alarm + triage, key safety, and the honest REST-vote caveat. |
-| [`concepts/signer-nonce-fence.md`](concepts/signer-nonce-fence.md) | Per-signing-key nonce ordering, the signer fence, and **the cross-restart residual v11.18.11 does not close**. Why only a proven fate lifts a fence, why re-submitting byte-identical bytes is the reconciliation engine, why a restart does **not** safely clear a fence (and vetoes itself while one is held), what is logged and what is deliberately never logged, and how to triage `ErrSignerFenced`. Read this if a signing key stops signing, or before claiming nonce inversion is "fixed". |
+| [`concepts/signer-nonce-fence.md`](concepts/signer-nonce-fence.md) | Per-signing-key nonce ordering, the signer fence, and **the cross-restart residual v11.18.12 does not close**. Why only a proven fate lifts a fence, why re-submitting byte-identical bytes is the reconciliation engine, why a restart does **not** safely clear a fence (and vetoes itself while one is held), what is logged and what is deliberately never logged, and how to triage `ErrSignerFenced`. Read this if a signing key stops signing, or before claiming nonce inversion is "fixed". |
 | [`concepts/content-validation-gate.md`](concepts/content-validation-gate.md) | The optional Layer-2 content-validation gate (`outcome_class`-keyed reject hook) and the deployment **arming seam** — both the stateless `contentvalidator.SetProvider` and the context-aware `SetProviderWithContext` (exposes the on-chain `RoleResolver` for signer-authority checks) — enabling it without patching the cmd entrypoints. |
 | [`federation-and-brain-api.md`](federation-and-brain-api.md) | The v11 HTTP surface: trust-only JOIN over direct HTTPS or libp2p relay/NAT traversal; explicit pairwise agent exports with default borrowed Read of their owned trees and receiver-side narrowing; independent manual Read/Copy grants; receiver-controlled Copy subscriptions; authenticated agent messaging; and `/fed/v1/pipe/event`. Transport, peer policy, contacts, and pipeline work are off-consensus; tx-33/34 preserves agreement compatibility. The Write field/route remains reserved and fails closed. |
 | [`reranker-and-setup.md`](reranker-and-setup.md) | The v11 local-engine and setup surface: create-or-join/private-or-shared onboarding, Synaptic Ledger recovery acknowledgement, portable memory-backup boundaries, recall-tuning clamps, managed semantic memory setup (`/v1/dashboard/embeddings/*`, pinned Ollama runtime + readiness-gated model pull), the reranker config endpoint (`kind` field + verify-on-enable), the managed llama.cpp sidecar (`/v1/dashboard/reranker/setup/*`, pinned assets + sha256 + adopt-not-respawn), the TEI vs llama.cpp rerank dialects, and `embedding_provider` stamped at insert. Mostly off-consensus; imported memories re-enter the normal consensus lifecycle. |
@@ -205,7 +205,7 @@ are recorded here because agents may have cached them.
   `sage_message_replies`, or `sage_message_history(folder="outbox")` for the
   untruncated text.
 
-## Related docs (reconciled through v11.18.11)
+## Related docs (reconciled through v11.18.12)
 
 These were stale earlier in v8 and have now been reconciled against the code. Where any of them still disagrees with this reference, this reference wins.
 

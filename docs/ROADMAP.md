@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.11 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.12 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -42,13 +42,45 @@ projects its RBAC-filtered agent channels as a traffic-weighted 3D connectome.
 v11.18.11 adds operator-only live connectome firing driven by contentless ticks
 and caller-filtered snapshot refetches, strips memory plaintext from retrieval
 activity events, makes bookend inbox visibility payload-free and self-healing,
-and raises every current Go build floor to patched 1.25.13. The supported
-consensus ceiling remains app-v26; **v11.18.11 does not introduce app-v27**.
+and raises every current Go build floor to patched 1.25.13. v11.18.12 adds the
+projection-safe agent-as-lobe engram view, hardens the exact 20-event operator
+dashboard SSE registry, restores signed task creation across official clients,
+adds exact-agent message presentation without changing claim/read/delivery
+semantics, and repairs release-facing documentation drift with fail-closed
+citation coverage. The supported consensus ceiling remains app-v26;
+**v11.18.12 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.12 patch
+
+CEREBRUM can lazily bloom one selected agent's highest-confidence visible
+memories around its connectome neuron. The bounded indexed lookup retains the
+operator-only and app-v23 per-record projection gates, and the browser clears,
+fences, and disposes stale lobe requests safely.
+
+The dashboard SSE contract now audits one exact 20-event operator registry,
+wires the seven previously missing events, and keeps message wake, MCP, and
+wizard protocols route-local. Typed control-flow analysis and executable client
+tests fail closed on dead, aliased, escaped, build-tagged, or decoy sinks.
+
+Official signed task constructors now include the required initial `planned`
+status; REST rejects an omitted signed task status before broadcast rather than
+constructing a deterministic app-v23-through-app-v26 proof mismatch. Message
+and pipe responses expose exact immutable sender/counterparty IDs beside mutable
+friendly labels through one bounded metadata query, suppress foreign-chain
+collisions, preserve authorized rows on lookup failure, and keep count-only
+responses identity-free.
+
+Release-facing documentation now matches the 33-tool MCP inventory and current
+dependency/route contracts. Symbol-anchored code citations are repaired and
+their verified coverage fails closed if a checked citation silently becomes
+unresolved. This patch introduces no new consensus application version or state
+migration: app-v26 remains the ceiling and v11.18.12 does not introduce
+app-v27.
 
 ## v11.18.11 patch
 

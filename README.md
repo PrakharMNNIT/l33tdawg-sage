@@ -51,6 +51,37 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.12
+
+**CEREBRUM can now open an agent as a memory lobe.** Selecting a connectome
+neuron lazily blooms that agent's highest-confidence visible memories as
+engrams, while retaining the operator-only route and app-v23 per-record
+projection checks. The indexed, bounded query avoids whole-brain scans; stale,
+failed, and disposed frontend requests cannot leave another agent's lobe on
+screen.
+
+**Dashboard live activity is now guarded as one exact 20-event registry.** The
+seven previously unwired operator events now reach the existing dashboard SSE
+stream, while message wake, MCP, and wizard protocols stay route-local. A
+fail-closed typed control-flow audit and executable browser contract reject
+dead, aliased, escaped, build-tagged, or decoy event sinks.
+
+**Signed task creation and message attribution now agree end to end.** Every
+official task constructor explicitly signs the required initial `planned`
+status, and REST fails fast instead of mutating an omitted signed field into a
+transaction that app-v23 through app-v26 must reject. Authorized message and
+pipe responses retain exact immutable agent IDs alongside mutable presentation
+labels, use one bounded metadata query, suppress foreign-chain label
+collisions, and keep count-only responses identity-free.
+
+This patch also repairs release-facing documentation drift, pins the current
+33-tool MCP inventory, and adds fail-closed symbol/citation coverage for the
+references it can verify. It introduces no new consensus application version
+or state migration. The ceiling remains app-v26; **v11.18.12 introduces no
+app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.12`. SDK 11.18.12.
+
 ## What's New in v11.18.11
 
 **The CEREBRUM connectome now fires live without widening its operator-only
@@ -1765,7 +1796,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.11`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.12`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
