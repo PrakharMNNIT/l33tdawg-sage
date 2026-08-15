@@ -161,6 +161,12 @@ func listCurrentConnectomeAgents(badgerStore *store.BadgerStore) ([]store.OnChai
 		if !enrollment.Active {
 			continue
 		}
+		// Root handover suspends every delegated Admin from the previous
+		// generation until the current Root explicitly reauthorizes it.
+		if role.Role == store.AppV23RoleAdmin &&
+			enrollment.RootGeneration != root.Generation {
+			continue
+		}
 		if err := store.ValidateAppV23EnrollmentPolicy(
 			role.Role, enrollment.Profile, enrollment.Capabilities,
 			enrollment.Clearance, enrollment.Active,
