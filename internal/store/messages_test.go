@@ -688,3 +688,69 @@ func TestMessageFingerprintsAreVaultSealedAndStillReplay(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, replayed)
 }
+
+// A fence rejection and a missing message are different facts and must not
+// collapse into the same error. Collapsing them is what let the MCP client
+// treat "another session holds this claim" as "this node is too old for this
+// route" and retry the same call without a session id, bypassing the fence.
+//
+// Distinguishing them leaks nothing across an agent boundary: the fence is
+// reached only after the caller is proven to be the addressed recipient, so it
+// separates sessions of ONE agent.
+func TestMessageReplyDistinguishesAnotherSessionsClaimFromAMissingMessage(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	_, _, err := s.SendLocalMessage(ctx, "send", testLocalMessage("msg", "alice", "bob", "work"))
+	require.NoError(t, err)
+	_, _, err = s.ReceiveLocalMessages(ctx, "bob", "", "receive", 1, "session-a")
+	require.NoError(t, err)
+
+	// Same agent, different session, no handoff: refused, and refused
+	// DISTINGUISHABLY.
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg", "from-b", "session-b")
+	require.ErrorIs(t, err, ErrMessageClaimedByOtherSession)
+	require.NotErrorIs(t, err, ErrMessageNotFound,
+		"a fence rejection must not masquerade as an absent message")
+
+	// A genuinely absent message stays a plain not-found, so the older-node
+	// compatibility path keeps working.
+	_, err = s.ReplyLocalMessage(ctx, "bob", "no-such-message", "from-a", "session-a")
+	require.ErrorIs(t, err, ErrMessageNotFound)
+	require.NotErrorIs(t, err, ErrMessageClaimedByOtherSession)
+
+	// A different AGENT is still an ordinary not-found: the fence must never be
+	// the thing that reveals another agent's message exists.
+	_, err = s.ReplyLocalMessage(ctx, "mallory", "msg", "from-mallory", "session-m")
+	require.ErrorIs(t, err, ErrMessageNotFound)
+	require.NotErrorIs(t, err, ErrMessageClaimedByOtherSession)
+
+	// The claiming session still succeeds, and an unfenced caller still
+	// succeeds, so the fix does not tighten anything it should not.
+	replayed, err := s.ReplyLocalMessage(ctx, "bob", "msg", "from-a", "session-a")
+	require.NoError(t, err)
+	require.False(t, replayed)
+}
+
+// After a documented handoff the new session owns the claim and the old one
+// loses it — still distinguishably.
+func TestMessageReplyFenceFollowsAnExplicitHandoff(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	_, _, err := s.SendLocalMessage(ctx, "send", testLocalMessage("msg", "alice", "bob", "work"))
+	require.NoError(t, err)
+	_, _, err = s.ReceiveLocalMessages(ctx, "bob", "", "receive", 1, "session-a")
+	require.NoError(t, err)
+
+	// The bool is "replayed" (an idempotent re-handoff), not "moved": a fresh
+	// handoff reports false.
+	replayedHandoff, err := s.HandoffLocalMessageClaim(ctx, "bob", "msg", "session-a", "session-b")
+	require.NoError(t, err)
+	require.False(t, replayedHandoff)
+
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg", "stale", "session-a")
+	require.ErrorIs(t, err, ErrMessageClaimedByOtherSession)
+
+	replayed, err := s.ReplyLocalMessage(ctx, "bob", "msg", "fresh", "session-b")
+	require.NoError(t, err)
+	require.False(t, replayed)
+}

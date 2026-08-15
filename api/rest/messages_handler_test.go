@@ -404,3 +404,75 @@ func TestCanonicalMessageSendDoesNotFailWhenOptionalNotifierDrops(t *testing.T) 
 	require.NoError(t, err)
 	require.Len(t, pipes, 1)
 }
+
+// The wire status is the whole point of this fix. The MCP client's older-node
+// fallback triggers on 404 and retries the same route WITHOUT a claimant
+// session, so collapsing a fence rejection into 404 hands the client a licence
+// to bypass the fence it just failed. A fence rejection must therefore be
+// distinguishable on the wire, while a genuinely absent message must stay 404
+// so the compatibility path keeps working.
+func TestMessageReplyFenceRejectionIsNotAFourOhFour(t *testing.T) {
+	s, sqlite := newPipeServer(t)
+	addMessageAgent(t, sqlite, "alice")
+	addMessageAgent(t, sqlite, "bob")
+	addMessageAgent(t, sqlite, "mallory")
+
+	sent := callMessageJSON(t, messageRouterAs(s, "alice", true), http.MethodPost, "/v1/messages",
+		map[string]any{"to_agent": "bob", "intent": "review", "payload": "private request", "idempotency_key": "fence-send"})
+	require.Equal(t, http.StatusCreated, sent.Code, sent.Body.String())
+	var sendResponse map[string]any
+	require.NoError(t, json.Unmarshal(sent.Body.Bytes(), &sendResponse))
+	messageID := sendResponse["message_id"].(string)
+
+	received := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPost, "/v1/messages/receive",
+		map[string]any{"receive_token": "fence-receive", "limit": 5, "claimant_session_id": "session-a"})
+	require.Equal(t, http.StatusOK, received.Code, received.Body.String())
+
+	// Same agent, second session, no handoff.
+	fenced := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPost, "/v1/messages/"+messageID+"/reply",
+		map[string]any{"result": "from-session-b", "claimant_session_id": "session-b"})
+	require.Equal(t, http.StatusConflict, fenced.Code, fenced.Body.String())
+	require.NotEqual(t, http.StatusNotFound, fenced.Code,
+		"a 404 here is what lets the client retry unfenced")
+	require.Contains(t, fenced.Body.String(), "message-claim-session-mismatch",
+		"the rejection needs a distinct problem type, not just a distinct status")
+
+	// The fence must not have completed anything.
+	stillOpen := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPost, "/v1/messages/"+messageID+"/reply",
+		map[string]any{"result": "from-session-a", "claimant_session_id": "session-a"})
+	require.Equal(t, http.StatusOK, stillOpen.Code, stillOpen.Body.String())
+
+	// A genuinely absent message stays 404 so the older-node fallback survives.
+	absent := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPost, "/v1/messages/msg-does-not-exist/reply",
+		map[string]any{"result": "x", "claimant_session_id": "session-a"})
+	require.Equal(t, http.StatusNotFound, absent.Code, absent.Body.String())
+	require.NotContains(t, absent.Body.String(), "message-claim-session-mismatch")
+}
+
+// Anti-enumeration: the new status must never become the thing that tells a
+// different agent the message exists.
+func TestMessageReplyFenceNeverLeaksAcrossAgents(t *testing.T) {
+	s, sqlite := newPipeServer(t)
+	addMessageAgent(t, sqlite, "alice")
+	addMessageAgent(t, sqlite, "bob")
+	addMessageAgent(t, sqlite, "mallory")
+
+	sent := callMessageJSON(t, messageRouterAs(s, "alice", true), http.MethodPost, "/v1/messages",
+		map[string]any{"to_agent": "bob", "intent": "review", "payload": "private", "idempotency_key": "leak-send"})
+	require.Equal(t, http.StatusCreated, sent.Code)
+	var sendResponse map[string]any
+	require.NoError(t, json.Unmarshal(sent.Body.Bytes(), &sendResponse))
+	messageID := sendResponse["message_id"].(string)
+
+	received := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPost, "/v1/messages/receive",
+		map[string]any{"receive_token": "leak-receive", "limit": 5, "claimant_session_id": "session-a"})
+	require.Equal(t, http.StatusOK, received.Code)
+
+	// Mallory is not the recipient. She must get the same 404 as for a message
+	// that does not exist — never the session-mismatch signal.
+	intruder := callMessageJSON(t, messageRouterAs(s, "mallory", true), http.MethodPost, "/v1/messages/"+messageID+"/reply",
+		map[string]any{"result": "stolen", "claimant_session_id": "session-b"})
+	require.Equal(t, http.StatusNotFound, intruder.Code, intruder.Body.String())
+	require.NotContains(t, intruder.Body.String(), "message-claim-session-mismatch",
+		"the fence must never reveal another agent's message to a non-recipient")
+}

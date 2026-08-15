@@ -791,6 +791,12 @@ var (
 	ErrMessageReceiveExpired      = errors.New("message receive replay is no longer retained")
 	ErrMessageReplyConflict       = errors.New("message already has a different reply")
 	ErrMessageNotFound            = errors.New("message not found")
+	// ErrMessageClaimedByOtherSession separates "another session of THIS
+	// agent holds the claim" from "no such message". Collapsing the two let
+	// the MCP client treat a fence rejection as an absent route and retry
+	// unfenced. Distinguishing them leaks nothing: the caller has already
+	// been proven to be the addressed recipient before the fence is applied.
+	ErrMessageClaimedByOtherSession = errors.New("message is claimed by another session of this agent")
 )
 
 // PipelineMessage represents an ephemeral agent-to-agent work item.
