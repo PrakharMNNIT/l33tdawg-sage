@@ -446,18 +446,39 @@ func TestHookStopCheckNeverBlocksTwiceInARow(t *testing.T) {
 	assert.Empty(t, stdout, "an already-blocked stop must be allowed to end")
 }
 
-// It changes how every session ends, so it stays off until asked for.
-func TestHookStopCheckIsOptIn(t *testing.T) {
+func TestHookStopCheckDefaultsOnOnlyForCodex(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		override string
+		want     bool
+	}{
+		{name: "Codex default", provider: "codex", want: true},
+		{name: "Codex provider is case insensitive", provider: "CODEX", want: true},
+		{name: "Claude remains opt in", provider: "claude-code", want: false},
+		{name: "unknown host remains opt in", provider: "other", want: false},
+		{name: "explicit Codex opt out", provider: "codex", override: "false", want: false},
+		{name: "explicit other-host opt in", provider: "other", override: "true", want: true},
+		{name: "invalid Codex override fails closed", provider: "codex", override: "nonsense", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("SAGE_PROVIDER", test.provider)
+			t.Setenv("SAGE_STOP_NUDGE", test.override)
+			assert.Equal(t, test.want, stopNudgeEnabled())
+		})
+	}
+}
+
+func TestHookStopCheckCodexDefaultContinuesForNewDurableWork(t *testing.T) {
 	withTestSageEnv(t, stopHookNode(t, 3, true))
-	withStopHookStdin(t, `{"session_id":"s1"}`)
+	t.Setenv("SAGE_PROVIDER", "codex")
+	t.Setenv("SAGE_STOP_NUDGE", "")
+	withStopHookStdin(t, `{"session_id":"codex-default","hook_event_name":"Stop"}`)
 
 	stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
-	assert.Empty(t, stdout, "unset SAGE_STOP_NUDGE must not block anything")
-
-	t.Setenv("SAGE_STOP_NUDGE", "nonsense")
-	withStopHookStdin(t, `{"session_id":"s1"}`)
-	stdout = captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
-	assert.Empty(t, stdout, "an unparseable value must not silently enable blocking")
+	assert.Contains(t, stdout, `"decision":"block"`,
+		"Codex's default Stop hook must create a continuation prompt for newer durable work")
 }
 
 func TestHookStopCheckDeniesTheStopWhenWorkIsPending(t *testing.T) {

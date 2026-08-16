@@ -113,13 +113,13 @@ does not define this durable sequence contract.
 
 ## Claude wake channel enablement
 
-The Claude host adapter is the one shipped adapter for this route, but it is
-off for every host unless `SAGE_CLAUDE_CHANNEL=1` (or another accepted true
-spelling) explicitly enables it (`claudeChannelEnabled`, `mcp.go:241`). Its subscription
-owns the one exact-agent wake lease, so an operator should enable it only when
-the attached host consumes the custom notification. Constructing an MCP
-`Server` never advertises or emits the experimental protocol on its own; the
-executable still makes an explicit enablement call (`EnableRESTClaudeChannel`, `internal/mcp/claude_wake_source.go:85`)
+The Claude host adapter is the one shipped adapter for this route. A
+project-scoped `sage-gui mcp` session whose `SAGE_PROVIDER` is `claude-code`
+arms it by default; set `SAGE_CLAUDE_CHANNEL=0` (or another accepted false
+spelling) to opt out. Other MCP hosts stay off unless explicitly enabled
+(`claudeChannelEnabled`, `mcp.go:242`). Constructing an MCP `Server` never
+advertises or emits the experimental protocol on its own; the executable still
+makes an explicit enablement call (`EnableRESTClaudeChannel`, `internal/mcp/claude_wake_source.go:85`)
 through `ConfigureClaudeChannel` (`internal/mcp/claude_channel.go:50`).
 
 When armed, the adapter subscribes to this agent's own signed wake stream and
@@ -135,6 +135,32 @@ affects message lifecycle state.
 
 Two consequences follow from the lease described above. A second runtime for
 the same agent is rejected with 409 rather than silently sharing the wake, so
-the wake accelerates exactly one runtime at a time. And because the channel
-only accelerates polling, failing to arm it is not fatal: a host that cannot
-open the stream still gets an ordinary MCP session and ordinary polling.
+the wake accelerates exactly one runtime at a time. The rejected adapter does
+not terminate: it retries from its last durable cursor with bounded exponential
+backoff (250ms through 30s), and can acquire the lease after the holder
+disconnects. Because the channel only accelerates polling, failing to arm or
+waiting for that lease is not fatal: the host keeps its ordinary MCP session
+and can still use the canonical inbox operations.
+
+## Codex turn-boundary wake
+
+Codex does not consume the custom `notifications/claude/channel` method, so a
+Codex MCP process must not acquire the Claude channel's exclusive wake lease.
+Instead, SAGE installs a Codex `Stop` command hook that reads the signed,
+lease-free `/v1/messages/wake-state` snapshot. The check is on by default when
+`SAGE_PROVIDER=codex`; set `SAGE_STOP_NUDGE=0` (or another accepted false
+spelling) to opt out (`stopNudgeEnabled`, `cmd/sage-gui/hook.go:435`).
+
+When the durable cursor has advanced and unfinished work exists, the hook emits
+Codex's documented top-level `{"decision":"block","reason":"..."}` result.
+Codex converts that result into one continuation prompt for the same thread, so
+the agent calls the canonical inbox operation before the turn becomes idle
+(`runHookStopCheck`, `cmd/sage-gui/hook.go:447`). The check never acquires the
+SSE lease, never sees message content or sender, refuses `SubagentStop`, blocks
+at most once per newer cursor and session, and fails open on every error.
+
+This is a turn-boundary continuation, not an out-of-band resurrection API. A
+message committed after a Codex thread is already fully idle waits durably for
+the next user turn, scheduled continuation, or session start; current Codex MCP
+configuration exposes no supported server-notification method that can inject a
+new turn into an already-idle local thread.

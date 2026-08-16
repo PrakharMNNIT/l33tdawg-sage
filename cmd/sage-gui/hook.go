@@ -428,12 +428,14 @@ type hookStopInput struct {
 	HookEventName  string `json:"hook_event_name"`
 }
 
-// stopNudgeEnabled keeps the check opt-in. It changes how every session ends,
-// so it stays off until an operator asks for it.
+// stopNudgeEnabled defaults on only for Codex, whose documented Stop hook turns
+// decision:block into a continuation prompt for the same thread. Other hosts
+// remain opt-in, and every host can explicitly disable it. An unparseable
+// override fails closed rather than unexpectedly extending a turn.
 func stopNudgeEnabled() bool {
 	raw := os.Getenv("SAGE_STOP_NUDGE")
 	if strings.TrimSpace(raw) == "" {
-		return false
+		return strings.EqualFold(strings.TrimSpace(os.Getenv("SAGE_PROVIDER")), "codex")
 	}
 	enabled, ok := envBool("SAGE_STOP_NUDGE", raw)
 	return ok && enabled

@@ -125,7 +125,8 @@ const sageStopScript = `#!/bin/bash
 #
 # An MCP server cannot wake a session that has already stopped, so the check is
 # the inverse: decline the stop once, so the agent handles the work in-session.
-# Opt-in via SAGE_STOP_NUDGE, and silent unless it decides to decline.
+# Default-on for Codex, opt-in for other hosts, and silent unless it decides
+# to decline. SAGE_STOP_NUDGE=0 explicitly disables it.
 #
 # Fail-open is deliberate and belt-and-braces: the subcommand allows the stop on
 # every internal error, and the || true means even a crashed or missing binary
@@ -221,12 +222,11 @@ func runMCP() error {
 	if projectDir, cwdErr := os.Getwd(); cwdErr == nil {
 		selfHealProject(projectDir, home, os.Getenv("SAGE_PROVIDER"), keyPath)
 	}
-	// The Claude wake extension remains explicitly opt-in. The custom
-	// notifications/claude/channel method is not consumed by the shipped Claude
-	// Code host,
-	// while its REST source owns the one exact-agent wake lease. Starting it only
-	// after an operator opt-in prevents an idle adapter from excluding a useful
-	// long-running consumer. A failure to arm remains deliberately non-fatal.
+	// Claude Code sessions arm the payload-free wake extension by default. A
+	// competing exact-agent consumer is rejected by the node, but the adapter
+	// keeps retrying with bounded backoff and acquires the lease after the holder
+	// disconnects. A failure to arm remains deliberately non-fatal: ordinary MCP
+	// requests continue while the wake accelerator reconnects in the background.
 	if claudeChannelEnabled() {
 		if err := server.EnableRESTClaudeChannel(); err != nil {
 			fmt.Fprintf(os.Stderr, "SAGE MCP: claude channel disabled: %v\n", err)
@@ -235,13 +235,14 @@ func runMCP() error {
 	return server.Run(context.Background())
 }
 
-// claudeChannelEnabled keeps the experimental wake extension opt-in for every
-// host. An unparseable override fails closed — envBool warns rather than
-// guessing.
+// claudeChannelEnabled arms the wake extension by default only for the shipped
+// Claude Code consumer. Other MCP hosts remain off unless explicitly enabled,
+// and an operator can explicitly disable a Claude Code session. An unparseable
+// override fails closed — envBool warns rather than guessing.
 func claudeChannelEnabled() bool {
 	raw := os.Getenv("SAGE_CLAUDE_CHANNEL")
 	if strings.TrimSpace(raw) == "" {
-		return false
+		return strings.EqualFold(strings.TrimSpace(os.Getenv("SAGE_PROVIDER")), "claude-code")
 	}
 	enabled, ok := envBool("SAGE_CLAUDE_CHANNEL", raw)
 	return ok && enabled
@@ -797,7 +798,7 @@ func installClaudeMD(projectDir string) error {
 // memories, UserPromptSubmit nudges per turn (replacing the noisier
 // PostToolUse on every Edit/Write/Bash), PreCompact crystallises before
 // detail is lost, SessionEnd writes a lifecycle observation, Stop runs the
-// opt-in end-of-turn work check (SAGE_STOP_NUDGE, default off), and
+// end-of-turn work check (default on for Codex; SAGE_STOP_NUDGE overrides), and
 // SubagentStop stays silent because a subagent finishing does not mean the
 // owning host session is idle.
 //
@@ -842,7 +843,7 @@ func sageHooksConfig(hookDirExpr string) map[string]any {
 		"UserPromptSubmit": []any{
 			map[string]any{"hooks": userPrompt},
 		},
-		// Stop: opt-in end-of-turn check for pending unclaimed work.
+		// Stop: end-of-turn check for newer durable work (default on for Codex).
 		// SubagentStop: shares the script, which refuses any non-Stop event.
 		"Stop": []any{
 			map[string]any{"hooks": stop},
