@@ -675,11 +675,20 @@ func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, message
 		if err != nil || !fetched || provider != "" || claimed != receiverID || sourceChain != "" || destinationChain != "" {
 			return ErrMessageNotFound
 		}
+		// The fence runs only after the caller has been proven to be this
+		// message's addressed recipient (claimed == receiverID above), so it
+		// separates SESSIONS of one agent, never one agent from another. It
+		// therefore reports a distinct error rather than collapsing into
+		// ErrMessageNotFound: a 404 is indistinguishable from an absent route,
+		// and the MCP client treats an absent route as licence to retry the
+		// same call without a session id — bypassing this check entirely.
 		if claimantSessionID != "" {
 			var currentSessionID string
 			if sessionErr := tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
-				WHERE receiver_agent_id=? AND message_id=?`, receiverID, messageID).Scan(&currentSessionID); sessionErr != nil || currentSessionID != claimantSessionID {
+				WHERE receiver_agent_id=? AND message_id=?`, receiverID, messageID).Scan(&currentSessionID); sessionErr != nil {
 				return ErrMessageNotFound
+			} else if currentSessionID != claimantSessionID {
+				return ErrMessageClaimedByOtherSession
 			}
 		}
 		if completeErr := tx.CompletePipeline(ctx, messageID, receiverID, result, ""); completeErr != nil {

@@ -313,6 +313,10 @@ func (s *Server) handleMessageHandoff(w http.ResponseWriter, r *http.Request) {
 		"claimant_session_id": req.ToSessionID, "idempotent_replay": replayed})
 }
 
+// messageClaimSessionProblemType marks a claimant-session fence rejection so a
+// caller can tell it apart from a genuinely absent message.
+const messageClaimSessionProblemType = "https://sage.dev/errors/message-claim-session-mismatch"
+
 func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
 	if !requireExactSignedMessageAction(w, r) {
 		return
@@ -344,6 +348,13 @@ func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, store.ErrMessageReplyConflict):
 			writeProblem(w, http.StatusConflict, "Reply conflict", "This message already has a different reply.")
+		case errors.Is(err, store.ErrMessageClaimedByOtherSession):
+			// Deliberately NOT a 404. The MCP client's compatibility fallback
+			// treats any 404 as an older node missing this route and retries
+			// without a claimant session, which would bypass the very fence
+			// that just rejected the call.
+			writeProblemTyped(w, http.StatusConflict, messageClaimSessionProblemType, "Claimed by another session",
+				"Another session of this agent holds this message's claim. Use sage_message_handoff to take it over, or reply from the claiming session.")
 		case errors.Is(err, store.ErrPipeResultTooLarge):
 			writeProblemTyped(w, http.StatusRequestEntityTooLarge, pipeTooLargeProblemType, "Reply too large", err.Error())
 		default:
