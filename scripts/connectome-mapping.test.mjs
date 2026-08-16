@@ -90,10 +90,12 @@ test('node fields map from the payload with sensible fallbacks', () => {
   const by = Object.fromEntries(g.nodes.map(n => [n.agent_id, n]));
   assert.equal(by.x.label, 'X');
   assert.equal(by.x.domain, 'd');
+  assert.equal(by.x.agent_domain, 'd');
   assert.equal(by.x.role, 'r');
   // label falls back to agent_id, domain falls back to role then 'agent'
   assert.equal(by.y.label, 'y');
   assert.equal(by.y.domain, 'agent');
+  assert.equal(by.y.agent_domain, '', 'display details must not mislabel the role fallback as a real domain');
   assert.equal(by.y.role, '');
 });
 
@@ -114,6 +116,35 @@ test('direction is preserved: A->B is distinct from B->A', () => {
   const keys = g.links.map(l => `${l.source}>${l.target}`);
   assert.ok(keys.includes('agent:alice>agent:bob'));
   assert.ok(keys.includes('agent:bob>agent:alice'));
+});
+
+test('nodes expose visible directional traffic, distinct peers, and strongest connection', () => {
+  const g = mapConnectome(payload);
+  const by = Object.fromEntries(g.nodes.map(n => [n.agent_id, n]));
+  assert.deepEqual(
+    { incoming:by.alice._incoming, outgoing:by.alice._outgoing, peers:by.alice._peers },
+    { incoming:2, outgoing:5, peers:1 },
+  );
+  assert.deepEqual(
+    { incoming:by.bob._incoming, outgoing:by.bob._outgoing, peers:by.bob._peers },
+    { incoming:5, outgoing:3, peers:2 },
+  );
+  assert.equal(by.bob._strongest_peer, 'alice');
+  assert.equal(by.bob._strongest_peer_traffic, 7,
+    'strongest connection combines retained traffic in both directions');
+  assert.deepEqual(
+    { incoming:by.carol._incoming, outgoing:by.carol._outgoing, peers:by.carol._peers },
+    { incoming:1, outgoing:0, peers:1 },
+  );
+});
+
+test('a self-synapse contributes directional traffic but not a connected peer', () => {
+  const [node] = mapConnectome({
+    neurons:[{agent_id:'solo'}],
+    synapses:[{from_agent:'solo',to_agent:'solo',count:3}],
+  }).nodes;
+  assert.equal(node._incoming,3); assert.equal(node._outgoing,3);
+  assert.equal(node._peers,0); assert.equal(node._strongest_peer,'');
 });
 
 test('edges to unknown agents are dropped (no ghost nodes)', () => {
@@ -207,6 +238,10 @@ test('connectome guidance is reachable without adding another floating panel', (
 
   assert.match(rootTemplate, /class="lg-detail guide-connectome" hidden>[\s\S]*Agents are neurons[\s\S]*Click one to bloom its memories/i,
     'standalone MRI must keep connectome guidance inside its existing reading legend');
+  const modeChromeStart = mriSource.indexOf('function updateModeChrome(');
+  const modeChromeEnd = mriSource.indexOf('function setMode(', modeChromeStart);
+  assert.doesNotMatch(mriSource.slice(modeChromeStart,modeChromeEnd), /legend\.hidden\s*=|\.legend[^\n]*hidden/,
+    'connectome mode must not hide the standalone reading guide to make room for agent details');
   const standaloneMountStart = mriPageSource.indexOf("mountMriBrain(document.getElementById('mount')");
   const standaloneMountEnd = mriPageSource.indexOf('});', standaloneMountStart);
   assert.ok(standaloneMountStart >= 0 && standaloneMountEnd > standaloneMountStart,
@@ -246,6 +281,76 @@ test('connectome guidance is reachable without adding another floating panel', (
     'mobile must not hide whichever action happens to be first');
 });
 
+test('connectome exposes persistent, keyboard-reachable agent identity details', () => {
+  assert.match(mriSource, /<aside class="agent-inspector" aria-label="Connectome agent details" aria-hidden="true">/,
+    'selected details must be a labelled nonmodal landmark');
+  assert.match(mriSource, /<select class="ai-select" aria-label="Browse agents">/,
+    'canvas-only neurons need a keyboard and touch selection path');
+  assert.match(mriSource, /<button type="button" class="ai-close" aria-label="Close agent details">/,
+    'persistent details need a real accessible close button');
+  assert.match(mriSource, /class="tip" role="tooltip" aria-hidden="true"/,
+    'transient hover details must expose tooltip semantics');
+  assert.match(mriSource, /\.onNodeClick\([^\n]*selectNeuron\(n\)/,
+    'a canvas click must enter the same persistent selection path as the picker');
+  assert.match(mriSource, /const onKeyDown=e=>\{ if\(e\.key==='Escape' && selectedAgentID\)/,
+    'Escape must dismiss a selected agent');
+  assert.match(mriSource, /subs\.push\(\(\)=>document\.removeEventListener\('keydown',onKeyDown\)\)/,
+    'the global Escape listener must be cleaned up with the renderer');
+});
+
+test('selection dismissal hides the large inspector and returns keyboard focus to the picker', () => {
+  const renderStart=mriSource.indexOf('function renderAgentInspector(');
+  const renderEnd=mriSource.indexOf('function clearAgentSelection(',renderStart);
+  const render=mriSource.slice(renderStart,renderEnd);
+  assert.match(render,/classList\.toggle\('visible', mode === 'connectome' && chosen\)/,
+    'the expanded panel must exist only while an agent is selected');
+  assert.match(mriSource,/\.ai-close'\)\.onclick=\(\)=>\{ exitFocus\(\); \$\('\.ai-select'\)\.focus\(\); \}/);
+  assert.match(mriSource,/e\.key==='Escape'[\s\S]{0,100}exitFocus\(\); \$\('\.ai-select'\)\.focus\(\)/);
+  assert.match(mriSource,/t\.closest\('\.panel,\.agent-browser,\.agent-inspector'\)/,
+    'picker events must be chrome, never graph-background dismissal');
+});
+
+test('a live reload restores cached selected memories or restarts an interrupted bloom', () => {
+  const start=mriSource.indexOf('function restoreSelectedAgent(');
+  const end=mriSource.indexOf('function setHullOpacity(',start);
+  const body=mriSource.slice(start,end);
+  assert.match(body,/applyEngramBloom\(Graph\.graphData\(\), selectedMemoryState\.memories\|\|\[\], selected, focusSet, placeNear\)/,
+    'ready memories must be recomposed after graph replacement strips transient nodes');
+  assert.match(body,/selectedMemoryState=\{status:'loading'\}[\s\S]*bloomEngrams\(selected\)/,
+    'an invalidated in-flight bloom must restart instead of leaving the inspector loading forever');
+  assert.match(body,/else if \(selectedMemoryState && selectedMemoryState\.status==='loading'\)/,
+    'explicit engram errors must wait for Retry rather than hammering the endpoint on every live tick');
+  assert.match(mriSource,/restoreSelectedAgent\(d\)/,
+    'successful reload reconciliation must invoke the tested restore path');
+});
+
+test('empty memory results retain projection and continuation caveats', () => {
+  const start=mriSource.indexOf('function renderMemoryState(');
+  const end=mriSource.indexOf('function renderAgentInspector(',start);
+  const body=mriSource.slice(start,end);
+  assert.match(body,/!memories\.length[\s\S]*state\.partial[\s\S]*temporarily hidden/);
+  assert.match(body,/!memories\.length[\s\S]*state\.continuation[\s\S]*More may exist/);
+});
+
+test('agent tooltip is clamped, escaped, and includes identity plus visible traffic', () => {
+  const showStart = mriSource.indexOf('function showTip(');
+  const showEnd = mriSource.indexOf('function onMove(', showStart);
+  const show = mriSource.slice(showStart, showEnd);
+  assert.match(show, /escapeHtml\(agentName\(n\)\)/);
+  assert.match(show, /escapeHtml\(agentRole\(n\)\)/);
+  assert.match(show, /escapeHtml\(agentDomain\(n\)\)/);
+  assert.match(show, /escapeHtml\(id\)/, 'canonical agent identity must be escaped');
+  assert.match(show, /n\._incoming/); assert.match(show, /n\._outgoing/); assert.match(show, /n\._peers/);
+  const positionStart = mriSource.indexOf('function positionTip(');
+  const positionEnd = mriSource.indexOf('function showTip(', positionStart);
+  const position = mriSource.slice(positionStart, positionEnd);
+  assert.match(position, /tip\.offsetWidth/); assert.match(position, /tip\.offsetHeight/);
+  assert.match(position, /Math\.max\(pad,Math\.min\(r\.width-tip\.offsetWidth-pad,left\)\)/,
+    'horizontal tooltip placement must stay inside the renderer');
+  assert.match(position, /Math\.max\(pad,Math\.min\(r\.height-tip\.offsetHeight-pad,top\)\)/,
+    'vertical tooltip placement must stay inside the renderer');
+});
+
 test('mode controls retain visible pressed and keyboard-focus styling in both themes', () => {
   const styleStart = mriSource.indexOf('const STYLE = `');
   const styleEnd = mriSource.indexOf('`;\n\nfunction injectStyleOnce', styleStart);
@@ -274,7 +379,7 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
   };
 
   const body = functionBody('updateModeChrome');
-  const runChrome = new Function('$', 'root', 'mode', 'announce', body);
+  const runChrome = new Function('$', 'root', 'mode', 'announce', 'hideTip', 'renderAgentInspector', 'selectedAgentNode', body);
   const elements = {
     '.b-mode': { textContent: '', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
     '.lg-title': { textContent: '' },
@@ -286,7 +391,7 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
   const root = { querySelectorAll: () => labels };
   const $ = selector => elements[selector];
 
-  runChrome($, root, 'connectome', true);
+  runChrome($, root, 'connectome', true, () => {}, () => {}, null);
   assert.equal(elements['.b-mode'].textContent, '◉ connectome',
     'a toggle button keeps one visible label; aria-pressed carries its state');
   assert.equal(elements['.b-mode'].attrs['aria-label'], 'Connectome view',
@@ -299,7 +404,7 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
   assert.match(elements['.sr-status'].textContent, /Connectome view/);
   assert.deepEqual(labels.map(label => label.textContent), ['neurons', 'synapses', 'hubs']);
 
-  runChrome($, root, 'memory', true);
+  runChrome($, root, 'memory', true, () => {}, () => {}, null);
   assert.equal(elements['.b-mode'].textContent, '◉ connectome');
   assert.equal(elements['.b-mode'].attrs['aria-label'], 'Connectome view');
   assert.equal(elements['.b-mode'].attrs['aria-pressed'], 'false');
@@ -313,8 +418,7 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
   const modeAnnouncements = [];
   const runSetMode = new Function(
     'next', 'mode', 'allowConnectome', 'graphLoads', 'bloomLoads', 'connectomeActivity',
-    'connectomeReloadIntent', 'neuronBirths', 'currentDomain', 'leaveFocusForGraphReplacement',
-    'focusId', 'focusSet',
+    'connectomeReloadIntent', 'neuronBirths', 'currentDomain', 'leaveFocusForGraphReplacement', 'clearAgentSelection',
     'hideExplorePanel', 'clearFocusMarker', 'updateModeChrome', 'hullState', '$',
     'sliderUnits', 'setHullOpacity', 'Graph', 'load', 'zoomOut', 'acquireInitialGraph',
     executableSetMode,
@@ -323,7 +427,7 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
   let focusLeaves = 0;
   runSetMode(
     'connectome', 'memory', true, { invalidate() {} }, { invalidate() {} }, resettable(),
-    resettable(), resettable(), null, () => { focusLeaves++; }, null, null, () => {}, () => {},
+    resettable(), resettable(), null, () => { focusLeaves++; }, () => {}, () => {}, () => {},
     announce => modeAnnouncements.push(announce), { valueFor: () => 0.03 }, () => null,
     value => value, () => {}, null, () => {}, () => {}, () => {},
   );

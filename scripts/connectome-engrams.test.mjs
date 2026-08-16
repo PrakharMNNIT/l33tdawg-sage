@@ -233,8 +233,8 @@ test('reload and mode-switch replacement paths tear down the bloom before fetchi
 });
 
 test('the 50ms deep-link bloom timer is tracked and cleared on dispose', () => {
-  assert.match(mriSource, /deepLinkTimer = setTimeout\(\(\) => \{ if \(!disposed\) bloomEngrams/,
-    'the deep-link timer must be assigned (trackable) and guard disposed');
+  assert.match(mriSource, /deepLinkTimer = setTimeout\(\(\) => \{ if \(!disposed\) selectNeuron/,
+    'the deep-link timer must select the agent persistently and remain trackable');
   assert.match(mriSource, /clearTimeout\(deepLinkTimer\)/,
     'the deep-link timer must be cleared in cleanup');
 });
@@ -243,8 +243,10 @@ test('only a NEURON click blooms engrams — clicking a bloomed engram does not 
   // clicking an engram (a memory node) must not re-run bloomEngrams with a memory
   // id as ?agent, which would strip the lobe and leave a focus ring on a removed
   // node. Guard: connectome click blooms only when n.isNeuron.
-  assert.match(mriSource, /mode==='connectome'\)\s*\{\s*if \(n\.isNeuron\) bloomEngrams\(n\); \}\s*else exploreNode\(n\)/,
-    'connectome click must bloom only neurons; memory-mode click keeps exploreNode');
+  assert.match(mriSource, /mode==='connectome'\)\s*\{\s*if \(n\.isNeuron\) selectNeuron\(n\); \}\s*else exploreNode\(n\)/,
+    'connectome click must select only neurons; selectNeuron owns the single bloom while memory mode keeps exploreNode');
+  const selectBody = functionBody(mriSource, 'selectNeuron');
+  assert.match(selectBody, /bloomEngrams\(n\)/, 'one selection must preserve the existing engram bloom');
 });
 
 test('bloom composition bridges only rendered peer neurons and strips on background exit', () => {
