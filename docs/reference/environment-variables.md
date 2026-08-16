@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.18.13. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
+<!-- Reconciled through SAGE v11.18.14. Every variable below was located at the cited file:line via `os.Getenv` or the local env helper. When the code changes, re-verify and bump this header. -->
 
 # SAGE Reference — Environment Variables
 
@@ -154,7 +154,8 @@ legacy Ollama vector space over a requested custom one (`cmd/amid/main.go`).
 |----------|--------------|---------|---------|--------|
 | `SAGE_SNAPSHOT_KEEP` | Snapshots to retain (newest N + per-version anchors, which are never pruned). Integer ≥ 1. | `5` | sage-gui | `cmd/sage-gui/node.go:262`, `cmd/sage-gui/snapshot.go:56` |
 | `SAGE_BRANCH_TAG` | Set `0`/`false`/`no` to disable branch tagging of memories. | on | MCP | `internal/mcp/branch.go:27` |
-| `SAGE_CLAUDE_CHANNEL` | Opt-in for the experimental Claude wake channel. When on, `sage-gui mcp` subscribes to this agent's signed `/v1/messages/wake` stream and emits a `notifications/claude/channel` JSON-RPC notification so the host can stop polling. Payload-free: the host learns only a durable wake cursor, never message content or sender. Accepts the usual boolean spellings; an unrecognized value warns and stays off. Failure to arm is non-fatal and leaves an ordinary MCP session. | off | sage-gui MCP (stdio) | `cmd/sage-gui/mcp.go:224`, `internal/mcp/claude_wake_source.go:84` |
+| `SAGE_CLAUDE_CHANNEL` | Controls the experimental Claude wake channel. Claude Code project sessions arm it by default; set `0`/`false`/`no` to opt out. Other MCP hosts remain off unless explicitly enabled. When on, `sage-gui mcp` subscribes to this agent's signed `/v1/messages/wake` stream and emits a `notifications/claude/channel` JSON-RPC notification so the host can stop polling. Payload-free: the host learns only a durable wake cursor, never message content or sender. An unrecognized value warns and stays off. Failure to arm is non-fatal and leaves an ordinary MCP session. | on for `claude-code`; off otherwise | sage-gui MCP (stdio) | `cmd/sage-gui/mcp.go:225`, `internal/mcp/claude_wake_source.go:84` |
+| `SAGE_STOP_NUDGE` | Opt-in end-of-turn check. When on, the generated Claude Code Stop hook asks the signed, lease-free wake snapshot whether durable message work remains unfinished and, if so, declines Stop once so the agent handles it in-session rather than going idle. Payload-free: the hook sees only the wake contract version, durable sequence, and pending bit. It never blocks `SubagentStop`, never blocks when `stop_hook_active` is set, nudges the same session again only for a newer sequence, surfaces an unchanged stranded sequence to a fresh session, and fails open on every error. | off | sage-gui hook, Claude Code Stop | `cmd/sage-gui/hook.go` (`stopNudgeEnabled`, `runHookStopCheck`), `cmd/sage-gui/mcp.go` (`sageStopScript`) |
 
 ---
 

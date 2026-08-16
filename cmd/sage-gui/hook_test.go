@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -402,4 +405,395 @@ func TestFlattenLine(t *testing.T) {
 	// Non-ASCII should round-trip cleanly
 	assert.Equal(t, "café résumé", flattenLine("café\nrésumé"))
 	assert.True(t, strings.Contains(flattenLine("hello"), "hello"))
+}
+
+// withStopHookStdin feeds a Stop hook payload on stdin for one call.
+func withStopHookStdin(t *testing.T, payload string) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stop-stdin")
+	require.NoError(t, err)
+	_, err = f.WriteString(payload)
+	require.NoError(t, err)
+	_, err = f.Seek(0, io.SeekStart)
+	require.NoError(t, err)
+	original := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() { os.Stdin = original; _ = f.Close() })
+}
+
+// stopHookNode serves the durable wake snapshot the stop check now reads.
+// seq is the monotonic exact-agent sequence; pending means unfinished work
+// exists, whether still claimable or held by a claimant session.
+func stopHookNode(t *testing.T, seq uint64, pending bool) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/messages/wake-state", r.URL.Path,
+			"the stop check must read the lease-free snapshot, never the SSE route")
+		_ = json.NewEncoder(w).Encode(map[string]any{"version": 1, "seq": seq, "pending": pending})
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// The protocol's own loop guard. stop_hook_active means this turn was already
+// held open once, so a second block would start a loop the agent cannot exit.
+func TestHookStopCheckNeverBlocksTwiceInARow(t *testing.T) {
+	withTestSageEnv(t, stopHookNode(t, 3, true))
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+	withStopHookStdin(t, `{"session_id":"s1","stop_hook_active":true}`)
+
+	stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	assert.Empty(t, stdout, "an already-blocked stop must be allowed to end")
+}
+
+// It changes how every session ends, so it stays off until asked for.
+func TestHookStopCheckIsOptIn(t *testing.T) {
+	withTestSageEnv(t, stopHookNode(t, 3, true))
+	withStopHookStdin(t, `{"session_id":"s1"}`)
+
+	stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	assert.Empty(t, stdout, "unset SAGE_STOP_NUDGE must not block anything")
+
+	t.Setenv("SAGE_STOP_NUDGE", "nonsense")
+	withStopHookStdin(t, `{"session_id":"s1"}`)
+	stdout = captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	assert.Empty(t, stdout, "an unparseable value must not silently enable blocking")
+}
+
+func TestHookStopCheckDeniesTheStopWhenWorkIsPending(t *testing.T) {
+	withTestSageEnv(t, stopHookNode(t, 2, true))
+	t.Setenv("SAGE_STOP_NUDGE", "true")
+	withStopHookStdin(t, `{"session_id":"s1"}`)
+
+	stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	require.NotEmpty(t, stdout)
+
+	// Stop uses the TOP-LEVEL decision model. hookSpecificOutput is the shape
+	// for PreToolUse and friends; Claude Code ignores it for Stop, so emitting
+	// it would block nothing while this test still passed. Assert the exact
+	// documented shape, and assert the wrong one is absent.
+	var decision struct {
+		Decision           string          `json:"decision"`
+		Reason             string          `json:"reason"`
+		HookSpecificOutput json.RawMessage `json:"hookSpecificOutput"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &decision), "must emit the documented block document")
+	assert.Equal(t, "block", decision.Decision, "Stop blocks with decision=block, not deny")
+	assert.Empty(t, decision.HookSpecificOutput, "Stop must not use the hookSpecificOutput shape")
+	assert.Contains(t, decision.Reason, "unfinished durable work")
+	assert.Contains(t, decision.Reason, "untrusted content",
+		"the nudge must carry the inbox security boundary with it")
+	// Payload-free: the nudge is derived from the wake snapshot alone, so no message
+	// identity or body can reach it. (The word "payload" legitimately appears
+	// in the security-boundary sentence, so assert on leak SHAPES instead.)
+	assert.NotContains(t, stdout, "message_id")
+	assert.NotContains(t, stdout, "msg-")
+	assert.NotContains(t, stdout, "from_agent")
+	assert.NotContains(t, stdout, "intent")
+}
+
+// Work the agent has already been told about, and may have deliberately
+// declined, must not hold the session open forever. Only NEW work re-blocks.
+func TestHookStopCheckDoesNotReTrapOnDeclinedWork(t *testing.T) {
+	withTestSageEnv(t, stopHookNode(t, 2, true))
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+
+	withStopHookStdin(t, `{"session_id":"s1"}`)
+	first := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	require.Contains(t, first, `"decision":"block"`, "the first pending item should nudge once")
+
+	withStopHookStdin(t, `{"session_id":"s1"}`)
+	second := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	assert.Empty(t, second, "the same pending work must not nudge the same session twice")
+}
+
+func TestHookStopCheckNudgesAgainOnlyWhenNewWorkArrives(t *testing.T) {
+	seq := uint64(2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"version": 1, "seq": seq, "pending": true})
+	}))
+	defer srv.Close()
+	withTestSageEnv(t, srv.URL)
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+
+	withStopHookStdin(t, `{"session_id":"s1"}`)
+	require.Contains(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }), `"decision":"block"`)
+	withStopHookStdin(t, `{"session_id":"s1"}`)
+	require.Empty(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }))
+
+	seq = 5 // a genuinely new message lands
+	withStopHookStdin(t, `{"session_id":"s1"}`)
+	again := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	assert.Contains(t, again, `"decision":"block"`, "new work must be able to nudge again")
+	assert.Contains(t, again, `"decision":"block"`)
+
+	// A different session starts fresh regardless of the marker.
+	withStopHookStdin(t, `{"session_id":"s2"}`)
+	assert.Contains(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }), `"decision":"block"`)
+}
+
+// A hook fault must never be able to wedge a session, so every failure allows
+// the stop and none of them returns an error to the dispatcher.
+func TestHookStopCheckFailsOpen(t *testing.T) {
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+
+	t.Run("unreachable node", func(t *testing.T) {
+		withTestSageEnv(t, "http://127.0.0.1:1")
+		withStopHookStdin(t, `{"session_id":"s1"}`)
+		stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+		assert.Empty(t, stdout)
+	})
+
+	t.Run("malformed stdin", func(t *testing.T) {
+		withTestSageEnv(t, stopHookNode(t, 4, true))
+		withStopHookStdin(t, `{not json`)
+		stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+		assert.Empty(t, stdout)
+	})
+
+	t.Run("inconsistent probe", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 3, "unread": false})
+		}))
+		defer srv.Close()
+		withTestSageEnv(t, srv.URL)
+		withStopHookStdin(t, `{"session_id":"s1"}`)
+		stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+		assert.Empty(t, stdout)
+	})
+
+	t.Run("no pending work", func(t *testing.T) {
+		withTestSageEnv(t, stopHookNode(t, 7, false))
+		withStopHookStdin(t, `{"session_id":"s1"}`)
+		stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+		assert.Empty(t, stdout)
+	})
+}
+
+// A subagent finishing is not evidence that the owning host session is idle.
+// Nudging it toward sage_inbox could create a SECOND claimant for the same
+// agent — the one-handler violation the claimant-session fence exists to stop.
+// Guarded in Go, not only in the generated settings, so a hand-wired
+// SubagentStop is still silent.
+func TestHookStopCheckRefusesAnyEventOtherThanStop(t *testing.T) {
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+	for _, event := range []string{"SubagentStop", "PreCompact", "Notification"} {
+		t.Run(event, func(t *testing.T) {
+			withTestSageEnv(t, stopHookNode(t, 4, true))
+			withStopHookStdin(t, `{"session_id":"s1","hook_event_name":"`+event+`"}`)
+			stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+			assert.Empty(t, stdout, event+" must never decline a stop")
+		})
+	}
+
+	// The main event still nudges, so the guard is not simply refusing everything.
+	withTestSageEnv(t, stopHookNode(t, 4, true))
+	withStopHookStdin(t, `{"session_id":"s1","hook_event_name":"Stop"}`)
+	assert.Contains(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }), `"decision":"block"`)
+}
+
+// Without a session identity the per-session marker cannot be attributed.
+// Writing it anyway stores malformed state that can re-nudge forever, so the
+// check must fail open and leave no marker behind.
+func TestHookStopCheckFailsOpenWhenSessionIDIsMissing(t *testing.T) {
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+	for name, payload := range map[string]string{
+		"absent": `{"hook_event_name":"Stop"}`,
+		"empty":  `{"session_id":"","hook_event_name":"Stop"}`,
+		"blank":  `{"session_id":"   ","hook_event_name":"Stop"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("SAGE_HOME", home)
+			withTestSageEnv(t, stopHookNode(t, 3, true))
+			t.Setenv("SAGE_HOME", home)
+			withStopHookStdin(t, payload)
+
+			stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+			assert.Empty(t, stdout, "a payload with no usable session id must allow the stop")
+			_, statErr := os.Stat(filepath.Join(home, stopNudgeStateDir))
+			assert.True(t, os.IsNotExist(statErr), "no marker may be written without a session identity")
+		})
+	}
+}
+
+// BLOCKER 1 REGRESSION. The old check compared an unread COUNT against a stored
+// high-water mark, which is a level rather than a generation: nudge at 5, let
+// those five be handled, then one genuinely new message arrives and 1 <= 5, so
+// the new work never nudges at all. A monotonic durable sequence has no such
+// hole. This drives exactly that sequence and requires the nudge to fire.
+func TestHookStopCheckNudgesWhenWorkShrinksButSequenceAdvances(t *testing.T) {
+	seq := uint64(5)
+	pending := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"version": 1, "seq": seq, "pending": pending})
+	}))
+	defer srv.Close()
+	withTestSageEnv(t, srv.URL)
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+
+	// Five items pending; nudge once.
+	withStopHookStdin(t, `{"session_id":"s1","hook_event_name":"Stop"}`)
+	require.Contains(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }), `"decision":"block"`)
+
+	// All five handled: nothing unfinished, so nothing to say.
+	pending = false
+	withStopHookStdin(t, `{"session_id":"s1","hook_event_name":"Stop"}`)
+	require.Empty(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }))
+
+	// ONE new message arrives. Under a count high-water mark this is 1 <= 5 and
+	// would be silently swallowed; under a monotonic sequence it is 6 > 5.
+	seq, pending = 6, true
+	withStopHookStdin(t, `{"session_id":"s1","hook_event_name":"Stop"}`)
+	assert.Contains(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }), `"decision":"block"`,
+		"newer durable work must nudge even though less of it is outstanding")
+}
+
+// A row stranded by a dead claimant session keeps pending true at an unchanged
+// sequence. A FRESH session has never seen that sequence, so it must be told;
+// the session that already saw it must not be re-trapped.
+func TestHookStopCheckSurfacesStrandedWorkToAFreshSessionOnly(t *testing.T) {
+	withTestSageEnv(t, stopHookNode(t, 9, true))
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+
+	withStopHookStdin(t, `{"session_id":"dead-session","hook_event_name":"Stop"}`)
+	require.Contains(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }), `"decision":"block"`)
+	withStopHookStdin(t, `{"session_id":"dead-session","hook_event_name":"Stop"}`)
+	require.Empty(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }),
+		"the session already told must not be re-trapped at the same sequence")
+
+	// A restart: new session id, same durable sequence, work still unfinished.
+	withStopHookStdin(t, `{"session_id":"fresh-session","hook_event_name":"Stop"}`)
+	assert.Contains(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }), `"decision":"block"`,
+		"a fresh runtime must learn about work stranded at an unchanged sequence")
+}
+
+// An unrecognised wake contract version must not be guessed at.
+func TestHookStopCheckIgnoresAnUnknownWakePayloadVersion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"version": 99, "seq": 4, "pending": true})
+	}))
+	defer srv.Close()
+	withTestSageEnv(t, srv.URL)
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+	withStopHookStdin(t, `{"session_id":"s1","hook_event_name":"Stop"}`)
+	assert.Empty(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }))
+}
+
+// The exact defect an adversarial review found: the nudge marker used to be a
+// single machine-wide slot, so two concurrent Claude sessions evicted each
+// other and each was re-nudged about work it had already declined — every
+// turn-end, forever. That made this hook's own emitted promise, "declining is
+// final", false whenever more than one session was running.
+func TestHookStopCheckDecliningStaysFinalAcrossInterleavedSessions(t *testing.T) {
+	withTestSageEnv(t, stopHookNode(t, 5, true))
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+
+	nudge := func(session string) string {
+		withStopHookStdin(t, `{"session_id":"`+session+`","hook_event_name":"Stop"}`)
+		return captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	}
+
+	require.Contains(t, nudge("s1"), `"decision":"block"`, "s1 is told once")
+	require.Contains(t, nudge("s2"), `"decision":"block"`, "s2 has never been told, so it is told once")
+
+	// s1 already declined this exact sequence. A second session existing must
+	// not resurrect it.
+	assert.Empty(t, nudge("s1"), "declining must stay final even after another session was nudged")
+	assert.Empty(t, nudge("s2"), "and for the interleaved session too")
+
+	// Both remain settled across further alternation.
+	assert.Empty(t, nudge("s1"))
+	assert.Empty(t, nudge("s2"))
+}
+
+// The marker is a bounded hint, not a ledger. Many sessions must not grow it
+// without limit, and eviction must never resurrect a nudge for the session
+// currently being asked about.
+func TestHookStopCheckMarkerStaysBounded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+	withTestSageEnv(t, stopHookNode(t, 3, true))
+	t.Setenv("SAGE_HOME", home)
+	t.Setenv("SAGE_STOP_NUDGE", "1")
+
+	for i := 0; i < maxStopNudgeSessions*2; i++ {
+		withStopHookStdin(t, fmt.Sprintf(`{"session_id":"s%03d","hook_event_name":"Stop"}`, i))
+		require.NotEmpty(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }))
+	}
+	entries, err := os.ReadDir(filepath.Join(home, stopNudgeStateDir))
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(entries), maxStopNudgeSessions, "marker directory must stay bounded")
+
+	// The most recent session is still remembered, so it is not re-nudged.
+	withStopHookStdin(t, fmt.Sprintf(`{"session_id":"s%03d","hook_event_name":"Stop"}`, maxStopNudgeSessions*2-1))
+	assert.Empty(t, captureStdout(t, func() { require.NoError(t, runHookStopCheck()) }))
+}
+
+// THE RACE THE SEQUENTIAL TESTS CANNOT SEE. An earlier repair kept one shared
+// file holding a line per session, which still required an unlocked
+// read-modify-write. Stop hooks are separate OS processes, so two can read the
+// same content and the last writer erases the other's entry — and the evicted
+// session is then re-nudged about work it already declined. Interleaving calls
+// sequentially never reproduces it, because each call sees the previous write.
+//
+// Per-session files remove the contention rather than guarding it. This drives
+// genuinely concurrent writers and requires every session's mark to survive.
+func TestHookStopCheckConcurrentSessionsDoNotEvictEachOther(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+
+	const sessions = 24
+	var wg sync.WaitGroup
+	for i := 0; i < sessions; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			storeStopNudgeState(fmt.Sprintf("session-%02d", n), uint64(n+1))
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < sessions; i++ {
+		got := loadStopNudgeState(fmt.Sprintf("session-%02d", i))
+		assert.Equal(t, uint64(i+1), got,
+			"a concurrent writer must not erase another session's mark")
+	}
+}
+
+// Same session, concurrent writers: the mark must remain readable and valid
+// rather than torn, whichever write lands last.
+func TestHookStopCheckConcurrentSameSessionWritesStayReadable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+
+	var wg sync.WaitGroup
+	for i := 1; i <= 16; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			storeStopNudgeState("same-session", uint64(n))
+		}(i)
+	}
+	wg.Wait()
+
+	got := loadStopNudgeState("same-session")
+	assert.GreaterOrEqual(t, got, uint64(1), "the mark must survive as a valid sequence")
+	assert.LessOrEqual(t, got, uint64(16), "and must be one of the values actually written")
+
+	entries, err := os.ReadDir(filepath.Join(home, stopNudgeStateDir))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "every writer must clean up its unique temporary file")
+	assert.True(t, isStopNudgeMarkerName(entries[0].Name()), "only the final marker may remain")
+}
+
+func TestHookStopCheckMarkerUsesTheFullOpaqueSessionDigest(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SAGE_HOME", home)
+
+	path := stopNudgeMarkerPath("session/id that must never become a path")
+	name := filepath.Base(path)
+	assert.Len(t, name, sha256.Size*2, "the full digest avoids cross-session marker collisions")
+	assert.True(t, isStopNudgeMarkerName(name))
+	assert.NotContains(t, path, "session/id", "the opaque session id must never enter the filesystem path")
 }

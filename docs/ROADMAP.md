@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.13 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.14 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -52,13 +52,49 @@ deterministic bounded corroborator evidence and lifecycle hardening, removes
 the floating Connectome caption while strengthening mode accessibility, adds
 Claude's explicitly enabled signed production wake source with lossless
 backpressure, and closes the MCP claimant-session compatibility fallback
-bypass. The supported consensus ceiling remains app-v26;
-**v11.18.13 does not introduce app-v27**.
+bypass. v11.18.14 keeps claimed work visible to wake and inbox consumers,
+adds exact payload-free stranded-claim state and a lease-free wake snapshot,
+arms Claude Code wake by default, and gives its optional Stop hook a monotonic
+one-shot recovery signal. It preserves sender-selected canonical message TTLs,
+adds a persistent accessible Connectome agent inspector, batches and totally
+orders agent-as-lobe corroborator reads, and documents the enforced 31-day
+timeline range. The supported consensus ceiling remains app-v26;
+**v11.18.14 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.14 patch
+
+Canonical Messages now remain visible while unfinished, whether still pending
+or already claimed. Same-cursor wake reconnects replay stranded work, the MCP
+inbox carries an exact payload-free claimed-elsewhere tri-state, and a signed
+lease-free wake snapshot lets short-lived hooks observe the durable monotonic
+sequence without acquiring or disrupting the exclusive SSE consumer lease.
+Claude Code project sessions arm the wake channel by default; the optional
+Stop-only nudge fails open and uses per-session durable sequence state so a
+declined generation is not allowed to trap the session indefinitely.
+
+Claimant-session conflicts stay typed instead of falling through a legacy 404
+path, and recovery remains explicit through passive history plus compare-and-
+swap handoff. The every-open canonical retention migration now matches only the
+exact historical 24-hour stamp by epoch seconds, preserving deliberate bounded
+TTLs while still rescuing RFC3339Nano production rows.
+
+CEREBRUM's Connectome adds reliable escaped hover identity and a persistent,
+nonmodal agent inspector shared by click, tap, and keyboard selection. Exact
+identity, visible retained traffic, peers, activity, and memory-lobe states
+remain useful through loading, empty, partial, error, live-refresh, mobile, and
+reduced-motion paths without hiding established guidance.
+
+Agent-as-lobe corroborator presentation uses one bounded deterministic batch
+with matching SQLite and PostgreSQL total order instead of N+1 exact-ID reads.
+The `sage_timeline` MCP schema now advertises the server's enforced 31-day
+range. This patch introduces no new consensus application version or state
+migration: app-v26 remains the ceiling and v11.18.14 does not introduce
+app-v27.
 
 ## v11.18.13 patch
 

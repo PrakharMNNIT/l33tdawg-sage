@@ -959,7 +959,8 @@ type MessageStatus struct {
 
 // MessageWakeState is payload-free exact-recipient inbox wake metadata. Seq is
 // monotonic and advances only for a fresh canonical local pending insertion;
-// Pending is a current bounded queue predicate, not delivery/read/presence.
+// Pending reports unfinished recipient work, whether still claimable or held
+// by a claimant session. It is not delivery/read/presence evidence.
 type MessageWakeState struct {
 	Seq     uint64 `json:"seq"`
 	Pending bool   `json:"pending"`
@@ -973,6 +974,7 @@ type MessageStore interface {
 	SendLocalMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage) (*PipelineMessage, bool, error)
 	SendFederatedMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage, event *PipelineTransportOutbox) (*PipelineMessage, bool, error)
 	ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int, claimantSessionID ...string) ([]*PipelineMessage, bool, error)
+	CountClaimedLocalMessagesElsewhere(ctx context.Context, receiverID, claimantSessionID string) (int, error)
 	HandoffLocalMessageClaim(ctx context.Context, receiverID, messageID, fromSessionID, toSessionID string) (bool, error)
 	ReplyLocalMessage(ctx context.Context, receiverID, messageID, result string, claimantSessionID ...string) (bool, error)
 	AcknowledgeLocalMessageRead(ctx context.Context, receiverID, messageID string) (bool, error)

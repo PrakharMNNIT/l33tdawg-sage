@@ -123,9 +123,27 @@ func (s *SQLiteStore) migrateMessages(ctx context.Context) error {
 	// v11.17.8 stamped the old 24-hour pipeline TTL onto canonical msg-* rows.
 	// Extend still-live inbox/outbox items during upgrade so a recipient that
 	// was offline through the release does not lose unread work.
+	//
+	// This runs on EVERY store open, not once, so it must target only what
+	// v11.17.8 actually stamped. Matching every msg-* row would re-stamp a
+	// sender's deliberate bounded TTL on every restart: ttl_minutes is a
+	// documented parameter (0 durable, else 1-1440), so a 30-minute message
+	// silently became a permanent one that no sweeper would ever collect.
+	// Keying on the exact old default leaves a caller-chosen expiry alone.
+	//
+	// Compare as epoch SECONDS, not as formatted text. Production writes
+	// expires_at with RFC3339Nano, so a stored value keeps up to 9 fractional
+	// digits, while strftime's %f emits only 3 — a textual comparison never
+	// matches a real row and would rescue nothing. Seconds are precise enough:
+	// the old default stamped exactly +24h, and a 30-minute TTL is 85800s away.
+	//
+	// A caller who chose exactly 1440 minutes is indistinguishable from the old
+	// default by construction and is still extended. That is the one ambiguous
+	// case and it is preferred over losing unread work on upgrade.
 	if _, err := s.writeExecContext(ctx, `UPDATE pipeline_messages
 		SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ',created_at,'+100 years')
-		WHERE pipe_id LIKE 'msg-%' AND status IN ('pending','claimed')`); err != nil {
+		WHERE pipe_id LIKE 'msg-%' AND status IN ('pending','claimed')
+		  AND strftime('%s',expires_at)=strftime('%s',created_at,'+24 hours')`); err != nil {
 		return fmt.Errorf("extend canonical message inbox retention: %w", err)
 	}
 	// An upgraded node may already hold canonical pending work. Give each exact
@@ -316,7 +334,9 @@ func (s *SQLiteStore) SendLocalMessage(ctx context.Context, idempotencyKey strin
 }
 
 // GetMessageWakeState returns only the authenticated caller's exact durable
-// wake sequence and whether currently claimable canonical local work exists.
+// wake sequence and whether unfinished canonical local work exists. Claimed
+// work remains unfinished: a claimant session may crash, so claim ownership
+// alone cannot make the wake surface say the recipient has nothing to handle.
 // It never decrypts a message and does not claim, read, acknowledge, or mutate.
 func (s *SQLiteStore) GetMessageWakeState(ctx context.Context, recipientID string) (MessageWakeState, error) {
 	recipientID = strings.TrimSpace(recipientID)
@@ -339,7 +359,7 @@ func (s *SQLiteStore) GetMessageWakeState(ctx context.Context, recipientID strin
 	if err := s.conn.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM pipeline_messages
 		 WHERE source_chain_id='' AND destination_chain_id='' AND to_provider=''
-		   AND to_agent=? AND status='pending'
+		   AND to_agent=? AND status IN ('pending','claimed')
 		   AND expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))`, recipientID).Scan(&pending); err != nil {
 		return MessageWakeState{}, err
 	}
@@ -534,6 +554,32 @@ func (s *SQLiteStore) ReceiveLocalMessages(ctx context.Context, agentID, provide
 		return nil
 	})
 	return items, replayed, err
+}
+
+// CountClaimedLocalMessagesElsewhere returns only an exact-recipient scalar.
+// It deliberately queries the authoritative claim rows rather than a bounded
+// history page, so older stranded claims cannot disappear behind newer work.
+// No message identifier, sender, intent, payload, or claimant identity crosses
+// this boundary.
+func (s *SQLiteStore) CountClaimedLocalMessagesElsewhere(
+	ctx context.Context, receiverID, claimantSessionID string,
+) (int, error) {
+	receiverID = strings.TrimSpace(receiverID)
+	claimantSessionID = strings.TrimSpace(claimantSessionID)
+	if receiverID == "" || claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes {
+		return 0, ErrMessageNotFound
+	}
+	var count int
+	err := s.conn.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM pipeline_messages p
+		JOIN message_fetch_receipts r
+		  ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
+		WHERE p.to_agent=? AND p.to_provider=''
+		  AND p.source_chain_id='' AND p.destination_chain_id=''
+		  AND p.status='claimed' AND p.completed_at IS NULL
+		  AND r.claimant_session_id!=?`,
+		receiverID, receiverID, claimantSessionID).Scan(&count)
+	return count, err
 }
 
 // HandoffLocalMessageClaim transfers only the session-level coordination
