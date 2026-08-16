@@ -470,7 +470,7 @@ downloads the pinned OpenAI `tunnel-client` if needed, writes the profile, start
 the client in the background, and surfaces the final connector URL. Routes are
 registered by `RegisterChatGPTTunnelRoutes` (`web/chatgpt_tunnel_handler.go:30-35`)
 inside the same `wizardSecurityGate` group as the ChatGPT wizard
-(`web/handler.go:531-535`).
+(`web/handler.go:1789-1802`).
 
 **Auth:** these routes carry dashboard auth plus the strict same-origin wizard gate.
 They download a binary and spawn a subprocess, so a cross-origin browser tab must

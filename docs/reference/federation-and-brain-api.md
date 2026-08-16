@@ -224,7 +224,7 @@ Every established-peer request, including `query`, `write`, and `sync`, is authe
 ### `GET /fed/v1/status`
 
 Authenticated reachability / identity and permission preflight (`handleStatus`,
-`internal/federation/server.go:285-319`). Distinguishes "peer unreachable" from
+`internal/federation/server.go:457-578`). Distinguishes "peer unreachable" from
 "peer misconfigured" and carries the caller-bound current grant.
 
 **Response** (`StatusResponse`, `internal/federation/types.go:118-166`):
@@ -401,7 +401,7 @@ or dispatch credentials to `/v1/memory/submit`
 The `write-v1` constant and `RemoteWriteRequest` envelope remain reserved for
 mixed-version compatibility, but current SAGE never advertises the capability. The
 outbound `WritePeer` method returns the typed unavailable error before agreement
-lookup or dialing (`internal/federation/remote_write.go:9-45`), and status adds
+lookup or dialing (`internal/federation/remote_write.go:44-50`), and status adds
 only capabilities actually supported by the running node
 (`internal/federation/server.go:282-315`).
 
@@ -712,7 +712,7 @@ dashboard-authenticated agents cannot inspect ceremonies or change peer policy
 (`web/federation_join.go:71-102`, `1021-1037`). Everything remains
 off-consensus except the ordinary transactions explicitly described here.
 Every route 501s when the transport is not wired (`fedReady`,
-`federation_join.go:62-69`).
+`federation_join.go:98-107`).
 
 | Method + path | Handler | Purpose |
 |---|---|---|
@@ -880,7 +880,7 @@ Receiver admission independently rechecks `remote Publish ∩ local Subscribe`.
 An absent peer-RBAC policy and a configured-empty policy both deny v3 Copy; v3
 never falls back to tx-33. These intersections and the fail-closed identity/CA
 binding are applied by `pairwiseEgressPolicy` and `pairwiseIngressPolicy`
-(`internal/federation/sync_outbox.go:351-428`).
+(`internal/federation/sync_outbox.go:628-665`).
 
 Both original host and original guest may publish their own Copy offer and
 subscription after JOIN. They cannot edit the other node's choice. Lanes are
