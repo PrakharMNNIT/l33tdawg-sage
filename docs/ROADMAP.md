@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.14 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.15 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -58,13 +58,43 @@ arms Claude Code wake by default, and gives its optional Stop hook a monotonic
 one-shot recovery signal. It preserves sender-selected canonical message TTLs,
 adds a persistent accessible Connectome agent inspector, batches and totally
 orders agent-as-lobe corroborator reads, and documents the enforced 31-day
-timeline range. The supported consensus ceiling remains app-v26;
-**v11.18.14 does not introduce app-v27**.
+timeline range. v11.18.15 backfills wake state for claimed-only upgraded work,
+makes deprecated exact-local pipe admission atomic with its durable generation,
+restores the experimental Claude notification adapter to explicit opt-in,
+adds deterministic `memory_id` ordering for timestamp ties, and makes citation
+repair anchor-aware and fail-closed over new parser debt. The supported
+consensus ceiling remains app-v26; **v11.18.15 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.15 patch
+
+Startup wake migration now allocates a non-zero catch-up sequence when an
+upgraded recipient's only unfinished exact-local work is already claimed, not
+only when a pending row remains. The deprecated `/v1/pipe/send` path now gives
+every exact local recipient the same atomic row-plus-generation invariant:
+keyed sends retain canonical replay semantics, unkeyed sends use a dedicated
+single-transaction admission primitive, publication follows commit, and an
+incapable backend returns 501 before inserting anything. Provider-only and
+federated work remain outside the exact-local sequence.
+
+The custom Claude wake notification channel is opt-in for every host because the
+shipped Claude Code host does not consume it and an idle adapter must not acquire
+the exclusive exact-agent wake lease. Pending memory batches now use
+`memory_id` as the final SQLite/PostgreSQL tiebreak when timestamps match.
+
+Documentation citations now parse bounded newline-separated symbol/path pairs
+and hyphenated Go directories. A versioned registry records each concrete
+declaration, lead-comment, or interior anchor; automatic repair is limited to
+accepted declaration anchors and keeps their recorded line current. Lead,
+interior, unknown, or false quoted claims are reported for human review. The
+remaining legacy skipped and bare references are pinned as explicit debt, so
+new skipped coverage or lost checked coverage fails without forcing a bulk
+migration. This patch introduces no new consensus application version or state
+migration: app-v26 remains the ceiling and v11.18.15 does not introduce app-v27.
 
 ## v11.18.14 patch
 
@@ -73,9 +103,11 @@ or already claimed. Same-cursor wake reconnects replay stranded work, the MCP
 inbox carries an exact payload-free claimed-elsewhere tri-state, and a signed
 lease-free wake snapshot lets short-lived hooks observe the durable monotonic
 sequence without acquiring or disrupting the exclusive SSE consumer lease.
-Claude Code project sessions arm the wake channel by default; the optional
-Stop-only nudge fails open and uses per-session durable sequence state so a
-declined generation is not allowed to trap the session indefinitely.
+Claude Code and Codex project sessions arm the Stop-only turn-boundary nudge by
+default. It fails open—including when its one-shot cursor cannot be persisted—
+and uses per-session durable sequence state so a declined generation cannot
+trap the session indefinitely. The experimental custom Claude notification
+adapter remains explicit opt-in for hosts known to consume it.
 
 Claimant-session conflicts stay typed instead of falling through a legacy 404
 path, and recovery remains explicit through passive history plus compare-and-

@@ -566,6 +566,23 @@ func (s *Server) handlePipeResolve(w http.ResponseWriter, r *http.Request) {
 	writeProblem(w, http.StatusNotFound, "Unknown target", fmt.Sprintf("no registered local or visible federated agent matches %q", target))
 }
 
+// isExactLocalAdmission reports whether this row is canonical work addressed to
+// a concrete local agent on this node, and therefore owes that recipient a
+// durable wake generation.
+//
+// Provider-addressed rows are deliberately excluded while the provider is still
+// unresolved: there is no exact recipient to allocate a sequence for. A provider
+// name that HAS resolved to a concrete local ToAgent leaves ToProvider empty and
+// so counts as exact-local, which is the intended behaviour — that agent should
+// be woken. Federated rows carry a chain id on either side and are never local.
+func isExactLocalAdmission(msg *store.PipelineMessage) bool {
+	return msg != nil &&
+		strings.TrimSpace(msg.ToAgent) != "" &&
+		msg.ToProvider == "" &&
+		msg.SourceChainID == "" &&
+		msg.DestinationChainID == ""
+}
+
 // pipelineSendActivitySummary renders the dashboard Chain Activity row for a
 // newly created pipeline message. It is deliberately metadata-only.
 //
@@ -922,6 +939,38 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 		} else {
 			insertErr = transportStore.InsertPipelineWithTransport(r.Context(), msg, event)
 		}
+	} else if isExactLocalAdmission(msg) {
+		// Exact-local canonical work must never be admitted through a bare
+		// InsertPipeline. That allocates no wake generation, so the recipient's
+		// durable sequence never moves and every "is this newer than what I last
+		// saw" consumer answers no. Legacy polling could still find the row, but
+		// wake consumers could not observe it as a new generation.
+		messageStore, messageOK := s.store.(store.MessageStore)
+		switch {
+		case !messageOK:
+			// FAIL CLOSED. Falling back to a bare InsertPipeline here would
+			// recreate the exact invariant violation this change exists to
+			// remove, and would return 201 for work the wake contract cannot
+			// represent. Refusing before insertion is the honest answer: no row,
+			// no half-admitted state, and a caller that knows it failed.
+			writeProblem(w, http.StatusNotImplemented, "Messages unavailable",
+				"The active store does not support canonical messages.")
+			return
+		case req.IdempotencyKey != "":
+			if len(req.IdempotencyKey) > store.MaxMessageTokenBytes {
+				writeProblem(w, http.StatusBadRequest, "Invalid idempotency key", "idempotency_key is too long")
+				return
+			}
+			// Keyed sends go through the canonical path so a replay returns the
+			// original row and advances the sequence exactly once.
+			msg, idempotentReplay, insertErr = messageStore.SendLocalMessage(r.Context(), req.IdempotencyKey, msg)
+		default:
+			var admitted *store.PipelineMessage
+			admitted, insertErr = messageStore.AdmitLocalMessage(r.Context(), msg)
+			if insertErr == nil {
+				msg = admitted
+			}
+		}
 	} else {
 		insertErr = pipeStore.InsertPipeline(r.Context(), msg)
 	}
@@ -945,6 +994,13 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 		if nudger, ok := s.federation.(federatedPipeTransportNudger); ok {
 			nudger.NudgePipelineTransport()
 		}
+	}
+	// Publish the process-local wake only AFTER the transaction committed.
+	// WakeSeq is process-local return metadata populated by fresh atomic
+	// admissions only; GetPipeline does not populate it, so an idempotent replay
+	// returns zero and cannot publish the same durable generation again.
+	if msg.WakeSeq > 0 {
+		s.publishMessageWake(msg.ToAgent, msg.WakeSeq)
 	}
 
 	if s.OnEvent != nil {

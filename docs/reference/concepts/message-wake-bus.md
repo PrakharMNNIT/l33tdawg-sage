@@ -9,11 +9,26 @@ claim, presence, or workflow evidence.
 
 ## Durable sequence
 
-`internal/store/messages.go` (`SQLiteStore.SendLocalMessage`) inserts the
-canonical pending `msg-*` row, caller-scoped idempotency binding, and the
-recipient's next `message_wake_state.seq` in one SQLite transaction. A fresh
-recipient begins at sequence 1. An exact idempotent replay returns the original
-message and does not advance the sequence. A rollback advances nothing.
+The canonical `POST /v1/messages` path uses `SendLocalMessage` (`internal/store/messages.go:272-350`)
+to insert the pending `msg-*` row,
+caller-scoped idempotency binding, and the recipient's next
+`message_wake_state.seq` in one SQLite transaction. A fresh recipient begins at
+sequence 1. An exact idempotent replay returns the original message and does not
+advance the sequence. A rollback advances nothing.
+
+The deprecated `POST /v1/pipe/send` route now preserves the same wake invariant
+for exact local recipients. A request carrying `idempotency_key` uses the keyed
+`SendLocalMessage` (`internal/store/messages.go:272-350`) path. An unkeyed request uses
+`AdmitLocalMessage` (`internal/store/messages.go:351-387`), which inserts the row and allocates the
+sequence in one transaction without creating a replay mapping. After either
+fresh path commits, `handlePipeSend` (`api/rest/pipe_handler.go:619-1033`) publishes only the
+returned process-local non-zero generation. A keyed replay loads
+the original row without `WakeSeq`, so it neither advances nor republishes the
+generation. Provider-only and federated rows have no exact local recipient and
+do not allocate an exact-recipient sequence. If the active backend cannot
+perform atomic canonical admission, an exact-local pipe send fails with HTTP
+501 before inserting anything rather than creating a row wake consumers cannot
+observe as new.
 
 `SQLiteStore.GetMessageWakeState` returns only:
 
@@ -72,9 +87,10 @@ cancel, or compete with the long-running wake consumer.
 ## Broker and reconnect safety
 
 `api/rest/message_wake.go` (`messageWakeBroker`) is process-local acceleration
-only. Publication occurs after `SendLocalMessage` returns committed, and only
-for a fresh admission. A missing publication or process crash cannot lose the
-wake: reconnect reads the durable sequence before waiting on the broker.
+only. Publication occurs after an atomic message admission returns committed,
+and only when it returns a fresh non-zero `WakeSeq`. A missing publication or
+process crash cannot lose the wake: reconnect reads the durable sequence before
+waiting on the broker.
 
 One exact agent has one active consumer lease. The same `consumer_id` may
 supersede its stale connection; a different consumer receives `409` until the
@@ -95,20 +111,22 @@ The older HTTP-MCP `notifications/sage_message` bridge remains a separate,
 best-effort compatibility notification for already-open MCP SSE sessions and
 does not define this durable sequence contract.
 
-## Claude wake channel enablement
+## Experimental Claude wake channel enablement
 
-The Claude host adapter is the one shipped consumer of this route. A
-project-scoped `sage-gui mcp` session whose `SAGE_PROVIDER` is `claude-code`
-arms it by default; set `SAGE_CLAUDE_CHANNEL=0` (or another accepted false
-spelling) to opt out. Other MCP hosts stay off unless explicitly enabled
-(`cmd/sage-gui/mcp.go:224`). Constructing an MCP `Server` never advertises or
-emits the experimental protocol on its own; the executable still makes an
-explicit enablement call (`internal/mcp/claude_wake_source.go:84`,
-`internal/mcp/claude_channel.go:50`).
+The Claude notification adapter is experimental and defaults off. Enable it
+with `SAGE_CLAUDE_CHANNEL=1` only when the attached host is known to consume
+`notifications/claude/channel`. Codex is always refused because it cannot
+consume that method and must not occupy the exclusive wake lease. Other hosts
+remain off unless explicitly enabled
+(`claudeChannelEnabled`, `mcp.go:332`). Constructing an MCP `Server` never
+advertises or emits the experimental protocol on its own; the executable still
+makes an explicit enablement call (`EnableRESTClaudeChannel`, `internal/mcp/claude_wake_source.go:85`)
+through `ConfigureClaudeChannel` (`internal/mcp/claude_channel.go:50`).
 
-When armed, the adapter subscribes to this agent's own signed wake stream and
+When armed for a compatible host, the adapter subscribes to this agent's own signed wake stream and
 turns durable unfinished-work state into a `notifications/claude/channel` JSON-RPC
-notification, so the host can stop polling its inbox on a timer.
+notification. The shipped Claude Code host does not currently consume that
+custom method; its supported continuation path is the Stop hook below.
 
 The channel is **only a poll accelerator, and it is payload-free**. A wake
 carries `version`, `seq`, and `pending` and nothing else, so the host learns
@@ -119,6 +137,36 @@ affects message lifecycle state.
 
 Two consequences follow from the lease described above. A second runtime for
 the same agent is rejected with 409 rather than silently sharing the wake, so
-the wake accelerates exactly one runtime at a time. And because the channel
-only accelerates polling, failing to arm it is not fatal: a host that cannot
-open the stream still gets an ordinary MCP session and ordinary polling.
+the wake accelerates exactly one runtime at a time. The rejected adapter does
+not terminate: it retries from its last durable cursor with bounded exponential
+backoff (250ms through 30s), and can acquire the lease after the holder
+disconnects. Because the channel only accelerates polling, failing to arm or
+waiting for that lease is not fatal: the host keeps its ordinary MCP session
+and can still use the canonical inbox operations.
+
+## Claude Code and Codex turn-boundary wake
+
+Codex does not consume the custom `notifications/claude/channel` method, so a
+Codex MCP process cannot acquire the Claude channel's exclusive wake lease,
+even through an explicit override. The shipped Claude Code host also does not
+consume that experimental method, so the adapter is opt-in and should be
+enabled only for a host that is known to consume it. Instead, SAGE installs a
+`Stop` command hook for Claude Code and Codex that reads the signed, lease-free
+`/v1/messages/wake-state` snapshot. The check is on by default when
+`SAGE_PROVIDER=claude-code` or `SAGE_PROVIDER=codex`; legacy installed Stop
+hooks with no provider label also default on. Set `SAGE_STOP_NUDGE=0` (or another accepted false
+spelling) to opt out (`stopNudgeEnabled`, `cmd/sage-gui/hook.go:435`).
+
+When the durable cursor has advanced and unfinished work exists, the hook emits
+Codex's documented top-level `{"decision":"block","reason":"..."}` result.
+The host converts that result into one continuation prompt for the same thread, so
+the agent calls the canonical inbox operation before the turn becomes idle
+(`runHookStopCheck`, `cmd/sage-gui/hook.go:451`). The check never acquires the
+SSE lease, never sees message content or sender, refuses `SubagentStop`, blocks
+at most once per newer cursor and session, and fails open on every error.
+
+This is a turn-boundary continuation, not an out-of-band resurrection API. A
+message committed after a thread is already fully idle waits durably for
+the next user turn, scheduled continuation, or session start; current Codex MCP
+configuration exposes no supported server-notification method that can inject a
+new turn into an already-idle local thread.

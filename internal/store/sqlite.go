@@ -2828,7 +2828,7 @@ func (s *SQLiteStore) GetPendingByDomain(ctx context.Context, domainTag string, 
 		`SELECT memory_id, submitting_agent, content, content_hash,
 			memory_type, domain_tag, confidence_score, status, created_at
 		FROM memories WHERE status = 'proposed' AND domain_tag LIKE ?
-		ORDER BY created_at LIMIT ?`, domainTag, limit)
+		ORDER BY created_at ASC, memory_id ASC LIMIT ?`, domainTag, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get pending: %w", err)
 	}

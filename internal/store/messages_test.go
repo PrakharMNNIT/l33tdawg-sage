@@ -934,3 +934,79 @@ func TestCanonicalMigrationRescuesRowsWrittenWithNanosecondPrecision(t *testing.
 		"a real v11.17.8 row written at RFC3339Nano precision must still be rescued")
 	require.Greater(t, got, stamped, "rescue must extend, not shorten")
 }
+
+// AdmitLocalMessage must insert the row and advance the wake sequence in ONE
+// transaction. The dangerous direction is NOT a failed insert — it is an insert
+// that SUCCEEDS while the wake allocation fails, because a bare
+// InsertPipeline-then-bump would leave durable work with no generation, which
+// is the silent state this release exists to remove.
+//
+// An earlier version of this test aborted BEFORE INSERT, so the wake update was
+// never attempted and it only proved the easy half. This aborts the wake update
+// itself, with the row insert already succeeded inside the transaction.
+func TestAdmitLocalMessageRollsBackTheRowWhenWakeAllocationFails(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+
+	_, _, err := s.SendLocalMessage(ctx, "seed", testLocalMessage("msg-seed", "alice", "bob", "seed"))
+	require.NoError(t, err)
+	before, err := s.GetMessageWakeState(ctx, "bob")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), before.Seq, "bob must already have a generation so the UPDATE arm is taken")
+
+	// Abort the wake allocation, NOT the insert. By the time this fires the
+	// pipeline row is already written inside the transaction.
+	_, err = s.writeExecContext(ctx,
+		`CREATE TRIGGER fail_wake_alloc BEFORE UPDATE ON message_wake_state
+		 WHEN NEW.recipient_agent_id='bob'
+		 BEGIN SELECT RAISE(ABORT,'forced wake failure'); END`)
+	require.NoError(t, err)
+
+	admitted, err := s.AdmitLocalMessage(ctx, testLocalMessage("msg-orphan", "alice", "bob", "must not survive"))
+	require.Error(t, err, "a failed wake allocation must fail the admission")
+	require.Nil(t, admitted)
+
+	after, err := s.GetMessageWakeState(ctx, "bob")
+	require.NoError(t, err)
+	require.Equal(t, before.Seq, after.Seq, "the sequence must not advance")
+
+	orphan, err := s.GetPipeline(ctx, "msg-orphan")
+	require.Error(t, err, "the row must NOT survive a failed wake allocation")
+	require.Nil(t, orphan, "durable work with no generation is the exact silent state being removed")
+}
+
+// The happy path: one admission, one generation, reported back to the caller so
+// the handler can publish exactly what was durably allocated.
+func TestAdmitLocalMessageAdvancesAndReportsTheSequence(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+
+	first, err := s.AdmitLocalMessage(ctx, testLocalMessage("msg-a1", "alice", "bob", "work"))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), first.WakeSeq)
+
+	second, err := s.AdmitLocalMessage(ctx, testLocalMessage("msg-a2", "alice", "bob", "more"))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), second.WakeSeq, "each admission allocates the next generation")
+
+	state, err := s.GetMessageWakeState(ctx, "bob")
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), state.Seq)
+}
+
+// Federated and provider-addressed rows have no exact local recipient, so they
+// must be refused rather than silently allocating someone a sequence.
+func TestAdmitLocalMessageRefusesNonExactLocalRows(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+
+	provider := testLocalMessage("msg-p", "alice", "bob", "work")
+	provider.ToProvider = "some-provider"
+	_, err := s.AdmitLocalMessage(ctx, provider)
+	require.Error(t, err)
+
+	federated := testLocalMessage("msg-f", "alice", "bob", "work")
+	federated.DestinationChainID = "remote-chain"
+	_, err = s.AdmitLocalMessage(ctx, federated)
+	require.Error(t, err)
+}

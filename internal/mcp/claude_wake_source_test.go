@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -112,6 +114,107 @@ func TestClaudeWakeSourceReportsRejectedSubscribe(t *testing.T) {
 			require.Nil(t, subscription)
 		})
 	}
+}
+
+// Default-on is safe only if a second runtime that loses the exact-agent wake
+// lease remains alive and acquires it after the holder disconnects. This pins
+// the complete REST-source + channel retry path rather than merely asserting
+// that Subscribe returns an error for 409.
+func TestClaudeChannelRetriesLeaseConflictAndAcquiresAfterRelease(t *testing.T) {
+	var mu sync.Mutex
+	var activeConsumer string
+	var conflictCount int
+	var firstID, secondID string
+	firstAcquired := make(chan struct{})
+	secondAcquired := make(chan struct{})
+	var firstOnce, secondOnce sync.Once
+
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		consumerID := r.URL.Query().Get("consumer_id")
+		mu.Lock()
+		if activeConsumer != "" && activeConsumer != consumerID {
+			conflictCount++
+			mu.Unlock()
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"title":"wake consumer already active"}`)
+			return
+		}
+		activeConsumer = consumerID
+		mu.Unlock()
+
+		switch consumerID {
+		case firstID:
+			firstOnce.Do(func() { close(firstAcquired) })
+		case secondID:
+			secondOnce.Do(func() { close(secondAcquired) })
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		if consumerID == secondID {
+			_, _ = fmt.Fprint(w, "event: wake\ndata: {\"version\":1,\"seq\":7,\"pending\":true}\n\n")
+			w.(http.Flusher).Flush()
+		}
+		<-r.Context().Done()
+
+		mu.Lock()
+		if activeConsumer == consumerID {
+			activeConsumer = ""
+		}
+		mu.Unlock()
+	}))
+	t.Cleanup(node.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	server := NewServer(node.URL, privateKey)
+	first, err := newRESTClaudeWakeSource(server)
+	require.NoError(t, err)
+	second, err := newRESTClaudeWakeSource(server)
+	require.NoError(t, err)
+	firstID, secondID = first.consumerID, second.consumerID
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstOut := newStdioOutbound(firstCtx, io.Discard)
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		runClaudeChannel(firstCtx, firstOut, testClaudeConfig(first))
+	}()
+	select {
+	case <-firstAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first runtime did not acquire the wake lease")
+	}
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	var secondSink lockedBuffer
+	secondOut := newStdioOutbound(secondCtx, &secondSink)
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		runClaudeChannel(secondCtx, secondOut, testClaudeConfig(second))
+	}()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return conflictCount > 0
+	}, 2*time.Second, time.Millisecond, "second runtime never observed the 409 lease conflict")
+
+	cancelFirst()
+	<-firstDone
+	firstOut.Close()
+	select {
+	case <-secondAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rejected runtime did not acquire the lease after release")
+	}
+	waitFor(t, func() bool { return len(secondSink.lines()) == 1 })
+	require.Equal(t, []string{"7"}, wakeSeqs(t, secondSink.lines()))
+
+	cancelSecond()
+	<-secondDone
+	secondOut.Close()
 }
 
 func TestClaudeWakeSourceTranslatesEventsAndIgnoresHeartbeats(t *testing.T) {

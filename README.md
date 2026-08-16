@@ -51,6 +51,35 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.15
+
+**Every unfinished exact-recipient local canonical message now has a durable
+wake generation, including upgrade-era claimed-only work and sends through the
+deprecated pipe route.** Startup backfill covers both pending and claimed rows, so a recipient
+whose only live work was already claimed cannot reopen as the silent
+`{seq:0,pending:true}` state. Keyed exact-local pipe sends use the canonical
+idempotent admission path; unkeyed sends insert the row and advance the same
+recipient sequence atomically. Publication happens only after commit, exact
+replays do not republish, and an incapable backend fails before insertion rather
+than creating durable work that wake consumers cannot observe as new.
+
+The experimental Claude notification adapter is explicitly opt-in again. The
+shipped Claude Code host does not consume that custom notification, while the
+adapter would otherwise acquire the one exact-agent wake lease and exclude a
+useful long-running consumer. `SAGE_CLAUDE_CHANNEL=true` still enables it for an
+operator who intentionally has a compatible host.
+
+Pending-memory presentation is deterministic even when creation timestamps tie:
+SQLite and PostgreSQL both use `memory_id` as the final ordering key. The
+documentation citation guard now parses newline-separated and hyphenated paths,
+pins every concrete declaration/lead/interior anchor, repairs only explicitly
+accepted declaration anchors, refuses semantic locations it cannot reconstruct,
+and inventories the remaining legacy skipped and bare references. This patch
+introduces no new consensus application version or state migration. The ceiling
+remains app-v26; **v11.18.15 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.15`. SDK 11.18.15.
+
 ## What's New in v11.18.14
 
 **Durable agent messages now stay visible until the work is actually
@@ -1862,7 +1891,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.14`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.15`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

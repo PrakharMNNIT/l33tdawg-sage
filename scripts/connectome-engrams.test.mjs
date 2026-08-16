@@ -117,6 +117,20 @@ test('bloom generations reject an older response for the same neuron', () => {
     'background exit, mode change, or disposal must invalidate the in-flight bloom');
 });
 
+test('bloom generations fence cross-agent and access-invalidated responses', () => {
+  const loads = createEngramBloomCoordinator();
+  const alice = loads.begin('alice');
+  const bob = loads.begin('bob');
+  assert.equal(loads.isCurrent(alice, 'alice'), false,
+    'selecting another agent must reject the older agent response');
+  assert.equal(loads.isCurrent(bob, 'alice'), false,
+    'a current generation is still bound to its raw agent identity');
+  assert.equal(loads.isCurrent(bob, 'bob'), true);
+  loads.invalidate();
+  assert.equal(loads.isCurrent(bob, 'bob'), false,
+    'an access invalidation must reject a response even when agent identity did not change');
+});
+
 // --- scoped mri-brain wiring ---
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 function functionBody(src, name) {
@@ -140,7 +154,7 @@ test('bloomEngrams fetches one agent from /memory/engrams and maps the result', 
 
 test('renderer applies the behavior-tested bloom composition', () => {
   const body = functionBody(mriSource, 'bloomEngrams');
-  assert.match(body, /applyEngramBloom\(Graph\.graphData\(\), engrams, n, focusSet, placeNear\)/,
+  assert.match(body, /applyEngramBloom\(Graph\.graphData\(\), engrams, current, focusSet, placeNear\)/,
     'renderer must use the pure composition whose object endpoints and collisions are tested');
 });
 
@@ -160,16 +174,39 @@ test('clearBloom applies stripBloom — a no-op clear must fail this', () => {
     'clearBloom must actually strip the bloom via stripBloom, not be a no-op');
 });
 
-test('bloomEngrams clears the prior lobe BEFORE fetching — no stale bloom on failure or supersede', () => {
+test('bloomEngrams clears a fresh selection but preserves a live-refresh snapshot until replacement', () => {
   const body = functionBody(mriSource, 'bloomEngrams');
   assert.match(body, /if \(disposed \|\| !Graph[\s\S]{0,60}mode !== 'connectome'\) return;/,
     'a disposed/mode guard must gate entry so a post-cleanup deep-link cannot touch Graph');
-  const clearIdx = body.indexOf('clearBloom()');
+  const clearIdx = body.indexOf('if (!preserve) clearBloom()');
   const fetchIdx = body.indexOf('await fetch');
   assert.ok(clearIdx !== -1 && fetchIdx !== -1 && clearIdx < fetchIdx,
-    'clearBloom() must run before the fetch, so a failed/superseded request leaves nothing stranded');
+    'fresh selections clear before fetch while same-agent live refreshes retain the last verified bloom');
+  assert.match(body, /selectedMemoryState = preserve \? \{ \.\.\.prior, status:'updating' \} : \{ status:'loading' \}/,
+    'live refresh must be explicit updating state rather than pretending cached cards are current');
+  assert.match(body, /selectedMemoryState=preserve\?\{\.\.\.prior,status:'stale'\}:\{status:'error'\}/,
+    'a failed refresh must keep and label the last verified result');
   assert.match(body, /!bloomLoads\.isCurrent\(bloomRequest, agentID\)\) return/,
     'a superseded response, including the same neuron, must be generation-fenced');
+});
+
+test('stale bloom responses are rejected before mapping, rendering, or replacing the verified bloom', () => {
+  const body = functionBody(mriSource, 'bloomEngrams');
+  const fence = body.indexOf('!bloomLoads.isCurrent(bloomRequest, agentID)) return');
+  const map = body.indexOf('const engrams = mapEngrams(payload)');
+  const ready = body.indexOf("selectedMemoryState = { status:'ready'");
+  const replacementClear = body.indexOf('clearBloom()', map);
+  const apply = body.indexOf('applyEngramBloom(', map);
+  assert.ok(fence !== -1 && map !== -1 && fence < map,
+    'moving the generation fence after payload projection must fail');
+  assert.ok(fence < ready && fence < replacementClear && fence < apply,
+    'a stale payload must not change cards, clear the verified bloom, or compose graph nodes');
+  assert.match(body,
+    /const current = selectedAgentNode && selectedAgentNode\.agent_id===agentID \? selectedAgentNode : n;/,
+    'an accepted refresh must bind to the newest graph snapshot rather than its pre-reload node object');
+  assert.match(body,
+    /focusId = current\.id; focusSet = composed\.focusSet;[\s\S]*setFocusMarkerNode\(current\)/,
+    'every accepted replacement must move both graph focus and marker to the rebound node');
 });
 
 test('every renderer focus-exit path strips bridges and invalidates in-flight blooms', () => {

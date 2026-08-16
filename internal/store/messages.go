@@ -152,7 +152,7 @@ func (s *SQLiteStore) migrateMessages(ctx context.Context) error {
 	if _, err := s.writeExecContext(ctx, `INSERT OR IGNORE INTO message_wake_state(recipient_agent_id,seq)
 		SELECT DISTINCT to_agent,1 FROM pipeline_messages
 		WHERE source_chain_id='' AND destination_chain_id='' AND to_provider=''
-		  AND to_agent<>'' AND status='pending' AND expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')`); err != nil {
+		  AND to_agent<>'' AND status IN ('pending','claimed') AND expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')`); err != nil {
 		return fmt.Errorf("backfill canonical message wake state: %w", err)
 	}
 	return nil
@@ -331,6 +331,53 @@ func (s *SQLiteStore) SendLocalMessage(ctx context.Context, idempotencyKey strin
 		return nil
 	})
 	return result, replayed, err
+}
+
+// AdmitLocalMessage inserts one exact-local pipeline row and advances that
+// recipient's durable wake sequence in the SAME transaction, without any
+// idempotency mapping. It is the unkeyed sibling of SendLocalMessage.
+//
+// It exists because the deprecated pipe route admits exact-local canonical rows
+// through a bare InsertPipeline, which allocates no wake generation. A row
+// admitted that way is real work no wake consumer can observe as new: the
+// wake sequence never moves, so a consumer comparing "is this newer than what I
+// last saw" answers no, forever. Adding a separate seq bump after the insert
+// would not fix it — a crash between the two leaves durable work with no
+// generation, which is exactly the silent state this release exists to remove.
+// Hence one transaction, or neither.
+//
+// The caller must not pass an idempotency key here; keyed sends belong on
+// SendLocalMessage so replay returns the original row and advances once.
+func (s *SQLiteStore) AdmitLocalMessage(ctx context.Context, msg *PipelineMessage) (*PipelineMessage, error) {
+	if msg == nil || strings.TrimSpace(msg.FromAgent) == "" || strings.TrimSpace(msg.ToAgent) == "" ||
+		msg.SourceChainID != "" || msg.DestinationChainID != "" || msg.ToProvider != "" || msg.Status != "pending" {
+		return nil, fmt.Errorf("exact-local admission requires an exact local sender and recipient")
+	}
+	var result *PipelineMessage
+	err := s.RunInTx(ctx, func(txStore OffchainStore) error {
+		tx := txStore.(*SQLiteStore)
+		if insertErr := tx.InsertPipeline(ctx, msg); insertErr != nil {
+			return insertErr
+		}
+		var wakeSeq int64
+		if writeErr := tx.conn.QueryRowContext(ctx,
+			`INSERT INTO message_wake_state(recipient_agent_id,seq) VALUES(?,1)
+			 ON CONFLICT(recipient_agent_id) DO UPDATE SET seq=message_wake_state.seq+1
+			 RETURNING seq`, msg.ToAgent).Scan(&wakeSeq); writeErr != nil {
+			return writeErr
+		}
+		if wakeSeq < 1 {
+			return errors.New("exact-local wake sequence did not advance")
+		}
+		admitted := *msg
+		admitted.WakeSeq = uint64(wakeSeq)
+		result = &admitted
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // GetMessageWakeState returns only the authenticated caller's exact durable

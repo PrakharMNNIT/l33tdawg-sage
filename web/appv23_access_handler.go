@@ -1353,6 +1353,10 @@ func (h *DashboardHandler) handleAppV23AccessGroupPut() http.HandlerFunc {
 				return
 			}
 		}
+		// Access groups can change the caller-visible connectome projection. The
+		// dashboard stream is global, so publish only an invalidation tick after
+		// the commit is proven (including reconciliation), never group details.
+		h.emitAccessInvalidation()
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": true, "tx_type": ptx.Type, "tx_hash": hash, "height": height,
 			"reconciled": reconciled,
@@ -1408,6 +1412,9 @@ func (h *DashboardHandler) handleAppV23AccessGroupDelete() http.HandlerFunc {
 				return
 			}
 		}
+		// See handleAppV23AccessGroupPut: the authorized snapshot endpoint, not
+		// this identity-free stream, is the enforcement and data boundary.
+		h.emitAccessInvalidation()
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"ok": true, "tx_type": ptx.Type, "tx_hash": hash, "height": height,
 			"reconciled": reconciled,

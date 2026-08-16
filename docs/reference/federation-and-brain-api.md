@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.18.14 code (2026-08-16). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
+<!-- Verified against SAGE v11.18.15 code (2026-08-16). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
 
 # SAGE Federation and Brain HTTP API Reference (v11)
 
@@ -224,7 +224,7 @@ Every established-peer request, including `query`, `write`, and `sync`, is authe
 ### `GET /fed/v1/status`
 
 Authenticated reachability / identity and permission preflight (`handleStatus`,
-`internal/federation/server.go:285-319`). Distinguishes "peer unreachable" from
+`internal/federation/server.go:457-578`). Distinguishes "peer unreachable" from
 "peer misconfigured" and carries the caller-bound current grant.
 
 **Response** (`StatusResponse`, `internal/federation/types.go:118-166`):
@@ -318,7 +318,7 @@ The whole inner proof plus intent/payload/result use the local vault-backed
 storage path. Foreign completion creates no memory journal, and the result is
 atomically paired with its durable return outbox event before the peer is
 acknowledged (`internal/store/pipeline_transport.go:126-189`, `:256-326`;
-`handlePipeResult`, `api/rest/pipe_handler.go:1445-1621`).
+`handlePipeResult`, `api/rest/pipe_handler.go:1501-1677`).
 
 ### `POST /fed/v1/query/available`
 
@@ -401,7 +401,7 @@ or dispatch credentials to `/v1/memory/submit`
 The `write-v1` constant and `RemoteWriteRequest` envelope remain reserved for
 mixed-version compatibility, but current SAGE never advertises the capability. The
 outbound `WritePeer` method returns the typed unavailable error before agreement
-lookup or dialing (`internal/federation/remote_write.go:9-45`), and status adds
+lookup or dialing (`internal/federation/remote_write.go:44-50`), and status adds
 only capabilities actually supported by the running node
 (`internal/federation/server.go:282-315`).
 
@@ -712,7 +712,7 @@ dashboard-authenticated agents cannot inspect ceremonies or change peer policy
 (`web/federation_join.go:71-102`, `1021-1037`). Everything remains
 off-consensus except the ordinary transactions explicitly described here.
 Every route 501s when the transport is not wired (`fedReady`,
-`federation_join.go:62-69`).
+`federation_join.go:98-107`).
 
 | Method + path | Handler | Purpose |
 |---|---|---|
@@ -879,8 +879,9 @@ connection not paused ∩ source PeerRBAC Copy ∩ source Publish ∩ receiver S
 Receiver admission independently rechecks `remote Publish ∩ local Subscribe`.
 An absent peer-RBAC policy and a configured-empty policy both deny v3 Copy; v3
 never falls back to tx-33. These intersections and the fail-closed identity/CA
-binding are applied by `pairwiseEgressPolicy` and `pairwiseIngressPolicy`
-(`internal/federation/sync_outbox.go:351-428`).
+binding are applied by `pairwiseEgressPolicy`
+(`internal/federation/sync_outbox.go:571-622`) and `pairwiseIngressPolicy`
+(`internal/federation/sync_outbox.go:628-662`).
 
 Both original host and original guest may publish their own Copy offer and
 subscription after JOIN. They cannot edit the other node's choice. Lanes are

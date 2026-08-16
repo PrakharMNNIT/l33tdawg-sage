@@ -140,6 +140,12 @@ func (s *Server) handleAccessGrant(w http.ResponseWriter, r *http.Request) {
 		s.writeConsensusTxError(w, stage, "access grant", err)
 		return
 	}
+	// The dashboard stream has no subscriber identity, so this is deliberately
+	// a payload-free cache-invalidation tick. Each client must re-fetch its
+	// caller-filtered connectome projection after the grant is committed.
+	if s.OnEvent != nil {
+		s.OnEvent("access", "", "", "", nil)
+	}
 
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"status":  "granted",
@@ -188,6 +194,11 @@ func (s *Server) handleAccessRevoke(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeConsensusTxError(w, stage, "access revoke", err)
 		return
+	}
+	// See handleAccessGrant: authorization details must never enter the global
+	// dashboard stream. The empty tick only invalidates caller-scoped caches.
+	if s.OnEvent != nil {
+		s.OnEvent("access", "", "", "", nil)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{

@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -125,7 +126,8 @@ const sageStopScript = `#!/bin/bash
 #
 # An MCP server cannot wake a session that has already stopped, so the check is
 # the inverse: decline the stop once, so the agent handles the work in-session.
-# Opt-in via SAGE_STOP_NUDGE, and silent unless it decides to decline.
+# Default-on for Claude Code and Codex, opt-in for other hosts, and silent unless it decides
+# to decline. SAGE_STOP_NUDGE=0 explicitly disables it.
 #
 # Fail-open is deliberate and belt-and-braces: the subcommand allows the stop on
 # every internal error, and the || true means even a crashed or missing binary
@@ -174,6 +176,7 @@ func runMCP() error {
 	// session is always resolved to a project/workspace identity.
 	keyPath, _ := configuredMCPIdentityEnv()
 
+	provider := strings.TrimSpace(os.Getenv("SAGE_PROVIDER"))
 	projectName := strings.TrimSpace(os.Getenv("SAGE_PROJECT"))
 
 	if keyPath != "" {
@@ -188,10 +191,16 @@ func runMCP() error {
 			// failed workspace lookup into node-operator authority.
 			return fmt.Errorf("resolve project directory for unpinned MCP identity: %w", err)
 		}
-		projectName = filepath.Base(projectDir)
-		keyPath = implicitMCPIdentityPath(home, projectDir, os.Getenv("SAGE_PROVIDER"), os.Getenv("SAGE_PROJECT"))
+		keyPath, provider, projectName, err = resolveImplicitWorkspaceIdentity(home, projectDir, provider, projectName)
+		if err != nil {
+			return fmt.Errorf("resolve canonical workspace identity: %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "INFO: Identity resolved via per-project agents/: %s\n", keyPath)
 	}
+	if provider != "" {
+		_ = os.Setenv("SAGE_PROVIDER", provider)
+	}
+	keyPath = filepath.Clean(expandTilde(keyPath))
 
 	// Ensure parent directory exists (critical for SAGE_IDENTITY_PATH auto-generation).
 	// keyPath is already sanitized via filepath.Clean above.
@@ -219,13 +228,13 @@ func runMCP() error {
 	// Self-heal only after resolving the active identity: generated lifecycle
 	// hooks must sign as the same agent as this MCP session.
 	if projectDir, cwdErr := os.Getwd(); cwdErr == nil {
-		selfHealProject(projectDir, home, os.Getenv("SAGE_PROVIDER"), keyPath)
+		selfHealProject(projectDir, home, provider, keyPath)
 	}
-	// Claude Code is the shipped consumer of the payload-free wake extension,
-	// so its project-scoped MCP sessions arm the channel by default. A failure
-	// to arm remains deliberately non-fatal: the wake channel accelerates
-	// polling, and a host that cannot open the stream must still get an ordinary
-	// working MCP session rather than no session at all.
+	// The experimental custom-notification adapter is explicit opt-in for hosts
+	// known to consume it. A competing exact-agent consumer is rejected by the node, but the adapter
+	// keeps retrying with bounded backoff and acquires the lease after the holder
+	// disconnects. A failure to arm remains deliberately non-fatal: ordinary MCP
+	// requests continue while the wake accelerator reconnects in the background.
 	if claudeChannelEnabled() {
 		if err := server.EnableRESTClaudeChannel(); err != nil {
 			fmt.Fprintf(os.Stderr, "SAGE MCP: claude channel disabled: %v\n", err)
@@ -234,14 +243,99 @@ func runMCP() error {
 	return server.Run(context.Background())
 }
 
-// claudeChannelEnabled arms the wake extension by default only for the shipped
-// Claude Code consumer. Other MCP hosts remain off unless explicitly enabled,
-// and an operator can explicitly disable a Claude Code session. An unparseable
-// override fails closed — envBool warns rather than guessing.
+// canonicalWorkspaceRoot makes a verified Git repository, rather than a
+// transient checkout path, the implicit identity boundary. Linked worktrees
+// share the primary checkout's common .git directory and therefore its signer.
+// Non-Git projects retain their ordinary directory boundary. Recognised managed
+// scratch paths fail closed when Git cannot prove which repository owns them.
+func canonicalWorkspaceRoot(projectDir string) (string, error) {
+	return canonicalWorkspaceRootWithProbe(projectDir, func(ctx context.Context, clean string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, "git", "-C", clean, "rev-parse", "--show-toplevel", "--git-common-dir") //nolint:gosec // fixed executable/arguments; local workspace path only
+		return cmd.Output()
+	})
+}
+
+func canonicalWorkspaceRootWithProbe(projectDir string, probe func(context.Context, string) ([]byte, error)) (string, error) {
+	clean, err := filepath.Abs(projectDir)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, gitErr := probe(ctx, clean)
+	if gitErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("resolve git workspace: %w", ctxErr)
+		}
+		lower := strings.ToLower(filepath.ToSlash(clean))
+		if strings.Contains(lower, "/.claude/worktrees/") || strings.Contains(strings.ToLower(filepath.Base(clean)), "scratchpad") {
+			return "", fmt.Errorf("managed scratch workspace has no verifiable Git common root; set SAGE_IDENTITY_PATH for explicit isolation")
+		}
+		return filepath.Clean(clean), nil
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		return "", fmt.Errorf("unexpected git workspace response")
+	}
+	top := filepath.Clean(lines[0])
+	common := filepath.Clean(lines[1])
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(top, common)
+	}
+	common, err = filepath.Abs(common)
+	if err != nil || filepath.Base(common) != ".git" {
+		return "", fmt.Errorf("git common directory is not a repository root")
+	}
+	root := filepath.Dir(common)
+	if root == "." || root == string(filepath.Separator) {
+		return "", fmt.Errorf("refusing broad Git identity root")
+	}
+	return filepath.Clean(root), nil
+}
+
+// primaryWorkspaceMCPEnv reads only the SAGE env block from the canonical
+// repository's project config. This preserves an established signer for linked
+// worktrees without globally pinning unrelated repositories together.
+func primaryWorkspaceMCPEnv(root string) (map[string]string, bool, error) {
+	path := filepath.Join(root, ".mcp.json")
+	raw, err := readBoundedConfig(path, 1<<20)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var config map[string]any
+	if err := json.Unmarshal(raw, &config); err != nil {
+		return nil, false, err
+	}
+	servers, _ := config["mcpServers"].(map[string]any)
+	sage, _ := servers["sage"].(map[string]any)
+	env, _ := sage["env"].(map[string]any)
+	if env == nil {
+		return nil, false, nil
+	}
+	result := map[string]string{}
+	for _, key := range []string{"SAGE_PROVIDER", "SAGE_PROJECT", "SAGE_IDENTITY_PATH"} {
+		if value, ok := env[key].(string); ok {
+			result[key] = value
+		}
+	}
+	return result, true, nil
+}
+
+// claudeChannelEnabled is an explicit adapter opt-in. The shipped Claude Code
+// host does not consume notifications/claude/channel, while Codex must never
+// acquire the adapter's exclusive wake lease because it cannot consume that
+// method. An unparseable override fails closed — envBool warns rather than
+// guessing.
 func claudeChannelEnabled() bool {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("SAGE_PROVIDER")), "codex") {
+		return false
+	}
 	raw := os.Getenv("SAGE_CLAUDE_CHANNEL")
 	if strings.TrimSpace(raw) == "" {
-		return strings.EqualFold(strings.TrimSpace(os.Getenv("SAGE_PROVIDER")), "claude-code")
+		return false
 	}
 	enabled, ok := envBool("SAGE_CLAUDE_CHANNEL", raw)
 	return ok && enabled
@@ -259,6 +353,40 @@ func configuredMCPIdentityEnv() (string, bool) {
 		return keyPath, false
 	}
 	return os.Getenv("SAGE_AGENT_KEY"), false
+}
+
+// resolveImplicitWorkspaceIdentity is the single identity-resolution path used
+// by both MCP and lifecycle hooks. Keeping this shared is load-bearing: a hook
+// signed by a different scratchpad key would either lose access or register a
+// duplicate agent even when MCP itself had correctly inherited the root signer.
+func resolveImplicitWorkspaceIdentity(home, projectDir, provider, project string) (string, string, string, error) {
+	root, err := canonicalWorkspaceRoot(projectDir)
+	if err != nil {
+		return "", provider, project, err
+	}
+	if primary, found, configErr := primaryWorkspaceMCPEnv(root); configErr != nil {
+		return "", provider, project, configErr
+	} else if found {
+		primaryProvider := strings.TrimSpace(primary["SAGE_PROVIDER"])
+		if provider == "" {
+			provider = primaryProvider
+		}
+		// Provider separation remains absolute: a root's Claude signer must
+		// never collapse a Codex session onto the same key.
+		if strings.EqualFold(provider, primaryProvider) {
+			if key := strings.TrimSpace(primary["SAGE_IDENTITY_PATH"]); key != "" {
+				if project == "" {
+					project = strings.TrimSpace(primary["SAGE_PROJECT"])
+				}
+				return filepath.Clean(expandTilde(key)), provider, project, nil
+			}
+		}
+	}
+	configuredProject := project
+	if project == "" {
+		project = filepath.Base(root)
+	}
+	return implicitMCPIdentityPath(home, root, provider, configuredProject), provider, project, nil
 }
 
 // implicitMCPIdentityPath resolves the no-explicit-key path used by a shared
@@ -797,7 +925,8 @@ func installClaudeMD(projectDir string) error {
 // memories, UserPromptSubmit nudges per turn (replacing the noisier
 // PostToolUse on every Edit/Write/Bash), PreCompact crystallises before
 // detail is lost, SessionEnd writes a lifecycle observation, Stop runs the
-// opt-in end-of-turn work check (SAGE_STOP_NUDGE, default off), and
+// end-of-turn work check (default on for Claude Code and Codex;
+// SAGE_STOP_NUDGE overrides), and
 // SubagentStop stays silent because a subagent finishing does not mean the
 // owning host session is idle.
 //
@@ -842,7 +971,7 @@ func sageHooksConfig(hookDirExpr string) map[string]any {
 		"UserPromptSubmit": []any{
 			map[string]any{"hooks": userPrompt},
 		},
-		// Stop: opt-in end-of-turn check for pending unclaimed work.
+		// Stop: end-of-turn check for newer durable work (default on for Codex).
 		// SubagentStop: shares the script, which refuses any non-Stop event.
 		"Stop": []any{
 			map[string]any{"hooks": stop},

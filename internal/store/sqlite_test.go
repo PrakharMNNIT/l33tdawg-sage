@@ -2094,3 +2094,40 @@ func TestGetDomainLastActivity(t *testing.T) {
 	assert.True(t, dl["busy-domain"] > dl["quiet-domain"], "busy domain must sort newer: %v", dl)
 	assert.Contains(t, dl["busy-domain"], "2026-07-02", "MAX(created_at) per domain")
 }
+
+// TestGetPendingByDomainTotallyOrdered pins the deterministic order of the pending-by-domain
+// read: created_at alone is not a total order (proposed memories minted in the same block/second
+// tie), so without the memory_id tiebreak the order is arbitrary and diverges across runs and
+// backends. This matches the order its paginated sibling GetPendingByDomainPage already uses.
+// Removing the tiebreak fails this.
+func TestGetPendingByDomainTotallyOrdered(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	at := time.Unix(1_700_000_000, 0).UTC()
+	// 10 proposed memories in one domain sharing ONE timestamp, inserted in REVERSE id order,
+	// so only the memory_id tiebreak yields a stable order.
+	for i := 9; i >= 0; i-- {
+		rec := testMemory(fmt.Sprintf("m%02d", i), "agent1", fmt.Sprintf("content %d", i), "general")
+		rec.CreatedAt = at
+		require.NoError(t, s.InsertMemory(ctx, rec))
+	}
+
+	got, err := s.GetPendingByDomain(ctx, "general", 100)
+	require.NoError(t, err)
+	require.Len(t, got, 10)
+	for i, r := range got {
+		require.Equal(t, fmt.Sprintf("m%02d", i), r.MemoryID,
+			"same-timestamp proposed memories must be ordered by the memory_id tiebreak, not arbitrary order")
+	}
+
+	names := func(rs []*memory.MemoryRecord) []string {
+		out := make([]string, len(rs))
+		for i, r := range rs {
+			out[i] = r.MemoryID
+		}
+		return out
+	}
+	again, err := s.GetPendingByDomain(ctx, "general", 100)
+	require.NoError(t, err)
+	require.Equal(t, names(got), names(again), "the pending-by-domain read must be a stable total order")
+}

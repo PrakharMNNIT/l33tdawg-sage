@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -51,10 +52,17 @@ func TestInstanceLockInheritedHandoffAndForgedFD(t *testing.T) {
 		home := t.TempDir()
 		other, err := os.OpenFile(filepath.Join(t.TempDir(), "other.lock"), os.O_CREATE|os.O_RDWR, 0600)
 		require.NoError(t, err)
-		defer other.Close()
 		t.Setenv(instanceLockFDEnv, strconv.FormatUint(uint64(other.Fd()), 10))
 		lock, err := acquireInstanceLock(home)
 		require.Error(t, err)
 		require.Nil(t, lock)
+
+		// Rejecting a forged descriptor must not create an os.File wrapper whose
+		// finalizer can later close the caller-owned descriptor after FD reuse.
+		runtime.GC()
+		runtime.GC()
+		_, err = unix.FcntlInt(other.Fd(), unix.F_GETFD, 0)
+		require.NoError(t, err)
+		require.NoError(t, other.Close())
 	})
 }

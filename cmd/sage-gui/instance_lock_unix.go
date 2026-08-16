@@ -27,22 +27,20 @@ func acquireInstanceLock(sageHome string) (*instanceLock, error) {
 	if raw := os.Getenv(instanceLockFDEnv); raw != "" {
 		fd, err := strconv.Atoi(raw)
 		if err == nil && fd >= 3 {
-			f := os.NewFile(uintptr(fd), "sage-instance.lock")
-			if f != nil {
-				fdInfo, fdStatErr := f.Stat()
-				pathInfo, pathStatErr := os.Stat(path)
-				if fdStatErr == nil && pathStatErr == nil && fdInfo.Mode().IsRegular() && os.SameFile(fdInfo, pathInfo) {
-					if flockErr := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); flockErr != nil {
-						return nil, fmt.Errorf("inherited descriptor does not own the SAGE instance lock: %w", flockErr)
-					}
-					if _, flagErr := unix.FcntlInt(f.Fd(), unix.F_SETFD, unix.FD_CLOEXEC); flagErr != nil {
-						return nil, fmt.Errorf("protect inherited instance lock from child processes: %w", flagErr)
-					}
-					if unsetErr := os.Unsetenv(instanceLockFDEnv); unsetErr != nil {
-						return nil, fmt.Errorf("clear inherited instance lock environment: %w", unsetErr)
-					}
-					return &instanceLock{file: f}, nil
+			var fdStat, pathStat unix.Stat_t
+			fdStatErr := unix.Fstat(fd, &fdStat)
+			pathStatErr := unix.Stat(path, &pathStat)
+			if fdStatErr == nil && pathStatErr == nil && fdStat.Mode&unix.S_IFMT == unix.S_IFREG && fdStat.Dev == pathStat.Dev && fdStat.Ino == pathStat.Ino {
+				if flockErr := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); flockErr != nil {
+					return nil, fmt.Errorf("inherited descriptor does not own the SAGE instance lock: %w", flockErr)
 				}
+				if _, flagErr := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC); flagErr != nil {
+					return nil, fmt.Errorf("protect inherited instance lock from child processes: %w", flagErr)
+				}
+				if unsetErr := os.Unsetenv(instanceLockFDEnv); unsetErr != nil {
+					return nil, fmt.Errorf("clear inherited instance lock environment: %w", unsetErr)
+				}
+				return &instanceLock{file: os.NewFile(uintptr(fd), "sage-instance.lock")}, nil
 			}
 		}
 		return nil, fmt.Errorf("invalid inherited SAGE instance lock")

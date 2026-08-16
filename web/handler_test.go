@@ -2361,7 +2361,7 @@ func TestOverlayOnChainAgentPolicyReplacesStaleSQLiteRBAC(t *testing.T) {
 	assert.Equal(t, store.AgentCapabilityReadAllDomains, projected.Capabilities)
 }
 
-func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
+func TestHandleUpdateAgent_PublishesCommittedPermissionInvalidation(t *testing.T) {
 	cometMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		writeCommitOKAt(w, r, 77, "")
@@ -2392,16 +2392,7 @@ func TestHandleUpdateAgent_PublishesCommittedPermissionActivity(t *testing.T) {
 	r.ServeHTTP(resp, req)
 	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
 
-	select {
-	case event := <-events:
-		body := string(event)
-		assert.Contains(t, body, "event: access")
-		assert.Contains(t, body, `"action":"permissions_updated"`)
-		assert.Regexp(t, `"tx_hash":"[0-9A-F]{64}"`, body)
-		assert.Contains(t, body, `"height":77`)
-	case <-time.After(time.Second):
-		t.Fatal("committed permission update did not emit Chain Activity event")
-	}
+	requirePayloadFreeAccessInvalidation(t, events)
 }
 
 func TestHandleUpdateAgent_PermissionsRejectSignedAgentWithoutOverride(t *testing.T) {

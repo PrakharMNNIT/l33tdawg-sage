@@ -853,6 +853,10 @@ func TestAppV23GroupMutationReconcilesCommittedStateAfterMalformedRPCResponse(t 
 		))
 	}))
 	h := appV23AccessTestHandler(fixture, rpc.URL, nil)
+	h.SSE = NewSSEBroadcaster()
+	events := h.SSE.Subscribe()
+	require.NotNil(t, events)
+	defer h.SSE.Unsubscribe(events)
 	req := appV23AccessRequest(t, http.MethodPut, "/groups/research", "groupID", "research", map[string]any{
 		"name": "Research", "members": []string{fixture.agentID}, "expected_revision": 0,
 	})
@@ -866,6 +870,7 @@ func TestAppV23GroupMutationReconcilesCommittedStateAfterMalformedRPCResponse(t 
 	require.NoError(t, err)
 	require.NotNil(t, group)
 	assert.Equal(t, uint64(1), group.Revision)
+	requirePayloadFreeAccessInvalidation(t, events)
 }
 
 func TestAppV26GroupMutationReconcilesAuthorityAfterMalformedRPCResponse(t *testing.T) {

@@ -340,9 +340,12 @@ func loadHookSeed() ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("resolve project directory for hook identity: %w", err)
 		}
-		keyPath = implicitMCPIdentityPath(
-			SageHome(), cwd, os.Getenv("SAGE_PROVIDER"), os.Getenv("SAGE_PROJECT"),
+		keyPath, _, _, err = resolveImplicitWorkspaceIdentity(
+			SageHome(), cwd, strings.TrimSpace(os.Getenv("SAGE_PROVIDER")), strings.TrimSpace(os.Getenv("SAGE_PROJECT")),
 		)
+		if err != nil {
+			return nil, fmt.Errorf("resolve canonical hook workspace: %w", err)
+		}
 	}
 	keyPath = filepath.Clean(expandTilde(keyPath))
 	data, err := os.ReadFile(keyPath) //nolint:gosec // path from trusted identity resolution
@@ -428,12 +431,18 @@ type hookStopInput struct {
 	HookEventName  string `json:"hook_event_name"`
 }
 
-// stopNudgeEnabled keeps the check opt-in. It changes how every session ends,
-// so it stays off until an operator asks for it.
+// stopNudgeEnabled defaults on for the two shipped hosts whose documented Stop
+// hook turns decision:block into a continuation prompt for the same thread.
+// Other hosts remain opt-in, and every host can explicitly disable it. An
+// unparseable override fails closed rather than unexpectedly extending a turn.
 func stopNudgeEnabled() bool {
 	raw := os.Getenv("SAGE_STOP_NUDGE")
 	if strings.TrimSpace(raw) == "" {
-		return false
+		provider := strings.TrimSpace(os.Getenv("SAGE_PROVIDER"))
+		// Older Claude Code user-scope installs did not write SAGE_PROVIDER into
+		// their hook environment. The existence of the explicit SAGE Stop hook is
+		// the capability signal in that migration case, so unset defaults on too.
+		return provider == "" || strings.EqualFold(provider, "codex") || strings.EqualFold(provider, "claude-code")
 	}
 	enabled, ok := envBool("SAGE_STOP_NUDGE", raw)
 	return ok && enabled
@@ -503,7 +512,14 @@ func runHookStopCheck() error {
 		// to act on what it has already seen is its decision to make.
 		return nil
 	}
-	storeStopNudgeState(input.SessionID, wake.Seq)
+	// Never emit a block until the cursor that makes this a one-shot has been
+	// durably stored. Otherwise an unwritable/full SAGE_HOME turns every later
+	// Stop into the same block forever, contradicting both fail-open and
+	// "declining is final".
+	if err := storeStopNudgeState(input.SessionID, wake.Seq); err != nil {
+		fmt.Fprintf(os.Stderr, "SAGE stop-check: cannot persist wake cursor: %v\n", err)
+		return nil
+	}
 
 	// Stop uses the TOP-LEVEL decision model: {"decision":"block","reason":...}.
 	// It is NOT hookSpecificOutput — that shape belongs to PreToolUse and
@@ -565,41 +581,76 @@ func loadStopNudgeState(sessionID string) uint64 {
 	return seq
 }
 
-func storeStopNudgeState(sessionID string, seq uint64) {
+func storeStopNudgeState(sessionID string, seq uint64) error {
 	dir := filepath.Join(SageHome(), stopNudgeStateDir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return
+		return fmt.Errorf("create marker directory: %w", err)
 	}
 	// Each writer gets its own temporary file. A fixed path+".tmp" is still
 	// shared by concurrent hooks for the SAME session: one writer can truncate
 	// it while the other is writing, or rename it out from under the other.
 	// Unique siblings remove that last shared write surface.
 	path := stopNudgeMarkerPath(sessionID)
+	release, err := acquireStopNudgeMarkerLock(path)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// Same-session hooks can overlap. Never let a late older write lower the
+	// durable cursor and resurrect a generation the session already declined.
+	if existing := loadStopNudgeState(sessionID); existing >= seq {
+		return nil
+	}
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-") //nolint:gosec // private directory under SAGE_HOME
 	if err != nil {
-		return
+		return fmt.Errorf("create marker: %w", err)
 	}
 	tmpPath := tmp.Name()
 	defer func() { _ = os.Remove(tmpPath) }()
 	if _, err := tmp.WriteString(strconv.FormatUint(seq, 10) + "\n"); err != nil {
 		_ = tmp.Close()
-		return
+		return fmt.Errorf("write marker: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return
+		return fmt.Errorf("close marker: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		// Windows does not replace an existing destination. Removing it first
 		// can expose a brief missing-marker window, but that failure direction is
 		// one extra nudge, never a suppressed newer generation.
 		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-			return
+			return fmt.Errorf("replace marker: %w", removeErr)
 		}
 		if err := os.Rename(tmpPath, path); err != nil {
-			return
+			return fmt.Errorf("replace marker: %w", err)
 		}
 	}
 	pruneStopNudgeMarkers(dir)
+	return nil
+}
+
+// A per-session lock directory is a portable cross-process mutex: Mkdir is
+// atomic on the filesystems SAGE supports, unlike an in-process sync.Mutex.
+// A crashed hook can leave it behind, so old locks are recoverable; ordinary
+// contention is tightly bounded and fails open rather than wedging turn exit.
+func acquireStopNudgeMarkerLock(markerPath string) (func(), error) {
+	lockPath := markerPath + ".lock"
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for {
+		if err := os.Mkdir(lockPath, 0o700); err == nil {
+			return func() { _ = os.Remove(lockPath) }, nil
+		} else if !os.IsExist(err) {
+			return nil, fmt.Errorf("acquire marker lock: %w", err)
+		}
+		if info, err := os.Stat(lockPath); err == nil && time.Since(info.ModTime()) > 5*time.Second {
+			_ = os.Remove(lockPath)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("acquire marker lock: timed out")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func isStopNudgeMarkerName(name string) bool {

@@ -27,7 +27,7 @@ sudo mv sage-gui /usr/local/bin/  # or add to your PATH
 
 ```bash
 sage-gui version
-# sage-gui v11.18.14
+# sage-gui v11.18.15
 ```
 
 ---
@@ -145,7 +145,7 @@ The dashboard's **Connect an AI tool** flow (in the onboarding wizard, and on th
 
 ### 1. Same machine, one click
 
-For ChatGPT desktop **Codex mode**, Claude Code, Codex CLI, Cursor, Windsurf, or Claude Desktop running on the same computer as SAGE. Pick the tool, give a project folder if it is a per-project client (Claude Code, Codex CLI, Cursor), and click Connect. SAGE **writes the config file itself** and the agent registers its own on-chain identity on first connect. ChatGPT desktop Codex mode uses the app-wide `~/.codex/config.toml`, but the MCP process derives a separate stable Codex signing identity from each active workspace folder; an explicitly pinned custom `SAGE_IDENTITY_PATH` still wins. Work does not use this local stdio configuration. Restart the tool and it picks up its SAGE connection. You manage its identity and permissions afterward on the Agents page, which shows the exact signer ID each grant applies to.
+For ChatGPT desktop **Codex mode**, Claude Code, Codex CLI, Cursor, Windsurf, or Claude Desktop running on the same computer as SAGE. Pick the tool, give a project folder if it is a per-project client (Claude Code, Codex CLI, Cursor), and click Connect. SAGE **writes the config file itself** and the agent registers its own on-chain identity on first connect. Shared Claude Code/Codex registrations derive one provider-separated signer per canonical repository: linked worktrees and managed scratchpads reuse the primary repository signer instead of appearing as new agents, while Claude Code and Codex still do not share a key. An explicitly pinned worktree-local `SAGE_IDENTITY_PATH` opts into isolation and wins. Work does not use this local stdio configuration. Restart the tool and it picks up its SAGE connection. You manage its identity and permissions afterward on the Agents page, which shows the exact signer ID each grant applies to.
 
 ### 2. ChatGPT Work or remote MCP on another computer
 
@@ -197,7 +197,7 @@ sage-gui setup
 
 ### 3. Start using it
 
-Just chat normally. SAGE v11.18.14 advertises 33 MCP tools. The core workflow is:
+Just chat normally. SAGE v11.18.15 advertises 33 MCP tools. The core workflow is:
 
 | Tool | What it does |
 |------|-------------|

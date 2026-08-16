@@ -145,6 +145,7 @@ func TestHookSessionStart_NodeUnreachableReturnsError(t *testing.T) {
 
 func TestHookSessionStart_MissingKeyReturnsError(t *testing.T) {
 	tmp := t.TempDir()
+	withHookWorkingDirectory(t, tmp)
 	t.Setenv("HOME", tmp)
 	t.Setenv("SAGE_HOME", tmp)
 	t.Setenv("SAGE_AGENT_KEY", "")
@@ -446,18 +447,52 @@ func TestHookStopCheckNeverBlocksTwiceInARow(t *testing.T) {
 	assert.Empty(t, stdout, "an already-blocked stop must be allowed to end")
 }
 
-// It changes how every session ends, so it stays off until asked for.
-func TestHookStopCheckIsOptIn(t *testing.T) {
+func TestHookStopCheckDefaultsOnForShippedStopCapableHosts(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		override string
+		want     bool
+	}{
+		{name: "Codex default", provider: "codex", want: true},
+		{name: "Codex provider is case insensitive", provider: "CODEX", want: true},
+		{name: "Claude Code default", provider: "claude-code", want: true},
+		{name: "Claude Code provider is case insensitive", provider: "CLAUDE-CODE", want: true},
+		{name: "legacy Claude hook without provider defaults on", provider: "", want: true},
+		{name: "unknown host remains opt in", provider: "other", want: false},
+		{name: "explicit Codex opt out", provider: "codex", override: "false", want: false},
+		{name: "explicit other-host opt in", provider: "other", override: "true", want: true},
+		{name: "invalid Codex override fails closed", provider: "codex", override: "nonsense", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("SAGE_PROVIDER", test.provider)
+			t.Setenv("SAGE_STOP_NUDGE", test.override)
+			assert.Equal(t, test.want, stopNudgeEnabled())
+		})
+	}
+}
+
+func TestHookStopCheckCodexDefaultContinuesForNewDurableWork(t *testing.T) {
 	withTestSageEnv(t, stopHookNode(t, 3, true))
-	withStopHookStdin(t, `{"session_id":"s1"}`)
+	t.Setenv("SAGE_PROVIDER", "codex")
+	t.Setenv("SAGE_STOP_NUDGE", "")
+	withStopHookStdin(t, `{"session_id":"codex-default","hook_event_name":"Stop"}`)
 
 	stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
-	assert.Empty(t, stdout, "unset SAGE_STOP_NUDGE must not block anything")
+	assert.Contains(t, stdout, `"decision":"block"`,
+		"Codex's default Stop hook must create a continuation prompt for newer durable work")
+}
 
-	t.Setenv("SAGE_STOP_NUDGE", "nonsense")
-	withStopHookStdin(t, `{"session_id":"s1"}`)
-	stdout = captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
-	assert.Empty(t, stdout, "an unparseable value must not silently enable blocking")
+func TestHookStopCheckClaudeDefaultContinuesForNewDurableWork(t *testing.T) {
+	withTestSageEnv(t, stopHookNode(t, 4, true))
+	t.Setenv("SAGE_PROVIDER", "claude-code")
+	t.Setenv("SAGE_STOP_NUDGE", "")
+	withStopHookStdin(t, `{"session_id":"claude-default","hook_event_name":"Stop"}`)
+
+	stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+	assert.Contains(t, stdout, `"decision":"block"`,
+		"Claude Code's default Stop hook must create a continuation prompt for newer durable work")
 }
 
 func TestHookStopCheckDeniesTheStopWhenWorkIsPending(t *testing.T) {
@@ -567,6 +602,18 @@ func TestHookStopCheckFailsOpen(t *testing.T) {
 		withStopHookStdin(t, `{"session_id":"s1"}`)
 		stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
 		assert.Empty(t, stdout)
+	})
+
+	t.Run("wake cursor cannot be persisted", func(t *testing.T) {
+		home := t.TempDir()
+		// A regular file at the expected directory path makes MkdirAll fail on
+		// every platform, including privileged test runners.
+		require.NoError(t, os.WriteFile(filepath.Join(home, stopNudgeStateDir), []byte("not a directory"), 0o600))
+		withTestSageEnv(t, stopHookNode(t, 8, true))
+		t.Setenv("SAGE_HOME", home)
+		withStopHookStdin(t, `{"session_id":"s1","hook_event_name":"Stop"}`)
+		stdout := captureStdout(t, func() { require.NoError(t, runHookStopCheck()) })
+		assert.Empty(t, stdout, "a cursor persistence failure must allow the stop")
 	})
 }
 
@@ -768,18 +815,22 @@ func TestHookStopCheckConcurrentSameSessionWritesStayReadable(t *testing.T) {
 	t.Setenv("SAGE_HOME", home)
 
 	var wg sync.WaitGroup
+	errs := make(chan error, 16)
 	for i := 1; i <= 16; i++ {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			storeStopNudgeState("same-session", uint64(n))
+			errs <- storeStopNudgeState("same-session", uint64(n))
 		}(i)
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 
 	got := loadStopNudgeState("same-session")
-	assert.GreaterOrEqual(t, got, uint64(1), "the mark must survive as a valid sequence")
-	assert.LessOrEqual(t, got, uint64(16), "and must be one of the values actually written")
+	assert.Equal(t, uint64(16), got, "a late older writer must never lower the durable sequence")
 
 	entries, err := os.ReadDir(filepath.Join(home, stopNudgeStateDir))
 	require.NoError(t, err)
