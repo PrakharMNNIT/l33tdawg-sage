@@ -130,6 +130,56 @@ export function mapConnectome(g) {
     total: nodes.length, domainCounts: null, domainLast: null };
 }
 
+// Summarize the already-authorized directed links around one visible agent.
+// This never invents a global total: callers pass the RBAC-filtered connectome
+// snapshot, and the result contains only peers whose endpoints survived that
+// projection. Opposite directions stay distinct so the UI can say Sent and
+// Received instead of flattening a relationship into an ambiguous weight.
+export function agentConnections(graph, agentID) {
+  const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  const links = graph && Array.isArray(graph.links) ? graph.links : [];
+  const selected = nodes.find(n => n && n.isNeuron && n.agent_id === agentID);
+  if (!selected) return [];
+  const selectedNodeID = selected.id;
+  const nodeByID = new Map(nodes.map(n => [n.id, n]));
+  const endpointID = endpoint => endpoint && typeof endpoint === 'object' ? endpoint.id : endpoint;
+  const rows = new Map();
+  const rowFor = peerNodeID => {
+    const peer = nodeByID.get(peerNodeID);
+    if (!peer || !peer.agent_id || peer.agent_id === agentID) return null;
+    if (!rows.has(peerNodeID)) rows.set(peerNodeID, {
+      peer_id: peer.agent_id,
+      peer_node_id: peer.id,
+      peer_name: peer.label || peer.agent_id,
+      peer_domain: peer.agent_domain || '',
+      sent: 0,
+      received: 0,
+      total: 0,
+      last_fired: '',
+    });
+    return rows.get(peerNodeID);
+  };
+  for (const link of links) {
+    if (!link || link.link_type !== 'synapse') continue;
+    const source = endpointID(link.source), target = endpointID(link.target);
+    let row = null;
+    if (source === selectedNodeID && target !== selectedNodeID) {
+      row = rowFor(target);
+      if (row) row.sent += link.count || 0;
+    } else if (target === selectedNodeID && source !== selectedNodeID) {
+      row = rowFor(source);
+      if (row) row.received += link.count || 0;
+    }
+    if (!row) continue;
+    row.total = row.sent + row.received;
+    if (isLater(link.last_fired || '', row.last_fired)) row.last_fired = link.last_fired || '';
+  }
+  return [...rows.values()].sort((a, b) =>
+    b.total - a.total ||
+    (Date.parse(b.last_fired || '') || 0) - (Date.parse(a.last_fired || '') || 0) ||
+    a.peer_id.localeCompare(b.peer_id));
+}
+
 // A mode switch invalidates every request started for the previous view. The
 // renderer uses this tiny coordinator for both its initial acquisition and
 // later reloads so an out-of-order response can never be interpreted under a

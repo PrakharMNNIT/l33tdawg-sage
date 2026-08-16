@@ -103,9 +103,11 @@ or already claimed. Same-cursor wake reconnects replay stranded work, the MCP
 inbox carries an exact payload-free claimed-elsewhere tri-state, and a signed
 lease-free wake snapshot lets short-lived hooks observe the durable monotonic
 sequence without acquiring or disrupting the exclusive SSE consumer lease.
-Claude Code project sessions arm the wake channel by default; the optional
-Stop-only nudge fails open and uses per-session durable sequence state so a
-declined generation is not allowed to trap the session indefinitely.
+Claude Code and Codex project sessions arm the Stop-only turn-boundary nudge by
+default. It fails open—including when its one-shot cursor cannot be persisted—
+and uses per-session durable sequence state so a declined generation cannot
+trap the session indefinitely. The experimental custom Claude notification
+adapter remains explicit opt-in for hosts known to consume it.
 
 Claimant-session conflicts stay typed instead of falling through a legacy 404
 path, and recovery remains explicit through passive history plus compare-and-

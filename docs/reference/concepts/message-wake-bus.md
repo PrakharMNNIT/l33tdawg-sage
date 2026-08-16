@@ -111,20 +111,22 @@ The older HTTP-MCP `notifications/sage_message` bridge remains a separate,
 best-effort compatibility notification for already-open MCP SSE sessions and
 does not define this durable sequence contract.
 
-## Claude wake channel enablement
+## Experimental Claude wake channel enablement
 
-The Claude host adapter is the one shipped adapter for this route. A
-project-scoped `sage-gui mcp` session whose `SAGE_PROVIDER` is `claude-code`
-arms it by default; set `SAGE_CLAUDE_CHANNEL=0` (or another accepted false
-spelling) to opt out. Other MCP hosts stay off unless explicitly enabled
-(`claudeChannelEnabled`, `mcp.go:242`). Constructing an MCP `Server` never
+The Claude notification adapter is experimental and defaults off. Enable it
+with `SAGE_CLAUDE_CHANNEL=1` only when the attached host is known to consume
+`notifications/claude/channel`. Codex is always refused because it cannot
+consume that method and must not occupy the exclusive wake lease. Other hosts
+remain off unless explicitly enabled
+(`claudeChannelEnabled`, `mcp.go:321`). Constructing an MCP `Server` never
 advertises or emits the experimental protocol on its own; the executable still
 makes an explicit enablement call (`EnableRESTClaudeChannel`, `internal/mcp/claude_wake_source.go:85`)
 through `ConfigureClaudeChannel` (`internal/mcp/claude_channel.go:50`).
 
-When armed, the adapter subscribes to this agent's own signed wake stream and
+When armed for a compatible host, the adapter subscribes to this agent's own signed wake stream and
 turns durable unfinished-work state into a `notifications/claude/channel` JSON-RPC
-notification, so the host can stop polling its inbox on a timer.
+notification. The shipped Claude Code host does not currently consume that
+custom method; its supported continuation path is the Stop hook below.
 
 The channel is **only a poll accelerator, and it is payload-free**. A wake
 carries `version`, `seq`, and `pending` and nothing else, so the host learns
@@ -142,25 +144,29 @@ disconnects. Because the channel only accelerates polling, failing to arm or
 waiting for that lease is not fatal: the host keeps its ordinary MCP session
 and can still use the canonical inbox operations.
 
-## Codex turn-boundary wake
+## Claude Code and Codex turn-boundary wake
 
 Codex does not consume the custom `notifications/claude/channel` method, so a
-Codex MCP process must not acquire the Claude channel's exclusive wake lease.
-Instead, SAGE installs a Codex `Stop` command hook that reads the signed,
-lease-free `/v1/messages/wake-state` snapshot. The check is on by default when
-`SAGE_PROVIDER=codex`; set `SAGE_STOP_NUDGE=0` (or another accepted false
+Codex MCP process cannot acquire the Claude channel's exclusive wake lease,
+even through an explicit override. The shipped Claude Code host also does not
+consume that experimental method, so the adapter is opt-in and should be
+enabled only for a host that is known to consume it. Instead, SAGE installs a
+`Stop` command hook for Claude Code and Codex that reads the signed, lease-free
+`/v1/messages/wake-state` snapshot. The check is on by default when
+`SAGE_PROVIDER=claude-code` or `SAGE_PROVIDER=codex`; legacy installed Stop
+hooks with no provider label also default on. Set `SAGE_STOP_NUDGE=0` (or another accepted false
 spelling) to opt out (`stopNudgeEnabled`, `cmd/sage-gui/hook.go:435`).
 
 When the durable cursor has advanced and unfinished work exists, the hook emits
 Codex's documented top-level `{"decision":"block","reason":"..."}` result.
-Codex converts that result into one continuation prompt for the same thread, so
+The host converts that result into one continuation prompt for the same thread, so
 the agent calls the canonical inbox operation before the turn becomes idle
-(`runHookStopCheck`, `cmd/sage-gui/hook.go:447`). The check never acquires the
+(`runHookStopCheck`, `cmd/sage-gui/hook.go:451`). The check never acquires the
 SSE lease, never sees message content or sender, refuses `SubagentStop`, blocks
 at most once per newer cursor and session, and fails open on every error.
 
 This is a turn-boundary continuation, not an out-of-band resurrection API. A
-message committed after a Codex thread is already fully idle waits durably for
+message committed after a thread is already fully idle waits durably for
 the next user turn, scheduled continuation, or session start; current Codex MCP
 configuration exposes no supported server-notification method that can inject a
 new turn into an already-idle local thread.

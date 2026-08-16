@@ -95,17 +95,14 @@ type grantResult struct {
 	OverrideReady     bool   `json:"override_ready,omitempty"`
 }
 
-// emitAccessActivity publishes only a committed RBAC mutation. The dashboard
-// can therefore show the exact transaction and block which enforced a change.
-func (h *DashboardHandler) emitAccessActivity(action, content, domain string, data map[string]any) {
+// emitAccessInvalidation publishes only a committed RBAC mutation. The
+// dashboard stream has no subscriber identity, so the event must remain an
+// empty tick and each client must re-fetch its own authorized projection.
+func (h *DashboardHandler) emitAccessInvalidation() {
 	if h.SSE == nil {
 		return
 	}
-	if data == nil {
-		data = make(map[string]any)
-	}
-	data["action"] = action
-	h.SSE.Broadcast(SSEEvent{Type: EventAccess, Domain: domain, Content: content, Data: data})
+	h.SSE.Broadcast(SSEEvent{Type: EventAccess})
 }
 
 type adminOverrideExpectation struct {
@@ -433,9 +430,7 @@ func (h *DashboardHandler) grantAs(domain, granteeID string, level int, override
 			Code: "grant_rejected", Error: gErr.Error(), OwnerID: owner, OwnedDomain: ownedDomain,
 			OwnerLocal: ownerLocal}
 	}
-	h.emitAccessActivity("access_granted", fmt.Sprintf("Access granted: %s → %s (level %d)", domain, shortID(granteeID), level), domain, map[string]any{
-		"agent_id": granteeID, "owner_id": owner, "level": level, "tx_hash": txHash, "height": height,
-	})
+	h.emitAccessInvalidation()
 	return grantResult{Domain: domain, Action: "grant", Level: level, TxHash: txHash, Height: height, OK: true,
 		OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
 }
@@ -524,9 +519,7 @@ func (h *DashboardHandler) revokeAs(domain, granteeID string, override *adminOve
 		return grantResult{Domain: domain, Action: "revoke", OK: false,
 			Code: "revoke_rejected", Error: rErr.Error(), OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
 	}
-	h.emitAccessActivity("access_revoked", fmt.Sprintf("Access revoked: %s → %s", domain, shortID(granteeID)), domain, map[string]any{
-		"agent_id": granteeID, "owner_id": owner, "tx_hash": txHash, "height": height,
-	})
+	h.emitAccessInvalidation()
 	return grantResult{Domain: domain, Action: "revoke", TxHash: txHash, Height: height, OK: true, OwnerID: owner, OwnedDomain: ownedDomain, OwnerLocal: ownerLocal}
 }
 

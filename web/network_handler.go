@@ -707,7 +707,7 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 						CapabilitiesPresent: capabilitiesChanged,
 					},
 				}
-				if txHash, height, _, bErr := h.signAndBroadcastCommit(permTx, h.AdminSigningKey); bErr != nil {
+				if _, _, _, bErr := h.signAndBroadcastCommit(permTx, h.AdminSigningKey); bErr != nil {
 					// Preserve unrelated metadata edits, but restore every
 					// consensus-owned policy field. Returning 2xx with a warning
 					// here made the dashboard claim grants that Badger denied.
@@ -735,9 +735,7 @@ func (h *DashboardHandler) handleUpdateAgent(agentStore store.AgentStore) http.H
 					writeError(w, http.StatusBadGateway, "agent permission transaction was rejected: "+bErr.Error())
 					return
 				} else {
-					h.emitAccessActivity("permissions_updated", fmt.Sprintf("Permissions updated for %s", existing.Name), "", map[string]any{
-						"agent_id": id, "agent_name": existing.Name, "clearance": clearance, "tx_hash": txHash, "height": height,
-					})
+					h.emitAccessInvalidation()
 				}
 			}
 		}

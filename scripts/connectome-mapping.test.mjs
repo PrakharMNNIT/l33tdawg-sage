@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { createGraphLoadCoordinator, mapConnectome, diffConnectomeActivity, createConnectomeActivityTracker, createConnectomeReloadIntent } from '../web/static/js/connectome-map.js';
+import { createGraphLoadCoordinator, mapConnectome, agentConnections, diffConnectomeActivity, createConnectomeActivityTracker, createConnectomeReloadIntent } from '../web/static/js/connectome-map.js';
 
 const mriSource = await readFile(new URL('../web/static/js/mri-brain.js', import.meta.url), 'utf8');
 const appSource = await readFile(new URL('../web/static/js/app.js', import.meta.url), 'utf8');
@@ -116,6 +116,56 @@ test('direction is preserved: A->B is distinct from B->A', () => {
   const keys = g.links.map(l => `${l.source}>${l.target}`);
   assert.ok(keys.includes('agent:alice>agent:bob'));
   assert.ok(keys.includes('agent:bob>agent:alice'));
+});
+
+test('selected-agent connections preserve sent/received direction and visible peers', () => {
+  const graph = mapConnectome({
+    neurons: [
+      { agent_id: 'alice', name: 'Alice' },
+      { agent_id: 'bob', name: 'Bob' },
+      { agent_id: 'carol', name: 'Carol' },
+    ],
+    synapses: [
+      { from_agent: 'alice', to_agent: 'bob', count: 7, last_fired: '2026-08-16T10:00:00Z' },
+      { from_agent: 'bob', to_agent: 'alice', count: 2, last_fired: '2026-08-16T11:00:00Z' },
+      { from_agent: 'carol', to_agent: 'alice', count: 4, last_fired: '2026-08-16T09:00:00Z' },
+      { from_agent: 'hidden', to_agent: 'alice', count: 99, last_fired: '2026-08-16T12:00:00Z' },
+    ],
+  });
+  assert.deepEqual(agentConnections(graph, 'alice'), [
+    { peer_id:'bob', peer_node_id:'agent:bob', peer_name:'Bob', peer_domain:'', sent:7, received:2, total:9, last_fired:'2026-08-16T11:00:00Z' },
+    { peer_id:'carol', peer_node_id:'agent:carol', peer_name:'Carol', peer_domain:'', sent:0, received:4, total:4, last_fired:'2026-08-16T09:00:00Z' },
+  ]);
+  assert.deepEqual(agentConnections(graph, 'missing'), []);
+});
+
+test('connection inspection keeps object endpoints asymmetric and coalesces only the same peer', () => {
+  const graph = mapConnectome({
+    neurons: [
+      { agent_id: 'alice', name: 'Alice' },
+      { agent_id: 'bob', name: 'Bob' },
+      { agent_id: 'carol', name: 'Carol' },
+    ],
+    synapses: [
+      { from_agent: 'alice', to_agent: 'bob', count: 3, last_fired: '2026-08-16T10:00:00Z' },
+      { from_agent: 'bob', to_agent: 'alice', count: 11, last_fired: '2026-08-16T12:00:00Z' },
+      { from_agent: 'alice', to_agent: 'carol', count: 5, last_fired: '2026-08-16T11:00:00Z' },
+    ],
+  });
+  const byID = Object.fromEntries(graph.nodes.map(node => [node.id, node]));
+  // ForceGraph mutates link endpoints from ids to node objects after binding.
+  graph.links.forEach(link => {
+    link.source = byID[link.source];
+    link.target = byID[link.target];
+  });
+
+  assert.deepEqual(agentConnections(graph, 'alice'), [
+    { peer_id:'bob', peer_node_id:'agent:bob', peer_name:'Bob', peer_domain:'', sent:3, received:11, total:14, last_fired:'2026-08-16T12:00:00Z' },
+    { peer_id:'carol', peer_node_id:'agent:carol', peer_name:'Carol', peer_domain:'', sent:5, received:0, total:5, last_fired:'2026-08-16T11:00:00Z' },
+  ], 'reversing either sent/received branch or flattening both directions must fail');
+  assert.deepEqual(agentConnections(graph, 'bob'), [
+    { peer_id:'alice', peer_node_id:'agent:alice', peer_name:'Alice', peer_domain:'', sent:11, received:3, total:14, last_fired:'2026-08-16T12:00:00Z' },
+  ], 'the same directed rows must invert when the inspected endpoint changes');
 });
 
 test('nodes expose visible directional traffic, distinct peers, and strongest connection', () => {
@@ -298,6 +348,114 @@ test('connectome exposes persistent, keyboard-reachable agent identity details',
     'the global Escape listener must be cleaned up with the renderer');
 });
 
+test('directed-link inspection anchors the sender unless an endpoint is already selected', () => {
+  const body = bracedBlock(mriSource, 'function selectDirectedLink').body;
+  const inspect = new Function(
+    'l', 'rendered', 'selectedAgentNode', 'selectedAgentID', 'selectNeuron', 'pinAgentConnection',
+    body,
+  );
+  const alice = { id:'agent:alice', agent_id:'alice', label:'Alice', isNeuron:true };
+  const bob = { id:'agent:bob', agent_id:'bob', label:'Bob', isNeuron:true };
+  const rendered = { nodes:[alice, bob] };
+  const link = { source:'agent:alice', target:'agent:bob', link_type:'synapse', count:9 };
+  const selected = [], pinned = [];
+
+  inspect(link, rendered, null, null, node => selected.push(node.agent_id), peer => pinned.push(peer));
+  assert.deepEqual(selected, ['alice'], 'clicking an unanchored A→B edge must inspect its sender');
+  assert.deepEqual(pinned, ['bob'], 'the receiver must become the pinned peer');
+
+  selected.length = 0; pinned.length = 0;
+  inspect(link, rendered, bob, 'bob', node => selected.push(node.agent_id), peer => pinned.push(peer));
+  assert.deepEqual(selected, [], 'clicking an incident edge must not replace the selected endpoint');
+  assert.deepEqual(pinned, ['alice'], 'the opposite endpoint must be pinned when the receiver is selected');
+
+  selected.length = 0; pinned.length = 0;
+  inspect({ ...link, link_type:'focus' }, rendered, null, null,
+    node => selected.push(node.agent_id), peer => pinned.push(peer));
+  assert.deepEqual([selected, pinned], [[], []], 'transient memory links are not agent traffic');
+});
+
+test('memory mutations request a selected-memory refresh while traffic ticks reuse it', () => {
+  const reloadBody = bracedBlock(mriSource, 'const reload = () =>').body;
+  let cleared = null, scheduled = null;
+  const load = () => {};
+  const runReload = new Function(
+    'mode', 'selectedAgentID', 'selectedMemoryRefreshPending', 'clearTimeout', 't', 'setTimeout', 'load',
+    `${reloadBody}\nreturn { selectedMemoryRefreshPending, t };`,
+  );
+  const afterMutation = runReload(
+    'connectome', 'alice', false,
+    timer => { cleared = timer; }, 41,
+    (callback, delay) => { scheduled = { callback, delay }; return 42; }, load,
+  );
+  assert.equal(afterMutation.selectedMemoryRefreshPending, true,
+    'removing the mutation-only refresh flag must fail');
+  assert.equal(cleared, 41);
+  assert.deepEqual(scheduled, { callback:load, delay:3000 });
+  assert.equal(afterMutation.t, 42);
+
+  const withoutSelection = runReload(
+    'connectome', null, false, () => {}, null, (callback, delay) => ({ callback, delay }), load,
+  );
+  assert.equal(withoutSelection.selectedMemoryRefreshPending, false,
+    'memory churn must not invent a selected-agent refresh');
+
+  assert.match(mriSource,
+    /\['remember','forget','reinstate','cocommit','import','update','consensus'\]\.forEach\(eventName=>\{\s*subs\.push\(opts\.sse\.on\(eventName, reload\)\);\s*\}\)/,
+    'every memory mutation event must share the cache-invalidating reload path');
+
+  const pulseBody = bracedBlock(mriSource, 'const pulse = () =>').body;
+  let pulseScheduled = null, pulseLoads = [];
+  const runPulse = new Function('mode', 'clearTimeout', 'ct', 'setTimeout', 'load', `${pulseBody}\nreturn ct;`);
+  runPulse('connectome', () => {}, null, (callback, delay) => {
+    pulseScheduled = { callback, delay }; return 77;
+  }, tick => pulseLoads.push(tick));
+  assert.equal(pulseScheduled.delay, 900);
+  pulseScheduled.callback();
+  assert.deepEqual(pulseLoads, [true],
+    'traffic ticks must use load(true), not the selected-memory invalidation callback');
+});
+
+test('access invalidation ignores event payload and fences pre-access graph and memory responses', () => {
+  const body = bracedBlock(mriSource, 'const reauthorize=()=>').body;
+  assert.match(mriSource, /const reauthorize=\(\)=>\{/,
+    'access payloads are untrusted invalidation ticks, never replacement graph or identity data');
+  const calls = [];
+  const graphLoads = { invalidate(){ calls.push('graph-invalidate'); } };
+  const bloomLoads = { invalidate(){ calls.push('bloom-invalidate'); } };
+  const run = new Function(
+    'eventPayload', 'clearTimeout', 't', 'selectedMemoryRefreshPending', 'mode', 'selectedAgentID',
+    'graphLoads', 'bloomLoads', 'clearBloom', 'hideTip', 'focusId', 'focusSet', 'clearFocusMarker',
+    'selectedAgentNode', 'selectedMemoryState', 'renderAgentInspector', 'Graph', 'rendered',
+    'refreshCounts', 'populateAgentPicker', '$', 'document', 'load',
+    `${body}\nreturn { selectedMemoryRefreshPending, focusId, focusSet, selectedAgentNode, selectedMemoryState };`,
+  );
+  const state = run(
+    { detail:{ nodes:[{ agent_id:'attacker' }], engrams:[{ content:'inject' }] } },
+    () => calls.push('timer-clear'), 12, true, 'connectome', 'alice', graphLoads, bloomLoads,
+    () => calls.push('bloom-clear'), () => calls.push('tip-hide'), 'agent:alice', new Set(['agent:alice']),
+    () => calls.push('marker-clear'), { agent_id:'alice' }, { status:'ready', memories:[{ id:'secret' }] },
+    value => calls.push(value === null ? 'inspector-hide' : 'payload-rendered'),
+    { graphData:value => calls.push(value.nodes.length===0?'graph-clear':'payload-rendered') }, null,
+    value => calls.push(value.nodes.length===0?'counts-clear':'payload-rendered'),
+    value => calls.push(value.nodes.length===0?'picker-clear':'payload-rendered'),
+    () => null, { activeElement:null }, () => calls.push('load'),
+  );
+  assert.deepEqual(calls, [
+    'timer-clear', 'graph-invalidate', 'bloom-invalidate', 'bloom-clear', 'tip-hide',
+    'marker-clear', 'inspector-hide', 'graph-clear', 'counts-clear', 'picker-clear', 'load',
+  ], 'access must invalidate both request generations before any fresh authorized load');
+  assert.deepEqual(state, {
+    selectedMemoryRefreshPending:false,
+    focusId:null,
+    focusSet:null,
+    selectedAgentNode:null,
+    selectedMemoryState:{ status:'loading' },
+  });
+  assert.doesNotMatch(calls.join(' '), /payload|attacker|inject|secret/,
+    'no access-event field may populate UI or graph state');
+});
+
 test('selection dismissal hides the large inspector and returns keyboard focus to the picker', () => {
   const renderStart=mriSource.indexOf('function renderAgentInspector(');
   const renderEnd=mriSource.indexOf('function clearAgentSelection(',renderStart);
@@ -316,9 +474,12 @@ test('a live reload restores cached selected memories or restarts an interrupted
   const body=mriSource.slice(start,end);
   assert.match(body,/applyEngramBloom\(Graph\.graphData\(\), selectedMemoryState\.memories\|\|\[\], selected, focusSet, placeNear\)/,
     'ready memories must be recomposed after graph replacement strips transient nodes');
-  assert.match(body,/selectedMemoryState=\{status:'loading'\}[\s\S]*bloomEngrams\(selected\)/,
-    'an invalidated in-flight bloom must restart instead of leaving the inspector loading forever');
-  assert.match(body,/else if \(selectedMemoryState && selectedMemoryState\.status==='loading'\)/,
+  const loadBody=bracedBlock(mriSource,'function load(').body;
+  assert.match(loadBody,/if\(refreshSelectedMemory\|\|selectedMemoryState&&selectedMemoryState\.status==='updating'\)\{\s*bloomEngrams\(selectedAgentNode,\{preserve:true\}\);/,
+    'one owner must restart a mutation or interrupted updating bloom');
+  assert.match(loadBody,/else if\(selectedMemoryState&&selectedMemoryState\.status==='loading'\)\{\s*bloomEngrams\(selectedAgentNode\);/,
+    'a fresh loading selection must restart after graph replacement');
+  assert.doesNotMatch(loadBody,/selectedMemoryState\.status==='error'[\s\S]{0,120}bloomEngrams/,
     'explicit engram errors must wait for Retry rather than hammering the endpoint on every live tick');
   assert.match(mriSource,/restoreSelectedAgent\(d\)/,
     'successful reload reconciliation must invoke the tested restore path');

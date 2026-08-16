@@ -29,9 +29,10 @@ const (
 	// in activity for operator visibility but must never be presented as a
 	// consensus commit or a rewrite of historical chain state.
 	EventRecovery EventType = "recovery"
-	// EventAccess is emitted only after an RBAC transaction commits. It keeps
-	// Chain Activity an auditable view of enforced permissions, not merely a
-	// memory-operation feed.
+	// EventAccess is emitted only after an RBAC transaction commits. It is also
+	// a payload-free invalidation tick: the stream has no subscriber identity,
+	// so each client must re-fetch any caller-filtered access or connectome
+	// projection instead of learning authorization details from the event.
 	EventAccess EventType = "access"
 	// EventConnectome announces that the local agent connectome may have
 	// changed. It is a CACHE-INVALIDATION TICK, not data: it carries no

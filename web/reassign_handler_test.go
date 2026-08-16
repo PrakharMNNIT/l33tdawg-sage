@@ -86,14 +86,37 @@ func TestGrantAs_UnownedDomainUsesGenesisAdmin(t *testing.T) {
 	// proven hash — 64 uppercase hex — not whatever string a server chose.
 	assert.Regexp(t, "^[0-9A-F]{64}$", result.TxHash)
 	assert.Equal(t, int64(42), result.Height)
-	select {
-	case event := <-events:
-		assert.Contains(t, string(event), "event: access")
-		assert.Contains(t, string(event), `"action":"access_granted"`)
-		assert.Contains(t, string(event), `"tx_hash":"`+result.TxHash+`"`)
-	case <-time.After(time.Second):
-		t.Fatal("committed access grant did not emit Chain Activity event")
+	requirePayloadFreeAccessInvalidation(t, events)
+}
+
+func TestRevokeAs_EmitsPayloadFreeAccessInvalidation(t *testing.T) {
+	bs := newGrantTestBadger(t)
+	_, ownerKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	ownerID := agentIDForKey(ownerKey)
+	require.NoError(t, bs.RegisterDomain("sentinel-private-domain", ownerID, "", 1))
+
+	var captured *tx.ParsedTx
+	var calls atomic.Int32
+	rpc := newGrantRPC(t, &captured, &calls)
+	defer rpc.Close()
+	h := &DashboardHandler{
+		BadgerStore: bs, CometBFTRPC: rpc.URL, SSE: NewSSEBroadcaster(),
+		ResolveAgentKeyFn: func(id string) (ed25519.PrivateKey, bool) {
+			return ownerKey, id == ownerID
+		},
 	}
+	events := h.SSE.Subscribe()
+	require.NotNil(t, events)
+	defer h.SSE.Unsubscribe(events)
+
+	result := h.revokeAs("sentinel-private-domain", "sentinel-private-grantee", nil, nil)
+
+	require.True(t, result.OK, result.Error)
+	require.Equal(t, int32(1), calls.Load())
+	require.NotNil(t, captured)
+	require.NotNil(t, captured.AccessRevoke)
+	requirePayloadFreeAccessInvalidation(t, events)
 }
 
 func TestGrantAs_ChildDomainUsesOwningAncestorForModifyLevel(t *testing.T) {
