@@ -258,6 +258,9 @@ func canonicalWorkspaceRoot(projectDir string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", clean, "rev-parse", "--show-toplevel", "--git-common-dir") //nolint:gosec // fixed executable/arguments; local workspace path only
 	out, gitErr := cmd.Output()
 	if gitErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("resolve git workspace: %w", ctxErr)
+		}
 		lower := strings.ToLower(filepath.ToSlash(clean))
 		if strings.Contains(lower, "/.claude/worktrees/") || strings.Contains(strings.ToLower(filepath.Base(clean)), "scratchpad") {
 			return "", fmt.Errorf("managed scratch workspace has no verifiable Git common root; set SAGE_IDENTITY_PATH for explicit isolation")

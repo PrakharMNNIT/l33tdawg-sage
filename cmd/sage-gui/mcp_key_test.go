@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -74,6 +76,20 @@ func TestCanonicalWorkspaceRootCollapsesLinkedWorktree(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, rootKey, worktreeKey)
 	require.Equal(t, key, worktreeKey, "managed worktrees must use the primary repository's established signer")
+}
+
+func TestCanonicalWorkspaceRootFailsClosedWhenGitProbeTimesOut(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH shim uses a POSIX executable script")
+	}
+	shimDir := t.TempDir()
+	shim := filepath.Join(shimDir, "git")
+	require.NoError(t, os.WriteFile(shim, []byte("#!/bin/sh\nexec sleep 10\n"), 0o700))
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := canonicalWorkspaceRoot(t.TempDir())
+	require.ErrorIs(t, err, context.DeadlineExceeded,
+		"a timed-out Git probe must not fall back to a transient worktree identity")
 }
 
 func TestPrimaryWorkspaceMCPEnvPreservesPinnedProviderIdentity(t *testing.T) {
