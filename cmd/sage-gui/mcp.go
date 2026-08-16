@@ -253,7 +253,9 @@ func canonicalWorkspaceRoot(projectDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.Command("git", "-C", clean, "rev-parse", "--show-toplevel", "--git-common-dir") //nolint:gosec // fixed executable/arguments; local workspace path only
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", clean, "rev-parse", "--show-toplevel", "--git-common-dir") //nolint:gosec // fixed executable/arguments; local workspace path only
 	out, gitErr := cmd.Output()
 	if gitErr != nil {
 		lower := strings.ToLower(filepath.ToSlash(clean))
@@ -273,7 +275,7 @@ func canonicalWorkspaceRoot(projectDir string) (string, error) {
 	}
 	common, err = filepath.Abs(common)
 	if err != nil || filepath.Base(common) != ".git" {
-		return "", fmt.Errorf("Git common directory is not a repository root")
+		return "", fmt.Errorf("git common directory is not a repository root")
 	}
 	root := filepath.Dir(common)
 	if root == "." || root == string(filepath.Separator) {
