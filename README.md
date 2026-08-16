@@ -51,6 +51,41 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.14
+
+**Durable agent messages now stay visible until the work is actually
+finished.** Claiming a message no longer makes the payload-free wake surface go
+quiet: both pending and claimed rows remain unfinished, a reconnect at the
+current cursor receives an immediate wake, and `sage_inbox` reports an exact
+payload-free claimed-elsewhere state instead of a bounded-scan false zero.
+Claude Code project sessions arm the signed wake channel by default, while the
+optional Stop hook reads a lease-free monotonic snapshot so new or stranded
+work can nudge a session once without stealing the live SSE consumer lease.
+
+The same recovery path is honest at its edges. A claimant-session fence
+rejection remains a typed conflict instead of masquerading as a missing
+message, and history plus explicit compare-and-swap handoff remain the only
+way to recover another session's claim. Canonical retention migration now
+rescues only the exact historical 24-hour stamp, preserving a sender's chosen
+bounded TTL across every store reopen, including RFC3339 nanosecond timestamps.
+
+**CEREBRUM's Connectome now identifies the agents it renders.** Hover details
+are positioned and escaped reliably, while click, tap, and keyboard selection
+open one persistent inspector with exact agent identity, visible retained
+traffic, peers, activity, and an independently loading visible-memory lobe.
+Selection survives authorized live refreshes, error and empty states stay
+truthful, mobile uses a bounded sheet, and reduced-motion and established
+Connectome guidance remain intact.
+
+Agent-as-lobe corroborator reads now use one deterministically ordered bounded
+batch instead of an N+1 query pattern, with matching SQLite and PostgreSQL
+ordering. The MCP contract also states the server-enforced 31-day
+`sage_timeline` range rather than advertising requests the server rejects.
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.14 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.14`. SDK 11.18.14.
+
 ## What's New in v11.18.13
 
 **Hubanov's distributed-engram contribution now connects memories to the
@@ -1827,7 +1862,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.13`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.14`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
