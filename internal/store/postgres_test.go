@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"sort"
 	"testing"
 	"time"
 
@@ -314,4 +315,45 @@ func TestVotes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, votes, 1)
 	assert.Equal(t, "accept", votes[0].Decision)
+}
+
+// TestPostgresGetPendingByDomainTotallyOrdered pins the deterministic memory_id tiebreak on
+// real PostgreSQL: same-timestamp proposed rows must come back in memory_id order, matching the
+// paginated sibling. Dropping the tiebreak returns them in heap order and fails this. memory_id
+// is a UUID column, so the ids are real UUIDs sorted lexically — the order ORDER BY memory_id
+// yields for canonical lowercase UUIDs.
+func TestPostgresGetPendingByDomainTotallyOrdered(t *testing.T) {
+	store := setupTestStore(t)
+	ctx := context.Background()
+	domain := "pending-order-" + uuid.NewString()
+	at := time.Unix(1_700_000_000, 0).UTC()
+
+	ids := make([]string, 10)
+	for i := range ids {
+		ids[i] = uuid.NewString()
+	}
+	sort.Strings(ids) // the order ORDER BY memory_id yields
+	// Insert in REVERSE sorted order, all sharing ONE timestamp, so only the tiebreak orders them.
+	for i := len(ids) - 1; i >= 0; i-- {
+		content := "pending " + ids[i]
+		require.NoError(t, store.InsertMemory(ctx, &memory.MemoryRecord{
+			MemoryID:        ids[i],
+			SubmittingAgent: "agent-test",
+			Content:         content,
+			ContentHash:     memory.ComputeContentHash(content),
+			MemoryType:      memory.TypeObservation,
+			DomainTag:       domain,
+			ConfidenceScore: 0.8,
+			Status:          memory.StatusProposed,
+			CreatedAt:       at,
+		}))
+	}
+
+	got, err := store.GetPendingByDomain(ctx, domain, 100)
+	require.NoError(t, err)
+	require.Len(t, got, 10)
+	for i, r := range got {
+		require.Equal(t, ids[i], r.MemoryID,
+			"same-timestamp PostgreSQL proposed rows must be ordered by the memory_id tiebreak")
+	}
 }

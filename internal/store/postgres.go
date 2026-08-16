@@ -1321,7 +1321,7 @@ func (s *PostgresStore) GetPendingByDomain(ctx context.Context, domainTag string
 		`SELECT memory_id, submitting_agent, content, content_hash,
 			memory_type, domain_tag, confidence_score, status, created_at
 		FROM memories WHERE status = 'proposed' AND domain_tag LIKE $1
-		ORDER BY created_at LIMIT $2`, domainTag, limit)
+		ORDER BY created_at ASC, memory_id ASC LIMIT $2`, domainTag, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get pending: %w", err)
 	}
