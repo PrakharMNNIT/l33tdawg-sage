@@ -2770,6 +2770,56 @@ func (s *SQLiteStore) GetCorroborationsBounded(ctx context.Context, memoryID str
 	return corrs, rows.Err()
 }
 
+// GetCorroborationsBoundedBatch is the batched form of GetCorroborationsBounded: it returns,
+// per memory_id, up to perLimit corroborations in the same deterministic total order
+// (created_at, agent_id, id) — in ONE query rather than one per memory. It backs the CEREBRUM
+// agent-as-lobe bridges, where the per-record loop would otherwise fire up to
+// engramPerAgentLimit single-memory reads. A window function caps each partition to perLimit
+// so a memory corroborated by thousands can never materialize its whole set; the composite
+// idx_corroborations_memory_order serves both the seek and the per-partition order (verified
+// no full scan, WITHOUT ANALYZE). memoryIDs is sorted so partitions emit in a stable order.
+func (s *SQLiteStore) GetCorroborationsBoundedBatch(ctx context.Context, memoryIDs []string, perLimit int) (map[string][]*Corroboration, error) {
+	if perLimit <= 0 {
+		return nil, errors.New("corroboration limit must be positive")
+	}
+	out := make(map[string][]*Corroboration, len(memoryIDs))
+	if len(memoryIDs) == 0 {
+		return out, nil
+	}
+	ids := append([]string(nil), memoryIDs...)
+	sort.Strings(ids)
+	ph := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	for i, id := range ids {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, perLimit)
+
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT memory_id, id, agent_id, evidence, created_at FROM (
+			SELECT id, memory_id, agent_id, evidence, created_at,
+				ROW_NUMBER() OVER (PARTITION BY memory_id ORDER BY created_at, agent_id, id) AS rn
+			FROM corroborations INDEXED BY idx_corroborations_memory_order
+			WHERE memory_id IN (`+strings.Join(ph, ",")+`)
+		) WHERE rn <= ? ORDER BY memory_id, created_at, agent_id, id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get bounded corroborations batch: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		c := &Corroboration{}
+		var createdAt string
+		if scanErr := rows.Scan(&c.MemoryID, &c.ID, &c.AgentID, &c.Evidence, &createdAt); scanErr != nil {
+			return nil, fmt.Errorf("scan bounded corroboration batch: %w", scanErr)
+		}
+		c.CreatedAt = parseTime(createdAt)
+		out[c.MemoryID] = append(out[c.MemoryID], c)
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLiteStore) GetPendingByDomain(ctx context.Context, domainTag string, limit int) ([]*memory.MemoryRecord, error) {
 	if limit <= 0 {
 		limit = 20

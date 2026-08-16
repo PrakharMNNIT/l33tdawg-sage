@@ -218,6 +218,88 @@ func TestGetCorroborationsServesIndexNoTempSort(t *testing.T) {
 		"the composite index must satisfy the order without a temp sort; plan was:\n"+plan)
 }
 
+// TestGetCorroborationsBoundedBatch pins the batched read that backs the agent-as-lobe
+// bridges (replacing the per-engram N+1): in ONE query it caps EACH memory at perLimit and
+// returns the same total order (created_at, agent_id, id) as the single-memory reader.
+func TestGetCorroborationsBoundedBatch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	at := time.Unix(1_700_000_000, 0).UTC()
+	for _, m := range []string{"m1", "m2", "m3"} {
+		require.NoError(t, s.InsertMemory(ctx, testMemory(m, "author", "c-"+m, "dom")))
+	}
+	// m1: 20 corroborators sharing one timestamp, inserted in reverse — only the tiebreak orders them.
+	for i := 19; i >= 0; i-- {
+		require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m1", AgentID: fmt.Sprintf("agent-%02d", i), CreatedAt: at}))
+	}
+	for i := 0; i < 3; i++ {
+		require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{MemoryID: "m2", AgentID: fmt.Sprintf("b-%d", i), CreatedAt: at.Add(time.Duration(i) * time.Second)}))
+	}
+	// m3: no corroborations.
+
+	got, err := s.GetCorroborationsBoundedBatch(ctx, []string{"m1", "m2", "m3"}, 12)
+	require.NoError(t, err)
+	require.Len(t, got["m1"], 12, "each memory is capped at perLimit inside the single batched query")
+	for i, c := range got["m1"] {
+		require.Equal(t, fmt.Sprintf("agent-%02d", i), c.AgentID,
+			"same-timestamp rows use the agent_id tiebreak, per memory")
+	}
+	require.Len(t, got["m2"], 3, "a memory under the cap returns all its rows")
+	require.Equal(t, "b-0", got["m2"][0].AgentID)
+	require.NotContains(t, got, "m3", "a memory with no corroborations is absent from the batch result")
+
+	again, err := s.GetCorroborationsBoundedBatch(ctx, []string{"m1"}, 12)
+	require.NoError(t, err)
+	require.Equal(t, got["m1"][0].AgentID, again["m1"][0].AgentID, "the batch read is stable")
+	_, err = s.GetCorroborationsBoundedBatch(ctx, []string{"m1"}, 0)
+	require.Error(t, err, "a non-positive limit must fail closed")
+	empty, err := s.GetCorroborationsBoundedBatch(ctx, nil, 12)
+	require.NoError(t, err)
+	require.Empty(t, empty, "no memory IDs is a no-op, not an error")
+}
+
+// TestGetCorroborationsBoundedBatchSeeksNoFullScan pins the batch plan: the windowed
+// per-memory-capped read must SEARCH the composite index per memory rather than scan the
+// whole corroborations table, WITHOUT ANALYZE — so a heavily corroborated table can never
+// turn the batch into a full scan.
+func TestGetCorroborationsBoundedBatchSeeksNoFullScan(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	at := time.Unix(1_700_000_000, 0).UTC()
+	for i := 0; i < 20; i++ {
+		require.NoError(t, s.InsertMemory(ctx, testMemory(fmt.Sprintf("m%03d", i), "author", "c", "dom")))
+	}
+	for i := 0; i < 400; i++ {
+		require.NoError(t, s.InsertCorroboration(ctx, &Corroboration{
+			MemoryID: fmt.Sprintf("m%03d", i%20), AgentID: fmt.Sprintf("a%d", i),
+			CreatedAt: at.Add(time.Duration(i) * time.Second),
+		}))
+	}
+
+	rows, err := s.conn.QueryContext(ctx,
+		`EXPLAIN QUERY PLAN SELECT memory_id, id, agent_id, evidence, created_at FROM (
+			SELECT id, memory_id, agent_id, evidence, created_at,
+				ROW_NUMBER() OVER (PARTITION BY memory_id ORDER BY created_at, agent_id, id) AS rn
+			FROM corroborations INDEXED BY idx_corroborations_memory_order
+			WHERE memory_id IN (?, ?, ?)
+		) WHERE rn <= ? ORDER BY memory_id, created_at, agent_id, id`, "m001", "m002", "m003", 12)
+	require.NoError(t, err)
+	defer rows.Close() //nolint:errcheck
+	var plan string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &notUsed, &detail))
+		plan += detail + "\n"
+	}
+	require.NoError(t, rows.Err())
+
+	require.Contains(t, plan, "idx_corroborations_memory_order",
+		"the batch must SEARCH the composite index per memory; plan was:\n"+plan)
+	require.NotContains(t, plan, "SCAN corroborations",
+		"a heavily corroborated table must never turn the batch into a full scan; plan was:\n"+plan)
+}
+
 // The CEREBRUM agent-as-lobe read is `WHERE submitting_agent = ? [AND status = ?]
 // ORDER BY confidence_score DESC LIMIT N`. idx_memories_submitting_agent
 // (submitting_agent, confidence_score) must satisfy BOTH the equality and the

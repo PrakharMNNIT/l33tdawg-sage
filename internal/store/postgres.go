@@ -1280,6 +1280,39 @@ func (s *PostgresStore) GetCorroborationsBounded(ctx context.Context, memoryID s
 	return corrs, rows.Err()
 }
 
+// GetCorroborationsBoundedBatch — batched form (parity with SQLiteStore): up to perLimit
+// corroborations per memory_id in the total order (created_at, agent_id, id), in one windowed
+// query capped per partition so no memory can materialize its whole set. The planner uses
+// idx_corroborations_memory_order for the seek + per-partition order.
+func (s *PostgresStore) GetCorroborationsBoundedBatch(ctx context.Context, memoryIDs []string, perLimit int) (map[string][]*Corroboration, error) {
+	if perLimit <= 0 {
+		return nil, errors.New("corroboration limit must be positive")
+	}
+	out := make(map[string][]*Corroboration, len(memoryIDs))
+	if len(memoryIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT memory_id, id, agent_id, evidence, created_at FROM (
+			SELECT id, memory_id, agent_id, evidence, created_at,
+				ROW_NUMBER() OVER (PARTITION BY memory_id ORDER BY created_at, agent_id, id) AS rn
+			FROM corroborations WHERE memory_id = ANY($1)
+		) ranked WHERE rn <= $2 ORDER BY memory_id, created_at, agent_id, id`, memoryIDs, perLimit)
+	if err != nil {
+		return nil, fmt.Errorf("get bounded corroborations batch: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		c := &Corroboration{}
+		if scanErr := rows.Scan(&c.MemoryID, &c.ID, &c.AgentID, &c.Evidence, &c.CreatedAt); scanErr != nil {
+			return nil, fmt.Errorf("scan bounded corroboration batch: %w", scanErr)
+		}
+		out[c.MemoryID] = append(out[c.MemoryID], c)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) GetPendingByDomain(ctx context.Context, domainTag string, limit int) ([]*memory.MemoryRecord, error) {
 	if limit <= 0 {
 		limit = 20
