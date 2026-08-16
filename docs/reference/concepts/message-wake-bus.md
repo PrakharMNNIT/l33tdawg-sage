@@ -9,11 +9,26 @@ claim, presence, or workflow evidence.
 
 ## Durable sequence
 
-`internal/store/messages.go` (`SQLiteStore.SendLocalMessage`) inserts the
-canonical pending `msg-*` row, caller-scoped idempotency binding, and the
-recipient's next `message_wake_state.seq` in one SQLite transaction. A fresh
-recipient begins at sequence 1. An exact idempotent replay returns the original
-message and does not advance the sequence. A rollback advances nothing.
+The canonical `POST /v1/messages` path uses `SendLocalMessage` (`internal/store/messages.go:272-350`)
+to insert the pending `msg-*` row,
+caller-scoped idempotency binding, and the recipient's next
+`message_wake_state.seq` in one SQLite transaction. A fresh recipient begins at
+sequence 1. An exact idempotent replay returns the original message and does not
+advance the sequence. A rollback advances nothing.
+
+The deprecated `POST /v1/pipe/send` route now preserves the same wake invariant
+for exact local recipients. A request carrying `idempotency_key` uses the keyed
+`SendLocalMessage` (`internal/store/messages.go:272-350`) path. An unkeyed request uses
+`AdmitLocalMessage` (`internal/store/messages.go:351-387`), which inserts the row and allocates the
+sequence in one transaction without creating a replay mapping. After either
+fresh path commits, `handlePipeSend` (`api/rest/pipe_handler.go:619-1033`) publishes only the
+returned process-local non-zero generation. A keyed replay loads
+the original row without `WakeSeq`, so it neither advances nor republishes the
+generation. Provider-only and federated rows have no exact local recipient and
+do not allocate an exact-recipient sequence. If the active backend cannot
+perform atomic canonical admission, an exact-local pipe send fails with HTTP
+501 before inserting anything rather than creating a row wake consumers cannot
+observe as new.
 
 `SQLiteStore.GetMessageWakeState` returns only:
 
@@ -72,9 +87,10 @@ cancel, or compete with the long-running wake consumer.
 ## Broker and reconnect safety
 
 `api/rest/message_wake.go` (`messageWakeBroker`) is process-local acceleration
-only. Publication occurs after `SendLocalMessage` returns committed, and only
-for a fresh admission. A missing publication or process crash cannot lose the
-wake: reconnect reads the durable sequence before waiting on the broker.
+only. Publication occurs after an atomic message admission returns committed,
+and only when it returns a fresh non-zero `WakeSeq`. A missing publication or
+process crash cannot lose the wake: reconnect reads the durable sequence before
+waiting on the broker.
 
 One exact agent has one active consumer lease. The same `consumer_id` may
 supersede its stale connection; a different consumer receives `409` until the

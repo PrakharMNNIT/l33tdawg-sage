@@ -1717,9 +1717,42 @@ components:
           description: Arbitrary content.
         ttl_minutes:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 1440
-          description: Defaults to 60.
+          description: With idempotency_key, omitted/0 is durable until handled; without a key, omitted/0 uses the legacy 1440-minute lifetime. Values 1-1440 request explicit expiry.
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Optional caller-scoped replay key. Exact retry returns the original row; same key with different content is a conflict.
+
+    PipeSendResponse:
+      type: object
+      required: [pipe_id, status, expires_at, destination_chain_id, idempotent_replay]
+      properties:
+        pipe_id:
+          type: string
+          pattern: '^msg-'
+        status:
+          type: string
+          example: pending
+        expires_at:
+          type: string
+          format: date-time
+        destination_chain_id:
+          type: string
+          description: Exact remote SAGE chain for a federated send; empty for local work.
+        idempotent_replay:
+          type: boolean
+          description: True only when a keyed request returned its original row without another admission or wake generation.
+        transport_status:
+          type: string
+          enum: [queued]
+          description: Present only for a federated send; confirms durable local queuing, not peer receipt.
+        peer_status:
+          type: string
+          enum: [unconfirmed]
+          description: Present only for a federated send; the remote peer and agent have not yet acknowledged delivery.
 
     PipeResultRequest:
       type: object
@@ -5151,32 +5184,30 @@ paths:
             schema:
               $ref: "#/components/schemas/PipeSendRequest"
       responses:
+        "200":
+          description: Exact idempotent replay of the original pipeline message.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PipeSendResponse"
         "201":
           description: Pipeline message queued.
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  pipe_id:
-                    type: string
-                  status:
-                    type: string
-                    example: pending
-                  expires_at:
-                    type: string
-                    format: date-time
-                  destination_chain_id:
-                    type: string
-                    description: Exact remote SAGE chain for a federated send; empty for local work.
+                $ref: "#/components/schemas/PipeSendResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
 
   /v1/pipe/inbox:
     get:

@@ -975,8 +975,8 @@ type MessageStore interface {
 	// AdmitLocalMessage is the unkeyed sibling of SendLocalMessage: it inserts
 	// an exact-local row and advances that recipient's wake sequence in ONE
 	// transaction. Bare InsertPipeline must not be used for exact-local
-	// canonical work, because a row with no wake generation is work the
-	// recipient can never be told about.
+	// canonical work, because wake consumers cannot observe a row with no wake
+	// generation as newly admitted work.
 	AdmitLocalMessage(ctx context.Context, msg *PipelineMessage) (*PipelineMessage, error)
 	SendFederatedMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage, event *PipelineTransportOutbox) (*PipelineMessage, bool, error)
 	ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int, claimantSessionID ...string) ([]*PipelineMessage, bool, error)

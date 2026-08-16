@@ -943,8 +943,8 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 		// Exact-local canonical work must never be admitted through a bare
 		// InsertPipeline. That allocates no wake generation, so the recipient's
 		// durable sequence never moves and every "is this newer than what I last
-		// saw" consumer answers no — forever. The row is real work nobody can be
-		// told about, which is the silent state this release exists to remove.
+		// saw" consumer answers no. Legacy polling could still find the row, but
+		// wake consumers could not observe it as a new generation.
 		messageStore, messageOK := s.store.(store.MessageStore)
 		switch {
 		case !messageOK:
@@ -995,19 +995,11 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 			nudger.NudgePipelineTransport()
 		}
 	}
-	// Publish the process-local wake only AFTER the transaction committed, and
-	// only for a fresh admission: a replay already published when it was first
-	// admitted, and publishing again would invent a generation no durable
-	// sequence backs.
-	//
-	// The WakeSeq>0 test is what actually enforces this today — WakeSeq is
-	// process-local return metadata (store.PipelineMessage, json:"-") that
-	// GetPipeline never populates, so a keyed replay comes back as zero. The
-	// !idempotentReplay clause is therefore redundant RIGHT NOW and is kept
-	// deliberately: it states the intent, and it is the guard that still holds
-	// if WakeSeq ever becomes a stored column. Do not read it as load-bearing
-	// on its own — a mutation removing it will not fail any test.
-	if !idempotentReplay && msg.WakeSeq > 0 {
+	// Publish the process-local wake only AFTER the transaction committed.
+	// WakeSeq is process-local return metadata populated by fresh atomic
+	// admissions only; GetPipeline does not populate it, so an idempotent replay
+	// returns zero and cannot publish the same durable generation again.
+	if msg.WakeSeq > 0 {
 		s.publishMessageWake(msg.ToAgent, msg.WakeSeq)
 	}
 

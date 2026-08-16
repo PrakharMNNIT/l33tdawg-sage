@@ -172,6 +172,35 @@ test('v11.17 app-v23 through app-v26 public contract markers stay release-visibl
   assert.match(environment, /not an upgraded-node repair selector/);
 });
 
+test('legacy pipe send documents canonical exact-local admission and replay', () => {
+  const openapi = read('api/openapi.yaml');
+  const schemaStart = openapi.indexOf('    PipeSendRequest:');
+  const schemaEnd = openapi.indexOf('    PipeResultRequest:', schemaStart);
+  const routeStart = openapi.indexOf('  /v1/pipe/send:');
+  const routeEnd = openapi.indexOf('  /v1/pipe/inbox:', routeStart);
+  assert.notEqual(schemaStart, -1);
+  assert.notEqual(schemaEnd, -1);
+  assert.notEqual(routeStart, -1);
+  assert.notEqual(routeEnd, -1);
+
+  const schema = openapi.slice(schemaStart, schemaEnd);
+  const route = openapi.slice(routeStart, routeEnd);
+  assert.match(schema, /ttl_minutes:\n\s+type: integer\n\s+minimum: 0\n\s+maximum: 1440/);
+  assert.match(schema, /idempotency_key:\n\s+type: string\n\s+minLength: 1\n\s+maxLength: 256/);
+  assert.match(schema, /PipeSendResponse:[\s\S]*required: \[pipe_id, status, expires_at, destination_chain_id, idempotent_replay\]/);
+  assert.match(schema, /pipe_id:\n\s+type: string\n\s+pattern: '\^msg-'/);
+  assert.match(route, /"200":[\s\S]*PipeSendResponse/);
+  assert.match(route, /"201":[\s\S]*PipeSendResponse/);
+  assert.match(route, /"409":[\s\S]*Conflict/);
+  assert.match(route, /"501":[\s\S]*NotImplemented/);
+
+  const rest = read('docs/reference/rest-api.md');
+  const wake = read('docs/reference/concepts/message-wake-bus.md');
+  assert.match(rest, /HTTP 201 fresh; HTTP 200 exact keyed replay/);
+  assert.match(rest, /HTTP 501 before insertion/);
+  assert.match(wake, /Provider-only and federated rows have no exact local recipient/);
+});
+
 test('hybrid expansion authorization contract stays release-visible', () => {
   const section = (path, start, end) => {
     const body = read(path);

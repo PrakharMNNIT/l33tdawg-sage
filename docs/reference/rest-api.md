@@ -1948,7 +1948,7 @@ vault-backed. A foreign request or result is never automatically journaled,
 embedded, indexed as memory, written to Badger/AppHash, or treated as trusted
 instructions (`internal/store/sqlite.go:4764-4837`,
 `internal/store/pipeline_transport.go:92-176`,
-`shouldAutoJournalPipeline`, `api/rest/pipe_handler.go:1950-1959`).
+`shouldAutoJournalPipeline`, `api/rest/pipe_handler.go:2006-2015`).
 
 ### `POST /v1/pipe/resolve`
 
@@ -2264,7 +2264,8 @@ Send a pipeline message to another agent or provider.
 | `destination_chain_id` | string | no | For a federated send, the exact chain returned by `/v1/pipe/resolve`; requires exact `to_agent` and empty `to_provider` |
 | `intent` | string | no | Human description of the work |
 | `payload` | string | yes | Arbitrary content |
-| `ttl_minutes` | int | no | 0–1440; omitted/0 is durable until handled; 1–1440 requests explicit expiry |
+| `ttl_minutes` | int | no | 0–1440. With `idempotency_key`, omitted/0 is durable until handled; without a key, the legacy route defaults omitted/0 to 1440 minutes. Values 1–1440 request explicit expiry. |
+| `idempotency_key` | string | no | Caller-scoped 1–256-byte token. Exact retry returns the original row; reusing the key for different content is HTTP 409. Omit only when replay protection is not required. |
 
 For a local send, the target must be registered here. For a federated send,
 call `/v1/pipe/resolve` first and sign its exact `source_chain_id`, `to_agent`,
@@ -2276,8 +2277,20 @@ cannot cross the federation edge. It additionally repeats the caller/domain
 intersection check described above, so a copied resolve response cannot bypass
 local policy (`api/rest/pipe_handler.go`).
 
-**Response** (HTTP 201):
-`{"pipe_id":"pipe-<uuid>","status":"pending","expires_at":"...","destination_chain_id":"<remote chain or empty>"}`.
+For an exact local recipient, both keyed and unkeyed admissions insert the
+`msg-*` row and advance that recipient's durable wake sequence in one
+transaction. Keyed sends use `SendLocalMessage` (`internal/store/messages.go:272-350`);
+unkeyed sends use `AdmitLocalMessage` (`internal/store/messages.go:351-387`). The route publishes
+the returned non-zero generation only after commit. A backend without that
+atomic canonical capability returns HTTP 501 before insertion
+(`handlePipeSend`, `api/rest/pipe_handler.go:619-1033`). Provider-only and
+federated rows do not allocate an exact-local wake sequence.
+
+**Response** (HTTP 201 fresh; HTTP 200 exact keyed replay):
+`{"pipe_id":"msg-<uuid>","status":"pending","expires_at":"...","destination_chain_id":"<remote chain or empty>","idempotent_replay":false}`.
+An exact keyed replay returns the original `msg-*` row with
+`idempotent_replay:true`, does not advance the durable sequence, and does not
+publish a second wake.
 For a remote send, `pending` means durably queued for delivery; it does not claim
 that the peer or agent has already received the work. Consequently, an exact
 address resolved from a bounded legacy-status offline cache can be accepted
@@ -2496,7 +2509,7 @@ Atomically claim a pipeline message (prevents double-processing).
 Submit a result for a claimed message. Purely local completion keeps the
 existing auto-journal summary. Federated completion does not journal and queues
 the result over the original agreement-bound return route
-(`handlePipeResult`, `api/rest/pipe_handler.go:1445-1621`).
+(`handlePipeResult`, `api/rest/pipe_handler.go:1501-1677`).
 
 **Request body:**
 
