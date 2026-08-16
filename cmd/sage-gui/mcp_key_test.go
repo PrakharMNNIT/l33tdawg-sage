@@ -8,9 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -79,17 +79,19 @@ func TestCanonicalWorkspaceRootCollapsesLinkedWorktree(t *testing.T) {
 }
 
 func TestCanonicalWorkspaceRootFailsClosedWhenGitProbeTimesOut(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("PATH shim uses a POSIX executable script")
-	}
-	shimDir := t.TempDir()
-	shim := filepath.Join(shimDir, "git")
-	require.NoError(t, os.WriteFile(shim, []byte("#!/bin/sh\nexec sleep 10\n"), 0o700))
-	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	_, err := canonicalWorkspaceRoot(t.TempDir())
+	started := time.Now()
+	_, err := canonicalWorkspaceRootWithProbe(t.TempDir(), func(ctx context.Context, _ string) ([]byte, error) {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		require.Less(t, time.Until(deadline), 3*time.Second,
+			"Git discovery must keep a bounded identity-resolution budget")
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
 	require.ErrorIs(t, err, context.DeadlineExceeded,
 		"a timed-out Git probe must not fall back to a transient worktree identity")
+	require.Less(t, time.Since(started), 4*time.Second,
+		"identity resolution must fail closed promptly when Git stalls")
 }
 
 func TestPrimaryWorkspaceMCPEnvPreservesPinnedProviderIdentity(t *testing.T) {

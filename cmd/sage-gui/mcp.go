@@ -249,14 +249,20 @@ func runMCP() error {
 // Non-Git projects retain their ordinary directory boundary. Recognised managed
 // scratch paths fail closed when Git cannot prove which repository owns them.
 func canonicalWorkspaceRoot(projectDir string) (string, error) {
+	return canonicalWorkspaceRootWithProbe(projectDir, func(ctx context.Context, clean string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, "git", "-C", clean, "rev-parse", "--show-toplevel", "--git-common-dir") //nolint:gosec // fixed executable/arguments; local workspace path only
+		return cmd.Output()
+	})
+}
+
+func canonicalWorkspaceRootWithProbe(projectDir string, probe func(context.Context, string) ([]byte, error)) (string, error) {
 	clean, err := filepath.Abs(projectDir)
 	if err != nil {
 		return "", err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", clean, "rev-parse", "--show-toplevel", "--git-common-dir") //nolint:gosec // fixed executable/arguments; local workspace path only
-	out, gitErr := cmd.Output()
+	out, gitErr := probe(ctx, clean)
 	if gitErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", fmt.Errorf("resolve git workspace: %w", ctxErr)
