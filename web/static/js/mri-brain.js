@@ -1628,6 +1628,9 @@ export function mountMriBrain(container, opts = {}) {
     graphLoads.invalidate();
     bloomLoads.invalidate();
     mode = next;
+    container.dispatchEvent(new CustomEvent('sage:mri-mode-change', {
+      detail: { mode },
+    }));
     connectomeActivity.reset();
     connectomeReloadIntent.reset();
     neuronBirths.reset();

@@ -351,6 +351,21 @@ test('agent tooltip is clamped, escaped, and includes identity plus visible traf
     'vertical tooltip placement must stay inside the renderer');
 });
 
+test('connectome mode suppresses memory-only empty and unavailable overlays', () => {
+  assert.match(mriSource,
+    /container\.dispatchEvent\(new CustomEvent\('sage:mri-mode-change',[\s\S]{0,100}detail: \{ mode \}/,
+    'the renderer must expose its actual active mode to the host');
+  assert.match(appSource,
+    /element\.addEventListener\('sage:mri-mode-change', onModeChange\)/,
+    'the dashboard must subscribe to renderer mode changes');
+  assert.match(appSource, /const showingMemoryView = mriMode === 'memory'/);
+  const overlayStart = appSource.indexOf('const showingMemoryView = mriMode');
+  const overlayEnd = appSource.indexOf('// Global tooltips state', overlayStart);
+  const overlayBlock = appSource.slice(overlayStart, overlayEnd);
+  assert.equal((overlayBlock.match(/showingMemoryView &&/g) || []).length, 3,
+    'all three memory-only overlays must be gated by the active MRI mode');
+});
+
 test('mode controls retain visible pressed and keyboard-focus styling in both themes', () => {
   const styleStart = mriSource.indexOf('const STYLE = `');
   const styleEnd = mriSource.indexOf('`;\n\nfunction injectStyleOnce', styleStart);
@@ -418,16 +433,19 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
   const modeAnnouncements = [];
   const runSetMode = new Function(
     'next', 'mode', 'allowConnectome', 'graphLoads', 'bloomLoads', 'connectomeActivity',
-    'connectomeReloadIntent', 'neuronBirths', 'currentDomain', 'leaveFocusForGraphReplacement', 'clearAgentSelection',
+    'connectomeReloadIntent', 'neuronBirths', 'currentDomain', 'container', 'CustomEvent', 'leaveFocusForGraphReplacement', 'clearAgentSelection',
     'hideExplorePanel', 'clearFocusMarker', 'updateModeChrome', 'hullState', '$',
     'sliderUnits', 'setHullOpacity', 'Graph', 'load', 'zoomOut', 'acquireInitialGraph',
     executableSetMode,
   );
   const resettable = () => ({ reset() {} });
   let focusLeaves = 0;
+  const modeEvents = [];
+  function FakeCustomEvent(type, init) { this.type = type; this.detail = init.detail; }
   runSetMode(
     'connectome', 'memory', true, { invalidate() {} }, { invalidate() {} }, resettable(),
-    resettable(), resettable(), null, () => { focusLeaves++; }, () => {}, () => {}, () => {},
+    resettable(), resettable(), null, { dispatchEvent(event) { modeEvents.push(event); } }, FakeCustomEvent,
+    () => { focusLeaves++; }, () => {}, () => {}, () => {},
     announce => modeAnnouncements.push(announce), { valueFor: () => 0.03 }, () => null,
     value => value, () => {}, null, () => {}, () => {}, () => {},
   );
@@ -435,6 +453,9 @@ test('mode chrome exposes coherent toggle state, active guidance, and live statu
     'the executable mode transition must invoke the announcing chrome path exactly once');
   assert.equal(focusLeaves, 1,
     'the executable mode transition must strip any distributed-engram bloom exactly once');
+  assert.deepEqual(modeEvents.map(event => [event.type, event.detail.mode]),
+    [['sage:mri-mode-change', 'connectome']],
+    'the host must receive the actual active mode so memory-only overlays can hide');
 });
 
 // Live firing pulses only the synapses that actually carried a message. The
