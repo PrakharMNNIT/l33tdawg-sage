@@ -118,7 +118,7 @@ with `SAGE_CLAUDE_CHANNEL=1` only when the attached host is known to consume
 `notifications/claude/channel`. Codex is always refused because it cannot
 consume that method and must not occupy the exclusive wake lease. Other hosts
 remain off unless explicitly enabled
-(`claudeChannelEnabled`, `mcp.go:321`). Constructing an MCP `Server` never
+(`claudeChannelEnabled`, `mcp.go:332`). Constructing an MCP `Server` never
 advertises or emits the experimental protocol on its own; the executable still
 makes an explicit enablement call (`EnableRESTClaudeChannel`, `internal/mcp/claude_wake_source.go:85`)
 through `ConfigureClaudeChannel` (`internal/mcp/claude_channel.go:50`).
