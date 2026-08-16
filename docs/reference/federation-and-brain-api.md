@@ -879,8 +879,9 @@ connection not paused ∩ source PeerRBAC Copy ∩ source Publish ∩ receiver S
 Receiver admission independently rechecks `remote Publish ∩ local Subscribe`.
 An absent peer-RBAC policy and a configured-empty policy both deny v3 Copy; v3
 never falls back to tx-33. These intersections and the fail-closed identity/CA
-binding are applied by `pairwiseEgressPolicy` and `pairwiseIngressPolicy`
-(`internal/federation/sync_outbox.go:628-665`).
+binding are applied by `pairwiseEgressPolicy`
+(`internal/federation/sync_outbox.go:571-622`) and `pairwiseIngressPolicy`
+(`internal/federation/sync_outbox.go:628-662`).
 
 Both original host and original guest may publish their own Copy offer and
 subscription after JOIN. They cannot edit the other node's choice. Lanes are
