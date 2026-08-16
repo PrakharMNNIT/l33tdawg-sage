@@ -1140,6 +1140,7 @@ function MriView({ sse }) {
     const [inventory, setInventory] = useState(null);
     const [projectionAvailability, setProjectionAvailability] = useState('loading');
     const [graphAvailability, setGraphAvailability] = useState('loading');
+    const [mriMode, setMriMode] = useState('memory');
     const [selectedDomain, setSelectedDomain] = useState('');
     useEffect(() => {
         if (!ref.current) return;
@@ -1150,7 +1151,12 @@ function MriView({ sse }) {
                 setGraphAvailability(state);
             }
         };
+        const onModeChange = event => {
+            const mode = event?.detail?.mode;
+            if (mode === 'memory' || mode === 'connectome') setMriMode(mode);
+        };
         element.addEventListener('sage:mri-graph-availability', onGraphAvailability);
+        element.addEventListener('sage:mri-mode-change', onModeChange);
         const cleanup = mountMriBrain(ref.current, {
             showScan: false,
             showDomainLegend: false,
@@ -1158,6 +1164,7 @@ function MriView({ sse }) {
         });
         return () => {
             element.removeEventListener('sage:mri-graph-availability', onGraphAvailability);
+            element.removeEventListener('sage:mri-mode-change', onModeChange);
             cleanup();
         };
     }, [sse]);
@@ -1175,23 +1182,24 @@ function MriView({ sse }) {
     const partialProjection = projectionAvailability === 'partial';
     const memoryViewUnavailable = projectionAvailability === 'unavailable' ||
         graphAvailability === 'unavailable';
+    const showingMemoryView = mriMode === 'memory';
     return html`<div class="mri-wrap">
         <div class="mri-stage" ref=${ref}></div>
         <${BrainDomainInventory} onInventory=${setInventory} onAvailability=${setProjectionAvailability}
             selectedDomain=${selectedDomain} onSelectDomain=${selectDomain} />
-        ${memoryViewUnavailable && html`<div class="brain-empty-overlay" role="alert">
+        ${showingMemoryView && memoryViewUnavailable && html`<div class="brain-empty-overlay" role="alert">
             <${EmptyState} icon="brain"
                 headline="Memory view temporarily unavailable"
                 hint="Your memories are still stored and unchanged. CEREBRUM refused to display an unverified or incomplete projection instead of pretending the brain is empty."
                 actionLabel="Reload CEREBRUM"
                 onAction=${() => window.location.reload()} />
         </div>`}
-        ${!memoryViewUnavailable && noLocalMemories && partialProjection && html`<div class="brain-empty-overlay" role="alert">
+        ${showingMemoryView && !memoryViewUnavailable && noLocalMemories && partialProjection && html`<div class="brain-empty-overlay" role="alert">
             <${EmptyState} icon="brain"
                 headline="No memories can be safely shown yet"
                 hint="Some historical records are hidden while CEREBRUM verifies them. Your stored data was not changed." />
         </div>`}
-        ${!memoryViewUnavailable && noLocalMemories && !partialProjection && html`<div class="brain-empty-overlay">
+        ${showingMemoryView && !memoryViewUnavailable && noLocalMemories && !partialProjection && html`<div class="brain-empty-overlay">
             <${EmptyState} icon="brain"
                 headline=${hasSharedDomains ? 'No memories stored locally' : 'Your brain is empty'}
                 hint=${hasSharedDomains

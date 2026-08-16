@@ -178,6 +178,21 @@ const STYLE = `
 .mrib .tip .h{color:#eaf4ff;font-weight:700;margin-bottom:2px}
 .mrib .tip .m{color:#5d7395;font-size:11px}
 .mrib .tip .chip{font-size:10px;padding:1px 6px;border-radius:6px;background:#0e1b30;color:#aecbf0;margin-right:4px}
+.mrib .tip .hint{margin-top:6px;color:#39d0ff;font-size:10px}
+.mrib .agent-browser{display:none;position:absolute;top:16px;right:16px;width:min(340px,calc(100% - 32px));z-index:8;padding:8px;background:rgba(10,16,28,.9);border:1px solid #15233b;border-radius:10px;backdrop-filter:blur(10px);box-shadow:0 8px 30px #0007}
+.mrib .agent-browser.visible{display:block}
+.mrib .agent-inspector{display:none;position:absolute;top:68px;right:16px;width:min(340px,calc(100% - 32px));max-height:calc(100% - 148px);overflow:auto;z-index:8;padding:14px;background:rgba(10,16,28,.92);border:1px solid #15233b;border-radius:12px;backdrop-filter:blur(10px);box-shadow:0 12px 44px #0009}
+.mrib .agent-inspector.visible{display:block}
+.mrib.with-domain-legend .agent-browser{left:16px;right:auto;top:82px}.mrib.with-domain-legend .agent-inspector{left:16px;right:auto;top:134px;max-height:calc(100% - 214px)}
+.mrib .ai-head{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px}
+.mrib .ai-neuron{width:12px;height:12px;border-radius:50%;margin-top:5px;box-shadow:0 0 12px currentColor;flex:none}
+.mrib .ai-heading{min-width:0;flex:1}.mrib .ai-kicker{color:#39d0ff;font-size:10px;letter-spacing:1.4px;text-transform:uppercase}.mrib .ai-name{color:#eaf4ff;font:700 15px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}.mrib .ai-role{color:#9fb6d8;font-size:11px;margin-top:2px}
+.mrib .ai-close{width:40px;height:40px;margin:-8px -8px 0 0;border:0;border-radius:9px;background:transparent;color:#9fb6d8;cursor:pointer;font:20px/1 sans-serif}.mrib .ai-close:hover{background:#0e1b30;color:#eaf4ff}
+.mrib .ai-select{min-width:0;width:100%;padding:8px 10px;color:#dceaff;background:#081221;border:1px solid #203455;border-radius:8px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.mrib .ai-section{border-top:1px solid #15233b;padding-top:10px;margin-top:10px}.mrib .ai-label{color:#5d7395;font-size:10px;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:3px}.mrib .ai-value{color:#dceaff;font-size:12px;overflow-wrap:anywhere}.mrib .ai-id-row{display:flex;gap:8px;align-items:flex-start}.mrib .ai-id{flex:1;color:#aecbf0;font-size:11px;word-break:break-all}.mrib .ai-copy,.mrib .ai-retry{border:1px solid #203455;border-radius:7px;background:transparent;color:#39d0ff;cursor:pointer;font:10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:4px 7px}.mrib .ai-copy:hover,.mrib .ai-retry:hover{background:#0e1b30}
+.mrib .ai-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}.mrib .ai-stat{padding:8px;border-radius:8px;background:rgba(14,27,48,.62)}.mrib .ai-stat b{display:block;color:#eaf4ff;font-size:14px}.mrib .ai-stat span{color:#5d7395;font-size:9px;letter-spacing:.8px;text-transform:uppercase}.mrib .ai-memory{color:#9fb6d8;font-size:11px}.mrib .ai-memory.error{color:#ff9aa5}.mrib .ai-memory-title{color:#dceaff;font-size:11px;margin:6px 0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mrib .ai-empty{color:#5d7395;font-size:11px}
+.mrib .ai-selected[hidden]{display:none}
+.mrib .agent-inspector :is(button,select):focus-visible{outline:2px solid #39d0ff;outline-offset:2px}
 .mrib .flag{position:absolute;bottom:16px;right:16px;color:#3a4a66;font-size:10px;letter-spacing:1px}
 .mrib .sr-status{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .mrib .boot{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#5d7395;letter-spacing:2px;font-size:12px}
@@ -249,11 +264,18 @@ const STYLE = `
 :root[data-theme="light"] .mrib .legend h4,
 :root[data-theme="light"] .mrib .legend .cls{border-color:#e2e8f0}
 :root[data-theme="light"] .mrib .tip{background:rgba(255,255,255,.97);border-color:#dbe3ec}
+:root[data-theme="light"] .mrib .agent-inspector{background:rgba(255,255,255,.94);border-color:#dbe3ec;box-shadow:0 8px 32px rgba(15,23,42,.15)}
+:root[data-theme="light"] .mrib .agent-browser{background:rgba(255,255,255,.94);border-color:#dbe3ec;box-shadow:0 8px 32px rgba(15,23,42,.12)}
+:root[data-theme="light"] .mrib .ai-name,:root[data-theme="light"] .mrib .ai-value,:root[data-theme="light"] .mrib .ai-stat b,:root[data-theme="light"] .mrib .ai-memory-title{color:#1e293b}
+:root[data-theme="light"] .mrib .ai-select{color:#1e293b;background:#fff;border-color:#cbd5e1}
+:root[data-theme="light"] .mrib .ai-stat{background:#f1f5f9}
 :root[data-theme="light"] .mrib .explore .ex-col{background:rgba(255,255,255,.6);border-color:#e2e8f0}
 :root[data-theme="light"] .mrib .explore .ex-card{background:rgba(240,244,249,.7)}
 :root[data-theme="light"] .mrib .explore .ex-card:hover{background:#e9eef4;border-color:#cbd5e1}
 :root[data-theme="light"] .mrib .flag{color:#94a3b8}
 :root[data-theme="light"] .mrib .hud .sld input{accent-color:#0891b2}
+@media (max-width:760px),(pointer:coarse){.mrib .agent-browser,.mrib.with-domain-legend .agent-browser{top:8px;left:8px;right:8px;width:auto}.mrib .agent-inspector,.mrib.with-domain-legend .agent-inspector{top:auto;left:8px;right:8px;bottom:72px;width:auto;max-height:55vh}.mrib .ai-close{width:44px;height:44px}}
+@media (prefers-reduced-motion:reduce){.mrib .agent-inspector,.mrib .tip{transition:none!important}}
 `;
 
 function injectStyleOnce() {
@@ -334,6 +356,7 @@ export function mountMriBrain(container, opts = {}) {
 
   const root = document.createElement('div');
   root.className = 'mrib';
+  root.classList.toggle('with-domain-legend', showDomainLegend);
   root.innerHTML = `
     <div class="mrib-graph"></div>
     <div class="boot">◉ ACQUIRING HIPPOCAMPAL FIELD…</div>
@@ -372,7 +395,17 @@ export function mountMriBrain(container, opts = {}) {
       ${allowConnectome ? '<button type="button" class="btn b-mode" aria-label="Connectome view" aria-pressed="false">◉ connectome</button>' : ''}
       <label class="sld">skull <input class="b-op" type="range" min="0" max="60" value="8"></label>
     </div>
-    <div class="tip"></div>
+    <div class="agent-browser" aria-hidden="true"><select class="ai-select" aria-label="Browse agents"><option value="">Browse agents…</option></select></div>
+    <aside class="agent-inspector" aria-label="Connectome agent details" aria-hidden="true">
+      <div class="ai-selected">
+        <div class="ai-head"><span class="ai-neuron"></span><div class="ai-heading"><div class="ai-kicker">Selected agent</div><div class="ai-name"></div><div class="ai-role"></div></div><button type="button" class="ai-close" aria-label="Close agent details">×</button></div>
+        <div class="ai-section"><div class="ai-label">Agent ID</div><div class="ai-id-row"><code class="ai-id"></code><button type="button" class="ai-copy">Copy</button></div></div>
+        <div class="ai-section"><div class="ai-label">Domain</div><div class="ai-value ai-domain"></div><div class="ai-label" style="margin-top:8px">Last retained message activity</div><div class="ai-value ai-activity"></div></div>
+        <div class="ai-section"><div class="ai-label">Visible retained traffic</div><div class="ai-grid"><div class="ai-stat"><b class="ai-in">0</b><span>Incoming</span></div><div class="ai-stat"><b class="ai-out">0</b><span>Outgoing</span></div><div class="ai-stat"><b class="ai-total">0</b><span>Total</span></div><div class="ai-stat"><b class="ai-peers">0</b><span>Connected agents</span></div></div><div class="ai-value ai-strongest" style="margin-top:8px"></div></div>
+        <div class="ai-section"><div class="ai-label">Visible memory lobe</div><div class="ai-memory"></div></div>
+      </div>
+    </aside>
+    <div class="tip" role="tooltip" aria-hidden="true"></div>
     <div class="flag"></div>
     <div class="sr-status" role="status" aria-live="polite"></div>`;
   container.appendChild(root);
@@ -578,6 +611,7 @@ export function mountMriBrain(container, opts = {}) {
   async function bloomEngrams(n){
     if (disposed || !Graph || !rendered || mode !== 'connectome') return;
     const agentID = n.agent_id || n.id;
+    if (selectedAgentID === agentID) { selectedMemoryState = { status:'loading' }; renderMemoryState(); }
     const bloomRequest = bloomLoads.begin(agentID);
     focusNeuron(n);
     // Clear any prior bloom IMMEDIATELY, before the fetch — so a failed, errored,
@@ -587,14 +621,16 @@ export function mountMriBrain(container, opts = {}) {
     let payload;
     try {
       const resp = await fetch(ENGRAMS_URL + '?agent=' + encodeURIComponent(agentID), { credentials: 'same-origin' });
-      if (!resp.ok) return;
+      if (!resp.ok) { if (selectedAgentID===agentID) { selectedMemoryState={status:'error'}; renderMemoryState(); } return; }
       payload = await resp.json();
-    } catch (e) { console.warn('[mri] engrams unavailable:', e.message); return; }
+    } catch (e) { console.warn('[mri] engrams unavailable:', e.message); if (selectedAgentID===agentID) { selectedMemoryState={status:'error'}; renderMemoryState(); } return; }
     // Superseded (another neuron clicked while this was in flight) or torn down:
     // drop the stale response rather than bloom it under the wrong focus.
     if (disposed || !Graph || mode !== 'connectome' || focusId !== n.id ||
         !bloomLoads.isCurrent(bloomRequest, agentID)) return;
     const engrams = mapEngrams(payload);
+    selectedMemoryState = { status:'ready', memories:engrams, continuation:payload && payload.continuation_required === true, partial:!!(payload && payload.projection && payload.projection.partial === true) };
+    renderMemoryState();
     const composed = applyEngramBloom(Graph.graphData(), engrams, n, focusSet, placeNear);
     focusId = n.id; focusSet = composed.focusSet;
     Graph.graphData(composed.graphData);
@@ -691,6 +727,9 @@ export function mountMriBrain(container, opts = {}) {
 
   let Graph = null, controls = null, disposed = false, flow = true, scanning = true;
   let lastNodeClickAt = 0, graphPointerDown = null;
+  let selectedAgentID = null, selectedAgentNode = null;
+  let selectedMemoryState = null;
+  let pointerX = 0, pointerY = 0;
   let hullMat = null, brainMat = null, surfMat = null, curOpacity = hullState.valueFor(mode);
   let focusMarker = null, focusRingTexture = null;
   let currentDomain = null;                 // drill-down lobe (null = overview)
@@ -718,6 +757,100 @@ export function mountMriBrain(container, opts = {}) {
       detail: { state },
     }));
   };
+
+  const agentName = n => String((n && (n.label || n.agent_id)) || 'Unknown agent');
+  const agentRole = n => String((n && n.role) || 'Unknown role');
+  const agentDomain = n => String((n && n.agent_domain) || 'No domain');
+  function activityLabel(value){
+    if (!value) return 'No recorded retained activity';
+    const at = new Date(value);
+    if (Number.isNaN(at.getTime())) return 'No recorded retained activity';
+    const age = Math.max(0, Date.now() - at.getTime());
+    const relative = age < 60000 ? 'Traffic just now'
+      : age < 3600000 ? `Last traffic ${Math.floor(age/60000)}m ago`
+      : age < 86400000 ? `Last traffic ${Math.floor(age/3600000)}h ago`
+      : `Last traffic ${Math.floor(age/86400000)}d ago`;
+    return `${relative} · ${at.toLocaleString()}`;
+  }
+  function populateAgentPicker(d){
+    const select = $('.ai-select'); if (!select) return;
+    const nodes = (d && Array.isArray(d.nodes) ? d.nodes : []).filter(n => n.isNeuron && n.agent_id);
+    select.innerHTML = '<option value="">Browse agents…</option>';
+    nodes.sort((a,b)=>agentName(a).localeCompare(agentName(b))).forEach(n => {
+      const option = document.createElement('option');
+      option.value = n.agent_id; option.textContent = `${agentName(n)} · ${n.agent_id}`;
+      select.appendChild(option);
+    });
+    select.value = selectedAgentID || '';
+  }
+  function renderMemoryState(){
+    const el = $('.ai-memory'); if (!el) return;
+    const state = selectedMemoryState;
+    el.className = 'ai-memory'; el.innerHTML = '';
+    if (!state || state.status === 'loading') { el.textContent = 'Loading visible committed memories…'; return; }
+    if (state.status === 'error') {
+      el.classList.add('error'); el.textContent = 'Couldn’t load visible memories. ';
+      const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'ai-retry'; retry.textContent = 'Retry';
+      retry.onclick = () => { if (selectedAgentNode) { selectedMemoryState = { status:'loading' }; renderMemoryState(); bloomEngrams(selectedAgentNode); } };
+      el.appendChild(retry); return;
+    }
+    const memories = state.memories || [];
+    if (!memories.length) {
+      el.textContent = `No visible committed memories in this result.${state.partial ? ' Some records may be temporarily hidden by projection health.' : ''}${state.continuation ? ' More may exist beyond this bounded view.' : ''}`;
+      return;
+    }
+    const summary = document.createElement('div');
+    summary.textContent = `${memories.length} visible memor${memories.length===1?'y':'ies'}${state.continuation ? ' · showing top results' : ''}${state.partial ? ' · projection partial' : ''}`;
+    el.appendChild(summary);
+    memories.slice(0,3).forEach(memory => { const row=document.createElement('div'); row.className='ai-memory-title'; row.textContent=memory.label||memory.memory_id||'Untitled memory'; el.appendChild(row); });
+  }
+  function renderAgentInspector(n, announce=false){
+    const inspector = $('.agent-inspector'); if (!inspector) return;
+    const chosen = !!(n && n.isNeuron && n.agent_id);
+    inspector.classList.toggle('visible', mode === 'connectome' && chosen);
+    inspector.setAttribute('aria-hidden', mode === 'connectome' && chosen ? 'false' : 'true');
+    if (!chosen) return;
+    selectedAgentID = n.agent_id; selectedAgentNode = n;
+    $('.ai-select').value = selectedAgentID;
+    $('.ai-neuron').style.background = domainColor(n.domain);
+    $('.ai-neuron').style.color = domainColor(n.domain);
+    $('.ai-name').textContent = agentName(n); $('.ai-role').textContent = agentRole(n);
+    $('.ai-id').textContent = n.agent_id; $('.ai-domain').textContent = agentDomain(n);
+    $('.ai-activity').textContent = activityLabel(n._activity);
+    $('.ai-in').textContent = fmtN(n._incoming); $('.ai-out').textContent = fmtN(n._outgoing);
+    $('.ai-total').textContent = fmtN(n._w); $('.ai-peers').textContent = fmtN(n._peers);
+    const peer = n._strongest_peer && rendered && rendered.nodes.find(x=>x.agent_id===n._strongest_peer);
+    $('.ai-strongest').textContent = n._strongest_peer
+      ? `Strongest visible connection: ${agentName(peer || {agent_id:n._strongest_peer})} · ${fmtN(n._strongest_peer_traffic)} retained messages`
+      : 'No visible connected agents';
+    renderMemoryState();
+    if (announce) { const status=$('.sr-status'); if(status) status.textContent=`Selected agent ${agentName(n)}, ${n.agent_id}.`; }
+  }
+  function clearAgentSelection(announce=false){
+    selectedAgentID = null; selectedAgentNode = null; selectedMemoryState = null;
+    const select=$('.ai-select'); if(select) select.value='';
+    renderAgentInspector(null);
+    if (announce) { const status=$('.sr-status'); if(status) status.textContent='Agent selection cleared.'; }
+  }
+  function selectNeuron(n){
+    if (mode !== 'connectome' || !n || !n.isNeuron || !n.agent_id) return;
+    selectedMemoryState = { status:'loading' };
+    renderAgentInspector(n, true);
+    bloomEngrams(n);
+  }
+  function restoreSelectedAgent(d){
+    if (!selectedAgentID) return;
+    const selected = d.nodes.find(n=>n.isNeuron && n.agent_id===selectedAgentID);
+    if (!selected) { clearAgentSelection(); const status=$('.sr-status'); if(status) status.textContent='Selected agent is no longer available.'; return; }
+    selectedAgentNode=selected; renderAgentInspector(selected); focusNeuron(selected);
+    if (selectedMemoryState && selectedMemoryState.status==='ready') {
+      const composed=applyEngramBloom(Graph.graphData(), selectedMemoryState.memories||[], selected, focusSet, placeNear);
+      focusId=selected.id; focusSet=composed.focusSet; Graph.graphData(composed.graphData);
+      Graph.nodeColor(nodeColorRGBA); setFocusMarkerNode(selected);
+    } else if (selectedMemoryState && selectedMemoryState.status==='loading') {
+      selectedMemoryState={status:'loading'}; renderMemoryState(); bloomEngrams(selected);
+    }
+  }
 
   function setHullOpacity(o){
     curOpacity = o;
@@ -922,6 +1055,8 @@ export function mountMriBrain(container, opts = {}) {
       rendered = d;
       refreshCounts(d);
       buildLobes(d);
+      populateAgentPicker(d);
+      restoreSelectedAgent(d);
       connectomeReloadIntent.settle(request.mode, tickGeneration, true);
     }).catch(() => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
@@ -977,7 +1112,7 @@ export function mountMriBrain(container, opts = {}) {
   }
 
   function exitFocus(){
-    if (!focusId) return;
+    if (!focusId && !selectedAgentID) return;
     bloomLoads.invalidate();
     focusId = null; focusSet = null;
     clearFocusMarker();
@@ -986,6 +1121,7 @@ export function mountMriBrain(container, opts = {}) {
       Graph.nodeColor(nodeColorRGBA);
     }
     hideExplorePanel();
+    clearAgentSelection(true);
     zoomOut();
   }
 
@@ -1192,7 +1328,7 @@ export function mountMriBrain(container, opts = {}) {
       .linkDirectionalParticleWidth(1.1).linkDirectionalParticleSpeed(linkParticleSpeedFor)
       .warmupTicks(1).cooldownTicks(6)
       .onNodeHover(showTip)
-      .onNodeClick(n=>{ lastNodeClickAt = performance.now(); if (mode==='connectome') { if (n.isNeuron) bloomEngrams(n); } else exploreNode(n); })
+      .onNodeClick(n=>{ lastNodeClickAt = performance.now(); hideTip(); if (mode==='connectome') { if (n.isNeuron) selectNeuron(n); } else exploreNode(n); })
       .onBackgroundClick(()=>{ exitFocus(); });
 
     // Positions are pinned by placeNodes() (fx/fy/fz), so disable the force
@@ -1311,6 +1447,8 @@ export function mountMriBrain(container, opts = {}) {
     } catch(e){ /* hull optional */ }
 
     buildLobes(data);
+    populateAgentPicker(data);
+    renderAgentInspector(null);
     const lt=$('.linktypes');
     if (lt) Object.values(LINK_TYPES).filter(t=>t.typed).forEach(t=>lt.insertAdjacentHTML('beforeend',
       `<div class="row"><span class="bar" style="background:${t.color}"></span><div class="t"><span>${t.label}</span></div></div>`));
@@ -1403,7 +1541,7 @@ export function mountMriBrain(container, opts = {}) {
       // Deep-link: auto-bloom a requested agent's lobe on first connectome paint.
       if (focusAgent && !autoBloomed && mode === 'connectome' && rendered) {
         const target = rendered.nodes.find(nd => nd.isNeuron && (nd.agent_id || nd.id) === focusAgent);
-        if (target) { autoBloomed = true; deepLinkTimer = setTimeout(() => { if (!disposed) bloomEngrams(target); }, 50); }
+        if (target) { autoBloomed = true; deepLinkTimer = setTimeout(() => { if (!disposed) selectNeuron(target); }, 50); }
       }
     }).catch(() => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
@@ -1415,20 +1553,34 @@ export function mountMriBrain(container, opts = {}) {
   }
   acquireInitialGraph();
 
-  function showTip(n){ const tip=$('.tip'); if(!n){ tip.style.display='none'; return; }
-    tip.style.display='block';
-    if(n.isNeuron){
-      tip.innerHTML=`<div class="h">${escapeHtml((n.label||'').slice(0,90))}</div><div class="m">neuron · ${escapeHtml(n.role||'agent')}${n.domain?` · ${escapeHtml(n.domain)}`:''}</div>
-        <div style="margin-top:5px"><span class="chip">traffic ${n._w|0}</span><span class="chip">${(n._deg||0)>=0.5?'hub':'node'}</span></div>`;
-      return;
+  function hideTip(){ const tip=$('.tip'); if(!tip) return; tip.style.display='none'; tip.setAttribute('aria-hidden','true'); }
+  function positionTip(){
+    const tip=$('.tip'); if(!tip || tip.style.display!=='block') return;
+    const r=root.getBoundingClientRect(), gap=14, pad=8;
+    let left=pointerX-r.left+gap, top=pointerY-r.top+gap;
+    if (left+tip.offsetWidth+pad>r.width) left=pointerX-r.left-tip.offsetWidth-gap;
+    if (top+tip.offsetHeight+pad>r.height) top=pointerY-r.top-tip.offsetHeight-gap;
+    tip.style.left=Math.max(pad,Math.min(r.width-tip.offsetWidth-pad,left))+'px';
+    tip.style.top=Math.max(pad,Math.min(r.height-tip.offsetHeight-pad,top))+'px';
+  }
+  function showTip(n){ const tip=$('.tip'); if(!n){ hideTip(); return; }
+    if (mode !== 'connectome') {
+      tip.style.display='block'; tip.setAttribute('aria-hidden','false');
+      tip.innerHTML=`<div class="h">${escapeHtml((n.label||'').slice(0,90))}</div><div class="m">${escapeHtml(n.domain)} · ${escapeHtml(n.memory_type||'—')} · ${escapeHtml(n.status)}</div><div style="margin-top:5px"><span class="chip">conf ${(+n.confidence).toFixed(2)}</span><span class="chip">corroborated ×${n.corroboration_count|0}</span></div>`;
+      positionTip(); return;
     }
-    tip.innerHTML=`<div class="h">${escapeHtml((n.label||'').slice(0,90))}</div><div class="m">${escapeHtml(n.domain)} · ${escapeHtml(n.memory_type||'—')} · ${escapeHtml(n.status)}</div>
-      <div style="margin-top:5px"><span class="chip">conf ${(+n.confidence).toFixed(2)}</span><span class="chip">corroborated ×${n.corroboration_count|0}</span></div>`; }
-  function onMove(e){ const tip=$('.tip'); if(tip.style.display==='block'){ const r=root.getBoundingClientRect();
-    tip.style.left=(e.clientX-r.left+14)+'px'; tip.style.top=(e.clientY-r.top+14)+'px'; } }
-  function isPanelTarget(t){ return !!(t && t.closest && t.closest('.panel')); }
+    if (!n.isNeuron) { hideTip(); return; }
+    const id=String(n.agent_id||'Unknown agent'), short=id.length>30?id.slice(0,14)+'…'+id.slice(-10):id;
+    tip.style.display='block'; tip.setAttribute('aria-hidden','false');
+    tip.innerHTML=`<div class="h"><span class="dot" style="width:8px;height:8px;background:${domainColor(n.domain)};margin-right:7px"></span>${escapeHtml(agentName(n))}</div><div class="m">Agent · ${escapeHtml(agentRole(n))} · ${escapeHtml(agentDomain(n))}</div><div class="m" title="${escapeHtml(id)}">${escapeHtml(short)}</div>
+      <div style="margin-top:5px"><span class="chip">in ${fmtN(n._incoming)}</span><span class="chip">out ${fmtN(n._outgoing)}</span><span class="chip">${fmtN(n._peers)} peers</span></div><div class="m" style="margin-top:5px">${escapeHtml(activityLabel(n._activity))}</div><div class="hint">Click for agent details</div>`;
+    positionTip();
+  }
+  function onMove(e){ pointerX=e.clientX; pointerY=e.clientY; positionTip(); }
+  function isPanelTarget(t){ return !!(t && t.closest && t.closest('.panel,.agent-browser,.agent-inspector')); }
   function onGraphPointerDown(e){
     if (isPanelTarget(e.target)) return;
+    hideTip();
     graphPointerDown = { x: e.clientX, y: e.clientY };
   }
   function onGraphClick(e){
@@ -1437,7 +1589,7 @@ export function mountMriBrain(container, opts = {}) {
     if (graphPointerDown && Math.hypot(e.clientX - graphPointerDown.x, e.clientY - graphPointerDown.y) > 6) return;
     exitFocus();
   }
-  root.addEventListener('mousemove', onMove);
+  root.addEventListener('pointermove', onMove, true);
   root.addEventListener('pointerdown', onGraphPointerDown);
   root.addEventListener('click', onGraphClick);
   // Relabel the stat panel and expose mode-specific guidance through the
@@ -1445,6 +1597,7 @@ export function mountMriBrain(container, opts = {}) {
   // visible panel over the graph.
   function updateModeChrome(announce=false){
     const connectome = mode === 'connectome';
+    hideTip();
     const btn=$('.b-mode');
     if(btn) {
       btn.textContent = '◉ connectome';
@@ -1452,10 +1605,12 @@ export function mountMriBrain(container, opts = {}) {
       btn.setAttribute('aria-pressed', connectome ? 'true' : 'false');
     }
     const title = $('.lg-title'); if (title) title.textContent = connectome ? 'Connectome' : 'Domain tags';
+    const browser = $('.agent-browser'); if (browser) { browser.classList.toggle('visible',connectome); browser.setAttribute('aria-hidden',connectome?'false':'true'); }
     const memoryGuide = $('.guide-memory'); if (memoryGuide) memoryGuide.hidden = connectome;
     const connectomeGuide = $('.guide-connectome'); if (connectomeGuide) connectomeGuide.hidden = !connectome;
     const set = mode==='connectome' ? ['neurons','synapses','hubs'] : ['memories','synapses','consolidated'];
     root.querySelectorAll('.hud .l').forEach((el,i)=>{ if(set[i]) el.textContent=set[i]; });
+    renderAgentInspector(connectome ? selectedAgentNode : null);
     if (announce) {
       const status = $('.sr-status');
       if (status) status.textContent = connectome
@@ -1473,11 +1628,15 @@ export function mountMriBrain(container, opts = {}) {
     graphLoads.invalidate();
     bloomLoads.invalidate();
     mode = next;
+    container.dispatchEvent(new CustomEvent('sage:mri-mode-change', {
+      detail: { mode },
+    }));
     connectomeActivity.reset();
     connectomeReloadIntent.reset();
     neuronBirths.reset();
     currentDomain = null;
     leaveFocusForGraphReplacement();
+    clearAgentSelection(false);
     updateModeChrome(true);
     // Recall this view's remembered skull opacity (its default, or the operator's
     // last manual choice for this view) and reflect it on the slider, so a round
@@ -1493,6 +1652,21 @@ export function mountMriBrain(container, opts = {}) {
   $('.b-flow').onclick=function(){ flow=!flow; if(Graph) Graph.linkDirectionalParticles(linkParticlesFor); this.textContent=flow?'⚡ flow: on':'⚡ flow: off'; };
   $('.b-op').oninput=function(){ const o=this.value/100; setHullOpacity(o); hullState.record(mode, o); };
   if (allowConnectome) $('.b-mode').onclick=function(){ setMode(mode==='connectome'?'memory':'connectome'); };
+  $('.ai-select').onchange=function(){
+    if (!this.value) { if(selectedAgentID) exitFocus(); return; }
+    if (mode!=='connectome' || !rendered) return;
+    const n=rendered.nodes.find(node=>node.isNeuron && node.agent_id===this.value);
+    if(n) selectNeuron(n);
+  };
+  $('.ai-close').onclick=()=>{ exitFocus(); $('.ai-select').focus(); };
+  $('.ai-copy').onclick=async function(){
+    if(!selectedAgentID) return;
+    try { await navigator.clipboard.writeText(selectedAgentID); this.textContent='Copied'; setTimeout(()=>{ if(!disposed) this.textContent='Copy'; },1200); }
+    catch(e){ this.textContent='Unavailable'; }
+  };
+  const onKeyDown=e=>{ if(e.key==='Escape' && selectedAgentID) { e.preventDefault(); exitFocus(); $('.ai-select').focus(); } };
+  document.addEventListener('keydown',onKeyDown);
+  subs.push(()=>document.removeEventListener('keydown',onKeyDown));
 
   return function cleanup(){
     disposed = true;
@@ -1503,7 +1677,7 @@ export function mountMriBrain(container, opts = {}) {
     clearInterval(dormancyTimer);
     clearTimeout(deepLinkTimer);
     subs.forEach(u => { try { u && u(); } catch(e){ /* noop */ } });
-    root.removeEventListener('mousemove', onMove);
+    root.removeEventListener('pointermove', onMove, true);
     root.removeEventListener('pointerdown', onGraphPointerDown);
     root.removeEventListener('click', onGraphClick);
     try {

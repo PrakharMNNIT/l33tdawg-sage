@@ -63,11 +63,22 @@ export function mapConnectome(g) {
   const ids = new Set(srcNeurons.map(n => n.agent_id));
 
   const weight = {};
+  const incoming = {}, outgoing = {}, peers = {}, peerTraffic = {};
   const activity = {};   // most recent last_fired across a neuron's incident edges
   let maxWeight = 0, maxCount = 0;
   for (const s of srcSynapses) {
     if (!ids.has(s.from_agent) || !ids.has(s.to_agent)) continue;
     const c = s.count || 0;
+    outgoing[s.from_agent] = (outgoing[s.from_agent] || 0) + c;
+    incoming[s.to_agent] = (incoming[s.to_agent] || 0) + c;
+    if (s.from_agent !== s.to_agent) {
+      (peers[s.from_agent] ||= new Set()).add(s.to_agent);
+      (peers[s.to_agent] ||= new Set()).add(s.from_agent);
+      (peerTraffic[s.from_agent] ||= {})[s.to_agent] = peerTraffic[s.from_agent][s.to_agent] || 0;
+      peerTraffic[s.from_agent][s.to_agent] += c;
+      (peerTraffic[s.to_agent] ||= {})[s.from_agent] = peerTraffic[s.to_agent][s.from_agent] || 0;
+      peerTraffic[s.to_agent][s.from_agent] += c;
+    }
     weight[s.from_agent] = (weight[s.from_agent] || 0) + c;
     weight[s.to_agent] = (weight[s.to_agent] || 0) + c;
     if (c > maxCount) maxCount = c;
@@ -80,14 +91,23 @@ export function mapConnectome(g) {
   }
   for (const w of Object.values(weight)) { if (w > maxWeight) maxWeight = w; }
 
-  const nodes = srcNeurons.map(n => ({
+  const nodes = srcNeurons.map(n => {
+    const strongest = Object.entries(peerTraffic[n.agent_id] || {})
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0] || null;
+    return ({
     id: agentNodeID(n.agent_id),
     agent_id: n.agent_id,
+    agent_domain: n.domain || '',
     domain: n.domain || n.role || 'agent',
     label: n.name || n.agent_id,
     role: n.role || '',
     isNeuron: true,
     _w: weight[n.agent_id] || 0,
+    _incoming: incoming[n.agent_id] || 0,
+    _outgoing: outgoing[n.agent_id] || 0,
+    _peers: (peers[n.agent_id] || new Set()).size,
+    _strongest_peer: strongest ? strongest[0] : '',
+    _strongest_peer_traffic: strongest ? strongest[1] : 0,
     _deg: maxWeight ? (weight[n.agent_id] || 0) / maxWeight : 0,
     // most recent activity across this neuron's synapses ('' = never fired), used
     // by the client to grey out dormant agents (rung 5 pruning).
@@ -95,7 +115,8 @@ export function mapConnectome(g) {
     // memory fields the shared render/tip paths read, given neutral values
     status: 'committed', confidence: 1, corroboration_count: 0,
     memory_type: 'agent', created_at: '',
-  }));
+    });
+  });
 
   const links = srcSynapses
     .filter(s => ids.has(s.from_agent) && ids.has(s.to_agent))
