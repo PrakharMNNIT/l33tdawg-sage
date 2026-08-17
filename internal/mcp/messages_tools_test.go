@@ -1304,6 +1304,17 @@ func TestInboxDegradesWhenOwnClaimedVisibilityFails(t *testing.T) {
 	}
 }
 
+func TestInboxMentionsUnavailableOwnClaimsAlongsideNewWork(t *testing.T) {
+	response := map[string]any{
+		"count":   1,
+		"message": "You have 1 inbox item(s).",
+	}
+	mergeOwnClaimedUnfinishedSurface(response, map[string]any{
+		"own_claimed_unfinished_state": "unavailable",
+	})
+	require.Contains(t, response["message"], "Same-session claimed-work visibility is unavailable")
+}
+
 func TestInboxUsesAuthoritativeClaimedElsewhereScalar(t *testing.T) {
 	var claimantSessionID string
 	mux := http.NewServeMux()

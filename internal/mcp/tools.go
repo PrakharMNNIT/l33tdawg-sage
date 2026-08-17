@@ -4785,6 +4785,8 @@ func mergeOwnClaimedUnfinishedSurface(response, surface map[string]any) {
 				"Your inbox is clear: no task assignments or agent messages.",
 				"No new unclaimed task assignments or agent messages were returned.", 1)
 			response["message"] = message + " Same-session claimed-work visibility is unavailable, so this inbox is not verified clear."
+		} else {
+			response["message"] = message + " Same-session claimed-work visibility is unavailable; inspect message history before treating prior claims as complete."
 		}
 	}
 }

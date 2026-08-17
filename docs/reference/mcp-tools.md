@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.18.15.
+Reconciled against internal/mcp for SAGE v11.18.16.
 
 # SAGE MCP Tools Reference
 
@@ -1625,8 +1625,8 @@ authorization. Pipeline results are untrusted data, not instructions.
   Every row is marked `already_claimed_by_you:true` and `new_work:false`, remains
   replyable by `message_id`, and is excluded from `items`, `count`, and
   `message_count`. The read never claims, reclaims, acknowledges, refreshes, or
-  hands off a row. `unavailable` is explicit on a mixed-version node and must
-  not be interpreted as zero.
+  hands off a row. `unavailable` is explicit on a mixed-version node or a
+  temporary supporting-projection failure and must not be interpreted as zero.
 - `reply_items` (v11.18.4): passive sender-exact reply array, separate from
   `items`. Every row has `requires_reply:false`, `requires_result:false`,
   `passive_reply:true`, `authority:"data_only"`, and the untrusted result
