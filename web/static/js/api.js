@@ -503,10 +503,9 @@ export async function updateAgent(id, data) {
 
 export async function removeAgent(id, force = false) {
     const q = force ? '?force=true' : '';
-    const res = await fetch(`${API_BASE}/v1/dashboard/network/agents/${id}${q}`, {
+    return appV23AccessRequest(`/v1/dashboard/network/agents/${encodeURIComponent(id)}${q}`, {
         method: 'DELETE',
     });
-    return res.json();
 }
 
 export async function downloadBundle(id) {

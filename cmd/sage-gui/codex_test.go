@@ -154,6 +154,29 @@ func TestSelfHealCodex_RewritesStaleBinaryPath(t *testing.T) {
 	assert.NotContains(t, string(startAfter), "/old/path/to/sage-gui")
 }
 
+func TestSelfHealCodex_RewritesStaleHookBytesWithCurrentPaths(t *testing.T) {
+	projectDir, sageHome := withCodexInstallEnv(t)
+	require.NoError(t, runCodexInstall())
+
+	// Reproduce the v11.18.17 field failure: the hook directory and all five
+	// filenames exist, other hooks still mention the current binary and identity,
+	// but Stop is an older installer-owned no-op. Presence/path checks alone
+	// incorrectly accepted this mixed generation as current.
+	stopPath := filepath.Join(projectDir, ".codex", "hooks", "sage-stop.sh")
+	require.NoError(t, os.WriteFile(stopPath, []byte("#!/bin/bash\n# reserved for future checks\nexit 0\n"), 0755))
+
+	selfHealCodex(projectDir, sageHome)
+
+	binPath := expectExecutable(t)
+	identityPath := codexConfigIdentityPath(filepath.Join(projectDir, ".codex", "config.toml"), sageHome, "codex")
+	for name, tpl := range hookScriptSet() {
+		got, err := os.ReadFile(filepath.Join(projectDir, ".codex", "hooks", name))
+		require.NoError(t, err, "read refreshed %s", name)
+		assert.Equal(t, renderHookScript(tpl, binPath, "codex", identityPath), string(got),
+			"self-heal must restore the complete rendered hook set when any one script is stale")
+	}
+}
+
 func TestSelfHealCodex_NoOpWhenNoCodexDir(t *testing.T) {
 	projectDir, sageHome := withCodexInstallEnv(t)
 

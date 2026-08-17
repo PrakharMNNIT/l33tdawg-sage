@@ -51,6 +51,30 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.18
+
+**Codex upgrades now repair stale SAGE lifecycle hooks automatically.** On
+every MCP startup, the project self-healer compares all five installer-owned
+Codex hook scripts with their fully rendered current templates. A mixed
+generation can no longer pass merely because the files exist or another hook
+mentions the current binary. Upgrading therefore replaces legacy no-op Stop
+hooks and malformed prompt hooks without requiring a second manual
+`sage-gui codex install` run.
+
+**The CEREBRUM Connectome now leads with the graph itself.** Neurons have a
+larger practical click target; clicking one opens its persistent identity,
+visible incoming/outgoing traffic, strongest peer, directed connection list,
+and visible memory lobe. The compact fallback selector now shows only agents
+with visible peer relationships, ordered by retained traffic, instead of
+turning a large dormant/test roster into the primary navigation surface.
+Isolated authorized neurons remain visible and clickable in the brain and join
+the selector while selected.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.18 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.18`. SDK 11.18.18.
+
 ## What's New in v11.18.17
 
 **Routine MCP restarts no longer make the same stdio agent disown its own
@@ -1935,7 +1959,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.17`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.18`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

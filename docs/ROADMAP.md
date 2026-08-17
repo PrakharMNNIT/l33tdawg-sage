@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.17 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.18 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -68,13 +68,33 @@ new-work counts and claim ownership unchanged, and makes hook inbox status
 consult the payload-free durable wake snapshot. v11.18.17 persists the primary
 stdio claimant identity per exact agent/provider/project and reuses it only
 after an OS liveness lock proves the prior runtime is gone, while concurrent
-runtimes remain independently fenced. The supported consensus ceiling remains
-app-v26; **v11.18.17 does not introduce app-v27**.
+runtimes remain independently fenced. v11.18.18 makes the Codex startup
+self-healer compare every fully rendered lifecycle hook and makes Connectome
+neurons the primary agent-detail navigation surface, with a compact
+relationship-only fallback selector. The supported consensus ceiling remains
+app-v26; **v11.18.18 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.18 patch
+
+Codex project self-healing now byte-compares every installer-owned hook against
+the current template rendered with the active binary and pinned identity. Any
+stale member rewrites the complete five-script set, closing the mixed-generation
+upgrade failure where an obsolete no-op Stop hook survived because sibling
+scripts still referenced the current executable.
+
+The CEREBRUM Connectome now gives neurons a larger click target and explicitly
+leads operators to click the graph for persistent agent details and directed
+relationship inspection. Its fallback selector is bounded to agents with
+visible peer relationships, ordered by visible retained traffic; selected
+isolated neurons remain represented for keyboard continuity. The endpoint and
+both-endpoint RBAC projection are unchanged. This patch introduces no new
+consensus application version or state migration: app-v26 remains the ceiling
+and v11.18.18 does not introduce app-v27.
 
 ## v11.18.17 patch
 
