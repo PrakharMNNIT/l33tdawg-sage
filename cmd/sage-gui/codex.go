@@ -497,7 +497,7 @@ func installAgentsMD(projectDir string) error {
 //
 // Migration triggers (any one is enough):
 //   - .codex/hooks/ missing a current script
-//   - .codex/hooks/*.sh references a stale binary path
+//   - any installer-owned hook differs from its fully rendered current template
 //   - .codex/config.toml references a stale binary path
 //   - .codex/hooks.json missing (legacy installs predate it)
 func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
@@ -525,21 +525,18 @@ func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
 		identityPath = identityOverride
 	}
 	needsRewrite := false
-	hasBinRef := false
 
 	if _, statErr := os.Stat(hookDir); os.IsNotExist(statErr) {
 		needsRewrite = true
 	} else {
-		for name := range hookScriptSet() {
+		for name, tpl := range hookScriptSet() {
 			data, readErr := os.ReadFile(filepath.Join(hookDir, name)) //nolint:gosec // path inside project's .codex/hooks
 			if readErr != nil {
 				needsRewrite = true
 				continue
 			}
-			if strings.Contains(string(data), binPath) {
-				hasBinRef = true
-			}
-			if hookUsesDirectWriteIdentity(name) && (!strings.Contains(string(data), `SAGE_PROVIDER="codex"`) || !strings.Contains(string(data), identityPath)) {
+			want := renderHookScript(tpl, binPath, "codex", identityPath)
+			if string(data) != want {
 				needsRewrite = true
 			}
 		}
@@ -556,7 +553,7 @@ func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
 		needsRewrite = true
 	}
 
-	if !needsRewrite && hasBinRef {
+	if !needsRewrite {
 		return
 	}
 
