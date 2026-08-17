@@ -35,7 +35,7 @@ func acquireDurableClaimantIdentity(agentID, provider, project string) (string, 
 	}
 	scope := sha256.Sum256([]byte(agentID + "\x00" + provider + "\x00" + project))
 	dir := filepath.Join(home, "runtime", "mcp-claimants")
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil { //nolint:gosec // operator-selected SAGE_HOME, scope leaf is a local hash
 		return "", nil, fmt.Errorf("create claimant identity directory: %w", err)
 	}
 	base := hex.EncodeToString(scope[:])
@@ -75,7 +75,7 @@ func acquireDurableClaimantIdentity(agentID, provider, project string) (string, 
 		return "", nil, fmt.Errorf("create claimant identity temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
+	defer func() { _ = os.Remove(tmpPath) }() //nolint:gosec // path returned by os.CreateTemp in the private claimant directory
 	if chmodErr := tmp.Chmod(0600); chmodErr != nil {
 		_ = tmp.Close()
 		_ = lease.Close()
@@ -95,7 +95,7 @@ func acquireDurableClaimantIdentity(agentID, provider, project string) (string, 
 		_ = lease.Close()
 		return "", nil, closeErr
 	}
-	if renameErr := os.Rename(tmpPath, identityPath); renameErr != nil {
+	if renameErr := os.Rename(tmpPath, identityPath); renameErr != nil { //nolint:gosec // both paths are fixed children of the private claimant directory
 		_ = lease.Close()
 		return "", nil, fmt.Errorf("persist claimant identity: %w", renameErr)
 	}
