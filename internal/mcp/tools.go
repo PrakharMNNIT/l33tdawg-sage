@@ -4733,7 +4733,11 @@ func (s *Server) ownClaimedUnfinishedSurface(ctx context.Context, limit int) (ma
 					"Inspect sage_message_history(folder=\"inbox\") before treating the inbox as clear.",
 			}, nil
 		}
-		return nil, err
+		return map[string]any{
+			"own_claimed_unfinished_state": "unavailable",
+			"own_claimed_unfinished_action": "Same-session claimed-work visibility is temporarily unavailable. " +
+				"Inspect sage_message_history(folder=\"inbox\") before treating the inbox as clear.",
+		}, nil
 	}
 	items := make([]map[string]any, 0, len(response.Items))
 	for _, item := range response.Items {

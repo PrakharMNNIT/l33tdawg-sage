@@ -1265,6 +1265,45 @@ func TestInboxSeparatelySurfacesOwnClaimedUnfinishedWithoutReclaiming(t *testing
 	require.NotContains(t, secondInbox["message"], "inbox is clear")
 }
 
+func TestInboxDegradesWhenOwnClaimedVisibilityFails(t *testing.T) {
+	for _, status := range []int{http.StatusNotImplemented, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/messages/own-claimed-unfinished", func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, http.StatusText(status), status)
+			})
+			mux.HandleFunc("/v1/messages/receive", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+			})
+			mux.HandleFunc("/v1/pipe/inbox", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+			})
+			mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+			})
+			mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+			})
+			mux.HandleFunc("/v1/messages/claimed-elsewhere", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"claimed_elsewhere_count": 0})
+			})
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+			_, privateKey, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
+			s := NewServer(ts.URL, privateKey)
+
+			result, err := s.toolInbox(context.Background(), map[string]any{"limit": 5, "include_replies": false})
+			require.NoError(t, err, "an additive visibility failure must not take down sage_inbox")
+			inbox := result.(map[string]any)
+			require.Equal(t, 0, inbox["count"])
+			require.Equal(t, "unavailable", inbox["own_claimed_unfinished_state"])
+			require.Contains(t, inbox["own_claimed_unfinished_action"], "temporarily unavailable")
+			require.Contains(t, inbox["message"], "not verified clear")
+		})
+	}
+}
+
 func TestInboxUsesAuthoritativeClaimedElsewhereScalar(t *testing.T) {
 	var claimantSessionID string
 	mux := http.NewServeMux()
