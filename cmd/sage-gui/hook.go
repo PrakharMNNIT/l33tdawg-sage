@@ -118,7 +118,18 @@ func runHookInboxStatus() error {
 	if inbox.Count == nil || inbox.Unread == nil || *inbox.Count < 0 || (*inbox.Count > 0) != *inbox.Unread {
 		return fmt.Errorf("inbox status unavailable: invalid count probe response")
 	}
-	if *inbox.Count == 0 {
+	var wake struct {
+		Version int    `json:"version"`
+		Seq     uint64 `json:"seq"`
+		Pending bool   `json:"pending"`
+	}
+	if err := hookSignedJSON(http.MethodGet, "/v1/messages/wake-state", nil, &wake); err != nil {
+		return fmt.Errorf("inbox status unavailable: %w", err)
+	}
+	if wake.Version != stopNudgeWakeVersion || (wake.Pending && wake.Seq == 0) {
+		return fmt.Errorf("inbox status unavailable: invalid wake-state response")
+	}
+	if *inbox.Count == 0 && !wake.Pending {
 		return nil
 	}
 	seed, err := loadHookSeed()
@@ -127,8 +138,13 @@ func runHookInboxStatus() error {
 	}
 	priv := ed25519.NewKeyFromSeed(seed)
 	pub, _ := priv.Public().(ed25519.PublicKey) //nolint:errcheck
-	fmt.Printf("SAGE inbox: %d unread item(s) for exact agent %s (runtime %s). Call sage_inbox with a fresh poll before reporting no new messages.\n",
-		*inbox.Count, hex.EncodeToString(pub), version)
+	if *inbox.Count > 0 {
+		fmt.Printf("SAGE inbox: %d unclaimed item(s) for exact agent %s (runtime %s). Call sage_inbox with a fresh poll before reporting no new messages.\n",
+			*inbox.Count, hex.EncodeToString(pub), version)
+		return nil
+	}
+	fmt.Printf("SAGE inbox: unfinished durable work exists for exact agent %s (runtime %s), although no unclaimed item is waiting. Call sage_inbox to inspect same-session claims and claimed-elsewhere state.\n",
+		hex.EncodeToString(pub), version)
 	return nil
 }
 

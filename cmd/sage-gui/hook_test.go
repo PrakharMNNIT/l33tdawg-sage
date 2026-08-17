@@ -156,10 +156,14 @@ func TestHookSessionStart_MissingKeyReturnsError(t *testing.T) {
 }
 
 func TestHookInboxStatusIsPayloadFreeAndIdentityScoped(t *testing.T) {
-	var requestedPath string
+	var requestedPaths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestedPath = r.URL.RequestURI()
+		requestedPaths = append(requestedPaths, r.URL.RequestURI())
 		assert.NotEmpty(t, r.Header.Get("X-Agent-ID"))
+		if r.URL.Path == "/v1/messages/wake-state" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": 1, "seq": 2, "pending": true})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"count": 2, "unread": true})
 	}))
 	defer srv.Close()
@@ -169,8 +173,8 @@ func TestHookInboxStatusIsPayloadFreeAndIdentityScoped(t *testing.T) {
 	pub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
 
 	stdout := captureStdout(t, func() { require.NoError(t, runHookInboxStatus()) })
-	assert.Equal(t, "/v1/pipe/history/inbox?count_only=1", requestedPath)
-	assert.Contains(t, stdout, "2 unread item(s)")
+	assert.Equal(t, []string{"/v1/pipe/history/inbox?count_only=1", "/v1/messages/wake-state"}, requestedPaths)
+	assert.Contains(t, stdout, "2 unclaimed item(s)")
 	assert.Contains(t, stdout, hex.EncodeToString(pub))
 	assert.Contains(t, stdout, "Call sage_inbox with a fresh poll")
 	assert.NotContains(t, stdout, "sentinel-payload")
@@ -178,7 +182,11 @@ func TestHookInboxStatusIsPayloadFreeAndIdentityScoped(t *testing.T) {
 }
 
 func TestHookInboxStatusZeroIsSilentAndFailureIsNotZero(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/messages/wake-state" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": 1, "seq": 0, "pending": false})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"count": 0, "unread": false})
 	}))
 	withTestSageEnv(t, srv.URL)
@@ -187,6 +195,26 @@ func TestHookInboxStatusZeroIsSilentAndFailureIsNotZero(t *testing.T) {
 	err := runHookInboxStatus()
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "count 0")
+}
+
+func TestHookInboxStatusReportsClaimedUnfinishedWorkWithoutLeakingIt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/messages/wake-state" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"version": 1, "seq": 7, "pending": true,
+				"message_id": "must-not-be-read", "payload": "must-not-leak",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"count": 0, "unread": false})
+	}))
+	defer srv.Close()
+	withTestSageEnv(t, srv.URL)
+	stdout := captureStdout(t, func() { require.NoError(t, runHookInboxStatus()) })
+	require.Contains(t, stdout, "unfinished durable work exists")
+	require.Contains(t, stdout, "no unclaimed item is waiting")
+	require.NotContains(t, stdout, "must-not-be-read")
+	require.NotContains(t, stdout, "must-not-leak")
 }
 
 func TestHookInboxStatusRejectsIncompleteOrInconsistentProbe(t *testing.T) {

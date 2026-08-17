@@ -37,6 +37,7 @@ func messageRouterAs(s *Server, callerID string, exactProof bool) http.Handler {
 	r.Get("/v1/messages/wake", s.handleMessageWake)
 	r.Get("/v1/messages/wake-state", s.handleMessageWakeState)
 	r.Get("/v1/messages/claimed-elsewhere", s.handleMessagesClaimedElsewhere)
+	r.Get("/v1/messages/own-claimed-unfinished", s.handleOwnClaimedUnfinishedMessages)
 	r.Post("/v1/messages/receive", s.handleMessagesReceive)
 	r.Post("/v1/messages/{message_id}/reply", s.handleMessageReply)
 	r.Put("/v1/messages/{message_id}/handoff", s.handleMessageHandoff)
@@ -136,6 +137,30 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 	require.Contains(t, receivedAgain.Body.String(), `"idempotent_replay":true`)
 	require.Contains(t, receivedAgain.Body.String(), messageID)
 	require.Contains(t, receivedAgain.Body.String(), `"claimant_session_id":"mcp-helper"`)
+	ownClaimed := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
+		"/v1/messages/own-claimed-unfinished?claimant_session_id=mcp-helper&limit=5", nil)
+	require.Equal(t, http.StatusOK, ownClaimed.Code, ownClaimed.Body.String())
+	var ownResponse struct {
+		Items []map[string]any `json:"items"`
+		Count int              `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal(ownClaimed.Body.Bytes(), &ownResponse))
+	require.Equal(t, 1, ownResponse.Count)
+	require.Len(t, ownResponse.Items, 1)
+	require.Equal(t, messageID, ownResponse.Items[0]["message_id"])
+	require.Equal(t, "private request", ownResponse.Items[0]["payload"])
+	require.Equal(t, true, ownResponse.Items[0]["already_claimed_by_you"])
+	require.Equal(t, "mcp-helper", ownResponse.Items[0]["claimant_session_id"])
+	otherOwnClaimed := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
+		"/v1/messages/own-claimed-unfinished?claimant_session_id=mcp-supervisor&limit=5", nil)
+	require.Equal(t, http.StatusOK, otherOwnClaimed.Code, otherOwnClaimed.Body.String())
+	require.NotContains(t, otherOwnClaimed.Body.String(), messageID)
+	require.NotContains(t, otherOwnClaimed.Body.String(), "private request")
+	malloryOwnClaimed := callMessageJSON(t, messageRouterAs(s, "mallory", true), http.MethodGet,
+		"/v1/messages/own-claimed-unfinished?claimant_session_id=mcp-helper&limit=5", nil)
+	require.Equal(t, http.StatusOK, malloryOwnClaimed.Code, malloryOwnClaimed.Body.String())
+	require.NotContains(t, malloryOwnClaimed.Body.String(), messageID)
+	require.NotContains(t, malloryOwnClaimed.Body.String(), "private request")
 	currentClaims := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
 		"/v1/messages/claimed-elsewhere?claimant_session_id=mcp-helper", nil)
 	require.Equal(t, http.StatusOK, currentClaims.Code, currentClaims.Body.String())

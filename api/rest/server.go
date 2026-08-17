@@ -837,6 +837,7 @@ func (s *Server) setupRouter() chi.Router {
 			r.Get("/v1/messages/wake", s.handleMessageWake)
 			r.Get("/v1/messages/wake-state", s.handleMessageWakeState)
 			r.Get("/v1/messages/claimed-elsewhere", s.handleMessagesClaimedElsewhere)
+			r.Get("/v1/messages/own-claimed-unfinished", s.handleOwnClaimedUnfinishedMessages)
 			r.Post("/v1/messages/receive", s.handleMessagesReceive)
 			r.Post("/v1/messages/{message_id}/reply", s.handleMessageReply)
 			r.Put("/v1/messages/{message_id}/handoff", s.handleMessageHandoff)
