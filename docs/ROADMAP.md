@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.15 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.16 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -62,13 +62,34 @@ timeline range. v11.18.15 backfills wake state for claimed-only upgraded work,
 makes deprecated exact-local pipe admission atomic with its durable generation,
 restores the experimental Claude notification adapter to explicit opt-in,
 adds deterministic `memory_id` ordering for timestamp ties, and makes citation
-repair anchor-aware and fail-closed over new parser debt. The supported
-consensus ceiling remains app-v26; **v11.18.15 does not introduce app-v27**.
+repair anchor-aware and fail-closed over new parser debt. v11.18.16 gives the
+exact current claimant a bounded passive view of its unfinished work, keeps
+new-work counts and claim ownership unchanged, and makes hook inbox status
+consult the payload-free durable wake snapshot. The supported consensus ceiling
+remains app-v26; **v11.18.16 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.16 patch
+
+The canonical MCP inbox now exposes `own_claimed_unfinished` separately from
+newly claimed `items`. Only unfinished, unexpired exact-local messages owned by
+the exact current agent and claimant session appear. Repeated reads are passive,
+the list is bounded while its total remains exact, and same-call claims cannot
+appear in both projections because prior ownership is read before new work is
+claimed. Completion removes a row normally; no automatic handoff or ownership
+recovery is introduced.
+
+The short-lived inbox hook also reads the lease-free durable wake snapshot, so
+claimed work keeps the status surface non-empty without exposing message IDs,
+senders, intents, payloads, or counts. An older node, alternate backend, or
+transient failure of the additive projection is explicit but cannot take down
+the primary inbox. This patch introduces no new consensus application version
+or state migration: app-v26 remains the ceiling and v11.18.16 does not
+introduce app-v27.
 
 ## v11.18.15 patch
 

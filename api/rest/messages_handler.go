@@ -3,6 +3,7 @@ package rest
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -305,6 +306,76 @@ func (s *Server) handleMessagesClaimedElsewhere(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"claimed_elsewhere_count": count})
+}
+
+// handleOwnClaimedUnfinishedMessages returns a bounded, non-claiming view of
+// work already owned by this exact caller/session. It is deliberately separate
+// from receive so a repoll cannot re-claim, steal, or duplicate queue items.
+func (s *Server) handleOwnClaimedUnfinishedMessages(w http.ResponseWriter, r *http.Request) {
+	if !requireExactSignedMessageAction(w, r) {
+		return
+	}
+	claimantSessionID := strings.TrimSpace(r.URL.Query().Get("claimant_session_id"))
+	if claimantSessionID == "" || len(claimantSessionID) > store.MaxMessageClaimantSessionBytes {
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant session",
+			"claimant_session_id is required and bounded")
+		return
+	}
+	limit := 5
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 20 {
+			writeProblem(w, http.StatusBadRequest, "Invalid message limit", "limit must be between 1 and 20")
+			return
+		}
+		limit = parsed
+	}
+	messageStore, ok := canonicalMessageStore(s)
+	if !ok {
+		writeProblem(w, http.StatusNotImplemented, "Messages unavailable",
+			"The active store does not support canonical messages.")
+		return
+	}
+	agentID := middleware.ContextAgentID(r.Context())
+	items, total, err := messageStore.GetOwnClaimedUnfinishedMessages(
+		r.Context(), agentID, claimantSessionID, limit)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "Claimed work unavailable",
+			"This session's unfinished claimed work is temporarily unavailable.")
+		return
+	}
+	agentIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		if item != nil {
+			agentIDs = append(agentIDs, item.FromAgent)
+		}
+	}
+	presentations := s.resolvePipelineAgentPresentations(r.Context(), agentIDs...)
+	response := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		presentation := presentations[item.FromAgent]
+		entry := map[string]any{
+			"message_id": item.PipeID, "from_agent": item.FromAgent,
+			"intent": item.Intent, "payload": item.Payload, "status": item.Status,
+			"created_at": item.CreatedAt, "expires_at": item.ExpiresAt,
+			"claimant_session_id": claimantSessionID, "already_claimed_by_you": true,
+			"requires_reply": true, "authority": pipeRequestAuthority, "trust": pipeLocalTrust,
+			"security_notice": pipeRESTRequestSecurityNotice,
+		}
+		if item.FromProvider != "" {
+			entry["from_provider"] = item.FromProvider
+		}
+		if presentation.DisplayName != "" {
+			entry["from_display_name"] = presentation.DisplayName
+		}
+		if presentation.RegisteredName != "" {
+			entry["from_registered_name"] = presentation.RegisteredName
+		}
+		response = append(response, entry)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": response, "count": total, "limit": limit, "truncated": total > len(response),
+	})
 }
 
 func (s *Server) handleMessageHandoff(w http.ResponseWriter, r *http.Request) {

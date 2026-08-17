@@ -520,6 +520,78 @@ func TestClaimedElsewhereCountIsExactBeyondOneHistoryPage(t *testing.T) {
 	require.Zero(t, count, "another agent cannot use the scalar to observe Bob's claims")
 }
 
+func TestOwnClaimedUnfinishedMessagesAreExactBoundedAndNonMutating(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	for _, id := range []string{"msg-own-a", "msg-own-b", "msg-own-expired"} {
+		_, _, err := s.SendLocalMessage(ctx, "send-"+id, testLocalMessage(id, "alice", "bob", id+" private payload"))
+		require.NoError(t, err)
+	}
+	claimed, replayed, err := s.ReceiveLocalMessages(ctx, "bob", "", "claim-owned", 3, "session-a")
+	require.NoError(t, err)
+	require.False(t, replayed)
+	require.Len(t, claimed, 3)
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-own-a", "done", "session-a")
+	require.NoError(t, err)
+	_, err = s.writeExecContext(ctx,
+		`UPDATE pipeline_messages SET expires_at='2000-01-01T00:00:00.000Z' WHERE pipe_id='msg-own-expired'`)
+	require.NoError(t, err)
+
+	type claimSnapshot struct {
+		status, claimedBy, claimedAt, claimantSession string
+	}
+	snapshot := func() claimSnapshot {
+		var got claimSnapshot
+		require.NoError(t, s.conn.QueryRowContext(ctx, `SELECT p.status,p.claimed_by,p.claimed_at,r.claimant_session_id
+			FROM pipeline_messages p JOIN message_fetch_receipts r ON r.message_id=p.pipe_id
+			WHERE p.pipe_id='msg-own-b'`).Scan(&got.status, &got.claimedBy, &got.claimedAt, &got.claimantSession))
+		return got
+	}
+	before := snapshot()
+	for i := 0; i < 3; i++ {
+		items, total, readErr := s.GetOwnClaimedUnfinishedMessages(ctx, "bob", "session-a", 1)
+		require.NoError(t, readErr)
+		require.Equal(t, 1, total, "completed and expired claims are not unfinished")
+		require.Len(t, items, 1)
+		require.Equal(t, "msg-own-b", items[0].PipeID)
+		require.Equal(t, "msg-own-b private payload", items[0].Payload)
+		require.Equal(t, "session-a", items[0].ClaimedSessionID)
+	}
+	require.Equal(t, before, snapshot(), "passive visibility must not refresh or mutate claim ownership")
+
+	items, total, err := s.GetOwnClaimedUnfinishedMessages(ctx, "bob", "session-b", 20)
+	require.NoError(t, err)
+	require.Zero(t, total, "another session of the same agent sees no claimed payload")
+	require.Empty(t, items)
+	items, total, err = s.GetOwnClaimedUnfinishedMessages(ctx, "mallory", "session-a", 20)
+	require.NoError(t, err)
+	require.Zero(t, total, "another agent sees no claimed payload")
+	require.Empty(t, items)
+
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-own-b", "done", "session-a")
+	require.NoError(t, err, "an ID obtained only from the passive own-claimed projection remains replyable")
+	items, total, err = s.GetOwnClaimedUnfinishedMessages(ctx, "bob", "session-a", 20)
+	require.NoError(t, err)
+	require.Zero(t, total)
+	require.Empty(t, items)
+}
+
+func TestOwnClaimedUnfinishedMessagesReturnsBoundedListAndExactTotal(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("msg-own-bounded-%d", i)
+		_, _, err := s.SendLocalMessage(ctx, "send-"+id, testLocalMessage(id, "alice", "bob", "private"))
+		require.NoError(t, err)
+	}
+	_, _, err := s.ReceiveLocalMessages(ctx, "bob", "", "claim-bounded", 3, "session-a")
+	require.NoError(t, err)
+	items, total, err := s.GetOwnClaimedUnfinishedMessages(ctx, "bob", "session-a", 2)
+	require.NoError(t, err)
+	require.Equal(t, 3, total)
+	require.Len(t, items, 2)
+}
+
 func TestMessageReadRequiresExactRecipientFetchAndStatusIsSenderOnlyMetadata(t *testing.T) {
 	ctx := context.Background()
 	s := newMessageTestStore(t)

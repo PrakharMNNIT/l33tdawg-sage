@@ -106,6 +106,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.13 | Hubanov distributed-engram bridges with bounded deterministic corroborator evidence, accessible Connectome guidance without a floating card, Claude signed production wake source with lossless shutdown, and claimant-session-safe reply fallback; no new app version; app-v26 remains the ceiling |
 | v11.18.14 | Unfinished-message wake and exact stranded-claim visibility, lease-free monotonic Stop nudges, sender-TTL-preserving canonical migration, persistent accessible Connectome agent details, batched totally ordered corroborator presentation, and the truthful 31-day timeline contract; no new app version; app-v26 remains the ceiling |
 | v11.18.15 | Unfinished-message wake backfill for claimed-only upgrades, default-on fail-open Stop nudges for Claude Code and Codex, atomic exact-local legacy-pipe admission, explicit opt-in for the experimental Claude notification adapter, deterministic pending-memory tiebreaks, canonical linked-worktree identities, live directed Connectome inspection, and anchor-aware citation repair with pinned parser debt; no new app version; app-v26 remains the ceiling |
+| v11.18.16 | Unfinished-message wake and passive exact-session claim visibility in `sage_inbox`, payload-free hook parity for claimed work, and fail-soft compatibility when that additive projection is unavailable; no automatic ownership transfer; no new app version; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

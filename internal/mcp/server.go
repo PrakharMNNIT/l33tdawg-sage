@@ -917,6 +917,7 @@ var retryableReadOnlyGETPaths = map[string]bool{
 	"/v1/memory/list":                          true,
 	"/v1/memory/tasks":                         true,
 	"/v1/memory/timeline":                      true,
+	"/v1/messages/own-claimed-unfinished":      true,
 	"/v1/pipe/history/inbox":                   true,
 	"/v1/pipe/history/outbox":                  true,
 	"/v1/pipe/results":                         true,

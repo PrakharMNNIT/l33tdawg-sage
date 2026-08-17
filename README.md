@@ -51,6 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.16
+
+**Claimed agent work no longer disappears from the inbox that claimed it.**
+`sage_inbox` now returns a separate bounded `own_claimed_unfinished` projection
+for messages already owned by the exact current agent session. The projection
+is passive: it never claims, refreshes, transfers, or duplicates work, and it
+does not change the established `items` or `count` meaning of newly available
+work. Exact agent/session filtering, completion and expiry handling, bounded
+results with an exact total, reply-after-repoll, and nonmutation are pinned by
+store, REST, and MCP regression coverage.
+
+The payload-free hook status path also checks the durable wake snapshot, so
+claimed-but-unfinished work cannot be reported as a clean inbox merely because
+no unclaimed row remains. Older or temporarily incapable nodes degrade to an
+explicit `unavailable` state instead of either a false zero or a failed primary
+inbox call. This patch does not automatically transfer claims from another
+session; passive history plus explicit compare-and-swap handoff remain the
+recovery boundary. It introduces no new consensus application version or state
+migration. The ceiling remains app-v26; **v11.18.16 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.16`. SDK 11.18.16.
+
 ## What's New in v11.18.15
 
 **Every unfinished exact-recipient local canonical message now has a durable
@@ -1891,7 +1913,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.15`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.16`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

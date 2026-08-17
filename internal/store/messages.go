@@ -629,6 +629,57 @@ func (s *SQLiteStore) CountClaimedLocalMessagesElsewhere(
 	return count, err
 }
 
+// GetOwnClaimedUnfinishedMessages is the non-claiming companion to canonical
+// receive. It resurfaces only work this exact claimant session already owns;
+// it never changes claim, read, wake, or workflow state. The list is bounded
+// while total remains an exact scalar across the full matching set.
+func (s *SQLiteStore) GetOwnClaimedUnfinishedMessages(
+	ctx context.Context, receiverID, claimantSessionID string, limit int,
+) ([]*PipelineMessage, int, error) {
+	receiverID = strings.TrimSpace(receiverID)
+	claimantSessionID = strings.TrimSpace(claimantSessionID)
+	if receiverID == "" || claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes || limit < 1 || limit > 20 {
+		return nil, 0, ErrMessageNotFound
+	}
+	rows, err := s.conn.QueryContext(ctx, `SELECT p.pipe_id, COUNT(*) OVER()
+		FROM pipeline_messages p
+		JOIN message_fetch_receipts r
+		  ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
+		WHERE p.to_agent=? AND p.to_provider=''
+		  AND p.source_chain_id='' AND p.destination_chain_id=''
+		  AND p.status='claimed' AND p.completed_at IS NULL
+		  AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		  AND r.claimant_session_id=?
+		ORDER BY p.created_at ASC, p.pipe_id ASC LIMIT ?`,
+		receiverID, receiverID, claimantSessionID, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close() //nolint:errcheck
+	ids := make([]string, 0, limit)
+	total := 0
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id, &total); err != nil {
+			return nil, 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	items := make([]*PipelineMessage, 0, len(ids))
+	for _, id := range ids {
+		item, err := s.GetPipeline(ctx, id)
+		if err != nil {
+			return nil, 0, err
+		}
+		item.ClaimedSessionID = claimantSessionID
+		items = append(items, item)
+	}
+	return items, total, nil
+}
+
 // HandoffLocalMessageClaim transfers only the session-level coordination
 // marker for one already-claimed canonical message. Agent authorization and
 // workflow ownership do not change. The compare-and-swap makes concurrent or

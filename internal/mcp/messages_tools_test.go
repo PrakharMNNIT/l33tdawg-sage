@@ -1182,6 +1182,139 @@ func TestClaimedCanonicalWorkRemainsRecoverableFromPassiveInboxHistory(t *testin
 	require.NotContains(t, messageHistoryItems[0], "pipe_id")
 }
 
+func TestInboxSeparatelySurfacesOwnClaimedUnfinishedWithoutReclaiming(t *testing.T) {
+	var mu sync.Mutex
+	receiveCalls := 0
+	ownCalls := 0
+	var claimantSessionID string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/own-claimed-unfinished", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		ownCalls++
+		claimantSessionID = r.URL.Query().Get("claimant_session_id")
+		if ownCalls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0, "limit": 5, "truncated": false})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{
+				{"message_id": "msg-b", "from_agent": "alice", "payload": "unfinished-b", "claimant_session_id": claimantSessionID},
+				{"message_id": "msg-c", "from_agent": "alice", "payload": "unfinished-c", "claimant_session_id": claimantSessionID},
+			},
+			"count": 2, "limit": 5, "truncated": false,
+		})
+	})
+	mux.HandleFunc("/v1/messages/receive", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		receiveCalls++
+		if receiveCalls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{
+				{"message_id": "msg-a", "from_agent": "alice", "payload": "first-a"},
+				{"message_id": "msg-b", "from_agent": "alice", "payload": "first-b"},
+				{"message_id": "msg-c", "from_agent": "alice", "payload": "first-c"},
+			}, "count": 3})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
+	mux.HandleFunc("/v1/messages/read-batch", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{
+			{"message_id": "msg-a", "read_status": "confirmed"},
+			{"message_id": "msg-b", "read_status": "confirmed"},
+			{"message_id": "msg-c", "read_status": "confirmed"},
+		}})
+	})
+	mux.HandleFunc("/v1/pipe/inbox", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
+	mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
+	mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
+	mux.HandleFunc("/v1/messages/claimed-elsewhere", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"claimed_elsewhere_count": 0})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, privateKey)
+
+	first, err := s.toolInbox(context.Background(), map[string]any{"limit": 5, "include_replies": false})
+	require.NoError(t, err)
+	firstInbox := first.(map[string]any)
+	require.Equal(t, 3, firstInbox["count"])
+	require.Equal(t, 0, firstInbox["own_claimed_unfinished_count"])
+
+	second, err := s.toolInbox(context.Background(), map[string]any{"limit": 5, "include_replies": false})
+	require.NoError(t, err)
+	secondInbox := second.(map[string]any)
+	require.Equal(t, 0, secondInbox["count"], "new-work count must keep its existing meaning")
+	require.Empty(t, secondInbox["items"])
+	require.Equal(t, 2, secondInbox["own_claimed_unfinished_count"])
+	own := secondInbox["own_claimed_unfinished"].([]map[string]any)
+	require.Len(t, own, 2)
+	require.Equal(t, []string{"msg-b", "msg-c"}, []string{own[0]["message_id"].(string), own[1]["message_id"].(string)})
+	require.Equal(t, true, own[0]["already_claimed_by_you"])
+	require.Equal(t, false, own[0]["new_work"])
+	require.Equal(t, claimantSessionID, own[0]["claimant_session_id"])
+	require.NotContains(t, secondInbox["message"], "inbox is clear")
+}
+
+func TestInboxDegradesWhenOwnClaimedVisibilityFails(t *testing.T) {
+	for _, status := range []int{http.StatusNotImplemented, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/messages/own-claimed-unfinished", func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, http.StatusText(status), status)
+			})
+			mux.HandleFunc("/v1/messages/receive", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+			})
+			mux.HandleFunc("/v1/pipe/inbox", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+			})
+			mux.HandleFunc("/v1/pipe/results", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+			})
+			mux.HandleFunc("/v1/dashboard/task-notifications", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+			})
+			mux.HandleFunc("/v1/messages/claimed-elsewhere", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"claimed_elsewhere_count": 0})
+			})
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+			_, privateKey, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
+			s := NewServer(ts.URL, privateKey)
+
+			result, err := s.toolInbox(context.Background(), map[string]any{"limit": 5, "include_replies": false})
+			require.NoError(t, err, "an additive visibility failure must not take down sage_inbox")
+			inbox := result.(map[string]any)
+			require.Equal(t, 0, inbox["count"])
+			require.Equal(t, "unavailable", inbox["own_claimed_unfinished_state"])
+			require.Contains(t, inbox["own_claimed_unfinished_action"], "temporarily unavailable")
+			require.Contains(t, inbox["message"], "not verified clear")
+		})
+	}
+}
+
+func TestInboxMentionsUnavailableOwnClaimsAlongsideNewWork(t *testing.T) {
+	response := map[string]any{
+		"count":   1,
+		"message": "You have 1 inbox item(s).",
+	}
+	mergeOwnClaimedUnfinishedSurface(response, map[string]any{
+		"own_claimed_unfinished_state": "unavailable",
+	})
+	require.Contains(t, response["message"], "Same-session claimed-work visibility is unavailable")
+}
+
 func TestInboxUsesAuthoritativeClaimedElsewhereScalar(t *testing.T) {
 	var claimantSessionID string
 	mux := http.NewServeMux()
