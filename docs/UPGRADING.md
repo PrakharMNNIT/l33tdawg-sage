@@ -110,6 +110,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.17 | Durable primary stdio claimant identity scoped by exact agent/provider/project, OS-lock liveness fencing across ordinary restarts, distinct concurrent-session ownership, and installed-runtime identity carry-forward; pre-v11.18.17 claims still require explicit CAS handoff; no new app version; app-v26 remains the ceiling |
 | v11.18.18 | Byte-exact automatic Codex lifecycle-hook self-healing plus click-first CEREBRUM Connectome agent details, larger neuron targets, and a relationship-scoped fallback selector; no new app version; app-v26 remains the ceiling |
 | v11.18.19 | Global-scope Codex hook isolation, single-owner hit-tested Connectome clicks, bounded domain-access details, and responsive bloomed memory nodes; no new app version; app-v26 remains the ceiling |
+| v11.18.20 | Same-mode verified MRI snapshot retention across transient refresh failures, with cold and cross-mode failures still fail-closed; no new app version; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

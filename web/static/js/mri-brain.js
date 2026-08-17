@@ -19,6 +19,7 @@ import { THREE, ForceGraph3D, UnrealBloomPass } from '/ui/js/vendor/sage-graph.b
 import { MRI_LAYOUT, mriDepthForAge, mriVerticalPosition } from '/ui/js/mri-layout.js';
 import { createGraphLoadCoordinator, createEngramBloomCoordinator, mapConnectome, agentConnections, createConnectomeActivityTracker, createConnectomeReloadIntent, synapsePlasticity, neuronDormancy, createNeuronBirthTracker, neuronTint, mapEngrams, stripBloom, applyEngramBloom } from '/ui/js/connectome-map.js';
 import { createModeHull } from '/ui/js/mode-hull.js';
+import { graphAvailabilityAfterFailure } from '/ui/js/graph-availability.js';
 
 const LINK_TYPES = {
   supports:    { color: '#5ee2a0', label: 'supports',    typed: true },
@@ -766,6 +767,12 @@ export function mountMriBrain(container, opts = {}) {
   const graphLoads = createGraphLoadCoordinator();
   const bloomLoads = createEngramBloomCoordinator();
   let rendered = null;   // last graph data handed to ForceGraph (for neuron focus)
+  // A failed live refresh must not make an already-rendered, verified snapshot
+  // look unavailable. Keep the snapshot's source mode explicit: the same ForceGraph
+  // instance is reused while switching between memory and connectome views, so
+  // merely checking `rendered` would let connectome bytes masquerade as a memory
+  // snapshot (or vice versa) after a failed mode switch.
+  let renderedMode = null;
   const subs = [];
   let graphRetryTimer = null;
   let graphRetryDelay = 2000;
@@ -1157,6 +1164,7 @@ export function mountMriBrain(container, opts = {}) {
       markConnectomeBirths(d);
       Graph.graphData(d);
       rendered = d;
+      renderedMode = request.mode;
       if(request.mode==='connectome') selectedSnapshotAt=Date.now();
       refreshCounts(d);
       buildLobes(d);
@@ -1174,7 +1182,14 @@ export function mountMriBrain(container, opts = {}) {
       connectomeReloadIntent.settle(request.mode, tickGeneration, true);
     }).catch(() => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
-      reportGraphAvailability('unavailable');
+      // The renderer deliberately retains its last verified graph on transport,
+      // parse, or projection-refresh failures. Reflect that truth in the parent
+      // UI instead of covering safe data with the hard-unavailable overlay. A
+      // cold failure (or a failed switch whose visible bytes belong to the other
+      // mode) remains unavailable and continues through the same retry path.
+      reportGraphAvailability(graphAvailabilityAfterFailure(
+        !!rendered, renderedMode, request.mode,
+      ));
       if(request.mode==='connectome'&&selectedAgentID) setInspectorLive('unavailable');
       if (!graphReloadPending) scheduleGraphRetry(load);
     }).finally(() => {
@@ -1432,6 +1447,7 @@ export function mountMriBrain(container, opts = {}) {
     markConnectomeFiring(data, false);
     markConnectomeBirths(data);
     rendered = data;
+    renderedMode = mode;
     if(mode==='connectome') selectedSnapshotAt=Date.now();
     Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'))
       .backgroundColor(mriBgColor())

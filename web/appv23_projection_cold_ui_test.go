@@ -58,6 +58,17 @@ func TestMRIGraphFailureIsUnavailableAndNeverSyntheticEmptyData(t *testing.T) {
 		"a transport failure must not masquerade as a successful empty graph")
 }
 
+func TestMRIRefreshFailureKeepsSameModeVerifiedSnapshotVisible(t *testing.T) {
+	mriBytes, err := os.ReadFile("static/js/mri-brain.js")
+	require.NoError(t, err)
+	mri := string(mriBytes)
+
+	assert.Contains(t, mri, "let renderedMode = null")
+	assert.Contains(t, mri, "renderedMode = request.mode")
+	assert.Contains(t, mri, "renderedMode = mode")
+	assert.Contains(t, mri, "graphAvailabilityAfterFailure(")
+}
+
 func TestMemoryListClientCarriesOpaqueContinuation(t *testing.T) {
 	apiBytes, err := os.ReadFile("static/js/api.js")
 	require.NoError(t, err)
