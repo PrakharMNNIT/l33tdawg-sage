@@ -549,8 +549,8 @@ func TestOwnClaimedUnfinishedMessagesAreExactBoundedAndNonMutating(t *testing.T)
 	}
 	before := snapshot()
 	for i := 0; i < 3; i++ {
-		items, total, err := s.GetOwnClaimedUnfinishedMessages(ctx, "bob", "session-a", 1)
-		require.NoError(t, err)
+		items, total, readErr := s.GetOwnClaimedUnfinishedMessages(ctx, "bob", "session-a", 1)
+		require.NoError(t, readErr)
 		require.Equal(t, 1, total, "completed and expired claims are not unfinished")
 		require.Len(t, items, 1)
 		require.Equal(t, "msg-own-b", items[0].PipeID)
