@@ -501,6 +501,15 @@ func installAgentsMD(projectDir string) error {
 //   - .codex/config.toml references a stale binary path
 //   - .codex/hooks.json missing (legacy installs predate it)
 func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
+	// ~/.codex is Codex's user-global configuration directory, not a project
+	// install. Treating $HOME as a workspace makes hooks.json global, so a SAGE
+	// Stop hook created while one task happens to run from $HOME is then applied
+	// to every unrelated Codex task. Project hooks must never be self-healed into
+	// that scope. The global MCP registration remains valid; only project-side
+	// lifecycle artifacts are excluded here.
+	if userHome, err := os.UserHomeDir(); err == nil && sameFilesystemPath(projectDir, userHome) {
+		return
+	}
 	identityOverride := ""
 	if len(identityOverrides) > 0 {
 		identityOverride = identityOverrides[0]

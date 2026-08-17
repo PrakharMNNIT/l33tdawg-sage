@@ -174,7 +174,7 @@ const STYLE = `
 .mrib .scan{position:absolute;top:16px;left:16px;padding:10px 14px}
 .mrib .scan b{color:#eaf4ff;font-size:14px;letter-spacing:.5px}
 .mrib .scan .s{color:#39d0ff;font-size:11px;letter-spacing:2px;margin-top:4px}
-.mrib .tip{position:absolute;pointer-events:none;display:none;max-width:280px;padding:8px 11px;background:rgba(6,11,20,.96);border:1px solid #15233b;border-radius:9px;z-index:9;font-size:12px}
+.mrib .tip{position:absolute;pointer-events:none;display:none;max-width:280px;max-height:min(320px,calc(100% - 16px));overflow:hidden;padding:8px 11px;background:rgba(6,11,20,.96);border:1px solid #15233b;border-radius:9px;z-index:9;font-size:12px}
 .mrib .tip .h{color:#eaf4ff;font-weight:700;margin-bottom:2px}
 .mrib .tip .m{color:#5d7395;font-size:11px}
 .mrib .tip .chip{font-size:10px;padding:1px 6px;border-radius:6px;background:#0e1b30;color:#aecbf0;margin-right:4px}
@@ -191,6 +191,7 @@ const STYLE = `
 .mrib .ai-close{width:40px;height:40px;margin:-8px -8px 0 0;border:0;border-radius:9px;background:transparent;color:#9fb6d8;cursor:pointer;font:20px/1 sans-serif}.mrib .ai-close:hover{background:#0e1b30;color:#eaf4ff}
 .mrib .ai-select{min-width:0;width:100%;padding:8px 10px;color:#dceaff;background:#081221;border:1px solid #203455;border-radius:8px;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .mrib .ai-section{border-top:1px solid #15233b;padding-top:10px;margin-top:10px}.mrib .ai-label{color:#5d7395;font-size:10px;letter-spacing:1.2px;text-transform:uppercase;margin-bottom:3px}.mrib .ai-value{color:#dceaff;font-size:12px;overflow-wrap:anywhere}.mrib .ai-id-row{display:flex;gap:8px;align-items:flex-start}.mrib .ai-id{flex:1;color:#aecbf0;font-size:11px;word-break:break-all}.mrib .ai-copy,.mrib .ai-retry{border:1px solid #203455;border-radius:7px;background:transparent;color:#39d0ff;cursor:pointer;font:10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:4px 7px}.mrib .ai-copy:hover,.mrib .ai-retry:hover{background:#0e1b30}
+.mrib .ai-domain-details summary{cursor:pointer;color:#dceaff;font-size:12px;overflow-wrap:anywhere}.mrib .ai-domain-full{max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-word;padding:8px;border-radius:7px;background:#081221;color:#9fb6d8;font-size:10px}
 .mrib .ai-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}.mrib .ai-stat{padding:8px;border-radius:8px;background:rgba(14,27,48,.62)}.mrib .ai-stat b{display:block;color:#eaf4ff;font-size:14px}.mrib .ai-stat span{color:#5d7395;font-size:9px;letter-spacing:.8px;text-transform:uppercase}.mrib .ai-memory{color:#9fb6d8;font-size:11px}.mrib .ai-memory.error{color:#ff9aa5}.mrib .ai-memory-title{color:#dceaff;font-size:11px;margin:6px 0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mrib .ai-empty{color:#5d7395;font-size:11px}
 .mrib .ai-live{display:inline-flex;align-items:center;gap:5px;color:#5ee2a0;font-size:10px;margin-top:5px}.mrib .ai-live:before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}.mrib .ai-live.updating{color:#f6c85f}.mrib .ai-live.unavailable{color:#ff9aa5}
 .mrib .ai-connections{display:grid;gap:6px}.mrib .ai-connection{width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 8px;text-align:left;padding:8px;border:1px solid #15233b;border-radius:8px;background:rgba(14,27,48,.48);color:#dceaff;cursor:pointer;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.mrib .ai-connection:hover,.mrib .ai-connection.selected{background:#0e2943;border-color:#39d0ff}.mrib .ai-connection .peer{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}.mrib .ai-connection .counts{color:#aecbf0;white-space:nowrap}.mrib .ai-connection .last{grid-column:1/-1;color:#5d7395;font-size:10px}.mrib .ai-connections-empty{color:#5d7395;font-size:11px}
@@ -404,10 +405,11 @@ export function mountMriBrain(container, opts = {}) {
       <div class="ai-selected">
         <div class="ai-head"><span class="ai-neuron"></span><div class="ai-heading"><div class="ai-kicker">Selected agent</div><div class="ai-name"></div><div class="ai-role"></div><div class="ai-live">Snapshot</div></div><button type="button" class="ai-close" aria-label="Close agent details">×</button></div>
         <div class="ai-section"><div class="ai-label">Agent ID</div><div class="ai-id-row"><code class="ai-id"></code><button type="button" class="ai-copy">Copy</button></div></div>
-        <div class="ai-section"><div class="ai-label">Domain</div><div class="ai-value ai-domain"></div><div class="ai-label" style="margin-top:8px">Last retained message activity</div><div class="ai-value ai-activity"></div></div>
+        <div class="ai-section"><div class="ai-label">Last retained message activity</div><div class="ai-value ai-activity"></div></div>
         <div class="ai-section"><div class="ai-label">Visible retained traffic</div><div class="ai-grid"><div class="ai-stat"><b class="ai-in">0</b><span>Incoming</span></div><div class="ai-stat"><b class="ai-out">0</b><span>Outgoing</span></div><div class="ai-stat"><b class="ai-total">0</b><span>Total</span></div><div class="ai-stat"><b class="ai-peers">0</b><span>Connected agents</span></div></div><div class="ai-value ai-strongest" style="margin-top:8px"></div></div>
         <div class="ai-section"><div class="ai-label">Visible retained connections</div><div class="ai-connections"></div></div>
         <div class="ai-section"><div class="ai-label">Visible memory lobe</div><div class="ai-memory"></div></div>
+        <div class="ai-section"><div class="ai-label">Domain access metadata</div><details class="ai-domain-details"><summary class="ai-domain"></summary><pre class="ai-domain-full"></pre></details></div>
       </div>
     </aside>
     <div class="tip" role="tooltip" aria-hidden="true"></div>
@@ -749,7 +751,7 @@ export function mountMriBrain(container, opts = {}) {
 
   const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   let Graph = null, controls = null, disposed = false, flow = !reduceMotion, scanning = !reduceMotion;
-  let lastNodeClickAt = 0, graphPointerDown = null;
+  let graphPointerDown = null;
   let selectedAgentID = null, selectedAgentNode = null;
   let selectedConnectionPeerID = null, selectedSnapshotAt = 0;
   let selectedMemoryState = null;
@@ -786,6 +788,11 @@ export function mountMriBrain(container, opts = {}) {
   const agentName = n => String((n && (n.label || n.agent_id)) || 'Unknown agent');
   const agentRole = n => String((n && n.role) || 'Unknown role');
   const agentDomain = n => String((n && n.agent_domain) || 'No domain');
+  function agentDomainSummary(n){
+    const raw=agentDomain(n);
+    if(raw.length<=120) return raw;
+    return `${raw.slice(0,117)}… · ${raw.length.toLocaleString()} characters`;
+  }
   function activityLabel(value){
     if (!value) return 'No recorded retained activity';
     const at = new Date(value);
@@ -898,7 +905,9 @@ export function mountMriBrain(container, opts = {}) {
     $('.ai-neuron').style.background = domainColor(n.domain);
     $('.ai-neuron').style.color = domainColor(n.domain);
     $('.ai-name').textContent = agentName(n); $('.ai-role').textContent = agentRole(n);
-    $('.ai-id').textContent = n.agent_id; $('.ai-domain').textContent = agentDomain(n);
+    const domain=agentDomain(n);
+    $('.ai-id').textContent = n.agent_id; $('.ai-domain').textContent = agentDomainSummary(n);
+    $('.ai-domain-full').textContent = domain;
     $('.ai-activity').textContent = activityLabel(n._activity);
     $('.ai-in').textContent = fmtN(n._incoming); $('.ai-out').textContent = fmtN(n._outgoing);
     $('.ai-total').textContent = fmtN(n._w); $('.ai-peers').textContent = fmtN(n._peers);
@@ -1436,9 +1445,10 @@ export function mountMriBrain(container, opts = {}) {
       .warmupTicks(1).cooldownTicks(6)
       .onNodeHover(showTip)
       .onLinkHover(showLinkTip)
-      .onNodeClick(n=>{ lastNodeClickAt = performance.now(); hideTip(); if (mode==='connectome') { if (n.isNeuron) selectNeuron(n); } else exploreNode(n); })
-      .onLinkClick(l=>{ lastNodeClickAt=performance.now(); hideTip(); if(mode==='connectome') selectDirectedLink(l); })
-      .onBackgroundClick(()=>{ exitFocus(); });
+      .clickAfterDrag(true)
+      .onNodeClick((n,e)=>{ if(!graphClickWithinTolerance(e)) return; hideTip(); if (mode==='connectome') { if (n.isNeuron) selectNeuron(n); else if(n._engram) announceEngram(n); } else exploreNode(n); })
+      .onLinkClick((l,e)=>{ if(!graphClickWithinTolerance(e)) return; hideTip(); if(mode==='connectome') selectDirectedLink(l); })
+      .onBackgroundClick(e=>{ if(graphClickWithinTolerance(e)) exitFocus(); });
 
     // Positions are pinned by placeNodes() (fx/fy/fz), so disable the force
     // simulation entirely — zero per-tick cost regardless of node count.
@@ -1710,10 +1720,15 @@ export function mountMriBrain(container, opts = {}) {
       tip.innerHTML=`<div class="h">${escapeHtml((n.label||'').slice(0,90))}</div><div class="m">${escapeHtml(n.domain)} · ${escapeHtml(n.memory_type||'—')} · ${escapeHtml(n.status)}</div><div style="margin-top:5px"><span class="chip">conf ${(+n.confidence).toFixed(2)}</span><span class="chip">corroborated ×${n.corroboration_count|0}</span></div>`;
       positionTip(); return;
     }
+    if (n._engram) {
+      tip.style.display='block'; tip.setAttribute('aria-hidden','false');
+      tip.innerHTML=`<div class="h">${escapeHtml((n.label||n.memory_id||'Visible memory').slice(0,90))}</div><div class="m">Memory · ${escapeHtml(n.domain||'unknown')} · ${escapeHtml(n.memory_type||n.status||'committed')}</div><div class="hint">Memory in the selected agent’s visible lobe</div>`;
+      positionTip(); return;
+    }
     if (!n.isNeuron) { hideTip(); return; }
     const id=String(n.agent_id||'Unknown agent'), short=id.length>30?id.slice(0,14)+'…'+id.slice(-10):id;
     tip.style.display='block'; tip.setAttribute('aria-hidden','false');
-    tip.innerHTML=`<div class="h"><span class="dot" style="width:8px;height:8px;background:${domainColor(n.domain)};margin-right:7px"></span>${escapeHtml(agentName(n))}</div><div class="m">Agent · ${escapeHtml(agentRole(n))} · ${escapeHtml(agentDomain(n))}</div><div class="m" title="${escapeHtml(id)}">${escapeHtml(short)}</div>
+    tip.innerHTML=`<div class="h"><span class="dot" style="width:8px;height:8px;background:${domainColor(n.domain)};margin-right:7px"></span>${escapeHtml(agentName(n))}</div><div class="m">Agent · ${escapeHtml(agentRole(n))} · ${escapeHtml(agentDomainSummary(n))}</div><div class="m" title="${escapeHtml(id)}">${escapeHtml(short)}</div>
       <div style="margin-top:5px"><span class="chip">in ${fmtN(n._incoming)}</span><span class="chip">out ${fmtN(n._outgoing)}</span><span class="chip">${fmtN(n._peers)} peers</span></div><div class="m" style="margin-top:5px">${escapeHtml(activityLabel(n._activity))}</div><div class="hint">Click for agent details</div>`;
     positionTip();
   }
@@ -1744,15 +1759,15 @@ export function mountMriBrain(container, opts = {}) {
     hideTip();
     graphPointerDown = { x: e.clientX, y: e.clientY };
   }
-  function onGraphClick(e){
-    if (!focusId || isPanelTarget(e.target)) return;
-    if (performance.now() - lastNodeClickAt < 350) return;
-    if (graphPointerDown && Math.hypot(e.clientX - graphPointerDown.x, e.clientY - graphPointerDown.y) > 6) return;
-    exitFocus();
+  function graphClickWithinTolerance(e){
+    return !graphPointerDown || !e || Math.hypot(e.clientX-graphPointerDown.x,e.clientY-graphPointerDown.y)<=6;
+  }
+  function announceEngram(n){
+    const status=$('.sr-status');
+    if(status) status.textContent=`Visible memory ${n.label||n.memory_id||'without a title'} in ${agentName(selectedAgentNode)}’s lobe.`;
   }
   root.addEventListener('pointermove', onMove, true);
   root.addEventListener('pointerdown', onGraphPointerDown);
-  root.addEventListener('click', onGraphClick);
   // Relabel the stat panel and expose mode-specific guidance through the
   // existing reading panel. Mode changes are announced without placing another
   // visible panel over the graph.
@@ -1840,7 +1855,6 @@ export function mountMriBrain(container, opts = {}) {
     subs.forEach(u => { try { u && u(); } catch(e){ /* noop */ } });
     root.removeEventListener('pointermove', onMove, true);
     root.removeEventListener('pointerdown', onGraphPointerDown);
-    root.removeEventListener('click', onGraphClick);
     try {
       if (focusMarker && focusMarker.parent) focusMarker.parent.remove(focusMarker);
       if (focusMarker && focusMarker.material) focusMarker.material.dispose();

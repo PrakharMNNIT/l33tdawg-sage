@@ -51,6 +51,27 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.19
+
+**Codex project hooks stay inside their project.** The v11.18.18 byte-exact
+self-healer could mistake Codex's user-global `~/.codex` configuration directory
+for a project and generate a global `hooks.json`. That made an unrelated Codex
+task receive SAGE inbox Stop nudges for the shared agent identity. The healer now
+refuses the user-home/global scope; project-local hooks continue to self-repair.
+
+**Connectome clicks now have one hit-tested owner.** The redundant DOM click
+fallback that raced ForceGraph's deferred node click is gone. Small pointer
+wobble is handled by one explicit tolerance, background dismissal uses the
+graph's raycast result, and clicking a second neuron no longer closes the
+inspector and starts a competing zoom-out first. Raw domain-access metadata is
+summarized behind a bounded disclosure below traffic, relationships, and memory
+details; bloomed memory nodes now expose hover and accessible click feedback.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.19 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.19`. SDK 11.18.19.
+
 ## What's New in v11.18.18
 
 **Codex upgrades now repair stale SAGE lifecycle hooks automatically.** On
@@ -1959,7 +1980,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.18`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.19`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
