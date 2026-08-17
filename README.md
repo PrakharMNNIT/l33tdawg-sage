@@ -51,6 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.17
+
+**Routine MCP restarts no longer make the same stdio agent disown its own
+unfinished messages.** The primary stdio runtime now persists one opaque
+claimant identity per exact signed agent, provider, and project under
+`SAGE_HOME`, and holds an OS advisory lock as the liveness fence. A later
+runtime reuses that identity only after the earlier process is no longer live;
+a genuinely concurrent runtime receives an independent identity and retains
+the existing one-handler and compare-and-swap handoff boundary. In-place
+installed-binary handoff also carries the current claimant identity while the
+old process keeps the lock alive.
+
+The fix is deliberately prospective and does not bulk-transfer historical
+claims created by pre-v11.18.17 random process identities. Those rows remain
+visible through `claimed_elsewhere_count` and passive history and can still be
+transferred one at a time with the existing CAS-fenced handoff after the old
+claimant is known dead. HTTP MCP conversations remain transport-scoped. This
+patch introduces no new consensus application version or state migration. The
+ceiling remains app-v26; **v11.18.17 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.17`. SDK 11.18.17.
+
 ## What's New in v11.18.16
 
 **Claimed agent work no longer disappears from the inbox that claimed it.**
@@ -1913,7 +1935,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.16`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.17`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

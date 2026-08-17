@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.16 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.17 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -65,13 +65,32 @@ adds deterministic `memory_id` ordering for timestamp ties, and makes citation
 repair anchor-aware and fail-closed over new parser debt. v11.18.16 gives the
 exact current claimant a bounded passive view of its unfinished work, keeps
 new-work counts and claim ownership unchanged, and makes hook inbox status
-consult the payload-free durable wake snapshot. The supported consensus ceiling
-remains app-v26; **v11.18.16 does not introduce app-v27**.
+consult the payload-free durable wake snapshot. v11.18.17 persists the primary
+stdio claimant identity per exact agent/provider/project and reuses it only
+after an OS liveness lock proves the prior runtime is gone, while concurrent
+runtimes remain independently fenced. The supported consensus ceiling remains
+app-v26; **v11.18.17 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.17 patch
+
+The primary stdio MCP runtime now stores one opaque claimant identity under
+`SAGE_HOME/runtime/mcp-claimants/`, scoped by the exact signed agent, provider,
+and project. It holds a platform-native advisory lock for the runtime lifetime.
+An ordinary restart therefore reopens the same session's unfinished work only
+after the earlier process is dead, while a concurrent process falls back to a
+separate random claimant and cannot silently share ownership. Installed-runtime
+handoff carries the identity while the parent retains the lock.
+
+Pre-v11.18.17 random claimant IDs are not bulk-adopted; explicit CAS-fenced
+handoff remains their recovery path. HTTP MCP conversation identities remain
+transport-scoped. This patch introduces no new consensus application version
+or state migration: app-v26 remains the ceiling and v11.18.17 does not
+introduce app-v27.
 
 ## v11.18.16 patch
 
