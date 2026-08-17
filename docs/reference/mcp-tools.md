@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.18.16.
+Reconciled against internal/mcp for SAGE v11.18.17.
 
 # SAGE MCP Tools Reference
 
@@ -994,7 +994,19 @@ reassigns the message to the calling MCP session. A stale or concurrent handoff
 returns a conflict instead of silently duplicating ownership. Session IDs are
 opaque coordination metadata, not authorization principals.
 
-**Source:** `internal/mcp/tools.go` (`sage_message_handoff`);
+For stdio MCP, the primary runtime persists one claimant identity per exact
+signed agent, provider, and project under `SAGE_HOME/runtime/mcp-claimants/`.
+It holds an OS advisory lock for the runtime lifetime, so an ordinary restart
+reuses that identity only after the prior process is no longer live. A truly
+concurrent runtime cannot acquire the lock and keeps an independent opaque
+session ID, preserving one-handler and compare-and-swap handoff semantics. An
+installed-runtime executable handoff carries the current identity while the
+old process retains the lock as its liveness fence. HTTP transport conversation
+IDs remain transport-scoped and are not collapsed into the stdio identity.
+
+**Source:** `internal/mcp/claimant_identity.go` (`acquireDurableClaimantIdentity`);
+`internal/mcp/server.go` (`conversation`, `trustedHandoffClaimantSessionID`);
+`internal/mcp/tools.go` (`sage_message_handoff`);
 `api/rest/messages_handler.go` (`handleMessageHandoff`);
 `internal/store/messages.go` (`HandoffLocalMessageClaim`).
 

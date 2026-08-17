@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,11 +16,28 @@ import {
   newUnchecked,
   anchorId,
   repairEligibility,
+  goFilesUnder,
 } from './doc-citations.mjs';
 
 const readJson = (name) => JSON.parse(readFileSync(new URL(name, import.meta.url), 'utf8'));
 const baseline = readJson('./doc-citations.baseline.json');
 const legacyBaseline = readJson('./doc-citations.legacy.json');
+
+test('Go source discovery skips generated and worktree roots before recursion', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'sage-doc-walk-'));
+  try {
+    writeFileSync(join(fixture, 'kept.go'), 'package fixture\n');
+    for (const skipped of ['dist', '.claude', 'scratchpad']) {
+      const dir = join(fixture, skipped);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'duplicate.go'), 'package duplicate\n');
+      if (process.platform !== 'win32') symlinkSync('loop', join(dir, 'loop'));
+    }
+    assert.deepEqual(goFilesUnder(fixture), [join(fixture, 'kept.go')]);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
 
 // docs/reference/ is where CLAUDE.md sends agents INSTEAD of reading the source,
 // and it supersedes api/openapi.yaml and ARCHITECTURE.md where they disagree.

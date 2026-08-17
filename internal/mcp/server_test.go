@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,6 +92,7 @@ func TestConversationStateIsIsolatedAndReleased(t *testing.T) {
 }
 
 func TestClaimantSessionIdentityIsStablePerConversationAndOpaque(t *testing.T) {
+	t.Setenv("SAGE_HOME", t.TempDir())
 	s, _ := testServer(t)
 	ctxA := WithConversationID(context.Background(), "sse:A")
 	ctxB := WithConversationID(context.Background(), "sse:B")
@@ -104,6 +106,97 @@ func TestClaimantSessionIdentityIsStablePerConversationAndOpaque(t *testing.T) {
 	require.NotEqual(t, a1, b)
 	require.Regexp(t, `^mcp-[0-9a-f]{32}$`, a1)
 	require.NotContains(t, a1, "sse:A")
+}
+
+func TestStdioClaimantIdentitySurvivesProcessRestart(t *testing.T) {
+	t.Setenv("SAGE_HOME", t.TempDir())
+	t.Setenv("SAGE_PROVIDER", "codex")
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	first := NewServer("http://localhost:9999", key)
+	first.SetProject("sage")
+	firstID, err := first.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, first.claimantLease)
+	require.NoError(t, first.claimantLease.Close())
+
+	restarted := NewServer("http://localhost:9999", key)
+	restarted.SetProject("sage")
+	restartedID, err := restarted.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = restarted.claimantLease.Close() })
+	require.Equal(t, firstID, restartedID)
+}
+
+func TestConcurrentStdioRuntimeCannotShareDurableClaimantIdentity(t *testing.T) {
+	t.Setenv("SAGE_HOME", t.TempDir())
+	t.Setenv("SAGE_PROVIDER", "codex")
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	primary := NewServer("http://localhost:9999", key)
+	primary.SetProject("sage")
+	primaryID, err := primary.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, primary.claimantLease)
+
+	concurrent := NewServer("http://localhost:9999", key)
+	concurrent.SetProject("sage")
+	concurrentID, err := concurrent.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	require.Nil(t, concurrent.claimantLease)
+	require.NotEqual(t, primaryID, concurrentID)
+
+	require.NoError(t, primary.claimantLease.Close())
+	restarted := NewServer("http://localhost:9999", key)
+	restarted.SetProject("sage")
+	restartedID, err := restarted.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = restarted.claimantLease.Close() })
+	require.Equal(t, primaryID, restartedID)
+}
+
+func TestRuntimeHandoffRetainsClaimantIdentityWhileParentHoldsLease(t *testing.T) {
+	t.Setenv("SAGE_HOME", t.TempDir())
+	t.Setenv("SAGE_PROVIDER", "codex")
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	parent := NewServer("http://localhost:9999", key)
+	parent.SetProject("sage")
+	parentID, err := parent.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = parent.claimantLease.Close() })
+
+	t.Setenv(mcpRuntimeHandoffEnv, "1")
+	t.Setenv(mcpRuntimeHandoffParentEnv, strconv.Itoa(os.Getppid()))
+	t.Setenv(mcpRuntimeHandoffClaimantEnv, parentID)
+	child := NewServer("http://localhost:9999", key)
+	child.SetProject("sage")
+	childID, err := child.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, parentID, childID)
+	require.Nil(t, child.claimantLease)
+}
+
+func TestRuntimeHandoffRejectsMalformedClaimantIdentity(t *testing.T) {
+	t.Setenv("SAGE_HOME", t.TempDir())
+	t.Setenv("SAGE_PROVIDER", "codex")
+	t.Setenv(mcpRuntimeHandoffEnv, "1")
+	t.Setenv(mcpRuntimeHandoffParentEnv, strconv.Itoa(os.Getppid()))
+	t.Setenv(mcpRuntimeHandoffClaimantEnv, "mcp-not-an-opaque-id")
+	_, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	server := NewServer("http://localhost:9999", key)
+	server.SetProject("sage")
+	id, err := server.claimantSessionID(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(server.closeClaimantLease)
+	require.Regexp(t, `^mcp-[0-9a-f]{32}$`, id)
+	require.NotEqual(t, "mcp-not-an-opaque-id", id)
+	require.NotNil(t, server.claimantLease)
 }
 
 func TestHandleInitialize(t *testing.T) {
