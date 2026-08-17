@@ -37,6 +37,7 @@ const mcpRuntimeHandoffEnv = "SAGE_MCP_RUNTIME_HANDOFF"
 const (
 	mcpRuntimeHandoffParentEnv      = "SAGE_MCP_RUNTIME_HANDOFF_PARENT_PID"
 	mcpRuntimeHandoffInitializedEnv = "SAGE_MCP_RUNTIME_HANDOFF_INITIALIZED"
+	mcpRuntimeHandoffClaimantEnv    = "SAGE_MCP_RUNTIME_HANDOFF_CLAIMANT_ID"
 )
 
 // mcpExecutableSnapshot identifies the exact on-disk executable that started a
@@ -96,6 +97,7 @@ type Server struct {
 
 	conversationMu sync.Mutex
 	conversations  map[string]*conversationState
+	claimantLease  io.Closer
 
 	// Cached recall settings from dashboard preferences.
 	recallTopK     int
@@ -152,9 +154,48 @@ func (s *Server) conversation(ctx context.Context) *conversationState {
 		state.lastUsed = time.Now()
 		return state
 	}
-	state := &conversationState{lastUsed: time.Now(), claimantSessionID: newMCPClaimantSessionID()}
+	claimantSessionID := newMCPClaimantSessionID()
+	if id == "stdio" {
+		if inherited := trustedHandoffClaimantSessionID(); inherited != "" {
+			claimantSessionID = inherited
+		} else if durableID, lease, err := acquireDurableClaimantIdentity(s.agentID, s.provider, s.project); err == nil {
+			claimantSessionID = durableID
+			s.claimantLease = lease
+		}
+	}
+	state := &conversationState{lastUsed: time.Now(), claimantSessionID: claimantSessionID}
 	s.conversations[id] = state
 	return state
+}
+
+func trustedHandoffClaimantSessionID() string {
+	if os.Getenv(mcpRuntimeHandoffEnv) != "1" || os.Getenv(mcpRuntimeHandoffParentEnv) != strconv.Itoa(os.Getppid()) {
+		return ""
+	}
+	id := strings.TrimSpace(os.Getenv(mcpRuntimeHandoffClaimantEnv))
+	if !validMCPClaimantSessionID(id) {
+		return ""
+	}
+	return id
+}
+
+func (s *Server) currentStdioClaimantSessionID() string {
+	s.conversationMu.Lock()
+	defer s.conversationMu.Unlock()
+	if state := s.conversations["stdio"]; state != nil {
+		return state.claimantSessionID
+	}
+	return ""
+}
+
+func (s *Server) closeClaimantLease() {
+	s.conversationMu.Lock()
+	lease := s.claimantLease
+	s.claimantLease = nil
+	s.conversationMu.Unlock()
+	if lease != nil {
+		_ = lease.Close()
+	}
 }
 
 func newMCPClaimantSessionID() string {
@@ -247,6 +288,7 @@ func (s *Server) requireBoundFederatedCaller(ctx context.Context) error {
 
 // Run starts the stdio MCP server loop.
 func (s *Server) Run(ctx context.Context) error {
+	defer s.closeClaimantLease()
 	reader := bufio.NewReaderSize(os.Stdin, 64<<10)
 	out := newStdioOutbound(ctx, os.Stdout)
 	var channelCancel context.CancelFunc
@@ -325,7 +367,11 @@ func (s *Server) Run(ctx context.Context) error {
 			shutdown()
 			// Pass the buffered reader, not raw os.Stdin: ReadSlice may already
 			// have pulled bytes from following frames into reader's buffer.
-			started, err := handoffMCPProcess(ctx, executable.path, os.Args[1:], line, reader, os.Stdout, os.Stderr, os.Environ(), lifecycle.initialized)
+			handoffEnv := os.Environ()
+			if claimantSessionID := s.currentStdioClaimantSessionID(); claimantSessionID != "" {
+				handoffEnv = withMCPEnvironment(handoffEnv, mcpRuntimeHandoffClaimantEnv, claimantSessionID)
+			}
+			started, err := handoffMCPProcess(ctx, executable.path, os.Args[1:], line, reader, os.Stdout, os.Stderr, handoffEnv, lifecycle.initialized)
 			if started {
 				// Once the replacement owns stdin the current runtime must never
 				// execute the replayed frame, even if the child later exits with an
