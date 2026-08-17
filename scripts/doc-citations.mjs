@@ -45,8 +45,14 @@ const RAW_REFERENCE = /([A-Za-z0-9_/.-]*[a-z0-9_]\.go):(\d+)/g;
 // A top-level func begins at column 0; anything indented is a body line.
 const FUNC_DECL = /^func (?:\([^)]*\) )?([A-Za-z0-9_]+)/;
 
+const WALK_SKIP = new Set(['node_modules', '.git', '.claude', 'third_party', 'vendor', 'dist', 'scratchpad']);
+
 function walk(dir, pred, out = []) {
   for (const entry of readdirSync(dir)) {
+    // Skip generated/dependency trees before stat/recurse. Filtering the final
+    // .go list is too late: recursive packaging symlinks can exceed PATH_MAX
+    // while the walker is still descending into an ignored directory.
+    if (WALK_SKIP.has(entry)) continue;
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) walk(full, pred, out);
     else if (pred(full)) out.push(full);
@@ -55,10 +61,11 @@ function walk(dir, pred, out = []) {
 }
 
 export function goFiles() {
-  const skip = new Set(['node_modules', '.git', 'third_party', 'vendor']);
-  return walk(root, (p) => p.endsWith('.go'), []).filter(
-    (p) => !relative(root, p).split('/').some((s) => skip.has(s)),
-  );
+  return goFilesUnder(root);
+}
+
+export function goFilesUnder(scanRoot) {
+  return walk(scanRoot, (p) => p.endsWith('.go'), []);
 }
 
 export function docFiles() {
