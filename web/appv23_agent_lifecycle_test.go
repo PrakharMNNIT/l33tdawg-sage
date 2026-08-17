@@ -23,6 +23,26 @@ import (
 	"github.com/l33tdawg/sage/internal/tx"
 )
 
+func TestAppV23RejectPendingRegistrationCannotReportHTTPConflictAsSuccess(t *testing.T) {
+	apiBytes, err := os.ReadFile("static/js/api.js")
+	require.NoError(t, err)
+	api := string(apiBytes)
+	start := strings.Index(api, "export async function removeAgent")
+	require.NotEqual(t, -1, start)
+	end := strings.Index(api[start:], "\n}\n")
+	require.NotEqual(t, -1, end)
+	removeAgentClient := api[start : start+end]
+
+	assert.Contains(t, removeAgentClient, "return appV23AccessRequest(")
+	assert.NotContains(t, removeAgentClient, "return res.json()")
+
+	appBytes, err := os.ReadFile("static/js/app.js")
+	require.NoError(t, err)
+	app := string(appBytes)
+	assert.Contains(t, app, "e.code === 'agent_has_memories'")
+	assert.Contains(t, app, "Deprecate them or transfer their domains before rejecting the identity.")
+}
+
 func TestAppV23RemoveCommitsDeactivationAndGroupCleanupBeforeSQLProjection(t *testing.T) {
 	fixture := newAppV23AccessFixture(t)
 	require.NoError(t, fixture.badger.MutateAppV23AccessGroup(

@@ -75,7 +75,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.18.17';
+const SAGE_VERSION = 'v11.18.18';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -9557,7 +9557,10 @@ function AppV23AccessControl() {
             await load();
             if (onDirectoryChanged) await onDirectoryChanged();
         } catch (e) {
-            showToast(e.message || 'The registration could not be rejected.', 'error', 9000);
+            const message = e.code === 'agent_has_memories'
+                ? 'This registration still owns historical memories. Deprecate them or transfer their domains before rejecting the identity.'
+                : e.message || 'The registration could not be rejected.';
+            showToast(message, 'error', 9000);
         } finally {
             setRejectBusy(false);
             endMutation(mutationKey);

@@ -181,6 +181,7 @@ const STYLE = `
 .mrib .tip .hint{margin-top:6px;color:#39d0ff;font-size:10px}
 .mrib .agent-browser{display:none;position:absolute;top:16px;right:16px;width:min(340px,calc(100% - 32px));z-index:8;padding:8px;background:rgba(10,16,28,.9);border:1px solid #15233b;border-radius:10px;backdrop-filter:blur(10px);box-shadow:0 8px 30px #0007}
 .mrib .agent-browser.visible{display:block}
+.mrib .agent-browser-hint{margin:0 0 6px;color:#9fb6d8;font-size:10px;letter-spacing:.35px}
 .mrib .agent-inspector{display:none;position:absolute;top:68px;right:16px;width:min(340px,calc(100% - 32px));max-height:calc(100% - 148px);overflow:auto;z-index:8;padding:14px;background:rgba(10,16,28,.92);border:1px solid #15233b;border-radius:12px;backdrop-filter:blur(10px);box-shadow:0 12px 44px #0009}
 .mrib .agent-inspector.visible{display:block}
 .mrib.with-domain-legend .agent-browser{left:16px;right:auto;top:82px}.mrib.with-domain-legend .agent-inspector{left:16px;right:auto;top:134px;max-height:calc(100% - 214px)}
@@ -398,7 +399,7 @@ export function mountMriBrain(container, opts = {}) {
       ${allowConnectome ? '<button type="button" class="btn b-mode" aria-label="Connectome view" aria-pressed="false">◉ connectome</button>' : ''}
       <label class="sld">skull <input class="b-op" type="range" min="0" max="60" value="8"></label>
     </div>
-    <div class="agent-browser" aria-hidden="true"><select class="ai-select" aria-label="Browse agents"><option value="">Browse agents…</option></select></div>
+    <div class="agent-browser" aria-hidden="true"><div class="agent-browser-hint">Click a neuron for details, or choose a connected visible agent</div><select class="ai-select" aria-label="Browse connected visible agents"><option value="">Connected visible agents…</option></select></div>
     <aside class="agent-inspector" aria-label="Connectome agent details" aria-hidden="true">
       <div class="ai-selected">
         <div class="ai-head"><span class="ai-neuron"></span><div class="ai-heading"><div class="ai-kicker">Selected agent</div><div class="ai-name"></div><div class="ai-role"></div><div class="ai-live">Snapshot</div></div><button type="button" class="ai-close" aria-label="Close agent details">×</button></div>
@@ -505,7 +506,7 @@ export function mountMriBrain(container, opts = {}) {
   // Memory nodes size by corroboration+confidence+freshness; neurons size by
   // degree (total traffic) so hubs read as large cells, plus a transient birth swell.
   const nodeVal = n => n.isNeuron
-    ? 1.6 + (n._deg||0)*7 + neuronBirthGlow(n)*4
+    ? 3.0 + (n._deg||0)*7 + neuronBirthGlow(n)*4
     : 1.4 + (n.corroboration_count||0)*1.1 + (n.confidence||0)*0.8 + (n._fresh||0)*2.2;
   function nodeColorRGBA(n){
     // Focus mode: everything outside the clicked node's neighbourhood fades back.
@@ -805,11 +806,17 @@ export function mountMriBrain(container, opts = {}) {
   }
   function populateAgentPicker(d){
     const select = $('.ai-select'); if (!select) return;
-    const nodes = (d && Array.isArray(d.nodes) ? d.nodes : []).filter(n => n.isNeuron && n.agent_id);
-    select.innerHTML = '<option value="">Browse agents…</option>';
-    nodes.sort((a,b)=>agentName(a).localeCompare(agentName(b))).forEach(n => {
+    // The graph itself remains the complete authorized neuron surface. The
+    // compact fallback picker is intentionally limited to agents with at least
+    // one visible retained connection, so a large roster of dormant/test
+    // identities does not become the primary navigation UI. Preserve an
+    // already-selected isolated neuron across live snapshot refreshes.
+    const nodes = (d && Array.isArray(d.nodes) ? d.nodes : []).filter(n =>
+      n.isNeuron && n.agent_id && ((n._peers || 0) > 0 || n.agent_id === selectedAgentID));
+    select.innerHTML = '<option value="">Connected visible agents…</option>';
+    nodes.sort((a,b)=>(b._w||0)-(a._w||0)||agentName(a).localeCompare(agentName(b))).forEach(n => {
       const option = document.createElement('option');
-      option.value = n.agent_id; option.textContent = `${agentName(n)} · ${n.agent_id}`;
+      option.value = n.agent_id; option.textContent = `${agentName(n)} · ${fmtN(n._peers)} peer${n._peers===1?'':'s'}`;
       select.appendChild(option);
     });
     select.value = selectedAgentID || '';
@@ -883,6 +890,10 @@ export function mountMriBrain(container, opts = {}) {
     inspector.setAttribute('aria-hidden', mode === 'connectome' && chosen ? 'false' : 'true');
     if (!chosen) return;
     selectedAgentID = n.agent_id; selectedAgentNode = n;
+    // A clicked isolated neuron is intentionally absent from the compact
+    // connected-agent picker until selected. Rebuild after selection so Close,
+    // Escape, and live refreshes still have a coherent keyboard return target.
+    populateAgentPicker(rendered);
     $('.ai-select').value = selectedAgentID;
     $('.ai-neuron').style.background = domainColor(n.domain);
     $('.ai-neuron').style.color = domainColor(n.domain);

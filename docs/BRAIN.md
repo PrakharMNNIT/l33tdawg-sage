@@ -17,6 +17,25 @@ domain and how settled they are. This is the brain view: drag to orbit, scroll
 to zoom, click a memory to focus its train of thought, and click open space to
 return to all memories.
 
+### Switch to the agent Connectome
+
+Choose **◉ connectome** in the lower HUD to replace memory nodes with the
+currently authorized agent projection. Each neuron is one active ordinary
+agent; directed synapses are visible retained message traffic. Root, pending,
+removed, and caller-hidden identities are not rendered.
+
+Click a neuron to open its persistent details. The panel shows its exact agent
+ID and domain, incoming and outgoing retained-message counts, strongest visible
+peer, and a direction-preserving relationship list—**Sent** and **Received** are
+kept separate. Clicking a relationship isolates that pair in the brain; clicking
+a directed synapse opens the sender/receiver relationship directly.
+
+The compact selector is a fallback for keyboard and touch navigation, not the
+primary roster. It contains only agents with a visible peer relationship,
+ordered by visible retained traffic. Authorized isolated neurons remain in the
+brain and can be opened by clicking them; while selected, an isolated neuron is
+also retained in the selector so Close and Escape return focus coherently.
+
 ---
 
 ## What a node tells you

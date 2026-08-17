@@ -334,8 +334,8 @@ test('connectome guidance is reachable without adding another floating panel', (
 test('connectome exposes persistent, keyboard-reachable agent identity details', () => {
   assert.match(mriSource, /<aside class="agent-inspector" aria-label="Connectome agent details" aria-hidden="true">/,
     'selected details must be a labelled nonmodal landmark');
-  assert.match(mriSource, /<select class="ai-select" aria-label="Browse agents">/,
-    'canvas-only neurons need a keyboard and touch selection path');
+  assert.match(mriSource, /<select class="ai-select" aria-label="Browse connected visible agents">/,
+    'connected visible neurons need a compact keyboard and touch selection path');
   assert.match(mriSource, /<button type="button" class="ai-close" aria-label="Close agent details">/,
     'persistent details need a real accessible close button');
   assert.match(mriSource, /class="tip" role="tooltip" aria-hidden="true"/,
@@ -346,6 +346,21 @@ test('connectome exposes persistent, keyboard-reachable agent identity details',
     'Escape must dismiss a selected agent');
   assert.match(mriSource, /subs\.push\(\(\)=>document\.removeEventListener\('keydown',onKeyDown\)\)/,
     'the global Escape listener must be cleaned up with the renderer');
+});
+
+test('connectome makes neuron clicks primary and keeps the fallback picker connection-scoped', () => {
+  assert.match(mriSource, /Click a neuron for details, or choose a connected visible agent/,
+    'the visible instruction must lead with direct neuron interaction');
+  assert.match(mriSource, /n\.isNeuron && n\.agent_id && \(\(n\._peers \|\| 0\) > 0 \|\| n\.agent_id === selectedAgentID\)/,
+    'the fallback picker must exclude dormant roster noise while preserving a selected isolated neuron');
+  assert.match(mriSource, /nodes\.sort\(\(a,b\)=>\(b\._w\|\|0\)-\(a\._w\|\|0\)\|\|agentName\(a\)\.localeCompare\(agentName\(b\)\)\)/,
+    'connected agents must be ordered by visible traffic before name');
+  assert.match(mriSource, /const nodeVal = n => n\.isNeuron\s*\? 3\.0 \+ \(n\._deg\|\|0\)\*7/,
+    'even dormant neurons need a practical minimum canvas click target');
+  assert.match(mriSource, /\.onNodeClick\([^\n]*selectNeuron\(n\)/,
+    'clicking the enlarged neuron must enter the persistent detail and relationship path');
+  assert.match(mriSource, /selectedAgentID = n\.agent_id; selectedAgentNode = n;[\s\S]{0,300}populateAgentPicker\(rendered\);[\s\S]{0,100}\$\('\.ai-select'\)\.value = selectedAgentID/,
+    'a clicked isolated neuron must be added to the picker before it becomes the keyboard return target');
 });
 
 test('directed-link inspection anchors the sender unless an endpoint is already selected', () => {
