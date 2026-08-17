@@ -132,6 +132,8 @@ docs/*
 !docs/design/
 docs/design/*
 !docs/design/agent-message-receipts.md
+!docs/design/sage-commons-lantern-v12-support.md
+scratchpad/
 # Agent-facing code reference (public)
 !docs/reference/
 # Architecture diagram (rendered PNG embedded in ARCHITECTURE.md; .mmd source kept local/untracked)

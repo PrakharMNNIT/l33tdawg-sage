@@ -12,8 +12,10 @@
 If you discover a security vulnerability in SAGE, please report it responsibly:
 
 1. **Do NOT open a public GitHub issue**
-2. Email the author directly via GitHub: [@l33tdawg](https://github.com/l33tdawg)
-3. Include a description of the vulnerability, steps to reproduce, and any relevant logs or screenshots
+2. Use GitHub's private vulnerability reporting: **[Security → Report a vulnerability](https://github.com/l33tdawg/sage/security/advisories/new)**. The report stays private between you and the maintainers until an advisory is published, and it lets us coordinate a fix, a CVE, and credit in one place.
+3. Include a description of the vulnerability, steps to reproduce, the affected version or commit, and any relevant logs or screenshots
+
+If the private advisory form is unavailable to you for any reason, contact [@l33tdawg](https://github.com/l33tdawg) to arrange another channel — but please still do not open a public issue.
 
 ## Response Timeline
 
