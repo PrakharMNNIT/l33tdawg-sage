@@ -51,6 +51,20 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.20
+
+**A transient MRI refresh no longer hides a graph CEREBRUM has already
+verified.** Memory and Connectome snapshots now retain their explicit source
+mode. If a live refresh fails, CEREBRUM keeps the last verified snapshot visible
+only when it belongs to that same mode, while retrying in the background. Cold
+failures and failed mode switches still fail closed, so Connectome bytes can
+never masquerade as a verified memory projection.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.20 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.20`. SDK 11.18.20.
+
 ## What's New in v11.18.19
 
 **Codex project hooks stay inside their project.** The v11.18.18 byte-exact
@@ -1980,7 +1994,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.19`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.20`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

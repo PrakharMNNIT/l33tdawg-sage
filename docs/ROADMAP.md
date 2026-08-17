@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.19 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.20 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -71,16 +71,29 @@ after an OS liveness lock proves the prior runtime is gone, while concurrent
 runtimes remain independently fenced. v11.18.18 makes the Codex startup
 self-healer compare every fully rendered lifecycle hook and makes Connectome
 neurons the primary agent-detail navigation surface, with a compact
-relationship-only fallback selector. v11.18.19 prevents Codex project-hook
+relationship-only fallback selector. v11.18.20 also keeps a last verified MRI
+snapshot visible across a transient same-mode refresh failure. v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
 metadata and making bloomed memories responsive. The supported consensus
-ceiling remains app-v26; **v11.18.19 does not introduce app-v27**.
+ceiling remains app-v26; **v11.18.20 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.20 patch
+
+The CEREBRUM MRI renderer now records which view mode produced the currently
+rendered verified snapshot. A transient live-refresh failure keeps that snapshot
+visible only when the failed request belongs to the same mode; cold failures and
+failed Memory/Connectome switches remain explicitly unavailable and continue
+retrying. This removes the contradictory overlay that could cover a valid brain
+while the domain inventory remained populated.
+
+This patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.20 does not introduce app-v27.
 
 ## v11.18.19 patch
 
