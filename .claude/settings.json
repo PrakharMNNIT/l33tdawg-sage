@@ -103,7 +103,12 @@
       "mcp__sage__sage_register",
       "mcp__sage__sage_timeline",
       "mcp__sage__sage_reinstate",
-      "mcp__sage__sage_rename"
+      "mcp__sage__sage_rename",
+      "mcp__sage__sage_inbox",
+      "mcp__sage__sage_messages_receive",
+      "mcp__sage__sage_message_history",
+      "mcp__sage__sage_message_replies",
+      "mcp__sage__sage_message_status"
     ]
   }
 }
