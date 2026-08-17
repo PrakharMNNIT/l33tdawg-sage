@@ -187,6 +187,27 @@ func TestSelfHealCodex_NoOpWhenNoCodexDir(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "self-heal must not create .codex/ when it doesn't exist")
 }
 
+func TestSelfHealCodex_NeverCreatesGlobalHooksUnderUserHome(t *testing.T) {
+	userHome := t.TempDir()
+	sageHome := t.TempDir()
+	t.Setenv("HOME", userHome)
+
+	// A normal global Codex installation already has ~/.codex/config.toml.
+	// Its presence must not be mistaken for evidence of a project-local SAGE
+	// install, because ~/.codex/hooks.json is loaded by every unrelated task.
+	codexDir := filepath.Join(userHome, ".codex")
+	require.NoError(t, os.MkdirAll(codexDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(codexDir, "config.toml"),
+		[]byte("[mcp_servers.sage]\ncommand = \"sage-gui\"\n"), 0600))
+
+	selfHealCodex(userHome, sageHome)
+
+	_, hooksErr := os.Stat(filepath.Join(codexDir, "hooks.json"))
+	assert.True(t, os.IsNotExist(hooksErr), "self-heal must never create global Codex hooks")
+	_, scriptsErr := os.Stat(filepath.Join(codexDir, "hooks"))
+	assert.True(t, os.IsNotExist(scriptsErr), "self-heal must never create global hook scripts")
+}
+
 func TestSelfHealCodex_RepairsMissingHooksJSON(t *testing.T) {
 	projectDir, sageHome := withCodexInstallEnv(t)
 	require.NoError(t, runCodexInstall())

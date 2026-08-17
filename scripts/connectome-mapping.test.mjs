@@ -363,6 +363,34 @@ test('connectome makes neuron clicks primary and keeps the fallback picker conne
     'a clicked isolated neuron must be added to the picker before it becomes the keyboard return target');
 });
 
+test('connectome click dispatch has one hit-tested owner and tolerates small pointer drift', () => {
+  assert.doesNotMatch(mriSource, /root\.addEventListener\('click'/,
+    'a DOM click fallback races ForceGraph deferred hit-testing and must not dismiss a real node click');
+  assert.match(mriSource, /\.clickAfterDrag\(true\)/,
+    'ForceGraph must deliver the candidate click so the renderer can apply its explicit tolerance');
+  const body = bracedBlock(mriSource, 'function graphClickWithinTolerance').body;
+  const withinTolerance = new Function('e', 'graphPointerDown', body);
+  assert.equal(withinTolerance({ clientX:102, clientY:101 }, { x:100, y:100 }), true,
+    'a two-pixel mouse wobble must still select the neuron');
+  assert.equal(withinTolerance({ clientX:110, clientY:100 }, { x:100, y:100 }), false,
+    'a real orbit drag must not become a click');
+  assert.match(mriSource, /\.onBackgroundClick\(e=>\{ if\(graphClickWithinTolerance\(e\)\) exitFocus\(\); \}\)/,
+    'only the graph library raycast may classify a background click');
+});
+
+test('connectome bounds domain metadata and keeps traffic ahead of optional raw policy', () => {
+  const traffic = mriSource.indexOf('<div class="ai-label">Visible retained traffic</div>');
+  const domain = mriSource.indexOf('<div class="ai-label">Domain access metadata</div>');
+  assert.ok(traffic !== -1 && domain > traffic,
+    'raw access metadata must not bury the primary traffic and relationship details');
+  assert.match(mriSource, /<details class="ai-domain-details"><summary class="ai-domain"><\/summary><pre class="ai-domain-full"><\/pre><\/details>/,
+    'the full access value must remain available behind an explicit bounded disclosure');
+  assert.match(mriSource, /\.ai-domain-full\{max-height:180px;overflow:auto/,
+    'expanded policy metadata must scroll inside a bounded region');
+  assert.match(mriSource, /agentDomainSummary\(n\)/,
+    'the inspector and hover path must use the bounded domain summary');
+});
+
 test('directed-link inspection anchors the sender unless an endpoint is already selected', () => {
   const body = bracedBlock(mriSource, 'function selectDirectedLink').body;
   const inspect = new Function(
@@ -514,7 +542,8 @@ test('agent tooltip is clamped, escaped, and includes identity plus visible traf
   const show = mriSource.slice(showStart, showEnd);
   assert.match(show, /escapeHtml\(agentName\(n\)\)/);
   assert.match(show, /escapeHtml\(agentRole\(n\)\)/);
-  assert.match(show, /escapeHtml\(agentDomain\(n\)\)/);
+  assert.match(show, /escapeHtml\(agentDomainSummary\(n\)\)/,
+    'the tooltip must never render unbounded raw access metadata');
   assert.match(show, /escapeHtml\(id\)/, 'canonical agent identity must be escaped');
   assert.match(show, /n\._incoming/); assert.match(show, /n\._outgoing/); assert.match(show, /n\._peers/);
   const positionStart = mriSource.indexOf('function positionTip(');

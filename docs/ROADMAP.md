@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.18 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.19 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -71,13 +71,33 @@ after an OS liveness lock proves the prior runtime is gone, while concurrent
 runtimes remain independently fenced. v11.18.18 makes the Codex startup
 self-healer compare every fully rendered lifecycle hook and makes Connectome
 neurons the primary agent-detail navigation surface, with a compact
-relationship-only fallback selector. The supported consensus ceiling remains
-app-v26; **v11.18.18 does not introduce app-v27**.
+relationship-only fallback selector. v11.18.19 prevents Codex project-hook
+self-healing from ever targeting the user-global `~/.codex` scope and removes
+the Connectome's competing DOM/ForceGraph click paths while bounding raw access
+metadata and making bloomed memories responsive. The supported consensus
+ceiling remains app-v26; **v11.18.19 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.19 patch
+
+Codex self-healing now rejects the user-home/global configuration scope before
+inspecting or creating lifecycle artifacts. A normal global MCP registration
+therefore cannot grow a global Stop hook that injects one project's durable
+inbox work into unrelated tasks. Existing project-local byte-exact repair is
+unchanged.
+
+The Connectome now routes node, link, and background clicks through the graph
+library's raycast result with one explicit six-pixel pointer tolerance. The
+hit-test-free DOM fallback and its stale timing heuristic are removed. Primary
+traffic, connection, and memory details render before domain-access metadata;
+large raw values remain available inside a bounded disclosure, tooltips are
+clamped, and bloomed memory nodes provide hover and accessible click feedback.
+This patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.19 does not introduce app-v27.
 
 ## v11.18.18 patch
 

@@ -276,12 +276,16 @@ test('the 50ms deep-link bloom timer is tracked and cleared on dispose', () => {
     'the deep-link timer must be cleared in cleanup');
 });
 
-test('only a NEURON click blooms engrams — clicking a bloomed engram does not re-bloom', () => {
+test('only a NEURON click blooms engrams while a bloomed engram responds without re-blooming', () => {
   // clicking an engram (a memory node) must not re-run bloomEngrams with a memory
   // id as ?agent, which would strip the lobe and leave a focus ring on a removed
   // node. Guard: connectome click blooms only when n.isNeuron.
-  assert.match(mriSource, /mode==='connectome'\)\s*\{\s*if \(n\.isNeuron\) selectNeuron\(n\); \}\s*else exploreNode\(n\)/,
-    'connectome click must select only neurons; selectNeuron owns the single bloom while memory mode keeps exploreNode');
+  assert.match(mriSource, /mode==='connectome'\)\s*\{\s*if \(n\.isNeuron\) selectNeuron\(n\); else if\(n\._engram\) announceEngram\(n\); \}\s*else exploreNode\(n\)/,
+    'connectome click must select only neurons while engrams acknowledge the click without triggering another bloom');
+  assert.match(mriSource, /if \(n\._engram\) \{[\s\S]{0,500}Memory in the selected agent’s visible lobe/,
+    'bloomed memories must expose a visible hover response');
+  assert.match(mriSource, /function announceEngram\(n\)[\s\S]{0,250}status\.textContent=/,
+    'bloomed memory clicks must produce an accessible response');
   const selectBody = functionBody(mriSource, 'selectNeuron');
   assert.match(selectBody, /bloomEngrams\(n\)/, 'one selection must preserve the existing engram bloom');
 });
