@@ -51,6 +51,20 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.22
+
+**A missing optional ForceGraph API can no longer strand CEREBRUM after the
+verified brain has rendered.** The renderer now publishes the core graph and
+truthful counts before optional anatomical, control, and interaction setup. The
+bundled runtime's absent `clickAfterDrag` helper is feature-gated, so the brain
+hull, controls, and auto-rotation continue instead of falling into the cold
+unavailable path with real nodes already on screen.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.22 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.22`. SDK 11.18.22.
+
 ## What's New in v11.18.21
 
 **A domain-summary refresh can no longer cover a verified MRI graph.** The MRI
@@ -2006,7 +2020,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.21`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.22`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

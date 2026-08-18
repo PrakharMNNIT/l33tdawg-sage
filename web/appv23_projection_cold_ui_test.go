@@ -69,6 +69,34 @@ func TestMRIRefreshFailureKeepsSameModeVerifiedSnapshotVisible(t *testing.T) {
 	assert.Contains(t, mri, "graphAvailabilityAfterFailure(")
 }
 
+func TestMRIPostRenderInitializationFailureKeepsVerifiedGraphVisible(t *testing.T) {
+	mriBytes, err := os.ReadFile("static/js/mri-brain.js")
+	require.NoError(t, err)
+	mri := string(mriBytes)
+
+	coreReady := strings.Index(mri, "Graph.graphData(data);\n    refreshCounts(data);\n    reportGraphAvailability('ready')")
+	require.NotEqual(t, -1, coreReady,
+		"readiness must be published only after the core graph and truthful HUD exist")
+	forceGraph := strings.Index(mri, "Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'));")
+	require.NotEqual(t, -1, forceGraph)
+	assert.Greater(t, coreReady, forceGraph)
+	optionalChain := strings.Index(mri, "Graph.backgroundColor(mriBgColor())")
+	require.NotEqual(t, -1, optionalChain)
+	assert.Greater(t, optionalChain, coreReady,
+		"optional fluent setters must not run before the verified core is published")
+
+	assert.Contains(t, mri,
+		"!!Graph && !!rendered, renderedMode, request.mode")
+	assert.Contains(t, mri, "if (availability === 'ready')")
+	assert.Contains(t, mri,
+		"optional initial graph setup incomplete; keeping verified graph")
+	assert.Contains(t, mri,
+		"if (typeof Graph.clickAfterDrag === 'function') Graph.clickAfterDrag(true)",
+		"optional ForceGraph APIs must be feature-gated so renderer setup can continue")
+	assert.NotContains(t, mri, ".onLinkHover(showLinkTip)\n      .clickAfterDrag(true)",
+		"an unavailable optional API must not remain in the required fluent chain")
+}
+
 func TestMRIOverlayAuthorityDoesNotFollowDomainInventoryFailure(t *testing.T) {
 	appBytes, err := os.ReadFile("static/js/app.js")
 	require.NoError(t, err)
