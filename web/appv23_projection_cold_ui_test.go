@@ -69,6 +69,23 @@ func TestMRIRefreshFailureKeepsSameModeVerifiedSnapshotVisible(t *testing.T) {
 	assert.Contains(t, mri, "graphAvailabilityAfterFailure(")
 }
 
+func TestMRIOverlayAuthorityDoesNotFollowDomainInventoryFailure(t *testing.T) {
+	appBytes, err := os.ReadFile("static/js/app.js")
+	require.NoError(t, err)
+	app := string(appBytes)
+
+	mriStart := strings.Index(app, "function MriView")
+	require.NotEqual(t, -1, mriStart)
+	mriEnd := strings.Index(app[mriStart:], "\n// Global tooltips state")
+	require.NotEqual(t, -1, mriEnd)
+	mri := app[mriStart : mriStart+mriEnd]
+
+	assert.Contains(t, mri,
+		"const memoryViewUnavailable = graphAvailability === 'unavailable'")
+	assert.NotContains(t, mri,
+		"const memoryViewUnavailable = projectionAvailability === 'unavailable'")
+}
+
 func TestMemoryListClientCarriesOpaqueContinuation(t *testing.T) {
 	apiBytes, err := os.ReadFile("static/js/api.js")
 	require.NoError(t, err)

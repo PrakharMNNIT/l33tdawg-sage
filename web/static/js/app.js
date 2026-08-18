@@ -1180,8 +1180,11 @@ function MriView({ sse }) {
     const noLocalMemories = inventory && inventory.localMemoryTotal === 0;
     const hasSharedDomains = inventory && inventory.sharedDomains.length > 0;
     const partialProjection = projectionAvailability === 'partial';
-    const memoryViewUnavailable = projectionAvailability === 'unavailable' ||
-        graphAvailability === 'unavailable';
+    // The MRI renderer is the authority for whether the central graph is safe
+    // to show. Domain inventory has its own localized unavailable panel; letting
+    // that independent stats request drive this overlay can cover a verified,
+    // already-rendered graph after a transient sidebar refresh failure.
+    const memoryViewUnavailable = graphAvailability === 'unavailable';
     const showingMemoryView = mriMode === 'memory';
     return html`<div class="mri-wrap">
         <div class="mri-stage" ref=${ref}></div>
