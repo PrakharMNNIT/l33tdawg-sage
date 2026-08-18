@@ -57,6 +57,8 @@ func TestRunCodexInstall_WritesAllArtifacts(t *testing.T) {
 	}
 	// Hook commands must use absolute paths (Codex doesn't expand env vars).
 	assert.Contains(t, string(hooksData), filepath.Join(projectDir, ".codex", "hooks"))
+	assert.Contains(t, string(hooksData), `/bin/bash \"`, "Codex hooks must not depend on launcher PATH")
+	assert.NotContains(t, string(hooksData), `"command": "bash `)
 	assert.NotContains(t, string(hooksData), "${CLAUDE_PROJECT_DIR}")
 
 	// 5 hook scripts present and templated.
@@ -220,6 +222,25 @@ func TestSelfHealCodex_RepairsMissingHooksJSON(t *testing.T) {
 
 	_, err := os.Stat(hooksJSONPath)
 	assert.NoError(t, err, "self-heal should repair missing hooks.json")
+}
+
+func TestSelfHealCodex_RewritesPathDependentHooksJSON(t *testing.T) {
+	projectDir, sageHome := withCodexInstallEnv(t)
+	require.NoError(t, runCodexInstall())
+
+	hooksJSONPath := filepath.Join(projectDir, ".codex", "hooks.json")
+	hooksData, err := os.ReadFile(hooksJSONPath)
+	require.NoError(t, err)
+	legacy := strings.ReplaceAll(string(hooksData), `/bin/bash \"`, `bash \"`)
+	require.NotEqual(t, string(hooksData), legacy)
+	require.NoError(t, os.WriteFile(hooksJSONPath, []byte(legacy), 0600))
+
+	selfHealCodex(projectDir, sageHome)
+
+	healed, err := os.ReadFile(hooksJSONPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(healed), `/bin/bash \"`)
+	assert.NotContains(t, string(healed), `"command": "bash `)
 }
 
 // expectExecutable returns the cleaned, symlink-resolved path of the test

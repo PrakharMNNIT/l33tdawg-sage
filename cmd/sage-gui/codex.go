@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -102,7 +103,7 @@ func installCodexConfig(projectDir, sageHome, execPath string) ([]web.ConnectFil
 	// vars in hook commands, so we bake the absolute hook dir path in.
 	hooksPath := filepath.Join(codexDir, "hooks.json")
 	hooksAction := fileAction(hooksPath)
-	hooksConfig := map[string]any{"hooks": sageHooksConfig(hookDir)}
+	hooksConfig := map[string]any{"hooks": sageCodexHooksConfig(hookDir)}
 	hooksData, _ := json.MarshalIndent(hooksConfig, "", "  ")
 	if writeErr := safeWriteFile(hooksPath, append(hooksData, '\n'), 0600); writeErr != nil {
 		return files, fmt.Errorf("write hooks.json: %w", writeErr)
@@ -558,7 +559,10 @@ func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
 	}
 
 	hooksJSONPath := filepath.Join(codexDir, "hooks.json")
-	if _, statErr := os.Stat(hooksJSONPath); os.IsNotExist(statErr) {
+	hooksConfig := map[string]any{"hooks": sageCodexHooksConfig(hookDir)}
+	hooksData, _ := json.MarshalIndent(hooksConfig, "", "  ")
+	hooksData = append(hooksData, '\n')
+	if currentHooks, readErr := os.ReadFile(hooksJSONPath); readErr != nil || !bytes.Equal(currentHooks, hooksData) {
 		needsRewrite = true
 	}
 
@@ -585,9 +589,7 @@ func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
 		return
 	}
 
-	hooksConfig := map[string]any{"hooks": sageHooksConfig(hookDir)}
-	hooksData, _ := json.MarshalIndent(hooksConfig, "", "  ")
-	if writeErr := os.WriteFile(hooksJSONPath, append(hooksData, '\n'), 0600); writeErr != nil {
+	if writeErr := os.WriteFile(hooksJSONPath, hooksData, 0600); writeErr != nil {
 		fmt.Fprintf(os.Stderr, "SAGE: codex self-heal hooks.json: %v\n", writeErr)
 		return
 	}

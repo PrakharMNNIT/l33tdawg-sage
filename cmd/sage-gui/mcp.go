@@ -936,11 +936,22 @@ func installClaudeMD(projectDir string) error {
 // installs pass the absolute path because Codex doesn't expand its own env
 // vars in hook commands.
 func sageHooksConfig(hookDirExpr string) map[string]any {
+	return sageHooksConfigWithShell(hookDirExpr, "bash")
+}
+
+// sageCodexHooksConfig uses an absolute shell path because Codex CLI hook
+// processes can inherit a restricted PATH from their launcher. A bare "bash"
+// then fails before the fail-open hook script starts, surfacing as exit 127.
+func sageCodexHooksConfig(hookDirExpr string) map[string]any {
+	return sageHooksConfigWithShell(hookDirExpr, "/bin/bash")
+}
+
+func sageHooksConfigWithShell(hookDirExpr, shell string) map[string]any {
 	cmd := func(script string) []any {
 		return []any{
 			map[string]any{
 				"type":    "command",
-				"command": "bash \"" + hookDirExpr + "/" + script + "\"",
+				"command": shell + " \"" + hookDirExpr + "/" + script + "\"",
 				"timeout": 5,
 			},
 		}
