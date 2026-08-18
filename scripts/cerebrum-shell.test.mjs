@@ -122,13 +122,44 @@ test('task board always leaves its loading state after success or failure', () =
         appSource.indexOf('function Combobox('),
     );
     const loadTasks = tasksPage.slice(
-        tasksPage.indexOf('async function loadTasks()'),
+        tasksPage.indexOf('async function loadTasks('),
         tasksPage.indexOf('const pause ='),
     );
-    assert.match(loadTasks, /finally\s*\{\s*setLoading\(false\);\s*\}/,
+    assert.match(loadTasks, /finally\s*\{\s*if \(!silent\) setLoading\(false\);\s*\}/,
         'a successful return must not strand the task board in its loading state');
     assert.ok(loadTasks.indexOf('finally') > loadTasks.indexOf('catch'),
         'the same cleanup must cover both fulfilled and rejected task requests');
+});
+
+test('task board background refreshes preserve the mounted board during a column clear', () => {
+    const tasksPage = appSource.slice(
+        appSource.indexOf('function TasksPage('),
+        appSource.indexOf('function PipelineView('),
+    );
+    const loadTasks = tasksPage.slice(
+        tasksPage.indexOf('async function loadTasks('),
+        tasksPage.indexOf('const pause ='),
+    );
+    const reconcile = tasksPage.slice(
+        tasksPage.indexOf('async function reconcileClearedTasks('),
+        tasksPage.indexOf('async function moveTask('),
+    );
+    const scheduleReload = tasksPage.slice(
+        tasksPage.indexOf('const scheduleReload ='),
+        tasksPage.indexOf('// Live refresh:'),
+    );
+
+    assert.match(loadTasks, /async function loadTasks\(\{ silent = false \} = \{\}\)/);
+    assert.match(loadTasks, /if \(!silent\) \{\s*setLoading\(true\);\s*setError\(null\);\s*\}/,
+        'only entry and explicit refresh may replace the board with its loading surface');
+    assert.match(scheduleReload, /loadTasks\(\{ silent: true \}\)/,
+        'each remember/forget SSE must reconcile without blinking the whole board');
+    assert.match(reconcile, /await loadTasks\(\{ silent: true \}\)/,
+        'the bounded post-commit polling loop must keep the optimistic board mounted');
+    assert.doesNotMatch(reconcile, /await loadTasks\(\)/,
+        'no reconciliation attempt may re-enter the full loading surface');
+    assert.match(tasksPage, /onClick=\$\{\(\) => loadTasks\(\)\} title="Refresh"/,
+        'the explicit refresh button must retain visible loading feedback');
 });
 
 test('static JavaScript gate rejects the v11.15 nested-template failure under module grammar', () => {

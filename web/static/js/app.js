@@ -3274,7 +3274,9 @@ function TasksPage({ sse }) {
     // that produces no server event) is still picked up once the drag settles.
     const scheduleReload = () => {
         clearTimeout(reloadTimer.current);
-        reloadTimer.current = setTimeout(() => { if (!draggingRef.current) loadTasks(); }, 500);
+        reloadTimer.current = setTimeout(() => {
+            if (!draggingRef.current) loadTasks({ silent: true });
+        }, 500);
     };
 
     // Live refresh: agents create and move tasks through the same shared store, so
@@ -3285,9 +3287,16 @@ function TasksPage({ sse }) {
         return () => { clearTimeout(reloadTimer.current); subs.forEach(u => u && u()); };
     }, [sse]);
 
-    async function loadTasks() {
-        setLoading(true);
-        setError(null);
+    async function loadTasks({ silent = false } = {}) {
+        // Initial entry and an explicit operator refresh may replace the board
+        // with its loading state. SSE refreshes and post-commit reconciliation
+        // must keep the current board mounted: a terminal-column clear emits
+        // one forget event per card, and showing the full loading surface for
+        // every event makes the board flash throughout the batch.
+        if (!silent) {
+            setLoading(true);
+            setError(null);
+        }
         try {
             const data = await fetchTasks({ all: true, limit: 500 });
             const items = data.tasks || [];
@@ -3300,9 +3309,11 @@ function TasksPage({ sse }) {
 			return items;
         } catch (e) {
 			console.error('Task board load failed:', e);
-			setError('SAGE could not load your task list. Your tasks are still safe; try again.');
+			if (!silent) {
+				setError('SAGE could not load your task list. Your tasks are still safe; try again.');
+			}
 		} finally {
-			setLoading(false);
+			if (!silent) setLoading(false);
 		}
     }
 
@@ -3316,7 +3327,7 @@ function TasksPage({ sse }) {
         let latest = [];
         try {
             for (let attempt = 0; attempt < 4; attempt++) {
-                const items = await loadTasks();
+                const items = await loadTasks({ silent: true });
                 if (Array.isArray(items)) latest = items;
                 const remaining = latest.filter(task => pending.has(task.memory_id));
                 if (!remaining.length) return remaining;
@@ -3331,7 +3342,7 @@ function TasksPage({ sse }) {
                 setTasks(latest);
                 setDomains([...new Set(latest.map(task => task.domain_tag).filter(Boolean))].sort());
             } else {
-                loadTasks();
+                loadTasks({ silent: true });
             }
         }
     }
@@ -3541,7 +3552,7 @@ function TasksPage({ sse }) {
                         </select>
                     `}
                     <button class="btn" onClick=${() => setShowAddForm(!showAddForm)} title="Add task" style="font-weight:bold;">+ Add</button>
-                    <button class="btn" onClick=${loadTasks} title="Refresh" aria-label="Refresh task board">↻</button>
+                    <button class="btn" onClick=${() => loadTasks()} title="Refresh" aria-label="Refresh task board">↻</button>
                 </div>
             </div>
             ${showAddForm && html`
