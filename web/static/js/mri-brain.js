@@ -1440,7 +1440,6 @@ export function mountMriBrain(container, opts = {}) {
     if (disposed) return;
     clearTimeout(graphRetryTimer);
     resetGraphRetry();
-    reportGraphAvailability('ready');
     $('.boot').style.display = 'none';
     placeActive(data.nodes);
     resolveConnectomeLinks(data);
@@ -1449,9 +1448,18 @@ export function mountMriBrain(container, opts = {}) {
     rendered = data;
     renderedMode = mode;
     if(mode==='connectome') selectedSnapshotAt=Date.now();
-    Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'))
-      .backgroundColor(mriBgColor())
-      .graphData(data).nodeId('id').nodeLabel(()=>'' )
+    // Publish the ForceGraph instance before applying its optional fluent
+    // configuration. A setter later in the chain can throw after graphData has
+    // already painted nodes; keeping the assignment outside that chain lets the
+    // failure path recognize and retain the verified core instead of treating
+    // a half-configured-but-real canvas as a cold fetch failure.
+    Graph = ForceGraph3D({ controlType:'orbit' })($('.mrib-graph'));
+    Graph.graphData(data);
+    refreshCounts(data);
+    reportGraphAvailability('ready');
+
+    Graph.backgroundColor(mriBgColor())
+      .nodeId('id').nodeLabel(()=>'' )
       .nodeVal(nodeVal).nodeColor(nodeColorRGBA).nodeRelSize(2.4).nodeResolution(10).nodeOpacity(0.9)
       .linkColor(linkColorFor)
       .linkWidth(linkWidthFor)
@@ -1460,9 +1468,13 @@ export function mountMriBrain(container, opts = {}) {
       .linkDirectionalParticleWidth(1.1).linkDirectionalParticleSpeed(linkParticleSpeedFor)
       .warmupTicks(1).cooldownTicks(6)
       .onNodeHover(showTip)
-      .onLinkHover(showLinkTip)
-      .clickAfterDrag(true)
-      .onNodeClick((n,e)=>{ if(!graphClickWithinTolerance(e)) return; hideTip(); if (mode==='connectome') { if (n.isNeuron) selectNeuron(n); else if(n._engram) announceEngram(n); } else exploreNode(n); })
+      .onLinkHover(showLinkTip);
+    // clickAfterDrag is not present in every bundled ForceGraph3D runtime.
+    // The renderer already enforces its own pointer-distance tolerance below,
+    // so feature-gate this optional convenience API instead of aborting the
+    // entire anatomical layout, hull, controls, and rotation setup.
+    if (typeof Graph.clickAfterDrag === 'function') Graph.clickAfterDrag(true);
+    Graph.onNodeClick((n,e)=>{ if(!graphClickWithinTolerance(e)) return; hideTip(); if (mode==='connectome') { if (n.isNeuron) selectNeuron(n); else if(n._engram) announceEngram(n); } else exploreNode(n); })
       .onLinkClick((l,e)=>{ if(!graphClickWithinTolerance(e)) return; hideTip(); if(mode==='connectome') selectDirectedLink(l); })
       .onBackgroundClick(e=>{ if(graphClickWithinTolerance(e)) exitFocus(); });
 
@@ -1587,8 +1599,6 @@ export function mountMriBrain(container, opts = {}) {
     const lt=$('.linktypes');
     if (lt) Object.values(LINK_TYPES).filter(t=>t.typed).forEach(t=>lt.insertAdjacentHTML('beforeend',
       `<div class="row"><span class="bar" style="background:${t.color}"></span><div class="t"><span>${t.label}</span></div></div>`));
-    refreshCounts(data);
-
     // Frame the brain once, then gentle auto-rotate via OrbitControls.
     // autoRotate respects user zoom/pan/drag — unlike setting cameraPosition
     // every frame, which previously clobbered all interaction.
@@ -1710,11 +1720,24 @@ export function mountMriBrain(container, opts = {}) {
         const target = rendered.nodes.find(nd => nd.isNeuron && (nd.agent_id || nd.id) === focusAgent);
         if (target) { autoBloomed = true; deepLinkTimer = setTimeout(() => { if (!disposed) selectNeuron(target); }, 50); }
       }
-    }).catch(() => {
+    }).catch(err => {
       if (disposed || !graphLoads.isCurrent(request, mode)) return;
+      // A post-render setup failure used to land in this same promise catch as
+      // an HTTP/parse failure. That produced the exact impossible state of a
+      // verified, interactive graph behind a hard-unavailable overlay. Retain
+      // same-mode core output just as the live-refresh path does; retry only
+      // when no verified graph was actually created.
+      const availability = graphAvailabilityAfterFailure(
+        !!Graph && !!rendered, renderedMode, request.mode,
+      );
+      if (availability === 'ready') {
+        reportGraphAvailability('ready');
+        console.warn('[mri] optional initial graph setup incomplete; keeping verified graph:', err && err.message || err);
+        return;
+      }
+      reportGraphAvailability('unavailable');
       const boot = $('.boot');
       if (boot) boot.textContent = '◉ MEMORY GRAPH TEMPORARILY UNAVAILABLE — RETRYING…';
-      reportGraphAvailability('unavailable');
       scheduleGraphRetry(acquireInitialGraph);
     });
   }
