@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.20 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.21 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -72,16 +72,30 @@ runtimes remain independently fenced. v11.18.18 makes the Codex startup
 self-healer compare every fully rendered lifecycle hook and makes Connectome
 neurons the primary agent-detail navigation surface, with a compact
 relationship-only fallback selector. v11.18.20 also keeps a last verified MRI
-snapshot visible across a transient same-mode refresh failure. v11.18.19 prevents Codex project-hook
+snapshot visible across a transient same-mode refresh failure. v11.18.21 makes
+that renderer the sole authority for the central unavailable overlay, so an
+independent domain-inventory refresh failure cannot cover a verified graph.
+v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
 metadata and making bloomed memories responsive. The supported consensus
-ceiling remains app-v26; **v11.18.20 does not introduce app-v27**.
+ceiling remains app-v26; **v11.18.21 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.21 patch
+
+The central MRI unavailable overlay now follows only the renderer's verified
+graph state. The independent domain inventory continues to report and retry its
+own failures locally, but can no longer cover a safe graph that is already on
+screen. Genuine cold graph failures and failed Memory/Connectome switches keep
+their existing fail-closed behavior.
+
+This patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.21 does not introduce app-v27.
 
 ## v11.18.20 patch
 

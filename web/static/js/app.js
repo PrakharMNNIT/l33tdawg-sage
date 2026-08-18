@@ -75,7 +75,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.18.20';
+const SAGE_VERSION = 'v11.18.21';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -1180,8 +1180,11 @@ function MriView({ sse }) {
     const noLocalMemories = inventory && inventory.localMemoryTotal === 0;
     const hasSharedDomains = inventory && inventory.sharedDomains.length > 0;
     const partialProjection = projectionAvailability === 'partial';
-    const memoryViewUnavailable = projectionAvailability === 'unavailable' ||
-        graphAvailability === 'unavailable';
+    // The MRI renderer is the authority for whether the central graph is safe
+    // to show. Domain inventory has its own localized unavailable panel; letting
+    // that independent stats request drive this overlay can cover a verified,
+    // already-rendered graph after a transient sidebar refresh failure.
+    const memoryViewUnavailable = graphAvailability === 'unavailable';
     const showingMemoryView = mriMode === 'memory';
     return html`<div class="mri-wrap">
         <div class="mri-stage" ref=${ref}></div>
