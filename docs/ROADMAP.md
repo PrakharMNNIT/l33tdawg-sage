@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.21 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.22 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -75,16 +75,30 @@ relationship-only fallback selector. v11.18.20 also keeps a last verified MRI
 snapshot visible across a transient same-mode refresh failure. v11.18.21 makes
 that renderer the sole authority for the central unavailable overlay, so an
 independent domain-inventory refresh failure cannot cover a verified graph.
+v11.18.22 publishes verified MRI core readiness before optional renderer setup
+and feature-gates the bundled runtime's absent `clickAfterDrag` helper, keeping
+the anatomical hull, controls, and auto-rotation alive after the graph paints.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
 metadata and making bloomed memories responsive. The supported consensus
-ceiling remains app-v26; **v11.18.21 does not introduce app-v27**.
+ceiling remains app-v26; **v11.18.22 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.22 patch
+
+The CEREBRUM MRI renderer now establishes and publishes its verified core graph
+before applying optional ForceGraph configuration. Optional post-render failures
+therefore retain the real graph and truthful counts instead of presenting a cold
+unavailable overlay. The bundled runtime's absent `clickAfterDrag` helper is
+feature-gated so anatomical hull construction, controls, and rotation continue.
+
+This patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.22 does not introduce app-v27.
 
 ## v11.18.21 patch
 

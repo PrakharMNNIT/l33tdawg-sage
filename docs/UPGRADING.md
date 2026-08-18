@@ -112,6 +112,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.19 | Global-scope Codex hook isolation, single-owner hit-tested Connectome clicks, bounded domain-access details, and responsive bloomed memory nodes; no new app version; app-v26 remains the ceiling |
 | v11.18.20 | Same-mode verified MRI snapshot retention across transient refresh failures, with cold and cross-mode failures still fail-closed; no new app version; app-v26 remains the ceiling |
 | v11.18.21 | MRI-renderer authority for the central unavailable overlay, with independent domain-inventory failures localized to their own retrying panel; no new app version; app-v26 remains the ceiling |
+| v11.18.22 | Post-render MRI initialization hardening, verified-core readiness before optional renderer setup, and feature-gated `clickAfterDrag` support for bundled ForceGraph runtimes; no new app version; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
