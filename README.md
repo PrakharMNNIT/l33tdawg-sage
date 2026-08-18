@@ -51,6 +51,18 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.21
+
+**A domain-summary refresh can no longer cover a verified MRI graph.** The MRI
+renderer is now the sole authority for the central unavailable overlay. Domain
+inventory failures stay localized to their own retrying panel, while genuine
+cold graph failures and unsafe mode switches remain fail-closed.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.21 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.21`. SDK 11.18.21.
+
 ## What's New in v11.18.20
 
 **A transient MRI refresh no longer hides a graph CEREBRUM has already
@@ -1994,7 +2006,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.20`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.21`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
