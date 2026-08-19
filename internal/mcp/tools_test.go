@@ -2874,6 +2874,37 @@ func TestSageTurnScopesKeywordRecallToExactDomain(t *testing.T) {
 	require.Equal(t, "tii-sage", recalled[0]["domain"])
 }
 
+// The turn recall block is a curated subset of sage_recall's fields, and a
+// caller reading it cannot tell it is a subset. It must still carry the two
+// fields needed to weight a recalled memory — corroboration_count (trust) and
+// status (lifecycle) — or it silently under-informs the decision and hides a
+// deprecated row behind a plain recall.
+func TestSageTurnRecallCarriesCorroborationAndStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": false, "ready": true})
+	})
+	mux.HandleFunc("/v1/memory/search", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{
+			{"memory_id": "m1", "content": "ctx", "domain_tag": "tii-sage",
+				"confidence_score": 0.9, "memory_type": "fact",
+				"corroboration_count": 7, "status": "committed"},
+		}})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	t.Setenv("SAGE_RECALL_HYBRID", "0")
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+	result, err := s.toolTurn(context.Background(), map[string]any{"topic": "current work", "domain": "tii-sage"})
+	require.NoError(t, err)
+	recalled := result.(map[string]any)["recalled"].([]map[string]any)
+	require.Len(t, recalled, 1)
+	assert.Equal(t, 7, recalled[0]["corroboration_count"], "turn recall must carry the corroboration trust signal, like sage_recall")
+	assert.Equal(t, "committed", recalled[0]["status"], "turn recall must carry lifecycle status, like sage_recall")
+}
+
 func TestSageTurnFirstWritableDomainDoesNotReportBogusReadDenial(t *testing.T) {
 	var queryCalls, submitCalls int
 	mux := http.NewServeMux()
