@@ -368,6 +368,17 @@ terminal. Routes are registered by `RegisterRerankerSetupRoutes`
 means the feature is unavailable on this node and every endpoint returns
 `{"available": false}` or HTTP 501.
 
+> **Host compatibility.** The managed engine is a prebuilt llama.cpp binary, and the
+> pinned `linux/arm64` asset is compiled on a newer base than the `amd64` one. On an
+> older-glibc arm64 host — notably a Jetson on JetPack 6 / Ubuntu 22.04 — that binary
+> downloads and sha256-verifies, but the dynamic loader cannot run it (`GLIBC_2.38` /
+> `GLIBCXX_3.4.32` not found). The install now **preflights the engine** after extraction:
+> on such a host it fails with the loader's own reason instead of reporting success over an
+> engine that never starts, and points at the bring-your-own path — run your own
+> `llama-server` and set `SAGE_RERANK_ENABLED=1`, `SAGE_RERANK_KIND=llamacpp`, and
+> `SAGE_RERANK_URL` (section 4). A non-loader failure (an unrecognized flag, a timeout) is
+> not treated as an incompatibility, so a good install is never blocked on an ambiguous signal.
+
 **Auth:** these routes carry `authMiddleware` **plus** a strict same-origin gate
 (`wizardSecurityGate`, `web/handler.go:1789-1802`, `web/handler.go:741`). Because setup
 downloads and `chmod`s a binary and spawns `llama-server` as a subprocess, the same
