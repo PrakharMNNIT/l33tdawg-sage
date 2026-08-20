@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.22 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.23 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -78,16 +78,34 @@ independent domain-inventory refresh failure cannot cover a verified graph.
 v11.18.22 publishes verified MRI core readiness before optional renderer setup
 and feature-gates the bundled runtime's absent `clickAfterDrag` helper, keeping
 the anatomical hull, controls, and auto-rotation alive after the graph paints.
+v11.18.23 restores trust and lifecycle parity between `sage_turn` and
+`sage_recall`, discloses active/store embedding-space mismatches through
+readiness without blocking intentional re-embedding, and makes managed reranker
+setup surface proven host-loader incompatibilities with bring-your-own guidance.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
 metadata and making bloomed memories responsive. The supported consensus
-ceiling remains app-v26; **v11.18.22 does not introduce app-v27**.
+ceiling remains app-v26; **v11.18.23 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.23 patch
+
+The every-turn recall block now carries `corroboration_count` and lifecycle
+`status`, matching the decision-relevant evidence already exposed by explicit
+`sage_recall`. Boot also compares the active embedding space with vector spaces
+already present in the non-deprecated local store. Mismatches are logged and
+reported under `/ready` as degraded, while ordinary serving remains available
+and strict readiness can gate reconciliation. Managed reranker installation now
+preflights the verified engine binary and reports proven GLIBC, GLIBCXX, and
+CXXABI loader failures with the operator-controlled external-engine path.
+
+This patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.23 does not introduce app-v27.
 
 ## v11.18.22 patch
 

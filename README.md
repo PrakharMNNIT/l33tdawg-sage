@@ -51,6 +51,30 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.23
+
+**Turn-time recall now carries the same trust and lifecycle evidence as explicit
+recall.** `sage_turn` includes each recalled memory's `corroboration_count` and
+`status`, so the every-turn path no longer hides corroboration weight or whether
+a recalled row is committed or currently challenged.
+
+**Embedding-space drift is visible before it silently empties semantic recall.**
+At boot, SAGE compares the active embedder with the non-deprecated vector spaces
+already in the local store. A mismatch produces a loud warning and a structured
+`embedding_space` block in `/ready`; the node remains available by default while
+strict readiness returns 503, allowing an intentional re-embed migration to
+finish instead of turning a quality warning into an outage.
+
+**Managed reranker setup now diagnoses incompatible prebuilt engines.** After a
+verified install, SAGE preflights `llama-server`. Proven GLIBC, GLIBCXX, or CXXABI
+loader failures preserve the loader's real error and point operators to the
+bring-your-own reranker path instead of reporting a successful unusable install.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.23 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.23`. SDK 11.18.23.
+
 ## What's New in v11.18.22
 
 **A missing optional ForceGraph API can no longer strand CEREBRUM after the
@@ -2020,7 +2044,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.22`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.23`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
