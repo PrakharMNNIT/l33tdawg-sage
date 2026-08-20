@@ -14,6 +14,7 @@ import { restartBaselineBootID, requestedRestartIsReady } from './restart-proof.
 import { buildUpdateBanner } from './update-banner.js';
 import { computeReorderedColumn, applyColumnOrder } from './task-reorder.js';
 import { runSequential, summarizeClearedTasks, summarizeDroppedTasks, summarizeForgottenMemories } from './bulk-sequence.js';
+import { refreshTaskSnapshot } from './task-refresh.js';
 import { createFederationJoinScanLifecycle, normalizeFederationJoinState } from './federation-flow.js';
 import { buildBrainDomainInventory } from './domain-inventory.js';
 import { enqueueGovernedTransfer, runWithGovernanceCooldown } from './governance-retry.js';
@@ -3275,7 +3276,7 @@ function TasksPage({ sse }) {
     const scheduleReload = () => {
         clearTimeout(reloadTimer.current);
         reloadTimer.current = setTimeout(() => {
-            if (!draggingRef.current) loadTasks({ silent: true });
+            if (!draggingRef.current) loadTasks({ silent: true }).catch(() => {});
         }, 500);
     };
 
@@ -3298,20 +3299,17 @@ function TasksPage({ sse }) {
             setError(null);
         }
         try {
-            const data = await fetchTasks({ all: true, limit: 500 });
-            const items = data.tasks || [];
-            const settling = settlingClears.current;
-            setTasks(settling.size
-                ? items.filter(task => !settling.has(task.memory_id))
-                : items);
-            const ds = [...new Set(items.map(t => t.domain_tag).filter(Boolean))].sort();
-            setDomains(ds);
-			return items;
+            return await refreshTaskSnapshot({
+                fetcher: fetchTasks,
+                settlingIDs: settlingClears.current,
+                silent,
+                setTasks,
+                setDomains,
+                setError,
+            });
         } catch (e) {
 			console.error('Task board load failed:', e);
-			if (!silent) {
-				setError('SAGE could not load your task list. Your tasks are still safe; try again.');
-			}
+			if (silent) throw e;
 		} finally {
 			if (!silent) setLoading(false);
 		}
@@ -3342,7 +3340,7 @@ function TasksPage({ sse }) {
                 setTasks(latest);
                 setDomains([...new Set(latest.map(task => task.domain_tag).filter(Boolean))].sort());
             } else {
-                loadTasks({ silent: true });
+                loadTasks({ silent: true }).catch(() => {});
             }
         }
     }

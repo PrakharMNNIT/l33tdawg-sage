@@ -158,6 +158,10 @@ test('task board background refreshes preserve the mounted board during a column
         'the bounded post-commit polling loop must keep the optimistic board mounted');
     assert.doesNotMatch(reconcile, /await loadTasks\(\)/,
         'no reconciliation attempt may re-enter the full loading surface');
+    assert.match(loadTasks, /if \(silent\) throw e;/,
+        'a failed silent read must reject so reconciliation cannot treat it as confirmed absence');
+    assert.match(scheduleReload, /loadTasks\(\{ silent: true \}\)\.catch\(\(\) => \{\}\)/,
+        'fire-and-forget SSE refreshes must consume the deliberate silent rejection');
     assert.match(tasksPage, /onClick=\$\{\(\) => loadTasks\(\)\} title="Refresh"/,
         'the explicit refresh button must retain visible loading feedback');
 });
