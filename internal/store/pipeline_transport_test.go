@@ -365,6 +365,54 @@ func TestPurgeSyncPeerStatePreservesPendingResultNotice(t *testing.T) {
 	require.Contains(t, updates[0].LastError, "revoked before delivery")
 }
 
+func TestFederatedMessageReplyCompletionIsSessionFencedAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	s, err := NewSQLiteStore(ctx, ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+	now := time.Now().UTC()
+	proof := testPipelineTransportProof(t)
+	msg := &PipelineMessage{
+		PipeID: "msg-fed-replay", FromAgent: strings.Repeat("a", 64), ToAgent: proof.AgentID,
+		SourceChainID: "chain-peer", SourcePipeID: "remote-source", FederationPolicyEpoch: "epoch-1",
+		FederationAgreementID: strings.Repeat("c", 64), FederationContactID: strings.Repeat("d", 64),
+		FederationContactRevision: strings.Repeat("e", 64), Payload: "work", Status: "pending",
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}
+	require.NoError(t, s.InsertPipeline(ctx, msg))
+	require.NoError(t, s.ClaimPipeline(ctx, msg.PipeID, msg.ToAgent))
+	_, err = s.BindFederatedMessageClaimSession(ctx, msg.ToAgent, msg.PipeID, "session-a")
+	require.NoError(t, err)
+	event := &PipelineTransportOutbox{
+		EventID: "event-fed-reply-first", PipeID: msg.PipeID, RemoteChainID: msg.SourceChainID,
+		EventKind: "result", PolicyEpoch: msg.FederationPolicyEpoch, AgreementID: msg.FederationAgreementID,
+		ContactID: msg.FederationContactID, ContactRevision: msg.FederationContactRevision,
+		SourceAgentID: msg.ToAgent, TargetAgentID: msg.FromAgent, Proof: proof,
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}
+
+	_, _, err = s.CompleteFederatedMessageReplyWithTransport(ctx, msg.PipeID, msg.ToAgent, "session-b", "answer", event)
+	require.ErrorIs(t, err, ErrMessageClaimedByOtherSession)
+	eventID, replayed, err := s.CompleteFederatedMessageReplyWithTransport(ctx, msg.PipeID, msg.ToAgent, "session-a", "answer", event)
+	require.NoError(t, err)
+	require.False(t, replayed)
+	require.Equal(t, event.EventID, eventID)
+
+	retry := *event
+	retry.EventID = "event-fed-reply-retry"
+	eventID, replayed, err = s.CompleteFederatedMessageReplyWithTransport(ctx, msg.PipeID, msg.ToAgent, "session-a", "answer", &retry)
+	require.NoError(t, err)
+	require.True(t, replayed)
+	require.Equal(t, event.EventID, eventID, "lost-response retry must return the original durable event")
+	_, _, err = s.CompleteFederatedMessageReplyWithTransport(ctx, msg.PipeID, msg.ToAgent, "session-a", "different", &retry)
+	require.ErrorIs(t, err, ErrMessageReplyConflict)
+
+	var events int
+	require.NoError(t, s.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pipeline_transport_outbox
+		WHERE pipe_id=? AND event_kind='result'`, msg.PipeID).Scan(&events))
+	require.Equal(t, 1, events)
+}
+
 func TestPurgePipelinesRetainsPendingAndUnreportedTransport(t *testing.T) {
 	ctx := context.Background()
 	s, err := NewSQLiteStore(ctx, ":memory:")

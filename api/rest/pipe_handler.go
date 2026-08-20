@@ -68,6 +68,10 @@ type federatedPipeReceiptInboundStore interface {
 	GetFederatedReceiptInbound(context.Context, string) (*store.FederatedReceiptBinding, error)
 }
 
+type federatedMessageReplyStore interface {
+	CompleteFederatedMessageReplyWithTransport(context.Context, string, string, string, string, *store.PipelineTransportOutbox) (string, bool, error)
+}
+
 // callerCanReachFederatedPipeTarget reuses the caller/domain intersection that
 // backs ordinary federation discovery. The target resolver establishes a
 // peer-authenticated route, but must not turn that node-scoped fact into a
@@ -1503,9 +1507,10 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	agentID := middleware.ContextAgentID(r.Context())
 
 	var req struct {
-		Result        string `json:"result"`
-		SourcePipeID  string `json:"source_pipe_id"`
-		SourceChainID string `json:"source_chain_id"`
+		Result            string `json:"result"`
+		SourcePipeID      string `json:"source_pipe_id"`
+		SourceChainID     string `json:"source_chain_id"`
+		ClaimantSessionID string `json:"claimant_session_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
@@ -1542,6 +1547,10 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg.SourceChainID != "" {
+		if len(req.ClaimantSessionID) > store.MaxMessageClaimantSessionBytes {
+			writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is too long")
+			return
+		}
 		if req.SourcePipeID == "" || req.SourcePipeID != msg.SourcePipeID {
 			writeProblem(w, http.StatusConflict, "Federated pipeline changed", "Refresh this inbox item before returning its result.")
 			return
@@ -1600,6 +1609,7 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	// requesting agent's answer.
 	var completeErr error
 	var replyEventID string
+	var idempotentReplay bool
 	if msg.SourceChainID != "" {
 		transportStore, ok := pipeStore.(store.FederatedPipelineStore)
 		if !ok {
@@ -1631,17 +1641,35 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 			TargetAgentID:     msg.FromAgent, Proof: transportProof, CreatedAt: created,
 			ExpiresAt: created.Add(24 * time.Hour),
 		}
-		replyEventID = event.EventID
 		authorizer := s.federation.(federatedPipeAdmissionAuthorizer)
 		completeErr = authorizer.WithAuthorizedImportedPipe(r.Context(), msg, func() error {
-			return transportStore.CompleteFederatedPipelineWithTransport(r.Context(), pipeID, agentID, req.Result, event)
+			if req.ClaimantSessionID == "" {
+				replyEventID = event.EventID
+				return transportStore.CompleteFederatedPipelineWithTransport(r.Context(), pipeID, agentID, req.Result, event)
+			}
+			messageStore, supportsSessions := pipeStore.(federatedMessageReplyStore)
+			if !supportsSessions {
+				return store.ErrPipelineUnsupported
+			}
+			var messageErr error
+			replyEventID, idempotentReplay, messageErr = messageStore.CompleteFederatedMessageReplyWithTransport(
+				r.Context(), pipeID, agentID, req.ClaimantSessionID, req.Result, event)
+			return messageErr
 		})
 	} else {
 		completeErr = pipeStore.CompletePipeline(r.Context(), pipeID, agentID, req.Result, journalID)
 	}
 	if completeErr != nil {
-		if errors.Is(completeErr, store.ErrPipeResultTooLarge) {
+		switch {
+		case errors.Is(completeErr, store.ErrPipeResultTooLarge):
 			writeProblemTyped(w, http.StatusRequestEntityTooLarge, pipeTooLargeProblemType, "Result too large", completeErr.Error())
+			return
+		case errors.Is(completeErr, store.ErrMessageClaimedByOtherSession):
+			writeProblemTyped(w, http.StatusConflict, messageClaimSessionProblemType, "Claimed by another session",
+				"Another session of this agent holds this federated message claim. Use sage_message_handoff after deciding that claimant is stale.")
+			return
+		case errors.Is(completeErr, store.ErrMessageReplyConflict):
+			writeProblem(w, http.StatusConflict, "Reply conflict", "This federated message already has a different reply.")
 			return
 		}
 		writeProblem(w, http.StatusConflict, "Completion failed", completeErr.Error())
@@ -1669,6 +1697,7 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	if replyEventID != "" {
 		response["reply_event_id"] = replyEventID
 		response["reply_status"] = "queued"
+		response["idempotent_replay"] = idempotentReplay
 	}
 	writeJSON(w, http.StatusOK, response)
 }

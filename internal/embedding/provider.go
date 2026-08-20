@@ -134,3 +134,19 @@ func CanonicalSpaceID(spaceID string) string {
 	}
 	return strings.Join(parts, ":")
 }
+
+// LikelySpaceAlias is deliberately narrower than canonical equality: exactly
+// one spelling must carry an organization path and the other must be bare.
+// Two different organizations can publish repositories with the same final
+// model name, so org-a/model and org-b/model are not enough evidence to label
+// one an alias of the other. Ambiguous IDs (including model names containing
+// the ':' SpaceID delimiter) fail closed as not-classified.
+func LikelySpaceAlias(a, b string) bool {
+	pa, pb := strings.Split(a, ":"), strings.Split(b, ":")
+	if len(pa) != 3 || len(pb) != 3 || a == b {
+		return false
+	}
+	aQualified := strings.Contains(pa[1], "/")
+	bQualified := strings.Contains(pb[1], "/")
+	return aQualified != bQualified && CanonicalSpaceID(a) == CanonicalSpaceID(b)
+}

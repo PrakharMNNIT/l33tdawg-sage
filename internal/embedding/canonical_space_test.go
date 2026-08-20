@@ -41,3 +41,17 @@ func TestCanonicalSpaceID(t *testing.T) {
 	// Real default SpaceIDs round-trip cleanly (no model component to touch).
 	assert.Equal(t, "hash", CanonicalSpaceID(SpaceID(NewHashProvider(768))))
 }
+
+func TestLikelySpaceAliasRequiresOneQualifiedAndOneBareModel(t *testing.T) {
+	assert.True(t, LikelySpaceAlias(
+		"openai-compatible:gte-Qwen2-1.5B-instruct:1536",
+		"openai-compatible:Alibaba-NLP/gte-Qwen2-1.5B-instruct:1536"))
+	assert.False(t, LikelySpaceAlias(
+		"openai-compatible:org-a/model:1536",
+		"openai-compatible:org-b/model:1536"),
+		"same leaf name from different organizations is not sufficient alias evidence")
+	assert.False(t, LikelySpaceAlias(
+		"openai-compatible:org/model:variant:1536",
+		"openai-compatible:model:variant:1536"),
+		"ambiguous delimiter-bearing model IDs must fail closed")
+}

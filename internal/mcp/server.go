@@ -611,9 +611,9 @@ func (s *Server) handleInitialize(ctx context.Context, req *jsonRPCRequest) *jso
 	instructions := baseMCPInstructions()
 	if autoInceptionMsg, _ := s.ensureAutoInception(ctx, false); autoInceptionMsg != "" {
 		// MCP gives the server a first-class initialization instruction surface.
-		// Keep session standing there instead of charging the first tool payload
-		// for a large preamble. Clients that skip initialize retain the fallback
-		// in handleToolsCall below.
+		// Keep session standing there instead of charging any tool payload for a
+		// large preamble. Clients that skip initialize still receive clean tool
+		// results and can obtain the cached standing on a later initialize.
 		instructions = autoInceptionMsg
 	}
 	capabilities := map[string]any{
@@ -710,10 +710,11 @@ func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *json
 		}
 	}
 
-	// Auto-inception: on the very first tool call, check if brain is empty
-	// and auto-initialize if needed. This makes onboarding seamless — no need
-	// for the user to manually tell their AI to run sage_inception.
-	autoInceptionMsg, startedAutoInception := s.ensureAutoInception(ctx, params.Name == "sage_inception")
+	// Auto-inception still establishes server-side session state for clients
+	// that skip initialize, but its guidance belongs exclusively to MCP's
+	// first-class initialize.instructions channel. Never prepend it to an
+	// ordinary tool result: callers must be able to treat tool output as data.
+	_, _ = s.ensureAutoInception(ctx, params.Name == "sage_inception")
 
 	result, err := tool.Handler(ctx, params.Arguments)
 	if err != nil {
@@ -738,11 +739,6 @@ func (s *Server) handleToolsCall(ctx context.Context, req *jsonRPCRequest) *json
 
 	text, _ := json.MarshalIndent(result, "", "  ")
 	output := string(text)
-
-	// Prepend auto-inception message if brain was just initialized.
-	if startedAutoInception && autoInceptionMsg != "" {
-		output = autoInceptionMsg + "\n\n---\n\n" + output
-	}
 
 	return &jsonRPCResponse{
 		JSONRPC: "2.0",

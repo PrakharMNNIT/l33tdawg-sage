@@ -3778,11 +3778,10 @@ func checkEmbeddingSpaceConsistency(
 	// Those are a re-embed, not a genuinely different model — telling them apart
 	// keeps the warning actionable instead of crying "foreign model" at a
 	// cosmetic label split an operator would then learn to ignore.
-	activeCanon := embedding.CanonicalSpaceID(active)
 	alias := make(map[string]int)
 	aliasTotal := 0
 	for space, n := range foreign {
-		if space != active && embedding.CanonicalSpaceID(space) == activeCanon {
+		if embedding.LikelySpaceAlias(space, active) {
 			alias[space] = n
 			aliasTotal += n
 		}

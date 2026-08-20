@@ -9,8 +9,8 @@ v11.18.0. It makes a reply to a message you sent readable from MCP through the
 advertised `sage_message_replies` tool and a payload-free `sage_inbox` pointer,
 closing a gap where a completed reply existed only on a REST projection no MCP
 tool called. It moves per-session auto-connect guidance into MCP
-`initialize.instructions`, leaving the first tool result payload clean while
-retaining a compatibility fallback for clients that skip initialization. It
+`initialize.instructions`, leaving every tool result payload clean even for
+clients that skip initialization; a later handshake returns cached guidance. It
 also corrects the exceptional app-v21 → app-v22 recovery lane so proven
 skip-ahead transitions remain virtual, evidence-bound history rather than
 synthetic applied-upgrade records. Existing app-v22 through app-v26 chains are
@@ -564,8 +564,8 @@ v11.18.1 moves adaptive SAGE boot standing to the MCP initialization response.
 Each transport session performs the signed boot check at most once, repeated or
 concurrent initialization reuses the same instructions, and ordinary tool
 results no longer carry the auto-connect preamble. A client that omits the MCP
-handshake still receives the historical one-time fallback on its first tool
-call.
+handshake still receives clean tool results and can retrieve cached standing
+through a later initialization handshake.
 
 The app-v21 lineage doctor now emits schema-v2 retained-Comet transition claims
 for proven skip-ahead history, independently verifies the exact transition and

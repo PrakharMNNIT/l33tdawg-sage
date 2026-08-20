@@ -871,6 +871,61 @@ func TestMessageReplyFenceFollowsAnExplicitHandoff(t *testing.T) {
 	require.False(t, replayed)
 }
 
+func TestMessageReplyIdentifiesFederatedCompatibilityScopeOnlyForExactClaimant(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	require.NoError(t, s.InsertPipeline(ctx, &PipelineMessage{
+		PipeID: "msg-federated", FromAgent: "remote-sender", ToAgent: "bob",
+		Intent: "work", Payload: "payload", Status: "pending",
+		CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+		SourceChainID: "chain-remote", SourcePipeID: "msg-source",
+	}))
+	require.NoError(t, s.ClaimPipeline(ctx, "msg-federated", "bob"))
+	_, err := s.BindFederatedMessageClaimSession(ctx, "bob", "msg-federated", "session-b")
+	require.NoError(t, err)
+
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-federated", "done", "session-b")
+	require.ErrorIs(t, err, ErrMessageFederatedCompatibilityScope)
+
+	_, err = s.ReplyLocalMessage(ctx, "mallory", "msg-federated", "probe", "session-m")
+	require.ErrorIs(t, err, ErrMessageNotFound)
+	require.NotErrorIs(t, err, ErrMessageFederatedCompatibilityScope,
+		"the compatibility discriminator must not reveal another agent's message")
+}
+
+func TestFederatedClaimSessionBindingAndHandoffAreCASFenced(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	require.NoError(t, s.InsertPipeline(ctx, &PipelineMessage{
+		PipeID: "msg-fed-session", FromAgent: "remote", ToAgent: "bob",
+		Payload: "work", Status: "pending", SourceChainID: "chain-remote", SourcePipeID: "source",
+		CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}))
+	require.NoError(t, s.ClaimPipeline(ctx, "msg-fed-session", "bob"))
+
+	replayed, err := s.BindFederatedMessageClaimSession(ctx, "bob", "msg-fed-session", "session-a")
+	require.NoError(t, err)
+	require.False(t, replayed)
+	replayed, err = s.BindFederatedMessageClaimSession(ctx, "bob", "msg-fed-session", "session-a")
+	require.NoError(t, err)
+	require.True(t, replayed)
+	_, err = s.BindFederatedMessageClaimSession(ctx, "bob", "msg-fed-session", "session-b")
+	require.ErrorIs(t, err, ErrMessageReceiveConflict)
+
+	replayed, err = s.HandoffLocalMessageClaim(ctx, "bob", "msg-fed-session", "session-a", "session-b")
+	require.NoError(t, err)
+	require.False(t, replayed)
+	history, err := s.GetInboxHistory(ctx, "bob", "", 10)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	require.Equal(t, "session-b", history[0].ClaimedSessionID)
+
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-fed-session", "stale", "session-a")
+	require.ErrorIs(t, err, ErrMessageClaimedByOtherSession)
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-fed-session", "fresh", "session-b")
+	require.ErrorIs(t, err, ErrMessageFederatedCompatibilityScope)
+}
+
 // migrateMessages runs on EVERY store open, not once. It exists to rescue rows
 // that v11.17.8 stamped with the old 24-hour pipeline TTL, but it used to match
 // every canonical msg-* row in pending/claimed — so a sender's deliberate

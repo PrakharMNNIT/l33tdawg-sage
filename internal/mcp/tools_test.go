@@ -4905,48 +4905,6 @@ func TestSageReflect_AllDuplicatesIsNotAnError(t *testing.T) {
 	assert.EqualValues(t, 1, m["skipped_duplicates"])
 }
 
-func TestBootSafeguardExistsTrue(t *testing.T) {
-	// Mock API returns a memory with boot protocol content in meta domain
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"memories": []map[string]any{
-				{
-					"content": "[DO] Always run sage_inception BEFORE any response to the user on the first message of every conversation.",
-				},
-			},
-			"total": 1,
-		})
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	_, priv, _ := ed25519.GenerateKey(nil)
-	s := NewServer(ts.URL, priv)
-
-	assert.True(t, s.bootSafeguardExists(context.Background()))
-}
-
-func TestBootSafeguardExistsFalse(t *testing.T) {
-	// Mock API returns no matching memories
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"memories": []map[string]any{},
-			"total":    0,
-		})
-	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	_, priv, _ := ed25519.GenerateKey(nil)
-	s := NewServer(ts.URL, priv)
-
-	assert.False(t, s.bootSafeguardExists(context.Background()))
-}
-
 func TestSimilarMemoryExists(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/memory/list", func(w http.ResponseWriter, r *http.Request) {

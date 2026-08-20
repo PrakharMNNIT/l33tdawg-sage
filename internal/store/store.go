@@ -791,6 +791,12 @@ var (
 	ErrMessageReceiveExpired      = errors.New("message receive replay is no longer retained")
 	ErrMessageReplyConflict       = errors.New("message already has a different reply")
 	ErrMessageNotFound            = errors.New("message not found")
+	// ErrMessageFederatedCompatibilityScope is returned only after the caller
+	// has been proven to be the exact recipient of a claimed inbound federated
+	// pipeline row. It lets the canonical Messages facade select the negotiated
+	// federation reply path without treating an ordinary typed 404 as a licence
+	// to bypass claimant-session fencing.
+	ErrMessageFederatedCompatibilityScope = errors.New("message uses the federated compatibility reply path")
 	// ErrMessageClaimedByOtherSession separates "another session of THIS
 	// agent holds the claim" from "no such message". Collapsing the two let
 	// the MCP client treat a fence rejection as an absent route and retry

@@ -138,9 +138,9 @@ adaptive auto-inception standing once during `initialize` and returns it in
 `initialize.instructions`; the first tool result is not padded with that
 preamble. Repeated or concurrent initialization in one transport session
 reuses the cached standing without repeating registration or memory reads. A
-client that skips `initialize` retains the historical one-time fallback on its
-first non-inception tool call. An explicit first `sage_inception` call suppresses
-that fallback because the tool itself returns the standing.
+client that skips `initialize` still receives clean, payload-only tool results;
+a later `initialize` returns the cached standing. An explicit first
+`sage_inception` call returns the standing through that tool's own response.
 
 ---
 
