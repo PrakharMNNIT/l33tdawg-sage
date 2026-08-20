@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -18,6 +19,10 @@ const messageNotFoundTitle = "Message not found"
 func canonicalMessageStore(s *Server) (store.MessageStore, bool) {
 	messageStore, ok := s.store.(store.MessageStore)
 	return messageStore, ok
+}
+
+type federatedMessageClaimSessionBinder interface {
+	BindFederatedMessageClaimSession(context.Context, string, string, string) (bool, error)
 }
 
 func writeCanonicalMessageNotFound(w http.ResponseWriter, messageID string) {
@@ -362,6 +367,12 @@ func (s *Server) handleOwnClaimedUnfinishedMessages(w http.ResponseWriter, r *ht
 			"requires_reply": true, "authority": pipeRequestAuthority, "trust": pipeLocalTrust,
 			"security_notice": pipeRESTRequestSecurityNotice,
 		}
+		if item.SourceChainID != "" {
+			entry["source_chain_id"] = item.SourceChainID
+			entry["source_pipe_id"] = item.SourcePipeID
+			entry["foreign"] = true
+			entry["trust"] = pipeForeignTrust
+		}
 		if item.FromProvider != "" {
 			entry["from_provider"] = item.FromProvider
 		}
@@ -414,9 +425,51 @@ func (s *Server) handleMessageHandoff(w http.ResponseWriter, r *http.Request) {
 		"claimant_session_id": req.ToSessionID, "idempotent_replay": replayed})
 }
 
+func (s *Server) handleFederatedMessageClaimSession(w http.ResponseWriter, r *http.Request) {
+	if !requireExactSignedMessageAction(w, r) {
+		return
+	}
+	var req struct {
+		ClaimantSessionID string `json:"claimant_session_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	if req.ClaimantSessionID == "" || len(req.ClaimantSessionID) > store.MaxMessageClaimantSessionBytes {
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is required and bounded")
+		return
+	}
+	binder, ok := s.store.(federatedMessageClaimSessionBinder)
+	if !ok {
+		writeProblem(w, http.StatusNotImplemented, "Messages unavailable", "The active store does not support federated claim sessions.")
+		return
+	}
+	replayed, err := binder.BindFederatedMessageClaimSession(r.Context(), middleware.ContextAgentID(r.Context()),
+		chi.URLParam(r, "message_id"), req.ClaimantSessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrMessageReceiveConflict) {
+			writeProblem(w, http.StatusConflict, "Claimant session already bound", "Passive history names the existing claimant session; use sage_message_handoff only after deciding that claimant is stale.")
+			return
+		}
+		writeCanonicalMessageNotFound(w, chi.URLParam(r, "message_id"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message_id": chi.URLParam(r, "message_id"), "claimant_session_id": req.ClaimantSessionID,
+		"idempotent_replay": replayed,
+	})
+}
+
 // messageClaimSessionProblemType marks a claimant-session fence rejection so a
 // caller can tell it apart from a genuinely absent message.
 const messageClaimSessionProblemType = "https://sage.dev/errors/message-claim-session-mismatch"
+
+// messageFederatedCompatibilityProblemType is returned only after the signed
+// caller is proven to be the exact claimant of an inbound federated row. MCP
+// may then select the negotiated pipeline reply path without interpreting an
+// ordinary non-enumerating 404 as a compatibility signal.
+const messageFederatedCompatibilityProblemType = "https://sage.dev/errors/message-federated-compatibility-scope"
 
 func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
 	if !requireExactSignedMessageAction(w, r) {
@@ -456,6 +509,9 @@ func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
 			// that just rejected the call.
 			writeProblemTyped(w, http.StatusConflict, messageClaimSessionProblemType, "Claimed by another session",
 				"Another session of this agent holds this message's claim. Use sage_message_handoff to take it over, or reply from the claiming session.")
+		case errors.Is(err, store.ErrMessageFederatedCompatibilityScope):
+			writeProblemTyped(w, http.StatusConflict, messageFederatedCompatibilityProblemType, "Federated reply path required",
+				"This exact claimed inbound message must be answered through the negotiated federated reply path.")
 		case errors.Is(err, store.ErrPipeResultTooLarge):
 			writeProblemTyped(w, http.StatusRequestEntityTooLarge, pipeTooLargeProblemType, "Reply too large", err.Error())
 		default:

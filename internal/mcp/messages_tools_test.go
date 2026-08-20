@@ -292,6 +292,51 @@ func TestMessageReplyRetainsPlain404LegacyFallbackAndLocalScope(t *testing.T) {
 	require.Equal(t, claimantSessions[0], claimantSessions[1])
 }
 
+func TestMessageReplyUsesExplicitFederatedCompatibilityScope(t *testing.T) {
+	canonicalCalls := 0
+	legacyResultCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/msg-fed/reply", func(w http.ResponseWriter, _ *http.Request) {
+		canonicalCalls++
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": federatedCompatibilityProblemType, "title": "Federated reply path required",
+			"status": http.StatusConflict, "detail": "Use the negotiated federated reply path.",
+		})
+	})
+	mux.HandleFunc("/v1/pipe/msg-fed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"source_pipe_id": "remote-source", "reply_source_chain_id": "chain-remote",
+		})
+	})
+	mux.HandleFunc("/v1/pipe/msg-fed/result", func(w http.ResponseWriter, r *http.Request) {
+		legacyResultCalls++
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, "remote-source", body["source_pipe_id"])
+		require.Equal(t, "chain-remote", body["source_chain_id"])
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "completed", "reply_event_id": "reply-fed", "reply_status": "queued",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, privateKey)
+
+	result, err := s.toolMessageReply(context.Background(), map[string]any{
+		"message_id": "msg-fed", "result": "done",
+	})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Equal(t, "federated", response["scope"])
+	require.Equal(t, "reply-fed", response["reply_event_id"])
+	require.Equal(t, 1, canonicalCalls)
+	require.Equal(t, 1, legacyResultCalls)
+}
+
 func TestMessageSendSurfacesInboundThatArrivedAfterPriorEmptyPoll(t *testing.T) {
 	var inboxChecks int
 	var sendSucceeded bool

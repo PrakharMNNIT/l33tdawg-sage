@@ -51,6 +51,34 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.24
+
+**Federated inbox work now has recoverable, session-fenced ownership.** SAGE
+binds an inbound federated claim to the receiving MCP session before exposing
+its payload. Retained older claims receive an explicit `legacy` CAS fence for
+deliberate handoff; live work is never stolen by a timeout. Reply completion,
+the claimant check, encrypted result fingerprint, and durable return event now
+commit atomically, so a lost-response retry returns the original event while a
+different second reply conflicts.
+
+**MCP boot guidance no longer rides inside ordinary tool results.** Lifecycle
+standing stays in `initialize.instructions`, including for a client that
+initializes after its first tool call. The former imperative block that asked an
+agent to invoke tools and edit a memory file has been removed, keeping the inbox
+trust boundary internally consistent.
+
+**Embedding-space and retention diagnostics are more precise.** The readiness
+guard labels only a qualified-versus-bare spelling of the same provider/model
+leaf/dimension as a likely alias, without collapsing two organizations that
+publish the same basename. Durable-until-handled presentation is limited to
+actionable pending/claimed work, while mixed-version retention-only responses
+remain compatible.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.24 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.24`. SDK 11.18.24.
+
 ## What's New in v11.18.23
 
 **Turn-time recall now carries the same trust and lifecycle evidence as explicit
@@ -2044,7 +2072,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.23`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.24`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

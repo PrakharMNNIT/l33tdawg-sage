@@ -410,6 +410,97 @@ func (s *SQLiteStore) CompleteFederatedPipelineWithTransport(ctx context.Context
 	})
 }
 
+// CompleteFederatedMessageReplyWithTransport is the session-fenced,
+// idempotent Messages facade over federated pipeline completion. The claimant
+// CAS check, workflow completion, encrypted result fingerprint, and durable
+// return event share one transaction. An identical retry returns the original
+// event; a different retry is explicit equivocation.
+func (s *SQLiteStore) CompleteFederatedMessageReplyWithTransport(
+	ctx context.Context, pipeID, agentID, claimantSessionID, result string, event *PipelineTransportOutbox,
+) (eventID string, replayed bool, err error) {
+	if claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes || len(result) > MaxPipeContentBytes {
+		if len(result) > MaxPipeContentBytes {
+			return "", false, ErrPipeResultTooLarge
+		}
+		return "", false, ErrMessageNotFound
+	}
+	if event == nil || event.EventKind != "result" || event.PipeID != pipeID || event.SourceAgentID != agentID {
+		return "", false, fmt.Errorf("federated result transport binding is incomplete")
+	}
+	resultHash := messageKeyHash(result)
+	err = s.runPipelineTx(ctx, func(txStore OffchainStore) error {
+		tx := txStore.(*SQLiteStore)
+		var existingReceiver, existingHash string
+		lookupErr := tx.conn.QueryRowContext(ctx, `SELECT receiver_agent_id,result_hash FROM message_replies WHERE message_id=?`, pipeID).
+			Scan(&existingReceiver, &existingHash)
+		switch {
+		case lookupErr == nil:
+			if existingReceiver != agentID {
+				return ErrMessageNotFound
+			}
+			openedHash, openErr := tx.openMessageFingerprint(existingHash)
+			if openErr != nil {
+				return openErr
+			}
+			if openedHash != resultHash {
+				return ErrMessageReplyConflict
+			}
+			var currentSession string
+			if sessionErr := tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+				WHERE message_id=? AND receiver_agent_id=?`, pipeID, agentID).Scan(&currentSession); sessionErr != nil {
+				return ErrMessageNotFound
+			} else if currentSession != claimantSessionID {
+				return ErrMessageClaimedByOtherSession
+			}
+			if eventErr := tx.conn.QueryRowContext(ctx, `SELECT event_id FROM pipeline_transport_outbox
+				WHERE pipe_id=? AND event_kind='result'`, pipeID).Scan(&eventID); eventErr != nil {
+				return eventErr
+			}
+			replayed = true
+			return nil
+		case !errors.Is(lookupErr, sql.ErrNoRows):
+			return lookupErr
+		}
+
+		msg, getErr := tx.GetPipeline(ctx, pipeID)
+		if getErr != nil {
+			return getErr
+		}
+		if msg.SourceChainID == "" || msg.DestinationChainID != "" || msg.SourcePipeID == "" ||
+			event.RemoteChainID != msg.SourceChainID || event.PolicyEpoch != msg.FederationPolicyEpoch ||
+			event.AgreementID != msg.FederationAgreementID || event.ContactID != msg.FederationContactID ||
+			event.ContactRevision != msg.FederationContactRevision || event.TargetAgentID != msg.FromAgent ||
+			event.AuthorizationMode != msg.FederationAuthorizationMode ||
+			!bytes.Equal(event.LinkedRelation, msg.FederationLinkedRelation) || msg.ToAgent != agentID {
+			return fmt.Errorf("foreign pipeline row and result transport binding mismatch")
+		}
+		var currentSession string
+		if sessionErr := tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+			WHERE message_id=? AND receiver_agent_id=?`, pipeID, agentID).Scan(&currentSession); sessionErr != nil {
+			return ErrMessageNotFound
+		} else if currentSession != claimantSessionID {
+			return ErrMessageClaimedByOtherSession
+		}
+		if completeErr := tx.CompletePipeline(ctx, pipeID, agentID, result, ""); completeErr != nil {
+			return completeErr
+		}
+		if insertErr := tx.insertPipelineTransport(ctx, event); insertErr != nil {
+			return insertErr
+		}
+		sealedHash, sealErr := tx.sealMessageFingerprint(resultHash)
+		if sealErr != nil {
+			return sealErr
+		}
+		if _, insertErr := tx.writeExecContext(ctx, `INSERT INTO message_replies(message_id,receiver_agent_id,result_hash)
+			VALUES(?,?,?)`, pipeID, agentID, sealedHash); insertErr != nil {
+			return insertErr
+		}
+		eventID = event.EventID
+		return nil
+	})
+	return eventID, replayed, err
+}
+
 // ApplyFederatedPipelineResult atomically deduplicates one authenticated peer
 // result and completes the original outbound local pipe. The remote source's
 // private imported pipe id is the replay key; local callers continue using the

@@ -110,3 +110,43 @@ func SpaceID(p Provider) string {
 	}
 	return fmt.Sprintf("%s:%s:%d", name, model, dimension)
 }
+
+// CanonicalSpaceID collapses a SpaceID to a form that ignores an organization
+// prefix on the MODEL name, so a model served under two spellings —
+// "openai-compatible:Alibaba-NLP/gte-Qwen2-1.5B-instruct:1536" and
+// "openai-compatible:gte-Qwen2-1.5B-instruct:1536" — map to the same canonical
+// id. Only a leading "org/" on the model component is stripped; the provider
+// name and dimension are left untouched, so two genuinely different models, or
+// the same model at a different dimension, never collapse together.
+//
+// This is a heuristic for TELLING an operator "this foreign space is most likely
+// your own model under another name," not a change to how recall partitions:
+// recall still compares the exact SpaceID, because two spellings could in
+// principle be different builds, and silently widening the match would be exactly
+// the cross-space cosine SpaceID exists to prevent.
+func CanonicalSpaceID(spaceID string) string {
+	parts := strings.Split(spaceID, ":")
+	if len(parts) != 3 {
+		return spaceID // "hash" / "ollama" / "name:dim" — no model component to canonicalize
+	}
+	if i := strings.LastIndex(parts[1], "/"); i >= 0 {
+		parts[1] = parts[1][i+1:]
+	}
+	return strings.Join(parts, ":")
+}
+
+// LikelySpaceAlias is deliberately narrower than canonical equality: exactly
+// one spelling must carry an organization path and the other must be bare.
+// Two different organizations can publish repositories with the same final
+// model name, so org-a/model and org-b/model are not enough evidence to label
+// one an alias of the other. Ambiguous IDs (including model names containing
+// the ':' SpaceID delimiter) fail closed as not-classified.
+func LikelySpaceAlias(a, b string) bool {
+	pa, pb := strings.Split(a, ":"), strings.Split(b, ":")
+	if len(pa) != 3 || len(pb) != 3 || a == b {
+		return false
+	}
+	aQualified := strings.Contains(pa[1], "/")
+	bQualified := strings.Contains(pb[1], "/")
+	return aQualified != bQualified && CanonicalSpaceID(a) == CanonicalSpaceID(b)
+}

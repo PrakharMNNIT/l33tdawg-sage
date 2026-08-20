@@ -120,6 +120,18 @@ func (s *SQLiteStore) migrateMessages(ctx context.Context) error {
 		SELECT message_id,receiver_agent_id FROM message_receive_batch_items`); err != nil {
 		return fmt.Errorf("backfill canonical message fetch evidence: %w", err)
 	}
+	// Pre-session federated inbox claims carried only agent-level ownership.
+	// Give those retained exact-recipient rows an explicit unattributed CAS
+	// fence so passive history can name it and an operator/runtime can hand it
+	// off deliberately. Never infer that the old claimant is dead and never
+	// replace an existing concrete session binding.
+	if _, err := s.writeExecContext(ctx, `INSERT OR IGNORE INTO message_fetch_receipts
+		(message_id,receiver_agent_id,claimant_session_id)
+		SELECT pipe_id,to_agent,'legacy' FROM pipeline_messages
+		WHERE source_chain_id!='' AND destination_chain_id=''
+		  AND to_agent!='' AND to_provider='' AND status='claimed'`); err != nil {
+		return fmt.Errorf("backfill federated message claim fences: %w", err)
+	}
 	// v11.17.8 stamped the old 24-hour pipeline TTL onto canonical msg-* rows.
 	// Extend still-live inbox/outbox items during upgrade so a recipient that
 	// was offline through the release does not lose unread work.
@@ -621,8 +633,7 @@ func (s *SQLiteStore) CountClaimedLocalMessagesElsewhere(
 		FROM pipeline_messages p
 		JOIN message_fetch_receipts r
 		  ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
-		WHERE p.to_agent=? AND p.to_provider=''
-		  AND p.source_chain_id='' AND p.destination_chain_id=''
+		WHERE p.to_agent=? AND p.to_provider='' AND p.destination_chain_id=''
 		  AND p.status='claimed' AND p.completed_at IS NULL
 		  AND r.claimant_session_id!=?`,
 		receiverID, receiverID, claimantSessionID).Scan(&count)
@@ -645,8 +656,7 @@ func (s *SQLiteStore) GetOwnClaimedUnfinishedMessages(
 		FROM pipeline_messages p
 		JOIN message_fetch_receipts r
 		  ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
-		WHERE p.to_agent=? AND p.to_provider=''
-		  AND p.source_chain_id='' AND p.destination_chain_id=''
+		WHERE p.to_agent=? AND p.to_provider='' AND p.destination_chain_id=''
 		  AND p.status='claimed' AND p.completed_at IS NULL
 		  AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		  AND r.claimant_session_id=?
@@ -700,7 +710,7 @@ func (s *SQLiteStore) HandoffLocalMessageClaim(ctx context.Context, receiverID, 
 			Scan(&addressed, &provider, &claimed, &status, &sourceChain, &destinationChain, &current); err != nil {
 			return ErrMessageNotFound
 		}
-		if addressed != receiverID || provider != "" || claimed != receiverID || status != "claimed" || sourceChain != "" || destinationChain != "" {
+		if addressed != receiverID || provider != "" || claimed != receiverID || status != "claimed" || destinationChain != "" {
 			return ErrMessageNotFound
 		}
 		if current == toSessionID {
@@ -721,6 +731,118 @@ func (s *SQLiteStore) HandoffLocalMessageClaim(ctx context.Context, receiverID, 
 		return nil
 	})
 	return replayed, err
+}
+
+// BindFederatedMessageClaimSession attaches one concrete MCP session to an
+// already-claimed exact-recipient inbound federated row. INSERT is the claim
+// fence: a concurrent or stale runtime cannot overwrite an existing binding.
+// Legacy unattributed claims are intentionally not adopted here; callers must
+// inspect passive history and use the explicit CAS handoff from "legacy".
+func (s *SQLiteStore) BindFederatedMessageClaimSession(ctx context.Context, receiverID, messageID, claimantSessionID string) (bool, error) {
+	if receiverID == "" || messageID == "" || claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes {
+		return false, ErrMessageNotFound
+	}
+	var replayed bool
+	err := s.RunInTx(ctx, func(txStore OffchainStore) error {
+		tx := txStore.(*SQLiteStore)
+		var addressed, provider, claimed, status, sourceChain, destinationChain string
+		if err := tx.conn.QueryRowContext(ctx, `SELECT to_agent,to_provider,claimed_by,status,source_chain_id,destination_chain_id
+			FROM pipeline_messages WHERE pipe_id=?`, messageID).
+			Scan(&addressed, &provider, &claimed, &status, &sourceChain, &destinationChain); err != nil {
+			return ErrMessageNotFound
+		}
+		if addressed != receiverID || provider != "" || claimed != receiverID || status != "claimed" || sourceChain == "" || destinationChain != "" {
+			return ErrMessageNotFound
+		}
+		var current string
+		err := tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+			WHERE message_id=? AND receiver_agent_id=?`, messageID, receiverID).Scan(&current)
+		switch {
+		case err == nil && current == claimantSessionID:
+			replayed = true
+			return nil
+		case err == nil:
+			return ErrMessageReceiveConflict
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+		_, err = tx.writeExecContext(ctx, `INSERT INTO message_fetch_receipts
+			(message_id,receiver_agent_id,claimant_session_id) VALUES(?,?,?)`, messageID, receiverID, claimantSessionID)
+		return err
+	})
+	return replayed, err
+}
+
+// ClaimFederatedMessageWithSession atomically claims one inbound foreign row
+// and records the exact MCP session that owns it. Keeping these writes in one
+// transaction prevents a crash between claim and fence creation from leaving
+// work invisible and impossible to hand off.
+func (s *SQLiteStore) ClaimFederatedMessageWithSession(ctx context.Context, receiverID, messageID, claimantSessionID string) error {
+	claimantSessionID = strings.TrimSpace(claimantSessionID)
+	if claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes {
+		return ErrMessageNotFound
+	}
+	return s.RunInTx(ctx, func(txStore OffchainStore) error {
+		tx := txStore.(*SQLiteStore)
+		var sourceChain, destinationChain, status string
+		if err := tx.conn.QueryRowContext(ctx, `SELECT source_chain_id,destination_chain_id,status
+			FROM pipeline_messages WHERE pipe_id=?`, messageID).
+			Scan(&sourceChain, &destinationChain, &status); err != nil ||
+			sourceChain == "" || destinationChain != "" || status != "pending" {
+			return ErrMessageNotFound
+		}
+		if err := tx.ClaimPipeline(ctx, messageID, receiverID); err != nil {
+			return err
+		}
+		_, err := tx.writeExecContext(ctx, `INSERT INTO message_fetch_receipts
+			(message_id,receiver_agent_id,claimant_session_id) VALUES(?,?,?)`,
+			messageID, receiverID, claimantSessionID)
+		return err
+	})
+}
+
+// LookupFederatedMessageReplyReplay returns an already-committed inbound
+// foreign reply before mutable federation admission is rechecked. Revoking a
+// relationship may stop new work, but it must not make a lost HTTP response
+// erase the durable event id from an exact same-result/session retry.
+func (s *SQLiteStore) LookupFederatedMessageReplyReplay(
+	ctx context.Context, receiverID, messageID, claimantSessionID, result string,
+) (string, bool, error) {
+	if claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes || len(result) > MaxPipeContentBytes {
+		return "", false, ErrMessageNotFound
+	}
+	var existingReceiver, existingHash string
+	if err := s.conn.QueryRowContext(ctx, `SELECT receiver_agent_id,result_hash FROM message_replies WHERE message_id=?`, messageID).
+		Scan(&existingReceiver, &existingHash); errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	} else if err != nil {
+		return "", false, err
+	}
+	if existingReceiver != receiverID {
+		return "", false, ErrMessageNotFound
+	}
+	openedHash, err := s.openMessageFingerprint(existingHash)
+	if err != nil {
+		return "", false, err
+	}
+	if openedHash != messageKeyHash(result) {
+		return "", false, ErrMessageReplyConflict
+	}
+	var sourceChain, destinationChain, claimed, currentSession, eventID string
+	if err = s.conn.QueryRowContext(ctx, `SELECT p.source_chain_id,p.destination_chain_id,p.claimed_by,r.claimant_session_id
+		FROM pipeline_messages p JOIN message_fetch_receipts r ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
+		WHERE p.pipe_id=?`, receiverID, messageID).Scan(&sourceChain, &destinationChain, &claimed, &currentSession); err != nil ||
+		sourceChain == "" || destinationChain != "" || claimed != receiverID {
+		return "", false, ErrMessageNotFound
+	}
+	if currentSession != claimantSessionID {
+		return "", false, ErrMessageClaimedByOtherSession
+	}
+	if err = s.conn.QueryRowContext(ctx, `SELECT event_id FROM pipeline_transport_outbox
+		WHERE pipe_id=? AND event_kind='result'`, messageID).Scan(&eventID); err != nil {
+		return "", false, err
+	}
+	return eventID, true, nil
 }
 
 func hasExactMessageFetch(ctx context.Context, s *SQLiteStore, receiverID, messageID string) (bool, error) {
@@ -804,6 +926,27 @@ func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, message
 			if openedHash != resultHash {
 				return ErrMessageReplyConflict
 			}
+			// A completed inbound federated reply must still select the
+			// session-fenced transport path. Returning a canonical local replay
+			// here would discard the original reply event id and turn a
+			// lost-response retry into a false local success.
+			var provider, claimed, sourceChain, destinationChain string
+			if queryErr := tx.conn.QueryRowContext(ctx,
+				`SELECT to_provider,claimed_by,source_chain_id,destination_chain_id FROM pipeline_messages WHERE pipe_id=?`, messageID).
+				Scan(&provider, &claimed, &sourceChain, &destinationChain); queryErr != nil {
+				return ErrMessageNotFound
+			}
+			if provider == "" && claimed == receiverID && sourceChain != "" && destinationChain == "" {
+				var currentSessionID string
+				if claimantSessionID == "" || tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+					WHERE receiver_agent_id=? AND message_id=?`, receiverID, messageID).Scan(&currentSessionID) != nil {
+					return ErrMessageNotFound
+				}
+				if currentSessionID != claimantSessionID {
+					return ErrMessageClaimedByOtherSession
+				}
+				return ErrMessageFederatedCompatibilityScope
+			}
 			replayed = true
 			return nil
 		case !errors.Is(err, sql.ErrNoRows):
@@ -814,6 +957,24 @@ func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, message
 			`SELECT to_provider,claimed_by,source_chain_id,destination_chain_id FROM pipeline_messages WHERE pipe_id=?`, messageID).
 			Scan(&provider, &claimed, &sourceChain, &destinationChain); queryErr != nil {
 			return ErrMessageNotFound
+		}
+		// The public Messages facade shares identifiers with the retained
+		// pipeline transport. Once the exact caller is already established as
+		// the claimant of an inbound federated row, distinguish that compatibility
+		// scope so MCP can queue its signed cross-chain reply. Do this before the
+		// canonical fetch-receipt check: legacy/federated claims intentionally do
+		// not manufacture canonical local fetch evidence. Unrelated callers still
+		// receive the ordinary non-enumerating not-found error.
+		if provider == "" && claimed == receiverID && sourceChain != "" && destinationChain == "" {
+			var currentSessionID string
+			if claimantSessionID == "" || tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+				WHERE receiver_agent_id=? AND message_id=?`, receiverID, messageID).Scan(&currentSessionID) != nil {
+				return ErrMessageNotFound
+			}
+			if currentSessionID != claimantSessionID {
+				return ErrMessageClaimedByOtherSession
+			}
+			return ErrMessageFederatedCompatibilityScope
 		}
 		fetched, err := hasExactMessageFetch(ctx, tx, receiverID, messageID)
 		if err != nil || !fetched || provider != "" || claimed != receiverID || sourceChain != "" || destinationChain != "" {

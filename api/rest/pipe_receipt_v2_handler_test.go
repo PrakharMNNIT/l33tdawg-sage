@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,7 +45,7 @@ func (c *receiptV2Controller) ImportedPipeReceiptChallenge(
 }
 
 func (c *receiptV2Controller) RecordImportedPipeReceipt(
-	_ context.Context, pipeID, recipientID, kind string, proof store.PipelineAgentProof,
+	_ context.Context, pipeID, recipientID, kind string, proof store.PipelineAgentProof, claimantSessionIDs ...string,
 ) (bool, error) {
 	key := pipeID + "\x00" + kind
 	if recipientID != c.recipient || proof.AgentID != recipientID || pipeID == "" || pipeID == "missing" {
@@ -70,7 +71,11 @@ func (c *receiptV2Controller) RecordImportedPipeReceipt(
 		}
 		c.claimed[pipeID] = true
 	}
-	c.records = append(c.records, pipeReceiptBatchItem{PipeID: pipeID, Kind: kind, Proof: proof})
+	claimantSessionID := ""
+	if len(claimantSessionIDs) > 0 {
+		claimantSessionID = claimantSessionIDs[0]
+	}
+	c.records = append(c.records, pipeReceiptBatchItem{PipeID: pipeID, Kind: kind, ClaimantSessionID: claimantSessionID, Proof: proof})
 	return replayed, nil
 }
 
@@ -162,6 +167,9 @@ func (s receiptV2Signer) request(t *testing.T, method, path string, body []byte,
 	req.Header.Set("X-Agent-ID", s.id)
 	req.Header.Set("X-Signature", hex.EncodeToString(signature))
 	req.Header.Set("X-Timestamp", strconv.FormatInt(ts, 10))
+	if method == http.MethodPut && strings.HasSuffix(path, "/receipt/claimed") {
+		req.Header.Set("X-SAGE-Claimant-Session-ID", "test-session")
+	}
 	return req
 }
 
@@ -185,6 +193,14 @@ func callReceiptV2(t *testing.T, handler http.Handler, req *http.Request) *httpt
 
 func receiptV2Body(t *testing.T, value any) []byte {
 	t.Helper()
+	if request, ok := value.(pipeReceiptBatchRequest); ok {
+		for i := range request.Items {
+			if request.Items[i].Kind == "claimed" && request.Items[i].ClaimantSessionID == "" {
+				request.Items[i].ClaimantSessionID = "test-session"
+			}
+		}
+		value = request
+	}
 	body, err := json.Marshal(value)
 	require.NoError(t, err)
 	return body

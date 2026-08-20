@@ -114,6 +114,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.21 | MRI-renderer authority for the central unavailable overlay, with independent domain-inventory failures localized to their own retrying panel; no new app version; app-v26 remains the ceiling |
 | v11.18.22 | Post-render MRI initialization hardening, verified-core readiness before optional renderer setup, and feature-gated `clickAfterDrag` support for bundled ForceGraph runtimes; no new app version; app-v26 remains the ceiling |
 | v11.18.23 | Turn-recall trust/lifecycle parity, non-fatal boot-time embedding-space mismatch disclosure, and managed-reranker loader incompatibility diagnosis with bring-your-own guidance; no new app version; app-v26 remains the ceiling |
+| v11.18.24 | Session-fenced federated claim recovery and idempotent reply events, MCP boot-guidance result isolation, actionable-only retention labels, and qualified-versus-bare embedding alias diagnosis; no new app version; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

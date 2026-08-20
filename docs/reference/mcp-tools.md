@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.18.23.
+Reconciled against internal/mcp for SAGE v11.18.24.
 
 # SAGE MCP Tools Reference
 
@@ -138,9 +138,9 @@ adaptive auto-inception standing once during `initialize` and returns it in
 `initialize.instructions`; the first tool result is not padded with that
 preamble. Repeated or concurrent initialization in one transport session
 reuses the cached standing without repeating registration or memory reads. A
-client that skips `initialize` retains the historical one-time fallback on its
-first non-inception tool call. An explicit first `sage_inception` call suppresses
-that fallback because the tool itself returns the standing.
+client that skips `initialize` still receives clean, payload-only tool results;
+a later `initialize` returns the cached standing. An explicit first
+`sage_inception` call returns the standing through that tool's own response.
 
 ---
 
@@ -986,8 +986,8 @@ clients must not treat the legacy value as immutable registration history.
 
 ### sage_message_handoff
 
-**Purpose:** Deterministically transfer one already-claimed canonical local
-message between concurrent MCP runtimes that share the same signed agent
+**Purpose:** Deterministically transfer one already-claimed canonical local or
+inbound federated message between concurrent MCP runtimes that share the same signed agent
 identity. The caller supplies the `claimant_session_id` currently shown by
 `sage_message_history(folder="inbox")`; SAGE atomically compares that value and
 reassigns the message to the calling MCP session. A stale or concurrent handoff
@@ -1010,9 +1010,18 @@ IDs remain transport-scoped and are not collapsed into the stdio identity.
 `api/rest/messages_handler.go` (`handleMessageHandoff`);
 `internal/store/messages.go` (`HandoffLocalMessageClaim`).
 
+Inbound federated work is claimed and bound to the receiving MCP session in one
+transaction before its payload is exposed, including negotiated receipt-v2
+claims. Retained claims created before v11.18.24 are migrated to an explicit
+`claimant_session_id:"legacy"` fence. SAGE never assumes that claimant is dead:
+the recipient must inspect history and deliberately hand off from `legacy`.
+The exact-signed `PUT /v1/messages/{message_id}/claim-session` route remains a
+recovery/compatibility operation for an already-claimed unbound row; a
+competing bind conflicts instead of overwriting the first session.
+
 | Name | Type | Required | Description |
 |---|---|---:|---|
-| `message_id` | string | yes | Exact claimed local message to transfer. |
+| `message_id` | string | yes | Exact claimed local or inbound federated message to transfer. |
 | `from_session_id` | string | yes | Expected current claimant session from passive inbox history. |
 
 **Watcher and voice-bridge contract:** A watcher calls `sage_inbox` normally;
@@ -1032,13 +1041,18 @@ protocol. Display names such as “Mynah” do not define identity.
 
 ### sage_message_reply
 
-**Purpose:** Reply to one receiver-local `message_id` returned by
+**Purpose:** Reply to one receiver-local or inbound federated `message_id` returned by
 `sage_messages_receive` or `sage_inbox`. The MCP runtime includes its opaque
 claimant session, so a runtime that handed the work away cannot complete the
-still-open message from stale context. Local replies are idempotent;
-federated replies retain the negotiated secure transport and event
-deduplication. Only the exact recipient that fetched and claimed the message
-can reply.
+still-open message from stale context. Local and federated replies are
+idempotent. For federation, the claimant-session CAS check, workflow completion,
+encrypted result fingerprint, and durable return event commit in one
+transaction. Retrying the same result after a lost response returns the
+original `reply_event_id`; a different second result conflicts. Only the exact
+recipient session that currently owns the claim can reply.
+Recovery of an already-committed identical reply is evaluated before mutable
+federation admission, so a later pause/revocation cannot erase its durable event
+ID; live authorization is still required for every new completion.
 
 A federated reply result includes an immutable `reply_event_id` and its initial
 `reply_status:queued`. This is the signed result outbox event already created by
@@ -1054,10 +1068,12 @@ state; no original request workflow/read state or result content is exposed.
 **REST:** `POST /v1/messages/{message_id}/reply`.
 
 MCP falls back to the deprecated pipe-result route only when an older node
-returns a non-Problem-Details 404 for the missing Messages route. A current
-typed `https://sage.dev/errors/404` response is an authoritative
-non-enumerating denial, including after a claimant-session handoff, and is
-never retried through the compatibility endpoint.
+returns a non-Problem-Details 404 for the missing Messages route, or when a
+current node returns the exact-recipient/session-scoped typed
+`message-federated-compatibility-scope` signal. A current typed
+`https://sage.dev/errors/404` response remains an authoritative non-enumerating
+denial, including after a claimant-session handoff, and is never retried through
+the compatibility endpoint.
 
 ---
 
@@ -1088,6 +1104,15 @@ Federated reply-event lookup uses
 
 `sage_message_status` deliberately returns no result body. To read what the
 recipient actually replied, use `sage_message_replies` below.
+
+For an actionable `workflow_status` of `pending` or `claimed`, the canonical
+far-future storage sentinel is presented as
+`retention:"durable_until_handled"` and `expires_at` is omitted. Terminal
+(`completed`, `expired`, or `failed`) and unknown workflow states never carry
+that retention label: they expose the stored `expires_at` value, even when it
+is far in the future. This keeps lifecycle state authoritative instead of
+describing already-finished work as waiting to be handled
+(`internal/mcp/tools.go`, `formatMessageRetention`).
 
 ---
 
@@ -1182,7 +1207,7 @@ Each `items[]` entry:
 | `passive_reply` | bool | Always `true`. |
 | `requires_reply` | bool | Always `false`. Never reply to a reply. |
 | `requires_result` | bool | Always `false`. This is not an assignment owing a result. |
-| `retention` / `expires_at` | string | `retention:"durable_until_handled"` for a durable row; otherwise the row's expiry. |
+| `expires_at` | string | The row's stored expiry. Replies on this surface are `completed`, so they never carry `retention:"durable_until_handled"`, even if storage still contains the canonical far-future sentinel. |
 | `result_truncated`, `result_runes_returned`, `result_full_via` | bool/int/string | Present only when the reply exceeded `maxReplyResultRunes` (8,000 runes). A recipient can store up to 256 KiB (`store.MaxPipeContentBytes`), so an untruncated page could flood a context window. The untruncated text stays readable via `sage_message_history(folder="outbox")`, which `result_full_via` names. |
 | `foreign`, `destination_chain_id`, `recipient_agent` | bool/string/string | Present only for a reply that crossed a federation boundary. |
 
@@ -1858,6 +1883,13 @@ selects `COALESCE(result,'')`; `api/rest/pipe_handler.go` labels the surface
 Use `sage_message_replies` for the routine payload-free reply read; drop to
 `folder="outbox"` when you need the untruncated reply text, the original
 request, or non-completed workflow state.
+
+Retention presentation follows workflow state. Only actionable `pending` and
+`claimed` rows with the canonical far-future sentinel expose
+`retention:"durable_until_handled"` (and omit `expires_at`). `completed`,
+`expired`, `failed`, and unknown states expose their raw `expires_at` and never
+the retention label. The deprecated `sage_pipe_history` alias uses this same
+formatter and therefore has identical semantics.
 
 Rows remain available only while the normal transient pipeline retention period
 keeps them; use a memory or task for durable records.
