@@ -100,6 +100,14 @@ type EmbeddingSpaceStatus struct {
 	ActiveSpace   string         `json:"active_space,omitempty"`   // SpaceID the node writes and queries now
 	ForeignRows   int            `json:"foreign_rows,omitempty"`   // committed rows the active space cannot see
 	ForeignSpaces map[string]int `json:"foreign_spaces,omitempty"` // foreign space id -> row count
+	// AliasRows / AliasSpaces are the subset of the foreign rows whose space is
+	// most likely the ACTIVE model under a different name — same model and
+	// dimension, differing only by an organization prefix on the model. They are
+	// invisible to recall for the same reason (an exact-string space filter), but
+	// the fix is a re-embed, not a config change, so distinguishing them keeps the
+	// warning trustworthy instead of crying "foreign model" at a cosmetic split.
+	AliasRows   int            `json:"alias_rows,omitempty"`
+	AliasSpaces map[string]int `json:"alias_spaces,omitempty"`
 }
 
 type HealthChecker struct {

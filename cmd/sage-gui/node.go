@@ -3773,18 +3773,37 @@ func checkEmbeddingSpaceConsistency(
 		foreign[space] = n
 		total += n
 	}
+	// Classify the foreign spaces that are most likely the ACTIVE model under a
+	// different name (same model + dimension, differing only by an org prefix).
+	// Those are a re-embed, not a genuinely different model — telling them apart
+	// keeps the warning actionable instead of crying "foreign model" at a
+	// cosmetic label split an operator would then learn to ignore.
+	activeCanon := embedding.CanonicalSpaceID(active)
+	alias := make(map[string]int)
+	aliasTotal := 0
+	for space, n := range foreign {
+		if space != active && embedding.CanonicalSpaceID(space) == activeCanon {
+			alias[space] = n
+			aliasTotal += n
+		}
+	}
 	health.SetEmbeddingSpaceStatus(metrics.EmbeddingSpaceStatus{
 		OK:            total == 0,
 		ActiveSpace:   active,
 		ForeignRows:   total,
 		ForeignSpaces: foreign,
+		AliasRows:     aliasTotal,
+		AliasSpaces:   alias,
 	})
 	if total > 0 {
-		logger.Warn().
+		ev := logger.Warn().
 			Str("active_space", active).
 			Int("foreign_rows", total).
-			Interface("foreign_spaces", foreign).
-			Msg("embedding-space mismatch: the store holds committed vectors in a space the active embedder does not produce, so recall silently cannot see them. Re-embed to reconcile, or restart with the embedding config that wrote them. Serving in degraded mode (queryable at /ready).")
+			Interface("foreign_spaces", foreign)
+		if aliasTotal > 0 {
+			ev = ev.Int("alias_rows", aliasTotal).Interface("alias_spaces", alias)
+		}
+		ev.Msg("embedding-space mismatch: the store holds committed vectors in a space the active embedder does not produce, so recall silently cannot see them. Rows counted under alias_* are most likely your own model under a different name (same model and dimension) — a re-embed reconciles those. Re-embed to reconcile, or restart with the embedding config that wrote them. Serving in degraded mode (queryable at /ready).")
 	}
 }
 

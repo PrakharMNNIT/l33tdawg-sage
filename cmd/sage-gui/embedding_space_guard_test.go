@@ -101,3 +101,47 @@ func TestCheckEmbeddingSpaceConsistency_CountErrorLeavesUnchecked(t *testing.T) 
 	es := body["embedding_space"].(map[string]any)
 	assert.Equal(t, false, es["checked"], "a failed count leaves the check unrun, not a fabricated OK")
 }
+
+// fakeSemanticProvider is a minimal embedding.Provider (plus Named/Modeler) whose
+// SpaceID is a three-part name:model:dim id, so the alias classifier has a model
+// component to reason about — NewHashProvider only ever yields "hash"/"hash:N".
+type fakeSemanticProvider struct {
+	name, model string
+	dim         int
+}
+
+func (f fakeSemanticProvider) Embed(context.Context, string) ([]float32, error) { return nil, nil }
+func (f fakeSemanticProvider) Dimension() int                                   { return f.dim }
+func (f fakeSemanticProvider) Ready() bool                                      { return true }
+func (f fakeSemanticProvider) Semantic() bool                                   { return true }
+func (f fakeSemanticProvider) Name() string                                     { return f.name }
+func (f fakeSemanticProvider) Model() string                                    { return f.model }
+
+// A foreign space that is the ACTIVE model under a different name (the active
+// model carries an "Alibaba-NLP/" org prefix the stored rows lack) must be
+// reported as an alias, not lumped in with a genuinely different space — the
+// operator needs "re-embed, same model" rather than "wrong model."
+func TestCheckEmbeddingSpaceConsistency_ClassifiesLikelyAlias(t *testing.T) {
+	h := metrics.NewHealthChecker()
+	active := fakeSemanticProvider{name: "openai-compatible", model: "Alibaba-NLP/gte-Qwen2-1.5B-instruct", dim: 1536}
+	require.Equal(t, "openai-compatible:Alibaba-NLP/gte-Qwen2-1.5B-instruct:1536", embedding.SpaceID(active))
+
+	counter := fakeProviderCounter{counts: map[string]int{
+		"openai-compatible:Alibaba-NLP/gte-Qwen2-1.5B-instruct:1536": 1659, // active — reachable
+		"openai-compatible:gte-Qwen2-1.5B-instruct:1536":            12,    // same model, no org prefix — alias
+		"hash": 3, // genuinely different space — not an alias
+		"":     35, // repair queue — excluded
+	}}
+	checkEmbeddingSpaceConsistency(context.Background(), counter, active, h, zerolog.Nop())
+
+	code, body := readyBody(t, h, "/ready")
+	assert.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "degraded", body["status"])
+	es := body["embedding_space"].(map[string]any)
+	assert.EqualValues(t, 15, es["foreign_rows"], "12 alias + 3 hash; empty-provider excluded")
+	assert.EqualValues(t, 12, es["alias_rows"], "only the same-model-different-name rows")
+	aliases := es["alias_spaces"].(map[string]any)
+	assert.EqualValues(t, 12, aliases["openai-compatible:gte-Qwen2-1.5B-instruct:1536"])
+	_, hashAliased := aliases["hash"]
+	assert.False(t, hashAliased, "a genuinely different space is not an alias")
+}
