@@ -36,6 +36,7 @@ type remotePipeResolver struct {
 	linkedErr          error
 	linkedSourceAgent  string
 	linkedTargetString string
+	admissionErr       error
 }
 
 type offlineAdmissionResolver struct {
@@ -92,6 +93,9 @@ func (r *remotePipeResolver) AuthorizeImportedPipe(context.Context, *store.Pipel
 }
 
 func (r *remotePipeResolver) WithAuthorizedImportedPipe(_ context.Context, _ *store.PipelineMessage, action func() error) error {
+	if r.admissionErr != nil {
+		return r.admissionErr
+	}
 	if action != nil {
 		return action()
 	}
@@ -571,10 +575,12 @@ func TestLinkedV23ResultOutboxPreservesOriginalRelation(t *testing.T) {
 	require.NoError(t, memStore.ClaimPipeline(
 		context.Background(), "pipe-linked-imported", recipient,
 	))
+	_, err := memStore.BindFederatedMessageClaimSession(context.Background(), recipient, "pipe-linked-imported", "session-linked")
+	require.NoError(t, err)
 	s.SetFederation(&remotePipeResolver{fakeFederation: &fakeFederation{}})
 	body, err := json.Marshal(map[string]any{
 		"result": "linked reply", "source_pipe_id": "peer-linked-pipe",
-		"source_chain_id": "chain-local",
+		"source_chain_id": "chain-local", "claimant_session_id": "session-linked",
 	})
 	require.NoError(t, err)
 	req := httptest.NewRequest(
@@ -803,28 +809,55 @@ func TestHandlePipeResult_ForeignWorkNeverAutoJournals(t *testing.T) {
 	require.Equal(t, http.StatusOK, countBefore.Code, countBefore.Body.String())
 	require.JSONEq(t, `{"count":1,"unread":true}`, countBefore.Body.String())
 	require.NoError(t, memStore.ClaimPipeline(ctx, "pipe-imported", recipient))
-	s.SetFederation(&remotePipeResolver{fakeFederation: &fakeFederation{}})
+	_, err := memStore.BindFederatedMessageClaimSession(ctx, recipient, "pipe-imported", "session-recipient")
+	require.NoError(t, err)
+	resolver := &remotePipeResolver{fakeFederation: &fakeFederation{}}
+	s.SetFederation(resolver)
 
-	body, _ := json.Marshal(map[string]any{"result": "foreign result must stay transient", "source_pipe_id": "peer-pipe-1", "source_chain_id": "chain-local"})
-	req := httptest.NewRequest(http.MethodPut, "/v1/pipe/pipe-imported/result", bytes.NewReader(body))
-	req = req.WithContext(middleware.WithAgentAuth(req.Context(), &middleware.AgentAuthProof{
-		Signature: make([]byte, 64), Timestamp: time.Now().Unix(), Nonce: []byte("12345678"),
-		CanonicalRequest: append([]byte("PUT /v1/pipe/pipe-imported/result\n"), body...),
-	}))
-	rr := httptest.NewRecorder()
-	pipeRouterAs(s, recipient).ServeHTTP(rr, req)
+	body, _ := json.Marshal(map[string]any{"result": "foreign result must stay transient", "source_pipe_id": "peer-pipe-1", "source_chain_id": "chain-local", "claimant_session_id": "session-recipient"})
+	requestResult := func(requestBody []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/v1/pipe/pipe-imported/result", bytes.NewReader(requestBody))
+		req = req.WithContext(middleware.WithAgentAuth(req.Context(), &middleware.AgentAuthProof{
+			Signature: make([]byte, 64), Timestamp: time.Now().Unix(), Nonce: []byte("12345678"),
+			CanonicalRequest: append([]byte("PUT /v1/pipe/pipe-imported/result\n"), requestBody...),
+		}))
+		rr := httptest.NewRecorder()
+		pipeRouterAs(s, recipient).ServeHTTP(rr, req)
+		return rr
+	}
+	missingSessionBody, _ := json.Marshal(map[string]any{"result": "foreign result must stay transient", "source_pipe_id": "peer-pipe-1", "source_chain_id": "chain-local"})
+	require.Equal(t, http.StatusBadRequest, requestResult(missingSessionBody).Code,
+		"omitting the session must never select the old agent-only completion path")
+	wrongSessionBody, _ := json.Marshal(map[string]any{"result": "foreign result must stay transient", "source_pipe_id": "peer-pipe-1", "source_chain_id": "chain-local", "claimant_session_id": "session-sibling"})
+	require.Equal(t, http.StatusConflict, requestResult(wrongSessionBody).Code)
+
+	rr := requestResult(body)
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 	var response struct {
-		JournalID    string `json:"journal_id"`
-		Journaled    bool   `json:"journaled"`
-		ReplyEventID string `json:"reply_event_id"`
-		ReplyStatus  string `json:"reply_status"`
+		JournalID        string `json:"journal_id"`
+		Journaled        bool   `json:"journaled"`
+		ReplyEventID     string `json:"reply_event_id"`
+		ReplyStatus      string `json:"reply_status"`
+		IdempotentReplay bool   `json:"idempotent_replay"`
 	}
 	require.NoError(t, json.NewDecoder(rr.Body).Decode(&response))
 	assert.Empty(t, response.JournalID)
 	assert.False(t, response.Journaled)
 	assert.NotEmpty(t, response.ReplyEventID)
 	assert.Equal(t, "queued", response.ReplyStatus)
+	assert.False(t, response.IdempotentReplay)
+
+	resolver.admissionErr = errors.New("relationship revoked after durable completion")
+	replayedResult := requestResult(body)
+	require.Equal(t, http.StatusOK, replayedResult.Code, replayedResult.Body.String())
+	var replayedResponse struct {
+		ReplyEventID     string `json:"reply_event_id"`
+		IdempotentReplay bool   `json:"idempotent_replay"`
+	}
+	require.NoError(t, json.NewDecoder(replayedResult.Body).Decode(&replayedResponse))
+	require.Equal(t, response.ReplyEventID, replayedResponse.ReplyEventID,
+		"lost-response retry must return the original durable reply event")
+	require.True(t, replayedResponse.IdempotentReplay)
 
 	replyStatusRequest := func(caller, eventID string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/v1/messages/replies/"+eventID+"/status", nil)
@@ -1543,7 +1576,7 @@ func TestPipelineRESTForeignAndDeliveryMetadataRemainUntrusted(t *testing.T) {
 
 	inboxRR := httptest.NewRecorder()
 	pipeRouterAs(s, recipient).ServeHTTP(
-		inboxRR, httptest.NewRequest(http.MethodGet, "/v1/pipe/inbox", nil),
+		inboxRR, httptest.NewRequest(http.MethodGet, "/v1/pipe/inbox?claimant_session_id=session-foreign-rest", nil),
 	)
 	require.Equal(t, http.StatusOK, inboxRR.Code, inboxRR.Body.String())
 	var inbox struct {

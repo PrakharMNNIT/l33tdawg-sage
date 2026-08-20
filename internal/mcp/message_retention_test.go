@@ -53,6 +53,22 @@ func TestMessageRetentionFormatterRequiresActionableStatus(t *testing.T) {
 	}
 }
 
+func TestMessageRetentionFormatterPreservesActionableRetentionOnlyCompatibility(t *testing.T) {
+	for _, status := range []string{"pending", "claimed"} {
+		entry := map[string]any{"retention": "durable_until_handled"}
+		formatMessageRetention(entry, status, "")
+		require.Equal(t, "durable_until_handled", entry["retention"], status)
+	}
+	for _, status := range []string{"completed", "expired", "failed", "unknown", ""} {
+		entry := map[string]any{"retention": "durable_until_handled"}
+		formatMessageRetention(entry, status, "")
+		require.NotContains(t, entry, "retention", status)
+	}
+	entry := map[string]any{"retention": "unexpected"}
+	formatMessageRetention(entry, "pending", "")
+	require.NotContains(t, entry, "retention")
+}
+
 func TestMessageStatusRetentionTracksWorkflowStatus(t *testing.T) {
 	farFuture := farFutureMessageExpiry()
 	mux := http.NewServeMux()

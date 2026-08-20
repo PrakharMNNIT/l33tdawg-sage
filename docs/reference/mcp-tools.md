@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.18.23.
+Reconciled against internal/mcp for SAGE v11.18.24.
 
 # SAGE MCP Tools Reference
 
@@ -986,8 +986,8 @@ clients must not treat the legacy value as immutable registration history.
 
 ### sage_message_handoff
 
-**Purpose:** Deterministically transfer one already-claimed canonical local
-message between concurrent MCP runtimes that share the same signed agent
+**Purpose:** Deterministically transfer one already-claimed canonical local or
+inbound federated message between concurrent MCP runtimes that share the same signed agent
 identity. The caller supplies the `claimant_session_id` currently shown by
 `sage_message_history(folder="inbox")`; SAGE atomically compares that value and
 reassigns the message to the calling MCP session. A stale or concurrent handoff
@@ -1010,9 +1010,18 @@ IDs remain transport-scoped and are not collapsed into the stdio identity.
 `api/rest/messages_handler.go` (`handleMessageHandoff`);
 `internal/store/messages.go` (`HandoffLocalMessageClaim`).
 
+Inbound federated work is claimed and bound to the receiving MCP session in one
+transaction before its payload is exposed, including negotiated receipt-v2
+claims. Retained claims created before v11.18.24 are migrated to an explicit
+`claimant_session_id:"legacy"` fence. SAGE never assumes that claimant is dead:
+the recipient must inspect history and deliberately hand off from `legacy`.
+The exact-signed `PUT /v1/messages/{message_id}/claim-session` route remains a
+recovery/compatibility operation for an already-claimed unbound row; a
+competing bind conflicts instead of overwriting the first session.
+
 | Name | Type | Required | Description |
 |---|---|---:|---|
-| `message_id` | string | yes | Exact claimed local message to transfer. |
+| `message_id` | string | yes | Exact claimed local or inbound federated message to transfer. |
 | `from_session_id` | string | yes | Expected current claimant session from passive inbox history. |
 
 **Watcher and voice-bridge contract:** A watcher calls `sage_inbox` normally;
@@ -1032,13 +1041,18 @@ protocol. Display names such as “Mynah” do not define identity.
 
 ### sage_message_reply
 
-**Purpose:** Reply to one receiver-local `message_id` returned by
+**Purpose:** Reply to one receiver-local or inbound federated `message_id` returned by
 `sage_messages_receive` or `sage_inbox`. The MCP runtime includes its opaque
 claimant session, so a runtime that handed the work away cannot complete the
-still-open message from stale context. Local replies are idempotent;
-federated replies retain the negotiated secure transport and event
-deduplication. Only the exact recipient that fetched and claimed the message
-can reply.
+still-open message from stale context. Local and federated replies are
+idempotent. For federation, the claimant-session CAS check, workflow completion,
+encrypted result fingerprint, and durable return event commit in one
+transaction. Retrying the same result after a lost response returns the
+original `reply_event_id`; a different second result conflicts. Only the exact
+recipient session that currently owns the claim can reply.
+Recovery of an already-committed identical reply is evaluated before mutable
+federation admission, so a later pause/revocation cannot erase its durable event
+ID; live authorization is still required for every new completion.
 
 A federated reply result includes an immutable `reply_event_id` and its initial
 `reply_status:queued`. This is the signed result outbox event already created by
@@ -1054,10 +1068,12 @@ state; no original request workflow/read state or result content is exposed.
 **REST:** `POST /v1/messages/{message_id}/reply`.
 
 MCP falls back to the deprecated pipe-result route only when an older node
-returns a non-Problem-Details 404 for the missing Messages route. A current
-typed `https://sage.dev/errors/404` response is an authoritative
-non-enumerating denial, including after a claimant-session handoff, and is
-never retried through the compatibility endpoint.
+returns a non-Problem-Details 404 for the missing Messages route, or when a
+current node returns the exact-recipient/session-scoped typed
+`message-federated-compatibility-scope` signal. A current typed
+`https://sage.dev/errors/404` response remains an authoritative non-enumerating
+denial, including after a claimant-session handoff, and is never retried through
+the compatibility endpoint.
 
 ---
 

@@ -633,8 +633,7 @@ func (s *SQLiteStore) CountClaimedLocalMessagesElsewhere(
 		FROM pipeline_messages p
 		JOIN message_fetch_receipts r
 		  ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
-		WHERE p.to_agent=? AND p.to_provider=''
-		  AND p.source_chain_id='' AND p.destination_chain_id=''
+		WHERE p.to_agent=? AND p.to_provider='' AND p.destination_chain_id=''
 		  AND p.status='claimed' AND p.completed_at IS NULL
 		  AND r.claimant_session_id!=?`,
 		receiverID, receiverID, claimantSessionID).Scan(&count)
@@ -657,8 +656,7 @@ func (s *SQLiteStore) GetOwnClaimedUnfinishedMessages(
 		FROM pipeline_messages p
 		JOIN message_fetch_receipts r
 		  ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
-		WHERE p.to_agent=? AND p.to_provider=''
-		  AND p.source_chain_id='' AND p.destination_chain_id=''
+		WHERE p.to_agent=? AND p.to_provider='' AND p.destination_chain_id=''
 		  AND p.status='claimed' AND p.completed_at IS NULL
 		  AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		  AND r.claimant_session_id=?
@@ -775,6 +773,78 @@ func (s *SQLiteStore) BindFederatedMessageClaimSession(ctx context.Context, rece
 	return replayed, err
 }
 
+// ClaimFederatedMessageWithSession atomically claims one inbound foreign row
+// and records the exact MCP session that owns it. Keeping these writes in one
+// transaction prevents a crash between claim and fence creation from leaving
+// work invisible and impossible to hand off.
+func (s *SQLiteStore) ClaimFederatedMessageWithSession(ctx context.Context, receiverID, messageID, claimantSessionID string) error {
+	claimantSessionID = strings.TrimSpace(claimantSessionID)
+	if claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes {
+		return ErrMessageNotFound
+	}
+	return s.RunInTx(ctx, func(txStore OffchainStore) error {
+		tx := txStore.(*SQLiteStore)
+		var sourceChain, destinationChain, status string
+		if err := tx.conn.QueryRowContext(ctx, `SELECT source_chain_id,destination_chain_id,status
+			FROM pipeline_messages WHERE pipe_id=?`, messageID).
+			Scan(&sourceChain, &destinationChain, &status); err != nil ||
+			sourceChain == "" || destinationChain != "" || status != "pending" {
+			return ErrMessageNotFound
+		}
+		if err := tx.ClaimPipeline(ctx, messageID, receiverID); err != nil {
+			return err
+		}
+		_, err := tx.writeExecContext(ctx, `INSERT INTO message_fetch_receipts
+			(message_id,receiver_agent_id,claimant_session_id) VALUES(?,?,?)`,
+			messageID, receiverID, claimantSessionID)
+		return err
+	})
+}
+
+// LookupFederatedMessageReplyReplay returns an already-committed inbound
+// foreign reply before mutable federation admission is rechecked. Revoking a
+// relationship may stop new work, but it must not make a lost HTTP response
+// erase the durable event id from an exact same-result/session retry.
+func (s *SQLiteStore) LookupFederatedMessageReplyReplay(
+	ctx context.Context, receiverID, messageID, claimantSessionID, result string,
+) (string, bool, error) {
+	if claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes || len(result) > MaxPipeContentBytes {
+		return "", false, ErrMessageNotFound
+	}
+	var existingReceiver, existingHash string
+	if err := s.conn.QueryRowContext(ctx, `SELECT receiver_agent_id,result_hash FROM message_replies WHERE message_id=?`, messageID).
+		Scan(&existingReceiver, &existingHash); errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	} else if err != nil {
+		return "", false, err
+	}
+	if existingReceiver != receiverID {
+		return "", false, ErrMessageNotFound
+	}
+	openedHash, err := s.openMessageFingerprint(existingHash)
+	if err != nil {
+		return "", false, err
+	}
+	if openedHash != messageKeyHash(result) {
+		return "", false, ErrMessageReplyConflict
+	}
+	var sourceChain, destinationChain, claimed, currentSession, eventID string
+	if err = s.conn.QueryRowContext(ctx, `SELECT p.source_chain_id,p.destination_chain_id,p.claimed_by,r.claimant_session_id
+		FROM pipeline_messages p JOIN message_fetch_receipts r ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
+		WHERE p.pipe_id=?`, receiverID, messageID).Scan(&sourceChain, &destinationChain, &claimed, &currentSession); err != nil ||
+		sourceChain == "" || destinationChain != "" || claimed != receiverID {
+		return "", false, ErrMessageNotFound
+	}
+	if currentSession != claimantSessionID {
+		return "", false, ErrMessageClaimedByOtherSession
+	}
+	if err = s.conn.QueryRowContext(ctx, `SELECT event_id FROM pipeline_transport_outbox
+		WHERE pipe_id=? AND event_kind='result'`, messageID).Scan(&eventID); err != nil {
+		return "", false, err
+	}
+	return eventID, true, nil
+}
+
 func hasExactMessageFetch(ctx context.Context, s *SQLiteStore, receiverID, messageID string) (bool, error) {
 	var one int
 	err := s.conn.QueryRowContext(ctx,
@@ -855,6 +925,27 @@ func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, message
 			}
 			if openedHash != resultHash {
 				return ErrMessageReplyConflict
+			}
+			// A completed inbound federated reply must still select the
+			// session-fenced transport path. Returning a canonical local replay
+			// here would discard the original reply event id and turn a
+			// lost-response retry into a false local success.
+			var provider, claimed, sourceChain, destinationChain string
+			if queryErr := tx.conn.QueryRowContext(ctx,
+				`SELECT to_provider,claimed_by,source_chain_id,destination_chain_id FROM pipeline_messages WHERE pipe_id=?`, messageID).
+				Scan(&provider, &claimed, &sourceChain, &destinationChain); queryErr != nil {
+				return ErrMessageNotFound
+			}
+			if provider == "" && claimed == receiverID && sourceChain != "" && destinationChain == "" {
+				var currentSessionID string
+				if claimantSessionID == "" || tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+					WHERE receiver_agent_id=? AND message_id=?`, receiverID, messageID).Scan(&currentSessionID) != nil {
+					return ErrMessageNotFound
+				}
+				if currentSessionID != claimantSessionID {
+					return ErrMessageClaimedByOtherSession
+				}
+				return ErrMessageFederatedCompatibilityScope
 			}
 			replayed = true
 			return nil

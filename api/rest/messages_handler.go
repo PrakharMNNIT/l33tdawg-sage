@@ -367,6 +367,12 @@ func (s *Server) handleOwnClaimedUnfinishedMessages(w http.ResponseWriter, r *ht
 			"requires_reply": true, "authority": pipeRequestAuthority, "trust": pipeLocalTrust,
 			"security_notice": pipeRESTRequestSecurityNotice,
 		}
+		if item.SourceChainID != "" {
+			entry["source_chain_id"] = item.SourceChainID
+			entry["source_pipe_id"] = item.SourcePipeID
+			entry["foreign"] = true
+			entry["trust"] = pipeForeignTrust
+		}
 		if item.FromProvider != "" {
 			entry["from_provider"] = item.FromProvider
 		}

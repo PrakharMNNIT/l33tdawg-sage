@@ -3802,7 +3802,11 @@ func checkEmbeddingSpaceConsistency(
 		if aliasTotal > 0 {
 			ev = ev.Int("alias_rows", aliasTotal).Interface("alias_spaces", alias)
 		}
-		ev.Msg("embedding-space mismatch: the store holds committed vectors in a space the active embedder does not produce, so recall silently cannot see them. Rows counted under alias_* are most likely your own model under a different name (same model and dimension) — a re-embed reconciles those. Re-embed to reconcile, or restart with the embedding config that wrote them. Serving in degraded mode (queryable at /ready).")
+		message := "embedding-space mismatch: the store holds committed vectors in a space the active embedder does not produce, so recall silently cannot see them. Re-embed to reconcile, or restart with the embedding config that wrote them. Serving in degraded mode (queryable at /ready)."
+		if aliasTotal > 0 {
+			message = "embedding-space mismatch: the store holds committed vectors in a space the active embedder does not produce, so recall silently cannot see them. Rows counted under alias_* are likely the active model under one qualified and one bare name (same model and dimension) — a re-embed reconciles those. Re-embed to reconcile, or restart with the embedding config that wrote them. Serving in degraded mode (queryable at /ready)."
+		}
+		ev.Msg(message)
 	}
 }
 

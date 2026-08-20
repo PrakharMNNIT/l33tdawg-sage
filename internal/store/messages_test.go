@@ -906,6 +906,14 @@ func TestFederatedClaimSessionBindingAndHandoffAreCASFenced(t *testing.T) {
 	replayed, err := s.BindFederatedMessageClaimSession(ctx, "bob", "msg-fed-session", "session-a")
 	require.NoError(t, err)
 	require.False(t, replayed)
+	own, total, err := s.GetOwnClaimedUnfinishedMessages(ctx, "bob", "session-a", 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, total)
+	require.Len(t, own, 1)
+	require.Equal(t, "chain-remote", own[0].SourceChainID)
+	elsewhere, err := s.CountClaimedLocalMessagesElsewhere(ctx, "bob", "session-b")
+	require.NoError(t, err)
+	require.Equal(t, 1, elsewhere)
 	replayed, err = s.BindFederatedMessageClaimSession(ctx, "bob", "msg-fed-session", "session-a")
 	require.NoError(t, err)
 	require.True(t, replayed)
@@ -924,6 +932,61 @@ func TestFederatedClaimSessionBindingAndHandoffAreCASFenced(t *testing.T) {
 	require.ErrorIs(t, err, ErrMessageClaimedByOtherSession)
 	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-fed-session", "fresh", "session-b")
 	require.ErrorIs(t, err, ErrMessageFederatedCompatibilityScope)
+}
+
+func TestFederatedClaimAndSessionFenceAreAtomic(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	insert := func(id string) {
+		require.NoError(t, s.InsertPipeline(ctx, &PipelineMessage{
+			PipeID: id, FromAgent: "remote", ToAgent: "bob", Payload: "work", Status: "pending",
+			SourceChainID: "chain-remote", SourcePipeID: "source-" + id,
+			CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+		}))
+	}
+	insert("msg-fed-atomic")
+	require.NoError(t, s.ClaimFederatedMessageWithSession(ctx, "bob", "msg-fed-atomic", "session-a"))
+	history, err := s.GetInboxHistory(ctx, "bob", "", 10)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	require.Equal(t, "claimed", history[0].Status)
+	require.Equal(t, "session-a", history[0].ClaimedSessionID)
+
+	insert("msg-fed-rollback")
+	_, err = s.conn.ExecContext(ctx, `INSERT INTO message_fetch_receipts
+		(message_id,receiver_agent_id,claimant_session_id) VALUES(?,?,?)`, "msg-fed-rollback", "bob", "session-existing")
+	require.NoError(t, err)
+	require.Error(t, s.ClaimFederatedMessageWithSession(ctx, "bob", "msg-fed-rollback", "session-new"))
+	row, err := s.GetPipeline(ctx, "msg-fed-rollback")
+	require.NoError(t, err)
+	require.Equal(t, "pending", row.Status, "receipt insert failure must roll back the claim")
+}
+
+func TestFederatedClaimMigrationCreatesExplicitLegacyHandoffFence(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "federated-legacy.db")
+	s, err := NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	require.NoError(t, s.InsertPipeline(ctx, &PipelineMessage{
+		PipeID: "msg-fed-legacy", FromAgent: "remote", ToAgent: "bob",
+		Payload: "retained", Status: "pending", SourceChainID: "chain-remote", SourcePipeID: "source",
+		CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}))
+	require.NoError(t, s.ClaimPipeline(ctx, "msg-fed-legacy", "bob"))
+	require.NoError(t, s.Close())
+
+	s, err = NewSQLiteStore(ctx, dbPath)
+	require.NoError(t, err)
+	defer s.Close()
+	history, err := s.GetInboxHistory(ctx, "bob", "", 10)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	require.Equal(t, "legacy", history[0].ClaimedSessionID)
+	_, err = s.HandoffLocalMessageClaim(ctx, "bob", "msg-fed-legacy", "legacy", "session-new")
+	require.NoError(t, err)
+	history, err = s.GetInboxHistory(ctx, "bob", "", 10)
+	require.NoError(t, err)
+	require.Equal(t, "session-new", history[0].ClaimedSessionID)
 }
 
 // migrateMessages runs on EVERY store open, not once. It exists to rescue rows

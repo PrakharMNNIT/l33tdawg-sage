@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.23 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.24 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -82,16 +82,40 @@ v11.18.23 restores trust and lifecycle parity between `sage_turn` and
 `sage_recall`, discloses active/store embedding-space mismatches through
 readiness without blocking intentional re-embedding, and makes managed reranker
 setup surface proven host-loader incompatibilities with bring-your-own guidance.
+v11.18.24 adds session-fenced federated claim recovery and idempotent reply
+events, removes imperative boot mutations from MCP result traffic, scopes
+durable retention labels to actionable work, and tightens likely-alias
+embedding diagnostics.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
 metadata and making bloomed memories responsive. The supported consensus
-ceiling remains app-v26; **v11.18.23 does not introduce app-v27**.
+ceiling remains app-v26; **v11.18.24 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.24 patch
+
+Inbound federated claims now receive opaque MCP session ownership before their
+payload is exposed. Pre-v11.18.24 retained claims migrate to an explicit
+`legacy` compare-and-swap fence for deliberate recovery; SAGE never uses a
+timeout to steal live work. Federated completion atomically verifies the
+claimant session, completes workflow state, stores an encrypted result
+fingerprint, and persists the return event, making identical lost-response
+retries replay-safe and conflicting second results explicit.
+
+MCP auto-connect standing is confined to `initialize.instructions`; ordinary
+tool results remain payload-only even when a client initializes late. The
+imperative boot block that requested tool invocation and local file mutation is
+removed. Message retention labels now describe only pending/claimed actionable
+work, and the embedding readiness guard's likely-alias classifier requires one
+qualified and one bare spelling rather than conflating two organizations.
+
+This patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.24 does not introduce app-v27.
 
 ## v11.18.23 patch
 

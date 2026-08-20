@@ -404,6 +404,11 @@ func TestFederatedMessageReplyCompletionIsSessionFencedAndIdempotent(t *testing.
 	require.NoError(t, err)
 	require.True(t, replayed)
 	require.Equal(t, event.EventID, eventID, "lost-response retry must return the original durable event")
+	_, err = s.ReplyLocalMessage(ctx, msg.ToAgent, msg.PipeID, "answer", "session-a")
+	require.ErrorIs(t, err, ErrMessageFederatedCompatibilityScope,
+		"canonical retries must return to the federated path that preserves the original reply event id")
+	_, err = s.ReplyLocalMessage(ctx, msg.ToAgent, msg.PipeID, "answer", "session-b")
+	require.ErrorIs(t, err, ErrMessageClaimedByOtherSession)
 	_, _, err = s.CompleteFederatedMessageReplyWithTransport(ctx, msg.PipeID, msg.ToAgent, "session-a", "different", &retry)
 	require.ErrorIs(t, err, ErrMessageReplyConflict)
 

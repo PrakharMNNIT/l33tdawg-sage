@@ -361,7 +361,7 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_message_handoff": {
 			Name:        "sage_message_handoff",
-			Description: "Atomically transfer one claimed local message from the claimant_session_id shown by sage_message_history to this MCP session. The expected from_session_id is a compare-and-swap fence: a stale or concurrent handoff fails visibly instead of duplicating ownership.",
+			Description: "Atomically transfer one claimed local or inbound federated message from the claimant_session_id shown by sage_message_history to this MCP session. The expected from_session_id is a compare-and-swap fence: a stale or concurrent handoff fails visibly instead of duplicating ownership. Pre-v11.18.24 federated claims are surfaced as legacy and still require this explicit handoff; they are never stolen automatically.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -374,7 +374,7 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_message_reply": {
 			Name:        "sage_message_reply",
-			Description: "Reply to one receiver-local message_id returned by sage_messages_receive or sage_inbox. Local replies are idempotent; federated replies use the negotiated secure delivery and deduplication protocol.",
+			Description: "Reply to one receiver-local or inbound federated message_id returned by sage_messages_receive or sage_inbox. The claimant session is checked in the same transaction that completes work. Local and federated replies are idempotent: an identical retry returns the original result/event, while a different second reply conflicts.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -4628,6 +4628,8 @@ type canonicalMessageWireItem struct {
 	Payload            string `json:"payload"`
 	CreatedAt          string `json:"created_at"`
 	ClaimantSessionID  string `json:"claimant_session_id"`
+	SourceChainID      string `json:"source_chain_id"`
+	SourcePipeID       string `json:"source_pipe_id"`
 }
 
 func (s *Server) receiveCanonicalMessageBatch(ctx context.Context, receiveToken string, limit int) ([]pipelineInboxWireItem, bool, error) {
@@ -4693,7 +4695,7 @@ func (s *Server) ownClaimedUnfinishedSurface(ctx context.Context, limit int) (ma
 			PipeID: item.MessageID, FromAgent: item.FromAgent, FromProvider: item.FromProvider,
 			FromDisplayName: item.FromDisplayName, FromRegisteredName: item.FromRegisteredName,
 			Intent: item.Intent, Payload: item.Payload, CreatedAt: item.CreatedAt,
-			ClaimantSessionID: item.ClaimantSessionID,
+			ClaimantSessionID: item.ClaimantSessionID, SourceChainID: item.SourceChainID, SourcePipeID: item.SourcePipeID,
 		})
 		formatted["already_claimed_by_you"] = true
 		formatted["new_work"] = false
@@ -5157,6 +5159,10 @@ func (s *Server) acknowledgeNegotiatedFederatedInboxBatch(
 	candidates []pipelineInboxWireItem,
 	metadata map[string]map[string]any,
 ) ([]pipelineInboxWireItem, error, bool) {
+	claimantSessionID, sessionErr := s.claimantSessionID(ctx)
+	if sessionErr != nil {
+		return nil, sessionErr, true
+	}
 	v2 := make([]pipelineInboxWireItem, 0, len(candidates))
 	for _, item := range candidates {
 		if item.ReceiptProtocolVersion == 2 {
@@ -5197,9 +5203,13 @@ func (s *Server) acknowledgeNegotiatedFederatedInboxBatch(
 		if err != nil {
 			continue
 		}
-		recordItems = append(recordItems, map[string]any{
+		recordItem := map[string]any{
 			"pipe_id": item.PipeID, "kind": item.EventKind, "proof": proof,
-		})
+		}
+		if item.EventKind == "claimed" {
+			recordItem["claimant_session_id"] = claimantSessionID
+		}
+		recordItems = append(recordItems, recordItem)
 	}
 	if len(recordItems) == 0 {
 		return nil, fmt.Errorf("receipt-v2 batch returned no signable challenges"), true
@@ -5406,8 +5416,15 @@ const durableMessageExpiryThreshold = 50 * 365 * 24 * time.Hour
 // expiry still carries the sentinel, so terminal and unknown statuses retain
 // the raw expires_at value instead.
 func formatMessageRetention(entry map[string]any, status, rawExpiry string) {
+	upstreamRetention, _ := entry["retention"].(string)
 	delete(entry, "retention")
 	if rawExpiry == "" {
+		// Mixed-version peers may already translate the canonical sentinel and
+		// omit expires_at. Preserve only the exact actionable vocabulary; never
+		// carry it onto terminal or unknown states.
+		if (status == "pending" || status == "claimed") && upstreamRetention == "durable_until_handled" {
+			entry["retention"] = upstreamRetention
+		}
 		return
 	}
 	entry["expires_at"] = rawExpiry
@@ -5594,6 +5611,10 @@ func (s *Server) receiveUnifiedPipelineInbox(
 	limit int,
 ) ([]pipelineInboxWireItem, map[string]map[string]any, error, error) {
 	readMetadata := make(map[string]map[string]any)
+	claimantSessionID, sessionErr := s.claimantSessionID(ctx)
+	if sessionErr != nil {
+		return nil, readMetadata, nil, sessionErr
+	}
 	canonicalItems, _, receiveErr := s.receiveCanonicalMessageBatch(ctx, receiveToken, limit)
 	if receiveErr != nil {
 		if !isAPIStatus(receiveErr, http.StatusNotFound) {
@@ -5603,7 +5624,7 @@ func (s *Server) receiveUnifiedPipelineInbox(
 			Items []pipelineInboxWireItem `json:"items"`
 			Count int                     `json:"count"`
 		}
-		path := fmt.Sprintf("/v1/pipe/inbox?limit=%d", limit)
+		path := fmt.Sprintf("/v1/pipe/inbox?limit=%d&claimant_session_id=%s", limit, url.QueryEscape(claimantSessionID))
 		if err := s.doSignedJSON(ctx, http.MethodGet, path, nil, &legacy); err != nil {
 			return nil, readMetadata, nil, err
 		}
@@ -5631,7 +5652,7 @@ func (s *Server) receiveUnifiedPipelineInbox(
 		Items []pipelineInboxWireItem `json:"items"`
 		Count int                     `json:"count"`
 	}
-	path := fmt.Sprintf("/v1/pipe/inbox?limit=%d", remaining)
+	path := fmt.Sprintf("/v1/pipe/inbox?limit=%d&claimant_session_id=%s", remaining, url.QueryEscape(claimantSessionID))
 	if err := s.doSignedJSON(ctx, http.MethodGet, path, nil, &legacy); err != nil {
 		if len(items) == 0 {
 			return nil, readMetadata, nil, err
