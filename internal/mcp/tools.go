@@ -3073,9 +3073,15 @@ func appendTurnRecallResult(result map[string]any, recall recallResp, domain str
 			"confidence":  r.ConfidenceScore,
 			"type":        r.MemoryType,
 			"created_at":  r.CreatedAt,
-			"source_kind": r.SourceKind,
-			"foreign":     r.Foreign,
-			"trust":       r.Trust,
+			// Weighting a recalled memory needs its corroboration and lifecycle:
+			// sage_recall carries both, and a caller reading the turn block cannot
+			// tell it is a subset. Omitting them here silently drops the trust
+			// signal and hides a deprecated row behind a plain recall.
+			"corroboration_count": r.CorroborationCount,
+			"status":              r.Status,
+			"source_kind":         r.SourceKind,
+			"foreign":             r.Foreign,
+			"trust":               r.Trust,
 		}
 		if r.SourceChainID != "" {
 			entry["source_chain_id"] = r.SourceChainID

@@ -87,16 +87,32 @@ type AppV25MaintenanceStatus struct {
 type appV25MaintenanceProvider func() AppV25MaintenanceStatus
 
 // HealthChecker tracks the health status of dependencies.
+// EmbeddingSpaceStatus reports whether the store's committed vectors all live in
+// the vector space the active embedder produces. A node booted configured for
+// one space over a store written in another does not error: recall filters by
+// embedding_provider = active space, so every row in a foreign space silently
+// becomes invisible. That is a quality loss, not an outage — so it surfaces as a
+// queryable degraded status and a loud boot log rather than a refusal to start,
+// which would brick a deliberate re-embed migration (the exact legitimate case).
+type EmbeddingSpaceStatus struct {
+	Checked       bool           `json:"checked"`                  // has the boot check run?
+	OK            bool           `json:"ok"`                       // no committed rows in a foreign non-empty space
+	ActiveSpace   string         `json:"active_space,omitempty"`   // SpaceID the node writes and queries now
+	ForeignRows   int            `json:"foreign_rows,omitempty"`   // committed rows the active space cannot see
+	ForeignSpaces map[string]int `json:"foreign_spaces,omitempty"` // foreign space id -> row count
+}
+
 type HealthChecker struct {
-	postgresOK  atomic.Bool
-	cometbftOK  atomic.Bool
-	embedder    atomic.Value // EmbedderStatus, set by SetEmbedderHealth
-	voter       atomic.Value // VoterStatus, set by SetVoterStatus
-	scoped      atomic.Value // ScopedProjectionStatus, set by recovery wiring
-	vendored    atomic.Value // VendoredAgentEnrollmentStatus, set by bootstrap/repair wiring
-	canonical   atomic.Value // canonicalMemoryProjectionProvider, wired after the final Badger store is selected
-	maintenance atomic.Value // appV25MaintenanceProvider, current-process migration proof
-	Version     string
+	postgresOK     atomic.Bool
+	cometbftOK     atomic.Bool
+	embedder       atomic.Value // EmbedderStatus, set by SetEmbedderHealth
+	embeddingSpace atomic.Value // EmbeddingSpaceStatus, set once at boot by the store-vs-config space check
+	voter          atomic.Value // VoterStatus, set by SetVoterStatus
+	scoped         atomic.Value // ScopedProjectionStatus, set by recovery wiring
+	vendored       atomic.Value // VendoredAgentEnrollmentStatus, set by bootstrap/repair wiring
+	canonical      atomic.Value // canonicalMemoryProjectionProvider, wired after the final Badger store is selected
+	maintenance    atomic.Value // appV25MaintenanceProvider, current-process migration proof
+	Version        string
 }
 
 // NewHealthChecker creates a new health checker.
@@ -116,6 +132,21 @@ func (h *HealthChecker) embedderStatus() EmbedderStatus {
 		return v
 	}
 	return EmbedderStatus{}
+}
+
+// SetEmbeddingSpaceStatus records the boot-time comparison of the store's
+// committed vector spaces against the active embedder's space. Called once at
+// startup; until then the check reads as not-yet-run.
+func (h *HealthChecker) SetEmbeddingSpaceStatus(s EmbeddingSpaceStatus) {
+	s.Checked = true
+	h.embeddingSpace.Store(s)
+}
+
+func (h *HealthChecker) embeddingSpaceStatus() EmbeddingSpaceStatus {
+	if v, ok := h.embeddingSpace.Load().(EmbeddingSpaceStatus); ok {
+		return v
+	}
+	return EmbeddingSpaceStatus{}
 }
 
 // SetVoterStatus records the memory auto-voter's latest self-report (called by
@@ -246,6 +277,7 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 	vendored := h.vendoredAgentEnrollmentStatus()
 	canonical := h.canonicalMemoryProjectionStatus()
 	maintenance := h.appV25MaintenanceStatus()
+	embSpace := h.embeddingSpaceStatus()
 
 	status := "ready"
 	httpStatus := http.StatusOK
@@ -303,6 +335,16 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		if r.URL.Query().Get("strict") == "1" {
 			httpStatus = http.StatusServiceUnavailable
 		}
+	case embSpace.Checked && !embSpace.OK:
+		// The store holds committed vectors in a space the active embedder does not
+		// produce; recall filters by the active space, so those rows are silently
+		// invisible. The node still SERVES — this is a quality loss, not an outage —
+		// so report degraded (HTTP 200) with the mismatch visible for reconciliation
+		// (re-embed, or boot with the config that wrote them). ?strict=1 gates on it.
+		status = "degraded"
+		if r.URL.Query().Get("strict") == "1" {
+			httpStatus = http.StatusServiceUnavailable
+		}
 	case canonical.Required && canonical.Quarantined:
 		// Record-local projection faults are isolated and omitted from broad
 		// reads. Keep the node operational and advertise the degraded state
@@ -336,6 +378,7 @@ func (h *HealthChecker) ReadinessHandler(w http.ResponseWriter, r *http.Request)
 		"postgres":            pgOK,
 		"cometbft":            cmtOK,
 		"embedder":            emb,
+		"embedding_space":     embSpace,
 		"scoped_projection":   scoped,
 		"vendored_agent":      vendored,
 		"memory_projection":   canonical,
