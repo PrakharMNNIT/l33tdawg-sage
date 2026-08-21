@@ -51,24 +51,20 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.18.25
+## What's New in v11.18.26
 
-**CEREBRUM task refreshes are quiet without becoming stale.** Background SSE
-and post-clear reconciliation keep the mounted board visible instead of
-flashing the full loading surface. Canonical read failures remain failures—not
-proof that a task disappeared—and a monotonic generation fence prevents an
-older response from overwriting newer task state or clearing a newer error.
+**The supported Go dependency baseline is refreshed.** This release carries
+the validated `testify` 1.12.0, `x/crypto` 0.55.0, and `x/tools` 0.49.0 module
+updates already exercised by the full repository gate.
 
-**Codex lifecycle hooks survive restricted launchers without taking ownership
-of the user's hook file.** Installation resolves and persists the host's Bash
-executable, including non-FHS and Windows Git Bash paths, while self-heal
-semantically replaces only SAGE-owned commands. Custom hooks, custom events,
-and unrelated top-level JSON remain intact during migration.
+**Code scanning and native-shell CI actions are refreshed to their pinned
+current revisions.** CodeQL runs with the updated action bundle and the native
+shell cache action is updated, without changing SAGE runtime behavior.
 
 This patch introduces no new consensus application version or state migration.
-The ceiling remains app-v26; **v11.18.25 introduces no app-v27**.
+The ceiling remains app-v26; **v11.18.26 introduces no app-v27**.
 
-Container: `ghcr.io/l33tdawg/sage:11.18.25`. SDK 11.18.25.
+Container: `ghcr.io/l33tdawg/sage:11.18.26`. SDK 11.18.26.
 
 ## What's New in v11.18.24
 
@@ -2093,7 +2089,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.25`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.26`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
