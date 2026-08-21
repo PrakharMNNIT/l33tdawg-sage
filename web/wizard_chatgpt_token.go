@@ -15,8 +15,8 @@ import (
 // mintMCPTokenForWizard issues a fresh bearer for the given agent. Returns
 // (plainTextToken, tokenID, actingAgentID, createdAt, err). plainTextToken is shown ONCE
 // to the wizard UI and never again.
-func mintMCPTokenForWizard(ctx context.Context, ts mcpWizardTokenStore, agentID, name string) (string, string, string, time.Time, error) {
-	issued, err := ts.IssueMCPToken(ctx, name, agentID, agentID, "wizard-mcp-token")
+func mintMCPTokenForWizard(ctx context.Context, ts mcpWizardTokenStore, issuerID, targetID, name string) (string, string, string, time.Time, error) {
+	issued, err := ts.IssueMCPToken(ctx, name, issuerID, targetID, "wizard-mcp-token")
 	if err != nil {
 		return "", "", "", time.Time{}, err
 	}

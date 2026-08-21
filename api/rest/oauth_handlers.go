@@ -142,8 +142,8 @@ type OAuthDashboardSession func(r *http.Request) bool
 // OAuthControlActorResolver resolves the exact current local CEREBRUM
 // authority for this request. Production wires the dashboard's app-v23-aware
 // resolver, which accepts only the current committed Root or an active
-// current-generation same-machine Admin. The returned identity is the issuer
-// for a distinct pending-review MCP agent; it never becomes the token actor.
+// current-generation same-machine Admin. The returned identity owns the token;
+// app-v23 selects a separate existing managed ordinary agent as its actor.
 type OAuthControlActorResolver func(r *http.Request) (agentID string, ok bool)
 
 // OAuthLocalityChecker is the localhost control-plane boundary used by the
@@ -168,14 +168,16 @@ type oauthApprovalHandoff struct {
 // screen rather than letting the user pick an agent that the bearer will
 // not actually act as.
 type OAuthHandler struct {
-	Store                OAuthStore
-	IsAuthed             OAuthSessionChecker
-	HasDashboardCookie   OAuthDashboardSession
-	ResolveControlActor  OAuthControlActorResolver
-	IsLocalApproval      OAuthLocalityChecker
-	IssuerBaseURL        func(r *http.Request) string // e.g. "https://host:8443" — derived per request
-	LocalApprovalBaseURL string                       // e.g. "http://127.0.0.1:8080"
-	NodeOperatorAgentID  string
+	Store                       OAuthStore
+	IsAuthed                    OAuthSessionChecker
+	HasDashboardCookie          OAuthDashboardSession
+	ResolveControlActor         OAuthControlActorResolver
+	IsLocalApproval             OAuthLocalityChecker
+	IssuerBaseURL               func(r *http.Request) string // e.g. "https://host:8443" — derived per request
+	LocalApprovalBaseURL        string                       // e.g. "http://127.0.0.1:8080"
+	NodeOperatorAgentID         string
+	ManagedTokenTargetsRequired func() bool
+	ValidateTokenTarget         func(context.Context, string) error
 
 	csrfKey        []byte // process-lifetime random for HMAC-signing consent + approval handles
 	dcrLimits      *ipRateLimiter
@@ -994,14 +996,19 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
     <h2 style="font-size: 1.1em;">Mint a new bearer for this client</h2>
     <p class="meta">A new <code>mcp_tokens</code> row is created for this connection — you can revoke it at any time from <code>sage-gui mcp-token revoke &lt;id&gt;</code> or the dashboard.</p>
     <p>
+      {{if .BindExisting}}<label>Existing managed agent ID<br>
+        <input type="text" name="agent_id" value="" required style="width: 100%; box-sizing: border-box;" placeholder="64-char Ed25519 public key">
+      </label>{{end}}
       <label>Token name (optional, e.g. "chatgpt-laptop")<br>
         <input type="text" name="token_name" value="" style="width: 100%; box-sizing: border-box;">
       </label>
     </p>
-    <div class="card" style="background:#fff;border-color:#cfd8dc;">
+    {{if .BindExisting}}<div class="card" style="background:#fff;border-color:#cfd8dc;">
+      <p style="margin:0;"><strong>Identity:</strong> the selected existing active agent</p>
+      <p class="meta" style="margin:0.5em 0 0;">The node must already hold this agent's managed key. The bearer receives exactly that agent's existing permissions; token creation never creates a pending identity.</p>
+    </div>{{else}}<div class="card" style="background:#fff;border-color:#cfd8dc;">
       <p style="margin:0;"><strong>Identity:</strong> a distinct pending-review MCP agent</p>
-      <p class="meta" style="margin:0.5em 0 0;">This connection receives its own signing key and starts as a restricted Member pending CEREBRUM review. It never inherits Root or Admin authority from the person approving it.</p>
-    </div>
+    </div>{{end}}
     <p style="margin-top:1em;"><button type="submit">Authorize</button></p>
   </form>
 
@@ -1045,6 +1052,7 @@ func (h *OAuthHandler) renderConsent(
 		CSRFNonce           string
 		ApprovalHandoff     string
 		Action              string
+		BindExisting        bool
 	}{
 		ClientID:            p.ClientID,
 		RedirectURI:         p.RedirectURI,
@@ -1057,6 +1065,7 @@ func (h *OAuthHandler) renderConsent(
 		CSRFNonce:           csrfNonce,
 		ApprovalHandoff:     p.ApprovalHandoff,
 		Action:              action,
+		BindExisting:        h.ManagedTokenTargetsRequired != nil && h.ManagedTokenTargetsRequired(),
 	}
 	_ = actorID // authority is deliberately not rendered into the consent page
 	if err := consentTemplate.Execute(w, data); err != nil {
@@ -1101,18 +1110,36 @@ func (h *OAuthHandler) processConsent(
 		tokenName = "oauth-" + p.ClientID
 	}
 
-	// actorID is resolved from live local CEREBRUM state on this exact POST.
-	// It owns the token record but never becomes the token's acting identity:
-	// IssuePendingMCPToken generates and synchronously registers a distinct
-	// restricted Member key.
-	agentID := strings.TrimSpace(actorID)
-	if len(agentID) != 64 {
+	// actorID is the authorizing Root/Admin and remains the token owner. The
+	// bearer acts only as the separately selected existing managed identity.
+	issuerID := strings.TrimSpace(actorID)
+	if len(issuerID) != 64 {
 		h.renderConsent(w, r, p, actorID, "current CEREBRUM authority unavailable — bearers cannot be issued", r.URL.Path)
 		return
 	}
-	if _, decErr := hex.DecodeString(agentID); decErr != nil {
+	if _, decErr := hex.DecodeString(issuerID); decErr != nil {
 		h.renderConsent(w, r, p, actorID, "current CEREBRUM authority is invalid — server misconfiguration", r.URL.Path)
 		return
+	}
+	targetID := issuerID
+	if h.ManagedTokenTargetsRequired != nil && h.ManagedTokenTargetsRequired() {
+		targetID = strings.TrimSpace(r.FormValue("agent_id"))
+		if len(targetID) != 64 {
+			h.renderConsent(w, r, p, actorID, "select an existing managed agent identity", r.URL.Path)
+			return
+		}
+		if _, decErr := hex.DecodeString(targetID); decErr != nil {
+			h.renderConsent(w, r, p, actorID, "selected agent identity is invalid", r.URL.Path)
+			return
+		}
+		if h.ValidateTokenTarget == nil {
+			h.renderConsent(w, r, p, actorID, "agent enrollment validation is unavailable", r.URL.Path)
+			return
+		}
+		if targetErr := h.ValidateTokenTarget(r.Context(), targetID); targetErr != nil {
+			h.renderConsent(w, r, p, actorID, "selected agent is not an active approved local identity", r.URL.Path)
+			return
+		}
 	}
 	// Validate the redirect sink before creating either secret. The normal
 	// HandleAuthorize validation is intentionally repeated here because this is
@@ -1128,9 +1155,9 @@ func (h *OAuthHandler) processConsent(
 	}
 
 	// 1. Mint via the exact shared issuer used by /v1/mcp/tokens and the
-	// wizard. On vault-active nodes this creates/registers a distinct keyed
-	// identity and records the operator as issuer/owner.
-	issued, err := h.Store.IssuePendingMCPToken(r.Context(), tokenName, agentID, agentID, "oauth-mcp-token")
+	// wizard. App-v23 binds the bearer to targetID while recording the live
+	// Root/Admin as its issuer/owner.
+	issued, err := h.Store.IssuePendingMCPToken(r.Context(), tokenName, issuerID, targetID, "oauth-mcp-token")
 	if err != nil {
 		http.Error(w, "failed to persist token: "+err.Error(), http.StatusInternalServerError)
 		return

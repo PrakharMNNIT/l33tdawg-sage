@@ -13188,6 +13188,13 @@ ${runCommand}`;
     `;
 }
 
+function managedBearerAgents(agents) {
+    return (agents || []).filter(agent =>
+        agent && agent.agent_id && agent.local_key_available &&
+        agent.enrollment_active && !agent.needs_approval && !agent.needs_reauthorization
+    );
+}
+
 // RemoteAccessWizard — guided flow that gives SAGE a public URL via cloudflared
 // so a tool on another computer (or a hosted chat like ChatGPT) can reach it.
 // Steps 1-6 are generic tunnel setup (install → login → hostname → create →
@@ -13236,6 +13243,8 @@ function RemoteAccessWizard({ agents, onClose, target }) {
 
     // Step 6: token mint
     const [tokenName, setTokenName] = useState(forChatGPT ? 'chatgpt' : 'remote');
+    const tokenAgents = managedBearerAgents(agents);
+    const [tokenAgentID, setTokenAgentID] = useState(tokenAgents[0]?.agent_id || '');
     const [mintedToken, setMintedToken] = useState(null);
     const [minting, setMinting] = useState(false);
 
@@ -13344,7 +13353,7 @@ function RemoteAccessWizard({ agents, onClose, target }) {
         setMinting(true);
         setError(null);
         try {
-            const r = await wizardMintToken('', tokenName);
+            const r = await wizardMintToken(tokenAgentID, tokenName);
             if (r.error) { setError(r.error); }
             else { setMintedToken(r); setStep(7); }
         } catch (e) { setError('mint token failed: ' + e.message); }
@@ -13513,12 +13522,19 @@ function RemoteAccessWizard({ agents, onClose, target }) {
                     ${step === 6 && html`
                         <div style="line-height:1.55;">
                             <h3 style="margin-top:0;">Mint a bearer token</h3>
-                            <p>CEREBRUM creates a separate restricted Member identity for this bearer. It starts pending review and never inherits the approving Root or Admin key.</p>
+                            <p>This bearer runs as an existing approved agent whose exact key is already managed by this node.</p>
+                            <div class="wizard-field">
+                                <label>Agent identity</label>
+                                <select class="wizard-input" value=${tokenAgentID} onChange=${e => setTokenAgentID(e.target.value)}>
+                                    <option value="">Select an active managed agent</option>
+                                    ${tokenAgents.map(agent => html`<option value=${agent.agent_id}>${agent.name || agent.registered_name || agent.agent_id.slice(0, 12)} — ${agent.agent_id.slice(0, 12)}…</option>`)}
+                                </select>
+                            </div>
                             <div class="wizard-field">
                                 <label>Token name</label>
                                 <input class="wizard-input" value=${tokenName} onInput=${e => setTokenName(e.target.value)} placeholder=${forChatGPT ? 'chatgpt' : 'remote'} />
                             </div>
-                            <button class="btn btn-primary" onClick=${startMintToken} disabled=${minting}>
+                            <button class="btn btn-primary" onClick=${startMintToken} disabled=${minting || !tokenAgentID}>
                                 ${minting ? 'Minting…' : 'Mint bearer'}
                             </button>
                         </div>
@@ -13606,6 +13622,8 @@ function ChatGPTCopyField({ label, value, sensitive, multiline }) {
 // option: zero external surface area.
 function CursorSetupPanel({ agents, onClose }) {
     const [tokenName, setTokenName] = useState('cursor');
+    const tokenAgents = managedBearerAgents(agents);
+    const [tokenAgentID, setTokenAgentID] = useState(tokenAgents[0]?.agent_id || '');
     const [mintedToken, setMintedToken] = useState(null);
     const [minting, setMinting] = useState(false);
     const [error, setError] = useState(null);
@@ -13614,7 +13632,7 @@ function CursorSetupPanel({ agents, onClose }) {
         setMinting(true);
         setError(null);
         try {
-            const r = await wizardMintToken('', tokenName);
+            const r = await wizardMintToken(tokenAgentID, tokenName);
             if (r.error) setError(r.error);
             else setMintedToken(r);
         } catch (e) { setError('mint failed: ' + e.message); }
@@ -13641,12 +13659,19 @@ function CursorSetupPanel({ agents, onClose }) {
 
                     ${!mintedToken && html`
                         <h3 style="margin-top:18px;">1. Mint a bearer</h3>
-                        <p style="font-size:12px;color:var(--text-muted);">This bearer receives its own restricted Member identity pending review; it never runs as CEREBRUM Root or the approving Admin. Keep it private and revoke it when the connection is no longer needed.</p>
+                        <p style="font-size:12px;color:var(--text-muted);">This bearer runs as the selected existing approved agent. Its exact key must already be managed by this node. Keep it private and revoke it when the connection is no longer needed.</p>
+                        <div class="wizard-field">
+                            <label>Agent identity</label>
+                            <select class="wizard-input" value=${tokenAgentID} onChange=${e => setTokenAgentID(e.target.value)}>
+                                <option value="">Select an active managed agent</option>
+                                ${tokenAgents.map(agent => html`<option value=${agent.agent_id}>${agent.name || agent.registered_name || agent.agent_id.slice(0, 12)} — ${agent.agent_id.slice(0, 12)}…</option>`)}
+                            </select>
+                        </div>
                         <div class="wizard-field">
                             <label>Token name</label>
                             <input class="wizard-input" value=${tokenName} onInput=${e => setTokenName(e.target.value)} placeholder="cursor" />
                         </div>
-                        <button class="btn btn-primary" onClick=${onMint} disabled=${minting}>
+                        <button class="btn btn-primary" onClick=${onMint} disabled=${minting || !tokenAgentID}>
                             ${minting ? 'Minting…' : 'Mint bearer'}
                         </button>
                     `}
@@ -13768,6 +13793,8 @@ function RemoteConnectPanel({ agents, onOpenChatGPT }) {
     const [base, setBase] = useState('');           // 'tunnel' | 'lan'
     const [lanIdx, setLanIdx] = useState(0);        // which lan_candidates entry the operator picked
     const [tokenName, setTokenName] = useState('remote');
+    const tokenAgents = managedBearerAgents(agents);
+    const [tokenAgentID, setTokenAgentID] = useState(tokenAgents[0]?.agent_id || '');
     const [minting, setMinting] = useState(false);
     const [minted, setMinted] = useState(null);
     const [mintErr, setMintErr] = useState(null);
@@ -13795,7 +13822,7 @@ function RemoteConnectPanel({ agents, onOpenChatGPT }) {
         setMinting(true);
         setMintErr(null);
         try {
-            const r = await wizardMintToken('', tokenName || 'remote');
+            const r = await wizardMintToken(tokenAgentID, tokenName || 'remote');
             if (r.error) setMintErr(r.error);
             else setMinted(r);
         } catch (e) { setMintErr('mint failed: ' + (e.message || e)); }
@@ -13944,12 +13971,19 @@ function RemoteConnectPanel({ agents, onOpenChatGPT }) {
                     : html`
                         ${!minted && html`
                             <h4 style="margin:14px 0 8px;">Mint a bearer for the other computer</h4>
-                            <p style="font-size:12px;color:var(--text-muted);">The bearer receives its own restricted Member identity pending review; it never inherits CEREBRUM Root or Admin authority.</p>
+                            <p style="font-size:12px;color:var(--text-muted);">The bearer runs as the selected existing approved agent whose exact key is managed by this node.</p>
+                                    <div class="wizard-field">
+                                        <label>Agent identity</label>
+                                        <select class="wizard-input" value=${tokenAgentID} onChange=${e => setTokenAgentID(e.target.value)}>
+                                            <option value="">Select an active managed agent</option>
+                                            ${tokenAgents.map(agent => html`<option value=${agent.agent_id}>${agent.name || agent.registered_name || agent.agent_id.slice(0, 12)} — ${agent.agent_id.slice(0, 12)}…</option>`)}
+                                        </select>
+                                    </div>
                                     <div class="wizard-field">
                                         <label>Token name</label>
                                         <input class="wizard-input" value=${tokenName} onInput=${e => setTokenName(e.target.value)} placeholder="remote" />
                                     </div>
-                                    <button class="btn btn-primary" onClick=${onMint} disabled=${minting}>
+                                    <button class="btn btn-primary" onClick=${onMint} disabled=${minting || !tokenAgentID}>
                                         ${minting ? 'Minting…' : 'Mint bearer'}
                                     </button>
                         `}

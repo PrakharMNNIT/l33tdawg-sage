@@ -61,6 +61,13 @@ updates already exercised by the full repository gate.
 current revisions.** CodeQL runs with the updated action bundle and the native
 shell cache action is updated, without changing SAGE runtime behavior.
 
+**HTTP MCP tokens now bind to existing approved managed identities.** On
+app-v23 nodes, token creation no longer generates an unapprovable pending
+principal: Root/Admin selects an active ordinary agent already managed by the
+node, and issuance fails closed if its exact key is unavailable. The CLI also
+handles `mcp-token create --help` without minting a credential and rejects
+unknown creation flags.
+
 This patch introduces no new consensus application version or state migration.
 The ceiling remains app-v26; **v11.18.26 introduces no app-v27**.
 
@@ -1689,7 +1696,7 @@ SDK 11.8.3.
 
 **Synchronization groups — human-verified, signed memory sharing between separate SAGE brains.** A synchronization group coordinates memory sharing off-consensus through a partitioned, hash-chained, ed25519-signed audit journal: a roster sub-chain replicated to every member and independent per-domain sub-chains replicated only to the members who share that domain, so a node never learns of a domain it does not share. Group items are origin-signed, so a relaying peer can back-fill the mesh without being able to forge or mis-attribute them. Adding a shared domain is a two-party action — the owning member and the group controller both sign — members express selective-sync consent over the subset of domains they receive, and controller epoch rotation, member removal, and rejoin are all explicit signed roster events reconciled between peers by anti-entropy exchange.
 
-Each MCP bearer token now mints and registers its own signing identity, so a delegated agent action is attributable to exactly one token and one token can never act as another. This release also hardens group authorization: a controller epoch rotation now re-attests the shared domain set under the incoming controller, so rotating control away from a node revokes that node's ability to admit or re-widen shared domains with its old key; and a removed or departed member cannot be silently re-activated with stale entitlements — re-entry requires a fresh, co-signed invitation. The v11.8 consensus fork gate is present but dormant.
+At the time of v11.8.2, each MCP bearer minted and registered its own signing identity. Current app-v23 behavior supersedes that design: v11.18.26 binds new bearers to existing approved locally managed agents so token creation cannot strand an unapprovable identity. This release also hardens group authorization: a controller epoch rotation now re-attests the shared domain set under the incoming controller, so rotating control away from a node revokes that node's ability to admit or re-widen shared domains with its old key; and a removed or departed member cannot be silently re-activated with stale entitlements — re-entry requires a fresh, co-signed invitation. The v11.8 consensus fork gate is present but dormant.
 
 The CEREBRUM MRI now renders a 2,500-memory representative sample instead of stopping at 500, filling large brains with a denser view while preserving a bounded GPU and API workload. The dashboard and fullscreen MRI share one limit, and operators can still tune the server ceiling with `SAGE_GRAPH_MAX_NODES`.
 

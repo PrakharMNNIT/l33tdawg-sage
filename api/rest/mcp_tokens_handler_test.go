@@ -3,6 +3,9 @@ package rest
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/l33tdawg/sage/api/rest/middleware"
+	"github.com/l33tdawg/sage/internal/auth"
 	"github.com/l33tdawg/sage/internal/store"
 )
 
@@ -94,6 +98,52 @@ func TestMCPTokenIssue_BadAgentID(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, rr.Code, "body=%s", c.body)
 		assert.Contains(t, rr.Body.String(), c.want, "body=%s", c.body)
 	}
+}
+
+func TestAppV23MCPTokenIssueBindsToExistingApprovedManagedAgent(t *testing.T) {
+	s, _ := newTokenServer(t)
+	badgerStore, err := store.NewBadgerStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = badgerStore.CloseBadger() })
+	s.badgerStore = badgerStore
+	s.SetPostV23ForNextTxAccessor(func() bool { return true })
+
+	targetPub, targetPriv, err := auth.GenerateKeypair()
+	require.NoError(t, err)
+	targetID := auth.PublicKeyToAgentID(targetPub)
+	require.NoError(t, badgerStore.BootstrapAppV23Genesis(store.AppV23GenesisBootstrap{
+		RootID: tokenOperatorID, Scope: "mcp-token-bind-test",
+		AgentID: targetID, Profile: store.AppV23ProfileStandard,
+		HomeDomain: "managed.home", Clearance: 2,
+		Height: 1, BootstrapDigest: "mcp-token-bind-test",
+	}))
+	tokenStore := s.store.(*store.SQLiteStore)
+	tokenStore.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
+	t.Cleanup(func() { tokenStore.SetMCPTokenKeyedIdentityRequirement(nil) })
+	tokenStore.SetMCPTokenIdentityResolver(func(id string) (ed25519.PrivateKey, bool) {
+		if id != targetID {
+			return nil, false
+		}
+		return targetPriv, true
+	})
+	t.Cleanup(func() { tokenStore.SetMCPTokenIdentityResolver(nil) })
+
+	body := []byte(`{"agent_id":"` + targetID + `","name":"chatgpt"}`)
+	rr := httptest.NewRecorder()
+	tokenRouterAs(s, tokenOperatorID).ServeHTTP(rr,
+		httptest.NewRequest(http.MethodPost, "/v1/mcp/tokens", bytes.NewReader(body)))
+	require.Equal(t, http.StatusCreated, rr.Code, rr.Body.String())
+	var response MCPTokenIssueResponse
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&response))
+	require.Equal(t, targetID, response.AgentID)
+
+	digest := sha256.Sum256([]byte(response.Token))
+	boundID, signer, lookupErr := tokenStore.LookupMCPTokenSignerWithBearer(
+		context.Background(), response.Token, hex.EncodeToString(digest[:]),
+	)
+	require.NoError(t, lookupErr)
+	require.Equal(t, targetID, boundID)
+	require.Equal(t, targetID, hex.EncodeToString(signer.Public().(ed25519.PublicKey)))
 }
 
 func TestMCPTokenList_EmptyThenPopulated(t *testing.T) {
