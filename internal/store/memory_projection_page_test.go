@@ -233,8 +233,12 @@ func TestPostgresProjectionSchemaReplacesBroadTriggersWithScopedStatementTrigger
 	require.GreaterOrEqual(t, memoryDrop, 0)
 	require.Greater(t, memoryCreate, memoryDrop)
 	require.Contains(t, schema,
-		"AFTER UPDATE OF submitting_agent, content, content_hash,")
+		"AFTER UPDATE OF memory_id, submitting_agent, content, content_hash,")
 	require.NotContains(t, schema, "AFTER UPDATE ON memories")
+	require.Contains(t, schema,
+		"AFTER UPDATE OF embedding, embedding_provider ON memories")
+	require.Contains(t, schema,
+		"FOR EACH STATEMENT EXECUTE FUNCTION sage_bump_memory_space_revision()")
 
 	graphDrop := strings.Index(
 		schema,
