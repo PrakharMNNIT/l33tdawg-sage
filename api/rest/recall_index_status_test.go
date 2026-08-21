@@ -42,6 +42,7 @@ func fullVisibilityCaller(t *testing.T, srv *Server, badger *store.BadgerStore, 
 	require.NoError(t, err)
 	badger.PublishCanonicalMemoryProjectionAuditAt(
 		true, false, false, revision, badger.CanonicalMemoryProjectionRevision(),
+		mockStoreOf(srv).VaultGeneration(),
 	)
 	return id
 }
@@ -198,6 +199,18 @@ func TestRecallIndexStatusRejectsStaleOrChangingProjectionAudit(t *testing.T) {
 		_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
 		assert.Equal(t, "unavailable", resp.IndexStatus,
 			"empty lookup and completeness must share one vector-space generation")
+	})
+
+	t.Run("vault generation changed after semantic query", func(t *testing.T) {
+		srv, badger, _, _, _ := setupAppV23RESTAccess(t)
+		srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
+		tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
+		ms := mockStoreOf(srv)
+		ms.querySimilarAfter = func() { ms.vaultGeneration++ }
+		ms.outside = outsideSpaceProbe{hasOutside: false, established: true}
+		_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
+		assert.Equal(t, "unavailable", resp.IndexStatus,
+			"empty lookup and completeness must share one vault generation")
 	})
 
 	t.Run("source changed during probe", func(t *testing.T) {

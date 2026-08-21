@@ -383,6 +383,15 @@ func (s *SQLiteStore) RequirePristineStateSyncProjection(ctx context.Context) er
 			}
 			continue
 		}
+		if table == "memory_space_revision" {
+			var id, revision int64
+			if err := s.conn.QueryRowContext(ctx,
+				`SELECT singleton, revision FROM memory_space_revision`,
+			).Scan(&id, &revision); err != nil || id != 1 || revision != 0 {
+				return errors.New("state sync receiving requires a pristine memory space revision")
+			}
+			continue
+		}
 		if table == "graph_projection_revision" {
 			var id, revision int64
 			if err := s.conn.QueryRowContext(ctx,
@@ -990,7 +999,7 @@ func (s *SQLiteStore) ensureMemoryProjectionRevision(ctx context.Context) error 
 		DROP TRIGGER IF EXISTS memories_projection_revision_update;
 		CREATE TRIGGER memories_projection_revision_update
 			AFTER UPDATE OF
-				submitting_agent, content, content_hash,
+				memory_id, submitting_agent, content, content_hash,
 				domain_tag, status, created_at
 			ON memories
 			BEGIN

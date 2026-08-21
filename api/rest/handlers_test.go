@@ -35,6 +35,7 @@ type mockMemoryStore struct {
 	outside            outsideSpaceProbe
 	projectionRevision uint64
 	spaceRevision      uint64
+	vaultGeneration    uint64
 	querySimilarAfter  func()
 	memories           map[string]*memory.MemoryRecord
 	votes              map[string][]*store.ValidationVote
@@ -97,6 +98,7 @@ func (m *mockMemoryStore) MemoryProjectionRevision(_ context.Context) (uint64, e
 func (m *mockMemoryStore) MemorySpaceRevision(_ context.Context) (uint64, error) {
 	return m.spaceRevision, nil
 }
+func (m *mockMemoryStore) VaultGeneration() uint64 { return m.vaultGeneration }
 
 func (m *mockMemoryStore) GetMemory(_ context.Context, memoryID string) (*memory.MemoryRecord, error) {
 	rec, ok := m.memories[memoryID]

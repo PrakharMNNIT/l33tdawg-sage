@@ -32,6 +32,7 @@ type CanonicalMemoryProjectionHealth struct {
 	SourceBound       bool   `json:"-"`
 	SQLRevision       uint64 `json:"-"`
 	CanonicalRevision uint64 `json:"-"`
+	VaultGeneration   uint64 `json:"-"`
 }
 
 type canonicalMemoryProjectionHealthTracker struct {
@@ -82,7 +83,7 @@ func (s *BadgerStore) PublishCanonicalMemoryProjectionAudit(
 	required, legacyCompatible, quarantined bool,
 ) {
 	s.publishCanonicalMemoryProjectionAudit(
-		required, legacyCompatible, quarantined, false, 0, 0, false,
+		required, legacyCompatible, quarantined, false, 0, 0, 0, false,
 	)
 }
 
@@ -91,11 +92,11 @@ func (s *BadgerStore) PublishCanonicalMemoryProjectionAudit(
 // Callers may reuse the result only while both revisions still match.
 func (s *BadgerStore) PublishCanonicalMemoryProjectionAuditAt(
 	required, legacyCompatible, quarantined bool,
-	sqlRevision, canonicalRevision uint64,
+	sqlRevision, canonicalRevision, vaultGeneration uint64,
 ) {
 	s.publishCanonicalMemoryProjectionAudit(
 		required, legacyCompatible, quarantined, false,
-		sqlRevision, canonicalRevision, true,
+		sqlRevision, canonicalRevision, vaultGeneration, true,
 	)
 }
 
@@ -107,13 +108,13 @@ func (s *BadgerStore) PublishCanonicalMemoryProjectionSubsetAudit(
 	legacyCompatible, quarantined bool,
 ) {
 	s.publishCanonicalMemoryProjectionAudit(
-		true, legacyCompatible, quarantined, true, 0, 0, false,
+		true, legacyCompatible, quarantined, true, 0, 0, 0, false,
 	)
 }
 
 func (s *BadgerStore) publishCanonicalMemoryProjectionAudit(
 	required, legacyCompatible, quarantined, subset bool,
-	sqlRevision, canonicalRevision uint64,
+	sqlRevision, canonicalRevision, vaultGeneration uint64,
 	sourceBound bool,
 ) {
 	if s == nil || s.canonicalMemoryProjectionHealth == nil {
@@ -131,6 +132,7 @@ func (s *BadgerStore) publishCanonicalMemoryProjectionAudit(
 		SourceBound:       sourceBound,
 		SQLRevision:       sqlRevision,
 		CanonicalRevision: canonicalRevision,
+		VaultGeneration:   vaultGeneration,
 	}
 	switch {
 	case !required:

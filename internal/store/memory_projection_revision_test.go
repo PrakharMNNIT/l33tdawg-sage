@@ -146,6 +146,15 @@ func TestSQLiteMemoryProjectionRevisionTracksRawMemoryMutations(t *testing.T) {
 	afterRawUpdate, err := sqlStore.MemoryProjectionRevision(ctx)
 	require.NoError(t, err)
 	require.Equal(t, afterInsert+1, afterRawUpdate)
+	renamedID := record.MemoryID + "-renamed"
+	_, err = sqlStore.conn.ExecContext(ctx,
+		`UPDATE memories SET memory_id = ? WHERE memory_id = ?`, renamedID, record.MemoryID)
+	require.NoError(t, err)
+	record.MemoryID = renamedID
+	afterIdentityUpdate, err := sqlStore.MemoryProjectionRevision(ctx)
+	require.NoError(t, err)
+	require.Equal(t, afterRawUpdate+1, afterIdentityUpdate,
+		"canonical projection identity changes must invalidate the audit")
 	spaceBeforeEmbedding, err := sqlStore.MemorySpaceRevision(ctx)
 	require.NoError(t, err)
 
@@ -159,7 +168,7 @@ func TestSQLiteMemoryProjectionRevisionTracksRawMemoryMutations(t *testing.T) {
 	require.NoError(t, err)
 	afterEmbedding, err := sqlStore.MemoryProjectionRevision(ctx)
 	require.NoError(t, err)
-	require.Equal(t, afterRawUpdate, afterEmbedding,
+	require.Equal(t, afterIdentityUpdate, afterEmbedding,
 		"embedding maintenance must not invalidate canonical disclosure audits")
 	spaceAfterEmbedding, err := sqlStore.MemorySpaceRevision(ctx)
 	require.NoError(t, err)

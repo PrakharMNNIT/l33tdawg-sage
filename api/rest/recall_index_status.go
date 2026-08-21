@@ -9,12 +9,14 @@ import (
 type recallProjectionRevisionProvider interface {
 	MemoryProjectionRevision(context.Context) (uint64, error)
 	MemorySpaceRevision(context.Context) (uint64, error)
+	VaultGeneration() uint64
 }
 
 type recallProjectionSource struct {
 	sql       uint64
 	canonical uint64
 	space     uint64
+	vault     uint64
 }
 
 func (s *Server) exactCanonicalMemoryProjectionSource(
@@ -38,7 +40,10 @@ func (s *Server) exactCanonicalMemoryProjectionSource(
 		return source, false
 	}
 	canonicalRevision := s.badgerStore.CanonicalMemoryProjectionRevision()
-	if sqlRevision != health.SQLRevision || canonicalRevision != health.CanonicalRevision {
+	vaultGeneration := provider.VaultGeneration()
+	if sqlRevision != health.SQLRevision ||
+		canonicalRevision != health.CanonicalRevision ||
+		vaultGeneration != health.VaultGeneration {
 		return source, false
 	}
 	spaceRevision, err := provider.MemorySpaceRevision(ctx)
@@ -46,7 +51,8 @@ func (s *Server) exactCanonicalMemoryProjectionSource(
 		return source, false
 	}
 	return recallProjectionSource{
-		sql: sqlRevision, canonical: canonicalRevision, space: spaceRevision,
+		sql: sqlRevision, canonical: canonicalRevision,
+		space: spaceRevision, vault: vaultGeneration,
 	}, true
 }
 
@@ -66,9 +72,16 @@ func (s *Server) canonicalMemoryProjectionSourceUnchanged(
 	if err != nil {
 		return false
 	}
-	return sqlRevision == want.sql &&
+	health := s.badgerStore.CanonicalMemoryProjectionHealth()
+	return health.Checked && health.OK && health.SourceBound &&
+		health.State == store.CanonicalMemoryProjectionExact &&
+		health.SQLRevision == want.sql &&
+		health.CanonicalRevision == want.canonical &&
+		health.VaultGeneration == want.vault &&
+		sqlRevision == want.sql &&
 		s.badgerStore.CanonicalMemoryProjectionRevision() == want.canonical &&
-		spaceRevision == want.space
+		spaceRevision == want.space &&
+		provider.VaultGeneration() == want.vault
 }
 
 // recallIndexStatusHasExactQueryUniverse reports whether the empty response was

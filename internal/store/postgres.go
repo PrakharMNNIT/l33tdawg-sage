@@ -283,7 +283,7 @@ var postgresProjectionSchema = []string{
 	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
 	`DROP TRIGGER IF EXISTS memories_projection_revision_update_v1 ON memories`,
 	`CREATE TRIGGER memories_projection_revision_update_v1
-	 AFTER UPDATE OF submitting_agent, content, content_hash,
+	 AFTER UPDATE OF memory_id, submitting_agent, content, content_hash,
 	   domain_tag, status, created_at ON memories
 	 FOR EACH STATEMENT
 	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
