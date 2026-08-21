@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -242,7 +243,7 @@ func oauthHiddenInput(t *testing.T, body, name string) string {
 	return value[:end]
 }
 
-func TestOAuthLocalApprovalBridgeMintsDistinctPendingAgentEncryptionOnAndOff(t *testing.T) {
+func TestOAuthLocalApprovalBridgeBindsExistingManagedAgentEncryptionOnAndOff(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(map[bool]string{false: "unencrypted", true: "vault-encrypted"}[encrypted], func(t *testing.T) {
 			h, router, tokenStore := newOAuthRouter(t, false, "")
@@ -256,19 +257,23 @@ func TestOAuthLocalApprovalBridgeMintsDistinctPendingAgentEncryptionOnAndOff(t *
 			}
 			tokenStore.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
 			t.Cleanup(func() { tokenStore.SetMCPTokenKeyedIdentityRequirement(nil) })
-			var registeredID, registeredProvider string
-			tokenStore.SetMCPTokenIdentityRegistrar(func(
-				_ context.Context,
-				pub ed25519.PublicKey,
-				priv ed25519.PrivateKey,
-				_, provider string,
-			) error {
-				require.True(t, priv.Public().(ed25519.PublicKey).Equal(pub))
-				registeredID = hex.EncodeToString(pub)
-				registeredProvider = provider
-				return nil
+			targetPub, targetPriv, keyErr := ed25519.GenerateKey(rand.Reader)
+			require.NoError(t, keyErr)
+			targetID := hex.EncodeToString(targetPub)
+			tokenStore.SetMCPTokenIdentityResolver(func(id string) (ed25519.PrivateKey, bool) {
+				if id != targetID {
+					return nil, false
+				}
+				return targetPriv, true
 			})
-			t.Cleanup(func() { tokenStore.SetMCPTokenIdentityRegistrar(nil) })
+			t.Cleanup(func() { tokenStore.SetMCPTokenIdentityResolver(nil) })
+			h.ManagedTokenTargetsRequired = func() bool { return true }
+			h.ValidateTokenTarget = func(_ context.Context, id string) error {
+				if id != targetID {
+					return errors.New("not an approved target")
+				}
+				return nil
+			}
 
 			approverID := strings.Repeat("7", 64)
 			h.ResolveControlActor = func(r *http.Request) (string, bool) {
@@ -326,12 +331,13 @@ func TestOAuthLocalApprovalBridgeMintsDistinctPendingAgentEncryptionOnAndOff(t *
 			require.NoError(t, err)
 			require.NoError(t, getResp.Body.Close())
 			csrf := oauthHiddenInput(t, string(getBody), "csrf_nonce")
-			require.Contains(t, string(getBody), "distinct pending-review MCP agent")
+			require.Contains(t, string(getBody), "selected existing active agent")
 
 			form := url.Values{
 				"handoff":    {handoff},
 				"csrf_nonce": {csrf},
 				"token_name": {"bridge-client"},
+				"agent_id":   {targetID},
 			}
 			postReq := httptest.NewRequest(
 				http.MethodPost, approvalURL.RequestURI(), strings.NewReader(form.Encode()),
@@ -356,9 +362,8 @@ func TestOAuthLocalApprovalBridgeMintsDistinctPendingAgentEncryptionOnAndOff(t *
 			require.NoError(t, err)
 			require.Len(t, rows, 1)
 			require.Equal(t, approverID, rows[0].IssuerID)
-			require.Equal(t, registeredID, rows[0].AgentID)
+			require.Equal(t, targetID, rows[0].AgentID)
 			require.NotEqual(t, approverID, rows[0].AgentID)
-			require.Equal(t, "oauth-mcp-token", registeredProvider)
 
 			tokenForm := url.Values{
 				"grant_type": {"authorization_code"}, "code": {code},
@@ -386,8 +391,8 @@ func TestOAuthLocalApprovalBridgeMintsDistinctPendingAgentEncryptionOnAndOff(t *
 				hex.EncodeToString(tokenDigest[:]),
 			)
 			require.NoError(t, err)
-			require.Equal(t, registeredID, agentID)
-			require.Equal(t, registeredID, hex.EncodeToString(signer.Public().(ed25519.PublicKey)))
+			require.Equal(t, targetID, agentID)
+			require.Equal(t, targetID, hex.EncodeToString(signer.Public().(ed25519.PublicKey)))
 
 			// The same approval handle cannot mint a second token.
 			replayReq := httptest.NewRequest(

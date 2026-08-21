@@ -1260,6 +1260,11 @@ func runServe(startupProof string) (rerr error) {
 	// federation transport role unchanged. Gate issuance and lookup synchronously
 	// on the live app version, then durably revoke those rows at boot/activation.
 	sqliteStore.SetMCPTokenKeyedIdentityRequirement(app.IsAppV23ActiveForNextTx)
+	// App-v23 bearer issuance binds only to an existing approved identity whose
+	// exact key is already in the node's managed inventory. This is the same
+	// resolver used by consent and Root recovery, so token creation cannot mint
+	// an unapprovable principal with orphaned key material.
+	sqliteStore.SetMCPTokenIdentityResolver(resolveLocalAgentKey)
 	revokeLegacyMCPBearers := func() bool {
 		revoked, err := sqliteStore.RevokeAppV23LegacyMCPBearers(ctx)
 		if err != nil {
@@ -1767,6 +1772,8 @@ func runServe(startupProof string) (rerr error) {
 	// it is never consulted after Root handover.
 	oauthHandler.IsLocalApproval = dashboard.IsLocalCEREBRUMRequest
 	oauthHandler.ResolveControlActor = dashboard.ResolveOAuthControlActor
+	oauthHandler.ManagedTokenTargetsRequired = app.IsAppV23ActiveForNextTx
+	oauthHandler.ValidateTokenTarget = restServer.ValidateMCPTokenTarget
 	oauthHandler.LocalApprovalBaseURL = oauthLocalApprovalBaseURL(cfg.RESTAddr)
 	oauthHandler.NodeOperatorAgentID = operatorAgentID
 	rest.MountOAuthRoutes(r, oauthHandler)

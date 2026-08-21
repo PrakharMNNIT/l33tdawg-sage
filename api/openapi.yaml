@@ -2275,7 +2275,11 @@ components:
           description: Human label, e.g. "chatgpt-laptop".
         agent_id:
           type: string
-          description: 64-char hex Ed25519 pubkey to mint for.
+          description: >-
+            App-v23: 64-char hex Ed25519 pubkey of an existing active approved
+            ordinary agent whose exact key is locally managed. The bearer
+            executes with that identity's existing permissions. Pre-v23: the
+            node operator identity.
 
     MCPTokenIssueResponse:
       type: object
@@ -4856,8 +4860,10 @@ paths:
       operationId: issueMCPToken
       summary: Issue a bearer token for MCP clients that cannot sign Ed25519 requests.
       description: >-
-        Ed25519 auth required (admin use). Token plaintext shown ONCE — not
-        stored, only SHA-256 digest persisted.
+        Ed25519 auth required (current Root/Admin under app-v23). Token
+        plaintext is shown ONCE; only its SHA-256 digest is persisted. App-v23
+        binds the bearer to the requested existing active locally managed agent
+        and never creates a new pending principal.
       tags:
         - MCP Tokens
       requestBody:

@@ -6,8 +6,8 @@ package rest
 // the bearer-token auth that gates the actual MCP transport). The flow is:
 //
 //  1. Current Root/Admin (or the pre-v23 node operator during upgrade) calls
-//     POST /v1/mcp/tokens. Under app-v23 the authorizer is only the issuer:
-//     the bearer receives a distinct restricted Member identity.
+//     POST /v1/mcp/tokens. Under app-v23 agent_id selects an already-enrolled
+//     local identity whose managed key is held by this node.
 //     The server returns a one-shot token string + token ID.
 //   2. External MCP client (ChatGPT, Cursor, etc.) sends that token in
 //      Authorization: Bearer <token> on every /v1/mcp/sse or
@@ -54,7 +54,7 @@ func (s *Server) ConfigureMCPTokenIdentityRegistrar(ts *store.SQLiteStore) {
 // MCPTokenIssueRequest is the JSON body for POST /v1/mcp/tokens.
 type MCPTokenIssueRequest struct {
 	Name    string `json:"name"`     // human label, e.g. "chatgpt-laptop"
-	AgentID string `json:"agent_id"` // hex-encoded ed25519 pubkey of the agent identity to mint for
+	AgentID string `json:"agent_id"` // exact existing managed identity the bearer executes as
 }
 
 // MCPTokenIssueResponse is what the client sees ONCE and only once.
@@ -75,6 +75,20 @@ type MCPTokenSummary struct {
 	CreatedAt  time.Time `json:"created_at"`
 	LastUsedAt time.Time `json:"last_used_at,omitempty"`
 	RevokedAt  time.Time `json:"revoked_at,omitempty"`
+}
+
+// ValidateMCPTokenTarget verifies the consensus half of app-v23 bind-to-
+// existing issuance. The store separately proves that the exact private key is
+// present in the node's managed inventory before it writes a token row.
+func (s *Server) ValidateMCPTokenTarget(_ context.Context, agentID string) error {
+	active, err := s.appV23ActiveOrdinaryAgent(agentID)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return errors.New("agent_id must identify an active approved ordinary agent")
+	}
+	return nil
 }
 
 // handleMCPTokenIssue mints a new bearer token. The plaintext token is shown
@@ -118,11 +132,15 @@ func (s *Server) handleMCPTokenIssue(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusForbidden, "MCP token issuance requires the current CEREBRUM Root or a current local Admin")
 			return
 		}
-		if req.AgentID != callerID {
-			writeJSONError(w, http.StatusBadRequest, "agent_id must match the authorizing Root or Admin")
+		if targetErr := s.ValidateMCPTokenTarget(r.Context(), req.AgentID); targetErr != nil {
+			if strings.Contains(targetErr.Error(), "active approved") {
+				writeJSONError(w, http.StatusBadRequest, targetErr.Error())
+				return
+			}
+			writeJSONError(w, http.StatusServiceUnavailable, "MCP token target enrollment is unavailable")
 			return
 		}
-		legacyAgentID = callerID
+		legacyAgentID = req.AgentID
 	} else {
 		if s.nodeOperatorID == "" {
 			writeJSONError(w, http.StatusServiceUnavailable, "node operator identity unavailable — MCP tokens cannot be issued")
@@ -152,7 +170,7 @@ func (s *Server) handleMCPTokenIssue(w http.ResponseWriter, r *http.Request) {
 		AgentID:   issued.AgentID,
 		Token:     issued.Token,
 		CreatedAt: issued.CreatedAt,
-		UseHint:   "Set Authorization: Bearer <token> on requests to /v1/mcp/sse or /v1/mcp/streamable. Vault-backed tokens sign as their own on-chain identity. SAVE THIS TOKEN NOW — it is never shown again.",
+		UseHint:   "Set Authorization: Bearer <token> on requests to /v1/mcp/sse or /v1/mcp/streamable. This token executes exactly as the selected existing agent identity. SAVE THIS TOKEN NOW — it is never shown again.",
 	}
 
 	w.Header().Set("Content-Type", "application/json")

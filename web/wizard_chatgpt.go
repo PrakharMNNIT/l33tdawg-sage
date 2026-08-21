@@ -1132,9 +1132,46 @@ func (h *DashboardHandler) handleWizardMintToken(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusServiceUnavailable, "current CEREBRUM authority unavailable — MCP tokens cannot be issued")
 		return
 	}
-	if req.AgentID != "" && req.AgentID != issuerID {
-		writeError(w, http.StatusBadRequest, "agent_id must match the current authorizing Root or Admin")
-		return
+	targetID := req.AgentID
+	if h.appV23IsActive() {
+		if targetID == "" {
+			writeError(w, http.StatusBadRequest, "agent_id must identify an existing managed agent")
+			return
+		}
+		if h.appV23IsRootIdentity(targetID) || h.BadgerStore == nil {
+			writeError(w, http.StatusBadRequest, "agent_id must identify an active approved ordinary agent")
+			return
+		}
+		enrollment, enrollmentErr := h.BadgerStore.GetAppV23Enrollment(targetID)
+		role, roleErr := h.BadgerStore.GetAppV23Role(targetID)
+		root, rootErr := h.BadgerStore.GetAppV23Root()
+		validPolicy := enrollment != nil && role != nil &&
+			store.ValidateAppV23Policy(
+				role.Role, enrollment.Profile, enrollment.Capabilities, enrollment.Clearance,
+			) == nil
+		currentAdmin := role != nil && enrollment != nil && root != nil &&
+			(role.Role != store.AppV23RoleAdmin || enrollment.RootGeneration == root.Generation)
+		if enrollmentErr != nil || roleErr != nil || rootErr != nil || root == nil ||
+			enrollment == nil || role == nil || !enrollment.Active ||
+			enrollment.AgentID != targetID || role.AgentID != targetID ||
+			enrollment.Profile == store.AppV23ProfileRoot || !validPolicy || !currentAdmin {
+			writeError(w, http.StatusBadRequest, "agent_id must identify an active approved ordinary agent")
+			return
+		}
+		if h.ResolveAgentKeyFn == nil {
+			writeError(w, http.StatusServiceUnavailable, "managed agent key resolver unavailable")
+			return
+		}
+		if _, ok := h.ResolveAgentKeyFn(targetID); !ok {
+			writeError(w, http.StatusBadRequest, "agent_id key is not managed by this node")
+			return
+		}
+	} else {
+		if targetID != "" && targetID != issuerID {
+			writeError(w, http.StatusBadRequest, "agent_id must match the node operator before app-v23")
+			return
+		}
+		targetID = issuerID
 	}
 
 	ts, ok := h.store.(mcpWizardTokenStore)
@@ -1144,7 +1181,7 @@ func (h *DashboardHandler) handleWizardMintToken(w http.ResponseWriter, r *http.
 	}
 
 	// Mint the token using the same primitives as the api/rest handler.
-	token, id, actingAgentID, createdAt, err := mintMCPTokenForWizard(r.Context(), ts, issuerID, req.TokenName)
+	token, id, actingAgentID, createdAt, err := mintMCPTokenForWizard(r.Context(), ts, issuerID, targetID, req.TokenName)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "mint token: "+err.Error())
 		return

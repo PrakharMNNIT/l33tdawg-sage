@@ -3,7 +3,7 @@ package main
 // CLI for managing HTTP MCP bearer tokens.
 //
 // Usage:
-//   sage-gui mcp-token create [--name <label>]
+//   sage-gui mcp-token create [--agent <existing-agent-id>] [--name <label>]
 //   sage-gui mcp-token list
 //   sage-gui mcp-token revoke <id>
 //
@@ -50,12 +50,12 @@ func printMCPTokenUsage() {
 	fmt.Println(`Manage HTTP MCP bearer tokens.
 
 Usage:
-  sage-gui mcp-token create [--name <label>]
+  sage-gui mcp-token create [--agent <existing-agent-id>] [--name <label>]
   sage-gui mcp-token list
   sage-gui mcp-token revoke <id>
 
 Examples:
-  sage-gui mcp-token create --name chatgpt-laptop
+  sage-gui mcp-token create --agent <existing-agent-id> --name chatgpt-laptop
   sage-gui mcp-token list
   sage-gui mcp-token revoke 6c5e9f8a-b21d-4d52-89c4-1a3a4d9e7c5a`)
 }
@@ -77,11 +77,19 @@ func runMCPTokenCreate() error {
 			}
 			name = args[i+1]
 			i++
+		case "--help", "-h", "help":
+			// create mints a real credential, so help must return before any
+			// signing-key lookup or API call can issue one.
+			printMCPTokenUsage()
+			return nil
 		default:
-			if strings.HasPrefix(args[i], "--agent=") {
+			switch {
+			case strings.HasPrefix(args[i], "--agent="):
 				agentID = strings.TrimPrefix(args[i], "--agent=")
-			} else if strings.HasPrefix(args[i], "--name=") {
+			case strings.HasPrefix(args[i], "--name="):
 				name = strings.TrimPrefix(args[i], "--name=")
+			default:
+				return fmt.Errorf("unknown argument %q for 'mcp-token create'; run 'sage-gui mcp-token create --help'", args[i])
 			}
 		}
 	}
@@ -89,10 +97,9 @@ func runMCPTokenCreate() error {
 	if identityErr != nil {
 		return identityErr
 	}
-	if agentID != "" && agentID != operatorID {
-		return fmt.Errorf("HTTP MCP tokens execute as this node's operator (%s); remove --agent or use that identity", operatorID)
+	if agentID == "" {
+		agentID = operatorID
 	}
-	agentID = operatorID
 
 	body, _ := json.Marshal(map[string]string{
 		"agent_id": agentID,

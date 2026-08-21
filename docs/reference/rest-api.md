@@ -1836,16 +1836,18 @@ must be the exact current committed CEREBRUM Root or an active
 current-generation local Admin; the historical `agent.key` transport identity
 does not retain issuance authority after Root handover.
 
-The token plaintext is shown **once only**. Every app-v23 bearer mints and
-synchronously self-registers a distinct restricted Member identity pending
-CEREBRUM review; it never acts as Root/Admin or falls back to the issuer's key.
-Its private key is AES-256-GCM sealed under an HKDF-SHA256 key derived from the
-bearer plaintext and a per-row random salt, whether optional ledger encryption
-is on or off. This keeps the credential stable through ledger enable/disable,
-lock/unlock, and passphrase changes. SQLite stores the bearer SHA-256 only as
-its lookup/fingerprint value; that digest cannot decrypt the signing key.
-Authentication presents the plaintext transiently to unlock only its own row,
-then downstream REST calls sign as the token's distinct agent. Existing
+The token plaintext is shown **once only**. Under app-v23, `agent_id` selects an
+existing active approved ordinary agent whose exact private key is already in
+the node's managed key inventory. Issuance fails without writing a token row if
+either the consensus enrollment or local key is unavailable. It never creates
+a new pending principal. The selected private key is AES-256-GCM sealed under
+an HKDF-SHA256 key derived from the bearer plaintext and a per-row random salt,
+whether optional ledger encryption is on or off. The bearer therefore executes
+with exactly the selected agent's existing permissions; the authorizing
+Root/Admin remains only the token owner/issuer. SQLite stores the bearer SHA-256
+only as its lookup/fingerprint value; that digest cannot decrypt the signing
+key. Authentication presents the plaintext transiently to unlock only its own
+row, then downstream REST calls sign as the selected agent. Existing
 vault-sealed keyed rows remain compatible: while unlocked, their next valid
 bearer authentication atomically rewraps them into the transition-stable
 bearer envelope. Until that one-time migration, a locked vault fails them
@@ -1856,7 +1858,7 @@ closed rather than falling back to Root.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `name` | string | no | Human label, e.g. `chatgpt-laptop` |
-| `agent_id` | string | yes | The authorizing current Root/Admin's 64-char hex Ed25519 pubkey. The response `agent_id` is the newly minted distinct MCP agent. |
+| `agent_id` | string | yes | App-v23: the existing active approved ordinary agent to bind, whose exact key must be locally managed. Pre-v23: the node operator identity. |
 
 **Response** (HTTP 201):
 
@@ -1904,7 +1906,7 @@ not public: `/oauth/approve` is a localhost-only CEREBRUM route.
 | `GET` | `/oauth/authorize` | Validate the DCR/PKCE request and redirect to an absolute loopback approval URL carrying only an opaque signed five-minute handoff |
 | `POST` | `/oauth/authorize` | Compatibility entry; remote requests still receive only the loopback handoff and cannot submit consent |
 | `GET` | `/oauth/approve` | Localhost-only consent page; resolves live Root/Admin authority and requires an unlocked CEREBRUM session when encryption is enabled |
-| `POST` | `/oauth/approve` | Localhost-only, CSRF-bound, single-use approval; re-resolves live authority, synchronously registers a distinct pending-review agent, then issues the authorization code |
+| `POST` | `/oauth/approve` | Localhost-only, CSRF-bound, single-use approval; re-resolves live authority, binds the bearer to the selected existing active locally managed agent, then issues the authorization code |
 | `POST` | `/oauth/token` | Exchange auth code for bearer (`grant_type=authorization_code` only) |
 
 The `access_token` returned by `/oauth/token` is the same bearer accepted by `Authorization: Bearer <token>` on `/v1/mcp/sse` and `/v1/mcp/streamable`. Token lifetime is controlled by revocation (`DELETE /v1/mcp/tokens/{id}`), not expiry — `expires_in: 0` in the token response.
