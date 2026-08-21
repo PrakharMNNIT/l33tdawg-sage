@@ -1008,6 +1008,7 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
       <p class="meta" style="margin:0.5em 0 0;">The node must already hold this agent's managed key. The bearer receives exactly that agent's existing permissions; token creation never creates a pending identity.</p>
     </div>{{else}}<div class="card" style="background:#fff;border-color:#cfd8dc;">
       <p style="margin:0;"><strong>Identity:</strong> a distinct pending-review MCP agent</p>
+      <p class="meta" style="margin:0.5em 0 0;">It never inherits Root or Admin authority from the person approving it.</p>
     </div>{{end}}
     <p style="margin-top:1em;"><button type="submit">Authorize</button></p>
   </form>
