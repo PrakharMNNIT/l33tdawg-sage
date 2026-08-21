@@ -264,10 +264,12 @@ replays do not republish, and an incapable backend fails before insertion rather
 than creating durable work that wake consumers cannot observe as new.
 
 The experimental Claude notification adapter is explicitly opt-in again. The
-shipped Claude Code host does not consume that custom notification, while the
-adapter would otherwise acquire the one exact-agent wake lease and exclude a
-useful long-running consumer. `SAGE_CLAUDE_CHANNEL=true` still enables it for an
-operator who intentionally has a compatible host.
+shipped Claude Code host registers the custom notification handler, but
+end-to-end delivery from a plain `.mcp.json` server through its plugin-scoped
+gate remains unverified. An idle adapter would also acquire the one exact-agent
+wake lease and exclude a useful long-running consumer.
+`SAGE_CLAUDE_CHANNEL=true` enables it for an operator who has confirmed that
+delivery path.
 
 Pending-memory presentation is deterministic even when creation timestamps tie:
 SQLite and PostgreSQL both use `memory_id` as the final ordering key. The

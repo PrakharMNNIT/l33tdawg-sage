@@ -263,9 +263,10 @@ single-transaction admission primitive, publication follows commit, and an
 incapable backend returns 501 before inserting anything. Provider-only and
 federated work remain outside the exact-local sequence.
 
-The custom Claude wake notification channel is opt-in for every host because the
-shipped Claude Code host does not consume it and an idle adapter must not acquire
-the exclusive exact-agent wake lease. Pending memory batches now use
+The custom Claude wake notification channel is opt-in for every host because
+end-to-end delivery from a plain `.mcp.json` server through Claude Code's
+plugin-scoped gate remains unverified, and an idle adapter must not acquire the
+exclusive exact-agent wake lease. Pending memory batches now use
 `memory_id` as the final SQLite/PostgreSQL tiebreak when timestamps match.
 
 Documentation citations now parse bounded newline-separated symbol/path pairs
@@ -289,7 +290,7 @@ Claude Code and Codex project sessions arm the Stop-only turn-boundary nudge by
 default. It fails open—including when its one-shot cursor cannot be persisted—
 and uses per-session durable sequence state so a declined generation cannot
 trap the session indefinitely. The experimental custom Claude notification
-adapter remains explicit opt-in for hosts known to consume it.
+adapter remains explicit opt-in for hosts with confirmed end-to-end delivery.
 
 Claimant-session conflicts stay typed instead of falling through a legacy 404
 path, and recovery remains explicit through passive history plus compare-and-

@@ -231,7 +231,7 @@ func runMCP() error {
 		selfHealProject(projectDir, home, provider, keyPath)
 	}
 	// The experimental custom-notification adapter is explicit opt-in for hosts
-	// known to consume it. A competing exact-agent consumer is rejected by the node, but the adapter
+	// with confirmed end-to-end delivery. A competing exact-agent consumer is rejected by the node, but the adapter
 	// keeps retrying with bounded backoff and acquires the lease after the holder
 	// disconnects. A failure to arm remains deliberately non-fatal: ordinary MCP
 	// requests continue while the wake accelerator reconnects in the background.
@@ -325,10 +325,11 @@ func primaryWorkspaceMCPEnv(root string) (map[string]string, bool, error) {
 }
 
 // claudeChannelEnabled is an explicit adapter opt-in. The shipped Claude Code
-// host does not consume notifications/claude/channel, while Codex must never
-// acquire the adapter's exclusive wake lease because it cannot consume that
-// method. An unparseable override fails closed — envBool warns rather than
-// guessing.
+// host registers a notifications/claude/channel handler, but delivery from a
+// plain .mcp.json server through the host's plugin-scoped channel gate remains
+// unverified. Codex must never acquire the adapter's exclusive wake lease
+// because it cannot consume that method. An unparseable override fails closed
+// — envBool warns rather than guessing.
 func claudeChannelEnabled() bool {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("SAGE_PROVIDER")), "codex") {
 		return false
