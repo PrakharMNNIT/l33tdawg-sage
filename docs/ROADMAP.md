@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.24 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.25 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -86,16 +86,35 @@ v11.18.24 adds session-fenced federated claim recovery and idempotent reply
 events, removes imperative boot mutations from MCP result traffic, scopes
 durable retention labels to actionable work, and tightens likely-alias
 embedding diagnostics.
+v11.18.25 keeps CEREBRUM task refreshes mounted while fencing stale responses
+and preserving authoritative read failures, and makes Codex hook shell
+migration portable without replacing custom user hooks.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
 metadata and making bloomed memories responsive. The supported consensus
-ceiling remains app-v26; **v11.18.24 does not introduce app-v27**.
+ceiling remains app-v26; **v11.18.25 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.25 patch
+
+CEREBRUM background task refreshes no longer replace the mounted board with a
+loading surface. Successful authoritative reads recover visible errors, failed
+silent reads cannot be interpreted as confirmed absence, and generation
+fencing prevents an older completion from overwriting newer state or
+resurrecting a settling task.
+
+Codex hook installation and self-heal resolve the Bash executable available on
+the host instead of assuming one filesystem layout. Migration replaces only
+installer-owned SAGE hook commands; unrelated lifecycle hooks, custom events,
+and top-level JSON remain user-owned and preserved.
+
+This patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.25 does not introduce app-v27.
 
 ## v11.18.24 patch
 
