@@ -51,6 +51,26 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.27
+
+**Empty semantic recall now distinguishes genuine absence from an incomplete
+vector-space view.** For an empty, domain-scoped semantic query, `index_status`
+reports `complete`, `incomplete`, or fail-closed `unavailable` only when the
+caller and exact query universe support that conclusion. The same signal is
+relayed through `sage_recall` and `sage_turn`, so write-on-absence agents can
+avoid manufacturing duplicates when committed memories are temporarily
+unreachable in the active embedding space.
+
+The proof is caller-safe and race-fenced across canonical projection, SQL,
+embedding-space, and vault generations. Narrowed or federated queries and
+unhealthy projections never receive a false completeness claim, while bounded
+indexed probes keep the empty-result path operationally safe.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.27 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.27`. SDK 11.18.27.
+
 ## What's New in v11.18.26
 
 **The supported Go dependency baseline is refreshed.** This release carries
@@ -2096,7 +2116,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.26`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.27`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
