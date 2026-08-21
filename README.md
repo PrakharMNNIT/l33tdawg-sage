@@ -51,6 +51,25 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.25
+
+**CEREBRUM task refreshes are quiet without becoming stale.** Background SSE
+and post-clear reconciliation keep the mounted board visible instead of
+flashing the full loading surface. Canonical read failures remain failures—not
+proof that a task disappeared—and a monotonic generation fence prevents an
+older response from overwriting newer task state or clearing a newer error.
+
+**Codex lifecycle hooks survive restricted launchers without taking ownership
+of the user's hook file.** Installation resolves and persists the host's Bash
+executable, including non-FHS and Windows Git Bash paths, while self-heal
+semantically replaces only SAGE-owned commands. Custom hooks, custom events,
+and unrelated top-level JSON remain intact during migration.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.25 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.25`. SDK 11.18.25.
+
 ## What's New in v11.18.24
 
 **Federated inbox work now has recoverable, session-fenced ownership.** SAGE
@@ -245,10 +264,12 @@ replays do not republish, and an incapable backend fails before insertion rather
 than creating durable work that wake consumers cannot observe as new.
 
 The experimental Claude notification adapter is explicitly opt-in again. The
-shipped Claude Code host does not consume that custom notification, while the
-adapter would otherwise acquire the one exact-agent wake lease and exclude a
-useful long-running consumer. `SAGE_CLAUDE_CHANNEL=true` still enables it for an
-operator who intentionally has a compatible host.
+shipped Claude Code host registers the custom notification handler, but
+end-to-end delivery from a plain `.mcp.json` server through its plugin-scoped
+gate remains unverified. An idle adapter would also acquire the one exact-agent
+wake lease and exclude a useful long-running consumer.
+`SAGE_CLAUDE_CHANNEL=true` enables it for an operator who has confirmed that
+delivery path.
 
 Pending-memory presentation is deterministic even when creation timestamps tie:
 SQLite and PostgreSQL both use `memory_id` as the final ordering key. The
@@ -2072,7 +2093,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.24`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.25`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
