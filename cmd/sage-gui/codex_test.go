@@ -304,7 +304,7 @@ func TestCodexHookCommandRunsWithEmptyPATH(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "ran")
 	script := filepath.Join(hookDir, "sage-session-start.sh")
 	require.NoError(t, os.WriteFile(script, []byte("printf ok > \""+marker+"\"\n"), 0755))
-	hooks := sageCodexHooksConfigWithShell(hookDir, shell)
+	hooks := sageHooksConfigWithShell(hookDir, shell)
 	command := hookCommand(t, hooks, "SessionStart")
 	cmd := exec.Command("/bin/sh", "-c", command) //nolint:gosec // generated fixture command
 	cmd.Env = []string{"PATH="}
@@ -315,7 +315,7 @@ func TestCodexHookCommandRunsWithEmptyPATH(t *testing.T) {
 }
 
 func TestCodexHookCommandQuotesShellPathsWithSpaces(t *testing.T) {
-	hooks := sageCodexHooksConfigWithShell("C:/tmp/hooks", "C:/Program Files/Git/bin/bash.exe")
+	hooks := sageHooksConfigWithShell("C:/tmp/hooks", "C:/Program Files/Git/bin/bash.exe")
 	assert.Equal(t, `"C:/Program Files/Git/bin/bash.exe" "C:/tmp/hooks/sage-session-start.sh"`, hookCommand(t, hooks, "SessionStart"))
 }
 

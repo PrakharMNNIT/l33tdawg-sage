@@ -935,23 +935,10 @@ func installClaudeMD(projectDir string) error {
 // (the env var is expanded by Claude Code at hook firing time); Codex
 // installs pass the absolute path because Codex doesn't expand its own env
 // vars in hook commands.
-func sageHooksConfig(hookDirExpr string) map[string]any {
-	return sageHooksConfigWithShell(hookDirExpr, "bash")
-}
-
-// sageCodexHooksConfig resolves Bash while the installer still has its normal
-// environment. Codex CLI hook processes can inherit a restricted PATH from
-// their launcher, so persisting the absolute executable avoids exit 127. The
-// resolver retains a previously installed absolute shell when available,
-// which keeps non-FHS and Windows Git Bash installs stable during self-heal.
-func sageCodexHooksConfig(hookDirExpr string) map[string]any {
-	return sageCodexHooksConfigWithShell(hookDirExpr, resolveCodexBash(""))
-}
-
-func sageCodexHooksConfigWithShell(hookDirExpr, shell string) map[string]any {
-	return sageHooksConfigWithShell(hookDirExpr, shell)
-}
-
+// resolveCodexBash resolves Bash while the installer still has its normal
+// environment. Codex hook processes can inherit a restricted PATH, so the
+// absolute executable is persisted. A valid prior absolute path is retained
+// for stable non-FHS and Windows Git Bash self-healing.
 func resolveCodexBash(preferred string) string {
 	if filepath.IsAbs(preferred) {
 		if info, err := os.Stat(preferred); err == nil && !info.IsDir() {
