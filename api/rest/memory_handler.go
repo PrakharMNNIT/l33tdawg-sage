@@ -980,10 +980,10 @@ func (s *Server) appV25RecoveredReadOverridesLegacyVisibility(agentID, domain st
 // author gate. App-v23 additionally has an author-scoped visible_agents
 // restriction that hasMemoryReadAccess does not cover, so require it unrestricted.
 //
-// App-v23 also hides unpublished/quarantined SQL projections. Require a complete
-// exact canonical projection audit before a raw SQL verdict; unchecked,
-// compatible, subset, and quarantined inventories all degrade to unavailable.
-// An individual successful row validation is not a domain-wide proof.
+// App-v23 also hides unpublished/quarantined SQL projections. The separate
+// completeness gate binds its audit to current SQL and canonical revisions
+// before and after the probe. This predicate proves only policy visibility;
+// both proofs are required before a verdict can be disclosed.
 func (s *Server) callerHasProvenFullDomainVisibility(agentID, domain string, at time.Time) bool {
 	if s.badgerStore == nil || agentID == "" || domain == "" {
 		return false // cannot prove without on-chain policy state
@@ -992,8 +992,8 @@ func (s *Server) callerHasProvenFullDomainVisibility(agentID, domain string, at 
 	if err != nil || !fullyCleared {
 		return false
 	}
-	if s.isPostV23ForNextTx() && (s.appV23LegacyVisibilityRestricted(agentID) || !s.hasExactCanonicalMemoryProjection()) {
-		return false // an author or unsafe projection filter can still hide rows
+	if s.isPostV23ForNextTx() && s.appV23LegacyVisibilityRestricted(agentID) {
+		return false // an author-scoped filter can still hide rows from this caller
 	}
 	return true
 }
@@ -2115,9 +2115,11 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	//   - The probe is bounded; a domain too large to settle cheaply → "unavailable".
 	//
 	// The signal is a three-value enum, never a count or a list.
-	if len(resp.Results) == 0 && req.DomainTag != "" && localDomainReadable {
+	if len(resp.Results) == 0 && req.DomainTag != "" {
 		activeSpace := s.activeEmbeddingProvider()
 		switch {
+		case !localDomainReadable:
+			resp.IndexStatus = "unavailable"
 		case !recallIndexStatusHasExactQueryUniverse(req):
 			resp.IndexStatus = "unavailable"
 		case activeSpace == "":
@@ -2125,9 +2127,16 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 		case !s.callerHasProvenFullDomainVisibility(queryAgentID, req.DomainTag, now):
 			resp.IndexStatus = "unavailable"
 		default:
+			projectionSource, projectionExact := s.exactCanonicalMemoryProjectionSource(r.Context())
+			if !projectionExact {
+				resp.IndexStatus = "unavailable"
+				break
+			}
 			hasOutside, established, cErr := s.store.DomainSpaceCompleteness(
 				r.Context(), req.DomainTag, activeSpace, store.CandidateFilterScanBudget)
 			switch {
+			case !s.canonicalMemoryProjectionSourceUnchanged(r.Context(), projectionSource):
+				resp.IndexStatus = "unavailable"
 			case cErr != nil:
 				s.logger.Warn().Err(cErr).Str("domain", req.DomainTag).Msg("recall index-status disclosure unavailable")
 				resp.IndexStatus = "unavailable"

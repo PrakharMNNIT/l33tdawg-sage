@@ -455,8 +455,9 @@ func (h *DashboardHandler) publishAppV23ProjectionAudit(
 		)
 		return
 	}
-	h.BadgerStore.PublishCanonicalMemoryProjectionAudit(
-		true, result.legacyCompatible, result.quarantined,
+	h.BadgerStore.PublishCanonicalMemoryProjectionAuditAt(
+		true, result.legacyCompatible, result.quarantined, result.source.SQLRevision,
+		result.source.CanonicalRevision,
 	)
 }
 

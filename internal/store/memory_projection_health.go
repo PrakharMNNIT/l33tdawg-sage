@@ -26,6 +26,12 @@ type CanonicalMemoryProjectionHealth struct {
 	State            string `json:"state"`
 	LegacyCompatible bool   `json:"legacy_compatible,omitempty"`
 	Quarantined      bool   `json:"quarantined,omitempty"`
+	// Audit source tokens are process-local proof metadata, not readiness API.
+	// SourceBound is true only when the complete audit was published with the
+	// exact SQL and canonical revisions it classified.
+	SourceBound       bool   `json:"-"`
+	SQLRevision       uint64 `json:"-"`
+	CanonicalRevision uint64 `json:"-"`
 }
 
 type canonicalMemoryProjectionHealthTracker struct {
@@ -76,7 +82,20 @@ func (s *BadgerStore) PublishCanonicalMemoryProjectionAudit(
 	required, legacyCompatible, quarantined bool,
 ) {
 	s.publishCanonicalMemoryProjectionAudit(
+		required, legacyCompatible, quarantined, false, 0, 0, false,
+	)
+}
+
+// PublishCanonicalMemoryProjectionAuditAt binds a complete, source-stable audit
+// to the exact independently-maintained SQL and canonical revisions it walked.
+// Callers may reuse the result only while both revisions still match.
+func (s *BadgerStore) PublishCanonicalMemoryProjectionAuditAt(
+	required, legacyCompatible, quarantined bool,
+	sqlRevision, canonicalRevision uint64,
+) {
+	s.publishCanonicalMemoryProjectionAudit(
 		required, legacyCompatible, quarantined, false,
+		sqlRevision, canonicalRevision, true,
 	)
 }
 
@@ -88,12 +107,14 @@ func (s *BadgerStore) PublishCanonicalMemoryProjectionSubsetAudit(
 	legacyCompatible, quarantined bool,
 ) {
 	s.publishCanonicalMemoryProjectionAudit(
-		true, legacyCompatible, quarantined, true,
+		true, legacyCompatible, quarantined, true, 0, 0, false,
 	)
 }
 
 func (s *BadgerStore) publishCanonicalMemoryProjectionAudit(
 	required, legacyCompatible, quarantined, subset bool,
+	sqlRevision, canonicalRevision uint64,
+	sourceBound bool,
 ) {
 	if s == nil || s.canonicalMemoryProjectionHealth == nil {
 		return
@@ -104,9 +125,12 @@ func (s *BadgerStore) publishCanonicalMemoryProjectionAudit(
 		// A completed audit is service-ready even when it localized rows that
 		// broad reads must quarantine. Quarantined drives HTTP 200 "degraded";
 		// unchecked/backend-unavailable remains the only readiness failure.
-		OK:               true,
-		LegacyCompatible: legacyCompatible,
-		Quarantined:      quarantined,
+		OK:                true,
+		LegacyCompatible:  legacyCompatible,
+		Quarantined:       quarantined,
+		SourceBound:       sourceBound,
+		SQLRevision:       sqlRevision,
+		CanonicalRevision: canonicalRevision,
 	}
 	switch {
 	case !required:

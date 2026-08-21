@@ -2,6 +2,7 @@ package rest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -27,7 +28,7 @@ import (
 // fullVisibilityCaller approves a TopSecret (clearance 4) agent that owns `home`,
 // so hasMemoryReadAccess at the top of the lattice proves it can read every
 // classification in that domain.
-func fullVisibilityCaller(t *testing.T, badger *store.BadgerStore, home string) string {
+func fullVisibilityCaller(t *testing.T, srv *Server, badger *store.BadgerStore, home string) string {
 	t.Helper()
 	id := appV23RESTAgentID("77")
 	rootID := appV23RESTAgentID("11")
@@ -37,7 +38,11 @@ func fullVisibilityCaller(t *testing.T, badger *store.BadgerStore, home string) 
 		Profile: store.AppV23ProfileStandard, HomeDomain: home,
 		Clearance: 4, Capabilities: 0, Active: true, UpdatedHeight: 2,
 	}, store.AppV23RoleMember, 0, 0))
-	badger.PublishCanonicalMemoryProjectionAudit(true, false, false)
+	revision, err := mockStoreOf(srv).MemoryProjectionRevision(context.Background())
+	require.NoError(t, err)
+	badger.PublishCanonicalMemoryProjectionAuditAt(
+		true, false, false, revision, badger.CanonicalMemoryProjectionRevision(),
+	)
 	return id
 }
 
@@ -66,7 +71,7 @@ func mockStoreOf(srv *Server) *mockMemoryStore {
 func TestRecallIndexStatusFullVisibilityPredicateGate(t *testing.T) {
 	srv, badger, _, ownerID, _ := setupAppV23RESTAccess(t)
 	srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
-	tsID := fullVisibilityCaller(t, badger, "fv.home")
+	tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
 	now := time.Now()
 
 	// Predicate itself: the fully-cleared owner is proven, the clearance-2 owner is not.
@@ -100,7 +105,7 @@ func TestRecallIndexStatusEnumForFullVisibilityCaller(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, badger, _, _, _ := setupAppV23RESTAccess(t)
 			srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
-			tsID := fullVisibilityCaller(t, badger, "fv.home")
+			tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
 			ms := mockStoreOf(srv)
 			ms.outside = tc.probe
 			var sawSpace string
@@ -124,7 +129,7 @@ func TestRecallIndexStatusNonDefaultStatusUniverseIsUnavailable(t *testing.T) {
 		t.Run("status="+statusFilter, func(t *testing.T) {
 			srv, badger, _, _, _ := setupAppV23RESTAccess(t)
 			srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
-			tsID := fullVisibilityCaller(t, badger, "fv.home")
+			tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
 			mockStoreOf(srv).outside = outsideSpaceProbe{hasOutside: true, established: true}
 			_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", statusFilter)
 			assert.Equal(t, "unavailable", resp.IndexStatus,
@@ -139,7 +144,7 @@ func TestRecallIndexStatusNonDefaultStatusUniverseIsUnavailable(t *testing.T) {
 func TestRecallIndexStatusEmptyActiveSpaceIsUnavailable(t *testing.T) {
 	srv, badger, _, _, _ := setupAppV23RESTAccess(t)
 	srv.embedder = nil // activeEmbeddingProvider() == ""
-	tsID := fullVisibilityCaller(t, badger, "fv.home")
+	tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
 	mockStoreOf(srv).outside = outsideSpaceProbe{hasOutside: true, established: true}
 	_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
 	assert.Equal(t, "unavailable", resp.IndexStatus)
@@ -148,14 +153,15 @@ func TestRecallIndexStatusEmptyActiveSpaceIsUnavailable(t *testing.T) {
 func TestRecallIndexStatusRequiresExactCanonicalProjectionHealth(t *testing.T) {
 	srv, badger, _, _, _ := setupAppV23RESTAccess(t)
 	srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
-	tsID := fullVisibilityCaller(t, badger, "fv.home")
+	tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
 	require.True(t, srv.callerHasProvenFullDomainVisibility(tsID, "fv.home", time.Now()))
 
 	// A complete inventory that found even one unsafe projection means raw SQL
 	// rows are not the caller-visible universe. The probe must not run, regardless
 	// of whether its answer would otherwise be complete or incomplete.
 	badger.PublishCanonicalMemoryProjectionAudit(true, false, true)
-	require.False(t, srv.callerHasProvenFullDomainVisibility(tsID, "fv.home", time.Now()))
+	_, exact := srv.exactCanonicalMemoryProjectionSource(context.Background())
+	require.False(t, exact)
 
 	render := func(probe outsideSpaceProbe) []byte {
 		mockStoreOf(srv).outside = probe
@@ -166,6 +172,64 @@ func TestRecallIndexStatusRequiresExactCanonicalProjectionHealth(t *testing.T) {
 	base := render(outsideSpaceProbe{hasOutside: false, established: true})
 	assert.Equal(t, string(base), string(render(outsideSpaceProbe{hasOutside: true, established: true})),
 		"a quarantined projection must not become a complete/incomplete oracle")
+}
+
+func TestRecallIndexStatusRejectsStaleOrChangingProjectionAudit(t *testing.T) {
+	t.Run("SQL revision changed after audit", func(t *testing.T) {
+		srv, badger, _, _, _ := setupAppV23RESTAccess(t)
+		srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
+		tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
+		ms := mockStoreOf(srv)
+		ms.projectionRevision++ // models SQL-before-Badger publication after the exact audit
+		var sawSpace string
+		ms.outside = outsideSpaceProbe{hasOutside: true, established: true, sawSpace: &sawSpace}
+		_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
+		assert.Equal(t, "unavailable", resp.IndexStatus)
+		assert.Empty(t, sawSpace, "a stale source token must stop the raw SQL probe")
+	})
+
+	t.Run("source changed during probe", func(t *testing.T) {
+		srv, badger, _, _, _ := setupAppV23RESTAccess(t)
+		srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
+		tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
+		ms := mockStoreOf(srv)
+		ms.outside = outsideSpaceProbe{
+			hasOutside: true, established: true,
+			after: func() { ms.projectionRevision++ },
+		}
+		_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
+		assert.Equal(t, "unavailable", resp.IndexStatus,
+			"a verdict over a source that changed during the scan must be discarded")
+	})
+}
+
+func TestRecallIndexStatusRemoteOnlyFederatedEmptyIsUnavailable(t *testing.T) {
+	srv, _, badger, _ := newRBACTestServer(t)
+	srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2}, name: "ollama"}
+	srv.SetFederation(&fakeFederation{})
+
+	body, err := json.Marshal(QueryMemoryRequest{
+		Embedding:         []float32{0.1, 0.2},
+		EmbeddingProvider: srv.activeEmbeddingProvider(),
+		DomainTag:         "remote.only",
+		StatusFilter:      "committed",
+		Federated:         true,
+	})
+	require.NoError(t, err)
+	req, callerID := signedRequest(t, http.MethodPost, "/v1/memory/query", body)
+	require.NoError(t, badger.RegisterAgent(callerID, "operator", "member", "", "test", "", 1))
+	require.NoError(t, badger.SetAgentPermission(
+		callerID, 1, `[{"domain":"remote.only","read":false}]`, "*", "", "",
+	))
+	srv.SetNodeOperatorID(callerID) // federation authority; local policy remains denied
+
+	rr := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp QueryMemoryResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Results)
+	assert.Equal(t, "unavailable", resp.IndexStatus)
 }
 
 func TestRecallIndexStatusExactQueryUniverseGate(t *testing.T) {
@@ -218,7 +282,7 @@ func TestRecallIndexStatusByteIdenticalForNonVisibleCaller(t *testing.T) {
 func TestRecallIndexStatusOnlyOnEmpty(t *testing.T) {
 	srv, badger, _, _, _ := setupAppV23RESTAccess(t)
 	srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
-	tsID := fullVisibilityCaller(t, badger, "fv.home")
+	tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
 	mockStoreOf(srv).outside = outsideSpaceProbe{hasOutside: true, established: true}
 	seedMemory(t, srv.store.(*rbacMockMemoryStore), "seeded", tsID, "fv.home", "a real memory")
 	_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")

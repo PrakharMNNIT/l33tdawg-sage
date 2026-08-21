@@ -1,13 +1,61 @@
 package rest
 
-import "github.com/l33tdawg/sage/internal/store"
+import (
+	"context"
 
-func (s *Server) hasExactCanonicalMemoryProjection() bool {
+	"github.com/l33tdawg/sage/internal/store"
+)
+
+type recallProjectionRevisionProvider interface {
+	MemoryProjectionRevision(context.Context) (uint64, error)
+}
+
+type recallProjectionSource struct {
+	sql       uint64
+	canonical uint64
+}
+
+func (s *Server) exactCanonicalMemoryProjectionSource(
+	ctx context.Context,
+) (recallProjectionSource, bool) {
+	var source recallProjectionSource
 	if s.badgerStore == nil {
-		return false
+		return source, false
 	}
 	health := s.badgerStore.CanonicalMemoryProjectionHealth()
-	return health.Checked && health.OK && health.State == store.CanonicalMemoryProjectionExact
+	if !health.Checked || !health.OK ||
+		health.State != store.CanonicalMemoryProjectionExact || !health.SourceBound {
+		return source, false
+	}
+	provider, ok := s.store.(recallProjectionRevisionProvider)
+	if !ok {
+		return source, false
+	}
+	sqlRevision, err := provider.MemoryProjectionRevision(ctx)
+	if err != nil {
+		return source, false
+	}
+	canonicalRevision := s.badgerStore.CanonicalMemoryProjectionRevision()
+	if sqlRevision != health.SQLRevision || canonicalRevision != health.CanonicalRevision {
+		return source, false
+	}
+	return recallProjectionSource{sql: sqlRevision, canonical: canonicalRevision}, true
+}
+
+func (s *Server) canonicalMemoryProjectionSourceUnchanged(
+	ctx context.Context,
+	want recallProjectionSource,
+) bool {
+	provider, ok := s.store.(recallProjectionRevisionProvider)
+	if !ok || s.badgerStore == nil {
+		return false
+	}
+	sqlRevision, err := provider.MemoryProjectionRevision(ctx)
+	if err != nil {
+		return false
+	}
+	return sqlRevision == want.sql &&
+		s.badgerStore.CanonicalMemoryProjectionRevision() == want.canonical
 }
 
 // recallIndexStatusHasExactQueryUniverse reports whether the empty response was
