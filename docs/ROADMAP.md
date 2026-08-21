@@ -106,8 +106,10 @@ explicit, reviewed operator ceremony rather than a silent mutation.
 
 This maintenance patch updates the validated Go dependency baseline (`testify`
 1.12.0, `x/crypto` 0.55.0, and `x/tools` 0.49.0) and the pinned CodeQL and
-native-shell CI actions. It does not change a SAGE runtime, REST, MCP, or
-consensus contract.
+native-shell CI actions. It also binds new app-v23 HTTP MCP bearers to existing
+approved locally managed agent identities, instead of creating structurally
+unapprovable pending principals, and makes the token-create CLI help path
+side-effect free.
 
 This patch introduces no new consensus application version or state migration:
 app-v26 remains the ceiling and v11.18.26 does not introduce app-v27.

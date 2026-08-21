@@ -428,6 +428,8 @@ func TestWizard_MintTokenV23UsesLiveLocalAuthorityAfterRootHandover(t *testing.T
 	h.NodeOperatorAgentID = fixture.rootID
 	h.ResolveAgentKeyFn = func(agentID string) (ed25519.PrivateKey, bool) {
 		switch agentID {
+		case fixture.agentID:
+			return fixture.agentKey, true
 		case fixture.rootID:
 			return fixture.rootKey, true
 		case currentRootID:
@@ -438,11 +440,17 @@ func TestWizard_MintTokenV23UsesLiveLocalAuthorityAfterRootHandover(t *testing.T
 			return nil, false
 		}
 	}
+	tokenStore.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
+	t.Cleanup(func() { tokenStore.SetMCPTokenKeyedIdentityRequirement(nil) })
+	tokenStore.SetMCPTokenIdentityResolver(h.ResolveAgentKeyFn)
+	t.Cleanup(func() { tokenStore.SetMCPTokenIdentityResolver(nil) })
 	router := testRouter(h)
 
 	mint := func(t *testing.T, name string, signer ed25519.PrivateKey, localBrowser bool) int {
 		t.Helper()
-		body, marshalErr := json.Marshal(map[string]string{"token_name": name})
+		body, marshalErr := json.Marshal(map[string]string{
+			"agent_id": fixture.agentID, "token_name": name,
+		})
 		require.NoError(t, marshalErr)
 		req := httptest.NewRequest(
 			http.MethodPost, "/v1/wizard/chatgpt/mint-token", bytes.NewReader(body),
@@ -474,6 +482,7 @@ func TestWizard_MintTokenV23UsesLiveLocalAuthorityAfterRootHandover(t *testing.T
 	issuers := map[string]bool{}
 	for _, row := range rows {
 		issuers[row.IssuerID] = true
+		require.Equal(t, fixture.agentID, row.AgentID)
 	}
 	require.True(t, issuers[currentRootID], "unencrypted local SPA must issue as current Root")
 	require.True(t, issuers[adminID], "current local Admin must issue under its own authority")

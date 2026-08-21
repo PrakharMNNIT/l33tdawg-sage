@@ -587,11 +587,11 @@ test('agent removal leaves the confirmation usable if the server rejects it', ()
         'the progress copy must not promise a redeployment that app-v23 removal does not perform');
 });
 
-test('MCP setup copy describes the app-v23 restricted identity instead of obsolete Root inheritance', () => {
+test('MCP setup copy binds app-v23 bearers to an approved managed agent instead of Root', () => {
     assert.doesNotMatch(appSource, /bearer (?:runs as|is) (?:an? )?(?:the )?local node operator/i);
     assert.doesNotMatch(appSource, /node-operator access|administrator credential for this SAGE node/i);
-    assert.match(appSource, /separate restricted Member identity/);
-    assert.match(appSource, /never inherits the approving Root or Admin key/);
+    assert.match(appSource, /selected existing approved agent/);
+    assert.match(appSource, /exact key (?:is already|must already be) managed by this node/);
 });
 
 test('historical Root authors are labelled without becoming selectable graph agents', () => {

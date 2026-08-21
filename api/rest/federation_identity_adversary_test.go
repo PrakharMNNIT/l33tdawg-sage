@@ -2,6 +2,9 @@ package rest
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,7 +18,9 @@ import (
 // still mint local MCP identities while the replacement Root is locked out.
 func TestAdversaryRootHandoverSeparatesMCPControlFromFederationTransportIdentity(t *testing.T) {
 	srv, _ := newTokenServer(t)
-	companionID := appV23RESTAgentID("22")
+	companionPub, companionKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	companionID := hex.EncodeToString(companionPub)
 	currentRootID := appV23RESTAgentID("33")
 	badger, err := store.NewBadgerStore(t.TempDir())
 	require.NoError(t, err)
@@ -29,6 +34,18 @@ func TestAdversaryRootHandoverSeparatesMCPControlFromFederationTransportIdentity
 	require.NoError(t, badger.RotateAppV23RootCredential(1, currentRootID, 2))
 	srv.badgerStore = badger
 	srv.SetPostV23ForNextTxAccessor(func() bool { return true })
+	tokenStore := srv.store.(*store.SQLiteStore)
+	tokenStore.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
+	tokenStore.SetMCPTokenIdentityResolver(func(id string) (ed25519.PrivateKey, bool) {
+		if id != companionID {
+			return nil, false
+		}
+		return companionKey, true
+	})
+	t.Cleanup(func() {
+		tokenStore.SetMCPTokenKeyedIdentityRequirement(nil)
+		tokenStore.SetMCPTokenIdentityResolver(nil)
+	})
 
 	for _, tc := range []struct {
 		name       string
@@ -45,7 +62,7 @@ func TestAdversaryRootHandoverSeparatesMCPControlFromFederationTransportIdentity
 		{
 			name:       "current Root can mint",
 			callerID:   currentRootID,
-			requestID:  currentRootID,
+			requestID:  companionID,
 			wantStatus: http.StatusCreated,
 		},
 	} {

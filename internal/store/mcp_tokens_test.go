@@ -59,6 +59,21 @@ func mkDigest(token string) string {
 	return hex.EncodeToString(d[:])
 }
 
+func setManagedMCPTokenIdentity(t *testing.T, s *SQLiteStore) (string, ed25519.PrivateKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	agentID := hex.EncodeToString(pub)
+	s.SetMCPTokenIdentityResolver(func(requested string) (ed25519.PrivateKey, bool) {
+		if requested != agentID {
+			return nil, false
+		}
+		return priv, true
+	})
+	t.Cleanup(func() { s.SetMCPTokenIdentityResolver(nil) })
+	return agentID, priv
+}
+
 func TestMCPTokens_InsertAndLookup(t *testing.T) {
 	s := newTokenStore(t)
 	ctx := context.Background()
@@ -216,30 +231,27 @@ func TestMCPTokenIssue_LegacyTokenPreservesDistinctIssuer(t *testing.T) {
 	require.Equal(t, "operator-owner", rows[0].IssuerID)
 }
 
-func TestAppV23MCPTokenPolicyMintsBearerSealedIdentityWithoutVault(t *testing.T) {
+func TestAppV23MCPTokenPolicyBindsBearerToManagedIdentityWithoutVault(t *testing.T) {
 	s := newTokenStore(t)
 	s.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
 	t.Cleanup(func() { s.SetMCPTokenKeyedIdentityRequirement(nil) })
-	var registeredID string
+	targetID, _ := setManagedMCPTokenIdentity(t, s)
+	registrarCalled := false
 	s.SetMCPTokenIdentityRegistrar(func(
-		_ context.Context,
-		pub ed25519.PublicKey,
-		_ ed25519.PrivateKey,
-		_, _ string,
+		context.Context, ed25519.PublicKey, ed25519.PrivateKey, string, string,
 	) error {
-		registeredID = hex.EncodeToString(pub)
-		return nil
+		registrarCalled = true
+		return errors.New("app-v23 bind-to-existing must not register a new principal")
 	})
 	t.Cleanup(func() { s.SetMCPTokenIdentityRegistrar(nil) })
 
 	issued, err := s.IssueMCPToken(
-		context.Background(), "must-be-keyed", "root-principal", "root-credential", "test",
+		context.Background(), "must-be-keyed", "root-principal", targetID, "test",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, issued)
-	require.Equal(t, issued.AgentID, registeredID)
-	require.NotEqual(t, "root-principal", issued.AgentID)
-	require.NotEqual(t, "root-credential", issued.AgentID)
+	require.Equal(t, targetID, issued.AgentID)
+	require.False(t, registrarCalled)
 
 	rows, listErr := s.ListMCPTokens(context.Background())
 	require.NoError(t, listErr)
@@ -257,22 +269,30 @@ func TestAppV23MCPTokenPolicyMintsBearerSealedIdentityWithoutVault(t *testing.T)
 		"the database digest alone must not decrypt an unencrypted-node token identity")
 }
 
+func TestAppV23MCPTokenPolicyRefusesUnmanagedIdentityWithoutWritingRow(t *testing.T) {
+	s := newTokenStore(t)
+	s.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
+	t.Cleanup(func() { s.SetMCPTokenKeyedIdentityRequirement(nil) })
+	targetID := strings.Repeat("a", 64)
+
+	issued, err := s.IssueMCPToken(
+		context.Background(), "unmanaged", "root-principal", targetID, "test",
+	)
+	require.Nil(t, issued)
+	require.ErrorContains(t, err, "managed identity resolver is not configured")
+	rows, listErr := s.ListMCPTokens(context.Background())
+	require.NoError(t, listErr)
+	require.Empty(t, rows, "failed bind-to-existing issuance must not create a token row")
+}
+
 func TestAppV23BearerSealedIdentitySurvivesRestartAndDBDigestCannotDecrypt(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "bearer-envelope-restart.db")
 	s, err := NewSQLiteStore(ctx, dbPath)
 	require.NoError(t, err)
 	s.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
-	s.SetMCPTokenIdentityRegistrar(func(
-		context.Context,
-		ed25519.PublicKey,
-		ed25519.PrivateKey,
-		string,
-		string,
-	) error {
-		return nil
-	})
-	issued, err := s.IssueMCPToken(ctx, "restart", "current-root", "current-root", "test")
+	targetID, _ := setManagedMCPTokenIdentity(t, s)
+	issued, err := s.IssueMCPToken(ctx, "restart", "current-root", targetID, "test")
 	require.NoError(t, err)
 	digest := mkDigest(issued.Token)
 
@@ -294,7 +314,6 @@ func TestAppV23BearerSealedIdentitySurvivesRestartAndDBDigestCannotDecrypt(t *te
 	)
 	require.Error(t, err, "the SHA-256 value stored in SQLite is not an envelope key")
 
-	s.SetMCPTokenIdentityRegistrar(nil)
 	s.SetMCPTokenKeyedIdentityRequirement(nil)
 	require.NoError(t, s.Close())
 
@@ -388,17 +407,8 @@ func TestMCPTokenBearerSealSurvivesLedgerEnableAndPassphraseChange(t *testing.T)
 	t.Cleanup(func() { _ = s.Close() })
 	s.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
 	t.Cleanup(func() { s.SetMCPTokenKeyedIdentityRequirement(nil) })
-	s.SetMCPTokenIdentityRegistrar(func(
-		context.Context,
-		ed25519.PublicKey,
-		ed25519.PrivateKey,
-		string,
-		string,
-	) error {
-		return nil
-	})
-	t.Cleanup(func() { s.SetMCPTokenIdentityRegistrar(nil) })
-	issued, err := s.IssueMCPToken(ctx, "bearer-first", "issuer", "operator", "test")
+	targetID, _ := setManagedMCPTokenIdentity(t, s)
+	issued, err := s.IssueMCPToken(ctx, "bearer-first", "issuer", targetID, "test")
 	require.NoError(t, err)
 	digest := mkDigest(issued.Token)
 
@@ -525,28 +535,19 @@ func TestAppV23LegacyMCPBearerActivationRevokesDurablyAcrossReopen(t *testing.T)
 		"app-v23 revocation must survive process restart")
 }
 
-func TestAppV23MCPTokenPolicyKeepsDistinctKeyedIdentity(t *testing.T) {
+func TestAppV23MCPTokenPolicyUsesExactManagedIdentityWithVault(t *testing.T) {
 	s := newTokenStore(t)
 	attachTokenVault(t, s)
 	s.SetMCPTokenKeyedIdentityRequirement(func() bool { return true })
 	t.Cleanup(func() { s.SetMCPTokenKeyedIdentityRequirement(nil) })
-	s.SetMCPTokenIdentityRegistrar(func(
-		_ context.Context,
-		_ ed25519.PublicKey,
-		_ ed25519.PrivateKey,
-		_, _ string,
-	) error {
-		return nil
-	})
-	t.Cleanup(func() { s.SetMCPTokenIdentityRegistrar(nil) })
+	targetID, _ := setManagedMCPTokenIdentity(t, s)
 
 	issued, err := s.IssueMCPToken(
-		context.Background(), "keyed", "root-principal", "root-credential", "test",
+		context.Background(), "keyed", "root-principal", targetID, "test",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, issued)
-	require.NotEqual(t, "root-principal", issued.AgentID)
-	require.NotEqual(t, "root-credential", issued.AgentID)
+	require.Equal(t, targetID, issued.AgentID)
 
 	agentID, signer, err := s.LookupMCPTokenSignerWithBearer(
 		context.Background(), issued.Token, mkDigest(issued.Token),

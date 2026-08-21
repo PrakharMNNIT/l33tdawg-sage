@@ -92,6 +92,14 @@ type MCPTokenIdentityRegistrar func(ctx context.Context, pub ed25519.PublicKey, 
 
 var mcpTokenRegistrars sync.Map // map[*SQLiteStore]MCPTokenIdentityRegistrar
 
+// MCPTokenIdentityResolver returns private key material already managed by
+// this node for an exact enrolled agent identity. App-v23 bearer issuance is
+// allowed to bind only to such an existing identity; it must never mint a new
+// pending principal that cannot complete the target-consent flow.
+type MCPTokenIdentityResolver func(agentID string) (ed25519.PrivateKey, bool)
+
+var mcpTokenIdentityResolvers sync.Map // map[*SQLiteStore]MCPTokenIdentityResolver
+
 // mcpTokenKeyedRequirements is process-local policy wiring. The callback is
 // evaluated for every issuance and lookup so the activation edge fails closed
 // immediately, before the durable revocation reconciler has to observe it.
@@ -120,6 +128,17 @@ func (s *SQLiteStore) SetMCPTokenIdentityRegistrar(reg MCPTokenIdentityRegistrar
 		return
 	}
 	mcpTokenRegistrars.Store(s, reg)
+}
+
+// SetMCPTokenIdentityResolver wires the local managed-key inventory used by
+// app-v23 token issuance. The resolver never exposes key material to callers;
+// the store seals the exact key under the one-shot bearer before persistence.
+func (s *SQLiteStore) SetMCPTokenIdentityResolver(resolve MCPTokenIdentityResolver) {
+	if resolve == nil {
+		mcpTokenIdentityResolvers.Delete(s)
+		return
+	}
+	mcpTokenIdentityResolvers.Store(s, resolve)
 }
 
 // SetMCPTokenKeyedIdentityRequirement wires the app-version gate used by all
@@ -381,6 +400,7 @@ func (s *SQLiteStore) insertMCPTokenWithBearerIdentity(
 	id, name, agentID, issuerID, tokenSHA256, tokenPubHex string,
 	tokenPriv ed25519.PrivateKey,
 	bearerPlaintext, provider string,
+	registrationState string,
 	cleanupPending bool,
 ) error {
 	if id == "" || agentID == "" || issuerID == "" || tokenSHA256 == "" ||
@@ -397,6 +417,9 @@ func (s *SQLiteStore) insertMCPTokenWithBearerIdentity(
 	if provider == "" {
 		provider = "mcp-token"
 	}
+	if registrationState != "pending" && registrationState != "confirmed" {
+		return fmt.Errorf("invalid token registration state %q", registrationState)
+	}
 	salt := make([]byte, mcpTokenBearerSealSaltSize)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return fmt.Errorf("generate bearer envelope salt: %w", err)
@@ -412,9 +435,9 @@ func (s *SQLiteStore) insertMCPTokenWithBearerIdentity(
 			id, name, agent_id, issuer_id, token_sha256, token_pubkey,
 			token_privkey_sealed, token_privkey_seal, token_privkey_salt,
 			registration_state, identity_provider, cleanup_pending
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, name, agentID, issuerID, tokenSHA256, tokenPubHex, sealed,
-		mcpTokenPrivateKeySealBearerV1, salt, provider, boolToInt(cleanupPending))
+		mcpTokenPrivateKeySealBearerV1, salt, registrationState, provider, boolToInt(cleanupPending))
 	if err != nil {
 		return fmt.Errorf("insert bearer-sealed mcp token identity: %w", err)
 	}
@@ -497,10 +520,9 @@ func openMCPTokenPrivateKeyWithBearer(
 }
 
 // IssueMCPToken is the single issuance primitive shared by direct REST, OAuth,
-// and the setup wizard. Vault-active nodes seal a distinct signing identity
-// with the vault. App-v23 nodes without a vault seal that identity under the
-// bearer itself, so an unencrypted personal node never falls back to Root.
-// Legacy keyless issuance remains only for unencrypted pre-v23 nodes.
+// and the setup wizard. App-v23 binds the bearer to an existing locally managed
+// identity; it never creates a pending principal. Older nodes retain their
+// historical distinct-identity/vault behavior for compatibility.
 func (s *SQLiteStore) IssueMCPToken(ctx context.Context, name, issuerID, legacyAgentID, provider string) (*MCPTokenIssue, error) {
 	return s.issueMCPToken(ctx, name, issuerID, legacyAgentID, provider, false)
 }
@@ -517,7 +539,7 @@ func (s *SQLiteStore) issueMCPToken(ctx context.Context, name, issuerID, legacyA
 		return nil, fmt.Errorf("issuer_id and legacy agent_id are required")
 	}
 	requireKeyed := s.mcpTokenKeyedIdentityRequired()
-	if s.VaultLocked() {
+	if !requireKeyed && s.VaultLocked() {
 		return nil, fmt.Errorf("keyed MCP token issuance unavailable: vault is locked")
 	}
 	raw := make([]byte, 32)
@@ -528,6 +550,30 @@ func (s *SQLiteStore) issueMCPToken(ctx context.Context, name, issuerID, legacyA
 	digest := sha256.Sum256([]byte(plain))
 	digestHex := hex.EncodeToString(digest[:])
 	issued := &MCPTokenIssue{ID: uuid.NewString(), Name: name, IssuerID: issuerID, Token: plain, CreatedAt: time.Now().UTC()}
+
+	if requireKeyed {
+		resolverAny, ok := mcpTokenIdentityResolvers.Load(s)
+		if !ok {
+			return nil, fmt.Errorf("MCP token issuance unavailable: managed identity resolver is not configured")
+		}
+		resolver := resolverAny.(MCPTokenIdentityResolver)
+		priv, found := resolver(legacyAgentID)
+		if !found || len(priv) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("MCP token target %s is not a locally managed identity", legacyAgentID)
+		}
+		pub, ok := priv.Public().(ed25519.PublicKey)
+		if !ok || hex.EncodeToString(pub) != legacyAgentID {
+			return nil, fmt.Errorf("managed key does not match MCP token target %s", legacyAgentID)
+		}
+		issued.AgentID = legacyAgentID
+		if err := s.insertMCPTokenWithBearerIdentity(
+			ctx, issued.ID, name, issued.AgentID, issuerID, digestHex,
+			issued.AgentID, priv, plain, provider, "confirmed", cleanupPending,
+		); err != nil {
+			return nil, err
+		}
+		return issued, nil
+	}
 
 	if !s.VaultActive() && !requireKeyed {
 		issued.AgentID = legacyAgentID
@@ -547,24 +593,14 @@ func (s *SQLiteStore) issueMCPToken(ctx context.Context, name, issuerID, legacyA
 		return nil, fmt.Errorf("generate token identity: %w", err)
 	}
 	issued.AgentID = hex.EncodeToString(pub)
-	if requireKeyed {
-		// App-v23 uses the bearer envelope regardless of memory-vault state.
-		// This keeps the credential stable across optional ledger
-		// enable/disable, lock/unlock, and passphrase-change transitions.
-		if err := s.insertMCPTokenWithBearerIdentity(
-			ctx, issued.ID, name, issued.AgentID, issuerID, digestHex,
-			issued.AgentID, priv, plain, provider, cleanupPending,
-		); err != nil {
-			return nil, err
-		}
-	} else if s.VaultActive() {
+	if s.VaultActive() {
 		if err := s.insertMCPTokenWithIdentity(ctx, issued.ID, name, issued.AgentID, issuerID, digestHex, issued.AgentID, priv, provider, cleanupPending); err != nil {
 			return nil, err
 		}
 	} else {
 		if err := s.insertMCPTokenWithBearerIdentity(
 			ctx, issued.ID, name, issued.AgentID, issuerID, digestHex,
-			issued.AgentID, priv, plain, provider, cleanupPending,
+			issued.AgentID, priv, plain, provider, "pending", cleanupPending,
 		); err != nil {
 			return nil, err
 		}
