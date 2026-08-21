@@ -32,11 +32,16 @@ import (
 // --- Mock stores -------------------------------------------------------------
 
 type mockMemoryStore struct {
-	memories       map[string]*memory.MemoryRecord
-	votes          map[string][]*store.ValidationVote
-	challenges     map[string][]*store.ChallengeEntry
-	corroborations map[string][]*store.Corroboration
-	pendingRecords []*memory.MemoryRecord
+	outside            outsideSpaceProbe
+	projectionRevision uint64
+	spaceRevision      uint64
+	vaultGeneration    uint64
+	querySimilarAfter  func()
+	memories           map[string]*memory.MemoryRecord
+	votes              map[string][]*store.ValidationVote
+	challenges         map[string][]*store.ChallengeEntry
+	corroborations     map[string][]*store.Corroboration
+	pendingRecords     []*memory.MemoryRecord
 	// setTagsCalls captures tag writes per memory_id for test assertions.
 	setTagsCalls map[string][]string
 	// setTagsCtx captures the most recent context passed to SetTags so
@@ -83,8 +88,17 @@ func newMockMemoryStore() *mockMemoryStore {
 
 func (m *mockMemoryStore) InsertMemory(_ context.Context, record *memory.MemoryRecord) error {
 	m.memories[record.MemoryID] = record
+	m.projectionRevision++
 	return nil
 }
+
+func (m *mockMemoryStore) MemoryProjectionRevision(_ context.Context) (uint64, error) {
+	return m.projectionRevision, nil
+}
+func (m *mockMemoryStore) MemorySpaceRevision(_ context.Context) (uint64, error) {
+	return m.spaceRevision, nil
+}
+func (m *mockMemoryStore) VaultGeneration() uint64 { return m.vaultGeneration }
 
 func (m *mockMemoryStore) GetMemory(_ context.Context, memoryID string) (*memory.MemoryRecord, error) {
 	rec, ok := m.memories[memoryID]
@@ -97,10 +111,32 @@ func (m *mockMemoryStore) GetMemory(_ context.Context, memoryID string) (*memory
 // Embedding-maintenance surface (added with the v11 embeddings-setup work) -
 // inert stubs, the REST tests never exercise re-embedding.
 func (m *mockMemoryStore) UpdateMemoryEmbedding(_ context.Context, _ string, _ []float32, _ string) error {
+	m.spaceRevision++
 	return nil
 }
 func (m *mockMemoryStore) CountMemoriesByProvider(_ context.Context) (map[string]int, error) {
 	return map[string]int{}, nil
+}
+
+// outsideFound/outsideEstablished/outsideErr drive the index-status disclosure
+// completeness probe backing index_status; sawSpace, when set, captures the
+// active-space argument the handler passed, so a test can assert the handler only
+// probes with an exact active vector space.
+type outsideSpaceProbe struct {
+	hasOutside, established bool
+	err                     error
+	sawSpace                *string
+	after                   func()
+}
+
+func (m *mockMemoryStore) DomainSpaceCompleteness(_ context.Context, _, activeSpace string, _ int) (bool, bool, error) {
+	if m.outside.sawSpace != nil {
+		*m.outside.sawSpace = activeSpace
+	}
+	if m.outside.after != nil {
+		m.outside.after()
+	}
+	return m.outside.hasOutside, m.outside.established, m.outside.err
 }
 func (m *mockMemoryStore) ListMemoriesForReembed(_ context.Context, _ string, _ int) ([]store.ReembedItem, error) {
 	return nil, nil

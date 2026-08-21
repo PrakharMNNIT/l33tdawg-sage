@@ -171,6 +171,9 @@ func TestPostgresMemoryProjectionRevisionAndVaultGeneration(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(
 		`SELECT revision FROM graph_projection_revision WHERE singleton = TRUE`,
 	)).WillReturnRows(pgxmock.NewRows([]string{"revision"}).AddRow(int64(17)))
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT revision FROM memory_space_revision WHERE singleton = TRUE`,
+	)).WillReturnRows(pgxmock.NewRows([]string{"revision"}).AddRow(int64(9)))
 
 	revision, err := s.MemoryProjectionRevision(context.Background())
 	require.NoError(t, err)
@@ -178,6 +181,9 @@ func TestPostgresMemoryProjectionRevisionAndVaultGeneration(t *testing.T) {
 	graphRevision, err := s.GraphProjectionRevision(context.Background())
 	require.NoError(t, err)
 	require.EqualValues(t, 17, graphRevision)
+	spaceRevision, err := s.MemorySpaceRevision(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, 9, spaceRevision)
 	require.Zero(t, s.VaultGeneration())
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -227,8 +233,12 @@ func TestPostgresProjectionSchemaReplacesBroadTriggersWithScopedStatementTrigger
 	require.GreaterOrEqual(t, memoryDrop, 0)
 	require.Greater(t, memoryCreate, memoryDrop)
 	require.Contains(t, schema,
-		"AFTER UPDATE OF submitting_agent, content, content_hash,")
+		"AFTER UPDATE OF memory_id, submitting_agent, content, content_hash,")
 	require.NotContains(t, schema, "AFTER UPDATE ON memories")
+	require.Contains(t, schema,
+		"AFTER UPDATE OF embedding, embedding_provider ON memories")
+	require.Contains(t, schema,
+		"FOR EACH STATEMENT EXECUTE FUNCTION sage_bump_memory_space_revision()")
 
 	graphDrop := strings.Index(
 		schema,

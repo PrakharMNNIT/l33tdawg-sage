@@ -562,6 +562,23 @@ components:
           description: Number of visible memories returned in this response.
         filtered:
           $ref: "#/components/schemas/FilterInfo"
+        index_status:
+          type: string
+          enum: [complete, incomplete, unavailable]
+          description: >
+            Present on an EMPTY, domain-scoped semantic recall. "complete" and
+            "incomplete" are available only for the exact unnarrowed local
+            status_filter=committed contract; other empty query universes emit
+            "unavailable" rather than certifying the wrong scope. "complete":
+            the empty result is genuine local absence.
+            "incomplete": the domain holds committed/challenged rows that no
+            vector, or a foreign vector space, keeps recall from returning —
+            empty is not proof of absence. "unavailable": the verdict could
+            not be proven leak-free and scope-exact (including when the caller
+            lacks full visibility, canonical projection health is not exact,
+            the vector space is unknown, the query uses status/provider/tag/
+            confidence/cursor/text narrowing, federation is requested, or the
+            live domain is too large to settle cheaply). Never a count or list.
 
     MemoryLinkRequest:
       type: object

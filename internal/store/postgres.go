@@ -283,7 +283,7 @@ var postgresProjectionSchema = []string{
 	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
 	`DROP TRIGGER IF EXISTS memories_projection_revision_update_v1 ON memories`,
 	`CREATE TRIGGER memories_projection_revision_update_v1
-	 AFTER UPDATE OF submitting_agent, content, content_hash,
+	 AFTER UPDATE OF memory_id, submitting_agent, content, content_hash,
 	   domain_tag, status, created_at ON memories
 	 FOR EACH STATEMENT
 	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
@@ -291,6 +291,25 @@ var postgresProjectionSchema = []string{
 	`CREATE TRIGGER memories_projection_revision_delete_v1
 	 AFTER DELETE ON memories FOR EACH STATEMENT
 	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
+	`CREATE TABLE IF NOT EXISTS memory_space_revision (
+		singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+		revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+	)`,
+	`INSERT INTO memory_space_revision(singleton, revision)
+	 VALUES (TRUE, 0) ON CONFLICT (singleton) DO NOTHING`,
+	`CREATE OR REPLACE FUNCTION sage_bump_memory_space_revision()
+	 RETURNS TRIGGER
+	 LANGUAGE plpgsql
+	 AS $$
+	 BEGIN
+	   UPDATE memory_space_revision SET revision = revision + 1 WHERE singleton = TRUE;
+	   RETURN NULL;
+	 END
+	 $$`,
+	`DROP TRIGGER IF EXISTS memories_space_revision_update_v1 ON memories`,
+	`CREATE TRIGGER memories_space_revision_update_v1
+	 AFTER UPDATE OF embedding, embedding_provider ON memories
+	 FOR EACH STATEMENT EXECUTE FUNCTION sage_bump_memory_space_revision()`,
 	`CREATE TABLE IF NOT EXISTS graph_projection_revision (
 		singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
 		revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
@@ -382,6 +401,21 @@ func (s *PostgresStore) MemoryProjectionRevision(ctx context.Context) (uint64, e
 	return uint64(revision), nil
 }
 
+// MemorySpaceRevision tracks vector/provider mutations separately from the
+// canonical serving projection revision.
+func (s *PostgresStore) MemorySpaceRevision(ctx context.Context) (uint64, error) {
+	var revision int64
+	if err := s.db.QueryRow(ctx,
+		`SELECT revision FROM memory_space_revision WHERE singleton = TRUE`,
+	).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("read memory space revision: %w", err)
+	}
+	if revision < 0 {
+		return 0, errors.New("memory space revision is negative")
+	}
+	return uint64(revision), nil
+}
+
 // GraphProjectionRevision returns the transactionally maintained generation of
 // SQL metadata rendered into graph nodes and edges.
 func (s *PostgresStore) GraphProjectionRevision(ctx context.Context) (uint64, error) {
@@ -421,6 +455,9 @@ var postgresTaskAssignmentSchema = []string{
 	// CEREBRUM agent-as-lobe: each agent's top memories by confidence
 	// (WHERE submitting_agent = ? ORDER BY confidence_score DESC), index-satisfiable.
 	`CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories (submitting_agent, confidence_score)`,
+	// Bounded live-row walk for DomainSpaceCompleteness. Rows outside the exact
+	// committed/challenged predicate are absent from this access path.
+	`CREATE INDEX IF NOT EXISTS idx_memories_domain_live_status ON memories (domain_tag, status, memory_id) WHERE status IN ('committed','challenged')`,
 	// CEREBRUM distributed engrams: bounded deterministic per-memory prefix.
 	// The memory_id prefix continues to serve the distinct-count aggregation.
 	`CREATE INDEX IF NOT EXISTS idx_corroborations_memory_order ON corroborations (memory_id, created_at, agent_id, id)`,
@@ -691,6 +728,49 @@ func (s *PostgresStore) CountMemoriesByProvider(ctx context.Context) (map[string
 		out[provider] = n
 	}
 	return out, rows.Err()
+}
+
+// DomainSpaceCompleteness — see Store. No per-record authorization: caller-safe
+// only when the handler has proven full domain visibility. Reads at most cap+1
+// committed/challenged rows in the domain (live-row composite-index bounded, no decrypt) and
+// classifies each by embedding space alone. The first out-of-space row settles
+// hasOutside; proving absence (complete) needs every row, so a bounded prefix that
+// fills without one returns established=false (→ "unavailable").
+func (s *PostgresStore) DomainSpaceCompleteness(
+	ctx context.Context, domain, activeSpace string, cap int,
+) (hasOutside, established bool, err error) {
+	rows, qerr := s.db.Query(ctx,
+		`SELECT CASE WHEN embedding IS NULL THEN 1 ELSE 0 END,
+		        COALESCE(embedding_provider, '')
+		 FROM memories
+		 WHERE domain_tag = $1 AND status IN ('committed','challenged')
+		 ORDER BY status, memory_id
+		 LIMIT $2`,
+		domain, cap+1)
+	if qerr != nil {
+		return false, false, fmt.Errorf("domain space-completeness scan: %w", qerr)
+	}
+	defer rows.Close()
+
+	scanned := 0
+	for rows.Next() {
+		scanned++
+		var embNull int
+		var provider string
+		if scanErr := rows.Scan(&embNull, &provider); scanErr != nil {
+			return false, false, fmt.Errorf("scan row: %w", scanErr)
+		}
+		if embNull != 0 || provider != activeSpace {
+			return true, true, nil // a concrete space-unreachable row → incomplete
+		}
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return false, false, rerr
+	}
+	if scanned > cap {
+		return false, false, nil // bounded prefix full, none out-of-space → unavailable
+	}
+	return false, true, nil // every committed/challenged row is in the active space → complete
 }
 
 func (s *PostgresStore) ListMemoriesForReembed(ctx context.Context, targetProvider string, limit int) ([]ReembedItem, error) {

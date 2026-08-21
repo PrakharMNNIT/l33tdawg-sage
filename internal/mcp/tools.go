@@ -1218,6 +1218,13 @@ func (s *Server) toolRecall(ctx context.Context, params map[string]any) (any, er
 	if degradedReason != "" {
 		out["degraded_reason"] = degradedReason
 	}
+	// Caller-scoped completeness of an empty result: whether THIS caller's visible
+	// set is fully reachable ("complete"), has rows recall can't return
+	// ("incomplete"), or couldn't be evaluated exactly ("unavailable"). Never a
+	// count — so it cannot report rows the caller may not see.
+	if queryResp.IndexStatus != "" {
+		out["index_status"] = queryResp.IndexStatus
+	}
 	if queryResp.Federation != nil {
 		out["federation"] = queryResp.Federation
 	} else if federationOptions.requested() {
@@ -1271,6 +1278,9 @@ type recallResp struct {
 	} `json:"results"`
 	TotalCount int                   `json:"total_count"`
 	Federation *recallFederationInfo `json:"federation,omitempty"`
+	// IndexStatus: caller-scoped completeness of an empty result (complete /
+	// incomplete / unavailable). Relayed so an empty recall is not read as absence.
+	IndexStatus string `json:"index_status,omitempty"`
 }
 
 type recallFederationInfo struct {
@@ -3030,6 +3040,12 @@ func (s *Server) toolTurn(ctx context.Context, params map[string]any) (any, erro
 	}
 	if _, hasErr := result["recall_error"]; !hasErr {
 		appendTurnRecallResult(result, turnRecall, recallDomain)
+	}
+	// appendTurnRecallResult returns before setting anything when the recall is
+	// empty — exactly the case index_status exists to describe — so relay the
+	// caller-scoped completeness here rather than dropping it at the early return.
+	if _, hasErr := result["recall_error"]; !hasErr && turnRecall.IndexStatus != "" {
+		result["index_status"] = turnRecall.IndexStatus
 	}
 
 	// Phase 3: Pipeline — check for incoming work and completed results.

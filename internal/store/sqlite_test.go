@@ -106,6 +106,17 @@ func TestRequirePristineStateSyncProjectionAcceptsOnlyCanonicalSchemaSeeds(t *te
 	})
 }
 
+func TestRequirePristineStateSyncProjectionRejectsAdvancedMemorySpaceRevision(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, s.RequirePristineStateSyncProjection(ctx))
+	_, err := s.conn.ExecContext(ctx,
+		`UPDATE memory_space_revision SET revision = 1 WHERE singleton = 1`)
+	require.NoError(t, err)
+	require.ErrorContains(t, s.RequirePristineStateSyncProjection(ctx),
+		"pristine memory space revision")
+}
+
 func TestInsertAndGetMemory(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

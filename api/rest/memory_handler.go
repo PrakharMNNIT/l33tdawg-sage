@@ -193,6 +193,18 @@ type QueryMemoryResponse struct {
 	// ran: which peers were queried and which failed (fail-closed peers are
 	// reported, never silently dropped).
 	Federation *FederationInfo `json:"federation,omitempty"`
+	// IndexStatus discloses, on an EMPTY domain-scoped recall of the default
+	// (committed) contract, whether the domain is fully reachable in the active
+	// vector space: "complete" (empty is genuine absence), "incomplete" (the
+	// domain holds committed/challenged rows that no vector, or a foreign space,
+	// keeps recall from returning — empty is not proof of absence), or
+	// "unavailable" (the verdict could not be proven leak-free: the caller is not
+	// proven to see every record in the domain, there is no exact active space, a
+	// non-default status filter was used, or the domain is too large to settle
+	// cheaply). It is emitted only to a caller proven to see every record in the
+	// domain, so it cannot disclose the existence or number of records hidden from
+	// that caller. Never a count or a list.
+	IndexStatus string `json:"index_status,omitempty"`
 }
 
 // FederationInfo discloses the outcome of a federated recall fan-out.
@@ -949,6 +961,41 @@ func (s *Server) appV25RecoveredReadOverridesLegacyVisibility(agentID, domain st
 	}
 	allowed, err := s.badgerStore.AuthorizeAppV25RecoveredDirectRead(agentID, domain)
 	return err == nil && allowed
+}
+
+// callerHasProvenFullDomainVisibility reports whether the caller is proven — at
+// O(1) per-caller cost, conservatively — to be able to read EVERY committed or
+// challenged record in `domain`, regardless of per-record classification. Only
+// such a caller may drive an empty recall's index_status verdict: for anyone
+// else a hidden higher-classification row could flip complete/incomplete and
+// leak its existence, so the handler returns "unavailable" instead.
+//
+// The proof rests on hasMemoryReadAccess being monotonic in the required
+// classification (higher clearance is only ever harder): proving read access at
+// the TOP of the 0–4 clearance lattice (TopSecret) proves it at every lower
+// classification, so no classification/clearance/domain gate can then hide a row
+// in this domain — and hasMemoryReadAccess runs both the fork-era and app-v23
+// gates internally. index_status is only ever computed on a domain-scoped recall
+// (req.DomainTag != ""), which structurally disables the pre-v23 cross-domain
+// author gate. App-v23 additionally has an author-scoped visible_agents
+// restriction that hasMemoryReadAccess does not cover, so require it unrestricted.
+//
+// App-v23 also hides unpublished/quarantined SQL projections. The separate
+// completeness gate binds its audit to current SQL and canonical revisions
+// before and after the probe. This predicate proves only policy visibility;
+// both proofs are required before a verdict can be disclosed.
+func (s *Server) callerHasProvenFullDomainVisibility(agentID, domain string, at time.Time) bool {
+	if s.badgerStore == nil || agentID == "" || domain == "" {
+		return false // cannot prove without on-chain policy state
+	}
+	fullyCleared, err := s.hasMemoryReadAccess(domain, agentID, uint8(tx.ClearanceTopSecret), at)
+	if err != nil || !fullyCleared {
+		return false
+	}
+	if s.isPostV23ForNextTx() && s.appV23LegacyVisibilityRestricted(agentID) {
+		return false // an author-scoped filter can still hide rows from this caller
+	}
+	return true
 }
 
 // hasMemoryReadAccess applies app-v22's domain-independent read capability
@@ -1841,10 +1888,11 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
+	activeVectorSpace := s.activeEmbeddingProvider()
 	opts := store.QueryOptions{
 		DomainTag:      req.DomainTag,
 		Provider:       req.Provider,
-		VectorProvider: s.activeEmbeddingProvider(),
+		VectorProvider: activeVectorSpace,
 		MinConfidence:  req.MinConfidence,
 		StatusFilter:   req.StatusFilter,
 		TopK:           s.disclosureRecallTopK(req.TopK),
@@ -1863,6 +1911,20 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	// store as DecayFloor, which filters the decayed value over the full candidate
 	// set before the top-K trim, pinned to `start` so it matches what we serialize.
 	setDecayFloor(&opts, start)
+
+	// Capture the exact canonical + vector-space source BEFORE semantic lookup.
+	// If any serving, canonical, or embedding-space mutation occurs before the
+	// later completeness proof finishes, the empty+verdict pair is discarded as
+	// unavailable rather than combining observations from different snapshots.
+	var indexStatusSource recallProjectionSource
+	indexStatusSourceExact := false
+	if req.DomainTag != "" && localDomainReadable &&
+		recallIndexStatusHasExactQueryUniverse(req) &&
+		activeVectorSpace != "" &&
+		s.callerHasProvenFullDomainVisibility(queryAgentID, req.DomainTag, start) {
+		indexStatusSource, indexStatusSourceExact =
+			s.exactCanonicalMemoryProjectionSource(r.Context())
+	}
 
 	var records []*memory.MemoryRecord
 	if localDomainReadable {
@@ -2047,6 +2109,58 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 		PlanAuthorizationModels:       authorizationModels,
 		PlanAuthorizationAttestations: authorizationAttestations,
 	})
+
+	// On an EMPTY, domain-scoped recall, disclose whether the domain is fully
+	// reachable in the active vector space, so an empty result is not silently read
+	// as absence. This is emitted ONLY when it can be proven to leak nothing:
+	//
+	//   - The completeness verdict (complete/incomplete) is computed over the
+	//     domain's rows with NO per-record authorization, so it is emitted ONLY to
+	//     a caller PROVEN to see every record in the domain
+	//     (callerHasProvenFullDomainVisibility). For such a caller no examined row
+	//     can be hidden, so the verdict cannot disclose a hidden record's existence
+	//     or count. Every other caller gets "unavailable" — never a partial
+	//     evaluation, never a guess.
+	//   - Only the exact unnarrowed local semantic recall contract is described:
+	//     status_filter "committed" (with challenged included), no provider/tag/
+	//     confidence/cursor/text narrowing, and no federation. Any other query
+	//     universe → "unavailable", never a verdict over the wrong rows or peers.
+	//   - Without an exact active vector space, recall does not partition by space
+	//     at all, so the probe's space test is meaningless → "unavailable".
+	//   - The probe is bounded; a domain too large to settle cheaply → "unavailable".
+	//
+	// The signal is a three-value enum, never a count or a list.
+	if len(resp.Results) == 0 && req.DomainTag != "" {
+		activeSpace := activeVectorSpace
+		switch {
+		case !localDomainReadable:
+			resp.IndexStatus = "unavailable"
+		case !recallIndexStatusHasExactQueryUniverse(req):
+			resp.IndexStatus = "unavailable"
+		case activeSpace == "":
+			resp.IndexStatus = "unavailable"
+		case !s.callerHasProvenFullDomainVisibility(queryAgentID, req.DomainTag, now):
+			resp.IndexStatus = "unavailable"
+		case !indexStatusSourceExact:
+			resp.IndexStatus = "unavailable"
+		default:
+			hasOutside, established, cErr := s.store.DomainSpaceCompleteness(
+				r.Context(), req.DomainTag, activeSpace, store.CandidateFilterScanBudget)
+			switch {
+			case !s.canonicalMemoryProjectionSourceUnchanged(r.Context(), indexStatusSource):
+				resp.IndexStatus = "unavailable"
+			case cErr != nil:
+				s.logger.Warn().Err(cErr).Str("domain", req.DomainTag).Msg("recall index-status disclosure unavailable")
+				resp.IndexStatus = "unavailable"
+			case !established:
+				resp.IndexStatus = "unavailable"
+			case hasOutside:
+				resp.IndexStatus = "incomplete"
+			default:
+				resp.IndexStatus = "complete"
+			}
+		}
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }

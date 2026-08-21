@@ -62,13 +62,38 @@ AFTER INSERT ON memories FOR EACH STATEMENT
 EXECUTE FUNCTION sage_bump_memory_projection_revision();
 
 CREATE TRIGGER memories_projection_revision_update_v1
-AFTER UPDATE OF submitting_agent, content, content_hash, domain_tag, status, created_at ON memories
+AFTER UPDATE OF memory_id, submitting_agent, content, content_hash, domain_tag, status, created_at ON memories
 FOR EACH STATEMENT
 EXECUTE FUNCTION sage_bump_memory_projection_revision();
 
 CREATE TRIGGER memories_projection_revision_delete_v1
 AFTER DELETE ON memories FOR EACH STATEMENT
 EXECUTE FUNCTION sage_bump_memory_projection_revision();
+
+-- Independent invalidation token for the vector-space universe. Re-embedding
+-- must fence an empty semantic query through its completeness proof without
+-- invalidating the canonical SQL-to-ledger inventory audit.
+CREATE TABLE memory_space_revision (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+);
+INSERT INTO memory_space_revision(singleton, revision) VALUES (TRUE, 0);
+
+CREATE FUNCTION sage_bump_memory_space_revision()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE memory_space_revision
+    SET revision = revision + 1
+    WHERE singleton = TRUE;
+    RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER memories_space_revision_update_v1
+AFTER UPDATE OF embedding, embedding_provider ON memories FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_memory_space_revision();
 
 -- Metadata invalidation token for graph nodes and edges. Memory fields already
 -- covered by memory_projection_revision are combined with this token in the
@@ -493,6 +518,9 @@ ALTER TABLE federations ADD COLUMN IF NOT EXISTS allowed_depts TEXT[];
 -- ============================================================
 CREATE INDEX idx_memories_domain ON memories (domain_tag);
 CREATE INDEX idx_memories_status ON memories (status);
+CREATE INDEX IF NOT EXISTS idx_memories_domain_live_status
+    ON memories (domain_tag, status, memory_id)
+    WHERE status IN ('committed','challenged');
 CREATE INDEX IF NOT EXISTS idx_memories_assignee ON memories (assignee) WHERE assignee != '';
 CREATE INDEX IF NOT EXISTS idx_memories_task_picked_up_by ON memories (task_picked_up_by) WHERE task_picked_up_by != '';
 -- Serves FindByContentHash, which voter.Run evaluates per pending memory on a

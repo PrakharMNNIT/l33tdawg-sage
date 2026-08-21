@@ -383,6 +383,15 @@ func (s *SQLiteStore) RequirePristineStateSyncProjection(ctx context.Context) er
 			}
 			continue
 		}
+		if table == "memory_space_revision" {
+			var id, revision int64
+			if err := s.conn.QueryRowContext(ctx,
+				`SELECT singleton, revision FROM memory_space_revision`,
+			).Scan(&id, &revision); err != nil || id != 1 || revision != 0 {
+				return errors.New("state sync receiving requires a pristine memory space revision")
+			}
+			continue
+		}
 		if table == "graph_projection_revision" {
 			var id, revision int64
 			if err := s.conn.QueryRowContext(ctx,
@@ -457,6 +466,13 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain_tag);
 	CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+	-- Bounds empty-recall completeness work to live rows in one domain. The
+	-- partial predicate exactly matches DomainSpaceCompleteness, while the full
+	-- key supplies its deterministic bounded walk without examining proposed,
+	-- validated, or deprecated rows.
+	CREATE INDEX IF NOT EXISTS idx_memories_domain_live_status
+		ON memories(domain_tag, status, memory_id)
+		WHERE status IN ('committed','challenged');
 	CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
 	-- Serves the CEREBRUM agent-as-lobe read: each agent's top memories by
 	-- confidence (WHERE submitting_agent = ? ORDER BY confidence_score DESC).
@@ -983,7 +999,7 @@ func (s *SQLiteStore) ensureMemoryProjectionRevision(ctx context.Context) error 
 		DROP TRIGGER IF EXISTS memories_projection_revision_update;
 		CREATE TRIGGER memories_projection_revision_update
 			AFTER UPDATE OF
-				submitting_agent, content, content_hash,
+				memory_id, submitting_agent, content, content_hash,
 				domain_tag, status, created_at
 			ON memories
 			BEGIN
@@ -994,6 +1010,19 @@ func (s *SQLiteStore) ensureMemoryProjectionRevision(ctx context.Context) error 
 			AFTER DELETE ON memories
 			BEGIN
 				UPDATE memory_projection_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
+		CREATE TABLE IF NOT EXISTS memory_space_revision (
+			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			revision  INTEGER NOT NULL CHECK (revision >= 0)
+		);
+		INSERT OR IGNORE INTO memory_space_revision(singleton, revision)
+			VALUES (1, 0);
+		DROP TRIGGER IF EXISTS memories_space_revision_update;
+		CREATE TRIGGER memories_space_revision_update
+			AFTER UPDATE OF embedding, embedding_provider ON memories
+			BEGIN
+				UPDATE memory_space_revision
 				SET revision = revision + 1 WHERE singleton = 1;
 			END;
 	`
@@ -1015,6 +1044,22 @@ func (s *SQLiteStore) MemoryProjectionRevision(ctx context.Context) (uint64, err
 	}
 	if revision < 0 {
 		return 0, errors.New("memory projection revision is negative")
+	}
+	return uint64(revision), nil
+}
+
+// MemorySpaceRevision tracks the vector bytes/provider partition independently
+// from the canonical serving projection. Re-embedding therefore fences semantic
+// absence proofs without invalidating the expensive canonical inventory audit.
+func (s *SQLiteStore) MemorySpaceRevision(ctx context.Context) (uint64, error) {
+	var revision int64
+	if err := s.conn.QueryRowContext(ctx,
+		`SELECT revision FROM memory_space_revision WHERE singleton = 1`,
+	).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("read memory space revision: %w", err)
+	}
+	if revision < 0 {
+		return 0, errors.New("memory space revision is negative")
 	}
 	return uint64(revision), nil
 }
@@ -1374,6 +1419,7 @@ func (s *SQLiteStore) migrateTaskSupport(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `ALTER TABLE memories_new RENAME TO memories`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain_tag)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_domain_live_status ON memories(domain_tag, status, memory_id) WHERE status IN ('committed','challenged')`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_provider ON memories(provider)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_task_status ON memories(task_status) WHERE task_status != ''`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories(submitting_agent, confidence_score)`)
@@ -1591,6 +1637,55 @@ func (s *SQLiteStore) CountMemoriesByProvider(ctx context.Context) (map[string]i
 		out[provider] = n
 	}
 	return out, rows.Err()
+}
+
+// DomainSpaceCompleteness — see Store. No per-record authorization: caller-safe
+// ONLY when the handler has proven full domain visibility, so every examined row
+// is one the caller may see. Reads at most cap+1 committed/challenged rows in the
+// domain (bounded by the live-row composite index — no decrypt, no cosine, no policy) and
+// classifies each by embedding space alone: out-of-space ⟺ no vector or a
+// provider tag other than activeSpace. The first out-of-space row settles
+// hasOutside immediately (an existence proof, independent of domain size). Absence
+// (complete) requires seeing every committed/challenged row; if the bounded prefix
+// fills without one, established=false and the handler reports "unavailable"
+// rather than scanning the whole domain to prove a negative.
+func (s *SQLiteStore) DomainSpaceCompleteness(
+	ctx context.Context, domain, activeSpace string, cap int,
+) (hasOutside, established bool, err error) {
+	rows, qerr := s.conn.QueryContext(ctx,
+		`SELECT CASE WHEN embedding IS NULL THEN 1 ELSE 0 END,
+		        COALESCE(embedding_provider, '')
+		 FROM memories
+		 WHERE domain_tag = ? AND status IN ('committed','challenged')
+		 ORDER BY status, memory_id
+		 LIMIT ?`,
+		domain, cap+1)
+	if qerr != nil {
+		return false, false, fmt.Errorf("domain space-completeness scan: %w", qerr)
+	}
+	defer func() { _ = rows.Close() }()
+
+	scanned := 0
+	for rows.Next() {
+		scanned++
+		var embNull int
+		var provider string
+		if scanErr := rows.Scan(&embNull, &provider); scanErr != nil {
+			return false, false, fmt.Errorf("scan row: %w", scanErr)
+		}
+		if embNull != 0 || provider != activeSpace {
+			return true, true, nil // a concrete space-unreachable row → incomplete
+		}
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return false, false, rerr
+	}
+	if scanned > cap {
+		// cap+1 committed/challenged rows, none out-of-space in the bounded prefix:
+		// cannot prove the rest are reachable without an unbounded scan → unavailable.
+		return false, false, nil
+	}
+	return false, true, nil // every committed/challenged row is in the active space → complete
 }
 
 // GetDomainLastActivity returns, per domain, the created_at of its most
