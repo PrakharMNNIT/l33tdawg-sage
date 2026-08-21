@@ -117,6 +117,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.24 | Session-fenced federated claim recovery and idempotent reply events, MCP boot-guidance result isolation, actionable-only retention labels, and qualified-versus-bare embedding alias diagnosis; no new app version; app-v26 remains the ceiling |
 | v11.18.25 | Generation-fenced CEREBRUM task refreshes with fail-closed reconciliation, plus portable merge-preserving Codex hook shell migration; no new app version; app-v26 remains the ceiling |
 | v11.18.26 | Validated Go dependency refresh plus pinned CI action updates; app-v23 MCP bearer issuance binds to existing approved locally managed agents; token-create help is side-effect free; no consensus change; app-v26 remains the ceiling |
+| v11.18.27 | Caller-safe empty semantic-recall completeness disclosure with exact projection/vector-space fencing and bounded indexed probes; no consensus change; app-v26 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
