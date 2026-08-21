@@ -275,7 +275,7 @@ func TestInitializeCarriesAutoConnectWithoutPaddingFirstToolResult(t *testing.T)
 	require.Equal(t, instructions, repeated.Result.(map[string]any)["instructions"])
 }
 
-func TestFirstToolRetainsAutoConnectFallbackWhenClientSkipsInitialize(t *testing.T) {
+func TestFirstToolStaysCleanWhenClientSkipsInitialize(t *testing.T) {
 	ts := mockSageAPI(t)
 	defer ts.Close()
 
@@ -299,8 +299,19 @@ func TestFirstToolRetainsAutoConnectFallbackWhenClientSkipsInitialize(t *testing
 		&jsonRPCRequest{JSONRPC: "2.0", ID: float64(1), Method: "tools/call", Params: params},
 	)
 	content := response.Result.(map[string]any)["content"].([]map[string]any)
-	require.Contains(t, content[0]["text"], "[SAGE Auto-Connect]")
-	require.Contains(t, content[0]["text"], `"echo": "legacy"`)
+	require.JSONEq(t, `{"echo":"legacy"}`, content[0]["text"].(string))
+	require.NotContains(t, content[0]["text"], "[SAGE Auto-Connect]")
+	require.NotContains(t, content[0]["text"], "BOOT SAFEGUARDS")
+	require.NotContains(t, content[0]["text"], "MEMORY.md")
+
+	initialize := s.handleRequest(
+		WithConversationID(context.Background(), "legacy:no-initialize"),
+		&jsonRPCRequest{JSONRPC: "2.0", ID: float64(2), Method: "initialize"},
+	)
+	instructions := initialize.Result.(map[string]any)["instructions"].(string)
+	require.Contains(t, instructions, "[SAGE Auto-Connect]")
+	require.NotContains(t, instructions, "BOOT SAFEGUARDS")
+	require.NotContains(t, instructions, "MEMORY.md")
 }
 
 func TestConcurrentInitializeRunsOneSessionBootCheck(t *testing.T) {
@@ -349,9 +360,9 @@ func TestConcurrentInitializeRunsOneSessionBootCheck(t *testing.T) {
 	// One inception registration plus the historical idempotent auto-register;
 	// neither operation may multiply with concurrent initialize requests.
 	require.Equal(t, int32(2), registerCalls.Load())
-	// One caller-scoped count plus one boot-safeguard lookup; neither may
-	// multiply with the number of concurrent initialize requests.
-	require.Equal(t, int32(2), listCalls.Load())
+	// One caller-scoped count; it must not multiply with the number of
+	// concurrent initialize requests.
+	require.Equal(t, int32(1), listCalls.Load())
 }
 
 func TestExplicitFirstInceptionSuppressesCompatibilityPreamble(t *testing.T) {

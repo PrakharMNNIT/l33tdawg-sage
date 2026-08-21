@@ -12,9 +12,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Managed engine install: SAGE downloads a pinned llama.cpp release build
@@ -106,7 +108,7 @@ func (m *Manager) EngineSizeBytes() int64 {
 // managed binary is already present.
 func (m *Manager) InstallEngine(ctx context.Context, progress func(done, total int64)) error {
 	if m.EngineInstalled() {
-		return nil
+		return m.preflightEngine(ctx)
 	}
 	// Guard against concurrent installs racing on the shared .part dir and
 	// rename (same pattern as Download). Without it, a second call's
@@ -198,13 +200,87 @@ func (m *Manager) InstallEngine(ctx context.Context, progress func(done, total i
 	// Belt-and-braces: if another install won the race while we were extracting,
 	// leave its engine in place rather than RemoveAll/Rename over it.
 	if m.EngineInstalled() {
-		return nil
+		return m.preflightEngine(ctx)
 	}
 	_ = os.RemoveAll(m.engineDir())
 	if err := os.Rename(tmpDir, m.engineDir()); err != nil {
 		return fmt.Errorf("install engine: %w", err)
 	}
+	return m.preflightEngine(ctx)
+}
+
+// EngineIncompatibleError means the managed engine downloaded and extracted
+// cleanly but cannot LOAD on this host: the dynamic loader rejected it because
+// the host's C/C++ runtime is older than the prebuilt asset requires. Distinct
+// from a download/extract failure — the bytes are correct, the host is too old
+// for this build. Callers should route the operator to a bring-your-own reranker
+// rather than retrying the managed install.
+type EngineIncompatibleError struct {
+	OS, Arch string
+	Detail   string // the loader's own message, e.g. "version `GLIBC_2.38' not found"
+}
+
+func (e *EngineIncompatibleError) Error() string {
+	return fmt.Sprintf(
+		"managed reranker engine cannot run on this host (%s/%s): %s. "+
+			"The prebuilt engine needs a newer C/C++ runtime than this host provides "+
+			"(the pinned linux/arm64 llama.cpp build is compiled on a newer base than the "+
+			"amd64 one, so an older-glibc arm64 host such as a Jetson on Ubuntu 22.04 hits this). "+
+			"Bring your own instead: run your own llama-server and set SAGE_RERANK_ENABLED=1, "+
+			"SAGE_RERANK_KIND=llamacpp, and SAGE_RERANK_URL to its address.",
+		e.OS, e.Arch, e.Detail)
+}
+
+// preflightEngine confirms the freshly-installed managed binary can actually
+// LOAD on this host, not merely that it downloaded and extracted. The install
+// verifies a sha256 and lands bytes on disk; that is silent about whether the
+// dynamic loader can satisfy the binary's C/C++ runtime requirements. On a host
+// with an older glibc than the build base (JetPack-6 / Ubuntu 22.04 on a Jetson,
+// against the Ubuntu-24.04-built arm64 asset) the engine never execs and the
+// operator sees only a dead engine with no cause. Running the binary with a
+// trivial flag surfaces the loader's own message so InstallEngine can fail with
+// the real reason instead of reporting success.
+func (m *Manager) preflightEngine(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, m.managedBinaryPath(), "--version")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if runErr := cmd.Run(); runErr != nil {
+		// Only convert a PROVEN dynamic-loader/libc version mismatch into an
+		// incompatibility. Any other non-zero exit (an unrecognized flag on some
+		// future build, a timeout) is not proof the host is too old, so it must
+		// not block an otherwise-good install on an ambiguous signal.
+		if isLoaderVersionFailure(stderr.String()) {
+			return &EngineIncompatibleError{
+				OS:     runtime.GOOS,
+				Arch:   effectiveArch(),
+				Detail: firstLine(stderr.String()),
+			}
+		}
+	}
 	return nil
+}
+
+// isLoaderVersionFailure recognizes the dynamic loader rejecting a binary because
+// the host's C/C++ runtime is too old. These tokens are emitted by ld.so and
+// libstdc++ themselves (e.g. "version `GLIBC_2.38' not found",
+// "`GLIBCXX_3.4.32' not found", "CXXABI_1.3.15 not found") and appear only in a
+// version-mismatch loader error, so matching them does not false-positive on
+// ordinary program output.
+func isLoaderVersionFailure(stderr string) bool {
+	s := strings.ToUpper(stderr)
+	return strings.Contains(s, "GLIBC_") ||
+		strings.Contains(s, "GLIBCXX_") ||
+		strings.Contains(s, "CXXABI_")
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return s
 }
 
 // extractTarGzFlat writes every regular file's BASENAME into dst. Flattening

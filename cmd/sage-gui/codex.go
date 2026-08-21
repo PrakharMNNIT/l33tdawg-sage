@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -102,9 +103,15 @@ func installCodexConfig(projectDir, sageHome, execPath string) ([]web.ConnectFil
 	// vars in hook commands, so we bake the absolute hook dir path in.
 	hooksPath := filepath.Join(codexDir, "hooks.json")
 	hooksAction := fileAction(hooksPath)
-	hooksConfig := map[string]any{"hooks": sageHooksConfig(hookDir)}
-	hooksData, _ := json.MarshalIndent(hooksConfig, "", "  ")
-	if writeErr := safeWriteFile(hooksPath, append(hooksData, '\n'), 0600); writeErr != nil {
+	existingHooks, readErr := os.ReadFile(hooksPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return files, fmt.Errorf("read hooks.json: %w", readErr)
+	}
+	hooksData, mergeErr := renderMergedCodexHooks(existingHooks, hookDir)
+	if mergeErr != nil {
+		return files, mergeErr
+	}
+	if writeErr := safeWriteFile(hooksPath, hooksData, 0600); writeErr != nil {
 		return files, fmt.Errorf("write hooks.json: %w", writeErr)
 	}
 	files = append(files, web.ConnectFile{Path: hooksPath, Action: hooksAction})
@@ -131,6 +138,25 @@ func installCodexConfig(projectDir, sageHome, execPath string) ([]web.ConnectFil
 	syncMemoryModeFlag(sageHome)
 
 	return files, nil
+}
+
+// renderMergedCodexHooks replaces only SAGE-owned hook entries. Users may
+// keep other lifecycle hooks and top-level settings in the same file.
+func renderMergedCodexHooks(existing []byte, hookDir string) ([]byte, error) {
+	document := make(map[string]any)
+	if len(bytes.TrimSpace(existing)) > 0 {
+		if err := json.Unmarshal(existing, &document); err != nil {
+			return nil, fmt.Errorf("existing Codex hooks.json is invalid JSON; fix it before connecting SAGE: %w", err)
+		}
+	}
+	currentHooks := document["hooks"]
+	shell := resolveCodexBash(installedSageHookShell(currentHooks, hookDir))
+	document["hooks"] = mergeSageHooksConfigWithShell(currentHooks, hookDir, shell)
+	data, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal hooks.json: %w", err)
+	}
+	return append(data, '\n'), nil
 }
 
 // codexConfigTemplate is the TOML written to .codex/config.toml. Codex
@@ -558,7 +584,17 @@ func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
 	}
 
 	hooksJSONPath := filepath.Join(codexDir, "hooks.json")
-	if _, statErr := os.Stat(hooksJSONPath); os.IsNotExist(statErr) {
+	currentHooks, hooksReadErr := os.ReadFile(hooksJSONPath)
+	if hooksReadErr != nil && !os.IsNotExist(hooksReadErr) {
+		fmt.Fprintf(os.Stderr, "SAGE: codex self-heal read hooks.json: %v\n", hooksReadErr)
+		return
+	}
+	hooksData, hooksMergeErr := renderMergedCodexHooks(currentHooks, hookDir)
+	if hooksMergeErr != nil {
+		fmt.Fprintf(os.Stderr, "SAGE: codex self-heal hooks.json: %v\n", hooksMergeErr)
+		return
+	}
+	if hooksReadErr != nil || !bytes.Equal(currentHooks, hooksData) {
 		needsRewrite = true
 	}
 
@@ -585,9 +621,7 @@ func selfHealCodex(projectDir, sageHome string, identityOverrides ...string) {
 		return
 	}
 
-	hooksConfig := map[string]any{"hooks": sageHooksConfig(hookDir)}
-	hooksData, _ := json.MarshalIndent(hooksConfig, "", "  ")
-	if writeErr := os.WriteFile(hooksJSONPath, append(hooksData, '\n'), 0600); writeErr != nil {
+	if writeErr := os.WriteFile(hooksJSONPath, hooksData, 0600); writeErr != nil {
 		fmt.Fprintf(os.Stderr, "SAGE: codex self-heal hooks.json: %v\n", writeErr)
 		return
 	}

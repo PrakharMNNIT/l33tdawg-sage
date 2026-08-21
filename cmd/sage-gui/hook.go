@@ -409,10 +409,11 @@ func flattenLine(s string) string {
 
 // --- Stop hook -------------------------------------------------------------
 //
-// An MCP server cannot make an idle host take a turn: MCP is host-driven, and
-// notifications/claude/channel is a custom method that an unrecognising client
-// silently ignores. So durable work cannot "wake" a session that has already
-// stopped.
+// Ordinary MCP request flow cannot make an idle host take a turn: MCP is
+// host-driven. notifications/claude/channel is a custom acceleration path that
+// requires confirmed end-to-end host delivery; an unrecognising client silently
+// ignores it. Without that path, durable work cannot "wake" a session that has
+// already stopped.
 //
 // What is achievable is the inverse: do not let the session go idle while
 // unclaimed work is pending. Claude Code's Stop hook can decline the stop and

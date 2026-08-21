@@ -231,7 +231,7 @@ func runMCP() error {
 		selfHealProject(projectDir, home, provider, keyPath)
 	}
 	// The experimental custom-notification adapter is explicit opt-in for hosts
-	// known to consume it. A competing exact-agent consumer is rejected by the node, but the adapter
+	// with confirmed end-to-end delivery. A competing exact-agent consumer is rejected by the node, but the adapter
 	// keeps retrying with bounded backoff and acquires the lease after the holder
 	// disconnects. A failure to arm remains deliberately non-fatal: ordinary MCP
 	// requests continue while the wake accelerator reconnects in the background.
@@ -325,10 +325,11 @@ func primaryWorkspaceMCPEnv(root string) (map[string]string, bool, error) {
 }
 
 // claudeChannelEnabled is an explicit adapter opt-in. The shipped Claude Code
-// host does not consume notifications/claude/channel, while Codex must never
-// acquire the adapter's exclusive wake lease because it cannot consume that
-// method. An unparseable override fails closed — envBool warns rather than
-// guessing.
+// host registers a notifications/claude/channel handler, but delivery from a
+// plain .mcp.json server through the host's plugin-scoped channel gate remains
+// unverified. Codex must never acquire the adapter's exclusive wake lease
+// because it cannot consume that method. An unparseable override fails closed
+// — envBool warns rather than guessing.
 func claudeChannelEnabled() bool {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("SAGE_PROVIDER")), "codex") {
 		return false
@@ -935,12 +936,82 @@ func installClaudeMD(projectDir string) error {
 // (the env var is expanded by Claude Code at hook firing time); Codex
 // installs pass the absolute path because Codex doesn't expand its own env
 // vars in hook commands.
-func sageHooksConfig(hookDirExpr string) map[string]any {
+// resolveCodexBash resolves Bash while the installer still has its normal
+// environment. Codex hook processes can inherit a restricted PATH, so the
+// absolute executable is persisted. A valid prior absolute path is retained
+// for stable non-FHS and Windows Git Bash self-healing.
+func resolveCodexBash(preferred string) string {
+	if filepath.IsAbs(preferred) {
+		if info, err := os.Stat(preferred); err == nil && !info.IsDir() {
+			return preferred
+		}
+	}
+	if path, err := exec.LookPath("bash"); err == nil {
+		if absolute, absErr := filepath.Abs(path); absErr == nil {
+			return absolute
+		}
+		return path
+	}
+	for _, candidate := range []string{"/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	// Preserve the historical fallback on platforms where Bash is supplied by
+	// the eventual host environment but cannot be resolved during installation.
+	return "bash"
+}
+
+func installedSageHookShell(existing any, hookDirExpr string) string {
+	events, ok := existing.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, entriesValue := range events {
+		entries, ok := entriesValue.([]any)
+		if !ok {
+			continue
+		}
+		for _, entryValue := range entries {
+			entry, ok := entryValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			hooks, ok := entry["hooks"].([]any)
+			if !ok {
+				continue
+			}
+			for _, hookValue := range hooks {
+				hook, ok := hookValue.(map[string]any)
+				if !ok {
+					continue
+				}
+				command, _ := hook["command"].(string)
+				if !isInstalledSageHookCommand(command, hookDirExpr) {
+					continue
+				}
+				for name := range hookScriptSet() {
+					suffix := ` "` + hookDirExpr + `/` + name + `"`
+					if strings.HasSuffix(command, suffix) {
+						return strings.Trim(strings.TrimSpace(strings.TrimSuffix(command, suffix)), `"`)
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func sageHooksConfigWithShell(hookDirExpr, shell string) map[string]any {
+	shellCommand := shell
+	if strings.ContainsAny(shellCommand, " \t") {
+		shellCommand = `"` + strings.ReplaceAll(shellCommand, `"`, `\"`) + `"`
+	}
 	cmd := func(script string) []any {
 		return []any{
 			map[string]any{
 				"type":    "command",
-				"command": "bash \"" + hookDirExpr + "/" + script + "\"",
+				"command": shellCommand + " \"" + hookDirExpr + "/" + script + "\"",
 				"timeout": 5,
 			},
 		}
@@ -985,13 +1056,17 @@ func sageHooksConfig(hookDirExpr string) map[string]any {
 // mergeSageHooksConfig replaces only installer-owned SAGE hook entries and
 // preserves unrelated user hooks under the same Claude lifecycle events.
 func mergeSageHooksConfig(existing any, hookDirExpr string) map[string]any {
+	return mergeSageHooksConfigWithShell(existing, hookDirExpr, "bash")
+}
+
+func mergeSageHooksConfigWithShell(existing any, hookDirExpr, shell string) map[string]any {
 	merged := make(map[string]any)
 	if current, ok := existing.(map[string]any); ok {
 		for event, value := range current {
 			merged[event] = value
 		}
 	}
-	for event, desired := range sageHooksConfig(hookDirExpr) {
+	for event, desired := range sageHooksConfigWithShell(hookDirExpr, shell) {
 		var kept []any
 		if entries, ok := merged[event].([]any); ok {
 			for _, entry := range entries {
@@ -1033,12 +1108,12 @@ func mergeSageHooksConfig(existing any, hookDirExpr string) map[string]any {
 
 func isInstalledSageHookCommand(command, hookDirExpr string) bool {
 	for name := range hookScriptSet() {
-		if command == `bash "`+hookDirExpr+`/`+name+`"` {
+		if strings.HasSuffix(command, ` "`+hookDirExpr+`/`+name+`"`) {
 			return true
 		}
 	}
 	for _, name := range []string{legacyBootScriptName, legacyTurnScriptName} {
-		if command == `bash "`+hookDirExpr+`/`+name+`"` {
+		if strings.HasSuffix(command, ` "`+hookDirExpr+`/`+name+`"`) {
 			return true
 		}
 	}

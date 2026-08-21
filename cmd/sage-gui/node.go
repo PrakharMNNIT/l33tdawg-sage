@@ -1125,6 +1125,13 @@ func runServe(startupProof string) (rerr error) {
 	})
 
 	embedProvider := createEmbeddingProvider(cfg, logger)
+	// Detect a store written in a different vector space than the active embedder
+	// — e.g. a bare `serve` with no embedding env starting over a store full of
+	// semantic vectors, silently downgrading to hash. Not fatal (the node serves),
+	// but recall filters by the active space, so foreign-space rows go invisible.
+	// Shout and record a queryable degraded status; never refuse to boot, because
+	// a deliberate re-embed migration is exactly this mismatch, transiently.
+	checkEmbeddingSpaceConsistency(ctx, sqliteStore, embedProvider, health, logger)
 	embedderReady := make(chan struct{}, 1)
 	trackDone(startEmbedderWatchdog(ctx, embedProvider, health, logger, func() {
 		select {
@@ -3726,6 +3733,81 @@ func applyEmbeddingProviderSelection(cfg *Config, provider string) {
 	cfg.Embedding.BaseURL = ""
 	cfg.Embedding.Model = ""
 	cfg.Embedding.Dimension = embedding.Dimension
+}
+
+// embeddingSpaceCounter is the slice of the store the boot space-check needs,
+// narrowed so the check is unit-testable with a fake.
+type embeddingSpaceCounter interface {
+	CountMemoriesByProvider(ctx context.Context) (map[string]int, error)
+}
+
+// checkEmbeddingSpaceConsistency compares the store's committed embedding spaces
+// against the space the active embedder produces, and records a queryable
+// degraded status (plus a loud log) when they disagree. It never fails the boot:
+// recall filtering by embedding_provider means a foreign-space row is a silent
+// quality loss, not an outage, and refusing to start would brick the legitimate
+// re-embed migration that transiently presents as exactly this mismatch.
+//
+// The empty-provider stamp ("") is deliberately excluded — those are rows queued
+// for re-embed after a store-time embedder outage, a different condition from a
+// space mismatch.
+func checkEmbeddingSpaceConsistency(
+	ctx context.Context,
+	counter embeddingSpaceCounter,
+	embedder embedding.Provider,
+	health *metrics.HealthChecker,
+	logger zerolog.Logger,
+) {
+	active := embedding.SpaceID(embedder)
+	counts, err := counter.CountMemoriesByProvider(ctx)
+	if err != nil {
+		logger.Warn().Err(err).Msg("embedding-space consistency check skipped: could not count memories by provider")
+		return
+	}
+	foreign := make(map[string]int)
+	total := 0
+	for space, n := range counts {
+		if n <= 0 || space == "" || space == active {
+			continue
+		}
+		foreign[space] = n
+		total += n
+	}
+	// Classify the foreign spaces that are most likely the ACTIVE model under a
+	// different name (same model + dimension, differing only by an org prefix).
+	// Those are a re-embed, not a genuinely different model — telling them apart
+	// keeps the warning actionable instead of crying "foreign model" at a
+	// cosmetic label split an operator would then learn to ignore.
+	alias := make(map[string]int)
+	aliasTotal := 0
+	for space, n := range foreign {
+		if embedding.LikelySpaceAlias(space, active) {
+			alias[space] = n
+			aliasTotal += n
+		}
+	}
+	health.SetEmbeddingSpaceStatus(metrics.EmbeddingSpaceStatus{
+		OK:            total == 0,
+		ActiveSpace:   active,
+		ForeignRows:   total,
+		ForeignSpaces: foreign,
+		AliasRows:     aliasTotal,
+		AliasSpaces:   alias,
+	})
+	if total > 0 {
+		ev := logger.Warn().
+			Str("active_space", active).
+			Int("foreign_rows", total).
+			Interface("foreign_spaces", foreign)
+		if aliasTotal > 0 {
+			ev = ev.Int("alias_rows", aliasTotal).Interface("alias_spaces", alias)
+		}
+		message := "embedding-space mismatch: the store holds committed vectors in a space the active embedder does not produce, so recall silently cannot see them. Re-embed to reconcile, or restart with the embedding config that wrote them. Serving in degraded mode (queryable at /ready)."
+		if aliasTotal > 0 {
+			message = "embedding-space mismatch: the store holds committed vectors in a space the active embedder does not produce, so recall silently cannot see them. Rows counted under alias_* are likely the active model under one qualified and one bare name (same model and dimension) — a re-embed reconciles those. Re-embed to reconcile, or restart with the embedding config that wrote them. Serving in degraded mode (queryable at /ready)."
+		}
+		ev.Msg(message)
+	}
 }
 
 // createEmbeddingProvider creates the configured embedding provider.

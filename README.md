@@ -51,6 +51,77 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.25
+
+**CEREBRUM task refreshes are quiet without becoming stale.** Background SSE
+and post-clear reconciliation keep the mounted board visible instead of
+flashing the full loading surface. Canonical read failures remain failures—not
+proof that a task disappeared—and a monotonic generation fence prevents an
+older response from overwriting newer task state or clearing a newer error.
+
+**Codex lifecycle hooks survive restricted launchers without taking ownership
+of the user's hook file.** Installation resolves and persists the host's Bash
+executable, including non-FHS and Windows Git Bash paths, while self-heal
+semantically replaces only SAGE-owned commands. Custom hooks, custom events,
+and unrelated top-level JSON remain intact during migration.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.25 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.25`. SDK 11.18.25.
+
+## What's New in v11.18.24
+
+**Federated inbox work now has recoverable, session-fenced ownership.** SAGE
+binds an inbound federated claim to the receiving MCP session before exposing
+its payload. Retained older claims receive an explicit `legacy` CAS fence for
+deliberate handoff; live work is never stolen by a timeout. Reply completion,
+the claimant check, encrypted result fingerprint, and durable return event now
+commit atomically, so a lost-response retry returns the original event while a
+different second reply conflicts.
+
+**MCP boot guidance no longer rides inside ordinary tool results.** Lifecycle
+standing stays in `initialize.instructions`, including for a client that
+initializes after its first tool call. The former imperative block that asked an
+agent to invoke tools and edit a memory file has been removed, keeping the inbox
+trust boundary internally consistent.
+
+**Embedding-space and retention diagnostics are more precise.** The readiness
+guard labels only a qualified-versus-bare spelling of the same provider/model
+leaf/dimension as a likely alias, without collapsing two organizations that
+publish the same basename. Durable-until-handled presentation is limited to
+actionable pending/claimed work, while mixed-version retention-only responses
+remain compatible.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.24 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.24`. SDK 11.18.24.
+
+## What's New in v11.18.23
+
+**Turn-time recall now carries the same trust and lifecycle evidence as explicit
+recall.** `sage_turn` includes each recalled memory's `corroboration_count` and
+`status`, so the every-turn path no longer hides corroboration weight or whether
+a recalled row is committed or currently challenged.
+
+**Embedding-space drift is visible before it silently empties semantic recall.**
+At boot, SAGE compares the active embedder with the non-deprecated vector spaces
+already in the local store. A mismatch produces a loud warning and a structured
+`embedding_space` block in `/ready`; the node remains available by default while
+strict readiness returns 503, allowing an intentional re-embed migration to
+finish instead of turning a quality warning into an outage.
+
+**Managed reranker setup now diagnoses incompatible prebuilt engines.** After a
+verified install, SAGE preflights `llama-server`. Proven GLIBC, GLIBCXX, or CXXABI
+loader failures preserve the loader's real error and point operators to the
+bring-your-own reranker path instead of reporting a successful unusable install.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.23 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.23`. SDK 11.18.23.
+
 ## What's New in v11.18.22
 
 **A missing optional ForceGraph API can no longer strand CEREBRUM after the
@@ -193,10 +264,12 @@ replays do not republish, and an incapable backend fails before insertion rather
 than creating durable work that wake consumers cannot observe as new.
 
 The experimental Claude notification adapter is explicitly opt-in again. The
-shipped Claude Code host does not consume that custom notification, while the
-adapter would otherwise acquire the one exact-agent wake lease and exclude a
-useful long-running consumer. `SAGE_CLAUDE_CHANNEL=true` still enables it for an
-operator who intentionally has a compatible host.
+shipped Claude Code host registers the custom notification handler, but
+end-to-end delivery from a plain `.mcp.json` server through its plugin-scoped
+gate remains unverified. An idle adapter would also acquire the one exact-agent
+wake lease and exclude a useful long-running consumer.
+`SAGE_CLAUDE_CHANNEL=true` enables it for an operator who has confirmed that
+delivery path.
 
 Pending-memory presentation is deterministic even when creation timestamps tie:
 SQLite and PostgreSQL both use `memory_id` as the final ordering key. The
@@ -2020,7 +2093,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.22`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.25`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

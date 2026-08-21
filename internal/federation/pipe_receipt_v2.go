@@ -111,7 +111,7 @@ func (m *Manager) ImportedPipeReceiptChallenge(
 // RecordImportedPipeReceipt verifies the exact recipient's nonce-bound proof,
 // then keeps authorization leases through the atomic claim/outbox write.
 func (m *Manager) RecordImportedPipeReceipt(
-	ctx context.Context, localPipeID, recipientID, kind string, proof store.PipelineAgentProof,
+	ctx context.Context, localPipeID, recipientID, kind string, proof store.PipelineAgentProof, claimantSessionIDs ...string,
 ) (bool, error) {
 	ss := m.syncStore()
 	if ss == nil || (kind != "claimed" && kind != "read") {
@@ -159,7 +159,7 @@ func (m *Manager) RecordImportedPipeReceipt(
 	var replayed bool
 	err = m.WithAuthorizedImportedPipe(ctx, msg, func() error {
 		var recordErr error
-		replayed, recordErr = ss.RecordImportedFederatedReceipt(ctx, localPipeID, recipientID, outbox)
+		replayed, recordErr = ss.RecordImportedFederatedReceipt(ctx, localPipeID, recipientID, outbox, claimantSessionIDs...)
 		return recordErr
 	})
 	if err == nil {
