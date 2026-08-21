@@ -6285,3 +6285,53 @@ func TestSageRememberNonTaskOmitsTaskStatus(t *testing.T) {
 	_, present := submitted["task_status"]
 	assert.False(t, present, "only a task memory may sign a task_status")
 }
+
+// sage_recall relays the node's caller-scoped index_status so an empty result
+// is not read as absence.
+func TestSageRecallRelaysIndexStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": true, "ready": true})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1, 0.2, 0.3}})
+	})
+	mux.HandleFunc("/v1/memory/query", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{}, "total_count": 0, "index_status": "incomplete",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+
+	result, err := s.toolRecall(context.Background(), map[string]any{"query": "test"})
+	require.NoError(t, err)
+	assert.Equal(t, "incomplete", result.(map[string]any)["index_status"])
+}
+
+// sage_turn's empty recall path relays index_status rather than dropping it at the
+// early return in appendTurnRecallResult.
+func TestSageTurnRelaysIndexStatusOnEmpty(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/embed/info", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"semantic": true, "ready": true})
+	})
+	mux.HandleFunc("/v1/embed", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": []float32{0.1, 0.2}, "embedding_provider": "ollama:nomic-embed-text:768"})
+	})
+	mux.HandleFunc("/v1/memory/query", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{}, "total_count": 0, "index_status": "incomplete",
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	_, priv, _ := ed25519.GenerateKey(nil)
+	s := NewServer(ts.URL, priv)
+
+	result, err := s.toolTurn(context.Background(), map[string]any{"topic": "current work", "domain": "tii-sage"})
+	require.NoError(t, err)
+	assert.Equal(t, "incomplete", result.(map[string]any)["index_status"], "an empty turn recall must still relay index_status")
+}

@@ -187,6 +187,11 @@ most important operational tool.
   (bool), `degraded_reason`: signal when the recall silently fell back to
   keyword-only (embedder down or a non-semantic hash node) — same meaning as on
   `sage_recall`.
+- `index_status` (`complete` | `incomplete` | `unavailable`): on an empty,
+  domain-scoped recall block, tells genuine absence from an indexing gap — same
+  meaning, caller-scoping, and consumer guidance as on `sage_recall`. Relayed on
+  the empty-recall path so an unindexed domain is not read as authoritative
+  absence.
 - Returns `vault_locked` error if the Synaptic Ledger is locked.
 - A typed effective write denial returns its exact stable `reason_code`,
   `retryable=false`, and operator `remedy` in `store_error`. MCP does not
@@ -391,6 +396,17 @@ verified configurations). For a correction, call this tool once with
   results are keyword-quality. When this is `true`, treat recall as lower-fidelity
   (fix the embedder / run the smart-memory setup).
 - `degraded_reason`: present only when degraded — a short explanation.
+- `index_status`: present only on an **empty, domain-scoped** recall, to tell
+  genuine absence from an indexing gap. `complete` — the empty result is real
+  absence; `incomplete` — the domain holds committed/challenged rows that no
+  vector, or a foreign vector space, keeps recall from returning, so empty is not
+  proof of absence; `unavailable` — no leak-free verdict could be made (the
+  caller is not proven to see every record in the domain, there is no exact
+  active vector space, or the domain is too large to settle cheaply). Emitted
+  only to a caller proven to see every record in the domain and never a count —
+  it cannot disclose records hidden from the caller. Map `incomplete` to
+  "recall unavailable," not "no results," so an unindexed domain does not read as
+  authoritative absence.
 - `federation`: when requested, `{queried, merged, coverage, errors?}`.
   `coverage` names each peer's search mode, match/include counts, and the
   keyword fallback available for embedding-provider mismatch. Missing transport

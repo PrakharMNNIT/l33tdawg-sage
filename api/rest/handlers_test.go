@@ -32,6 +32,7 @@ import (
 // --- Mock stores -------------------------------------------------------------
 
 type mockMemoryStore struct {
+	outside outsideSpaceProbe
 	memories       map[string]*memory.MemoryRecord
 	votes          map[string][]*store.ValidationVote
 	challenges     map[string][]*store.ChallengeEntry
@@ -101,6 +102,23 @@ func (m *mockMemoryStore) UpdateMemoryEmbedding(_ context.Context, _ string, _ [
 }
 func (m *mockMemoryStore) CountMemoriesByProvider(_ context.Context) (map[string]int, error) {
 	return map[string]int{}, nil
+}
+
+// outsideFound/outsideEstablished/outsideErr drive the index-status disclosure
+// completeness probe backing index_status; sawSpace, when set, captures the
+// active-space argument the handler passed, so a test can assert the handler only
+// probes with an exact active vector space.
+type outsideSpaceProbe struct {
+	hasOutside, established bool
+	err                    error
+	sawSpace               *string
+}
+
+func (m *mockMemoryStore) DomainSpaceCompleteness(_ context.Context, _, activeSpace string, _ int) (bool, bool, error) {
+	if m.outside.sawSpace != nil {
+		*m.outside.sawSpace = activeSpace
+	}
+	return m.outside.hasOutside, m.outside.established, m.outside.err
 }
 func (m *mockMemoryStore) ListMemoriesForReembed(_ context.Context, _ string, _ int) ([]store.ReembedItem, error) {
 	return nil, nil

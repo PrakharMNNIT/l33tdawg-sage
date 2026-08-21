@@ -1593,6 +1593,54 @@ func (s *SQLiteStore) CountMemoriesByProvider(ctx context.Context) (map[string]i
 	return out, rows.Err()
 }
 
+// DomainSpaceCompleteness — see Store. No per-record authorization: caller-safe
+// ONLY when the handler has proven full domain visibility, so every examined row
+// is one the caller may see. Reads at most cap+1 committed/challenged rows in the
+// domain (bounded by the domain index — no decrypt, no cosine, no policy) and
+// classifies each by embedding space alone: out-of-space ⟺ no vector or a
+// provider tag other than activeSpace. The first out-of-space row settles
+// hasOutside immediately (an existence proof, independent of domain size). Absence
+// (complete) requires seeing every committed/challenged row; if the bounded prefix
+// fills without one, established=false and the handler reports "unavailable"
+// rather than scanning the whole domain to prove a negative.
+func (s *SQLiteStore) DomainSpaceCompleteness(
+	ctx context.Context, domain, activeSpace string, cap int,
+) (hasOutside, established bool, err error) {
+	rows, qerr := s.conn.QueryContext(ctx,
+		`SELECT CASE WHEN embedding IS NULL THEN 1 ELSE 0 END,
+		        COALESCE(embedding_provider, '')
+		 FROM memories
+		 WHERE domain_tag = ? AND status IN ('committed','challenged')
+		 LIMIT ?`,
+		domain, cap+1)
+	if qerr != nil {
+		return false, false, fmt.Errorf("domain space-completeness scan: %w", qerr)
+	}
+	defer func() { _ = rows.Close() }()
+
+	scanned := 0
+	for rows.Next() {
+		scanned++
+		var embNull int
+		var provider string
+		if scanErr := rows.Scan(&embNull, &provider); scanErr != nil {
+			return false, false, fmt.Errorf("scan row: %w", scanErr)
+		}
+		if embNull != 0 || provider != activeSpace {
+			return true, true, nil // a concrete space-unreachable row → incomplete
+		}
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return false, false, rerr
+	}
+	if scanned > cap {
+		// cap+1 committed/challenged rows, none out-of-space in the bounded prefix:
+		// cannot prove the rest are reachable without an unbounded scan → unavailable.
+		return false, false, nil
+	}
+	return false, true, nil // every committed/challenged row is in the active space → complete
+}
+
 // GetDomainLastActivity returns, per domain, the created_at of its most
 // recent non-deprecated memory. The MRI lobe list sorts by this so the most
 // recently active domains surface first.

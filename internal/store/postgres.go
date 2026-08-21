@@ -693,6 +693,48 @@ func (s *PostgresStore) CountMemoriesByProvider(ctx context.Context) (map[string
 	return out, rows.Err()
 }
 
+// DomainSpaceCompleteness — see Store. No per-record authorization: caller-safe
+// only when the handler has proven full domain visibility. Reads at most cap+1
+// committed/challenged rows in the domain (domain-index bounded, no decrypt) and
+// classifies each by embedding space alone. The first out-of-space row settles
+// hasOutside; proving absence (complete) needs every row, so a bounded prefix that
+// fills without one returns established=false (→ "unavailable").
+func (s *PostgresStore) DomainSpaceCompleteness(
+	ctx context.Context, domain, activeSpace string, cap int,
+) (hasOutside, established bool, err error) {
+	rows, qerr := s.db.Query(ctx,
+		`SELECT CASE WHEN embedding IS NULL THEN 1 ELSE 0 END,
+		        COALESCE(embedding_provider, '')
+		 FROM memories
+		 WHERE domain_tag = $1 AND status IN ('committed','challenged')
+		 LIMIT $2`,
+		domain, cap+1)
+	if qerr != nil {
+		return false, false, fmt.Errorf("domain space-completeness scan: %w", qerr)
+	}
+	defer rows.Close()
+
+	scanned := 0
+	for rows.Next() {
+		scanned++
+		var embNull int
+		var provider string
+		if scanErr := rows.Scan(&embNull, &provider); scanErr != nil {
+			return false, false, fmt.Errorf("scan row: %w", scanErr)
+		}
+		if embNull != 0 || provider != activeSpace {
+			return true, true, nil // a concrete space-unreachable row → incomplete
+		}
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return false, false, rerr
+	}
+	if scanned > cap {
+		return false, false, nil // bounded prefix full, none out-of-space → unavailable
+	}
+	return false, true, nil // every committed/challenged row is in the active space → complete
+}
+
 func (s *PostgresStore) ListMemoriesForReembed(ctx context.Context, targetProvider string, limit int) ([]ReembedItem, error) {
 	rows, err := s.db.Query(ctx, `SELECT memory_id, content FROM memories
 		WHERE COALESCE(embedding_provider, '') NOT IN ($1, 'skipped', 'error') AND status != 'deprecated'
