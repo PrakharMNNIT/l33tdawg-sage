@@ -160,12 +160,19 @@ func (s *SQLiteStore) insertFederatedReceiptOutbox(ctx context.Context, event *F
 // that exact recipient owns the claim. A legacy imported row has no inbound
 // binding and therefore cannot manufacture a receipt.
 func (s *SQLiteStore) RecordImportedFederatedReceipt(
-	ctx context.Context, localPipeID, recipientID string, event *FederatedReceiptOutbox,
+	ctx context.Context, localPipeID, recipientID string, event *FederatedReceiptOutbox, claimantSessionIDs ...string,
 ) (bool, error) {
 	if event == nil || event.LocalPipeID != localPipeID || event.RecipientAgentID != recipientID {
 		return false, ErrFederatedReceiptInvalid
 	}
 	var replayed bool
+	claimantSessionID := ""
+	if len(claimantSessionIDs) > 0 {
+		claimantSessionID = strings.TrimSpace(claimantSessionIDs[0])
+		if claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes {
+			return false, ErrFederatedReceiptInvalid
+		}
+	}
 	err := s.runPipelineTx(ctx, func(txStore OffchainStore) error {
 		tx := txStore.(*SQLiteStore)
 		binding, err := tx.GetFederatedReceiptInbound(ctx, localPipeID)
@@ -185,8 +192,21 @@ func (s *SQLiteStore) RecordImportedFederatedReceipt(
 				if claimErr := tx.ClaimPipeline(ctx, localPipeID, recipientID); claimErr != nil {
 					return claimErr
 				}
+				if claimantSessionID != "" {
+					if _, receiptErr := tx.writeExecContext(ctx, `INSERT INTO message_fetch_receipts
+						(message_id,receiver_agent_id,claimant_session_id) VALUES(?,?,?)`,
+						localPipeID, recipientID, claimantSessionID); receiptErr != nil {
+						return receiptErr
+					}
+				}
 			} else if msg.ClaimedBy != recipientID {
 				return ErrFederatedReceiptConflict
+			} else if claimantSessionID != "" {
+				var currentSession string
+				if sessionErr := tx.conn.QueryRowContext(ctx, `SELECT claimant_session_id FROM message_fetch_receipts
+					WHERE message_id=? AND receiver_agent_id=?`, localPipeID, recipientID).Scan(&currentSession); sessionErr != nil || currentSession != claimantSessionID {
+					return ErrFederatedReceiptConflict
+				}
 			}
 		case "read":
 			if msg.ClaimedBy != recipientID || (msg.Status != "claimed" && msg.Status != "completed") {

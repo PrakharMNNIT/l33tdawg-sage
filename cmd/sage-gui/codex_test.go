@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -57,6 +59,11 @@ func TestRunCodexInstall_WritesAllArtifacts(t *testing.T) {
 	}
 	// Hook commands must use absolute paths (Codex doesn't expand env vars).
 	assert.Contains(t, string(hooksData), filepath.Join(projectDir, ".codex", "hooks"))
+	expectedShell := resolveCodexBash("")
+	assert.Contains(t, hookCommand(t, hooks, "SessionStart"), expectedShell, "Codex hooks must use the resolved shell")
+	if filepath.IsAbs(expectedShell) {
+		assert.NotContains(t, string(hooksData), `"command": "bash `, "Codex hooks must not depend on launcher PATH")
+	}
 	assert.NotContains(t, string(hooksData), "${CLAUDE_PROJECT_DIR}")
 
 	// 5 hook scripts present and templated.
@@ -220,6 +227,119 @@ func TestSelfHealCodex_RepairsMissingHooksJSON(t *testing.T) {
 
 	_, err := os.Stat(hooksJSONPath)
 	assert.NoError(t, err, "self-heal should repair missing hooks.json")
+}
+
+func TestSelfHealCodex_RewritesPathDependentHooksJSON(t *testing.T) {
+	projectDir, sageHome := withCodexInstallEnv(t)
+	require.NoError(t, runCodexInstall())
+
+	hooksJSONPath := filepath.Join(projectDir, ".codex", "hooks.json")
+	hooksData, err := os.ReadFile(hooksJSONPath)
+	require.NoError(t, err)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(hooksData, &document))
+	hooks := document["hooks"].(map[string]any)
+	for _, event := range hooks {
+		entries, ok := event.([]any)
+		if !ok {
+			continue
+		}
+		for _, entryValue := range entries {
+			entry := entryValue.(map[string]any)
+			for _, hookValue := range entry["hooks"].([]any) {
+				hook := hookValue.(map[string]any)
+				command := hook["command"].(string)
+				if isInstalledSageHookCommand(command, filepath.Join(projectDir, ".codex", "hooks")) {
+					hook["command"] = "bash" + command[strings.Index(command, " "):]
+				}
+			}
+		}
+	}
+	customStop := map[string]any{"hooks": []any{map[string]any{"type": "command", "command": "custom-tool", "timeout": float64(9)}}}
+	hooks["Stop"] = append(hooks["Stop"].([]any), customStop)
+	hooks["Notification"] = []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": "notify-tool"}}}}
+	document["customSetting"] = "keep-me"
+	legacy, err := json.MarshalIndent(document, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(hooksJSONPath, append(legacy, '\n'), 0600))
+
+	selfHealCodex(projectDir, sageHome)
+
+	healed, err := os.ReadFile(hooksJSONPath)
+	require.NoError(t, err)
+	var healedDocument map[string]any
+	require.NoError(t, json.Unmarshal(healed, &healedDocument))
+	healedHooks := healedDocument["hooks"].(map[string]any)
+	assert.Equal(t, "keep-me", healedDocument["customSetting"])
+	assert.Contains(t, healedHooks, "Notification", "custom hook events must survive self-heal")
+	assert.Contains(t, string(healed), "custom-tool", "custom hooks under SAGE events must survive self-heal")
+	assert.Contains(t, hookCommand(t, healedHooks, "SessionStart"), resolveCodexBash(""))
+}
+
+func TestRunCodexInstall_PreservesExistingCustomHooks(t *testing.T) {
+	projectDir, _ := withCodexInstallEnv(t)
+	codexDir := filepath.Join(projectDir, ".codex")
+	require.NoError(t, os.MkdirAll(codexDir, 0755))
+	existing := `{"customSetting":true,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"custom-tool"}]}],"Notification":[{"hooks":[{"type":"command","command":"notify-tool"}]}]}}`
+	require.NoError(t, os.WriteFile(filepath.Join(codexDir, "hooks.json"), []byte(existing), 0600))
+
+	require.NoError(t, runCodexInstall())
+
+	data, err := os.ReadFile(filepath.Join(codexDir, "hooks.json"))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "custom-tool")
+	assert.Contains(t, string(data), "notify-tool")
+	assert.Contains(t, string(data), `"customSetting": true`)
+}
+
+func TestCodexHookCommandRunsWithEmptyPATH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell command execution assertion is Unix-specific")
+	}
+	shell := resolveCodexBash("")
+	if !filepath.IsAbs(shell) {
+		t.Skip("bash was not resolvable to an absolute path")
+	}
+	hookDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "ran")
+	script := filepath.Join(hookDir, "sage-session-start.sh")
+	require.NoError(t, os.WriteFile(script, []byte("printf ok > \""+marker+"\"\n"), 0755))
+	hooks := sageHooksConfigWithShell(hookDir, shell)
+	command := hookCommand(t, hooks, "SessionStart")
+	cmd := exec.Command("/bin/sh", "-c", command) //nolint:gosec // generated fixture command
+	cmd.Env = []string{"PATH="}
+	require.NoError(t, cmd.Run())
+	data, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", string(data))
+}
+
+func TestCodexHookCommandQuotesShellPathsWithSpaces(t *testing.T) {
+	hooks := sageHooksConfigWithShell("C:/tmp/hooks", "C:/Program Files/Git/bin/bash.exe")
+	assert.Equal(t, `"C:/Program Files/Git/bin/bash.exe" "C:/tmp/hooks/sage-session-start.sh"`, hookCommand(t, hooks, "SessionStart"))
+}
+
+func TestRenderMergedCodexHooksRejectsInvalidJSON(t *testing.T) {
+	_, err := renderMergedCodexHooks([]byte(`{"hooks":`), t.TempDir())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid JSON")
+}
+
+func hookCommand(t *testing.T, hooks map[string]any, event string) string {
+	t.Helper()
+	entries, ok := hooks[event].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, entries)
+	entry, ok := entries[0].(map[string]any)
+	require.True(t, ok)
+	commands, ok := entry["hooks"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, commands)
+	hook, ok := commands[0].(map[string]any)
+	require.True(t, ok)
+	command, ok := hook["command"].(string)
+	require.True(t, ok)
+	return command
 }
 
 // expectExecutable returns the cleaned, symlink-resolved path of the test

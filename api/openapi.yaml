@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.18.22
+  version: 11.18.25
   description: |-
     (Sovereign) Agent Governed Experience — network REST API for memory
     submission, validation, and query.
@@ -1767,6 +1767,10 @@ components:
         source_chain_id:
           type: string
           description: Exact reply-source chain from GET /v1/pipe/{pipe_id}; required for federated results.
+        claimant_session_id:
+          type: string
+          maxLength: 128
+          description: Opaque session currently holding the claim; required for federated results.
 
     PipelineMessage:
       type: object
@@ -5223,6 +5227,13 @@ paths:
             minimum: 1
             maximum: 20
             default: 5
+        - name: claimant_session_id
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+          description: Required to atomically session-fence inbound foreign claims; local-only inbox reads may omit it.
       responses:
         "200":
           description: Inbox items.
@@ -5855,6 +5866,12 @@ paths:
                   journaled:
                     type: boolean
                     description: False for federated work; local completion may create a summary journal.
+                  reply_event_id:
+                    type: string
+                    description: Durable signed return event for federated work.
+                  idempotent_replay:
+                    type: boolean
+                    description: True when an identical retry recovered the original durable reply event.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":

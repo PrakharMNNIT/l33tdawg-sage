@@ -56,7 +56,15 @@ type federatedPipeAdmissionAuthorizer interface {
 
 type federatedPipeReceiptController interface {
 	ImportedPipeReceiptChallenge(context.Context, string, string, string) (json.RawMessage, error)
-	RecordImportedPipeReceipt(context.Context, string, string, string, store.PipelineAgentProof) (bool, error)
+	RecordImportedPipeReceipt(context.Context, string, string, string, store.PipelineAgentProof, ...string) (bool, error)
+}
+
+type federatedMessageSessionClaimer interface {
+	ClaimFederatedMessageWithSession(context.Context, string, string, string) error
+}
+
+type federatedMessageReplyReplayStore interface {
+	LookupFederatedMessageReplyReplay(context.Context, string, string, string, string) (string, bool, error)
 }
 
 type federatedPipeReceiptStatusStore interface {
@@ -66,6 +74,10 @@ type federatedPipeReceiptStatusStore interface {
 
 type federatedPipeReceiptInboundStore interface {
 	GetFederatedReceiptInbound(context.Context, string) (*store.FederatedReceiptBinding, error)
+}
+
+type federatedMessageReplyStore interface {
+	CompleteFederatedMessageReplyWithTransport(context.Context, string, string, string, string, *store.PipelineTransportOutbox) (string, bool, error)
 }
 
 // callerCanReachFederatedPipeTarget reuses the caller/domain intersection that
@@ -1069,6 +1081,11 @@ func (s *Server) handlePipeInbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agentID := middleware.ContextAgentID(r.Context())
+	claimantSessionID := strings.TrimSpace(r.URL.Query().Get("claimant_session_id"))
+	if len(claimantSessionID) > store.MaxMessageClaimantSessionBytes {
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is too long")
+		return
+	}
 
 	// Look up agent's provider
 	provider := ""
@@ -1106,11 +1123,13 @@ func (s *Server) handlePipeInbox(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			authorizer, ok := s.federation.(federatedPipeAdmissionAuthorizer)
-			if !ok || authorizer.WithAuthorizedImportedPipe(r.Context(), item, func() error {
-				return pipeStore.ClaimPipeline(r.Context(), item.PipeID, agentID)
+			sessionClaimer, supportsSessionClaim := s.store.(federatedMessageSessionClaimer)
+			if claimantSessionID == "" || !supportsSessionClaim || !ok || authorizer.WithAuthorizedImportedPipe(r.Context(), item, func() error {
+				return sessionClaimer.ClaimFederatedMessageWithSession(r.Context(), agentID, item.PipeID, claimantSessionID)
 			}) != nil {
 				continue
 			}
+			item.ClaimedSessionID = claimantSessionID
 		} else if err := pipeStore.ClaimPipeline(r.Context(), item.PipeID, agentID); err != nil {
 			continue
 		}
@@ -1228,6 +1247,7 @@ func (s *Server) handlePipeOutbox(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePipeClaim(w http.ResponseWriter, r *http.Request) {
 	pipeID := chi.URLParam(r, "pipe_id")
 	agentID := middleware.ContextAgentID(r.Context())
+	claimantSessionID := strings.TrimSpace(r.URL.Query().Get("claimant_session_id"))
 
 	pipeStore, ok := s.store.(store.PipelineStore)
 	if !ok {
@@ -1246,13 +1266,22 @@ func (s *Server) handlePipeClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg.SourceChainID != "" {
+		if claimantSessionID == "" || len(claimantSessionID) > store.MaxMessageClaimantSessionBytes {
+			writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is required and bounded for a federated claim")
+			return
+		}
 		authorizer, ok := s.federation.(federatedPipeAdmissionAuthorizer)
 		if !ok {
 			writeProblem(w, http.StatusNotImplemented, "Federated pipeline unavailable", "This node cannot revalidate the foreign work request.")
 			return
 		}
+		sessionClaimer, ok := s.store.(federatedMessageSessionClaimer)
+		if !ok {
+			writeProblem(w, http.StatusNotImplemented, "Federated pipeline unavailable", "This node cannot bind federated claim sessions.")
+			return
+		}
 		if err := authorizer.WithAuthorizedImportedPipe(r.Context(), msg, func() error {
-			return pipeStore.ClaimPipeline(r.Context(), pipeID, agentID)
+			return sessionClaimer.ClaimFederatedMessageWithSession(r.Context(), agentID, pipeID, claimantSessionID)
 		}); err != nil {
 			writeProblem(w, http.StatusConflict, "Federated pipeline suspended", "The connection, sharing grant, owner, or work-request permission changed.")
 			return
@@ -1291,9 +1320,10 @@ func (s *Server) handlePipeReceiptChallenge(w http.ResponseWriter, r *http.Reque
 const maxPipeReceiptBatchItems = 40
 
 type pipeReceiptBatchItem struct {
-	PipeID string                   `json:"pipe_id"`
-	Kind   string                   `json:"kind"`
-	Proof  store.PipelineAgentProof `json:"proof,omitempty"`
+	PipeID            string                   `json:"pipe_id"`
+	Kind              string                   `json:"kind"`
+	ClaimantSessionID string                   `json:"claimant_session_id,omitempty"`
+	Proof             store.PipelineAgentProof `json:"proof,omitempty"`
 }
 
 type pipeReceiptBatchRequest struct {
@@ -1361,10 +1391,19 @@ func (s *Server) handlePipeReceiptRecord(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	agentID := middleware.ContextAgentID(r.Context())
+	claimantSessionID := strings.TrimSpace(r.Header.Get("X-SAGE-Claimant-Session-ID"))
+	if kind == "claimed" && (claimantSessionID == "" || len(claimantSessionID) > store.MaxMessageClaimantSessionBytes) {
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "X-SAGE-Claimant-Session-ID is required and bounded for a federated claim.")
+		return
+	}
+	sessions := []string(nil)
+	if kind == "claimed" {
+		sessions = append(sessions, claimantSessionID)
+	}
 	replayed, err := controller.RecordImportedPipeReceipt(r.Context(), pipeID, agentID, kind, store.PipelineAgentProof{
 		AgentID: agentID, Signature: append([]byte(nil), proof.Signature...), Timestamp: proof.Timestamp,
 		Nonce: append([]byte(nil), proof.Nonce...), CanonicalRequest: append([]byte(nil), proof.CanonicalRequest...),
-	})
+	}, sessions...)
 	if err != nil {
 		if errors.Is(err, store.ErrFederatedReceiptNotFound) {
 			writeProblem(w, http.StatusNotFound, "Pipeline message not found", fmt.Sprintf("No pipeline message with id %s.", pipeID))
@@ -1404,7 +1443,8 @@ func (s *Server) handlePipeReceiptRecordBatch(w http.ResponseWriter, r *http.Req
 	seen := make(map[string]struct{}, len(req.Items))
 	for _, item := range req.Items {
 		key := item.PipeID + "\x00" + item.Kind
-		if item.PipeID == "" || (item.Kind != "claimed" && item.Kind != "read") || item.Proof.AgentID != agentID {
+		if item.PipeID == "" || (item.Kind != "claimed" && item.Kind != "read") || item.Proof.AgentID != agentID ||
+			(item.Kind == "claimed" && (item.ClaimantSessionID == "" || len(item.ClaimantSessionID) > store.MaxMessageClaimantSessionBytes)) {
 			if item.Kind == "claimed" {
 				claimFailed[item.PipeID] = true
 			}
@@ -1420,7 +1460,11 @@ func (s *Server) handlePipeReceiptRecordBatch(w http.ResponseWriter, r *http.Req
 			items = append(items, map[string]any{"pipe_id": item.PipeID, "event_kind": item.Kind, "receipt_status": "unconfirmed", "error": "claim_not_confirmed"})
 			continue
 		}
-		replayed, err := controller.RecordImportedPipeReceipt(r.Context(), item.PipeID, agentID, item.Kind, item.Proof)
+		sessions := []string(nil)
+		if item.Kind == "claimed" {
+			sessions = append(sessions, item.ClaimantSessionID)
+		}
+		replayed, err := controller.RecordImportedPipeReceipt(r.Context(), item.PipeID, agentID, item.Kind, item.Proof, sessions...)
 		if err != nil {
 			if item.Kind == "claimed" {
 				claimFailed[item.PipeID] = true
@@ -1503,9 +1547,10 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	agentID := middleware.ContextAgentID(r.Context())
 
 	var req struct {
-		Result        string `json:"result"`
-		SourcePipeID  string `json:"source_pipe_id"`
-		SourceChainID string `json:"source_chain_id"`
+		Result            string `json:"result"`
+		SourcePipeID      string `json:"source_pipe_id"`
+		SourceChainID     string `json:"source_chain_id"`
+		ClaimantSessionID string `json:"claimant_session_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
@@ -1542,12 +1587,12 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg.SourceChainID != "" {
-		if req.SourcePipeID == "" || req.SourcePipeID != msg.SourcePipeID {
-			writeProblem(w, http.StatusConflict, "Federated pipeline changed", "Refresh this inbox item before returning its result.")
+		if req.ClaimantSessionID == "" || len(req.ClaimantSessionID) > store.MaxMessageClaimantSessionBytes {
+			writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is required and bounded for a federated result")
 			return
 		}
-		if time.Now().UTC().After(msg.ExpiresAt) {
-			writeProblem(w, http.StatusConflict, "Pipeline expired", "This work request expired before its result was submitted.")
+		if req.SourcePipeID == "" || req.SourcePipeID != msg.SourcePipeID {
+			writeProblem(w, http.StatusConflict, "Federated pipeline changed", "Refresh this inbox item before returning its result.")
 			return
 		}
 		if _, ok := s.federation.(federatedPipeAdmissionAuthorizer); !ok {
@@ -1565,6 +1610,48 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	if msg.ClaimedBy != agentID && (msg.ClaimedBy != "" || !s.callerCanClaimPipe(r.Context(), agentID, msg)) {
 		writeProblem(w, http.StatusConflict, "Completion failed", fmt.Sprintf("pipeline message %s not available for completion by this agent", pipeID))
 		return
+	}
+	if msg.SourceChainID != "" {
+		proof := middleware.ContextAgentAuth(r.Context())
+		if proof == nil || len(proof.Signature) == 0 || len(proof.CanonicalRequest) == 0 || len(proof.Nonce) < 8 {
+			writeProblem(w, http.StatusForbidden, "Agent signature required", "Federated results require a fresh nonce-bound agent-signed request.")
+			return
+		}
+		pub, canonicalErr := auth.AgentIDToPublicKey(agentID)
+		if canonicalErr != nil || auth.PublicKeyToAgentID(pub) != agentID {
+			writeProblem(w, http.StatusForbidden, "Canonical agent identity required", "Federated results require the lowercase 64-hex form of the signing agent ID.")
+			return
+		}
+		replayStore, ok := pipeStore.(federatedMessageReplyReplayStore)
+		if !ok {
+			writeProblem(w, http.StatusNotImplemented, "Federated pipeline unavailable", "The active pipeline store cannot recover foreign result retries.")
+			return
+		}
+		replyEventID, replayed, replayErr := replayStore.LookupFederatedMessageReplyReplay(
+			r.Context(), agentID, pipeID, req.ClaimantSessionID, req.Result)
+		if replayErr != nil {
+			switch {
+			case errors.Is(replayErr, store.ErrMessageClaimedByOtherSession):
+				writeProblemTyped(w, http.StatusConflict, messageClaimSessionProblemType, "Claimed by another session",
+					"Another session of this agent holds this federated message claim. Use sage_message_handoff after deciding that claimant is stale.")
+			case errors.Is(replayErr, store.ErrMessageReplyConflict):
+				writeProblem(w, http.StatusConflict, "Reply conflict", "This federated message already has a different reply.")
+			default:
+				writeProblem(w, http.StatusConflict, "Completion failed", "The retained federated reply could not be recovered.")
+			}
+			return
+		}
+		if replayed {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status": "completed", "journal_id": "", "journaled": false,
+				"reply_event_id": replyEventID, "reply_status": "queued", "idempotent_replay": true,
+			})
+			return
+		}
+		if time.Now().UTC().After(msg.ExpiresAt) {
+			writeProblem(w, http.StatusConflict, "Pipeline expired", "This work request expired before its result was submitted.")
+			return
+		}
 	}
 
 	// Pipeline request/result text is untrusted agent content on both local and
@@ -1600,8 +1687,9 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	// requesting agent's answer.
 	var completeErr error
 	var replyEventID string
+	var idempotentReplay bool
 	if msg.SourceChainID != "" {
-		transportStore, ok := pipeStore.(store.FederatedPipelineStore)
+		_, ok := pipeStore.(store.FederatedPipelineStore)
 		if !ok {
 			writeProblem(w, http.StatusNotImplemented, "Federated pipeline unavailable", "The active pipeline store cannot return foreign results.")
 			return
@@ -1631,17 +1719,31 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 			TargetAgentID:     msg.FromAgent, Proof: transportProof, CreatedAt: created,
 			ExpiresAt: created.Add(24 * time.Hour),
 		}
-		replyEventID = event.EventID
 		authorizer := s.federation.(federatedPipeAdmissionAuthorizer)
 		completeErr = authorizer.WithAuthorizedImportedPipe(r.Context(), msg, func() error {
-			return transportStore.CompleteFederatedPipelineWithTransport(r.Context(), pipeID, agentID, req.Result, event)
+			messageStore, supportsSessions := pipeStore.(federatedMessageReplyStore)
+			if !supportsSessions {
+				return store.ErrPipelineUnsupported
+			}
+			var messageErr error
+			replyEventID, idempotentReplay, messageErr = messageStore.CompleteFederatedMessageReplyWithTransport(
+				r.Context(), pipeID, agentID, req.ClaimantSessionID, req.Result, event)
+			return messageErr
 		})
 	} else {
 		completeErr = pipeStore.CompletePipeline(r.Context(), pipeID, agentID, req.Result, journalID)
 	}
 	if completeErr != nil {
-		if errors.Is(completeErr, store.ErrPipeResultTooLarge) {
+		switch {
+		case errors.Is(completeErr, store.ErrPipeResultTooLarge):
 			writeProblemTyped(w, http.StatusRequestEntityTooLarge, pipeTooLargeProblemType, "Result too large", completeErr.Error())
+			return
+		case errors.Is(completeErr, store.ErrMessageClaimedByOtherSession):
+			writeProblemTyped(w, http.StatusConflict, messageClaimSessionProblemType, "Claimed by another session",
+				"Another session of this agent holds this federated message claim. Use sage_message_handoff after deciding that claimant is stale.")
+			return
+		case errors.Is(completeErr, store.ErrMessageReplyConflict):
+			writeProblem(w, http.StatusConflict, "Reply conflict", "This federated message already has a different reply.")
 			return
 		}
 		writeProblem(w, http.StatusConflict, "Completion failed", completeErr.Error())
@@ -1669,6 +1771,7 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	if replyEventID != "" {
 		response["reply_event_id"] = replyEventID
 		response["reply_status"] = "queued"
+		response["idempotent_replay"] = idempotentReplay
 	}
 	writeJSON(w, http.StatusOK, response)
 }

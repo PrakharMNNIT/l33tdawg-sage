@@ -41,11 +41,49 @@ func messageRouterAs(s *Server, callerID string, exactProof bool) http.Handler {
 	r.Post("/v1/messages/receive", s.handleMessagesReceive)
 	r.Post("/v1/messages/{message_id}/reply", s.handleMessageReply)
 	r.Put("/v1/messages/{message_id}/handoff", s.handleMessageHandoff)
+	r.Put("/v1/messages/{message_id}/claim-session", s.handleFederatedMessageClaimSession)
 	r.Put("/v1/messages/{message_id}/read", s.handleMessageRead)
 	r.Put("/v1/messages/read-batch", s.handleMessageReadBatch)
 	r.Get("/v1/messages/{message_id}/status", s.handleMessageStatus)
 	r.Get("/v1/messages/replies/{reply_event_id}/status", s.handleMessageReplyStatus)
 	return r
+}
+
+func TestFederatedMessageCompatibilitySignalIsExactRecipientAndSessionScoped(t *testing.T) {
+	s, sqlite := newPipeServer(t)
+	require.NoError(t, sqlite.InsertPipeline(t.Context(), &store.PipelineMessage{
+		PipeID: "msg-fed-scope", FromAgent: "remote", ToAgent: "bob",
+		Payload: "private", Status: "pending", SourceChainID: "chain-remote", SourcePipeID: "source",
+		CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}))
+	require.NoError(t, sqlite.ClaimPipeline(t.Context(), "msg-fed-scope", "bob"))
+
+	bound := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPut,
+		"/v1/messages/msg-fed-scope/claim-session", map[string]any{"claimant_session_id": "session-a"})
+	require.Equal(t, http.StatusOK, bound.Code, bound.Body.String())
+	require.Contains(t, bound.Body.String(), `"claimant_session_id":"session-a"`)
+	competingBind := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPut,
+		"/v1/messages/msg-fed-scope/claim-session", map[string]any{"claimant_session_id": "session-b"})
+	require.Equal(t, http.StatusConflict, competingBind.Code, competingBind.Body.String())
+
+	compatible := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPost,
+		"/v1/messages/msg-fed-scope/reply", map[string]any{"result": "done", "claimant_session_id": "session-a"})
+	require.Equal(t, http.StatusConflict, compatible.Code, compatible.Body.String())
+	var compatibilityProblem map[string]any
+	require.NoError(t, json.Unmarshal(compatible.Body.Bytes(), &compatibilityProblem))
+	require.Equal(t, messageFederatedCompatibilityProblemType, compatibilityProblem["type"])
+
+	staleSession := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodPost,
+		"/v1/messages/msg-fed-scope/reply", map[string]any{"result": "stale", "claimant_session_id": "session-b"})
+	require.Equal(t, http.StatusConflict, staleSession.Code, staleSession.Body.String())
+	require.Contains(t, staleSession.Body.String(), messageClaimSessionProblemType)
+	require.NotContains(t, staleSession.Body.String(), messageFederatedCompatibilityProblemType)
+
+	unrelated := callMessageJSON(t, messageRouterAs(s, "mallory", true), http.MethodPost,
+		"/v1/messages/msg-fed-scope/reply", map[string]any{"result": "probe", "claimant_session_id": "session-a"})
+	require.Equal(t, http.StatusNotFound, unrelated.Code, unrelated.Body.String())
+	require.NotContains(t, unrelated.Body.String(), messageFederatedCompatibilityProblemType)
+	require.NotContains(t, unrelated.Body.String(), "private")
 }
 
 func addMessageAgent(t *testing.T, s *store.SQLiteStore, id string) {

@@ -14,6 +14,7 @@ import { restartBaselineBootID, requestedRestartIsReady } from './restart-proof.
 import { buildUpdateBanner } from './update-banner.js';
 import { computeReorderedColumn, applyColumnOrder } from './task-reorder.js';
 import { runSequential, summarizeClearedTasks, summarizeDroppedTasks, summarizeForgottenMemories } from './bulk-sequence.js';
+import { refreshTaskSnapshot } from './task-refresh.js';
 import { createFederationJoinScanLifecycle, normalizeFederationJoinState } from './federation-flow.js';
 import { buildBrainDomainInventory } from './domain-inventory.js';
 import { enqueueGovernedTransfer, runWithGovernanceCooldown } from './governance-retry.js';
@@ -75,7 +76,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.18.22';
+const SAGE_VERSION = 'v11.18.25';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -3274,8 +3275,12 @@ function TasksPage({ sse }) {
     // that produces no server event) is still picked up once the drag settles.
     const scheduleReload = () => {
         clearTimeout(reloadTimer.current);
-        reloadTimer.current = setTimeout(() => { if (!draggingRef.current) loadTasks(); }, 500);
+        reloadTimer.current = setTimeout(() => {
+            if (!draggingRef.current) loadTasks({ silent: true }).catch(() => {});
+        }, 500);
     };
+
+    const taskLoadGeneration = useRef(0);
 
     // Live refresh: agents create and move tasks through the same shared store, so
     // refresh on task/remember/forget events instead of leaving the board stale.
@@ -3285,24 +3290,32 @@ function TasksPage({ sse }) {
         return () => { clearTimeout(reloadTimer.current); subs.forEach(u => u && u()); };
     }, [sse]);
 
-    async function loadTasks() {
-        setLoading(true);
-        setError(null);
+    async function loadTasks({ silent = false } = {}) {
+		const generation = ++taskLoadGeneration.current;
+        // Initial entry and an explicit operator refresh may replace the board
+        // with its loading state. SSE refreshes and post-commit reconciliation
+        // must keep the current board mounted: a terminal-column clear emits
+        // one forget event per card, and showing the full loading surface for
+        // every event makes the board flash throughout the batch.
+        if (!silent) {
+            setLoading(true);
+            setError(null);
+        }
         try {
-            const data = await fetchTasks({ all: true, limit: 500 });
-            const items = data.tasks || [];
-            const settling = settlingClears.current;
-            setTasks(settling.size
-                ? items.filter(task => !settling.has(task.memory_id))
-                : items);
-            const ds = [...new Set(items.map(t => t.domain_tag).filter(Boolean))].sort();
-            setDomains(ds);
-			return items;
+            return await refreshTaskSnapshot({
+                fetcher: fetchTasks,
+                settlingIDs: settlingClears.current,
+                silent,
+				isCurrent: () => generation === taskLoadGeneration.current,
+                setTasks,
+                setDomains,
+                setError,
+            });
         } catch (e) {
 			console.error('Task board load failed:', e);
-			setError('SAGE could not load your task list. Your tasks are still safe; try again.');
+			if (silent) throw e;
 		} finally {
-			setLoading(false);
+			if (!silent) setLoading(false);
 		}
     }
 
@@ -3314,25 +3327,32 @@ function TasksPage({ sse }) {
     async function reconcileClearedTasks(ids) {
         const pending = new Set(ids);
         let latest = [];
+		let hasAuthoritativeSnapshot = false;
         try {
             for (let attempt = 0; attempt < 4; attempt++) {
-                const items = await loadTasks();
-                if (Array.isArray(items)) latest = items;
+                const items = await loadTasks({ silent: true });
+				// A newer overlapping request superseded this response. It did not
+				// update state and cannot confirm task absence; retry within the
+				// same bounded reconciliation window.
+				if (!Array.isArray(items)) {
+					if (attempt < 3) await pause(750);
+					continue;
+				}
+				latest = items;
+				hasAuthoritativeSnapshot = true;
                 const remaining = latest.filter(task => pending.has(task.memory_id));
                 if (!remaining.length) return remaining;
                 if (attempt < 3) await pause(750);
             }
+			if (!hasAuthoritativeSnapshot) {
+				throw new Error('Task reconciliation was superseded before it could confirm the canonical state');
+			}
             return latest.filter(task => pending.has(task.memory_id));
         } finally {
             ids.forEach(id => settlingClears.current.delete(id));
-            // The final refresh above intentionally hid settling cards. Render
-            // the canonical outcome once the bounded wait has finished.
-            if (latest.length) {
-                setTasks(latest);
-                setDomains([...new Set(latest.map(task => task.domain_tag).filter(Boolean))].sort());
-            } else {
-                loadTasks();
-            }
+			// Fetch once more after releasing the settling filter. This request is
+			// generation-fenced too, so it cannot overwrite a newer snapshot.
+			loadTasks({ silent: true }).catch(() => {});
         }
     }
 
@@ -3541,7 +3561,7 @@ function TasksPage({ sse }) {
                         </select>
                     `}
                     <button class="btn" onClick=${() => setShowAddForm(!showAddForm)} title="Add task" style="font-weight:bold;">+ Add</button>
-                    <button class="btn" onClick=${loadTasks} title="Refresh" aria-label="Refresh task board">↻</button>
+                    <button class="btn" onClick=${() => loadTasks()} title="Refresh" aria-label="Refresh task board">↻</button>
                 </div>
             </div>
             ${showAddForm && html`

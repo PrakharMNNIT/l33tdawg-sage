@@ -27,7 +27,7 @@ sudo mv sage-gui /usr/local/bin/  # or add to your PATH
 
 ```bash
 sage-gui version
-# sage-gui v11.18.22
+# sage-gui v11.18.25
 ```
 
 ---
@@ -197,7 +197,7 @@ sage-gui setup
 
 ### 3. Start using it
 
-Just chat normally. SAGE v11.18.22 advertises 33 MCP tools. The core workflow is:
+Just chat normally. SAGE v11.18.25 advertises 33 MCP tools. The core workflow is:
 
 | Tool | What it does |
 |------|-------------|
@@ -233,7 +233,7 @@ The very first time your AI connects to SAGE, tell it:
 
 > **You:** Call sage_inception to initialize your memory.
 
-This seeds your AI's brain with foundational memories about how to use its memory system. From then on, the MCP server runs the session standing once during the MCP initialization handshake and returns adaptive lifecycle guidance through `initialize.instructions`. The first tool result therefore contains only that tool's payload. Clients that skip initialization retain a one-time compatibility fallback. The guidance adapts to the configured memory mode:
+This seeds your AI's brain with foundational memories about how to use its memory system. From then on, the MCP server runs the session standing once during the MCP initialization handshake and returns adaptive lifecycle guidance through `initialize.instructions`. Tool results contain only their requested payloads, including when a client skips initialization; a later initialization returns the cached standing. The guidance adapts to the configured memory mode:
 1. **Recall** relevant context at the start of every task
 2. **Remember** important learnings during work
 3. **Reflect** on what went right and wrong after tasks complete
