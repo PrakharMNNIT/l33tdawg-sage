@@ -171,6 +171,9 @@ func TestPostgresMemoryProjectionRevisionAndVaultGeneration(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(
 		`SELECT revision FROM graph_projection_revision WHERE singleton = TRUE`,
 	)).WillReturnRows(pgxmock.NewRows([]string{"revision"}).AddRow(int64(17)))
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT revision FROM memory_space_revision WHERE singleton = TRUE`,
+	)).WillReturnRows(pgxmock.NewRows([]string{"revision"}).AddRow(int64(9)))
 
 	revision, err := s.MemoryProjectionRevision(context.Background())
 	require.NoError(t, err)
@@ -178,6 +181,9 @@ func TestPostgresMemoryProjectionRevisionAndVaultGeneration(t *testing.T) {
 	graphRevision, err := s.GraphProjectionRevision(context.Background())
 	require.NoError(t, err)
 	require.EqualValues(t, 17, graphRevision)
+	spaceRevision, err := s.MemorySpaceRevision(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, 9, spaceRevision)
 	require.Zero(t, s.VaultGeneration())
 	require.NoError(t, mock.ExpectationsWereMet())
 }

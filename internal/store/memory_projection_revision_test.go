@@ -146,6 +146,8 @@ func TestSQLiteMemoryProjectionRevisionTracksRawMemoryMutations(t *testing.T) {
 	afterRawUpdate, err := sqlStore.MemoryProjectionRevision(ctx)
 	require.NoError(t, err)
 	require.Equal(t, afterInsert+1, afterRawUpdate)
+	spaceBeforeEmbedding, err := sqlStore.MemorySpaceRevision(ctx)
+	require.NoError(t, err)
 
 	_, err = sqlStore.conn.ExecContext(ctx,
 		`UPDATE memories
@@ -159,6 +161,10 @@ func TestSQLiteMemoryProjectionRevisionTracksRawMemoryMutations(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, afterRawUpdate, afterEmbedding,
 		"embedding maintenance must not invalidate canonical disclosure audits")
+	spaceAfterEmbedding, err := sqlStore.MemorySpaceRevision(ctx)
+	require.NoError(t, err)
+	require.Equal(t, spaceBeforeEmbedding+1, spaceAfterEmbedding,
+		"embedding/provider maintenance must invalidate semantic absence proofs")
 	graphAfterEmbedding, err := sqlStore.GraphProjectionRevision(ctx)
 	require.NoError(t, err)
 

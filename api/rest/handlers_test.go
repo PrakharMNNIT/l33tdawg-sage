@@ -34,6 +34,8 @@ import (
 type mockMemoryStore struct {
 	outside            outsideSpaceProbe
 	projectionRevision uint64
+	spaceRevision      uint64
+	querySimilarAfter  func()
 	memories           map[string]*memory.MemoryRecord
 	votes              map[string][]*store.ValidationVote
 	challenges         map[string][]*store.ChallengeEntry
@@ -92,6 +94,9 @@ func (m *mockMemoryStore) InsertMemory(_ context.Context, record *memory.MemoryR
 func (m *mockMemoryStore) MemoryProjectionRevision(_ context.Context) (uint64, error) {
 	return m.projectionRevision, nil
 }
+func (m *mockMemoryStore) MemorySpaceRevision(_ context.Context) (uint64, error) {
+	return m.spaceRevision, nil
+}
 
 func (m *mockMemoryStore) GetMemory(_ context.Context, memoryID string) (*memory.MemoryRecord, error) {
 	rec, ok := m.memories[memoryID]
@@ -104,6 +109,7 @@ func (m *mockMemoryStore) GetMemory(_ context.Context, memoryID string) (*memory
 // Embedding-maintenance surface (added with the v11 embeddings-setup work) -
 // inert stubs, the REST tests never exercise re-embedding.
 func (m *mockMemoryStore) UpdateMemoryEmbedding(_ context.Context, _ string, _ []float32, _ string) error {
+	m.spaceRevision++
 	return nil
 }
 func (m *mockMemoryStore) CountMemoriesByProvider(_ context.Context) (map[string]int, error) {

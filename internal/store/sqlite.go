@@ -1003,6 +1003,19 @@ func (s *SQLiteStore) ensureMemoryProjectionRevision(ctx context.Context) error 
 				UPDATE memory_projection_revision
 				SET revision = revision + 1 WHERE singleton = 1;
 			END;
+		CREATE TABLE IF NOT EXISTS memory_space_revision (
+			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			revision  INTEGER NOT NULL CHECK (revision >= 0)
+		);
+		INSERT OR IGNORE INTO memory_space_revision(singleton, revision)
+			VALUES (1, 0);
+		DROP TRIGGER IF EXISTS memories_space_revision_update;
+		CREATE TRIGGER memories_space_revision_update
+			AFTER UPDATE OF embedding, embedding_provider ON memories
+			BEGIN
+				UPDATE memory_space_revision
+				SET revision = revision + 1 WHERE singleton = 1;
+			END;
 	`
 	if _, err := s.writeExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("install memory projection revision: %w", err)
@@ -1022,6 +1035,22 @@ func (s *SQLiteStore) MemoryProjectionRevision(ctx context.Context) (uint64, err
 	}
 	if revision < 0 {
 		return 0, errors.New("memory projection revision is negative")
+	}
+	return uint64(revision), nil
+}
+
+// MemorySpaceRevision tracks the vector bytes/provider partition independently
+// from the canonical serving projection. Re-embedding therefore fences semantic
+// absence proofs without invalidating the expensive canonical inventory audit.
+func (s *SQLiteStore) MemorySpaceRevision(ctx context.Context) (uint64, error) {
+	var revision int64
+	if err := s.conn.QueryRowContext(ctx,
+		`SELECT revision FROM memory_space_revision WHERE singleton = 1`,
+	).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("read memory space revision: %w", err)
+	}
+	if revision < 0 {
+		return 0, errors.New("memory space revision is negative")
 	}
 	return uint64(revision), nil
 }

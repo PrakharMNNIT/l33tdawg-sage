@@ -62,6 +62,9 @@ func (m *rbacMockMemoryStore) QuerySimilar(_ context.Context, embedding []float3
 	if opts.TopK > 0 && len(results) > opts.TopK {
 		results = results[:opts.TopK]
 	}
+	if m.querySimilarAfter != nil {
+		m.querySimilarAfter()
+	}
 	return results, nil
 }
 

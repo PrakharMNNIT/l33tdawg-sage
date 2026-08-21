@@ -188,6 +188,18 @@ func TestRecallIndexStatusRejectsStaleOrChangingProjectionAudit(t *testing.T) {
 		assert.Empty(t, sawSpace, "a stale source token must stop the raw SQL probe")
 	})
 
+	t.Run("embedding space changed after semantic query", func(t *testing.T) {
+		srv, badger, _, _, _ := setupAppV23RESTAccess(t)
+		srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
+		tsID := fullVisibilityCaller(t, srv, badger, "fv.home")
+		ms := mockStoreOf(srv)
+		ms.querySimilarAfter = func() { ms.spaceRevision++ }
+		ms.outside = outsideSpaceProbe{hasOutside: false, established: true}
+		_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
+		assert.Equal(t, "unavailable", resp.IndexStatus,
+			"empty lookup and completeness must share one vector-space generation")
+	})
+
 	t.Run("source changed during probe", func(t *testing.T) {
 		srv, badger, _, _, _ := setupAppV23RESTAccess(t)
 		srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
@@ -195,7 +207,7 @@ func TestRecallIndexStatusRejectsStaleOrChangingProjectionAudit(t *testing.T) {
 		ms := mockStoreOf(srv)
 		ms.outside = outsideSpaceProbe{
 			hasOutside: true, established: true,
-			after: func() { ms.projectionRevision++ },
+			after: func() { ms.spaceRevision++ },
 		}
 		_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
 		assert.Equal(t, "unavailable", resp.IndexStatus,

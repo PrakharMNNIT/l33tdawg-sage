@@ -1888,10 +1888,11 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
+	activeVectorSpace := s.activeEmbeddingProvider()
 	opts := store.QueryOptions{
 		DomainTag:      req.DomainTag,
 		Provider:       req.Provider,
-		VectorProvider: s.activeEmbeddingProvider(),
+		VectorProvider: activeVectorSpace,
 		MinConfidence:  req.MinConfidence,
 		StatusFilter:   req.StatusFilter,
 		TopK:           s.disclosureRecallTopK(req.TopK),
@@ -1910,6 +1911,20 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	// store as DecayFloor, which filters the decayed value over the full candidate
 	// set before the top-K trim, pinned to `start` so it matches what we serialize.
 	setDecayFloor(&opts, start)
+
+	// Capture the exact canonical + vector-space source BEFORE semantic lookup.
+	// If any serving, canonical, or embedding-space mutation occurs before the
+	// later completeness proof finishes, the empty+verdict pair is discarded as
+	// unavailable rather than combining observations from different snapshots.
+	var indexStatusSource recallProjectionSource
+	indexStatusSourceExact := false
+	if req.DomainTag != "" && localDomainReadable &&
+		recallIndexStatusHasExactQueryUniverse(req) &&
+		activeVectorSpace != "" &&
+		s.callerHasProvenFullDomainVisibility(queryAgentID, req.DomainTag, start) {
+		indexStatusSource, indexStatusSourceExact =
+			s.exactCanonicalMemoryProjectionSource(r.Context())
+	}
 
 	var records []*memory.MemoryRecord
 	if localDomainReadable {
@@ -2116,7 +2131,7 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	//
 	// The signal is a three-value enum, never a count or a list.
 	if len(resp.Results) == 0 && req.DomainTag != "" {
-		activeSpace := s.activeEmbeddingProvider()
+		activeSpace := activeVectorSpace
 		switch {
 		case !localDomainReadable:
 			resp.IndexStatus = "unavailable"
@@ -2126,16 +2141,13 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 			resp.IndexStatus = "unavailable"
 		case !s.callerHasProvenFullDomainVisibility(queryAgentID, req.DomainTag, now):
 			resp.IndexStatus = "unavailable"
+		case !indexStatusSourceExact:
+			resp.IndexStatus = "unavailable"
 		default:
-			projectionSource, projectionExact := s.exactCanonicalMemoryProjectionSource(r.Context())
-			if !projectionExact {
-				resp.IndexStatus = "unavailable"
-				break
-			}
 			hasOutside, established, cErr := s.store.DomainSpaceCompleteness(
 				r.Context(), req.DomainTag, activeSpace, store.CandidateFilterScanBudget)
 			switch {
-			case !s.canonicalMemoryProjectionSourceUnchanged(r.Context(), projectionSource):
+			case !s.canonicalMemoryProjectionSourceUnchanged(r.Context(), indexStatusSource):
 				resp.IndexStatus = "unavailable"
 			case cErr != nil:
 				s.logger.Warn().Err(cErr).Str("domain", req.DomainTag).Msg("recall index-status disclosure unavailable")

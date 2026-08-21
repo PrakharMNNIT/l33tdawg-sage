@@ -8,11 +8,13 @@ import (
 
 type recallProjectionRevisionProvider interface {
 	MemoryProjectionRevision(context.Context) (uint64, error)
+	MemorySpaceRevision(context.Context) (uint64, error)
 }
 
 type recallProjectionSource struct {
 	sql       uint64
 	canonical uint64
+	space     uint64
 }
 
 func (s *Server) exactCanonicalMemoryProjectionSource(
@@ -39,7 +41,13 @@ func (s *Server) exactCanonicalMemoryProjectionSource(
 	if sqlRevision != health.SQLRevision || canonicalRevision != health.CanonicalRevision {
 		return source, false
 	}
-	return recallProjectionSource{sql: sqlRevision, canonical: canonicalRevision}, true
+	spaceRevision, err := provider.MemorySpaceRevision(ctx)
+	if err != nil {
+		return source, false
+	}
+	return recallProjectionSource{
+		sql: sqlRevision, canonical: canonicalRevision, space: spaceRevision,
+	}, true
 }
 
 func (s *Server) canonicalMemoryProjectionSourceUnchanged(
@@ -54,8 +62,13 @@ func (s *Server) canonicalMemoryProjectionSourceUnchanged(
 	if err != nil {
 		return false
 	}
+	spaceRevision, err := provider.MemorySpaceRevision(ctx)
+	if err != nil {
+		return false
+	}
 	return sqlRevision == want.sql &&
-		s.badgerStore.CanonicalMemoryProjectionRevision() == want.canonical
+		s.badgerStore.CanonicalMemoryProjectionRevision() == want.canonical &&
+		spaceRevision == want.space
 }
 
 // recallIndexStatusHasExactQueryUniverse reports whether the empty response was

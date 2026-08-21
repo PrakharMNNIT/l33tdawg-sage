@@ -70,6 +70,31 @@ CREATE TRIGGER memories_projection_revision_delete_v1
 AFTER DELETE ON memories FOR EACH STATEMENT
 EXECUTE FUNCTION sage_bump_memory_projection_revision();
 
+-- Independent invalidation token for the vector-space universe. Re-embedding
+-- must fence an empty semantic query through its completeness proof without
+-- invalidating the canonical SQL-to-ledger inventory audit.
+CREATE TABLE memory_space_revision (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+);
+INSERT INTO memory_space_revision(singleton, revision) VALUES (TRUE, 0);
+
+CREATE FUNCTION sage_bump_memory_space_revision()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE memory_space_revision
+    SET revision = revision + 1
+    WHERE singleton = TRUE;
+    RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER memories_space_revision_update_v1
+AFTER UPDATE OF embedding, embedding_provider ON memories FOR EACH STATEMENT
+EXECUTE FUNCTION sage_bump_memory_space_revision();
+
 -- Metadata invalidation token for graph nodes and edges. Memory fields already
 -- covered by memory_projection_revision are combined with this token in the
 -- graph cache key; this tracks the remaining rendered fields and link tables.

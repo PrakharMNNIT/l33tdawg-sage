@@ -291,6 +291,25 @@ var postgresProjectionSchema = []string{
 	`CREATE TRIGGER memories_projection_revision_delete_v1
 	 AFTER DELETE ON memories FOR EACH STATEMENT
 	 EXECUTE FUNCTION sage_bump_memory_projection_revision()`,
+	`CREATE TABLE IF NOT EXISTS memory_space_revision (
+		singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+		revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+	)`,
+	`INSERT INTO memory_space_revision(singleton, revision)
+	 VALUES (TRUE, 0) ON CONFLICT (singleton) DO NOTHING`,
+	`CREATE OR REPLACE FUNCTION sage_bump_memory_space_revision()
+	 RETURNS TRIGGER
+	 LANGUAGE plpgsql
+	 AS $$
+	 BEGIN
+	   UPDATE memory_space_revision SET revision = revision + 1 WHERE singleton = TRUE;
+	   RETURN NULL;
+	 END
+	 $$`,
+	`DROP TRIGGER IF EXISTS memories_space_revision_update_v1 ON memories`,
+	`CREATE TRIGGER memories_space_revision_update_v1
+	 AFTER UPDATE OF embedding, embedding_provider ON memories
+	 FOR EACH STATEMENT EXECUTE FUNCTION sage_bump_memory_space_revision()`,
 	`CREATE TABLE IF NOT EXISTS graph_projection_revision (
 		singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
 		revision  BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
@@ -378,6 +397,21 @@ func (s *PostgresStore) MemoryProjectionRevision(ctx context.Context) (uint64, e
 	}
 	if revision < 0 {
 		return 0, errors.New("memory projection revision is negative")
+	}
+	return uint64(revision), nil
+}
+
+// MemorySpaceRevision tracks vector/provider mutations separately from the
+// canonical serving projection revision.
+func (s *PostgresStore) MemorySpaceRevision(ctx context.Context) (uint64, error) {
+	var revision int64
+	if err := s.db.QueryRow(ctx,
+		`SELECT revision FROM memory_space_revision WHERE singleton = TRUE`,
+	).Scan(&revision); err != nil {
+		return 0, fmt.Errorf("read memory space revision: %w", err)
+	}
+	if revision < 0 {
+		return 0, errors.New("memory space revision is negative")
 	}
 	return uint64(revision), nil
 }
