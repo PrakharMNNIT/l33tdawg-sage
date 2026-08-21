@@ -493,6 +493,9 @@ ALTER TABLE federations ADD COLUMN IF NOT EXISTS allowed_depts TEXT[];
 -- ============================================================
 CREATE INDEX idx_memories_domain ON memories (domain_tag);
 CREATE INDEX idx_memories_status ON memories (status);
+CREATE INDEX IF NOT EXISTS idx_memories_domain_live_status
+    ON memories (domain_tag, status, memory_id)
+    WHERE status IN ('committed','challenged');
 CREATE INDEX IF NOT EXISTS idx_memories_assignee ON memories (assignee) WHERE assignee != '';
 CREATE INDEX IF NOT EXISTS idx_memories_task_picked_up_by ON memories (task_picked_up_by) WHERE task_picked_up_by != '';
 -- Serves FindByContentHash, which voter.Run evaluates per pending memory on a

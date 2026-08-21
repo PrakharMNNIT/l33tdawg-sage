@@ -457,6 +457,13 @@ func (s *SQLiteStore) initSchema(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain_tag);
 	CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+	-- Bounds empty-recall completeness work to live rows in one domain. The
+	-- partial predicate exactly matches DomainSpaceCompleteness, while the full
+	-- key supplies its deterministic bounded walk without examining proposed,
+	-- validated, or deprecated rows.
+	CREATE INDEX IF NOT EXISTS idx_memories_domain_live_status
+		ON memories(domain_tag, status, memory_id)
+		WHERE status IN ('committed','challenged');
 	CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
 	-- Serves the CEREBRUM agent-as-lobe read: each agent's top memories by
 	-- confidence (WHERE submitting_agent = ? ORDER BY confidence_score DESC).
@@ -1374,6 +1381,7 @@ func (s *SQLiteStore) migrateTaskSupport(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `ALTER TABLE memories_new RENAME TO memories`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain_tag)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_domain_live_status ON memories(domain_tag, status, memory_id) WHERE status IN ('committed','challenged')`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_provider ON memories(provider)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_task_status ON memories(task_status) WHERE task_status != ''`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories(submitting_agent, confidence_score)`)
@@ -1596,7 +1604,7 @@ func (s *SQLiteStore) CountMemoriesByProvider(ctx context.Context) (map[string]i
 // DomainSpaceCompleteness — see Store. No per-record authorization: caller-safe
 // ONLY when the handler has proven full domain visibility, so every examined row
 // is one the caller may see. Reads at most cap+1 committed/challenged rows in the
-// domain (bounded by the domain index — no decrypt, no cosine, no policy) and
+// domain (bounded by the live-row composite index — no decrypt, no cosine, no policy) and
 // classifies each by embedding space alone: out-of-space ⟺ no vector or a
 // provider tag other than activeSpace. The first out-of-space row settles
 // hasOutside immediately (an existence proof, independent of domain size). Absence
@@ -1611,6 +1619,7 @@ func (s *SQLiteStore) DomainSpaceCompleteness(
 		        COALESCE(embedding_provider, '')
 		 FROM memories
 		 WHERE domain_tag = ? AND status IN ('committed','challenged')
+		 ORDER BY status, memory_id
 		 LIMIT ?`,
 		domain, cap+1)
 	if qerr != nil {

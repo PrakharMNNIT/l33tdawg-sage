@@ -37,6 +37,7 @@ func fullVisibilityCaller(t *testing.T, badger *store.BadgerStore, home string) 
 		Profile: store.AppV23ProfileStandard, HomeDomain: home,
 		Clearance: 4, Capabilities: 0, Active: true, UpdatedHeight: 2,
 	}, store.AppV23RoleMember, 0, 0))
+	badger.PublishCanonicalMemoryProjectionAudit(true, false, false)
 	return id
 }
 
@@ -142,6 +143,50 @@ func TestRecallIndexStatusEmptyActiveSpaceIsUnavailable(t *testing.T) {
 	mockStoreOf(srv).outside = outsideSpaceProbe{hasOutside: true, established: true}
 	_, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
 	assert.Equal(t, "unavailable", resp.IndexStatus)
+}
+
+func TestRecallIndexStatusRequiresExactCanonicalProjectionHealth(t *testing.T) {
+	srv, badger, _, _, _ := setupAppV23RESTAccess(t)
+	srv.embedder = authoritativeTestEmbedder{vector: []float32{0.1, 0.2, 0.3}, name: "ollama"}
+	tsID := fullVisibilityCaller(t, badger, "fv.home")
+	require.True(t, srv.callerHasProvenFullDomainVisibility(tsID, "fv.home", time.Now()))
+
+	// A complete inventory that found even one unsafe projection means raw SQL
+	// rows are not the caller-visible universe. The probe must not run, regardless
+	// of whether its answer would otherwise be complete or incomplete.
+	badger.PublishCanonicalMemoryProjectionAudit(true, false, true)
+	require.False(t, srv.callerHasProvenFullDomainVisibility(tsID, "fv.home", time.Now()))
+
+	render := func(probe outsideSpaceProbe) []byte {
+		mockStoreOf(srv).outside = probe
+		rec, resp := queryEmptyRecall(t, srv, tsID, "fv.home", "committed")
+		require.Equal(t, "unavailable", resp.IndexStatus)
+		return append([]byte(nil), rec.Body.Bytes()...)
+	}
+	base := render(outsideSpaceProbe{hasOutside: false, established: true})
+	assert.Equal(t, string(base), string(render(outsideSpaceProbe{hasOutside: true, established: true})),
+		"a quarantined projection must not become a complete/incomplete oracle")
+}
+
+func TestRecallIndexStatusExactQueryUniverseGate(t *testing.T) {
+	base := QueryMemoryRequest{StatusFilter: "committed"}
+	require.True(t, recallIndexStatusHasExactQueryUniverse(base))
+
+	cases := map[string]QueryMemoryRequest{
+		"non-default status":  {StatusFilter: "proposed"},
+		"text arm":            {StatusFilter: "committed", Query: "needle"},
+		"provider":            {StatusFilter: "committed", Provider: "other"},
+		"confidence":          {StatusFilter: "committed", MinConfidence: 0.5},
+		"tags":                {StatusFilter: "committed", Tags: []string{"one"}},
+		"cursor":              {StatusFilter: "committed", Cursor: "next"},
+		"all federation":      {StatusFilter: "committed", Federated: true},
+		"selected federation": {StatusFilter: "committed", FederateChains: []string{"peer"}},
+	}
+	for name, req := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.False(t, recallIndexStatusHasExactQueryUniverse(req))
+		})
+	}
 }
 
 // P1#2 (Dhillon): a hidden row must not change the response. The store probe is

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -105,4 +106,30 @@ func TestDomainSpaceCompleteness(t *testing.T) {
 		assert.True(t, est)
 		assert.True(t, out)
 	})
+}
+
+func TestDomainSpaceCompletenessUsesLiveDomainIndex(t *testing.T) {
+	s := newTestStore(t)
+	rows, err := s.conn.QueryContext(context.Background(), `
+		EXPLAIN QUERY PLAN
+		SELECT CASE WHEN embedding IS NULL THEN 1 ELSE 0 END,
+		       COALESCE(embedding_provider, '')
+		FROM memories
+		WHERE domain_tag = ? AND status IN ('committed','challenged')
+		ORDER BY status, memory_id
+		LIMIT ?`, "bounded", 8193)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	require.NoError(t, rows.Err())
+	assert.Contains(t, plan.String(), "idx_memories_domain_live_status",
+		"the cap must bound examined live rows, not only returned rows")
 }

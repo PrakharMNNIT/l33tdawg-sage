@@ -980,10 +980,10 @@ func (s *Server) appV25RecoveredReadOverridesLegacyVisibility(agentID, domain st
 // author gate. App-v23 additionally has an author-scoped visible_agents
 // restriction that hasMemoryReadAccess does not cover, so require it unrestricted.
 //
-// Conservative edge: an app-v23 projection that is quarantined/unpublished is
-// dropped from recall even for a fully cleared caller. Such a row, if
-// out-of-space, makes this report "incomplete" — i.e. it errs toward NOT trusting
-// an empty result, never toward hiding a record, so it is safe.
+// App-v23 also hides unpublished/quarantined SQL projections. Require a complete
+// exact canonical projection audit before a raw SQL verdict; unchecked,
+// compatible, subset, and quarantined inventories all degrade to unavailable.
+// An individual successful row validation is not a domain-wide proof.
 func (s *Server) callerHasProvenFullDomainVisibility(agentID, domain string, at time.Time) bool {
 	if s.badgerStore == nil || agentID == "" || domain == "" {
 		return false // cannot prove without on-chain policy state
@@ -992,8 +992,8 @@ func (s *Server) callerHasProvenFullDomainVisibility(agentID, domain string, at 
 	if err != nil || !fullyCleared {
 		return false
 	}
-	if s.isPostV23ForNextTx() && s.appV23LegacyVisibilityRestricted(agentID) {
-		return false // an author-scoped filter can still hide rows from this caller
+	if s.isPostV23ForNextTx() && (s.appV23LegacyVisibilityRestricted(agentID) || !s.hasExactCanonicalMemoryProjection()) {
+		return false // an author or unsafe projection filter can still hide rows
 	}
 	return true
 }
@@ -2106,10 +2106,10 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	//     can be hidden, so the verdict cannot disclose a hidden record's existence
 	//     or count. Every other caller gets "unavailable" — never a partial
 	//     evaluation, never a guess.
-	//   - Only the exact default recall contract is described: status_filter
-	//     "committed" (which, with IncludeDisputed, admits committed+challenged —
-	//     exactly what the probe scans). Any other requested status universe →
-	//     "unavailable", never a verdict over the wrong rows.
+	//   - Only the exact unnarrowed local semantic recall contract is described:
+	//     status_filter "committed" (with challenged included), no provider/tag/
+	//     confidence/cursor/text narrowing, and no federation. Any other query
+	//     universe → "unavailable", never a verdict over the wrong rows or peers.
 	//   - Without an exact active vector space, recall does not partition by space
 	//     at all, so the probe's space test is meaningless → "unavailable".
 	//   - The probe is bounded; a domain too large to settle cheaply → "unavailable".
@@ -2118,7 +2118,7 @@ func (s *Server) handleQueryMemory(w http.ResponseWriter, r *http.Request) {
 	if len(resp.Results) == 0 && req.DomainTag != "" && localDomainReadable {
 		activeSpace := s.activeEmbeddingProvider()
 		switch {
-		case req.StatusFilter != "committed":
+		case !recallIndexStatusHasExactQueryUniverse(req):
 			resp.IndexStatus = "unavailable"
 		case activeSpace == "":
 			resp.IndexStatus = "unavailable"

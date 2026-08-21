@@ -566,18 +566,19 @@ components:
           type: string
           enum: [complete, incomplete, unavailable]
           description: >
-            Present only on an EMPTY, domain-scoped recall of the default
-            (status_filter=committed) contract, to tell absence from an
-            indexing gap. "complete": the empty result is genuine absence.
+            Present on an EMPTY, domain-scoped semantic recall. "complete" and
+            "incomplete" are available only for the exact unnarrowed local
+            status_filter=committed contract; other empty query universes emit
+            "unavailable" rather than certifying the wrong scope. "complete":
+            the empty result is genuine local absence.
             "incomplete": the domain holds committed/challenged rows that no
             vector, or a foreign vector space, keeps recall from returning —
             empty is not proof of absence. "unavailable": the verdict could
-            not be proven leak-free (the caller is not proven to see every
-            record in the domain, there is no exact active vector space, a
-            non-default status_filter was used, or the domain is too large to
-            settle cheaply). Emitted only to a caller proven to see every
-            record in the domain, so it never discloses the existence or count
-            of records hidden from that caller. Never a count or a list.
+            not be proven leak-free and scope-exact (including when the caller
+            lacks full visibility, canonical projection health is not exact,
+            the vector space is unknown, the query uses status/provider/tag/
+            confidence/cursor/text narrowing, federation is requested, or the
+            live domain is too large to settle cheaply). Never a count or list.
 
     MemoryLinkRequest:
       type: object

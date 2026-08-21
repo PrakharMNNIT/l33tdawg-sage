@@ -326,10 +326,11 @@ type MemoryStore interface {
 	//                       a foreign vector space (empty recall is NOT absence).
 	//   hasOutside=false, established=true  -> every such row is in activeSpace
 	//                       (empty recall is genuine absence for this caller).
-	// The scan is bounded to `cap` rows via the domain index; a domain with more
-	// than `cap` committed/challenged rows and no out-of-space row found in the
-	// bounded prefix returns established=false, so the handler reports
-	// "unavailable" rather than scanning unbounded to prove absence.
+	// The scan is bounded to `cap` qualifying rows via a partial composite
+	// (domain,status,memory_id) index whose predicate contains only committed and
+	// challenged rows. A domain with more than `cap` live rows and no out-of-space
+	// row found in the bounded prefix returns established=false, so the handler
+	// reports "unavailable" rather than scanning unbounded to prove absence.
 	DomainSpaceCompleteness(ctx context.Context, domain, activeSpace string, cap int) (hasOutside, established bool, err error)
 	// ListMemoriesForReembed returns up to `limit` memories not yet embedded by
 	// targetProvider, with decrypted content. This makes provider migration

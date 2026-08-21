@@ -421,6 +421,9 @@ var postgresTaskAssignmentSchema = []string{
 	// CEREBRUM agent-as-lobe: each agent's top memories by confidence
 	// (WHERE submitting_agent = ? ORDER BY confidence_score DESC), index-satisfiable.
 	`CREATE INDEX IF NOT EXISTS idx_memories_submitting_agent ON memories (submitting_agent, confidence_score)`,
+	// Bounded live-row walk for DomainSpaceCompleteness. Rows outside the exact
+	// committed/challenged predicate are absent from this access path.
+	`CREATE INDEX IF NOT EXISTS idx_memories_domain_live_status ON memories (domain_tag, status, memory_id) WHERE status IN ('committed','challenged')`,
 	// CEREBRUM distributed engrams: bounded deterministic per-memory prefix.
 	// The memory_id prefix continues to serve the distinct-count aggregation.
 	`CREATE INDEX IF NOT EXISTS idx_corroborations_memory_order ON corroborations (memory_id, created_at, agent_id, id)`,
@@ -695,7 +698,7 @@ func (s *PostgresStore) CountMemoriesByProvider(ctx context.Context) (map[string
 
 // DomainSpaceCompleteness — see Store. No per-record authorization: caller-safe
 // only when the handler has proven full domain visibility. Reads at most cap+1
-// committed/challenged rows in the domain (domain-index bounded, no decrypt) and
+// committed/challenged rows in the domain (live-row composite-index bounded, no decrypt) and
 // classifies each by embedding space alone. The first out-of-space row settles
 // hasOutside; proving absence (complete) needs every row, so a bounded prefix that
 // fills without one returns established=false (→ "unavailable").
@@ -707,6 +710,7 @@ func (s *PostgresStore) DomainSpaceCompleteness(
 		        COALESCE(embedding_provider, '')
 		 FROM memories
 		 WHERE domain_tag = $1 AND status IN ('committed','challenged')
+		 ORDER BY status, memory_id
 		 LIMIT $2`,
 		domain, cap+1)
 	if qerr != nil {
