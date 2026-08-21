@@ -939,19 +939,91 @@ func sageHooksConfig(hookDirExpr string) map[string]any {
 	return sageHooksConfigWithShell(hookDirExpr, "bash")
 }
 
-// sageCodexHooksConfig uses an absolute shell path because Codex CLI hook
-// processes can inherit a restricted PATH from their launcher. A bare "bash"
-// then fails before the fail-open hook script starts, surfacing as exit 127.
+// sageCodexHooksConfig resolves Bash while the installer still has its normal
+// environment. Codex CLI hook processes can inherit a restricted PATH from
+// their launcher, so persisting the absolute executable avoids exit 127. The
+// resolver retains a previously installed absolute shell when available,
+// which keeps non-FHS and Windows Git Bash installs stable during self-heal.
 func sageCodexHooksConfig(hookDirExpr string) map[string]any {
-	return sageHooksConfigWithShell(hookDirExpr, "/bin/bash")
+	return sageCodexHooksConfigWithShell(hookDirExpr, resolveCodexBash(""))
+}
+
+func sageCodexHooksConfigWithShell(hookDirExpr, shell string) map[string]any {
+	return sageHooksConfigWithShell(hookDirExpr, shell)
+}
+
+func resolveCodexBash(preferred string) string {
+	if filepath.IsAbs(preferred) {
+		if info, err := os.Stat(preferred); err == nil && !info.IsDir() {
+			return preferred
+		}
+	}
+	if path, err := exec.LookPath("bash"); err == nil {
+		if absolute, absErr := filepath.Abs(path); absErr == nil {
+			return absolute
+		}
+		return path
+	}
+	for _, candidate := range []string{"/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	// Preserve the historical fallback on platforms where Bash is supplied by
+	// the eventual host environment but cannot be resolved during installation.
+	return "bash"
+}
+
+func installedSageHookShell(existing any, hookDirExpr string) string {
+	events, ok := existing.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, entriesValue := range events {
+		entries, ok := entriesValue.([]any)
+		if !ok {
+			continue
+		}
+		for _, entryValue := range entries {
+			entry, ok := entryValue.(map[string]any)
+			if !ok {
+				continue
+			}
+			hooks, ok := entry["hooks"].([]any)
+			if !ok {
+				continue
+			}
+			for _, hookValue := range hooks {
+				hook, ok := hookValue.(map[string]any)
+				if !ok {
+					continue
+				}
+				command, _ := hook["command"].(string)
+				if !isInstalledSageHookCommand(command, hookDirExpr) {
+					continue
+				}
+				for name := range hookScriptSet() {
+					suffix := ` "` + hookDirExpr + `/` + name + `"`
+					if strings.HasSuffix(command, suffix) {
+						return strings.Trim(strings.TrimSpace(strings.TrimSuffix(command, suffix)), `"`)
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func sageHooksConfigWithShell(hookDirExpr, shell string) map[string]any {
+	shellCommand := shell
+	if strings.ContainsAny(shellCommand, " \t") {
+		shellCommand = `"` + strings.ReplaceAll(shellCommand, `"`, `\"`) + `"`
+	}
 	cmd := func(script string) []any {
 		return []any{
 			map[string]any{
 				"type":    "command",
-				"command": shell + " \"" + hookDirExpr + "/" + script + "\"",
+				"command": shellCommand + " \"" + hookDirExpr + "/" + script + "\"",
 				"timeout": 5,
 			},
 		}
@@ -996,13 +1068,17 @@ func sageHooksConfigWithShell(hookDirExpr, shell string) map[string]any {
 // mergeSageHooksConfig replaces only installer-owned SAGE hook entries and
 // preserves unrelated user hooks under the same Claude lifecycle events.
 func mergeSageHooksConfig(existing any, hookDirExpr string) map[string]any {
+	return mergeSageHooksConfigWithShell(existing, hookDirExpr, "bash")
+}
+
+func mergeSageHooksConfigWithShell(existing any, hookDirExpr, shell string) map[string]any {
 	merged := make(map[string]any)
 	if current, ok := existing.(map[string]any); ok {
 		for event, value := range current {
 			merged[event] = value
 		}
 	}
-	for event, desired := range sageHooksConfig(hookDirExpr) {
+	for event, desired := range sageHooksConfigWithShell(hookDirExpr, shell) {
 		var kept []any
 		if entries, ok := merged[event].([]any); ok {
 			for _, entry := range entries {
@@ -1044,12 +1120,12 @@ func mergeSageHooksConfig(existing any, hookDirExpr string) map[string]any {
 
 func isInstalledSageHookCommand(command, hookDirExpr string) bool {
 	for name := range hookScriptSet() {
-		if command == `bash "`+hookDirExpr+`/`+name+`"` {
+		if strings.HasSuffix(command, ` "`+hookDirExpr+`/`+name+`"`) {
 			return true
 		}
 	}
 	for _, name := range []string{legacyBootScriptName, legacyTurnScriptName} {
-		if command == `bash "`+hookDirExpr+`/`+name+`"` {
+		if strings.HasSuffix(command, ` "`+hookDirExpr+`/`+name+`"`) {
 			return true
 		}
 	}
