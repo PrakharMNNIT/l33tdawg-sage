@@ -3280,6 +3280,8 @@ function TasksPage({ sse }) {
         }, 500);
     };
 
+    const taskLoadGeneration = useRef(0);
+
     // Live refresh: agents create and move tasks through the same shared store, so
     // refresh on task/remember/forget events instead of leaving the board stale.
     useEffect(() => {
@@ -3289,6 +3291,7 @@ function TasksPage({ sse }) {
     }, [sse]);
 
     async function loadTasks({ silent = false } = {}) {
+		const generation = ++taskLoadGeneration.current;
         // Initial entry and an explicit operator refresh may replace the board
         // with its loading state. SSE refreshes and post-commit reconciliation
         // must keep the current board mounted: a terminal-column clear emits
@@ -3303,6 +3306,7 @@ function TasksPage({ sse }) {
                 fetcher: fetchTasks,
                 settlingIDs: settlingClears.current,
                 silent,
+				isCurrent: () => generation === taskLoadGeneration.current,
                 setTasks,
                 setDomains,
                 setError,
@@ -3323,25 +3327,32 @@ function TasksPage({ sse }) {
     async function reconcileClearedTasks(ids) {
         const pending = new Set(ids);
         let latest = [];
+		let hasAuthoritativeSnapshot = false;
         try {
             for (let attempt = 0; attempt < 4; attempt++) {
                 const items = await loadTasks({ silent: true });
-                if (Array.isArray(items)) latest = items;
+				// A newer overlapping request superseded this response. It did not
+				// update state and cannot confirm task absence; retry within the
+				// same bounded reconciliation window.
+				if (!Array.isArray(items)) {
+					if (attempt < 3) await pause(750);
+					continue;
+				}
+				latest = items;
+				hasAuthoritativeSnapshot = true;
                 const remaining = latest.filter(task => pending.has(task.memory_id));
                 if (!remaining.length) return remaining;
                 if (attempt < 3) await pause(750);
             }
+			if (!hasAuthoritativeSnapshot) {
+				throw new Error('Task reconciliation was superseded before it could confirm the canonical state');
+			}
             return latest.filter(task => pending.has(task.memory_id));
         } finally {
             ids.forEach(id => settlingClears.current.delete(id));
-            // The final refresh above intentionally hid settling cards. Render
-            // the canonical outcome once the bounded wait has finished.
-            if (latest.length) {
-                setTasks(latest);
-                setDomains([...new Set(latest.map(task => task.domain_tag).filter(Boolean))].sort());
-            } else {
-                loadTasks({ silent: true }).catch(() => {});
-            }
+			// Fetch once more after releasing the settling filter. This request is
+			// generation-fenced too, so it cannot overwrite a newer snapshot.
+			loadTasks({ silent: true }).catch(() => {});
         }
     }
 
