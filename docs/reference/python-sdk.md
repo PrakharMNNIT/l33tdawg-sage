@@ -1128,7 +1128,14 @@ register_domain(
 
 `POST /v1/domain/register`
 
-Caller becomes domain owner. Current v11 chains also auto-register the first writer of an unowned, non-shared domain as owner and grant that owner level-2 access; shared domains (`general`, `self`, `meta`, `sage-*`, and domains opened by governance) remain writable by authenticated agents.
+Caller becomes domain owner. Current v11 chains also auto-register the first
+writer of an unowned, non-shared domain as owner and grant that owner level-2
+access. Reserved shared domains (`general`, `self`, `meta`, `sage-*`, and
+domains opened by governance) are ownerless and reject explicit registration
+with HTTP 403 / ABCI code 50 (`shared domain not ownable`). Compile-time
+catch-alls are readable by active local agents within their classification
+clearance; shared Write remains subject to the caller's current or migrated
+app-v23 policy.
 
 ---
 

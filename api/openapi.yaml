@@ -3843,7 +3843,10 @@ paths:
   /v1/domain/register:
     post:
       operationId: domainRegister
-      summary: Register a domain. Caller becomes owner.
+      summary: Register a non-shared domain. Caller becomes owner.
+      description: >-
+        Reserved static catch-alls and governance-promoted shared domains are
+        ownerless and reject registration with HTTP 403 / ABCI code 50.
       tags:
         - Domain
       requestBody:
@@ -3869,6 +3872,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 

@@ -127,6 +127,43 @@ func TestAppV23LegacyReadCompatibilityRestrictsLocalRESTButNotPairwiseFederation
 	require.True(t, srv.appV23LegacyVisibilityRestricted(reader))
 }
 
+func TestAppV23LegacyStaticSharedWriteIsNotWriteOnly(t *testing.T) {
+	srv, _, badger, _ := newRBACTestServer(t)
+	srv.SetPostV22ForNextTxAccessor(func() bool { return true })
+	srv.SetPostV23ForNextTxAccessor(func() bool { return true })
+
+	root := fmt.Sprintf("%064x", 9051)
+	writer := fmt.Sprintf("%064x", 9052)
+	require.NoError(t, badger.RegisterAgentWithCapabilities(
+		root, "root", store.AppV23RoleAdmin, "", "", "", 1, 0,
+	))
+	require.NoError(t, badger.RegisterAgentWithCapabilities(
+		writer, "writer", store.AppV23RoleMember, "", "", "", 2, 0,
+	))
+	// Reproduce a stale historical owner row. Static shared-domain policy must
+	// ignore it rather than making the namespace private or treating this
+	// writer as a claimant.
+	require.NoError(t, badger.RegisterDomain("general", root, "", 3))
+	require.NoError(t, badger.EnsureAppV23Root("rest-static-shared-read", 100))
+
+	require.NoError(t, srv.checkDomainAccess(
+		context.Background(), writer, "general", "write",
+	), "an unchanged migrated Member retains the documented shared-domain write compatibility")
+	require.NoError(t, srv.checkDomainAccess(
+		context.Background(), writer, "general", "read",
+	), "a shared-domain writer must be able to dereference its accepted write")
+	allowed, err := srv.hasMemoryReadAccess(
+		"general", writer, 1, time.Unix(1000, 0),
+	)
+	require.NoError(t, err)
+	require.True(t, allowed)
+	allowed, err = srv.hasMemoryReadAccess(
+		"general", writer, 2, time.Unix(1000, 0),
+	)
+	require.NoError(t, err)
+	require.False(t, allowed, "shared Read remains bounded by current clearance")
+}
+
 func TestAppV23LegacyOrgMembershipClearanceSurvivesLocalRESTOnly(t *testing.T) {
 	srv, _, badger, _ := newRBACTestServer(t)
 	srv.SetPostV22ForNextTxAccessor(func() bool { return true })

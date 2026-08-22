@@ -134,6 +134,31 @@ func TestProcessAccessGrant_PostForkSharedPrefixReject(t *testing.T) {
 	assert.Error(t, err, "sage-debugging must remain unregistered")
 }
 
+func TestProcessDomainRegister_PostForkSharedReject(t *testing.T) {
+	app := setupTestApp(t)
+	app.v8AppliedHeight = 100
+	const height = int64(200)
+
+	registrant := newAgentKey(t)
+	require.NoError(t, app.badgerStore.SetSharedDomain("governed-open"))
+
+	for _, domain := range []string{"general", "self", "meta", "sage-debugging", "governed-open"} {
+		domain := domain
+		t.Run(domain, func(t *testing.T) {
+			parsed := makeDelegatedDomainRegisterTx(
+				t, registrant, registrant, []byte("register "+domain),
+				time.Unix(1_700_000_000, 0), domain, "", false,
+			)
+			result := app.processDomainRegister(parsed, height, time.Unix(1_700_000_000, 0))
+			require.Equal(t, uint32(50), result.Code, result.Log)
+			require.Contains(t, result.Log, "shared domain not ownable")
+
+			_, err := app.badgerStore.GetDomainOwner(domain)
+			require.Error(t, err, "shared domain %q must remain ownerless", domain)
+		})
+	}
+}
+
 // TestProcessAccessGrant_PostForkAncestorOwnedBlocksLeafClaim asserts
 // that if any ancestor of the grant domain has an owner, a different
 // agent CANNOT auto-claim the leaf — they would be writing under

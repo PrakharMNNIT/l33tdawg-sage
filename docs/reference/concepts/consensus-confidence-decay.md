@@ -160,7 +160,7 @@ PoE weights are computed at epoch boundaries and drive quorum vote weighting. Al
 const EpochInterval = 100  // blocks per epoch
 ```
 
-`IsEpochBoundary(height)` returns true when `height % 100 == 0 && height > 0`. At each boundary, `processEpoch` (`app.go:9554+`) recomputes weights for all validators.
+`IsEpochBoundary(height)` returns true when `height % 100 == 0 && height > 0`. At each boundary, `processEpoch` (`app.go:9563+`) recomputes weights for all validators.
 
 ### Weight Formula
 

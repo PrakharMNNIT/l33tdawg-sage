@@ -1198,7 +1198,11 @@ List active grants for an agent. Cross-checks BadgerDB (chain truth) against the
 
 ### `POST /v1/domain/register`
 
-Register a domain. Caller becomes owner. Broadcasts `TxTypeDomainRegister`.
+Register a non-shared domain. Caller becomes owner. Broadcasts
+`TxTypeDomainRegister`. Static catch-alls (`general`, `self`, `meta`, and
+`sage-*`) and governance-promoted shared domains are ownerless and return 403
+with `shared domain not ownable`; a historical owner row does not change that
+classification.
 
 **Request body:**
 
@@ -1209,6 +1213,8 @@ Register a domain. Caller becomes owner. Broadcasts `TxTypeDomainRegister`.
 | `parent` | string | no |
 
 **Response** (HTTP 201): `{"status": "registered", "tx_hash": "..."}`
+
+**Errors:** HTTP 403 / ABCI code 50 when `name` is a shared domain.
 
 ---
 
