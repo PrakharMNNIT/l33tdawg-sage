@@ -51,6 +51,24 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.18.28
+
+**Reserved shared domains are readable again without becoming ownable.** Active
+local principals can read the compile-time shared namespaces `general`, `self`,
+`meta`, and `sage-*`, while each record's classification still applies. This
+restores the shared-domain behavior expected by existing agents without opening
+private or restricted records.
+
+Access-grant transactions now reject attempts to register either those reserved
+namespaces or governance-promoted shared domains as owned domains. REST reports
+that conflict as a forbidden request, and the API, SDK, and RBAC references now
+state the same contract.
+
+This patch introduces no new consensus application version or state migration.
+The ceiling remains app-v26; **v11.18.28 introduces no app-v27**.
+
+Container: `ghcr.io/l33tdawg/sage:11.18.28`. SDK 11.18.28.
+
 ## What's New in v11.18.27
 
 **Empty semantic recall now distinguishes genuine absence from an incomplete
@@ -2116,7 +2134,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.27`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.28`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
