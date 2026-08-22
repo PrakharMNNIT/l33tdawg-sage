@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.27 is the current release.** It keeps the
+**Status (2026-08):** **v11.18.28 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -94,16 +94,33 @@ and native-shell CI actions without changing SAGE runtime behavior.
 v11.18.27 adds caller-safe empty semantic-recall completeness disclosure,
 fenced across the exact projection and embedding-space source so agents can
 distinguish genuine absence from temporarily unreachable committed memory.
+v11.18.28 restores readable compile-time shared namespaces while preventing
+reserved or governance-promoted shared domains from becoming ownable.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
 metadata and making bloomed memories responsive. The supported consensus
-ceiling remains app-v26; **v11.18.27 does not introduce app-v27**.
+ceiling remains app-v26; **v11.18.28 does not introduce app-v27**.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.18.28 patch
+
+Active local principals can once again read records in the compile-time shared
+domains `general`, `self`, `meta`, and `sage-*`. Record classification remains
+authoritative, so private and restricted records are not exposed by the shared
+domain rule.
+
+Access-grant processing rejects attempts to register either a compile-time
+shared namespace or a governance-promoted shared domain as owned. REST surfaces
+that conflict as forbidden, and the API, SDK, and RBAC references describe the
+same boundary.
+
+This patch introduces no new consensus application version or state migration:
+app-v26 remains the ceiling and v11.18.28 does not introduce app-v27.
 
 ## v11.18.27 patch
 
