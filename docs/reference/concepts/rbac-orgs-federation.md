@@ -103,7 +103,14 @@ Departments have their own `Clearance` field independent of the org-level member
 
 When an agent submits a memory to a domain that has no registered owner and is not a shared domain, `processMemorySubmit` calls `badgerStore.RegisterDomain(domain, agentID, "", height)` (check-and-set). The submitting agent becomes owner and receives a level-2 access grant automatically.
 
-**Shared domains** (never auto-registered, writable by any authenticated agent):
+**Shared domains** are ownerless and cannot be registered explicitly. The
+compile-time catch-alls are readable by every active local agent up to that
+agent's current clearance, even if historical chain state still contains an
+inert owner row. Their write policy remains separate: pre-app-v23 authenticated
+agents and unchanged migrated app-v23 principals retain compatibility Write,
+while fresh app-v23 principals need explicit shared Write authority. Dynamic
+governance-promoted shared domains retain explicit Read as well as Write policy.
+
 - Exact names: `general`, `self`, `meta` (`app.go:766-770`)
 - Prefix match: `sage-*` (`app.go:780-782`)
 - Any domain with on-chain `shared_domain:<name>` sentinel (set by `TxTypeDomainReassign` with `OpenToShared=true`)
@@ -336,7 +343,10 @@ whose canonical disposition is `member`, `legacy_restricted`, or
 when bit `2` is absent. It is strictly `Write`, never level-3 `Modify`; it
 requires the initial role and enrollment revisions and an exact match to the
 immutable migration baseline. Any explicit policy review ends it. Fresh
-app-v23 and direct-genesis agents always use normal explicit shared grants
+app-v23 and direct-genesis agents use normal explicit shared grants for Write
+or Modify. Compile-time catch-all Read remains automatic and
+classification-bounded; governance-promoted shared domains retain explicit
+Read policy
 (`internal/store/appv23_local_rbac.go`;
 `internal/abci/appv23_local_rbac.go`; `api/rest/memory_handler.go`).
 

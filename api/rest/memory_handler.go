@@ -3474,6 +3474,8 @@ func broadcastErrorPublic(err error) (int, string) {
 		return http.StatusForbidden, "access denied"
 	case strings.Contains(msg, "not in the validator set"):
 		return http.StatusForbidden, "access denied"
+	case strings.Contains(msg, "shared domain not ownable"):
+		return http.StatusForbidden, "shared domain not ownable"
 	case strings.Contains(msg, "agent identity verification failed"):
 		return http.StatusUnauthorized, "agent identity verification failed"
 	case strings.Contains(msg, "not registered"):

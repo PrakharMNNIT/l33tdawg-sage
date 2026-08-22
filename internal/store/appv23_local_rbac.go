@@ -4657,6 +4657,16 @@ func (s *BadgerStore) authorizeAppV23LocalDomainPolicy(policyID, domain string, 
 		return AppV23Authorization{Allowed: true}, nil
 	}
 	if shared {
+		// Compile-time catch-all domains are ownerless common resources. Once an
+		// active local principal has passed the profile/enrollment checks above,
+		// Read is part of that reserved contract; per-record classification still
+		// applies at the disclosure layer. Requiring an exact grant here made
+		// legacy-compatible shared Write a write-only trap, because no effective
+		// owner exists to issue that grant. Governance-promoted shared domains
+		// retain their narrower explicit-read policy.
+		if verb == AppV23VerbRead && IsSharedDomainName(domain) {
+			return AppV23Authorization{Allowed: true}, nil
+		}
 		recoveredGroup, recoveredGroupErr :=
 			s.AuthorizeAppV25RecoveredGroupDomain(policyID, domain, verb)
 		if recoveredGroupErr != nil {

@@ -8184,6 +8184,15 @@ func (app *SageApp) processDomainRegister(parsedTx *tx.ParsedTx, height int64, b
 	if err != nil {
 		return &abcitypes.ExecTxResult{Code: 40, Log: fmt.Sprintf("agent identity verification failed: %v", err)}
 	}
+	// Shared domains have no effective owner. Reject explicit registration at
+	// the same fork boundary as shared-domain grant rejection; otherwise a
+	// caller can receive a successful registration and an owned-domain index
+	// entry that confer no authority because every authorization resolver
+	// correctly treats the shared name as ownerless.
+	postSharedDomainRules := app.postV8Fork(height) || app.postAppV8Rules(height)
+	if postSharedDomainRules && app.isSharedDomain(reg.DomainName, height) {
+		return &abcitypes.ExecTxResult{Code: 50, Log: fmt.Sprintf("shared domain not ownable: %s", reg.DomainName)}
+	}
 	if app.postAppV23Rules(height) {
 		allowed, denialCode, decisionErr := app.appV23DomainDecision(
 			parsedTx, credentialID, reg.DomainName, store.AppV23VerbWrite, height, blockTime,

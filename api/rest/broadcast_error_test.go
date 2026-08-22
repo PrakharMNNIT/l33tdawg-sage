@@ -52,6 +52,11 @@ func TestBroadcastErrorPublic_DeprecationGate(t *testing.T) {
 			http.StatusForbidden,
 		},
 		{
+			"shared domain registration → 403",
+			"shared domain not ownable: general",
+			http.StatusForbidden,
+		},
+		{
 			"app-v17 wrong lifecycle state → 409",
 			"reinstate: memory abc is not challenged (status=committed)",
 			http.StatusConflict,
