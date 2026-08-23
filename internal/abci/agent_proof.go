@@ -557,7 +557,7 @@ func (app *SageApp) verifySignedAgentAction(
 				}
 				// Before app-v27, preserve encoding/json's historical null-to-empty
 				// string behavior so previously committed transactions replay.
-			} else if err := json.Unmarshal(body.TaskStatus, &canonicalTaskStatus); err != nil {
+			} else if statusErr := json.Unmarshal(body.TaskStatus, &canonicalTaskStatus); statusErr != nil {
 				return fmt.Errorf("signed task_status must be a string when present")
 			}
 		} else if postAppV27 && memoryType == tx.MemoryTypeTask {
