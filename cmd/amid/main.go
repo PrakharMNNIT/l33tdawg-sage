@@ -229,6 +229,7 @@ type restForkAccessorSetter interface {
 	SetPostV20ForNextTxAccessor(func() bool)
 	SetPostV22ForNextTxAccessor(func() bool)
 	SetPostV23ForNextTxAccessor(func() bool)
+	SetPostV27ForNextTxAccessor(func() bool)
 }
 
 type appForkAccessorSource interface {
@@ -237,6 +238,7 @@ type appForkAccessorSource interface {
 	IsAppV20ActiveForNextTx() bool
 	IsAppV22ActiveForNextTx() bool
 	IsAppV23ActiveForNextTx() bool
+	IsAppV27ActiveForNextTx() bool
 }
 
 // wireRESTForkAccessors keeps amid's REST authorization behavior in lockstep
@@ -249,6 +251,7 @@ func wireRESTForkAccessors(server restForkAccessorSetter, app appForkAccessorSou
 	server.SetPostV20ForNextTxAccessor(app.IsAppV20ActiveForNextTx)
 	server.SetPostV22ForNextTxAccessor(app.IsAppV22ActiveForNextTx)
 	server.SetPostV23ForNextTxAccessor(app.IsAppV23ActiveForNextTx)
+	server.SetPostV27ForNextTxAccessor(app.IsAppV27ActiveForNextTx)
 }
 
 const (

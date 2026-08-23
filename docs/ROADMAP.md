@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.18.28 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.0 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -96,16 +96,40 @@ fenced across the exact projection and embedding-space source so agents can
 distinguish genuine absence from temporarily unreachable committed memory.
 v11.18.28 restores readable compile-time shared namespaces while preventing
 reserved or governance-promoted shared domains from becoming ownable.
+v11.19.0 introduces app-v27: eligible immutable record authors gain narrowly
+scoped challenge/reinstate authority in compile-time reserved shared domains,
+and an omitted new-task `task_status` is canonically interpreted as `planned`.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
 metadata and making bloomed memories responsive. The supported consensus
-ceiling remains app-v26; **v11.18.28 does not introduce app-v27**.
+ceiling is app-v27.
 
 **Hard constraint driving the whole plan:** no chain reset. Existing chains must
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.0 release
+
+App-v27 makes exactly two consensus changes.
+
+First, the immutable author of a record in the compile-time reserved shared
+domains `general`, `self`, `meta`, and `sage-*` may challenge that record and
+may reinstate its open challenge without separately holding level-3 Modify.
+The authority is record-scoped and does not extend to governance-promoted
+shared domains. Pending or inactive enrollment, read-only/profile restrictions,
+shared-write denies, and classification/clearance failures remain hard denials.
+For app-v21 weighted challenges, an eligible author is included in the frozen
+electorate when the round opens.
+
+Second, an omitted `task_status` on a signed new-task request is canonicalized
+to `planned` after app-v27. REST transaction construction and consensus proof
+verification derive the same value. Pre-app-v27 blocks retain the historical
+explicit-field contract, so replay and AppHash behavior are unchanged.
+
+App-v27 activates through governance from app-v26, applies its rules at H+1,
+and requires no state migration.
 
 ## v11.18.28 patch
 

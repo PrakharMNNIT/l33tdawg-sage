@@ -25,7 +25,7 @@ import (
 // UNGATED CONSENSUS CHANGE — nodes on different versions would disagree about
 // whether the same transaction validates, which is a fork.
 //
-// Normalizing here is future app-v27 work behind a version gate. Until then,
+// App-v27 normalizes this only behind its forward gate. Before that boundary,
 // omission must remain a mismatch.
 func TestAppV26TaskStatusOmissionStaysAProofMismatch(t *testing.T) {
 	app, _, companion := directAppV23GenesisTestApp(t)
@@ -47,7 +47,7 @@ func TestAppV26TaskStatusOmissionStaysAProofMismatch(t *testing.T) {
 		ConfidenceScore: 0.9, Content: content, TaskStatus: "planned",
 	}}
 
-	err = app.verifySignedAgentAction(broadcast, companion.id, omittedReq, false, true, true)
+	err = app.verifySignedAgentAction(broadcast, companion.id, omittedReq, false, true, true, false)
 	require.Error(t, err,
 		"an omitted signed task_status must NOT be normalized by the proof check; "+
 			"accepting it would change which transactions validate, which is fork-class")
@@ -74,7 +74,89 @@ func TestAppV26ExplicitPlannedTaskStatusStillVerifies(t *testing.T) {
 	}}
 
 	require.NoError(t,
-		app.verifySignedAgentAction(broadcast, companion.id, explicitReq, false, true, true),
+		app.verifySignedAgentAction(broadcast, companion.id, explicitReq, false, true, true, false),
 		"an explicitly signed planned status is what every fixed client now sends; "+
 			"it must verify, or the clients are broken instead")
+}
+
+func TestAppV27TaskStatusOmissionNormalizesToPlanned(t *testing.T) {
+	app, _, companion := directAppV23GenesisTestApp(t)
+	content := "[TASK] app-v27 canonical omitted status"
+	contentHash := sha256.Sum256([]byte(content))
+
+	omitted := canonicalAgentRequest(t, "POST", "/v1/memory/submit", map[string]any{
+		"content": content, "memory_type": "task", "confidence_score": 0.9,
+	})
+	omittedReq, err := parseSignedAgentRequest(omitted)
+	require.NoError(t, err)
+
+	broadcast := &tx.ParsedTx{Type: tx.TxTypeMemorySubmit, MemorySubmit: &tx.MemorySubmit{
+		MemoryID: "00000000-0000-4000-8000-000000000000", ContentHash: contentHash[:],
+		MemoryType: tx.MemoryTypeTask, DomainTag: "voice-interface",
+		ConfidenceScore: 0.9, Content: content, TaskStatus: "planned",
+	}}
+
+	require.NoError(t,
+		app.verifySignedAgentAction(broadcast, companion.id, omittedReq, false, true, true, true),
+		"post-app-v27 treats omitted task_status as the canonical initial planned status")
+}
+
+func TestAppV27ExplicitEmptyTaskStatusIsNotOmission(t *testing.T) {
+	app, _, companion := directAppV23GenesisTestApp(t)
+	content := "[TASK] explicit empty is invalid"
+	contentHash := sha256.Sum256([]byte(content))
+	explicitEmpty := canonicalAgentRequest(t, "POST", "/v1/memory/submit", map[string]any{
+		"content": content, "memory_type": "task", "confidence_score": 0.9,
+		"task_status": "",
+	})
+	req, err := parseSignedAgentRequest(explicitEmpty)
+	require.NoError(t, err)
+	broadcast := &tx.ParsedTx{Type: tx.TxTypeMemorySubmit, MemorySubmit: &tx.MemorySubmit{
+		MemoryID: "00000000-0000-4000-8000-000000000000", ContentHash: contentHash[:],
+		MemoryType: tx.MemoryTypeTask, DomainTag: "voice-interface",
+		ConfidenceScore: 0.9, Content: content, TaskStatus: "planned",
+	}}
+	require.Error(t,
+		app.verifySignedAgentAction(broadcast, companion.id, req, false, true, true, true),
+		"an explicitly signed empty status must not acquire omission semantics")
+}
+
+func TestAppV27NullTaskStatusIsNotOmission(t *testing.T) {
+	app, _, companion := directAppV23GenesisTestApp(t)
+	content := "[TASK] null is not omission"
+	contentHash := sha256.Sum256([]byte(content))
+	nullStatus := canonicalAgentRequest(t, "POST", "/v1/memory/submit", map[string]any{
+		"content": content, "memory_type": "task", "confidence_score": 0.9,
+		"task_status": nil,
+	})
+	req, err := parseSignedAgentRequest(nullStatus)
+	require.NoError(t, err)
+	broadcast := &tx.ParsedTx{Type: tx.TxTypeMemorySubmit, MemorySubmit: &tx.MemorySubmit{
+		MemoryID: "00000000-0000-4000-8000-000000000000", ContentHash: contentHash[:],
+		MemoryType: tx.MemoryTypeTask, DomainTag: "voice-interface",
+		ConfidenceScore: 0.9, Content: content, TaskStatus: "planned",
+	}}
+	require.ErrorContains(t,
+		app.verifySignedAgentAction(broadcast, companion.id, req, false, true, true, true),
+		"must be a string")
+}
+
+func TestPreAppV27NullTaskStatusPreservesHistoricalEmptyDecode(t *testing.T) {
+	app := setupTestApp(t)
+	content := "historical explicit null task status"
+	contentHash := sha256.Sum256([]byte(content))
+	nullStatus := canonicalAgentRequest(t, "POST", "/v1/memory/submit", map[string]any{
+		"content": content, "memory_type": "fact", "domain_tag": "research",
+		"confidence_score": 0.9, "task_status": nil,
+	})
+	req, err := parseSignedAgentRequest(nullStatus)
+	require.NoError(t, err)
+	broadcast := &tx.ParsedTx{Type: tx.TxTypeMemorySubmit, MemorySubmit: &tx.MemorySubmit{
+		MemoryID: "00000000-0000-4000-8000-000000000000", ContentHash: contentHash[:],
+		MemoryType: tx.MemoryTypeFact, DomainTag: "research",
+		ConfidenceScore: 0.9, Content: content,
+	}}
+	require.NoError(t,
+		app.verifySignedAgentAction(broadcast, "delegated-agent", req, false, false, false, false),
+		"pre-app-v27 replay must preserve encoding/json's historical null-to-empty string decode")
 }

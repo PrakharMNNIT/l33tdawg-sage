@@ -1,8 +1,8 @@
-<!-- Core document reconciled through SAGE v11.18.28/app-v26, including consensus-backed Access Group authority, Root continuity, linked federated readers, and the quorum/state-sync/governance-gateway sections. -->
+<!-- Core document reconciled through SAGE v11.19.0/app-v27, including consensus-backed Access Group authority, Root continuity, linked federated readers, and the quorum/state-sync/governance-gateway sections. -->
 
 # RBAC, Organizations, and Federation
 
-Verified against SAGE v11.18.28. Legacy organization/federation sections retain
+Verified against SAGE v11.19.0. Legacy organization/federation sections retain
 their historical context; app-v23 roles, Root, Access Groups, and app-v25
 historical writer continuity are the current local-control model.
 
@@ -110,6 +110,13 @@ inert owner row. Their write policy remains separate: pre-app-v23 authenticated
 agents and unchanged migrated app-v23 principals retain compatibility Write,
 while fresh app-v23 principals need explicit shared Write authority. Dynamic
 governance-promoted shared domains retain explicit Read as well as Write policy.
+
+At app-v27, the immutable author of a record in one of the compile-time
+catch-alls has record-scoped challenge/reinstate authority without a separate
+level-3 Modify grant. Governance-promoted shared domains are excluded. The
+author still must pass active-enrollment, profile/capability, and
+classification/clearance hard gates; authorship is not ownership and does not
+grant general domain Modify.
 
 - Exact names: `general`, `self`, `meta` (`app.go:766-770`)
 - Prefix match: `sage-*` (`app.go:780-782`)

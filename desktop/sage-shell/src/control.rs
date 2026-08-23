@@ -189,7 +189,7 @@ fn supported_daemon_version(value: &str) -> bool {
     }
     let major = parts[0].parse::<u64>().ok();
     let minor = parts[1].parse::<u64>().ok();
-    major == Some(11) && matches!(minor, Some(10..=18))
+    major == Some(11) && matches!(minor, Some(10..=19))
 }
 
 fn valid_semver_number(value: &str) -> bool {
@@ -658,7 +658,8 @@ mod tests {
         assert!(supported_daemon_version("11.16.0"));
         assert!(supported_daemon_version("11.17.0"));
         assert!(supported_daemon_version("11.18.0"));
-        assert!(!supported_daemon_version("11.19.0"));
+        assert!(supported_daemon_version("11.19.0"));
+        assert!(!supported_daemon_version("11.20.0"));
         assert!(!supported_daemon_version("eleven"));
         assert!(valid_generation(&"A".repeat(43)));
         assert!(!valid_generation(&"B".repeat(43)));

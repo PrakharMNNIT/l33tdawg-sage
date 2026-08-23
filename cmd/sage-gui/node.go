@@ -1252,6 +1252,7 @@ func runServe(startupProof string) (rerr error) {
 	restServer.SetPostV20ForNextTxAccessor(app.IsAppV20ActiveForNextTx)
 	restServer.SetPostV22ForNextTxAccessor(app.IsAppV22ActiveForNextTx)
 	restServer.SetPostV23ForNextTxAccessor(app.IsAppV23ActiveForNextTx)
+	restServer.SetPostV27ForNextTxAccessor(app.IsAppV27ActiveForNextTx)
 	restServer.SetGovernanceDomainAccessor(app.GovernanceDelegationDomain)
 	// App-v23 Root is a non-delegable local credential. Before v23, legacy
 	// keyless MCP bearers intentionally fell back to cfg.AgentKey; at activation

@@ -1,8 +1,8 @@
-Verified against SDK source for SAGE v11.18.28. Package: sage-agent-sdk.
+Verified against SDK source for SAGE v11.19.0. Package: sage-agent-sdk.
 
 # SAGE Python SDK Reference
 
-**Package:** `sage-agent-sdk` **Version:** 11.18.28
+**Package:** `sage-agent-sdk` **Version:** 11.19.0
 **Requires:** Python 3.10+ | httpx ≥ 0.25 | pydantic ≥ 2.0 | PyNaCl ≥ 1.5
 
 ```bash
@@ -417,6 +417,11 @@ challenge(
 
 `POST /v1/memory/{memory_id}/challenge`
 
+At app-v27, the immutable author of a record in `general`, `self`, `meta`, or
+`sage-*` may challenge that exact record without separately holding a level-3
+Modify grant, provided all enrollment, profile/capability, and clearance hard
+gates pass. Governance-promoted shared domains are not included.
+
 ---
 
 #### `corroborate()`
@@ -470,6 +475,10 @@ current modify authorization, with the original challenger always allowed to
 withdraw. An app-v21 weighted round can be reinstated only by an identity in its
 snapshotted electorate. Returns
 `{"message": ..., "tx_hash": ..., "status": "committed"}`.
+
+An eligible app-v27 static reserved shared-domain record author is included in
+the frozen electorate when a weighted challenge opens and may therefore
+reinstate it. The exception is record-scoped and preserves all hard denials.
 
 ---
 

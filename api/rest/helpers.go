@@ -53,3 +53,17 @@ func decodeJSON(r *http.Request, v interface{}) error {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	return json.Unmarshal(body, v)
 }
+
+func jsonFieldPresent(r *http.Request, field string) (bool, error) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return false, fmt.Errorf("read body: %w", err)
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return false, err
+	}
+	_, ok := fields[field]
+	return ok, nil
+}

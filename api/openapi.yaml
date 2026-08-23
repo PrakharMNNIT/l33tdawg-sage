@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.18.28
+  version: 11.19.0
   description: |-
     (Sovereign) Agent Governed Experience — network REST API for memory
     submission, validation, and query.
@@ -340,11 +340,11 @@ components:
           enum:
             - planned
           description: >-
-            New task memories must enter consensus as planned, and MUST send it
-            explicitly. Omitting it returns 400 Missing task status: a signed
-            caller's agent proof covers the request body, so the server cannot
-            supply the value afterwards without invalidating that proof. Use the
-            task-status endpoint to change it after creation.
+            New task memories enter consensus as planned. After app-v27 this
+            field may be omitted: REST transaction construction and consensus
+            proof verification both canonicalize omission to planned. Before
+            app-v27, omission returns 400 Missing task status. Use the task-status
+            endpoint to change it after creation.
         linked_memories:
           type: array
           items:

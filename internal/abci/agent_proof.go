@@ -45,7 +45,7 @@ type signedAgentRequest struct {
 func (app *SageApp) enforceDelegatedAgentProof(
 	parsedTx *tx.ParsedTx,
 	consensusTime time.Time,
-	claim, postAppV20, postAppV22, postAppV23 bool,
+	claim, postAppV20, postAppV22, postAppV23, postAppV27 bool,
 ) error {
 	usesAgentIdentity := txUsesAgentIdentity(parsedTx.Type)
 	governanceProof := postAppV20 && isProofBearingGovernanceRequest(parsedTx)
@@ -88,7 +88,7 @@ func (app *SageApp) enforceDelegatedAgentProof(
 		return err
 	}
 	if bindErr := app.verifySignedAgentAction(
-		parsedTx, agentID, req, postAppV20, postAppV22, postAppV23,
+		parsedTx, agentID, req, postAppV20, postAppV22, postAppV23, postAppV27,
 	); bindErr != nil {
 		return fmt.Errorf("delegated agent action mismatch: %w", bindErr)
 	}
@@ -519,7 +519,7 @@ func (app *SageApp) verifySignedAgentAction(
 	actual *tx.ParsedTx,
 	agentID string,
 	req signedAgentRequest,
-	bindMemoryTags, postAppV22, postAppV23 bool,
+	bindMemoryTags, postAppV22, postAppV23, postAppV27 bool,
 ) error { //nolint:gocyclo,maintidx // exhaustive protocol routing is intentionally centralized
 	expected := &tx.ParsedTx{Type: actual.Type}
 
@@ -529,15 +529,15 @@ func (app *SageApp) verifySignedAgentAction(
 			return err
 		}
 		var body struct {
-			Content         string    `json:"content"`
-			MemoryType      string    `json:"memory_type"`
-			DomainTag       string    `json:"domain_tag"`
-			ConfidenceScore float64   `json:"confidence_score"`
-			Classification  int       `json:"classification,omitempty"`
-			Embedding       []float32 `json:"embedding,omitempty"`
-			ParentHash      string    `json:"parent_hash,omitempty"`
-			TaskStatus      string    `json:"task_status,omitempty"`
-			Tags            []string  `json:"tags,omitempty"`
+			Content         string          `json:"content"`
+			MemoryType      string          `json:"memory_type"`
+			DomainTag       string          `json:"domain_tag"`
+			ConfidenceScore float64         `json:"confidence_score"`
+			Classification  int             `json:"classification,omitempty"`
+			Embedding       []float32       `json:"embedding,omitempty"`
+			ParentHash      string          `json:"parent_hash,omitempty"`
+			TaskStatus      json.RawMessage `json:"task_status,omitempty"`
+			Tags            []string        `json:"tags,omitempty"`
 		}
 		if err := decodeSignedJSON(req.body, &body, false); err != nil {
 			return err
@@ -548,6 +548,20 @@ func (app *SageApp) verifySignedAgentAction(
 		}
 		if body.Content == "" || body.ConfidenceScore < 0 || body.ConfidenceScore > 1 || body.Classification < 0 || body.Classification > 4 {
 			return fmt.Errorf("signed memory submission fails the REST contract")
+		}
+		canonicalTaskStatus := ""
+		if len(body.TaskStatus) != 0 {
+			if bytes.Equal(bytes.TrimSpace(body.TaskStatus), []byte("null")) {
+				if postAppV27 {
+					return fmt.Errorf("signed task_status must be a string when present")
+				}
+				// Before app-v27, preserve encoding/json's historical null-to-empty
+				// string behavior so previously committed transactions replay.
+			} else if statusErr := json.Unmarshal(body.TaskStatus, &canonicalTaskStatus); statusErr != nil {
+				return fmt.Errorf("signed task_status must be a string when present")
+			}
+		} else if postAppV27 && memoryType == tx.MemoryTypeTask {
+			canonicalTaskStatus = "planned"
 		}
 		resolvedDomain := body.DomainTag
 		if resolvedDomain == "" {
@@ -596,7 +610,7 @@ func (app *SageApp) verifySignedAgentAction(
 			Content:         body.Content,
 			ParentHash:      body.ParentHash,
 			Classification:  tx.ClearanceLevel(body.Classification), // #nosec G115 -- range checked above
-			TaskStatus:      body.TaskStatus,
+			TaskStatus:      canonicalTaskStatus,
 			Tags:            canonicalTags,
 		}
 

@@ -1,4 +1,4 @@
-name: sage-v111800-federation
+name: sage-v111900-federation
 
 services:
   relay:
@@ -27,7 +27,7 @@ services:
       context: ../..
       dockerfile: deploy/federation-acceptance/Dockerfile.node
       args:
-        VERSION: v11.18.28-acceptance
+        VERSION: v11.19.0-acceptance
         COMMIT: docker-acceptance
     environment:
       SAGE_HOME: /root/.sage
@@ -61,17 +61,17 @@ services:
 
 networks:
   edge_a:
-    name: sage-v111800-federation-edge-a
+    name: sage-v111900-federation-edge-a
     internal: true
   edge_b:
-    name: sage-v111800-federation-edge-b
+    name: sage-v111900-federation-edge-b
     internal: true
   lan:
-    name: sage-v111800-federation-lan
+    name: sage-v111900-federation-lan
     internal: true
   # Separate host-control bridges keep REST observable without giving the two
   # nodes a shared container network that could bypass the relay assertion.
   control_a:
-    name: sage-v111800-federation-control-a
+    name: sage-v111900-federation-control-a
   control_b:
-    name: sage-v111800-federation-control-b
+    name: sage-v111900-federation-control-b
