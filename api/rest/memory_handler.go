@@ -1101,6 +1101,11 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
+	taskStatusPresent, err := jsonFieldPresent(r, "task_status")
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
 
 	// Validate required fields.
 	if req.Content == "" {
@@ -1146,7 +1151,7 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 		) {
 			return
 		}
-		// FAIL FAST instead of mutating a field the caller already signed.
+		// Before app-v27, fail fast instead of mutating a field the caller signed.
 		//
 		// This used to default an omitted task_status to "planned". That looks
 		// helpful and is the opposite: the mutation happens AFTER the agent's
@@ -1161,13 +1166,18 @@ func (s *Server) handleSubmitMemory(w http.ResponseWriter, r *http.Request) {
 		// at the edge costs the same request and says exactly what is wrong,
 		// and it broadcasts nothing.
 		//
-		// Deliberately NOT normalized server-side: making the proof check accept
-		// an omitted status would change which transactions validate, which is
-		// fork-class and belongs to a future app version, not to a bug fix.
-		if req.TaskStatus == "" {
-			writeProblem(w, http.StatusBadRequest, "Missing task status",
-				"task_status is required for a new task and must be signed as \"planned\"; the server cannot supply it after the fact without invalidating your agent proof.")
-			return
+		// App-v27 supplies the required forward-only consensus boundary: both REST
+		// and delegated-proof reconstruction canonically interpret omission as the
+		// only valid initial status, planned. The activation block stays pre-v27.
+		if req.TaskStatus == "" && !taskStatusPresent {
+			if !s.isPostV27ForNextTx() {
+				writeProblem(w, http.StatusBadRequest, "Missing task status",
+					"task_status is required for a new task and must be signed as \"planned\" until app-v27 activates.")
+				return
+			}
+			// App-v27 defines omission as the canonical initial planned state.
+			// Consensus reconstructs the same value from the immutable signed body.
+			req.TaskStatus = string(memory.TaskStatusPlanned)
 		}
 		if req.TaskStatus != string(memory.TaskStatusPlanned) {
 			writeProblem(w, http.StatusBadRequest, "Invalid initial task status", "A new task must enter consensus as planned; its assigned agent may start it after creation.")

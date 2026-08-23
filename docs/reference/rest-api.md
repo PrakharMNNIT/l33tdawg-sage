@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.18.28. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.19.0. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -36,7 +36,7 @@ against the legacy form.
 - Body is capped at 1 MB before reading for signature verification (`auth.go:143`).
 - `X-Agent-ID` is the hex-encoded Ed25519 **public key** (32 bytes = 64 hex chars); it IS the agent identity on-chain.
 
-**Post-app-v17 consensus binding.** The REST process is not the trust boundary. Once app-v17 is active, a transaction whose outer node key differs from `X-Agent-ID` carries the exact `canonical` bytes above in the optional `ParsedTx.AgentRequest` wire tail. `FinalizeBlock` re-hashes those bytes to `AgentBodyHash`, re-verifies the Ed25519 proof, rejects proofs more than five minutes older than deterministic block time, and rebuilds the expected type-specific payload from the signed method, path, and JSON. Historical non-governance proofs intentionally remain valid when ahead of block time because SAGE mints no idle heartbeat blocks and the first block after a long idle period can lag the already wall-clock-validated REST request. App-v20 governance is narrower: every governance envelope containing any agent-proof material, including one whose embedded signer equals the outer validator, must carry the complete request and 8-byte nonce and must fall within **±5 minutes** of deterministic block time. For memory submissions, content/type/domain/confidence/classification/parent/task status stay action-bound while the embedding hash is node-derived and outer-signature-bound: v11.7.4 made the active node authoritative for vector generation after request authentication. App-v23 adds one narrow deterministic exception: a task request may omit `domain_tag`, in which case both REST and consensus independently resolve the exact currently committed ordinary-agent home domain; an explicit domain remains byte-for-byte action-bound and is never remapped. A mismatch is rejected with code 109 before the action handler runs. A successful validation atomically claims an AppHash-folded proof fingerprint until its freshness window closes, so the same agent authorization cannot be wrapped in a second node transaction with a fresh outer nonce. Ordinary same-key non-governance transactions and **truly proofless** direct governance/upgrade-auto-voter transactions need no HTTP envelope: the outer signature binds the payload and app-v9's monotonic nonce prevents same-chain replay (`internal/abci/agent_proof.go`, `internal/store/badger.go`).
+**Post-app-v17 consensus binding.** The REST process is not the trust boundary. Once app-v17 is active, a transaction whose outer node key differs from `X-Agent-ID` carries the exact `canonical` bytes above in the optional `ParsedTx.AgentRequest` wire tail. `FinalizeBlock` re-hashes those bytes to `AgentBodyHash`, re-verifies the Ed25519 proof, rejects proofs more than five minutes older than deterministic block time, and rebuilds the expected type-specific payload from the signed method, path, and JSON. Historical non-governance proofs intentionally remain valid when ahead of block time because SAGE mints no idle heartbeat blocks and the first block after a long idle period can lag the already wall-clock-validated REST request. App-v20 governance is narrower: every governance envelope containing any agent-proof material, including one whose embedded signer equals the outer validator, must carry the complete request and 8-byte nonce and must fall within **±5 minutes** of deterministic block time. For memory submissions, content/type/domain/confidence/classification/parent/task status stay action-bound while the embedding hash is node-derived and outer-signature-bound: v11.7.4 made the active node authoritative for vector generation after request authentication. App-v23 adds one narrow deterministic exception: a task request may omit `domain_tag`, in which case both REST and consensus independently resolve the exact currently committed ordinary-agent home domain; an explicit domain remains byte-for-byte action-bound and is never remapped. App-v27 adds one more version-gated canonicalization: an omitted new-task `task_status` is interpreted as `planned` by both REST transaction construction and consensus proof verification. Before app-v27, omission remains invalid. A mismatch is rejected with code 109 before the action handler runs. A successful validation atomically claims an AppHash-folded proof fingerprint until its freshness window closes, so the same agent authorization cannot be wrapped in a second node transaction with a fresh outer nonce. Ordinary same-key non-governance transactions and **truly proofless** direct governance/upgrade-auto-voter transactions need no HTTP envelope: the outer signature binds the payload and app-v9's monotonic nonce prevents same-chain replay (`internal/abci/agent_proof.go`, `internal/store/badger.go`).
 
 The optional tail is emitted only after the app-v17 activation block commits. Before activation it is absent, preserving the exact bytes older validators re-encode and every historical block's replay behavior (`internal/tx/codec.go`, `api/rest/server.go`).
 
@@ -62,7 +62,7 @@ Submit a memory for BFT consensus. Blocks until `broadcast_tx_commit` returns (F
 | `embedding` | []float32 | no | Compatibility field. The node regenerates the vector from `content` with its currently selected provider so stale/foreign vector spaces cannot mix. |
 | `knowledge_triples` | []KnowledgeTriple | no | `{subject, predicate, object}` triples |
 | `parent_hash` | string | no | SHA-256 hex of parent memory for lineage |
-| `task_status` | string | **yes for `task`** | A new `task` memory MUST send `planned` explicitly; omitting it is rejected with `400 Missing task status`. The server cannot supply it for you: a signed caller's proof covers the request body, so defaulting it server-side would invalidate that proof and the submission would be rejected at consensus instead. Agents start or finish an assigned task through the task-status route after creation. |
+| `task_status` | string | **app-v27: no; earlier: yes for `task`** | A new task may send `planned` explicitly. After app-v27, omission is canonicalized to `planned` by REST transaction construction and consensus proof verification. Before app-v27, omission is rejected with `400 Missing task status`, preserving the historical signed-body and replay contract. Agents start or finish an assigned task through the task-status route after creation. |
 | `linked_memories` | []string | no | Related memory IDs for legacy/non-idempotent submission paths. App-v23 task creation rejects this field because links are not part of the canonical task transaction; create links separately after the task is confirmed. |
 | `tags` | []string | no | Up to 32 labels of 128 UTF-8 bytes each. Above app-v20 they are sorted/deduplicated into the signed tx; scoped-domain tags are also AppHash-covered and projection-recoverable. Ordinary-domain tags remain node-local. OR-filter on query/search. |
 | `provider` | string | no | Stored off-chain only; not on-chain |
@@ -560,6 +560,13 @@ for a decisive one-strike challenge (or a threshold-reaching confirmation), and
 `challenged` when app-v17 parks a first multi-holder challenge or app-v21 still
 requires additional corroboration-weighted challengers.
 
+After app-v27, the immutable author of a record in `general`, `self`, `meta`, or
+`sage-*` may challenge that exact record without separately holding level-3
+Modify. Governance-promoted shared domains are excluded, and pending/inactive
+enrollment, profile/capability restrictions, and classification/clearance
+failures remain hard denials. For an app-v21 weighted round, an eligible author
+is included in the electorate frozen when the round opens.
+
 **Error responses** (deprecation gate; `vote_handler.go:241`, `memory_handler.go:1675-1684`):
 
 | Status | Meaning |
@@ -605,6 +612,9 @@ domain owners/ancestor owners and level-3 modify grantees may reinstate, and the
 original challenger may withdraw even after their grant expires or is revoked.
 For an app-v21 weighted round, only identities in the round's snapshotted
 electorate may reinstate; later grant churn neither adds nor removes eligibility.
+An eligible app-v27 author of the exact record in a compile-time reserved shared
+domain is in that frozen electorate and may reinstate; the same hard denials and
+governance-promoted-domain exclusion apply.
 
 **Errors:** `400` when app-v17 is not active, `403` when the caller is not
 authorized under the applicable legacy or snapshotted-round rule, `404` for an

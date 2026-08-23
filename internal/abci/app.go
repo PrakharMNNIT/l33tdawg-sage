@@ -669,6 +669,10 @@ type SageApp struct {
 	// The activation block migrates historical groups to explicit read access;
 	// v26 mutation/authorization semantics begin strictly at H+1.
 	appV26AppliedHeight int64 // 0 => fork dormant
+	// appV27AppliedHeight gates author lifecycle authority for compile-time
+	// static shared domains and canonical omitted task-status normalization.
+	// The activation block remains under app-v26 rules; v27 semantics begin H+1.
+	appV27AppliedHeight int64 // 0 => fork dormant
 	// appV23GenesisActive is loaded only from the dedicated, AppHash-covered
 	// dual-signed genesis activation marker. It is separate from applied-height
 	// upgrades because a v23-born chain has no historical activation block.
@@ -850,6 +854,7 @@ const appV23UpgradeName = "app-v23"
 const appV24UpgradeName = "app-v24"
 const appV25UpgradeName = "app-v25"
 const appV26UpgradeName = "app-v26"
+const appV27UpgradeName = "app-v27"
 
 // governanceDelegationDomainStateKey holds the stable, consensus-derived
 // domain that post-app-v20 governance authorizations must sign. It is approved
@@ -2403,6 +2408,16 @@ func NewSageApp(badgerPath string, postgresURL string, logger zerolog.Logger) (*
 		_ = bs.CloseBadger()
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV27Fork(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV27Prerequisite(); invariantErr != nil {
+		_ = ps.Close()
+		_ = bs.CloseBadger()
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	// Reload persisted validators from BadgerDB (survives restart)
@@ -2508,6 +2523,12 @@ func NewSageAppWithStores(bs *store.BadgerStore, offchain store.OffchainStore, l
 	if invariantErr := app.validateAppV26Prerequisite(); invariantErr != nil {
 		return nil, invariantErr
 	}
+	if invariantErr := app.refreshAppV27Fork(); invariantErr != nil {
+		return nil, invariantErr
+	}
+	if invariantErr := app.validateAppV27Prerequisite(); invariantErr != nil {
+		return nil, invariantErr
+	}
 	app.reconcilePoEForkMonotonicity()
 
 	persistedVals, err := bs.LoadValidators()
@@ -2586,6 +2607,8 @@ func restoredValidatorInfo(id string, power int64) *validator.ValidatorInfo {
 // 6 <= 7, so the watchdog stops without re-proposing.
 func (app *SageApp) currentAppVersion() uint64 {
 	switch {
+	case app.appV27AppliedHeight > 0:
+		return 27 // app-v27 (shared-author lifecycle + task proof normalization) — highest gate
 	case app.appV26AppliedHeight > 0:
 		return 26 // app-v26 (consensus-backed Access Group authority) — highest gate
 	case app.appV25AppliedHeight > 0:
@@ -2644,13 +2667,13 @@ func (app *SageApp) currentAppVersion() uint64 {
 }
 
 // maxSupportedAppVersion is the highest app version this binary has a compiled
-// fork gate for (currently app-v26). It is the readiness ceiling for upgrade
+// fork gate for (currently app-v27). It is the readiness ceiling for upgrade
 // auto-voting: a validator must never vote to activate an upgrade it cannot
 // execute — doing so would commit consensus version.app=N while the binary
 // still runs at N-1, halting the chain on the next CometBFT handshake (the
 // maxSupportedAppVersion footgun). Bump this in lockstep with every new
 // appV<N>UpgradeName fork gate added above.
-const maxSupportedAppVersion uint64 = 26
+const maxSupportedAppVersion uint64 = 27
 
 // MaxSupportedAppVersion returns the highest app version this binary has a
 // compiled fork gate for. Operator tooling (cmd/sage-gui `upgrade propose`)
@@ -2946,6 +2969,19 @@ func (app *SageApp) ActiveUpgradeVote() (proposalID string, targetVersion uint64
 		} else if _, predecessorErr := app.validateAppV26Predecessor(); predecessorErr != nil {
 			app.logger.Warn().Err(predecessorErr).Str("proposal_id", prop.ProposalID).
 				Msg("app-v26 predecessor is invalid; skipping auto-vote")
+			supported = false
+		}
+	}
+	if payload.Name == appV27UpgradeName && payload.TargetAppVersion == 27 {
+		if app.currentAppVersion() != 26 {
+			app.logger.Warn().
+				Str("proposal_id", prop.ProposalID).
+				Uint64("current_app_version", app.currentAppVersion()).
+				Msg("app-v27 upgrade requires app-v26 as its immediate predecessor; skipping auto-vote")
+			supported = false
+		} else if _, predecessorErr := app.validateAppV27Predecessor(); predecessorErr != nil {
+			app.logger.Warn().Err(predecessorErr).Str("proposal_id", prop.ProposalID).
+				Msg("app-v27 predecessor is invalid; skipping auto-vote")
 			supported = false
 		}
 	}
@@ -3589,7 +3625,7 @@ func (app *SageApp) CheckTx(_ context.Context, req *abcitypes.RequestCheckTx) (*
 		if proofErr := app.enforceDelegatedAgentProof(
 			parsedTx, time.Now(), false,
 			postAppV20, app.isAppV22ActiveForNextTx(),
-			app.isAppV23ActiveForNextTx(),
+			app.isAppV23ActiveForNextTx(), app.isAppV27ActiveForNextTx(),
 		); proofErr != nil {
 			metrics.TxRejectedTotal.WithLabelValues("agent_proof_binding").Inc()
 			return &abcitypes.ResponseCheckTx{Code: 109, Log: fmt.Sprintf("agent proof rejected: %v", proofErr)}, nil
@@ -3659,6 +3695,7 @@ func (app *SageApp) cloneForAppV20Finalize(scopedStore *store.BadgerStore) *Sage
 		appV24AppliedHeight:      app.appV24AppliedHeight,
 		appV25AppliedHeight:      app.appV25AppliedHeight,
 		appV26AppliedHeight:      app.appV26AppliedHeight,
+		appV27AppliedHeight:      app.appV27AppliedHeight,
 		appV23GenesisActive:      app.appV23GenesisActive,
 		retainBlocks:             app.retainBlocks,
 		expectedGovernanceDomain: app.expectedGovernanceDelegationDomain(),
@@ -3705,6 +3742,7 @@ func (app *SageApp) publishAppV20FinalizeLocked(clone *SageApp) {
 	app.appV24AppliedHeight = clone.appV24AppliedHeight
 	app.appV25AppliedHeight = clone.appV25AppliedHeight
 	app.appV26AppliedHeight = clone.appV26AppliedHeight
+	app.appV27AppliedHeight = clone.appV27AppliedHeight
 	app.appV23GenesisActive = clone.appV23GenesisActive
 }
 
@@ -4356,6 +4394,26 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 				)
 			}
 		}
+		if plan.Name == appV27UpgradeName {
+			if plan.TargetAppVersion != 27 {
+				return nil, fmt.Errorf(
+					"sage: refuse malformed app-v27 activation at height %d: target_app_version=%d",
+					req.Height, plan.TargetAppVersion,
+				)
+			}
+			if current := app.currentAppVersion(); current != 26 {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v27 activation at height %d: current committed app version is %d, want 26",
+					req.Height, current,
+				)
+			}
+			if _, predecessorErr := app.validateAppV27Predecessor(); predecessorErr != nil {
+				return nil, fmt.Errorf(
+					"sage: refuse app-v27 activation at height %d: invalid predecessor: %w",
+					req.Height, predecessorErr,
+				)
+			}
+		}
 		// Version-non-regression floor (deterministic on every replica): never
 		// commit a consensus version.app lower than the chain's current app
 		// version. app-v7 (content-validation) is an INDEPENDENT gate that can be
@@ -4478,6 +4536,9 @@ func (app *SageApp) finalizeBlockUncommitted(_ context.Context, req *abcitypes.R
 		}
 		if plan.Name == appV26UpgradeName {
 			app.appV26AppliedHeight = req.Height
+		}
+		if plan.Name == appV27UpgradeName {
+			app.appV27AppliedHeight = req.Height
 		}
 		if plan.Name == appV12UpgradeName {
 			app.appV12AppliedHeight = req.Height
@@ -4693,7 +4754,7 @@ func (app *SageApp) processTx(parsedTx *tx.ParsedTx, height int64, blockTime tim
 		if proofErr := app.enforceDelegatedAgentProof(
 			parsedTx, blockTime, true,
 			app.postAppV20Fork(height), app.postAppV22Rules(height),
-			app.postAppV23Rules(height),
+			app.postAppV23Rules(height), app.postAppV27Rules(height),
 		); proofErr != nil {
 			metrics.TxRejectedTotal.WithLabelValues("agent_proof_binding_consensus").Inc()
 			return &abcitypes.ExecTxResult{Code: 109, Log: fmt.Sprintf("agent proof rejected: %v", proofErr)}
@@ -6851,6 +6912,19 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 				if decisionErr != nil {
 					return &abcitypes.ExecTxResult{Code: 91, Log: "challenge: app-v23 authorization failed"}
 				}
+				if !v23Modify && (denialCode == authzdenial.CodeMissingWriteGrant ||
+					denialCode == authzdenial.CodeManagerScopeDenied) {
+					authorID, authorErr := app.appV27StaticSharedAuthorPrincipal(
+						challenge.MemoryID, domain, height, blockTime,
+					)
+					if authorErr != nil {
+						return &abcitypes.ExecTxResult{Code: 91, Log: "challenge: app-v27 author authorization failed"}
+					}
+					v23Modify = authorID != "" && authorID == challengerID
+					if v23Modify {
+						denialCode = ""
+					}
+				}
 				if denialCode != "" {
 					return appV23Denial(denialCode)
 				}
@@ -7017,6 +7091,22 @@ func (app *SageApp) processMemoryChallenge(parsedTx *tx.ParsedTx, height int64, 
 				)
 				if additionalErr != nil {
 					return &abcitypes.ExecTxResult{Code: 91, Log: "challenge: app-v23 modify-holder classification filter failed"}
+				}
+				authorID, authorErr := app.appV27StaticSharedAuthorPrincipal(
+					challenge.MemoryID, domain, height, blockTime,
+				)
+				if authorErr != nil {
+					return &abcitypes.ExecTxResult{Code: 91, Log: "challenge: app-v27 author electorate lookup failed"}
+				}
+				if authorID != "" {
+					var authorOverLimit bool
+					holders, authorOverLimit = mergeAppV23Holders(
+						holders, []string{authorID}, store.MaxChallengeElectorateV21,
+					)
+					if authorOverLimit {
+						weightedFallbackLegacy = true
+						goto legacyChallengePolicy
+					}
 				}
 			}
 
@@ -7240,6 +7330,21 @@ legacyChallengePolicy:
 					if additionalErr != nil {
 						return &abcitypes.ExecTxResult{Code: 91, Log: "challenge: app-v23 modify-holder classification filter failed"}
 					}
+					authorID, authorErr := app.appV27StaticSharedAuthorPrincipal(
+						challenge.MemoryID, domain, height, blockTime,
+					)
+					if authorErr != nil {
+						return &abcitypes.ExecTxResult{Code: 91, Log: "challenge: app-v27 author holder lookup failed"}
+					}
+					if authorID != "" {
+						if merged, mergedOver := mergeAppV23Holders(
+							holders, []string{authorID}, store.MaxChallengeElectorateV21,
+						); mergedOver {
+							holders = make([]string, store.MaxChallengeElectorateV21+1)
+						} else {
+							holders = merged
+						}
+					}
 				}
 			}
 		}
@@ -7417,7 +7522,17 @@ func (app *SageApp) processMemoryReinstate(parsedTx *tx.ParsedTx, height int64, 
 	}
 	if weightedRecord != nil {
 		i := sort.SearchStrings(weightedRecord.Electorate, agentID)
-		if i == len(weightedRecord.Electorate) || weightedRecord.Electorate[i] != agentID {
+		eligible := i < len(weightedRecord.Electorate) && weightedRecord.Electorate[i] == agentID
+		if !eligible {
+			authorID, authorErr := app.appV27StaticSharedAuthorPrincipal(
+				rein.MemoryID, reinstateDomain, height, blockTime,
+			)
+			if authorErr != nil {
+				return &abcitypes.ExecTxResult{Code: 91, Log: "reinstate: app-v27 author authorization failed"}
+			}
+			eligible = authorID != "" && authorID == agentID
+		}
+		if !eligible {
 			return &abcitypes.ExecTxResult{Code: 92, Log: fmt.Sprintf(
 				"reinstate: agent %s is not in memory %s's snapshotted app-v21 electorate",
 				agentID[:16], rein.MemoryID)}
@@ -7467,6 +7582,19 @@ func (app *SageApp) processMemoryReinstate(parsedTx *tx.ParsedTx, height int64, 
 			)
 			if decisionErr != nil {
 				return &abcitypes.ExecTxResult{Code: 91, Log: "reinstate: authorization lookup failed"}
+			}
+			if !allowed && (denialCode == authzdenial.CodeMissingWriteGrant ||
+				denialCode == authzdenial.CodeManagerScopeDenied) {
+				authorID, authorErr := app.appV27StaticSharedAuthorPrincipal(
+					rein.MemoryID, domain, height, blockTime,
+				)
+				if authorErr != nil {
+					return &abcitypes.ExecTxResult{Code: 91, Log: "reinstate: app-v27 author authorization failed"}
+				}
+				allowed = authorID != "" && authorID == agentID
+				if allowed {
+					denialCode = ""
+				}
 			}
 			if !allowed {
 				if denialCode != "" {
@@ -10520,7 +10648,7 @@ func (app *SageApp) isAuthenticatedAppV20BootstrapProposal(rawTx []byte, height 
 	if app.postAppV17Rules(height) {
 		if proofErr := app.enforceDelegatedAgentProof(
 			parsed, blockTime, false,
-			false, app.postAppV22Rules(height), app.postAppV23Rules(height),
+			false, app.postAppV22Rules(height), app.postAppV23Rules(height), app.postAppV27Rules(height),
 		); proofErr != nil {
 			return false
 		}
@@ -11375,6 +11503,17 @@ func (app *SageApp) applyUpgradeProposal(proposal *governance.ProposalState, hei
 			return fmt.Errorf("app-v26 upgrade has invalid predecessor: %w", predecessorErr)
 		}
 	}
+	if p.Name == appV27UpgradeName {
+		if p.TargetAppVersion != 27 {
+			return fmt.Errorf("app-v27 upgrade has target version %d, want 27", p.TargetAppVersion)
+		}
+		if current := app.currentAppVersion(); current != 26 {
+			return fmt.Errorf("app-v27 upgrade requires current app version 26, got %d", current)
+		}
+		if _, predecessorErr := app.validateAppV27Predecessor(); predecessorErr != nil {
+			return fmt.Errorf("app-v27 upgrade has invalid predecessor: %w", predecessorErr)
+		}
+	}
 
 	// Execution-height regression re-guard: the chain's committed app version
 	// may have advanced (another upgrade activated) between propose and quorum.
@@ -11572,6 +11711,20 @@ func (app *SageApp) processUpgradePropose(parsedTx *tx.ParsedTx, height int64, b
 		if _, predecessorErr := app.validateAppV26Predecessor(); predecessorErr != nil {
 			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
 				"upgrade propose: app-v26 predecessor is invalid: %v", predecessorErr)}
+		}
+	}
+	if prop.Name == appV27UpgradeName {
+		if prop.TargetAppVersion != 27 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v27 requires target_app_version 27 (got %d)", prop.TargetAppVersion)}
+		}
+		if current := app.currentAppVersion(); current != 26 {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v27 requires current committed app version 26 (got %d)", current)}
+		}
+		if _, predecessorErr := app.validateAppV27Predecessor(); predecessorErr != nil {
+			return &abcitypes.ExecTxResult{Code: 47, Log: fmt.Sprintf(
+				"upgrade propose: app-v27 predecessor is invalid: %v", predecessorErr)}
 		}
 	}
 

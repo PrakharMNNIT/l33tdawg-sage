@@ -58,7 +58,7 @@ most upgrade anxiety.
 | | What it is | When it changes |
 |---|---|---|
 | **Release version** (`v11.x.y`) | The binary/semver you download | Every release |
-| **App version** (`app-v26`) | The consensus state-machine version, activated by governance | Only when consensus rules change |
+| **App version** (`app-v27`) | The consensus state-machine version, activated by governance | Only when consensus rules change |
 
 There is also a **consensus fork version**, currently `1`, which has never been
 bumped. It is the refusal gate for genuinely incompatible on-disk state. Because
@@ -119,6 +119,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.26 | Validated Go dependency refresh plus pinned CI action updates; app-v23 MCP bearer issuance binds to existing approved locally managed agents; token-create help is side-effect free; no consensus change; app-v26 remains the ceiling |
 | v11.18.27 | Caller-safe empty semantic-recall completeness disclosure with exact projection/vector-space fencing and bounded indexed probes; no consensus change; app-v26 remains the ceiling |
 | v11.18.28 | Restored reads for compile-time shared domains with classification enforcement, plus rejection of ownership registration for reserved or governance-promoted shared domains; no consensus change; app-v26 remains the ceiling |
+| v11.19.0 | app-v27: static reserved shared-domain record authors gain hard-denial-preserving challenge/reinstate authority; omitted new-task `task_status` canonicalizes to `planned` |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
@@ -161,13 +162,13 @@ that loses the transaction. See
 for the full contract, the operator triage steps, and the log/metric surface.
 
 A v10.x chain therefore sits somewhere around **app-v11 to app-v14**, and
-current v11 binaries support up to **app-v26**. That is roughly a dozen rungs.
+current v11 binaries support up to **app-v27**. That is roughly thirteen rungs.
 v11.18.0 does **not** introduce app-v27 and does not rewrite an existing
-app-v22, app-v23, app-v24, app-v25, or app-v26 chain.
+app-v22, app-v23, app-v24, app-v25, app-v26, or app-v27 chain.
 
 Forks activate **strictly one at a time**: every proposal must target the
-chain's current version **+ 1**. Skipping is rejected — a jump from 14 to 26
-would turn on app-v26 alone and permanently strand everything between.
+chain's current version **+ 1**. Skipping is rejected — a jump from 14 to 27
+would turn on app-v27 alone and permanently strand everything between.
 
 ---
 
@@ -334,7 +335,7 @@ same rules and tells you up front.
 A healthy result ends with:
 
 ```
-VERDICT: clear to climb from app-v14 to app-v26.
+VERDICT: clear to climb from app-v14 to app-v27.
 ```
 
 A bad one names the exact rung:
@@ -355,8 +356,8 @@ Never invent activation heights merely to make the ladder pass.
 
 This workflow exists only for an upgraded chain that is **exactly app-v21** and
 is missing one or more canonical app-v6 through app-v21 activation records. It
-does not modify an already-upgraded app-v22–app-v26 chain, repair an invalid
-present record, or introduce app-v27.
+does not modify an already-upgraded app-v22–app-v27 chain, repair an invalid
+present record, or synthesize a later fork activation.
 
 1. Keep the stopped-node `backup --full` from Step 2. Start every validator on
    v11.18.0, allow lower healthy rungs to climb, and stop normal upgrade
@@ -487,12 +488,12 @@ sage-gui upgrade status
 ```
 
 ```
-Chain app version : 26 (app-v26)
-Binary supports   : up to app-v26
+Chain app version : 27 (app-v27)
+Binary supports   : up to app-v27
 Next fork         : none — chain is at the highest version this binary supports
 ```
 
-A dozen rungs takes a while: each activation waits out an upgrade delay of at
+Thirteen rungs take a while: each activation waits out an upgrade delay of at
 least 200 blocks. **This is normal.** An idle SAGE chain mints no blocks at all,
 so the node submits harmless heartbeat transactions to tick a quiescent chain
 toward each pending plan's activation height.
@@ -502,7 +503,7 @@ toward each pending plan's activation height.
 Each rung waits out at least 200 blocks. Personal nodes run
 `timeout_commit = 1s` and the watchdog heartbeats a quiescent chain every 2s, so
 budget **roughly 4–7 minutes per rung**; quorum clusters run `timeout_commit =
-3s`, so **roughly 10 minutes**. A twelve-rung v10 → app-v26 climb is therefore
+3s`, so **roughly 10 minutes**. A thirteen-rung v10 → app-v27 climb is therefore
 about **1 hour on a personal node** and **2 hours on a cluster**. Treat these as
 order-of-magnitude, not a guarantee — a busy chain mints blocks faster.
 
@@ -717,7 +718,9 @@ sage-gui mcp-token create --agent <existing-agent-id>  # bind a replacement to a
 - [`reference/app-v25-upgrade-recovery.md`](reference/app-v25-upgrade-recovery.md)
   — historical repair, quarantine, and Root resolution controls
 - [`reference/concepts/app-v26-access-groups.md`](reference/concepts/app-v26-access-groups.md)
-  — the current Access Group authority model
+  — the Access Group authority model
+- [`reference/concepts/app-v27-lifecycle.md`](reference/concepts/app-v27-lifecycle.md)
+  — current record-author lifecycle authority and task-status canonicalization
 - [`reference/concepts/block-production-and-idle.md`](reference/concepts/block-production-and-idle.md)
   — why a healthy idle chain mints no blocks
 - [`GETTING_STARTED.md`](GETTING_STARTED.md) — first-time setup

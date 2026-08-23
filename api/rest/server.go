@@ -124,6 +124,8 @@ type Server struct {
 	// postV23ForNextTxFn gates local enrollment, mutable roles, and Access
 	// Group-derived read authority. nil preserves the historical REST policy.
 	postV23ForNextTxFn func() bool
+	// postV27ForNextTxFn gates canonical omitted task-status normalization.
+	postV27ForNextTxFn func() bool
 	// appV23RootKeyResolver is the local-only CEREBRUM broker seam. It resolves
 	// the exact current root credential without exposing it to the caller, so a
 	// promoted Admin's authenticated request can receive an action-bound,
@@ -324,6 +326,16 @@ func (s *Server) SetPostV23ForNextTxAccessor(fn func() bool) {
 
 func (s *Server) isPostV23ForNextTx() bool {
 	return s.postV23ForNextTxFn != nil && s.postV23ForNextTxFn()
+}
+
+// SetPostV27ForNextTxAccessor wires the dynamic app-v27 lifecycle and proof
+// normalization gate. Callers should pass app.IsAppV27ActiveForNextTx.
+func (s *Server) SetPostV27ForNextTxAccessor(fn func() bool) {
+	s.postV27ForNextTxFn = fn
+}
+
+func (s *Server) isPostV27ForNextTx() bool {
+	return s.postV27ForNextTxFn != nil && s.postV27ForNextTxFn()
 }
 
 // appV23IsRootIdentity keeps the sovereign node credential out of every

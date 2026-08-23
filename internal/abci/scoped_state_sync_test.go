@@ -311,7 +311,7 @@ func TestPrepareAppV20StateSyncBackupRejectsMissingHistoricalRootCredential(t *t
 	require.ErrorContains(t, err, "root credential history count")
 }
 
-func TestPrepareAppV20StateSyncBackupPreservesValidAppV26GroupAuthority(t *testing.T) {
+func TestPrepareAppV20StateSyncBackupPreservesValidAppV27ActivationImage(t *testing.T) {
 	rootDir := t.TempDir()
 	sourcePath := filepath.Join(rootDir, "source-badger")
 	source, err := store.NewBadgerStore(sourcePath)
@@ -380,6 +380,7 @@ func TestPrepareAppV20StateSyncBackupPreservesValidAppV26GroupAuthority(t *testi
 		RetireOwnedDomainsToRoot: true,
 	}, store.AppV23RoleMember, retiringEnrollment.Revision, retiringRole.Revision))
 	require.NoError(t, source.ValidateAppV26AccessGroupAuthorities())
+	require.NoError(t, source.MarkUpgradeApplied(appV27UpgradeName, 27, 8))
 
 	state := &AppState{Height: 8, EpochNum: poe.EpochNumber(8)}
 	appHash, err := source.ComputeAppHashExcludingBookkeeping()
@@ -391,7 +392,7 @@ func TestPrepareAppV20StateSyncBackupPreservesValidAppV26GroupAuthority(t *testi
 	state.AppHash = append([]byte(nil), appHash...)
 	require.NoError(t, SaveState(source, state))
 
-	backupPath := filepath.Join(rootDir, "app-v26.backup")
+	backupPath := filepath.Join(rootDir, "app-v27.backup")
 	backup, err := os.OpenFile(backupPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	require.NoError(t, err)
 	require.NoError(t, statesync.WriteCanonicalState(context.Background(), source.DB(), backup))

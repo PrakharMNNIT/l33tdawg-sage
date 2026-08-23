@@ -247,7 +247,7 @@ func TestAppV17DelegatedRESTRouteMatrix(t *testing.T) { //nolint:maintidx // pro
 		t.Run(tc.name, func(t *testing.T) {
 			req, err := parseSignedAgentRequest(tc.request)
 			require.NoError(t, err)
-			require.NoError(t, app.verifySignedAgentAction(tc.parsed, agent.id, req, false, false, false))
+			require.NoError(t, app.verifySignedAgentAction(tc.parsed, agent.id, req, false, false, false, false))
 		})
 	}
 }
@@ -275,11 +275,11 @@ func TestFederationExplicitPublicDelegatedBindingForkBoundary(t *testing.T) {
 	}
 	require.NoError(t, app.verifySignedAgentAction(
 		historical, agent.id, req,
-		false, false, false,
+		false, false, false, false,
 	), "pre-app-v22 must replay the historical explicit-zero default")
 	require.ErrorContains(t, app.verifySignedAgentAction(
 		historical, agent.id, req,
-		false, true, false,
+		false, true, false, false,
 	), "differs", "post-app-v22 must not broaden signed PUBLIC to CONFIDENTIAL")
 
 	postV22 := &tx.ParsedTx{
@@ -292,7 +292,7 @@ func TestFederationExplicitPublicDelegatedBindingForkBoundary(t *testing.T) {
 	}
 	require.NoError(t, app.verifySignedAgentAction(
 		postV22, agent.id, req,
-		false, true, false,
+		false, true, false, false,
 	))
 }
 
@@ -314,10 +314,10 @@ func TestAppV17DelegatedMemorySubmitAllowsNodeRegeneratedEmbedding(t *testing.T)
 		DomainTag: "sage-mcp-reliability", ConfidenceScore: 0.8,
 		Content: "a longer turn observation",
 	}}
-	require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false))
+	require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false, false))
 
 	actual.MemorySubmit.EmbeddingHash = []byte("not-a-sha256")
-	require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false), "invalid node-generated embedding hash")
+	require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false, false), "invalid node-generated embedding hash")
 }
 
 func TestAppV23DelegatedTaskOmissionBindsCommittedHomeDomain(t *testing.T) {
@@ -337,15 +337,15 @@ func TestAppV23DelegatedTaskOmissionBindsCommittedHomeDomain(t *testing.T) {
 	}}
 
 	require.NoError(t, app.verifySignedAgentAction(
-		actual, companion.id, req, false, true, true,
+		actual, companion.id, req, false, true, true, false,
 	))
 	require.ErrorContains(t, app.verifySignedAgentAction(
-		actual, companion.id, req, false, true, false,
+		actual, companion.id, req, false, true, false, false,
 	), "fails the REST contract", "pre-app-v23 replay must not acquire the new omitted-domain rule")
 
 	actual.MemorySubmit.DomainTag = "technical/hardware"
 	require.ErrorContains(t, app.verifySignedAgentAction(
-		actual, companion.id, req, false, true, true,
+		actual, companion.id, req, false, true, true, false,
 	), "differs", "the node may derive only the committed home domain")
 }
 
@@ -399,7 +399,7 @@ func TestAgentPermissionProofCapabilityPresenceMatchesRESTChangeDetection(t *tes
 					CapabilitiesPresent: tc.capabilityPresent,
 				},
 			}
-			require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false))
+			require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false, false))
 
 			if tc.requested == 0 {
 				// Zero is the only mask whose extension presence is not also
@@ -409,7 +409,7 @@ func TestAgentPermissionProofCapabilityPresenceMatchesRESTChangeDetection(t *tes
 			} else {
 				actual.AgentSetPermission.Capabilities = tc.requested ^ 1
 			}
-			require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false), "differs")
+			require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false, false), "differs")
 		})
 	}
 
@@ -428,7 +428,7 @@ func TestAgentPermissionProofCapabilityPresenceMatchesRESTChangeDetection(t *tes
 				AgentID: targetID, Clearance: 2,
 			},
 		}
-		require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false))
+		require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, false, false, false, false))
 	})
 }
 
@@ -447,10 +447,10 @@ func TestAppV20DelegatedMemorySubmitBindsCanonicalTags(t *testing.T) {
 		MemoryType: tx.MemoryTypeFact, DomainTag: "research", ConfidenceScore: 0.9,
 		Content: content, Tags: []string{"alpha", "zeta"},
 	}}
-	require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, true, false, false))
+	require.NoError(t, app.verifySignedAgentAction(actual, "delegated-agent", req, true, false, false, false))
 
 	actual.MemorySubmit.Tags = []string{"alpha", "other"}
-	require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, true, false, false), "differs")
+	require.ErrorContains(t, app.verifySignedAgentAction(actual, "delegated-agent", req, true, false, false, false), "differs")
 }
 
 func TestAppV17DelegatedNonRESTRoutesFailClosed(t *testing.T) {
@@ -465,7 +465,7 @@ func TestAppV17DelegatedNonRESTRoutesFailClosed(t *testing.T) {
 		{Type: tx.TxTypeUpgradeRevert, UpgradeRevert: &tx.UpgradeRevert{Name: "app-v17", TargetAppVersion: 16}},
 	} {
 		t.Run(fmt.Sprintf("type-%d", parsed.Type), func(t *testing.T) {
-			require.ErrorContains(t, app.verifySignedAgentAction(parsed, "agent", req, false, false, false), "no delegated REST action")
+			require.ErrorContains(t, app.verifySignedAgentAction(parsed, "agent", req, false, false, false, false), "no delegated REST action")
 		})
 	}
 }

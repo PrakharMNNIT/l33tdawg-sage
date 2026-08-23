@@ -51,6 +51,29 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.0
+
+**Record authors regain lifecycle authority in reserved shared namespaces.**
+After app-v27 activates, the immutable author of a record in `general`, `self`,
+`meta`, or `sage-*` may challenge that record and may reinstate its open
+challenge without separately holding a level-3 Modify grant. The exception is
+record-scoped and does not apply to governance-promoted shared domains. Pending
+or inactive enrollment, read-only/profile restrictions, shared-write denies,
+and classification/clearance failures still deny the action. App-v21 weighted
+challenge rounds include the eligible record author in their frozen electorate.
+
+**Omitted task status now has one canonical meaning.** After app-v27, a signed
+new-task request that omits `task_status` is canonicalized to `planned` by both
+REST transaction construction and consensus proof verification. Pre-app-v27
+chains retain the historical requirement to send `task_status: "planned"`
+explicitly, preserving replay and AppHash compatibility.
+
+App-v27 is a governed consensus upgrade from app-v26 with no state migration.
+Its rules begin at H+1 after activation; older blocks replay under their original
+application version.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.0`. SDK 11.19.0.
+
 ## What's New in v11.18.28
 
 **Reserved shared domains are readable again without becoming ownable.** Active
@@ -2134,7 +2157,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.18.28`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.0`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

@@ -45,6 +45,38 @@ func TestSignedTaskSubmitRejectsOmittedStatusBeforeBroadcast(t *testing.T) {
 		"an omitted task_status must never reach consensus; the proof cannot verify")
 }
 
+func TestAppV27SignedTaskSubmitCanonicalizesOmittedStatus(t *testing.T) {
+	fixture := newAppV23RESTRouteFixture(t)
+	fixture.server.SetPostV27ForNextTxAccessor(func() bool { return true })
+	comet := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(comet.Close)
+	fixture.server.cometbftRPC = comet.URL
+
+	body := []byte(`{"content":"app-v27 omitted status","memory_type":"task","domain_tag":"member.home","confidence_score":0.9}`)
+	req := appV23SignedRESTRouteRequest(
+		t, fixture, "member", http.MethodPost, "/v1/memory/submit", body, false,
+	)
+	rec := httptest.NewRecorder()
+	fixture.server.Router().ServeHTTP(rec, req)
+
+	require.NotEqual(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.NotContains(t, rec.Body.String(), "task_status is required",
+		"post-app-v27 omission must pass the edge guard as canonical planned")
+}
+
+func TestAppV27SignedTaskSubmitRejectsExplicitEmptyStatus(t *testing.T) {
+	fixture := newAppV23RESTRouteFixture(t)
+	fixture.server.SetPostV27ForNextTxAccessor(func() bool { return true })
+	body := []byte(`{"content":"explicit empty","memory_type":"task","domain_tag":"member.home","confidence_score":0.9,"task_status":""}`)
+	req := appV23SignedRESTRouteRequest(
+		t, fixture, "member", http.MethodPost, "/v1/memory/submit", body, false,
+	)
+	rec := httptest.NewRecorder()
+	fixture.server.Router().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "Invalid initial task status")
+}
+
 // An explicitly signed "planned" must be unaffected by the fail-fast — it is
 // the only valid initial status and it must still get past this guard.
 func TestSignedTaskSubmitAcceptsExplicitPlannedPastTheGuard(t *testing.T) {
