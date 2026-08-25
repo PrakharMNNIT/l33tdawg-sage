@@ -9,7 +9,7 @@ claim, presence, or workflow evidence.
 
 ## Durable sequence
 
-The canonical `POST /v1/messages` path uses `SendLocalMessage` (`internal/store/messages.go:284-362`)
+The canonical `POST /v1/messages` path uses `SendLocalMessage` (`internal/store/messages.go:295-373`)
 to insert the pending `msg-*` row,
 caller-scoped idempotency binding, and the recipient's next
 `message_wake_state.seq` in one SQLite transaction. A fresh recipient begins at
@@ -18,10 +18,10 @@ advance the sequence. A rollback advances nothing.
 
 The deprecated `POST /v1/pipe/send` route now preserves the same wake invariant
 for exact local recipients. A request carrying `idempotency_key` uses the keyed
-`SendLocalMessage` (`internal/store/messages.go:284-362`) path. An unkeyed request uses
-`AdmitLocalMessage` (`internal/store/messages.go:351-387`), which inserts the row and allocates the
+`SendLocalMessage` (`internal/store/messages.go:295-373`) path. An unkeyed request uses
+`AdmitLocalMessage` (`internal/store/messages.go:374-410`), which inserts the row and allocates the
 sequence in one transaction without creating a replay mapping. After either
-fresh path commits, `handlePipeSend` (`api/rest/pipe_handler.go:631-1045`) publishes only the
+fresh path commits, `handlePipeSend` (`api/rest/pipe_handler.go:640-1054`) publishes only the
 returned process-local non-zero generation. A keyed replay loads
 the original row without `WakeSeq`, so it neither advances nor republishes the
 generation. Provider-only and federated rows have no exact local recipient and
@@ -99,9 +99,10 @@ sequence and coalesces a slow client to the newest monotonic value. Per-write
 deadlines bound a client that stops reading. These are coordination controls,
 not evidence that the consumer is online or attended to an event.
 
-After receiving a wake, the supervisor still calls the canonical inbox
-operation (`sage_messages_receive` / `sage_inbox`) to claim work. Only those
-existing operations affect message lifecycle state.
+After receiving a wake, the supervisor calls the unified `sage_inbox` operation
+to claim exact, provider-addressed, or federated work. `sage_messages_receive`
+remains available for token-replay-safe exact-local batches. Only those existing
+claim operations affect message lifecycle state.
 
 ## Separate from dashboard and MCP transport SSE
 

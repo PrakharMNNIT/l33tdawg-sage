@@ -51,6 +51,34 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.1
+
+**Stranded message claims remain recoverable beyond the retained-history
+window.** `sage_inbox` now embeds the first passive, payload-free page of
+unfinished claims held by another runtime sharing the same exact agent identity.
+Agents can continue through every older page with
+`sage_message_history(folder="claimed_elsewhere")`, then deliberately transfer
+an exact claim through the existing compare-and-swap `sage_message_handoff`
+path after deciding that its former claimant is dead or stale.
+
+The recovery projection exposes only the message ID, claimant-session fence,
+timestamps, and local/federated classification needed for safe handoff. It does
+not expose sender identity, intent, payload, result, provider, or chain IDs.
+Expired TTL-bounded claims are also excluded consistently from both the exact
+diagnostic count and its recovery pages before the periodic expiry sweep runs.
+
+Provider-addressed compatibility messages now bind atomically to the exact
+claiming agent and MCP session, resurface on later polls, support CAS handoff,
+and complete idempotently through `sage_message_reply`. A failed reply explicitly
+does not authorize creating a substitute `sage_message_send`; agents must recover
+the original claim or report the failure. Existing claimed provider rows receive
+an off-chain SQLite `legacy` session fence during startup migration.
+
+This patch introduces no consensus change or application-version increase. The
+supported consensus ceiling remains app-v27.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.1`. SDK 11.19.1.
+
 ## What's New in v11.19.0
 
 **Record authors regain lifecycle authority in reserved shared namespaces.**
@@ -2157,7 +2185,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.0`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.1`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

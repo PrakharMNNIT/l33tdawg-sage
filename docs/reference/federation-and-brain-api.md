@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.19.0 code (2026-08-23). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
+<!-- Verified against SAGE v11.19.1 code (2026-08-25). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
 
 # SAGE Federation and Brain HTTP API Reference (v11)
 
@@ -318,7 +318,7 @@ The whole inner proof plus intent/payload/result use the local vault-backed
 storage path. Foreign completion creates no memory journal, and the result is
 atomically paired with its durable return outbox event before the peer is
 acknowledged (`internal/store/pipeline_transport.go:126-189`, `:256-326`;
-`handlePipeResult`, `api/rest/pipe_handler.go:1545-1780`).
+`handlePipeResult`, `api/rest/pipe_handler.go:1580-1869`).
 
 ### `POST /fed/v1/query/available`
 
