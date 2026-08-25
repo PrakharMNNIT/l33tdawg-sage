@@ -111,6 +111,8 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 	require.Equal(t, "claude-code/sage", items[0]["from_registered_name"])
 	require.Equal(t, "confirmed", items[0]["read_status"])
 	require.Equal(t, claimantSessionID, items[0]["claimant_session_id"])
+	require.Contains(t, items[0]["reply_action"], "sage_message_reply")
+	require.Contains(t, items[0]["reply_action"], "do not substitute sage_message_send")
 	require.Equal(t, claimantSessionID, received.(map[string]any)["claimant_session_id"])
 	mu.Lock()
 	require.ElementsMatch(t, []string{"/v1/messages/local-a/read", "/v1/messages/local-b/read"}, readPaths)
@@ -192,6 +194,74 @@ func TestMessageReplyCannotFallbackAcrossSameAgentClaimantSessions(t *testing.T)
 	require.Equal(t, 2, canonicalCalls)
 	require.Zero(t, pipePreflightCalls)
 	require.Zero(t, legacyResultCalls)
+}
+
+func TestMessagesReceiveFreshTokenResurfacesOwnClaimedWork(t *testing.T) {
+	var claimantSessionID string
+	receiveCalls := 0
+	ownCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/own-claimed-unfinished", func(w http.ResponseWriter, r *http.Request) {
+		ownCalls++
+		claimantSessionID = r.URL.Query().Get("claimant_session_id")
+		if ownCalls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0, "limit": 2, "truncated": false})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{
+				{"message_id": "msg-a", "from_agent": "alice", "intent": "ask", "payload": "one", "claimant_session_id": claimantSessionID},
+				{"message_id": "msg-b", "from_agent": "alice", "intent": "ask", "payload": "two", "claimant_session_id": claimantSessionID},
+			},
+			"count": 2, "limit": 2, "truncated": false,
+		})
+	})
+	mux.HandleFunc("/v1/messages/receive", func(w http.ResponseWriter, _ *http.Request) {
+		receiveCalls++
+		if receiveCalls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []map[string]any{
+					{"message_id": "msg-a", "from_agent": "alice", "intent": "ask", "payload": "one", "claimant_session_id": claimantSessionID},
+					{"message_id": "msg-b", "from_agent": "alice", "intent": "ask", "payload": "two", "claimant_session_id": claimantSessionID},
+				},
+				"count": 2,
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "count": 0})
+	})
+	mux.HandleFunc("/v1/messages/read-batch", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{
+			{"message_id": "msg-a", "read_status": "confirmed"},
+			{"message_id": "msg-b", "read_status": "confirmed"},
+		}})
+	})
+	mux.HandleFunc("/v1/messages/claimed-elsewhere", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"claimed_elsewhere_count": 0, "items": []any{}, "limit": 5, "truncated": false,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, privateKey)
+
+	first, err := s.toolMessagesReceive(context.Background(), map[string]any{"receive_token": "first", "limit": 2})
+	require.NoError(t, err)
+	require.Equal(t, 2, first.(map[string]any)["count"])
+	require.Equal(t, 0, first.(map[string]any)["own_claimed_unfinished_count"])
+
+	second, err := s.toolMessagesReceive(context.Background(), map[string]any{"receive_token": "fresh", "limit": 2})
+	require.NoError(t, err)
+	response := second.(map[string]any)
+	require.Equal(t, 0, response["count"], "a fresh token must not relabel old claims as new work")
+	require.Empty(t, response["items"])
+	require.Equal(t, 2, response["own_claimed_unfinished_count"])
+	owned := response["own_claimed_unfinished"].([]map[string]any)
+	require.Equal(t, []string{"msg-a", "msg-b"}, []string{owned[0]["message_id"].(string), owned[1]["message_id"].(string)})
+	require.Contains(t, response["message"], "This inbox is not clear")
+	require.Equal(t, "clear", response["claimed_elsewhere_state"])
 }
 
 func TestPipeResultAliasCannotOmitOrBypassClaimantSession(t *testing.T) {
@@ -335,6 +405,102 @@ func TestMessageReplyUsesExplicitFederatedCompatibilityScope(t *testing.T) {
 	require.Equal(t, "reply-fed", response["reply_event_id"])
 	require.Equal(t, 1, canonicalCalls)
 	require.Equal(t, 1, legacyResultCalls)
+}
+
+func TestMessageReplyUsesExplicitLegacyProviderCompatibilityScope(t *testing.T) {
+	canonicalCalls := 0
+	legacyResultCalls := 0
+	var claimantSessions []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/msg-provider/reply", func(w http.ResponseWriter, r *http.Request) {
+		canonicalCalls++
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		claimantSession, _ := body["claimant_session_id"].(string)
+		require.NotEmpty(t, claimantSession)
+		claimantSessions = append(claimantSessions, claimantSession)
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": legacyProviderCompatibilityProblemType, "title": "Legacy provider reply path required",
+			"status": http.StatusConflict, "detail": "Use the session-fenced legacy provider reply path.",
+		})
+	})
+	mux.HandleFunc("/v1/pipe/msg-provider", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"pipe_id": "msg-provider", "status": "claimed"})
+	})
+	mux.HandleFunc("/v1/pipe/msg-provider/result", func(w http.ResponseWriter, r *http.Request) {
+		legacyResultCalls++
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, "done", body["result"])
+		require.Equal(t, claimantSessions[0], body["claimant_session_id"],
+			"the compatibility completion must preserve the canonical claimant-session fence")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, privateKey)
+
+	result, err := s.toolMessageReply(context.Background(), map[string]any{
+		"message_id": "msg-provider", "result": "done",
+	})
+	require.NoError(t, err)
+	response := result.(map[string]any)
+	require.Equal(t, "local", response["scope"])
+	require.Equal(t, "legacy_provider", response["compatibility_scope"])
+	require.Contains(t, response["message"], "completed the original message")
+	require.Contains(t, response["message"], "do not create a substitute")
+	require.Equal(t, 2, canonicalCalls,
+		"the compatibility helper rechecks the exact typed signal before using the retained endpoint")
+	require.Equal(t, 1, legacyResultCalls)
+	require.Len(t, claimantSessions, 2)
+	require.Equal(t, claimantSessions[0], claimantSessions[1])
+}
+
+func TestMessageReplyRejectsNearMissLegacyProviderCompatibilitySignals(t *testing.T) {
+	tests := []struct {
+		name        string
+		problemType string
+		bodyStatus  int
+		contentType string
+	}{
+		{name: "wrong type", problemType: "https://sage.dev/errors/409", bodyStatus: http.StatusConflict, contentType: "application/problem+json"},
+		{name: "wrong body status", problemType: legacyProviderCompatibilityProblemType, bodyStatus: http.StatusBadRequest, contentType: "application/problem+json"},
+		{name: "wrong content type", problemType: legacyProviderCompatibilityProblemType, bodyStatus: http.StatusConflict, contentType: "application/json"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResultCalls := 0
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/messages/msg-provider/reply", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type": tc.problemType, "title": "Compatibility-like response",
+					"status": tc.bodyStatus, "detail": "This must not authorize fallback.",
+				})
+			})
+			mux.HandleFunc("/v1/pipe/msg-provider/result", func(w http.ResponseWriter, _ *http.Request) {
+				legacyResultCalls++
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed"})
+			})
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+			_, privateKey, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
+			s := NewServer(ts.URL, privateKey)
+
+			_, err = s.toolMessageReply(context.Background(), map[string]any{
+				"message_id": "msg-provider", "result": "done",
+			})
+			require.Error(t, err)
+			require.ErrorContains(t, err, "Do not substitute sage_message_send")
+			require.Zero(t, legacyResultCalls, "only the exact canonical typed signal may authorize fallback")
+		})
+	}
 }
 
 func TestMessageSendSurfacesInboundThatArrivedAfterPriorEmptyPoll(t *testing.T) {
@@ -825,7 +991,8 @@ func TestUnifiedInboxKeepsFederatedWorkVisibleWhenCanonicalMessagesExist(t *test
 	turn := s.checkPipelineInbox(context.Background())
 	require.Equal(t, true, turn["message_inbox_unread"])
 	require.Equal(t, 2, turn["message_inbox_unread_count"])
-	require.Contains(t, turn["message_inbox_action"], "sage_messages_receive")
+	require.Contains(t, turn["message_inbox_action"], "sage_inbox")
+	require.NotContains(t, turn["message_inbox_action"], "sage_messages_receive")
 	require.NotContains(t, turn, "message_inbox")
 	mu.Lock()
 	require.Equal(t, []string{"2"}, legacyLimits,

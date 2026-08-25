@@ -517,6 +517,11 @@ const messageClaimSessionProblemType = "https://sage.dev/errors/message-claim-se
 // ordinary non-enumerating 404 as a compatibility signal.
 const messageFederatedCompatibilityProblemType = "https://sage.dev/errors/message-federated-compatibility-scope"
 
+// messageLegacyProviderCompatibilityProblemType is emitted only after the
+// store proves exact claimed_by ownership and an exact claimant-session fence
+// on a local provider-addressed compatibility row.
+const messageLegacyProviderCompatibilityProblemType = "https://sage.dev/errors/message-legacy-provider-compatibility-scope"
+
 func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
 	if !requireExactSignedMessageAction(w, r) {
 		return
@@ -558,6 +563,9 @@ func (s *Server) handleMessageReply(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, store.ErrMessageFederatedCompatibilityScope):
 			writeProblemTyped(w, http.StatusConflict, messageFederatedCompatibilityProblemType, "Federated reply path required",
 				"This exact claimed inbound message must be answered through the negotiated federated reply path.")
+		case errors.Is(err, store.ErrMessageLegacyProviderCompatibilityScope):
+			writeProblemTyped(w, http.StatusConflict, messageLegacyProviderCompatibilityProblemType, "Legacy provider reply path required",
+				"This exact session-owned provider-addressed message must be answered through the compatibility pipeline reply path.")
 		case errors.Is(err, store.ErrPipeResultTooLarge):
 			writeProblemTyped(w, http.StatusRequestEntityTooLarge, pipeTooLargeProblemType, "Reply too large", err.Error())
 		default:

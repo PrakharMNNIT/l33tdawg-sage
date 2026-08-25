@@ -161,6 +161,28 @@ func TestAdvertisedMessageRepliesUsesExactSignedPassiveContract(t *testing.T) {
 	require.Contains(t, tool.Description, "Passive")
 }
 
+func TestAdvertisedMessageReplyForbidsSubstituteSend(t *testing.T) {
+	s, _ := newAdvertisedToolTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{})
+	})
+
+	reply := s.tools["sage_message_reply"].Description
+	require.Contains(t, reply, "provider-addressed legacy")
+	require.Contains(t, reply, "exact typed compatibility signal")
+	require.Contains(t, reply, "failed reply is not authorization")
+	require.Contains(t, reply, "sage_message_send")
+
+	inbox := s.tools["sage_inbox"].Description
+	require.Contains(t, inbox, "provider-addressed legacy work")
+	require.Contains(t, inbox, "failed reply is not authorization")
+	require.Contains(t, inbox, "sage_message_send")
+
+	receive := s.tools["sage_messages_receive"].Description
+	require.Contains(t, receive, "fresh token does not make prior work look cleared")
+	require.Contains(t, receive, "own_claimed_unfinished")
+	require.Contains(t, receive, "claimed_elsewhere")
+}
+
 // TestHiddenCompatibilityToolsAreUnchangedByReplyVisibility guards the other
 // direction: adding the advertised reply read must not un-hide or re-home any
 // deprecated pipe alias, and must not teach a client to use one.

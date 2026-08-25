@@ -815,6 +815,11 @@ var (
 	// federation reply path without treating an ordinary typed 404 as a licence
 	// to bypass claimant-session fencing.
 	ErrMessageFederatedCompatibilityScope = errors.New("message uses the federated compatibility reply path")
+	// ErrMessageLegacyProviderCompatibilityScope is returned only after an
+	// exact claimed_by identity and claimant-session receipt prove ownership of
+	// a local provider-addressed legacy row. It permits the compatibility pipe
+	// result path without treating a canonical typed 404 as a fallback signal.
+	ErrMessageLegacyProviderCompatibilityScope = errors.New("message uses the legacy provider compatibility reply path")
 	// ErrMessageClaimedByOtherSession separates "another session of THIS
 	// agent holds the claim" from "no such message". Collapsing the two let
 	// the MCP client treat a fence rejection as an absent route and retry
@@ -992,7 +997,7 @@ type MessageWakeState struct {
 
 // ClaimedElsewhereMessage is the payload-free recovery projection for an
 // unfinished message whose claim belongs to another runtime sharing the exact
-// recipient identity. It is sufficient for CAS handoff without exposing
+// recipient or persisted claimed-owner identity. It is sufficient for CAS handoff without exposing
 // sender, intent, payload, result, or federation provenance.
 type ClaimedElsewhereMessage struct {
 	MessageID         string

@@ -101,7 +101,8 @@ scoped challenge/reinstate authority in compile-time reserved shared domains,
 and an omitted new-task `task_status` is canonically interpreted as `planned`.
 v11.19.1 makes other-session claimed work recoverable beyond the newest 100
 generic history rows through a payload-free, cursor-paginated handoff
-projection, and aligns its exact count with TTL expiry.
+projection, aligns its exact count with TTL expiry, and makes provider-addressed
+compatibility work session-fenced, recoverable, and idempotently replyable.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -129,8 +130,17 @@ outside this projection. Ownership changes only through the existing
 compare-and-swap handoff route. Past-TTL rows are excluded from the scalar and
 page before the periodic expiry sweep, matching wake and same-session recovery.
 
-This patch introduces no consensus change, application-version increase, or
-state migration. The supported consensus ceiling remains app-v27.
+Provider-addressed compatibility rows now acquire an exact claimant-session
+receipt atomically with their inbox claim. They reappear under same-session or
+other-session recovery, can be handed off with the same CAS fence, and complete
+idempotently through `sage_message_reply`; identical lost-response retries
+replay while conflicting results fail. Fresh-token receive responses also carry
+the passive recovery surfaces, and failed replies explicitly do not authorize a
+substitute `sage_message_send`. Startup backfills existing claimed provider rows
+behind an off-chain `legacy` session fence.
+
+This patch introduces no consensus change or application-version increase. The
+supported consensus ceiling remains app-v27.
 
 ## v11.19.0 release
 

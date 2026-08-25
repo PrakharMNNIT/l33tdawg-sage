@@ -67,8 +67,15 @@ not expose sender identity, intent, payload, result, provider, or chain IDs.
 Expired TTL-bounded claims are also excluded consistently from both the exact
 diagnostic count and its recovery pages before the periodic expiry sweep runs.
 
-This patch introduces no consensus change, application-version increase, or
-state migration. The supported consensus ceiling remains app-v27.
+Provider-addressed compatibility messages now bind atomically to the exact
+claiming agent and MCP session, resurface on later polls, support CAS handoff,
+and complete idempotently through `sage_message_reply`. A failed reply explicitly
+does not authorize creating a substitute `sage_message_send`; agents must recover
+the original claim or report the failure. Existing claimed provider rows receive
+an off-chain SQLite `legacy` session fence during startup migration.
+
+This patch introduces no consensus change or application-version increase. The
+supported consensus ceiling remains app-v27.
 
 Container: `ghcr.io/l33tdawg/sage:11.19.1`. SDK 11.19.1.
 
