@@ -1875,7 +1875,7 @@ change the ordinary generic history projection.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `folder` | string | no | `inbox` (default) shows received history; `outbox` shows messages this agent sent; `claimed_elsewhere` shows payload-free recovery metadata for other-session unfinished claims. |
-| `limit` | int | no | For `inbox`/`outbox`, default 20 and max 100. For `claimed_elsewhere`, default 5 and max 20. |
+| `limit` | int | no | Default 20. Maximum 100 for `inbox`/`outbox`; maximum 20 for `claimed_elsewhere`. |
 | `cursor` | string | no | Valid only with `claimed_elsewhere`. Copy the preceding page's opaque `next_cursor` exactly; MCP does not decode or reconstruct it. |
 
 **Returns:** `items`, `count`, and `folder`. Each item includes lifecycle state

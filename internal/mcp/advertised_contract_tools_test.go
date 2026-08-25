@@ -204,7 +204,7 @@ func TestAdvertisedMessageIdentityContractsKeepExactIDsAuthoritative(t *testing.
 	properties := history.InputSchema["properties"].(map[string]any)
 	folders := properties["folder"].(map[string]any)["enum"].([]string)
 	require.Contains(t, folders, "claimed_elsewhere")
-	require.NotContains(t, properties["limit"].(map[string]any), "default",
-		"one schema default cannot truthfully represent folder-specific defaults")
+	require.Equal(t, 20, properties["limit"].(map[string]any)["default"],
+		"the existing history schema default must remain backward compatible")
 	require.Contains(t, properties, "cursor")
 }

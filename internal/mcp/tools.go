@@ -428,7 +428,7 @@ func (s *Server) registerTools() map[string]Tool {
 				"type": "object",
 				"properties": map[string]any{
 					"folder": map[string]any{"type": "string", "enum": []string{"inbox", "outbox", "claimed_elsewhere"}, "description": "History to browse (default: inbox); claimed_elsewhere is metadata-only recovery", "default": "inbox"},
-					"limit":  map[string]any{"type": "integer", "description": "Max retained messages to return (inbox/outbox default 20, max 100; claimed_elsewhere default 5, max 20)"},
+					"limit":  map[string]any{"type": "integer", "description": "Max retained messages to return (default 20; inbox/outbox max 100; claimed_elsewhere max 20)", "default": 20},
 					"cursor": map[string]any{"type": "string", "description": "Opaque claimed_elsewhere continuation cursor. Copy next_cursor from the preceding page exactly; not valid for inbox/outbox."},
 				},
 			},
@@ -4834,7 +4834,7 @@ func (s *Server) toolMessagesReceive(ctx context.Context, params map[string]any)
 	if len(receiveToken) > store.MaxMessageTokenBytes {
 		return nil, fmt.Errorf("'receive_token' must be at most %d bytes", store.MaxMessageTokenBytes)
 	}
-	limit := intParam(params, "limit", 5)
+	limit := intParam(params, "limit", 20)
 	if limit <= 0 || limit > 20 {
 		return nil, fmt.Errorf("'limit' must be between 1 and 20")
 	}
