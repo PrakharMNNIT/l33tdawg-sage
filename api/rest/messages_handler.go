@@ -2,6 +2,7 @@ package rest
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"strconv"
@@ -303,14 +304,59 @@ func (s *Server) handleMessagesClaimedElsewhere(w http.ResponseWriter, r *http.R
 			"The active store does not support canonical messages.")
 		return
 	}
-	count, err := messageStore.CountClaimedLocalMessagesElsewhere(
-		r.Context(), middleware.ContextAgentID(r.Context()), claimantSessionID)
+	limit := 5
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 20 {
+			writeProblem(w, http.StatusBadRequest, "Invalid message limit", "limit must be between 1 and 20")
+			return
+		}
+		limit = parsed
+	}
+	var afterCreatedAt string
+	var afterMessageID string
+	if raw := strings.TrimSpace(r.URL.Query().Get("cursor")); raw != "" {
+		decoded, err := base64.RawURLEncoding.DecodeString(raw)
+		parts := strings.SplitN(string(decoded), "\x00", 2)
+		if err != nil || len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			writeProblem(w, http.StatusBadRequest, "Invalid claim cursor", "cursor must be the opaque next_cursor returned by this route")
+			return
+		}
+		parsedCreatedAt, parseErr := time.Parse(time.RFC3339Nano, parts[0])
+		if parseErr != nil || parsedCreatedAt.IsZero() {
+			writeProblem(w, http.StatusBadRequest, "Invalid claim cursor", "cursor must be the opaque next_cursor returned by this route")
+			return
+		}
+		afterCreatedAt = parts[0]
+		afterMessageID = parts[1]
+	}
+	items, count, truncated, err := messageStore.GetClaimedMessagesElsewhere(
+		r.Context(), middleware.ContextAgentID(r.Context()), claimantSessionID, limit, afterCreatedAt, afterMessageID)
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "Claim visibility unavailable",
 			"Claimed-message coordination state is temporarily unavailable.")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"claimed_elsewhere_count": count})
+	responseItems := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		entry := map[string]any{
+			"message_id": item.MessageID, "claimant_session_id": item.ClaimantSessionID,
+			"created_at": item.CreatedAt, "expires_at": item.ExpiresAt, "foreign": item.Foreign,
+		}
+		if item.ClaimedAt != nil {
+			entry["claimed_at"] = item.ClaimedAt
+		}
+		responseItems = append(responseItems, entry)
+	}
+	response := map[string]any{
+		"claimed_elsewhere_count": count, "items": responseItems, "limit": limit, "truncated": truncated,
+	}
+	if truncated && len(items) > 0 {
+		last := items[len(items)-1]
+		cursor := last.CreatedAtCursor + "\x00" + last.MessageID
+		response["next_cursor"] = base64.RawURLEncoding.EncodeToString([]byte(cursor))
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // handleOwnClaimedUnfinishedMessages returns a bounded, non-claiming view of

@@ -518,6 +518,142 @@ func TestClaimedElsewhereCountIsExactBeyondOneHistoryPage(t *testing.T) {
 	count, err = s.CountClaimedLocalMessagesElsewhere(ctx, "mallory", "live-session")
 	require.NoError(t, err)
 	require.Zero(t, count, "another agent cannot use the scalar to observe Bob's claims")
+
+	seen := make(map[string]bool, total)
+	var afterCreatedAt string
+	var afterMessageID string
+	for {
+		page, exactTotal, truncated, pageErr := s.GetClaimedMessagesElsewhere(
+			ctx, "bob", "live-session", 20, afterCreatedAt, afterMessageID)
+		require.NoError(t, pageErr)
+		require.Equal(t, total, exactTotal)
+		for _, item := range page {
+			require.False(t, seen[item.MessageID], "keyset pages must not repeat rows")
+			require.Equal(t, "dead-session", item.ClaimantSessionID)
+			require.False(t, item.Foreign)
+			seen[item.MessageID] = true
+		}
+		if !truncated {
+			break
+		}
+		require.NotEmpty(t, page)
+		last := page[len(page)-1]
+		afterCreatedAt, afterMessageID = last.CreatedAtCursor, last.MessageID
+	}
+	require.Len(t, seen, total, "every exact counted claim must be recoverable past the history cap")
+
+	_, err = s.writeExecContext(ctx,
+		`UPDATE pipeline_messages SET expires_at='2000-01-01T00:00:00.000Z' WHERE pipe_id='msg-stranded-000'`)
+	require.NoError(t, err)
+	count, err = s.CountClaimedLocalMessagesElsewhere(ctx, "bob", "live-session")
+	require.NoError(t, err)
+	require.Equal(t, total-1, count, "past-TTL claims must agree with wake and own-claim visibility before the sweep")
+}
+
+func TestClaimedElsewhereRecoveryIncludesInboundFederatedWithoutContent(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	local := testLocalMessage("msg-local-elsewhere", "alice", "bob", "local private")
+	_, _, err := s.SendLocalMessage(ctx, "send-local-elsewhere", local)
+	require.NoError(t, err)
+	_, _, err = s.ReceiveLocalMessages(ctx, "bob", "", "receive-local-elsewhere", 1, "dead-local")
+	require.NoError(t, err)
+
+	foreign := testLocalMessage("msg-foreign-elsewhere", "remote-agent", "bob", "foreign private")
+	foreign.SourceChainID = "remote-chain"
+	foreign.SourcePipeID = "remote-message"
+	require.NoError(t, s.InsertPipeline(ctx, foreign))
+	require.NoError(t, s.ClaimFederatedMessageWithSession(ctx, "bob", foreign.PipeID, "dead-foreign"))
+
+	items, total, truncated, err := s.GetClaimedMessagesElsewhere(ctx, "bob", "live-session", 20, "", "")
+	require.NoError(t, err)
+	require.Equal(t, 2, total)
+	require.False(t, truncated)
+	require.Len(t, items, 2)
+	byID := make(map[string]ClaimedElsewhereMessage, len(items))
+	for _, item := range items {
+		byID[item.MessageID] = item
+	}
+	require.False(t, byID[local.PipeID].Foreign)
+	require.Equal(t, "dead-local", byID[local.PipeID].ClaimantSessionID)
+	require.True(t, byID[foreign.PipeID].Foreign)
+	require.Equal(t, "dead-foreign", byID[foreign.PipeID].ClaimantSessionID)
+
+	items, total, truncated, err = s.GetClaimedMessagesElsewhere(ctx, "mallory", "live-session", 20, "", "")
+	require.NoError(t, err)
+	require.Zero(t, total)
+	require.False(t, truncated)
+	require.Empty(t, items)
+}
+
+func TestClaimedElsewhereCursorPreservesRawSameTimestampKey(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	const rawCreatedAt = "2026-08-25T00:00:00.000Z"
+	for _, id := range []string{"msg-same-a", "msg-same-b", "msg-same-c"} {
+		_, _, err := s.SendLocalMessage(ctx, "send-"+id, testLocalMessage(id, "alice", "bob", "private"))
+		require.NoError(t, err)
+	}
+	_, _, err := s.ReceiveLocalMessages(ctx, "bob", "", "receive-same", 3, "dead-session")
+	require.NoError(t, err)
+	_, err = s.writeExecContext(ctx,
+		`UPDATE pipeline_messages SET created_at=? WHERE pipe_id IN ('msg-same-a','msg-same-b','msg-same-c')`, rawCreatedAt)
+	require.NoError(t, err)
+
+	var cursorCreatedAt, cursorMessageID string
+	var seen []string
+	for {
+		page, total, truncated, pageErr := s.GetClaimedMessagesElsewhere(
+			ctx, "bob", "live-session", 1, cursorCreatedAt, cursorMessageID)
+		require.NoError(t, pageErr)
+		require.Equal(t, 3, total)
+		require.Len(t, page, 1)
+		require.Equal(t, rawCreatedAt, page[0].CreatedAtCursor,
+			"the opaque key must preserve the database's fixed-width timestamp")
+		seen = append(seen, page[0].MessageID)
+		if !truncated {
+			break
+		}
+		cursorCreatedAt, cursorMessageID = page[0].CreatedAtCursor, page[0].MessageID
+	}
+	require.Equal(t, []string{"msg-same-a", "msg-same-b", "msg-same-c"}, seen)
+}
+
+func TestExpiredClaimCannotBeRecoveredHandedOffOrRepliedBeforeSweep(t *testing.T) {
+	ctx := context.Background()
+	s := newMessageTestStore(t)
+	_, _, err := s.SendLocalMessage(ctx, "send-expiry-race",
+		testLocalMessage("msg-expiry-race", "alice", "bob", "private"))
+	require.NoError(t, err)
+	_, _, err = s.ReceiveLocalMessages(ctx, "bob", "", "receive-expiry-race", 1, "dead-session")
+	require.NoError(t, err)
+	_, err = s.writeExecContext(ctx,
+		`UPDATE pipeline_messages SET expires_at='2000-01-01T00:00:00.000Z' WHERE pipe_id='msg-expiry-race'`)
+	require.NoError(t, err)
+
+	items, total, truncated, err := s.GetClaimedMessagesElsewhere(ctx, "bob", "live-session", 20, "", "")
+	require.NoError(t, err)
+	require.Zero(t, total)
+	require.False(t, truncated)
+	require.Empty(t, items)
+
+	_, err = s.HandoffLocalMessageClaim(ctx, "bob", "msg-expiry-race", "dead-session", "live-session")
+	require.ErrorIs(t, err, ErrMessageNotFound)
+	require.Error(t, s.CompletePipeline(ctx, "msg-expiry-race", "bob", "late-direct", ""))
+	_, err = s.ReplyLocalMessage(ctx, "bob", "msg-expiry-race", "late", "dead-session")
+	require.ErrorIs(t, err, ErrMessageNotFound)
+
+	history, err := s.GetInboxHistory(ctx, "bob", "", 10)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	require.Equal(t, "claimed", history[0].Status)
+	require.Equal(t, "dead-session", history[0].ClaimedSessionID)
+	changed, err := s.ExpirePipelines(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, changed)
+	expired, err := s.GetPipeline(ctx, "msg-expiry-race")
+	require.NoError(t, err)
+	require.Equal(t, "expired", expired.Status)
 }
 
 func TestOwnClaimedUnfinishedMessagesAreExactBoundedAndNonMutating(t *testing.T) {

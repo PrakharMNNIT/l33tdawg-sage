@@ -1377,7 +1377,16 @@ func TestInboxUsesAuthoritativeClaimedElsewhereScalar(t *testing.T) {
 	})
 	mux.HandleFunc("/v1/messages/claimed-elsewhere", func(w http.ResponseWriter, r *http.Request) {
 		claimantSessionID = r.URL.Query().Get("claimant_session_id")
-		_ = json.NewEncoder(w).Encode(map[string]any{"claimed_elsewhere_count": 105})
+		require.Equal(t, "5", r.URL.Query().Get("limit"))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"claimed_elsewhere_count": 105,
+			"items": []map[string]any{{
+				"message_id": "msg-oldest", "claimant_session_id": "dead-session",
+				"created_at": "2026-08-01T00:00:00Z", "claimed_at": "2026-08-01T00:01:00Z",
+				"expires_at": "2126-07-08T00:00:00Z", "foreign": false,
+			}},
+			"limit": 5, "truncated": true, "next_cursor": "opaque-next",
+		})
 	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -1393,9 +1402,99 @@ func TestInboxUsesAuthoritativeClaimedElsewhereScalar(t *testing.T) {
 	require.Equal(t, claimantSessionID, inbox["claimant_session_id"])
 	require.Equal(t, 105, inbox["claimed_elsewhere_count"])
 	require.Equal(t, "present", inbox["claimed_elsewhere_state"])
+	require.Equal(t, "available", inbox["claimed_elsewhere_recovery_state"])
+	require.Equal(t, true, inbox["claimed_elsewhere_truncated"])
+	require.Equal(t, "opaque-next", inbox["claimed_elsewhere_next_cursor"])
+	recovery := inbox["claimed_elsewhere_items"].([]map[string]any)
+	require.Len(t, recovery, 1)
+	require.Equal(t, "msg-oldest", recovery[0]["message_id"])
+	require.Equal(t, "dead-session", recovery[0]["claimant_session_id"])
+	require.NotContains(t, recovery[0], "payload")
+	require.NotContains(t, recovery[0], "intent")
+	require.NotContains(t, recovery[0], "sender_agent")
 	require.Contains(t, inbox["message"], "105 message(s)")
 	require.NotContains(t, inbox["message"], "inbox is clear")
 	require.Contains(t, inbox["claimed_elsewhere_action"], "sage_message_handoff")
+	require.Contains(t, inbox["claimed_elsewhere_action"], "opaque-next")
+}
+
+func TestMessageHistoryPagesClaimedElsewhereWithoutContent(t *testing.T) {
+	var claimantSessionID string
+	requests := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/claimed-elsewhere", func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		claimantSessionID = r.URL.Query().Get("claimant_session_id")
+		require.Regexp(t, `^mcp-[0-9a-f]{32}$`, claimantSessionID)
+		require.Equal(t, "1", r.URL.Query().Get("limit"))
+		cursor := r.URL.Query().Get("cursor")
+		if cursor == "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"claimed_elsewhere_count": 2,
+				"items": []map[string]any{{
+					"message_id": "msg-old", "claimant_session_id": "dead-a",
+					"created_at": "2026-08-01T00:00:00Z", "claimed_at": "2026-08-01T00:00:01Z",
+					"expires_at": "2126-07-08T00:00:00Z", "foreign": true,
+					"payload": "must not cross MCP", "intent": "must not cross MCP", "from_agent": "must not cross MCP",
+				}},
+				"limit": 1, "truncated": true, "next_cursor": "opaque/+cursor==",
+			})
+			return
+		}
+		require.Equal(t, "opaque/+cursor==", cursor)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"claimed_elsewhere_count": 2,
+			"items": []map[string]any{{
+				"message_id": "msg-newer", "claimant_session_id": "dead-b",
+				"created_at": "2026-08-02T00:00:00Z", "expires_at": "2126-07-09T00:00:00Z",
+				"foreign": false,
+			}},
+			"limit": 1, "truncated": false,
+		})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	s := NewServer(ts.URL, privateKey)
+
+	first, err := s.toolMessageHistory(context.Background(), map[string]any{
+		"folder": "claimed_elsewhere", "limit": 1,
+	})
+	require.NoError(t, err)
+	firstPage := first.(map[string]any)
+	require.Equal(t, "claimed_elsewhere", firstPage["folder"])
+	require.Equal(t, 2, firstPage["claimed_elsewhere_count"])
+	require.Equal(t, true, firstPage["truncated"])
+	require.Equal(t, "opaque/+cursor==", firstPage["next_cursor"])
+	items := firstPage["items"].([]map[string]any)
+	require.Len(t, items, 1)
+	require.Equal(t, "msg-old", items[0]["message_id"])
+	require.Equal(t, "dead-a", items[0]["claimant_session_id"])
+	require.Equal(t, true, items[0]["foreign"])
+	require.Equal(t, true, items[0]["passive_history"])
+	for _, forbidden := range []string{"payload", "intent", "from_agent", "sender_agent", "result"} {
+		require.NotContains(t, items[0], forbidden)
+	}
+	require.Contains(t, firstPage["message"], "sage_message_handoff")
+	require.Contains(t, firstPage["message"], "opaque/+cursor==")
+
+	second, err := s.toolMessageHistory(context.Background(), map[string]any{
+		"folder": "claimed_elsewhere", "limit": 1, "cursor": firstPage["next_cursor"],
+	})
+	require.NoError(t, err)
+	secondPage := second.(map[string]any)
+	require.Equal(t, false, secondPage["truncated"])
+	require.NotContains(t, secondPage, "next_cursor")
+	require.Equal(t, "opaque/+cursor==", secondPage["cursor"])
+	require.Equal(t, "msg-newer", secondPage["items"].([]map[string]any)[0]["message_id"])
+	require.Equal(t, 2, requests)
+
+	_, err = s.toolMessageHistory(context.Background(), map[string]any{
+		"folder": "inbox", "cursor": "must-not-be-ignored",
+	})
+	require.ErrorContains(t, err, "valid only")
+	require.Equal(t, 2, requests, "generic history must reject a recovery cursor before HTTP")
 }
 
 func TestCanonicalMessageToolsRejectOutOfContractBoundsBeforeHTTP(t *testing.T) {

@@ -120,6 +120,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.27 | Caller-safe empty semantic-recall completeness disclosure with exact projection/vector-space fencing and bounded indexed probes; no consensus change; app-v26 remains the ceiling |
 | v11.18.28 | Restored reads for compile-time shared domains with classification enforcement, plus rejection of ownership registration for reserved or governance-promoted shared domains; no consensus change; app-v26 remains the ceiling |
 | v11.19.0 | app-v27: static reserved shared-domain record authors gain hard-denial-preserving challenge/reinstate authority; omitted new-task `task_status` canonicalizes to `planned` |
+| v11.19.1 | Payload-free cursor-paginated recovery for other-session message claims beyond generic history, with TTL-consistent exact counts; no consensus change; app-v27 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

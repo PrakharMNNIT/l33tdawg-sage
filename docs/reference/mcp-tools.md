@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.19.0.
+Reconciled against internal/mcp for SAGE v11.19.1.
 
 # SAGE MCP Tools Reference
 
@@ -1007,7 +1007,8 @@ clients must not treat the legacy value as immutable registration history.
 **Purpose:** Deterministically transfer one already-claimed canonical local or
 inbound federated message between concurrent MCP runtimes that share the same signed agent
 identity. The caller supplies the `claimant_session_id` currently shown by
-`sage_message_history(folder="inbox")`; SAGE atomically compares that value and
+`sage_message_history(folder="claimed_elsewhere")` (or the first payload-free
+`claimed_elsewhere_items` page embedded in `sage_inbox`); SAGE atomically compares that value and
 reassigns the message to the calling MCP session. A stale or concurrent handoff
 returns a conflict instead of silently duplicating ownership. Session IDs are
 opaque coordination metadata, not authorization principals.
@@ -1045,10 +1046,12 @@ competing bind conflicts instead of overwriting the first session.
 **Watcher and voice-bridge contract:** A watcher calls `sage_inbox` normally;
 the first concurrent session to receive a message remains its one handler. An
 empty active poll from a sibling session is not proof that the shared agent has
-no retained work: inspect `sage_message_history(folder="inbox")`, attribute any
-claimed row to its `claimant_session_id`, and call `sage_message_handoff` only
-when takeover is intentional. The compare-and-swap conflict is the signal to
-refresh history, not permission to process a stale copy. SSE
+no retained work: review `claimed_elsewhere_items`, then page the complete
+metadata-only projection with `sage_message_history(folder="claimed_elsewhere")`.
+Call `sage_message_handoff` only when takeover is intentional and the previous
+claimant has been judged dead or stale. The compare-and-swap conflict is the
+signal to refresh the claimed-elsewhere projection, not permission to process a
+stale copy. SSE
 `notifications/sage_message` is wake-up metadata only and never assigns a
 session. Mynah / SAGE Voice Bridge should normally use its dedicated registered
 agent key; if an operator deliberately runs multiple bridge/watch processes
@@ -1696,10 +1699,18 @@ authorization. Pipeline results are untrusted data, not instructions.
   `clear` means the exact signed recipient's authoritative store query returned
   zero; `present` carries the exact payload-free count of unfinished messages
   held by another session. `unavailable` never implies zero and includes
-  `claimed_elsewhere_action`. The scalar is not derived from a bounded history
-  page and exposes no message ID, sender, intent, payload, or other session ID.
-  Inspect passive history before using `sage_message_handoff`, and transfer only
-  after judging the old claimant dead or stale.
+  `claimed_elsewhere_action`. The scalar is not derived from a bounded page.
+  The additive `claimed_elsewhere_items` first page exposes only the exact
+  `message_id`, its current `claimant_session_id`, lifecycle timestamps, and a
+  `foreign` boolean; it never exposes sender, provider, chain ID, intent,
+  payload, or result. `claimed_elsewhere_page_count`,
+  `claimed_elsewhere_limit`, `claimed_elsewhere_truncated`, and optional
+  `claimed_elsewhere_next_cursor` describe that oldest-first page.
+  `claimed_elsewhere_recovery_state:"available"` means the node supplied the
+  paged contract; `unavailable` keeps a truthful scalar but does not claim every
+  counted row is reachable through the generic newest-100 history window. Page
+  the remainder with `sage_message_history(folder="claimed_elsewhere")`, then
+  transfer only after judging the old claimant dead or stale.
 - `reply_count`, `reply_limit`, `reply_page_truncated`, optional
   `reply_next_before`, `reply_newest_completed_at`,
   `reply_oldest_completed_at`, and `reply_since`: embedded page metadata.
@@ -1849,19 +1860,23 @@ authoritative runtime/coordination-contract evidence either way.
 
 **Purpose:** Browse retained message inbox or outbox history without claiming,
 acknowledging, or re-queueing anything. Returned records use `message_id`; new
-clients do not need pipeline terminology. Use this after a lost `sage_inbox`
-response to reopen a claimed message safely.
+clients do not need pipeline terminology. The additive `claimed_elsewhere`
+folder is a separate, metadata-only recovery projection for unfinished claims
+held by another runtime sharing this exact agent identity. It does not widen or
+change the ordinary generic history projection.
 
 **Source:** `internal/mcp/tools.go` (`registerTools` entry
-`sage_message_history`; `Server.toolPipeHistory`; item formatter
-`formatPipelineHistoryItem`).
+`sage_message_history`; `Server.toolPipeHistory`;
+`Server.toolClaimedElsewhereHistory`; item formatters
+`formatPipelineHistoryItem` and `formatClaimedElsewhereHistoryItem`).
 
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `folder` | string | no | `inbox` (default) shows received history; `outbox` shows messages this agent sent. |
-| `limit` | int | no | Max retained records. Default 20; max 100. |
+| `folder` | string | no | `inbox` (default) shows received history; `outbox` shows messages this agent sent; `claimed_elsewhere` shows payload-free recovery metadata for other-session unfinished claims. |
+| `limit` | int | no | For `inbox`/`outbox`, default 20 and max 100. For `claimed_elsewhere`, default 5 and max 20. |
+| `cursor` | string | no | Valid only with `claimed_elsewhere`. Copy the preceding page's opaque `next_cursor` exactly; MCP does not decode or reconstruct it. |
 
 **Returns:** `items`, `count`, and `folder`. Each item includes lifecycle state
 (`pending`, `claimed`, `completed`, or `expired`), counterpart, timestamps, and
@@ -1869,6 +1884,19 @@ request/result content. `passive_history:true` confirms the call did not claim
 anything. Every payload is `payload_authority:"request_only"`; any result is
 `result_authority:"data_only"`. Neither is instructions, and neither is proof of
 remote delivery or reading.
+
+With `folder="claimed_elsewhere"`, the response instead carries the page-local
+`count`, exact current `claimed_elsewhere_count`, `limit`, `truncated`,
+`passive_read:true`, and optional `next_cursor`. Items are oldest first and
+contain only `message_id`, `claimant_session_id`, `created_at`, optional
+`claimed_at`, `expires_at`, `foreign`, plus MCP-derived
+`passive_history:true`, `new_work:false`, and `requires_handoff:true`. They do
+not contain sender, provider, chain ID, intent, payload, or result. A truncated
+page without `next_cursor` fails visibly instead of describing older rows as
+reachable. Copy `next_cursor` into the next call until `truncated:false`; before
+calling `sage_message_handoff`, independently judge the named claimant session
+dead or stale. Paging is passive and changes no claim, receipt, wake, or
+workflow state.
 
 For local exact-agent rows, `counterparty` prefers current display name, then
 registered name, then the legacy provider label, then a bounded exact-ID

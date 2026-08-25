@@ -202,13 +202,22 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 	currentClaims := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
 		"/v1/messages/claimed-elsewhere?claimant_session_id=mcp-helper", nil)
 	require.Equal(t, http.StatusOK, currentClaims.Code, currentClaims.Body.String())
-	require.JSONEq(t, `{"claimed_elsewhere_count":0}`, currentClaims.Body.String())
+	require.JSONEq(t, `{"claimed_elsewhere_count":0,"items":[],"limit":5,"truncated":false}`, currentClaims.Body.String())
 	otherClaims := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
 		"/v1/messages/claimed-elsewhere?claimant_session_id=mcp-supervisor", nil)
 	require.Equal(t, http.StatusOK, otherClaims.Code, otherClaims.Body.String())
-	require.JSONEq(t, `{"claimed_elsewhere_count":1}`, otherClaims.Body.String())
-	require.NotContains(t, otherClaims.Body.String(), messageID)
+	var elsewhereResponse struct {
+		Items []map[string]any `json:"items"`
+		Count int              `json:"claimed_elsewhere_count"`
+	}
+	require.NoError(t, json.Unmarshal(otherClaims.Body.Bytes(), &elsewhereResponse))
+	require.Equal(t, 1, elsewhereResponse.Count)
+	require.Len(t, elsewhereResponse.Items, 1)
+	require.Equal(t, messageID, elsewhereResponse.Items[0]["message_id"])
+	require.Equal(t, "mcp-helper", elsewhereResponse.Items[0]["claimant_session_id"])
 	require.NotContains(t, otherClaims.Body.String(), "private request")
+	require.NotContains(t, otherClaims.Body.String(), "alice")
+	require.NotContains(t, otherClaims.Body.String(), "review")
 	unsignedClaims := callMessageJSON(t, messageRouterAs(s, "bob", false), http.MethodGet,
 		"/v1/messages/claimed-elsewhere?claimant_session_id=mcp-supervisor", nil)
 	require.Equal(t, http.StatusForbidden, unsignedClaims.Code, unsignedClaims.Body.String())
@@ -241,6 +250,83 @@ func TestCanonicalLocalMessagesEndToEndAndAntiEnumeration(t *testing.T) {
 	require.NotContains(t, unauthorized.Body.String(), "private request")
 	require.NotContains(t, unauthorized.Body.String(), "alice")
 	require.NotContains(t, unauthorized.Body.String(), "bob")
+}
+
+func TestClaimedElsewhereRecoveryIsPaginatedPassiveAndContentFree(t *testing.T) {
+	s, sqlite := newPipeServer(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("msg-elsewhere-page-%d", i)
+		msg := &store.PipelineMessage{
+			PipeID: id, FromAgent: fmt.Sprintf("sender-%d", i), ToAgent: "bob",
+			Intent: "secret intent", Payload: "secret payload", Status: "pending",
+			CreatedAt: now.Add(time.Duration(i) * time.Millisecond), ExpiresAt: now.Add(time.Hour),
+		}
+		_, _, err := sqlite.SendLocalMessage(t.Context(), "send-"+id, msg)
+		require.NoError(t, err)
+	}
+	_, _, err := sqlite.ReceiveLocalMessages(t.Context(), "bob", "", "receive-page", 3, "dead-session")
+	require.NoError(t, err)
+
+	first := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
+		"/v1/messages/claimed-elsewhere?claimant_session_id=live-session&limit=2", nil)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	var firstPage struct {
+		Items     []map[string]any `json:"items"`
+		Count     int              `json:"claimed_elsewhere_count"`
+		Truncated bool             `json:"truncated"`
+		Next      string           `json:"next_cursor"`
+	}
+	require.NoError(t, json.Unmarshal(first.Body.Bytes(), &firstPage))
+	require.Equal(t, 3, firstPage.Count)
+	require.Len(t, firstPage.Items, 2)
+	require.True(t, firstPage.Truncated)
+	require.NotEmpty(t, firstPage.Next)
+	require.NotContains(t, first.Body.String(), "secret")
+	require.NotContains(t, first.Body.String(), "sender-")
+	for _, item := range firstPage.Items {
+		require.ElementsMatch(t,
+			[]string{"message_id", "claimant_session_id", "created_at", "claimed_at", "expires_at", "foreign"},
+			mapKeys(item))
+	}
+
+	second := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
+		"/v1/messages/claimed-elsewhere?claimant_session_id=live-session&limit=2&cursor="+firstPage.Next, nil)
+	require.Equal(t, http.StatusOK, second.Code, second.Body.String())
+	var secondPage struct {
+		Items     []map[string]any `json:"items"`
+		Count     int              `json:"claimed_elsewhere_count"`
+		Truncated bool             `json:"truncated"`
+		Next      string           `json:"next_cursor"`
+	}
+	require.NoError(t, json.Unmarshal(second.Body.Bytes(), &secondPage))
+	require.Equal(t, 3, secondPage.Count)
+	require.Len(t, secondPage.Items, 1)
+	require.False(t, secondPage.Truncated)
+	require.Empty(t, secondPage.Next)
+	require.NotEqual(t, firstPage.Items[0]["message_id"], secondPage.Items[0]["message_id"])
+	require.NotEqual(t, firstPage.Items[1]["message_id"], secondPage.Items[0]["message_id"])
+
+	mallory := callMessageJSON(t, messageRouterAs(s, "mallory", true), http.MethodGet,
+		"/v1/messages/claimed-elsewhere?claimant_session_id=live-session&limit=20", nil)
+	require.Equal(t, http.StatusOK, mallory.Code, mallory.Body.String())
+	require.NotContains(t, mallory.Body.String(), "msg-elsewhere-page")
+	require.NotContains(t, mallory.Body.String(), "dead-session")
+
+	badLimit := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
+		"/v1/messages/claimed-elsewhere?claimant_session_id=live-session&limit=21", nil)
+	require.Equal(t, http.StatusBadRequest, badLimit.Code, badLimit.Body.String())
+	badCursor := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
+		"/v1/messages/claimed-elsewhere?claimant_session_id=live-session&cursor=not-a-cursor", nil)
+	require.Equal(t, http.StatusBadRequest, badCursor.Code, badCursor.Body.String())
+}
+
+func mapKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func TestCanonicalMessageReceiveEnrichesCurrentNamesWithoutMutatingProviderIdentity(t *testing.T) {

@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.0 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.1 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -99,6 +99,9 @@ reserved or governance-promoted shared domains from becoming ownable.
 v11.19.0 introduces app-v27: eligible immutable record authors gain narrowly
 scoped challenge/reinstate authority in compile-time reserved shared domains,
 and an omitted new-task `task_status` is canonically interpreted as `planned`.
+v11.19.1 makes other-session claimed work recoverable beyond the newest 100
+generic history rows through a payload-free, cursor-paginated handoff
+projection, and aligns its exact count with TTL expiry.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -109,6 +112,25 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.1 release
+
+The exact `claimed_elsewhere_count` continues to cover every still-actionable
+claim held by another runtime sharing the same agent identity, including claims
+older than the generic history window. A new oldest-first, cursor-paginated
+recovery projection makes each counted row actionable using only its message
+ID, claimant-session fence, timestamps, and local/federated classification.
+`sage_inbox` embeds the first bounded page, while
+`sage_message_history(folder="claimed_elsewhere")` pages the remainder without
+claiming, acknowledging, handing off, or completing anything.
+
+Sender identity, provider and chain IDs, intent, payload, and result remain
+outside this projection. Ownership changes only through the existing
+compare-and-swap handoff route. Past-TTL rows are excluded from the scalar and
+page before the periodic expiry sweep, matching wake and same-session recovery.
+
+This patch introduces no consensus change, application-version increase, or
+state migration. The supported consensus ceiling remains app-v27.
 
 ## v11.19.0 release
 

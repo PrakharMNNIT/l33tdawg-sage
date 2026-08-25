@@ -635,9 +635,82 @@ func (s *SQLiteStore) CountClaimedLocalMessagesElsewhere(
 		  ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
 		WHERE p.to_agent=? AND p.to_provider='' AND p.destination_chain_id=''
 		  AND p.status='claimed' AND p.completed_at IS NULL
+		  AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		  AND r.claimant_session_id!=?`,
 		receiverID, receiverID, claimantSessionID).Scan(&count)
 	return count, err
+}
+
+// GetClaimedMessagesElsewhere makes the exact scalar actionable without
+// widening the content boundary. It returns only CAS handoff metadata for the
+// signed recipient, ordered by a stable exclusive (created_at, message_id)
+// keyset. The extra row is used only to report truncation.
+func (s *SQLiteStore) GetClaimedMessagesElsewhere(
+	ctx context.Context, receiverID, claimantSessionID string, limit int,
+	afterCreatedAt, afterMessageID string,
+) ([]ClaimedElsewhereMessage, int, bool, error) {
+	receiverID = strings.TrimSpace(receiverID)
+	claimantSessionID = strings.TrimSpace(claimantSessionID)
+	afterCreatedAt = strings.TrimSpace(afterCreatedAt)
+	afterMessageID = strings.TrimSpace(afterMessageID)
+	if receiverID == "" || claimantSessionID == "" || len(claimantSessionID) > MaxMessageClaimantSessionBytes ||
+		limit < 1 || limit > 20 || ((afterCreatedAt == "") != (afterMessageID == "")) {
+		return nil, 0, false, ErrMessageNotFound
+	}
+	if afterCreatedAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, afterCreatedAt); err != nil {
+			return nil, 0, false, ErrMessageNotFound
+		}
+	}
+	count, err := s.CountClaimedLocalMessagesElsewhere(ctx, receiverID, claimantSessionID)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	query := `SELECT p.pipe_id,r.claimant_session_id,p.created_at,p.claimed_at,p.expires_at,
+		CASE WHEN p.source_chain_id!='' THEN 1 ELSE 0 END
+		FROM pipeline_messages p
+		JOIN message_fetch_receipts r
+		  ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
+		WHERE p.to_agent=? AND p.to_provider='' AND p.destination_chain_id=''
+		  AND p.status='claimed' AND p.completed_at IS NULL
+		  AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		  AND r.claimant_session_id!=?`
+	args := []any{receiverID, receiverID, claimantSessionID}
+	if afterCreatedAt != "" {
+		query += ` AND (p.created_at>? OR (p.created_at=? AND p.pipe_id>?))`
+		args = append(args, afterCreatedAt, afterCreatedAt, afterMessageID)
+	}
+	query += ` ORDER BY p.created_at ASC,p.pipe_id ASC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	defer rows.Close() //nolint:errcheck
+	items := make([]ClaimedElsewhereMessage, 0, limit+1)
+	for rows.Next() {
+		var item ClaimedElsewhereMessage
+		var createdAt, expiresAt string
+		var claimedAt *string
+		var foreign int
+		if err := rows.Scan(&item.MessageID, &item.ClaimantSessionID, &createdAt, &claimedAt, &expiresAt, &foreign); err != nil {
+			return nil, 0, false, err
+		}
+		item.CreatedAt = parseTime(createdAt)
+		item.CreatedAtCursor = createdAt
+		item.ClaimedAt = parseTimePtr(claimedAt)
+		item.ExpiresAt = parseTime(expiresAt)
+		item.Foreign = foreign != 0
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, false, err
+	}
+	truncated := len(items) > limit
+	if truncated {
+		items = items[:limit]
+	}
+	return items, count, truncated, nil
 }
 
 // GetOwnClaimedUnfinishedMessages is the non-claiming companion to canonical
@@ -706,7 +779,8 @@ func (s *SQLiteStore) HandoffLocalMessageClaim(ctx context.Context, receiverID, 
 		if err := tx.conn.QueryRowContext(ctx, `SELECT p.to_agent,p.to_provider,p.claimed_by,p.status,
 			p.source_chain_id,p.destination_chain_id,r.claimant_session_id
 			FROM pipeline_messages p JOIN message_fetch_receipts r ON r.message_id=p.pipe_id
-			WHERE p.pipe_id=? AND r.receiver_agent_id=?`, messageID, receiverID).
+			WHERE p.pipe_id=? AND r.receiver_agent_id=?
+			  AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')`, messageID, receiverID).
 			Scan(&addressed, &provider, &claimed, &status, &sourceChain, &destinationChain, &current); err != nil {
 			return ErrMessageNotFound
 		}
@@ -721,7 +795,11 @@ func (s *SQLiteStore) HandoffLocalMessageClaim(ctx context.Context, receiverID, 
 			return ErrMessageReceiveConflict
 		}
 		result, err := tx.writeExecContext(ctx, `UPDATE message_fetch_receipts SET claimant_session_id=?
-			WHERE message_id=? AND receiver_agent_id=? AND claimant_session_id=?`, toSessionID, messageID, receiverID, fromSessionID)
+			WHERE message_id=? AND receiver_agent_id=? AND claimant_session_id=?
+			  AND EXISTS (SELECT 1 FROM pipeline_messages p WHERE p.pipe_id=?
+			    AND p.status='claimed' AND p.completed_at IS NULL
+			    AND p.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
+			toSessionID, messageID, receiverID, fromSessionID, messageID)
 		if err != nil {
 			return err
 		}
@@ -954,7 +1032,8 @@ func (s *SQLiteStore) ReplyLocalMessage(ctx context.Context, receiverID, message
 		}
 		var provider, claimed, sourceChain, destinationChain string
 		if queryErr := tx.conn.QueryRowContext(ctx,
-			`SELECT to_provider,claimed_by,source_chain_id,destination_chain_id FROM pipeline_messages WHERE pipe_id=?`, messageID).
+			`SELECT to_provider,claimed_by,source_chain_id,destination_chain_id FROM pipeline_messages
+			 WHERE pipe_id=? AND expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')`, messageID).
 			Scan(&provider, &claimed, &sourceChain, &destinationChain); queryErr != nil {
 			return ErrMessageNotFound
 		}

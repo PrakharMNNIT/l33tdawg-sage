@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.19.0. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.19.1. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -2164,7 +2164,7 @@ principal.
 | `POST /v1/messages` | Exact-local-agent send. Requires `to_agent`, `payload`, and a 1–256-byte caller-scoped `idempotency_key`; optional `intent` and `ttl_minutes` 0–1440. Omitted/0 is durable until handled; 1–1440 requests explicit expiry. Exact retry returns the original `message_id`; same key/different request is HTTP 409. |
 | `GET /v1/messages/wake` | Exact-caller payload-free catch-up/SSE. Requires a 1–128-byte `consumer_id`; accepts `after_seq` or matching `Last-Event-ID`. Events use `id:<seq>` and data exactly `{version,seq,pending}`, where `pending` means unfinished canonical work (`pending` or `claimed`). If unfinished work remains at the supplied cursor, reconnect immediately replays that same sequence as state catch-up. One exact agent has one active consumer lease; same-consumer reconnect supersedes its stale stream, while a different live consumer receives HTTP 409. |
 | `GET /v1/messages/wake-state` | Exact-caller lease-free payload-free snapshot returning exactly `{version,seq,pending}`. It reads the same durable unfinished-work state as the wake stream without acquiring, replacing, or releasing the live consumer lease; intended for short-lived host hooks that compare a monotonic cursor. |
-| `GET /v1/messages/claimed-elsewhere` | Exact-caller payload-free coordination scalar. Requires this runtime's 1–128-byte `claimant_session_id` and returns only `claimed_elsewhere_count`: the exact number of unfinished canonical local messages currently held by a different claimant session. The store query is not bounded by history pagination and exposes no message ID, claimant ID, sender, intent, or payload. |
+| `GET /v1/messages/claimed-elsewhere` | Exact-caller payload-free coordination and recovery projection. Requires this runtime's 1–128-byte `claimant_session_id`; accepts `limit` 1–20 (default 5) and an optional opaque `cursor`. Returns the exact full `claimed_elsewhere_count` plus an oldest-first bounded `items` page, `limit`, `truncated`, and `next_cursor` only when more rows remain. Each item contains only `message_id`, its current `claimant_session_id`, `created_at`, optional `claimed_at`, `expires_at`, and `foreign`; sender/provider/chain identity, intent, payload, result, and content never cross this surface. The exact-recipient store predicate includes still-actionable local and inbound-federated canonical claims held by a different session and is not bounded by generic history's newest-100 window. |
 | `GET /v1/messages/own-claimed-unfinished` | Exact-caller, exact-session passive visibility for canonical work already claimed by this runtime. Requires `claimant_session_id`; `limit` defaults to 5 and is capped at 20. Returns a bounded `items` list, exact `count`, `limit`, and `truncated`. Rows are marked `already_claimed_by_you:true`; the route never claims, reclaims, acknowledges, refreshes, hands off, or changes wake/workflow state. Another session or agent receives no matching IDs or payloads. |
 | `POST /v1/messages/receive` | Requires a 1–256-byte `receive_token`; optional limit 1–20 and opaque `claimant_session_id` up to 128 bytes. Claims and persists one exact ordered batch with session attribution. Same caller/token/limit replays that batch after a lost response; a different limit is HTTP 409. Replay metadata is retained for 48 hours and capped at 4096 tokens per agent: capacity returns HTTP 429, while a purged/incomplete exact batch returns HTTP 410 instead of claiming later work. |
 | `PUT /v1/messages/{message_id}/claim-session` | Exact claimed recipient of inbound federated work only. Binds an unbound claim to one opaque MCP session; repeating the same bind is idempotent and a competing bind is HTTP 409. Retained pre-v11.18.24 claims are instead migrated to the explicit `legacy` fence and require handoff. |
@@ -2197,10 +2197,17 @@ the addressed inbox row is durable on the same SQLite transaction boundary.
 `read_status:confirmed` is only exact addressed-recipient evidence; it is not
 presence, comprehension, or action.
 
-The claimed-elsewhere scalar is diagnostic, not automatic lease expiry. A new
-runtime must inspect passive inbox history and use the compare-and-swap handoff
-only after deciding the prior session is dead or stale; it must not steal a
-claim from a live worker.
+The claimed-elsewhere projection is diagnostic and passive, not automatic lease
+expiry. It changes no claim, receipt, wake, or workflow state. Its cursor is an
+opaque, URL-safe encoding of the exclusive `(created_at,message_id)` keyset;
+copy `next_cursor` exactly until `truncated:false`. Invalid limits or cursors are
+HTTP 400, and a truncated response never omits `next_cursor`. The exact count is
+recomputed for each page and may change if work is concurrently handed off,
+completed, or expires; the cursor orders the rows rather than freezing a
+snapshot. A new runtime must use the compare-and-swap handoff only after
+deciding the prior session is dead or stale; it must not steal a claim from a
+live worker. Generic `/v1/pipe/history/inbox` remains unchanged and must not be
+used as proof that every counted claim is reachable within its newest 100 rows.
 
 A fresh canonical local pending insertion also advances that exact recipient's
 durable monotonic wake sequence in the **same SQLite transaction** as the inbox

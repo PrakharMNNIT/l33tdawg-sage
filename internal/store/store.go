@@ -990,6 +990,20 @@ type MessageWakeState struct {
 	Pending bool   `json:"pending"`
 }
 
+// ClaimedElsewhereMessage is the payload-free recovery projection for an
+// unfinished message whose claim belongs to another runtime sharing the exact
+// recipient identity. It is sufficient for CAS handoff without exposing
+// sender, intent, payload, result, or federation provenance.
+type ClaimedElsewhereMessage struct {
+	MessageID         string
+	ClaimantSessionID string
+	CreatedAt         time.Time
+	CreatedAtCursor   string
+	ClaimedAt         *time.Time
+	ExpiresAt         time.Time
+	Foreign           bool
+}
+
 // MessageStore is the canonical local Messages service. Legacy pipeline
 // routes remain compatibility wrappers over the same pipeline_messages rows;
 // these methods add durable request idempotency and exact receipt evidence,
@@ -1006,6 +1020,7 @@ type MessageStore interface {
 	ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int, claimantSessionID ...string) ([]*PipelineMessage, bool, error)
 	GetOwnClaimedUnfinishedMessages(ctx context.Context, receiverID, claimantSessionID string, limit int) ([]*PipelineMessage, int, error)
 	CountClaimedLocalMessagesElsewhere(ctx context.Context, receiverID, claimantSessionID string) (int, error)
+	GetClaimedMessagesElsewhere(ctx context.Context, receiverID, claimantSessionID string, limit int, afterCreatedAt, afterMessageID string) ([]ClaimedElsewhereMessage, int, bool, error)
 	HandoffLocalMessageClaim(ctx context.Context, receiverID, messageID, fromSessionID, toSessionID string) (bool, error)
 	ReplyLocalMessage(ctx context.Context, receiverID, messageID, result string, claimantSessionID ...string) (bool, error)
 	AcknowledgeLocalMessageRead(ctx context.Context, receiverID, messageID string) (bool, error)
