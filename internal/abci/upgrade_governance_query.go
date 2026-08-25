@@ -72,8 +72,8 @@ func InspectUpgradeGovernanceState(bs *store.BadgerStore, currentAppVersion uint
 		if plan == nil {
 			return nil, errors.New("pending upgrade plan read returned nil without ErrNoUpgradePlan")
 		}
-		if err := validateUpgradeGovernancePlan(plan); err != nil {
-			return nil, err
+		if validationErr := validateUpgradeGovernancePlan(plan); validationErr != nil {
+			return nil, validationErr
 		}
 		status.PendingPlan = &UpgradeGovernancePendingPlan{
 			Name:             plan.Name,
@@ -95,8 +95,8 @@ func InspectUpgradeGovernanceState(bs *store.BadgerStore, currentAppVersion uint
 	if activeID == "" {
 		return nil, errors.New("active governance proposal pointer is empty")
 	}
-	if err := appV20Identifier("active proposal pointer", activeID); err != nil {
-		return nil, fmt.Errorf("active governance proposal pointer is not bounded: %w", err)
+	if boundErr := appV20Identifier("active proposal pointer", activeID); boundErr != nil {
+		return nil, fmt.Errorf("active governance proposal pointer is not bounded: %w", boundErr)
 	}
 	activeBytes, err := bs.GetGovProposal(activeID)
 	if err != nil {
@@ -106,8 +106,8 @@ func InspectUpgradeGovernanceState(bs *store.BadgerStore, currentAppVersion uint
 		return nil, fmt.Errorf("read active governance proposal: proposal %s not found", activeID)
 	}
 	var active governance.ProposalState
-	if err := json.Unmarshal(activeBytes, &active); err != nil {
-		return nil, fmt.Errorf("decode active governance proposal %q: %w", activeID, err)
+	if decodeErr := json.Unmarshal(activeBytes, &active); decodeErr != nil {
+		return nil, fmt.Errorf("decode active governance proposal %q: %w", activeID, decodeErr)
 	}
 	projection, err := buildUpgradeGovernanceActiveProposal(activeID, &active)
 	if err != nil {
