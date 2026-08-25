@@ -181,8 +181,8 @@ func TestProviderAddressedInboxClaimIsSessionBoundAndReplyCompatibilityIsTyped(t
 	})
 	providerResultRouter.Put("/v1/pipe/{pipe_id}/result", s.handlePipeResult)
 	callProviderResult := func(session, result string) *httptest.ResponseRecorder {
-		body, err := json.Marshal(map[string]any{"result": result, "claimant_session_id": session})
-		require.NoError(t, err)
+		body, marshalErr := json.Marshal(map[string]any{"result": result, "claimant_session_id": session})
+		require.NoError(t, marshalErr)
 		rr := httptest.NewRecorder()
 		providerResultRouter.ServeHTTP(rr, httptest.NewRequest(http.MethodPut,
 			"/v1/pipe/msg-provider-rest/result", bytes.NewReader(body)))

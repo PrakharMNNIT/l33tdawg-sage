@@ -1854,7 +1854,7 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if s.OnEvent != nil && !(providerCompatibility && idempotentReplay) {
+	if s.OnEvent != nil && (!providerCompatibility || !idempotentReplay) {
 		// `summary` deliberately NOT reused here. It carries the pipe id, the
 		// result length and the elapsed duration, which the JOURNAL legitimately
 		// records — that entry is an authorized memory, not a broadcast. The
