@@ -93,6 +93,62 @@ func TestLadderAcceptsChainThatHasNotClimbedYet(t *testing.T) {
 	}
 }
 
+func TestStoppedUpgradeGovernanceGuardIsFailClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  *sageabci.UpgradeGovernanceStatus
+		blocked bool
+		marker  string
+	}{
+		{
+			name: "clear",
+			status: &sageabci.UpgradeGovernanceStatus{
+				CurrentAppVersion: 27,
+			},
+			marker: "VERDICT      : CLEAR",
+		},
+		{
+			name: "pending plan",
+			status: &sageabci.UpgradeGovernanceStatus{
+				CurrentAppVersion: 26,
+				PendingPlan: &sageabci.UpgradeGovernancePendingPlan{
+					Name: "app-v27", TargetAppVersion: 27, ActivationHeight: 900,
+				},
+			},
+			blocked: true,
+			marker:  "VERDICT      : BLOCKED",
+		},
+		{
+			name: "active upgrade ballot",
+			status: &sageabci.UpgradeGovernanceStatus{
+				CurrentAppVersion: 26,
+				ActiveProposal: &sageabci.UpgradeGovernanceActiveProposal{
+					ProposalID: "proposal-27", Operation: "upgrade", TargetID: "app-v27",
+					Status: "voting", TargetAppVersion: uint64Pointer(27),
+				},
+			},
+			blocked: true,
+			marker:  "target app-v27",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var blocked bool
+			output := capturePreflightStdout(t, func() {
+				blocked = printStoppedUpgradeGovernanceStatus(tt.status)
+			})
+			if blocked != tt.blocked {
+				t.Fatalf("blocked = %v, want %v", blocked, tt.blocked)
+			}
+			if !strings.Contains(output, tt.marker) {
+				t.Fatalf("output missing %q:\n%s", tt.marker, output)
+			}
+		})
+	}
+}
+
+func uint64Pointer(value uint64) *uint64 { return &value }
+
 func TestInspectLadderAcceptsCompleteEvidence(t *testing.T) {
 	bs, _ := newPreflightStore(t)
 	seedLadder(t, bs, appV22LadderFloor, appV22LadderCeiling, nil)

@@ -106,23 +106,37 @@ func runUpgradePreflight(args []string) error {
 		return fmt.Errorf("read persisted app state: %w", err)
 	}
 	maxSupported := sageabci.MaxSupportedAppVersion()
+	reached := highestAppliedVersion(bs, maxSupported)
+	genesis, genesisErr := bs.GetAppV23GenesisActivation()
+	currentAppVersion := reached
+	if genesisErr == nil && genesis != nil && currentAppVersion < 23 {
+		currentAppVersion = 23
+	}
+	if currentAppVersion == 0 {
+		currentAppVersion = 1
+	}
+	governanceStatus, err := sageabci.InspectUpgradeGovernanceState(bs, currentAppVersion)
+	if err != nil {
+		return fmt.Errorf("inspect stopped-node upgrade governance state: %w", err)
+	}
 
 	fmt.Printf("SAGE upgrade preflight\n")
 	fmt.Printf("  data dir        : %s\n", resolvedDataDir)
 	fmt.Printf("  persisted height: %d\n", state.Height)
 	fmt.Printf("  binary supports : up to app-v%d\n", maxSupported)
 	fmt.Printf("  this binary     : sage-gui %s\n\n", version)
+	if printStoppedUpgradeGovernanceStatus(governanceStatus) {
+		return errors.New("upgrade preflight: binary replacement blocked by canonical pending upgrade governance state")
+	}
 
 	// A chain born directly at app-v23 has no app-v6..v21 history and consensus
 	// explicitly exempts it (internal/abci/appv23_local_rbac.go validateAppV23Prerequisite
 	// returns early on appV23GenesisActive). Applying the ladder to it would be
 	// a pure false alarm.
-	genesis, genesisErr := bs.GetAppV23GenesisActivation()
 	if genesisErr == nil && genesis != nil {
 		return reportDirectV23Genesis(bs, maxSupported)
 	}
 
-	reached := highestAppliedVersion(bs, maxSupported)
 	fmt.Printf("Highest applied activation record: app-v%d\n\n", reached)
 
 	rungs := inspectLadder(bs, state.Height, reached)
@@ -172,6 +186,40 @@ func runUpgradePreflight(args []string) error {
 	fmt.Println()
 	fmt.Println("Full procedure: docs/UPGRADING.md")
 	return nil
+}
+
+// printStoppedUpgradeGovernanceStatus returns true when replacing/restarting
+// binaries is unsafe. Preflight owns a read-only database handle, so unlike the
+// live status command this guard also works before the first fixed server has
+// started.
+func printStoppedUpgradeGovernanceStatus(status *sageabci.UpgradeGovernanceStatus) bool {
+	fmt.Println("Binary replacement guard (canonical stopped-node state):")
+	if status.PendingPlan == nil {
+		fmt.Println("  pending plan : none")
+	} else {
+		plan := status.PendingPlan
+		fmt.Printf("  pending plan : %s (target app-v%d, activation height %d)\n",
+			plan.Name, plan.TargetAppVersion, plan.ActivationHeight)
+	}
+	if status.ActiveProposal == nil {
+		fmt.Println("  active ballot: none")
+	} else {
+		proposal := status.ActiveProposal
+		fmt.Printf("  active ballot: %s (%s, target %s, status %s",
+			proposal.ProposalID, proposal.Operation, proposal.TargetID, proposal.Status)
+		if proposal.TargetAppVersion != nil {
+			fmt.Printf(", target app-v%d", *proposal.TargetAppVersion)
+		}
+		fmt.Println(")")
+	}
+	blocked := status.PendingPlan != nil || status.ActiveProposal != nil
+	if blocked {
+		fmt.Println("  VERDICT      : BLOCKED — do not replace or restart binaries until both are absent.")
+	} else {
+		fmt.Println("  VERDICT      : CLEAR — no pending upgrade plan or active governance ballot.")
+	}
+	fmt.Println()
+	return blocked
 }
 
 // printLadderFailureRecovery keeps preflight's operator guidance aligned with

@@ -43,6 +43,33 @@ sage-gui upgrade status
 > `sage-gui upgrade lineage verify --help`; if it is not recognized, your
 > binary predates the complete v11.18.0 recovery toolset.
 
+### First upgrade to v11.19.2: prove replacement safety while stopped
+
+v11.19.1 and earlier cannot authoritatively expose a pending upgrade plan or
+active governance ballot through the live CLI. For the first upgrade to
+v11.19.2, stop every validator, retain a full backup, install the new binary
+without starting SAGE, and run:
+
+```bash
+sage-gui upgrade preflight
+```
+
+The command opens canonical Badger state read-only and must report:
+
+```text
+Binary replacement guard (canonical stopped-node state):
+  pending plan : none
+  active ballot: none
+  VERDICT      : CLEAR — no pending upgrade plan or active governance ballot.
+```
+
+On a quorum chain, require this result and identical application state from
+every validator before restarting any of them. `BLOCKED`, an inspection error,
+or disagreement means do not replace or restart the validator set. Resume the
+old binaries under the existing coordinated upgrade procedure until canonical
+pending state is resolved, then stop, back up, and inspect again. Never edit
+Badger to manufacture a clear result.
+
 On a personal node that is the whole upgrade. The node proposes and activates
 each consensus fork by itself until it reaches the binary's ceiling.
 
@@ -121,6 +148,7 @@ Use this to work out how far your chain has to climb.
 | v11.18.28 | Restored reads for compile-time shared domains with classification enforcement, plus rejection of ownership registration for reserved or governance-promoted shared domains; no consensus change; app-v26 remains the ceiling |
 | v11.19.0 | app-v27: static reserved shared-domain record authors gain hard-denial-preserving challenge/reinstate authority; omitted new-task `task_status` canonicalizes to `planned` |
 | v11.19.1 | Payload-free cursor-paginated recovery for other-session claims, TTL-consistent counts, and session-fenced/idempotent recovery and reply for provider-addressed compatibility messages; includes an off-chain SQLite claim-receipt backfill, no consensus change, and app-v27 remains the ceiling |
+| v11.19.2 | Consensus-authoritative pending-plan and active-ballot inspection through live `upgrade status` and stopped-node `upgrade preflight`; malformed or inconsistent canonical state fails closed; no consensus change, and app-v27 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
@@ -491,8 +519,20 @@ sage-gui upgrade status
 ```
 Chain app version : 27 (app-v27)
 Binary supports   : up to app-v27
+Pending plan      : none
+Active ballot     : none
 Next fork         : none — chain is at the highest version this binary supports
 ```
+
+`upgrade status` obtains the chain version, pending plan, and active ballot
+from the fail-closed `/upgrade/governance-status` ABCI query; the binary ceiling
+comes from the local executable. `Pending plan` is the canonical
+`upgrade:plan` record; `Active ballot` is the canonical `state:gov:active`
+proposal and includes the decoded target app version for an upgrade ballot.
+The command exits non-zero if either record cannot be read or decoded. Do not
+substitute `sage_gov_status` for this pre-upgrade safety check: that MCP tool is
+useful for vote progress, but reads the off-chain dashboard projection rather
+than the canonical Badger state.
 
 Thirteen rungs take a while: each activation waits out an upgrade delay of at
 least 200 blocks. **This is normal.** An idle SAGE chain mints no blocks at all,
@@ -508,9 +548,9 @@ budget **roughly 4–7 minutes per rung**; quorum clusters run `timeout_commit =
 about **1 hour on a personal node** and **2 hours on a cluster**. Treat these as
 order-of-magnitude, not a guarantee — a busy chain mints blocks faster.
 
-`upgrade status` shows the app version but not the block height, so it looks
-frozen between activations even when everything is fine. The reliable progress
-signal is **block height rising**:
+`upgrade status` shows a pending plan's activation height but not the chain's
+current block height, so it can look frozen between activations even when
+everything is fine. The reliable progress signal is **block height rising**:
 
 ```bash
 curl -s http://127.0.0.1:26657/status | grep latest_block_height

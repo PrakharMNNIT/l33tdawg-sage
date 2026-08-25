@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.1 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.2 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -103,6 +103,10 @@ v11.19.1 makes other-session claimed work recoverable beyond the newest 100
 generic history rows through a payload-free, cursor-paginated handoff
 projection, aligns its exact count with TTL expiry, and makes provider-addressed
 compatibility work session-fenced, recoverable, and idempotently replyable.
+v11.19.2 makes binary-replacement safety observable from canonical consensus
+state: live `upgrade status` and stopped-node `upgrade preflight` report the
+exact pending plan and active ballot, decode upgrade targets, and fail closed
+on malformed, oversized, missing, or inconsistent state.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -113,6 +117,25 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.2 release
+
+The new `/upgrade/governance-status` ABCI query exposes a bounded,
+schema-versioned projection of the canonical pending `upgrade:plan` record and
+the exact `state:gov:active` proposal. Upgrade ballots decode and report their
+target application version. Any storage, pointer/proposal identity, bounds,
+status, height, canonical-name, or payload error rejects the query rather than
+manufacturing an empty result.
+
+`sage-gui upgrade status` consumes this authoritative projection instead of
+combining `/abci_info` with the off-chain dashboard governance mirror. The
+stopped-node `upgrade preflight` command calls the same inspector against a
+read-only Badger handle and blocks binary replacement if a plan or ballot is
+present, closing the one-time rollout gap before a v11.19.2 server can answer
+the live query.
+
+This patch changes no consensus rule, AppHash input, transaction type, key
+encoding, fork target, or application version. The ceiling remains app-v27.
 
 ## v11.19.1 release
 

@@ -10802,6 +10802,16 @@ func (app *SageApp) Query(_ context.Context, req *abcitypes.RequestQuery) (*abci
 			return &abcitypes.ResponseQuery{Code: 1, Log: "encode upgrade lineage status"}, nil
 		}
 		return &abcitypes.ResponseQuery{Code: 0, Value: value}, nil
+	case "/upgrade/governance-status":
+		status, err := app.buildUpgradeGovernanceStatus()
+		if err != nil {
+			return &abcitypes.ResponseQuery{Code: 1, Log: "upgrade governance status unavailable: " + err.Error()}, nil
+		}
+		value, err := json.Marshal(status)
+		if err != nil {
+			return &abcitypes.ResponseQuery{Code: 1, Log: "encode upgrade governance status"}, nil
+		}
+		return &abcitypes.ResponseQuery{Code: 0, Value: value}, nil
 	default:
 		return &abcitypes.ResponseQuery{Code: 1, Log: "unknown query path"}, nil
 	}
