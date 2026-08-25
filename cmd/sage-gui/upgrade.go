@@ -26,6 +26,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -151,14 +152,33 @@ func runUpgradeStatus(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	current, err := readChainAppVersion(ctx, *rpc)
+	governanceStatus, err := readUpgradeGovernanceStatus(ctx, *rpc)
 	if err != nil {
-		return fmt.Errorf("read chain app_version (is the node running? try --rpc): %w", err)
+		return fmt.Errorf("read authoritative upgrade governance status (is the node running? try --rpc): %w", err)
 	}
+	current := governanceStatus.CurrentAppVersion
 	maxV := sageabci.MaxSupportedAppVersion()
 
 	fmt.Printf("Chain app version : %d (app-v%d)\n", current, current)
 	fmt.Printf("Binary supports   : up to app-v%d\n", maxV)
+	if governanceStatus.PendingPlan == nil {
+		fmt.Println("Pending plan      : none")
+	} else {
+		plan := governanceStatus.PendingPlan
+		fmt.Printf("Pending plan      : %s (target app-v%d, activation height %d)\n",
+			plan.Name, plan.TargetAppVersion, plan.ActivationHeight)
+	}
+	if governanceStatus.ActiveProposal == nil {
+		fmt.Println("Active ballot     : none")
+	} else {
+		proposal := governanceStatus.ActiveProposal
+		fmt.Printf("Active ballot     : %s (%s, target %s, status %s",
+			proposal.ProposalID, proposal.Operation, proposal.TargetID, proposal.Status)
+		if proposal.TargetAppVersion != nil {
+			fmt.Printf(", target app-v%d", *proposal.TargetAppVersion)
+		}
+		fmt.Println(")")
+	}
 	if current >= maxV {
 		fmt.Println("Next fork         : none — chain is at the highest version this binary supports")
 		return nil
@@ -186,6 +206,45 @@ func runUpgradeStatus(args []string) error {
 		fmt.Printf("    sage-gui upgrade propose --target %d\n", current+1)
 	}
 	return nil
+}
+
+type upgradeGovernanceRPCStatus struct {
+	Schema            string                              `json:"schema"`
+	CurrentAppVersion uint64                              `json:"current_app_version"`
+	PendingPlan       *upgradeGovernanceRPCPendingPlan    `json:"pending_plan"`
+	ActiveProposal    *upgradeGovernanceRPCActiveProposal `json:"active_proposal"`
+}
+
+type upgradeGovernanceRPCPendingPlan struct {
+	Name             string `json:"name"`
+	TargetAppVersion uint64 `json:"target_app_version"`
+	ActivationHeight int64  `json:"activation_height"`
+}
+
+type upgradeGovernanceRPCActiveProposal struct {
+	ProposalID       string  `json:"proposal_id"`
+	Operation        string  `json:"operation"`
+	TargetID         string  `json:"target_id"`
+	Status           string  `json:"status"`
+	TargetAppVersion *uint64 `json:"target_app_version,omitempty"`
+}
+
+func readUpgradeGovernanceStatus(ctx context.Context, rpc string) (*upgradeGovernanceRPCStatus, error) {
+	raw, err := readABCIQueryValue(ctx, rpc, "/upgrade/governance-status")
+	if err != nil {
+		return nil, err
+	}
+	var status upgradeGovernanceRPCStatus
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return nil, fmt.Errorf("decode upgrade governance status: %w", err)
+	}
+	if status.Schema != "sage-upgrade-governance-status/v1" {
+		return nil, fmt.Errorf("unsupported upgrade governance status schema %q", status.Schema)
+	}
+	if status.CurrentAppVersion == 0 {
+		return nil, errors.New("upgrade governance status returned zero current_app_version")
+	}
+	return &status, nil
 }
 
 // runUpgradePropose submits a signed UpgradePropose for the given target.

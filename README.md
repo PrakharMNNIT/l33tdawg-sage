@@ -51,6 +51,37 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.2
+
+**Binary replacement now has consensus-authoritative upgrade-governance
+proof.** The read-only `/upgrade/governance-status` ABCI query reports the
+current application version, the exact pending `upgrade:plan` record, and the
+canonical `state:gov:active` proposal. Upgrade ballots include their decoded
+target application version. Storage, pointer/proposal identity, bounds,
+canonical-name, status, height, and payload-decode failures return ABCI code 1
+instead of being misreported as an empty plan or ballot.
+
+`sage-gui upgrade status` now consumes that fail-closed query rather than
+inferring safety from `/abci_info` plus the off-chain dashboard projection. The
+stopped-node `sage-gui upgrade preflight` command uses the same canonical
+inspector before the new server starts and blocks binary replacement whenever
+either a pending plan or active governance ballot exists.
+
+**One-time rollout from v11.19.1 or earlier:** stop every validator, take and
+retain a full backup, install the v11.19.2 binary without starting SAGE, and run
+`sage-gui upgrade preflight` against every validator's stopped data directory.
+Continue only when every node reports the identical app state and
+`Binary replacement guard ... CLEAR`. If any node reports `BLOCKED` or an
+inspection error, do not replace or restart the validator set; resume the old
+binaries under the existing coordinated upgrade procedure until canonical
+pending state is resolved, then stop and inspect again.
+
+This patch changes no consensus rule, AppHash input, transaction type, key
+encoding, fork target, or application version. Existing app-v27 chains replay
+byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.2`. SDK 11.19.2.
+
 ## What's New in v11.19.1
 
 **Stranded message claims remain recoverable beyond the retained-history
@@ -2185,7 +2216,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.1`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.2`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

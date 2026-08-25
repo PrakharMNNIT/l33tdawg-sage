@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.19.1.
+Reconciled against internal/mcp for SAGE v11.19.2.
 
 # SAGE MCP Tools Reference
 
@@ -2166,6 +2166,13 @@ proposal (if any) with vote tally and quorum progress.
 **When to call:** Before voting (to get `proposal_id` and understand the
 proposal); to monitor quorum progress; to verify a proposal was accepted or
 rejected.
+
+`sage_gov_status` reads the off-chain dashboard governance projection. It is
+not authoritative proof that no upgrade ballot exists, and that projection
+does not retain an upgrade proposal's consensus payload. Before binary
+replacement, use `sage-gui upgrade status`, whose
+`/upgrade/governance-status` ABCI query reads the canonical pending-plan and
+active-proposal records and fails closed on storage or decode errors.
 
 ---
 

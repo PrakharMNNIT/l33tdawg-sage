@@ -370,11 +370,22 @@ func TestUpgradeStatus_AdminCaveatPastAppV8(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			appVersion, err := strconv.ParseUint(tc.appVersion, 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
 			mux := http.NewServeMux()
-			mux.HandleFunc("/abci_info", func(w http.ResponseWriter, _ *http.Request) {
+			mux.HandleFunc("/abci_query", func(w http.ResponseWriter, _ *http.Request) {
+				value, marshalErr := json.Marshal(map[string]any{
+					"schema": "sage-upgrade-governance-status/v1", "current_app_version": appVersion,
+					"pending_plan": nil, "active_proposal": nil,
+				})
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"result": map[string]any{
-						"response": map[string]any{"app_version": tc.appVersion},
+						"response": map[string]any{"code": 0, "value": base64.StdEncoding.EncodeToString(value)},
 					},
 				})
 			})
@@ -396,6 +407,52 @@ func TestUpgradeStatus_AdminCaveatPastAppV8(t *testing.T) {
 				t.Errorf("chain-admin caveat = %v, want %v\noutput:\n%s", gotAdmin, tc.wantAdminWord, out)
 			}
 		})
+	}
+}
+
+func TestUpgradeStatusReportsAuthoritativePlanAndBallot(t *testing.T) {
+	target := uint64(27)
+	value, err := json.Marshal(upgradeGovernanceRPCStatus{
+		Schema:            "sage-upgrade-governance-status/v1",
+		CurrentAppVersion: 26,
+		PendingPlan: &upgradeGovernanceRPCPendingPlan{
+			Name: "app-v27", TargetAppVersion: 27, ActivationHeight: 1200,
+		},
+		ActiveProposal: &upgradeGovernanceRPCActiveProposal{
+			ProposalID: "proposal-27", Operation: "upgrade", TargetID: "app-v27",
+			Status: "voting", TargetAppVersion: &target,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/abci_query", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("path"); got != `"/upgrade/governance-status"` {
+			t.Errorf("query path = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"result": map[string]any{"response": map[string]any{
+				"code": 0, "value": base64.StdEncoding.EncodeToString(value),
+			}},
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	output := captureStdout(t, func() {
+		if err := runUpgradeStatus([]string{"--rpc", server.URL}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, want := range []string{
+		"Chain app version : 26 (app-v26)",
+		"Pending plan      : app-v27 (target app-v27, activation height 1200)",
+		"Active ballot     : proposal-27 (upgrade, target app-v27, status voting, target app-v27)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output missing %q:\n%s", want, output)
+		}
 	}
 }
 
