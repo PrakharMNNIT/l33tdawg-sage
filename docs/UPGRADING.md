@@ -160,6 +160,7 @@ Use this to work out how far your chain has to climb.
 | v11.19.2 | Consensus-authoritative pending-plan and active-ballot inspection through live `upgrade status` and stopped-node `upgrade preflight`; malformed or inconsistent canonical state fails closed; no consensus change, and app-v27 remains the ceiling |
 | v11.19.3 | The normal updater performs the canonical compatibility check itself, carries supported in-flight governance through its verified recovery snapshot, and requires no user CLI or prompt; malformed or unsupported state still fails before executable mutation |
 | v11.19.4 | Replacement capability is read from the exact candidate binary, while governance validation plus committed height/AppHash capture remain under one uninterrupted runtime fence; fixes the v11.19.3 live-updater TOCTOU without changing app-v27 |
+| v11.19.5 | Exact-local receipt repair, durable transport-scoped claimant identities, revision-fenced explicit handoff with legacy REST revision-0 compatibility, and database-incarnation-fenced payload-free nonblocking task/reply activity wake; no consensus change and app-v27 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

@@ -313,6 +313,40 @@ func TestMessageWakeStateIsLeaseFreeAndPayloadExact(t *testing.T) {
 		"snapshot must not release or replace the active consumer lease")
 }
 
+func TestInboxActivityStateIsSignedExactAgentAndSeparateFromWorkWake(t *testing.T) {
+	s, sqlite := newPipeServer(t)
+	addMessageAgent(t, sqlite, "alice")
+	addMessageAgent(t, sqlite, "bob")
+	_, err := sqlite.AdvanceInboxActivity(context.Background(), "bob")
+	require.NoError(t, err)
+
+	unsigned := callMessageJSON(t, messageRouterAs(s, "bob", false), http.MethodGet,
+		"/v1/inbox/activity-state", nil)
+	require.Equal(t, http.StatusForbidden, unsigned.Code)
+	state := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
+		"/v1/inbox/activity-state", nil)
+	require.Equal(t, http.StatusOK, state.Code, state.Body.String())
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(state.Body.Bytes(), &payload))
+	require.Equal(t, float64(1), payload["version"])
+	require.Equal(t, float64(1), payload["seq"])
+	require.Len(t, payload["epoch"].(string), 32)
+	require.Len(t, payload, 3, "activity state must expose only version, database epoch, and sequence")
+
+	alice := callMessageJSON(t, messageRouterAs(s, "alice", true), http.MethodGet,
+		"/v1/inbox/activity-state", nil)
+	require.Equal(t, http.StatusOK, alice.Code)
+	var alicePayload map[string]any
+	require.NoError(t, json.Unmarshal(alice.Body.Bytes(), &alicePayload))
+	require.Equal(t, float64(0), alicePayload["seq"])
+	require.Equal(t, payload["epoch"], alicePayload["epoch"], "all exact agents share one database incarnation")
+	wake := callMessageJSON(t, messageRouterAs(s, "bob", true), http.MethodGet,
+		"/v1/messages/wake-state", nil)
+	require.Equal(t, http.StatusOK, wake.Code)
+	require.JSONEq(t, `{"version":1,"seq":0,"pending":false}`, wake.Body.String(),
+		"activity must never become unfinished message work")
+}
+
 func mustJSON(t *testing.T, value any) []byte {
 	t.Helper()
 	raw, err := json.Marshal(value)
