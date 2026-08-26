@@ -325,6 +325,20 @@ CREATE TABLE IF NOT EXISTS agent_notifications (
 CREATE INDEX IF NOT EXISTS idx_agent_notifications_inbox ON agent_notifications(agent_id, state, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_notifications_task ON agent_notifications(task_id, assignment_version, state);
 
+-- Payload-free exact-agent novelty clock for task notices and passive replies.
+-- This is deliberately separate from canonical message work wake state.
+CREATE TABLE IF NOT EXISTS agent_inbox_activity (
+    agent_id TEXT PRIMARY KEY,
+    seq BIGINT NOT NULL CHECK (seq >= 0)
+);
+CREATE TABLE IF NOT EXISTS inbox_activity_meta (
+    singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+    epoch TEXT NOT NULL CHECK (length(epoch) = 32)
+);
+INSERT INTO inbox_activity_meta(singleton, epoch)
+VALUES (1, md5(random()::text || clock_timestamp()::text))
+ON CONFLICT (singleton) DO NOTHING;
+
 -- ============================================================
 -- 9. domain_registry (federation ACL)
 -- ============================================================

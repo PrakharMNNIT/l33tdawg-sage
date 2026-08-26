@@ -67,6 +67,10 @@ type providerMessageSessionClaimer interface {
 	ClaimProviderMessageWithSession(context.Context, string, string, string) error
 }
 
+type exactLocalMessageSessionClaimer interface {
+	ClaimExactLocalMessageWithSession(context.Context, string, string, string) error
+}
+
 type providerMessageSessionVerifier interface {
 	VerifyProviderMessageClaimSession(context.Context, string, string, string) error
 	LookupProviderMessageReplyReplay(context.Context, string, string, string, string) (bool, string, error)
@@ -1150,8 +1154,17 @@ func (s *Server) handlePipeInbox(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			item.ClaimedSessionID = providerClaimSessionID
-		} else if err := pipeStore.ClaimPipeline(r.Context(), item.PipeID, agentID); err != nil {
-			continue
+		} else {
+			exactSessionID := claimantSessionID
+			if exactSessionID == "" {
+				exactSessionID = "legacy"
+			}
+			sessionClaimer, ok := s.store.(exactLocalMessageSessionClaimer)
+			if !ok || sessionClaimer.ClaimExactLocalMessageWithSession(r.Context(), agentID, item.PipeID, exactSessionID) != nil {
+				continue
+			}
+			item.ClaimedSessionID = exactSessionID
+			item.ClaimRevision = 0
 		}
 		item.Status = "claimed"
 		item.ClaimedBy = agentID
@@ -1269,6 +1282,10 @@ func (s *Server) handlePipeClaim(w http.ResponseWriter, r *http.Request) {
 	agentID := middleware.ContextAgentID(r.Context())
 	claimantSessionID := strings.TrimSpace(r.URL.Query().Get("claimant_session_id"))
 	boundClaimantSessionID := ""
+	if len(claimantSessionID) > store.MaxMessageClaimantSessionBytes {
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is too long")
+		return
+	}
 
 	pipeStore, ok := s.store.(store.PipelineStore)
 	if !ok {
@@ -1287,7 +1304,7 @@ func (s *Server) handlePipeClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg.SourceChainID != "" {
-		if claimantSessionID == "" || len(claimantSessionID) > store.MaxMessageClaimantSessionBytes {
+		if claimantSessionID == "" {
 			writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "claimant_session_id is required and bounded for a federated claim")
 			return
 		}
@@ -1307,6 +1324,7 @@ func (s *Server) handlePipeClaim(w http.ResponseWriter, r *http.Request) {
 			writeProblem(w, http.StatusConflict, "Federated pipeline suspended", "The connection, sharing grant, owner, or work-request permission changed.")
 			return
 		}
+		boundClaimantSessionID = claimantSessionID
 	} else if msg.ToAgent == "" && msg.ToProvider != "" {
 		boundClaimantSessionID = claimantSessionID
 		if boundClaimantSessionID == "" {
@@ -1317,9 +1335,16 @@ func (s *Server) handlePipeClaim(w http.ResponseWriter, r *http.Request) {
 			writeProblem(w, http.StatusConflict, "Claim failed", "The provider-addressed message could not be session-bound.")
 			return
 		}
-	} else if err := pipeStore.ClaimPipeline(r.Context(), pipeID, agentID); err != nil {
-		writeProblem(w, http.StatusConflict, "Claim failed", err.Error())
-		return
+	} else {
+		boundClaimantSessionID = claimantSessionID
+		if boundClaimantSessionID == "" {
+			boundClaimantSessionID = "legacy"
+		}
+		sessionClaimer, ok := s.store.(exactLocalMessageSessionClaimer)
+		if !ok || sessionClaimer.ClaimExactLocalMessageWithSession(r.Context(), agentID, pipeID, boundClaimantSessionID) != nil {
+			writeProblem(w, http.StatusConflict, "Claim failed", "The exact-recipient message could not be session-bound.")
+			return
+		}
 	}
 
 	response := map[string]any{
@@ -1328,6 +1353,7 @@ func (s *Server) handlePipeClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	if boundClaimantSessionID != "" {
 		response["claimant_session_id"] = boundClaimantSessionID
+		response["claim_revision"] = uint64(0)
 	}
 	writeJSON(w, http.StatusOK, response)
 }

@@ -332,7 +332,8 @@ var defaultDomainSeeds = []struct {
 
 // RequirePristineStateSyncProjection rejects every application-owned row in a
 // receiving node's off-chain database except the exact canonical domain seeds
-// installed by initSchema. State sync rebuilds canonical scoped content by
+// and singleton zero-state/schema-incarnation metadata installed by initSchema.
+// State sync rebuilds canonical scoped content by
 // upsert; allowing any other pre-existing row would preserve stale local
 // memories, identities, policy, credentials, or federation state that the
 // trusted AppHash did not authorize. FTS5 shadow tables are internal storage;
@@ -398,6 +399,12 @@ func (s *SQLiteStore) RequirePristineStateSyncProjection(ctx context.Context) er
 				`SELECT singleton, revision FROM graph_projection_revision`,
 			).Scan(&id, &revision); err != nil || id != 1 || revision != 0 {
 				return errors.New("state sync receiving requires a pristine graph projection revision")
+			}
+			continue
+		}
+		if table == "inbox_activity_meta" {
+			if _, err := s.GetInboxActivityEpoch(ctx); err != nil {
+				return errors.New("state sync receiving requires a pristine inbox activity database incarnation")
 			}
 			continue
 		}
@@ -6040,6 +6047,11 @@ func (s *SQLiteStore) AssignTaskAndNotify(ctx context.Context, memoryID, assigne
 		inserted, _ := insertResult.RowsAffected()
 		notificationCreated = inserted == 1
 	}
+	if notificationCreated {
+		if _, err := s.AdvanceInboxActivity(ctx, assignee); err != nil {
+			return nil, fmt.Errorf("advance task inbox activity: %w", err)
+		}
+	}
 
 	return &TaskAssignmentResult{
 		Changed: changed, Assignee: assignee, AssignmentVersion: version, TaskStatus: taskStatus,
@@ -6668,7 +6680,7 @@ func (s *SQLiteStore) GetInboxHistory(ctx context.Context, agentID, provider str
 		`SELECT p.pipe_id, p.from_agent, p.from_provider, p.to_agent, p.to_provider, p.intent, p.payload,
 		        COALESCE(result, ''), status, created_at, COALESCE(claimed_by, ''), claimed_at, completed_at, expires_at, COALESCE(journal_id, ''),
 		        source_chain_id, source_pipe_id, destination_chain_id, federation_policy_epoch, federation_agreement_id, federation_contact_id, federation_contact_revision,
-		        federation_authorization_mode, federation_linked_relation, COALESCE(r.claimant_session_id, '')
+		        federation_authorization_mode, federation_linked_relation, COALESCE(r.claimant_session_id, ''), COALESCE(r.claim_revision, 0)
 		 FROM pipeline_messages p
 		 LEFT JOIN message_fetch_receipts r ON r.message_id=p.pipe_id AND r.receiver_agent_id=?
 		 WHERE p.destination_chain_id = ''
@@ -6692,7 +6704,7 @@ func (s *SQLiteStore) GetInboxHistory(ctx context.Context, agentID, provider str
 			&m.Intent, &m.Payload, &m.Result, &m.Status, &createdAt, &m.ClaimedBy, &claimedAt, &completedAt,
 			&expiresAt, &m.JournalID, &m.SourceChainID, &m.SourcePipeID, &m.DestinationChainID,
 			&m.FederationPolicyEpoch, &m.FederationAgreementID, &m.FederationContactID, &m.FederationContactRevision,
-			&m.FederationAuthorizationMode, &m.FederationLinkedRelation, &m.ClaimedSessionID); err != nil {
+			&m.FederationAuthorizationMode, &m.FederationLinkedRelation, &m.ClaimedSessionID, &m.ClaimRevision); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = parseTime(createdAt)
@@ -6781,6 +6793,16 @@ func (s *SQLiteStore) CompletePipeline(ctx context.Context, pipeID, agentID, res
 	if len(result) > MaxPipeContentBytes {
 		return ErrPipeResultTooLarge
 	}
+	if s.db != nil {
+		return s.RunInTx(ctx, func(tx OffchainStore) error {
+			return tx.(*SQLiteStore).CompletePipeline(ctx, pipeID, agentID, result, journalID)
+		})
+	}
+	var sender, sourceChain, destinationChain string
+	if err := s.conn.QueryRowContext(ctx, `SELECT from_agent,source_chain_id,destination_chain_id
+		FROM pipeline_messages WHERE pipe_id=?`, pipeID).Scan(&sender, &sourceChain, &destinationChain); err != nil {
+		return err
+	}
 	encryptedResult, err := s.encryptContent(result)
 	if err != nil {
 		return fmt.Errorf("encrypt pipeline result: %w", err)
@@ -6796,6 +6818,14 @@ func (s *SQLiteStore) CompletePipeline(ctx context.Context, pipeID, agentID, res
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("pipeline message %s not available for completion by %s (must be claimed by this agent first)", pipeID, agentID)
+	}
+	// Only fresh completion of a wholly local request is sender-visible inbox
+	// activity here. Federated results landing home advance in their dedicated
+	// authenticated transaction; imported requests target a remote sender.
+	if sender != "" && sourceChain == "" && destinationChain == "" {
+		if _, err := s.AdvanceInboxActivity(ctx, sender); err != nil {
+			return fmt.Errorf("advance reply inbox activity: %w", err)
+		}
 	}
 	return nil
 }

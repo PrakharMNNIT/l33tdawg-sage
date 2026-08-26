@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -361,14 +362,15 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_message_handoff": {
 			Name:        "sage_message_handoff",
-			Description: "Atomically transfer one claimed local or inbound federated message from the claimant_session_id shown by sage_message_history to this MCP session. The expected from_session_id is a compare-and-swap fence: a stale or concurrent handoff fails visibly instead of duplicating ownership. Pre-v11.18.24 federated claims are surfaced as legacy and still require this explicit handoff; they are never stolen automatically.",
+			Description: "Atomically transfer one claimed local or inbound federated message from the claimant_session_id and claim_revision shown by sage_message_history to this MCP session. The expected from_session_id plus from_revision form a revisioned compare-and-swap fence: stale, concurrent, and A→B→A delayed handoffs fail visibly instead of duplicating ownership. Pre-v11.18.24 claims are surfaced as legacy revision 0 and still require this explicit handoff; they are never stolen automatically.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"message_id":      map[string]any{"type": "string"},
 					"from_session_id": map[string]any{"type": "string", "maxLength": store.MaxMessageClaimantSessionBytes},
+					"from_revision":   map[string]any{"type": "integer", "minimum": 0, "description": "Exact claim_revision from passive claimed_elsewhere history"},
 				},
-				"required": []string{"message_id", "from_session_id"},
+				"required": []string{"message_id", "from_session_id", "from_revision"},
 			},
 			Handler: s.toolMessageHandoff,
 		},
@@ -4539,6 +4541,28 @@ func intParam(params map[string]any, key string, defaultVal int) int {
 	return defaultVal
 }
 
+func exactClaimRevisionParam(params map[string]any, key string) (uint64, bool) {
+	const maxExactJSONInteger = uint64(1<<53 - 1)
+	switch v := params[key].(type) {
+	case float64:
+		if v < 0 || v != math.Trunc(v) || v > float64(maxExactJSONInteger) {
+			return 0, false
+		}
+		return uint64(v), true
+	case json.Number:
+		n, err := strconv.ParseUint(string(v), 10, 64)
+		return n, err == nil && n < math.MaxInt64
+	case int:
+		return uint64(v), v >= 0
+	case int64:
+		return uint64(v), v >= 0
+	case uint64:
+		return v, v < math.MaxInt64
+	default:
+		return 0, false
+	}
+}
+
 func floatParam(params map[string]any, key string, defaultVal float64) float64 {
 	switch v := params[key].(type) {
 	case float64:
@@ -4694,6 +4718,7 @@ type canonicalMessageWireItem struct {
 	Payload            string `json:"payload"`
 	CreatedAt          string `json:"created_at"`
 	ClaimantSessionID  string `json:"claimant_session_id"`
+	ClaimRevision      uint64 `json:"claim_revision"`
 	SourceChainID      string `json:"source_chain_id"`
 	SourcePipeID       string `json:"source_pipe_id"`
 }
@@ -4718,7 +4743,7 @@ func (s *Server) receiveCanonicalMessageBatch(ctx context.Context, receiveToken 
 			PipeID: item.MessageID, FromAgent: item.FromAgent, FromProvider: item.FromProvider,
 			FromDisplayName: item.FromDisplayName, FromRegisteredName: item.FromRegisteredName,
 			Intent: item.Intent, Payload: item.Payload, CreatedAt: item.CreatedAt,
-			ClaimantSessionID: item.ClaimantSessionID,
+			ClaimantSessionID: item.ClaimantSessionID, ClaimRevision: item.ClaimRevision,
 		})
 	}
 	return items, response.IdempotentReplay, nil
@@ -4913,6 +4938,7 @@ func (s *Server) toolMessagesReceive(ctx context.Context, params map[string]any)
 		"claimant_session_id": func() string { id, _ := s.claimantSessionID(ctx); return id }(),
 		"message":             fmt.Sprintf("Received %d local message(s). Each returned item was acknowledged by exact message ID when possible.", len(items)),
 	}
+	s.attachClaimantIdentityStatus(ctx, response)
 	mergeOwnClaimedUnfinishedSurface(response, ownClaimedSurface)
 	if claimantSessionID, _ := response["claimant_session_id"].(string); claimantSessionID != "" {
 		s.attachClaimedElsewhere(ctx, response, claimantSessionID)
@@ -4929,14 +4955,15 @@ func (s *Server) toolMessageHandoff(ctx context.Context, params map[string]any) 
 	}
 	messageID := stringParam(params, "message_id", "")
 	fromSessionID := stringParam(params, "from_session_id", "")
-	if messageID == "" || fromSessionID == "" {
-		return nil, fmt.Errorf("'message_id' and 'from_session_id' are required")
+	fromRevision, revisionOK := exactClaimRevisionParam(params, "from_revision")
+	if messageID == "" || fromSessionID == "" || !revisionOK {
+		return nil, fmt.Errorf("'message_id', 'from_session_id', and an exact non-negative integer 'from_revision' are required")
 	}
 	toSessionID, err := s.claimantSessionID(ctx)
 	if err != nil {
 		return nil, err
 	}
-	body, _ := json.Marshal(map[string]any{"from_session_id": fromSessionID, "to_session_id": toSessionID})
+	body, _ := json.Marshal(map[string]any{"from_session_id": fromSessionID, "to_session_id": toSessionID, "from_revision": fromRevision})
 	var response map[string]any
 	if err := s.doSignedJSON(ctx, http.MethodPut, "/v1/messages/"+url.PathEscape(messageID)+"/handoff", body, &response); err != nil {
 		return nil, fmt.Errorf("message handoff: %w", err)
@@ -5165,6 +5192,7 @@ type pipelineInboxWireItem struct {
 	CreatedAt              string `json:"created_at"`
 	ReceiptProtocolVersion int    `json:"receipt_protocol_version"`
 	ClaimantSessionID      string `json:"claimant_session_id"`
+	ClaimRevision          uint64 `json:"claim_revision"`
 }
 
 func (s *Server) acknowledgeFederatedPipeReceipt(
@@ -5452,6 +5480,7 @@ type pipelineHistoryWireItem struct {
 	SourcePipeID       string `json:"source_pipe_id"`
 	DestinationChainID string `json:"destination_chain_id"`
 	ClaimantSessionID  string `json:"claimant_session_id"`
+	ClaimRevision      uint64 `json:"claim_revision"`
 }
 
 const (
@@ -5562,6 +5591,7 @@ func formatPipelineInboxItem(item pipelineInboxWireItem) map[string]any {
 	}
 	if item.ClaimantSessionID != "" {
 		entry["claimant_session_id"] = item.ClaimantSessionID
+		entry["claim_revision"] = item.ClaimRevision
 	}
 	if item.SourceChainID != "" {
 		entry["foreign"] = true
@@ -5659,6 +5689,7 @@ func formatPipelineHistoryItem(item pipelineHistoryWireItem, folder string) map[
 	}
 	if item.ClaimantSessionID != "" {
 		entry["claimant_session_id"] = item.ClaimantSessionID
+		entry["claim_revision"] = item.ClaimRevision
 	}
 	formatMessageRetention(entry, item.Status, item.ExpiresAt)
 	if item.Result != "" {
@@ -5976,6 +6007,7 @@ func (s *Server) decorateInboxResponse(ctx context.Context, response map[string]
 	response["coordination_schema"] = "sage.inbox.v2"
 	response["mcp_runtime_version"] = s.version
 	response["sender_replies_embedded"] = repliesEmbedded
+	s.attachClaimantIdentityStatus(ctx, response)
 	id, err := s.claimantSessionID(ctx)
 	if err != nil {
 		response["claimed_elsewhere_state"] = "unavailable"
@@ -5985,6 +6017,14 @@ func (s *Server) decorateInboxResponse(ctx context.Context, response map[string]
 	}
 	response["claimant_session_id"] = id
 	s.attachClaimedElsewhere(ctx, response, id)
+}
+
+func (s *Server) attachClaimantIdentityStatus(ctx context.Context, response map[string]any) {
+	mode, identityErr := s.claimantIdentityStatus(ctx)
+	response["claimant_identity_mode"] = mode
+	if identityErr != "" {
+		response["claimant_identity_error"] = identityErr
+	}
 }
 
 func (s *Server) attachClaimedElsewhere(ctx context.Context, response map[string]any, claimantSessionID string) {
@@ -6214,6 +6254,7 @@ func (s *Server) toolPipeHistory(ctx context.Context, params map[string]any) (an
 type claimedElsewhereHistoryWireItem struct {
 	MessageID         string `json:"message_id"`
 	ClaimantSessionID string `json:"claimant_session_id"`
+	ClaimRevision     uint64 `json:"claim_revision"`
 	CreatedAt         string `json:"created_at"`
 	ClaimedAt         string `json:"claimed_at"`
 	ExpiresAt         string `json:"expires_at"`
@@ -6232,6 +6273,7 @@ func formatClaimedElsewhereHistoryItem(item claimedElsewhereHistoryWireItem) map
 	entry := map[string]any{
 		"message_id":          item.MessageID,
 		"claimant_session_id": item.ClaimantSessionID,
+		"claim_revision":      item.ClaimRevision,
 		"created_at":          item.CreatedAt,
 		"expires_at":          item.ExpiresAt,
 		"foreign":             item.Foreign,
@@ -6300,7 +6342,7 @@ func (s *Server) toolClaimedElsewhereHistory(ctx context.Context, params map[str
 		return response, nil
 	}
 	message := fmt.Sprintf(
-		"Showing %d of %d unfinished claim(s) held by another claimant session, oldest first. This payload-free passive page changed no ownership. Before taking over an item, independently judge its claimant session dead or stale, then call sage_message_handoff with that exact message_id and from_session_id=claimant_session_id.",
+		"Showing %d of %d unfinished claim(s) held by another claimant session, oldest first. This payload-free passive page changed no ownership. Before taking over an item, independently judge its claimant session dead or stale, then call sage_message_handoff with that exact message_id, from_session_id=claimant_session_id, and from_revision=claim_revision.",
 		len(items), page.Count)
 	if page.Truncated {
 		message += fmt.Sprintf(

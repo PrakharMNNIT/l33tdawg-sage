@@ -104,6 +104,12 @@ func TestRequirePristineStateSyncProjectionAcceptsOnlyCanonicalSchemaSeeds(t *te
 		require.NoError(t, err)
 		require.ErrorContains(t, s.RequirePristineStateSyncProjection(ctx), "exact canonical default domains")
 	})
+	t.Run("invalid inbox activity incarnation", func(t *testing.T) {
+		s := newTestStore(t)
+		_, err := s.conn.ExecContext(ctx, `UPDATE inbox_activity_meta SET epoch = ? WHERE singleton = 1`, strings.Repeat("z", 32))
+		require.NoError(t, err)
+		require.ErrorContains(t, s.RequirePristineStateSyncProjection(ctx), "pristine inbox activity database incarnation")
+	})
 }
 
 func TestRequirePristineStateSyncProjectionRejectsAdvancedMemorySpaceRevision(t *testing.T) {

@@ -97,7 +97,11 @@ type Server struct {
 
 	conversationMu sync.Mutex
 	conversations  map[string]*conversationState
-	claimantLease  io.Closer
+	// Streamable HTTP conversations are bearer-scoped and can otherwise retain
+	// one durable claimant lease per credential forever. These bounds apply only
+	// to idle stream: states; stdio, SSE, and in-flight requests are never pruned.
+	streamConversationTTL   time.Duration
+	streamConversationLimit int
 
 	// Cached recall settings from dashboard preferences.
 	recallTopK     int
@@ -128,19 +132,35 @@ type Server struct {
 }
 
 type conversationState struct {
-	inceptionMu       sync.Mutex
-	inceptionChecked  bool
-	autoInceptionMsg  string
-	lastUsed          time.Time
-	claimantSessionID string
+	inceptionMu          sync.Mutex
+	inceptionChecked     bool
+	autoInceptionMsg     string
+	lastUsed             time.Time
+	claimantSessionID    string
+	claimantIdentityMode string
+	claimantIdentityErr  error
+	claimantLease        io.Closer
+	activeUses           int
 }
 
+const (
+	defaultStreamConversationTTL   = 30 * time.Minute
+	defaultStreamConversationLimit = 256
+)
+
 type conversationIDContextKey struct{}
+type claimantDurableScopeContextKey struct{}
 
 // WithConversationID scopes auto-inception to one MCP client/session. Stdio
 // callers naturally use the empty/default conversation.
 func WithConversationID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, conversationIDContextKey{}, id)
+}
+
+// withClaimantDurableScope attaches a stable server-derived transport scope.
+// Never populate it from an arbitrary client-supplied session header.
+func withClaimantDurableScope(ctx context.Context, scope string) context.Context {
+	return context.WithValue(ctx, claimantDurableScopeContextKey{}, scope)
 }
 
 func (s *Server) conversation(ctx context.Context) *conversationState {
@@ -154,18 +174,124 @@ func (s *Server) conversation(ctx context.Context) *conversationState {
 		state.lastUsed = time.Now()
 		return state
 	}
-	claimantSessionID := newMCPClaimantSessionID()
+	return s.newConversationStateLocked(ctx, id, time.Now())
+}
+
+func (s *Server) newConversationStateLocked(ctx context.Context, id string, now time.Time) *conversationState {
+	state := &conversationState{lastUsed: now, claimantSessionID: newMCPClaimantSessionID(), claimantIdentityMode: "ephemeral"}
 	if id == "stdio" {
 		if inherited := trustedHandoffClaimantSessionID(); inherited != "" {
-			claimantSessionID = inherited
-		} else if durableID, lease, err := acquireDurableClaimantIdentity(s.agentID, s.provider, s.project); err == nil {
-			claimantSessionID = durableID
-			s.claimantLease = lease
+			state.claimantSessionID = inherited
+			state.claimantIdentityMode = "inherited"
+		} else {
+			s.acquireConversationClaimantIdentity(state, s.agentID, "")
 		}
+	} else if durableScope, _ := ctx.Value(claimantDurableScopeContextKey{}).(string); durableScope != "" {
+		s.acquireConversationClaimantIdentity(state, s.effectiveAgentID(ctx), durableScope)
 	}
-	state := &conversationState{lastUsed: time.Now(), claimantSessionID: claimantSessionID}
 	s.conversations[id] = state
 	return state
+}
+
+// beginStreamConversationUse admits one streamable HTTP dispatch and pins its
+// conversation state until the returned function runs. It prunes expired idle
+// stream states first, then evicts the least-recently-used idle stream state
+// when needed to preserve the hard cap. If every slot is in flight, admission
+// fails instead of evicting a claimant lease that is still fencing a request.
+func (s *Server) beginStreamConversationUse(ctx context.Context) (func(), bool) {
+	id, _ := ctx.Value(conversationIDContextKey{}).(string)
+	if !strings.HasPrefix(id, "stream:") {
+		return func() {}, true
+	}
+	now := time.Now()
+	s.conversationMu.Lock()
+	s.pruneIdleStreamConversationsLocked(now, false)
+	state := s.conversations[id]
+	if state == nil {
+		if s.streamConversationCountLocked() >= s.streamConversationLimit {
+			s.pruneIdleStreamConversationsLocked(now, true)
+		}
+		if s.streamConversationCountLocked() >= s.streamConversationLimit {
+			s.conversationMu.Unlock()
+			return nil, false
+		}
+		state = s.newConversationStateLocked(ctx, id, now)
+	}
+	state.activeUses++
+	state.lastUsed = now
+	s.conversationMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.conversationMu.Lock()
+			if current := s.conversations[id]; current == state {
+				if current.activeUses > 0 {
+					current.activeUses--
+				}
+				current.lastUsed = time.Now()
+			}
+			s.conversationMu.Unlock()
+		})
+	}, true
+}
+
+func (s *Server) streamConversationCountLocked() int {
+	count := 0
+	for id := range s.conversations {
+		if strings.HasPrefix(id, "stream:") {
+			count++
+		}
+	}
+	return count
+}
+
+// pruneIdleStreamConversationsLocked removes every expired idle stream state.
+// When needSlot is true and the cap is still full, it additionally removes one
+// LRU idle state. Closing the lease while holding conversationMu prevents a new
+// state for the same durable scope from racing the old lease's release.
+func (s *Server) pruneIdleStreamConversationsLocked(now time.Time, needSlot bool) {
+	var oldestID string
+	var oldestTime time.Time
+	for id, state := range s.conversations {
+		if !strings.HasPrefix(id, "stream:") || state == nil || state.activeUses != 0 {
+			continue
+		}
+		if s.streamConversationTTL > 0 && now.Sub(state.lastUsed) >= s.streamConversationTTL {
+			s.deleteConversationLocked(id, state)
+			continue
+		}
+		if oldestID == "" || state.lastUsed.Before(oldestTime) {
+			oldestID, oldestTime = id, state.lastUsed
+		}
+	}
+	if needSlot && s.streamConversationCountLocked() >= s.streamConversationLimit && oldestID != "" {
+		s.deleteConversationLocked(oldestID, s.conversations[oldestID])
+	}
+}
+
+func (s *Server) deleteConversationLocked(id string, state *conversationState) {
+	delete(s.conversations, id)
+	if state != nil && state.claimantLease != nil {
+		_ = state.claimantLease.Close()
+		state.claimantLease = nil
+	}
+}
+
+func (s *Server) acquireConversationClaimantIdentity(state *conversationState, agentID, durableScope string) {
+	durableID, lease, err := acquireDurableClaimantIdentity(agentID, s.provider, s.project, durableScope)
+	switch {
+	case err == nil:
+		state.claimantSessionID = durableID
+		state.claimantIdentityMode = "durable"
+		state.claimantLease = lease
+	case errors.Is(err, errDurableClaimantIdentityBusy):
+		state.claimantIdentityMode = "concurrent_ephemeral"
+	default:
+		state.claimantSessionID = ""
+		state.claimantIdentityMode = "unavailable"
+		state.claimantIdentityErr = err
+	}
 }
 
 func trustedHandoffClaimantSessionID() string {
@@ -190,10 +316,15 @@ func (s *Server) currentStdioClaimantSessionID() string {
 
 func (s *Server) closeClaimantLease() {
 	s.conversationMu.Lock()
-	lease := s.claimantLease
-	s.claimantLease = nil
+	leases := make([]io.Closer, 0, len(s.conversations))
+	for _, state := range s.conversations {
+		if state != nil && state.claimantLease != nil {
+			leases = append(leases, state.claimantLease)
+			state.claimantLease = nil
+		}
+	}
 	s.conversationMu.Unlock()
-	if lease != nil {
+	for _, lease := range leases {
 		_ = lease.Close()
 	}
 }
@@ -207,11 +338,23 @@ func newMCPClaimantSessionID() string {
 }
 
 func (s *Server) claimantSessionID(ctx context.Context) (string, error) {
-	id := s.conversation(ctx).claimantSessionID
+	state := s.conversation(ctx)
+	id := state.claimantSessionID
 	if id == "" {
+		if state.claimantIdentityErr != nil {
+			return "", fmt.Errorf("establish durable MCP claimant session identity: %w", state.claimantIdentityErr)
+		}
 		return "", errors.New("could not establish MCP claimant session identity")
 	}
 	return id, nil
+}
+
+func (s *Server) claimantIdentityStatus(ctx context.Context) (string, string) {
+	state := s.conversation(ctx)
+	if state.claimantIdentityErr != nil {
+		return state.claimantIdentityMode, state.claimantIdentityErr.Error()
+	}
+	return state.claimantIdentityMode, ""
 }
 
 // ForgetConversation releases state for a transport session that has closed.
@@ -220,8 +363,12 @@ func (s *Server) ForgetConversation(id string) {
 		return
 	}
 	s.conversationMu.Lock()
+	state := s.conversations[id]
 	delete(s.conversations, id)
 	s.conversationMu.Unlock()
+	if state != nil && state.claimantLease != nil {
+		_ = state.claimantLease.Close()
+	}
 }
 
 // NewServer creates a new MCP server instance.
@@ -233,15 +380,17 @@ func NewServer(baseURL string, agentKey ed25519.PrivateKey) *Server {
 	}
 	pub, _ := agentKey.Public().(ed25519.PublicKey) //nolint:errcheck
 	s := &Server{
-		baseURL:             baseURL,
-		agentKey:            agentKey,
-		agentID:             hex.EncodeToString(pub),
-		provider:            os.Getenv("SAGE_PROVIDER"),
-		httpClient:          mcpHTTPClient(baseURL),
-		sendProbeTimeout:    3 * time.Second,
-		version:             "dev",
-		conversations:       make(map[string]*conversationState),
-		federatedAgentCache: make(map[string]federatedAgentCacheEntry),
+		baseURL:                 baseURL,
+		agentKey:                agentKey,
+		agentID:                 hex.EncodeToString(pub),
+		provider:                os.Getenv("SAGE_PROVIDER"),
+		httpClient:              mcpHTTPClient(baseURL),
+		sendProbeTimeout:        3 * time.Second,
+		version:                 "dev",
+		conversations:           make(map[string]*conversationState),
+		streamConversationTTL:   defaultStreamConversationTTL,
+		streamConversationLimit: defaultStreamConversationLimit,
+		federatedAgentCache:     make(map[string]federatedAgentCacheEntry),
 	}
 	s.tools = s.registerTools()
 	return s

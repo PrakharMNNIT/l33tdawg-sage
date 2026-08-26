@@ -79,6 +79,8 @@ build/
 desktop/sage-shell/target/
 desktop/sage-shell/gen/
 desktop/sage-shell/binaries/
+# SwiftPM build output for the native macOS Cerebrum app (v12)
+desktop/SAGECerebrumNative/.build/
 .eggs/
 *.egg
 .venv/
@@ -86,6 +88,8 @@ venv/
 
 # Stray test directories (real tests are in test/)
 tests/
+!desktop/SAGECerebrumNative/Tests/
+!desktop/SAGECerebrumNative/Tests/**
 
 # Protobuf generated
 internal/proto/sagepb/*.go
@@ -183,6 +187,7 @@ integrations/levelup/paper4/
 
 # Go build cache (created when GOCACHE points into the repo)
 .gocache/
+.clang-module-cache/
 
 # Generated per machine by sage-gui healHooks (templates live in
 # cmd/sage-gui/mcp.go). They get the operator's absolute agent key path

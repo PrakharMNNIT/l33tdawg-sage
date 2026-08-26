@@ -51,6 +51,42 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.5
+
+**Claim recovery and host wake coordination now survive real multi-transport
+runtimes.** Both exact-local compatibility claim paths—`GET /v1/pipe/inbox`
+and explicit `PUT /v1/pipe/{pipe_id}/claim`—atomically bind the session and
+create its receipt, so ownership cannot commit without recovery evidence. MCP
+claimant identities are durable and transport-scoped across stdio,
+Streamable HTTP, and SSE; `claimant_identity_mode` discloses whether the
+identity is durable, a safe concurrent ephemeral fallback, inherited, or
+unavailable.
+
+Claim transfer remains deliberate. `sage_message_handoff` requires the exact
+`claimant_session_id` and `claim_revision` returned by passive history; stale
+or A→B→A delayed transfers fail the revisioned compare-and-swap fence. The
+direct REST route preserves pre-v11.19.5 clients by treating an omitted
+`from_revision` as 0 only, so it can move an untouched first-generation claim
+but safely conflicts after any transfer. SAGE never steals a claim merely
+because it is old.
+
+The new signed, payload-free `GET /v1/inbox/activity-state` returns exactly
+`{version,epoch,seq}` so host hooks can notice fresh task assignments and
+replies. The opaque 32-character database-incarnation `epoch` survives process
+restarts and backup restore, but changes for a fresh database so an old host
+cursor cannot suppress new cues after reinitialization.
+Those events remain nonblocking coordination: they do not change the exact
+three-field `{version,seq,pending}` contract of `/v1/messages/wake` or
+`/v1/messages/wake-state`, and they never make Stop treat a reply as unfinished
+work. Hooks can surface activity on the next prompt, but cannot resurrect an
+already-idle host task.
+
+This patch changes no consensus rule, AppHash input, transaction type, key
+encoding, fork target, or application version. The supported consensus ceiling
+remains app-v27.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.5`. SDK 11.19.5.
+
 ## What's New in v11.19.4
 
 **Updater governance compatibility and recovery state are now one atomic
@@ -62,9 +98,14 @@ between the compatibility decision and the verified recovery snapshot.
 
 v11.19.3 acquired those two read fences separately. Its snapshot was coherent,
 but a concurrent Commit could make the preceding compatibility verdict stale.
-Because the vulnerable code is in the running v11.19.3 updater, upgrade from
-v11.19.3 to v11.19.4 using the stopped-node procedure in
-[`docs/UPGRADING.md`](docs/UPGRADING.md), not the v11.19.3 live updater.
+Personal single-node installs still upgrade normally in the app: v11.19.3 and
+v11.19.4 have the same app-v27 ceiling, the personal-node watchdog cannot create
+an unsupported app-v28 transition, and the updater performs the recovery
+snapshot, coordinated stop, final stopped-state snapshot, install, rollback,
+and restart automatically. No CLI or manual preflight is required. The
+stopped-node procedure in [`docs/UPGRADING.md`](docs/UPGRADING.md) is only for
+quorum or externally managed nodes where an operator can mutate governance
+during the v11.19.3 check-to-fence window.
 
 This patch changes no consensus rule, AppHash input, transaction type, key
 encoding, fork target, or application version. Existing app-v27 chains replay
@@ -87,7 +128,9 @@ than this binary supports still fails closed before executable mutation. The
 technical `upgrade status` and stopped-node `upgrade preflight` commands remain
 available for headless and quorum operators. **Superseded safety notice:** the
 v11.19.3 live updater did not hold one uninterrupted fence across that check and
-snapshot capture; use the stopped-node procedure when leaving v11.19.3.
+snapshot capture. That does not impose a CLI step on a personal node; only
+quorum or externally managed governance needs the coordinated stopped-node
+procedure when leaving v11.19.3.
 
 This patch changes no consensus rule, AppHash input, transaction type, key
 encoding, fork target, or application version. Existing app-v27 chains replay
@@ -2252,7 +2295,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.4`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.5`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
