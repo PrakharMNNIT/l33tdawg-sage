@@ -51,6 +51,27 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.4
+
+**Updater governance compatibility and recovery state are now one atomic
+proof.** The replacement binary reports its own maximum supported application
+version. SAGE validates canonical pending-plan and active-ballot state against
+that exact ceiling while holding the same runtime read fence that pins the
+snapshot height and AppHash. Consensus cannot publish newer governance state
+between the compatibility decision and the verified recovery snapshot.
+
+v11.19.3 acquired those two read fences separately. Its snapshot was coherent,
+but a concurrent Commit could make the preceding compatibility verdict stale.
+Because the vulnerable code is in the running v11.19.3 updater, upgrade from
+v11.19.3 to v11.19.4 using the stopped-node procedure in
+[`docs/UPGRADING.md`](docs/UPGRADING.md), not the v11.19.3 live updater.
+
+This patch changes no consensus rule, AppHash input, transaction type, key
+encoding, fork target, or application version. Existing app-v27 chains replay
+byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.4`. SDK 11.19.4.
+
 ## What's New in v11.19.3
 
 **Normal upgrades now preserve compatible governance state automatically.**
@@ -64,8 +85,9 @@ required.
 Malformed canonical state, an undecodable upgrade ballot, or a target newer
 than this binary supports still fails closed before executable mutation. The
 technical `upgrade status` and stopped-node `upgrade preflight` commands remain
-available for headless and quorum operators, but they are diagnostics rather
-than steps in the normal desktop upgrade flow.
+available for headless and quorum operators. **Superseded safety notice:** the
+v11.19.3 live updater did not hold one uninterrupted fence across that check and
+snapshot capture; use the stopped-node procedure when leaving v11.19.3.
 
 This patch changes no consensus rule, AppHash input, transaction type, key
 encoding, fork target, or application version. Existing app-v27 chains replay
@@ -2230,7 +2252,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.3`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.4`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

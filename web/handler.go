@@ -123,7 +123,7 @@ type DashboardHandler struct {
 	// snapshot for the exact currently committed state before an updater may
 	// replace the executable or a coordinated restart may enter a newer binary.
 	// Production wiring is mandatory; nil fails closed for version transitions.
-	PrepareVersionTransition func(context.Context, string) (func(), error)
+	PrepareVersionTransition func(context.Context, string, uint64) (func(), error)
 	// RunBackground binds operator-triggered jobs to the node lifecycle. The
 	// production node cancels and joins these before closing stores; nil keeps
 	// the lightweight test/embed behavior.

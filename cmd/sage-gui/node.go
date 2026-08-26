@@ -1388,7 +1388,7 @@ func runServe(startupProof string) (rerr error) {
 			return fmt.Errorf("restart already in progress")
 		}
 	}
-	dashboard.PrepareVersionTransition = func(snapshotCtx context.Context, targetVersion string) (_ func(), retErr error) {
+	dashboard.PrepareVersionTransition = func(snapshotCtx context.Context, targetVersion string, replacementMaxAppVersion uint64) (_ func(), retErr error) {
 		if snapshotScheduler == nil {
 			return nil, fmt.Errorf("snapshot scheduler is unavailable")
 		}
@@ -1398,15 +1398,20 @@ func runServe(startupProof string) (rerr error) {
 		// malformed state or an upgrade target this binary cannot execute blocks
 		// mutation; a supported in-flight upgrade is not a reason to deadlock the
 		// installation of a newer patch binary.
-		governanceStatus, governanceErr := app.UpgradeGovernanceStatus()
+		governanceStatus, height, appHash, release, governanceErr :=
+			app.AcquireVerifiedUpgradeSnapshotFence(replacementMaxAppVersion)
 		if governanceErr != nil {
-			return nil, fmt.Errorf("inspect canonical upgrade governance state: %w", governanceErr)
+			return nil, governanceErr
 		}
-		if compatibilityErr := governanceStatus.ValidateBinaryReplacement(sageabci.MaxSupportedAppVersion()); compatibilityErr != nil {
-			return nil, fmt.Errorf("prove automatic binary replacement compatibility: %w", compatibilityErr)
-		}
+		handedOff := false
+		defer func() {
+			if !handedOff {
+				release()
+			}
+		}()
 		logEvent := logger.Info().
 			Str("target_release", targetVersion).
+			Uint64("replacement_max_app_version", replacementMaxAppVersion).
 			Uint64("current_app_version", governanceStatus.CurrentAppVersion)
 		if governanceStatus.PendingPlan != nil {
 			logEvent = logEvent.
@@ -1421,16 +1426,6 @@ func runServe(startupProof string) (rerr error) {
 		}
 		logEvent.Msg("automatic updater governance compatibility verified")
 
-		height, appHash, release := app.AcquireSnapshotStateFence()
-		handedOff := false
-		defer func() {
-			if !handedOff {
-				release()
-			}
-		}()
-		if height <= 0 || len(appHash) == 0 {
-			return nil, fmt.Errorf("read committed state for pre-update snapshot: no committed application state")
-		}
 		_, snapshotErr := snapshotScheduler.TakeVerified(
 			snapshotCtx,
 			height,

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/l33tdawg/sage/internal/governance"
 	"github.com/l33tdawg/sage/internal/store"
@@ -55,6 +56,40 @@ func (app *SageApp) UpgradeGovernanceStatus() (*UpgradeGovernanceStatus, error) 
 	app.runtimeViewMu.RLock()
 	defer app.runtimeViewMu.RUnlock()
 	return app.buildUpgradeGovernanceStatus()
+}
+
+// AcquireVerifiedUpgradeSnapshotFence atomically proves replacement-binary
+// compatibility and pins the exact committed application tuple covered by that
+// proof. The read lock is intentionally acquired before governance inspection
+// and remains held until the caller releases the returned fence, so Commit
+// cannot publish a newer plan, ballot, height, or AppHash between validation
+// and the updater's recovery snapshot.
+func (app *SageApp) AcquireVerifiedUpgradeSnapshotFence(maxSupported uint64) (
+	status *UpgradeGovernanceStatus,
+	height int64,
+	appHash []byte,
+	release func(),
+	err error,
+) {
+	app.runtimeViewMu.RLock()
+	var once sync.Once
+	release = func() { once.Do(app.runtimeViewMu.RUnlock) }
+	fail := func(cause error) (*UpgradeGovernanceStatus, int64, []byte, func(), error) {
+		release()
+		return nil, 0, nil, nil, cause
+	}
+
+	status, err = app.buildUpgradeGovernanceStatus()
+	if err != nil {
+		return fail(fmt.Errorf("inspect canonical upgrade governance state: %w", err))
+	}
+	if err = status.ValidateBinaryReplacement(maxSupported); err != nil {
+		return fail(fmt.Errorf("prove replacement binary compatibility: %w", err))
+	}
+	if app.state == nil || app.state.Height <= 0 || len(app.state.AppHash) == 0 {
+		return fail(errors.New("read committed state for pre-update snapshot: no committed application state"))
+	}
+	return status, app.state.Height, append([]byte(nil), app.state.AppHash...), release, nil
 }
 
 // ValidateBinaryReplacement proves that this binary can execute the current

@@ -188,6 +188,42 @@ func TestUpgradeGovernanceStatusValidatesAutomaticBinaryReplacement(t *testing.T
 	}
 }
 
+func TestAcquireVerifiedUpgradeSnapshotFenceKeepsProofAndTupleAtomic(t *testing.T) {
+	app := setupTestApp(t)
+	app.state.Height = 42
+	app.state.AppHash = []byte("committed-app-hash")
+
+	status, height, appHash, release, err := app.AcquireVerifiedUpgradeSnapshotFence(MaxSupportedAppVersion())
+	require.NoError(t, err)
+	require.NotNil(t, status)
+	require.Equal(t, int64(42), height)
+	require.Equal(t, []byte("committed-app-hash"), appHash)
+	require.NotNil(t, release)
+	require.False(t, app.runtimeViewMu.TryLock(), "Commit must remain excluded after governance validation")
+
+	release()
+	require.True(t, app.runtimeViewMu.TryLock(), "release must return the runtime write lock")
+	app.runtimeViewMu.Unlock()
+}
+
+func TestAcquireVerifiedUpgradeSnapshotFenceReleasesOnIncompatibleGovernance(t *testing.T) {
+	app := setupTestApp(t)
+	app.state.Height = 42
+	app.state.AppHash = []byte("committed-app-hash")
+	require.NoError(t, app.badgerStore.SetUpgradePlan(&store.UpgradePlanRecord{
+		Name: "app-v28", TargetAppVersion: 28, ActivationHeight: 900,
+	}))
+
+	status, height, appHash, release, err := app.AcquireVerifiedUpgradeSnapshotFence(27)
+	require.ErrorContains(t, err, "targets app-v28")
+	require.Nil(t, status)
+	require.Zero(t, height)
+	require.Nil(t, appHash)
+	require.Nil(t, release)
+	require.True(t, app.runtimeViewMu.TryLock(), "failed validation must not leak the runtime read lock")
+	app.runtimeViewMu.Unlock()
+}
+
 func TestUpgradeGovernanceStatusReportsNonUpgradeBallotWithoutDecodingPayload(t *testing.T) {
 	app := setupTestApp(t)
 	proposal := &governance.ProposalState{

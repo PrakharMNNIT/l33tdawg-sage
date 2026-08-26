@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.3 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.4 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -111,6 +111,9 @@ v11.19.3 moves that compatibility decision into the normal updater: supported
 in-flight upgrade state is carried through the verified recovery snapshot and
 continues after restart without a prompt or CLI step, while malformed or
 unsupported targets still stop before executable mutation.
+v11.19.4 closes the v11.19.3 validation-to-fence race: it interrogates the
+replacement binary for its actual app-version ceiling and validates governance,
+height, and AppHash under one uninterrupted runtime fence.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -122,13 +125,30 @@ upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
 
+## v11.19.4 release
+
+The updater now probes the exact staged replacement executable for its maximum
+supported application version and passes that capability—not the running
+binary's ceiling—into the compatibility proof. Canonical governance inspection,
+replacement validation, committed height, and AppHash capture occur under one
+uninterrupted `runtimeViewMu` read fence, which remains held through snapshot
+verification and executable mutation.
+
+This closes the v11.19.3 TOCTOU window where Commit could publish newer
+governance state after validation but before snapshot fencing. The snapshot was
+coherent, but its compatibility verdict could be stale. The v11.19.3-to-v11.19.4
+transition must therefore use the documented stopped-node procedure; once
+v11.19.4 is running, future live updates use the corrected proof.
+
+Consensus behavior and the app-v27 ceiling are unchanged.
+
 ## v11.19.3 release
 
 The production updater reads canonical governance state under the same runtime
 view lock used by ABCI queries, validates the current version plus any pending
 plan or active upgrade ballot against the running updater's supported ceiling, and
-does so before the existing state fence, recovery snapshot, and executable
-replacement. Supported in-flight operations are compatible and continue after
+did so before a separately acquired state fence, recovery snapshot, and
+executable replacement. Supported in-flight operations are compatible and continue after
 restart; ordinary users see no governance prompt and run no command.
 
 Stopped-node `upgrade preflight` now applies the same compatibility policy for
@@ -136,6 +156,9 @@ technical operators instead of treating the mere presence of a supported plan
 or ballot as a blocker. Corrupt, inconsistent, undecodable, or unsupported
 state still fails closed. Consensus behavior and the app-v27 ceiling are
 unchanged.
+
+v11.19.4 supersedes this release's atomicity claim: a Commit could run between
+the v11.19.3 validation and snapshot-fence acquisitions.
 
 ## v11.19.2 release
 
