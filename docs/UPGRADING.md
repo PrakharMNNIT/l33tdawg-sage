@@ -19,30 +19,38 @@ differently.
 
 ## TL;DR for a personal (single-node) install
 
-Accept the update in SAGE. The updater checks canonical governance state,
-captures and verifies a full recovery snapshot, installs the new release, and
-restarts the node. A compatible pending plan or ballot is preserved and
-continues after restart. There is no terminal command or manual preflight in
-the normal desktop flow.
+Accept the update in SAGE, including the v11.19.3 to v11.19.4 update. The
+updater checks canonical governance state, captures and verifies a recovery
+snapshot, coordinates shutdown, captures the final stopped application state,
+installs the new release, rolls back automatically if the final safety gate
+fails, and restarts the node. A compatible pending plan or ballot is preserved
+and continues after restart. There is no terminal command, manual backup, or
+manual preflight in the normal desktop flow.
 
-> **Exception: leaving v11.19.3.** Do not use the v11.19.3 live updater for the
-> v11.19.4 transition. Its compatibility check and snapshot fence were separate
-> lock acquisitions. Follow the stopped-node v11.19.3 procedure below. Once
-> v11.19.4 is running, the live updater uses one atomic proof again.
+v11.19.3 did acquire the compatibility proof and snapshot fence separately,
+which v11.19.4 corrects. That does not require a personal-node user to perform a
+manual transition: both releases have the same app-v27 ceiling, and the
+personal-node automatic governance worker cannot create an unsupported
+app-v28 transition in that interval.
 
-### Required one-time procedure: v11.19.3 to v11.19.4
+### Operator-only exception: externally mutable v11.19.3 governance
 
-1. Stop SAGE. On a quorum chain, stop every validator under the coordinated
-   maintenance procedure.
-2. Retain a complete backup made while stopped: `sage-gui backup --full`.
-3. Install the v11.19.4 binary or app without starting it.
-4. Run `sage-gui upgrade preflight` against the exact stopped data directory.
-5. Continue only if every validator reports `COMPATIBLE` and the expected
-   identical application state; otherwise restore the previous executable and
-   resolve the canonical governance state before retrying.
-6. Start v11.19.4.
+The coordinated stopped-node procedure applies only when a v11.19.3 node is in
+a quorum deployment or another authorized operator/automation can mutate
+upgrade governance concurrently with binary replacement. Deployment automation
+must perform these steps; they are not an end-user desktop workflow:
 
-This avoids executing the vulnerable v11.19.3 live-update sequence entirely.
+1. Coordinate-stop every validator.
+2. Retain a complete stopped-state backup (`sage-gui backup --full`).
+3. Stage the v11.19.4 binary or app without starting it.
+4. Run the staged binary's `sage-gui upgrade preflight` against the exact
+   stopped data directory on every validator.
+5. Install and restart only after every validator reports `COMPATIBLE` and the
+   expected identical application state; otherwise keep the old executable and
+   resolve governance before retrying.
+
+This operator path avoids the v11.19.3 live check-to-fence window. Once
+v11.19.4 is running, future live updates use one atomic proof.
 
 > **Install SAGE v11.18.0 or later before you back up.** That is the concrete
 > minimum for `backup --full`, `restore --from`, `upgrade preflight`, and the

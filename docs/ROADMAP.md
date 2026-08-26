@@ -169,8 +169,12 @@ verification and executable mutation.
 This closes the v11.19.3 TOCTOU window where Commit could publish newer
 governance state after validation but before snapshot fencing. The snapshot was
 coherent, but its compatibility verdict could be stale. The v11.19.3-to-v11.19.4
-transition must therefore use the documented stopped-node procedure; once
-v11.19.4 is running, future live updates use the corrected proof.
+transition remains automatic for personal single-node installs because both
+releases have the same app-v27 ceiling and personal-node automation cannot
+introduce an unsupported next-app transition. The documented stopped-node
+procedure is limited to quorum or externally managed deployments where
+governance can be mutated concurrently; once v11.19.4 is running, future live
+updates use the corrected proof.
 
 Consensus behavior and the app-v27 ceiling are unchanged.
 
