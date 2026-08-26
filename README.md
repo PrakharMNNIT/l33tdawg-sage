@@ -62,9 +62,14 @@ between the compatibility decision and the verified recovery snapshot.
 
 v11.19.3 acquired those two read fences separately. Its snapshot was coherent,
 but a concurrent Commit could make the preceding compatibility verdict stale.
-Because the vulnerable code is in the running v11.19.3 updater, upgrade from
-v11.19.3 to v11.19.4 using the stopped-node procedure in
-[`docs/UPGRADING.md`](docs/UPGRADING.md), not the v11.19.3 live updater.
+Personal single-node installs still upgrade normally in the app: v11.19.3 and
+v11.19.4 have the same app-v27 ceiling, the personal-node watchdog cannot create
+an unsupported app-v28 transition, and the updater performs the recovery
+snapshot, coordinated stop, final stopped-state snapshot, install, rollback,
+and restart automatically. No CLI or manual preflight is required. The
+stopped-node procedure in [`docs/UPGRADING.md`](docs/UPGRADING.md) is only for
+quorum or externally managed nodes where an operator can mutate governance
+during the v11.19.3 check-to-fence window.
 
 This patch changes no consensus rule, AppHash input, transaction type, key
 encoding, fork target, or application version. Existing app-v27 chains replay
@@ -87,7 +92,9 @@ than this binary supports still fails closed before executable mutation. The
 technical `upgrade status` and stopped-node `upgrade preflight` commands remain
 available for headless and quorum operators. **Superseded safety notice:** the
 v11.19.3 live updater did not hold one uninterrupted fence across that check and
-snapshot capture; use the stopped-node procedure when leaving v11.19.3.
+snapshot capture. That does not impose a CLI step on a personal node; only
+quorum or externally managed governance needs the coordinated stopped-node
+procedure when leaving v11.19.3.
 
 This patch changes no consensus rule, AppHash input, transaction type, key
 encoding, fork target, or application version. Existing app-v27 chains replay
