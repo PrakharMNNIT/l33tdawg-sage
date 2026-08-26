@@ -54,7 +54,7 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 ## What's New in v11.19.6
 
 **Typed memory relationships are now readable through the public API and MCP.**
-`POST /v1/memory/links` accepts a bounded set of memory IDs and returns typed
+`POST /v1/memory/links` accepts up to 256 memory IDs and returns typed
 `supports`, `contradicts`, `supersedes`, and `refines` edges only when both
 endpoints are in that set and readable by the caller. The new `sage_get_links`
 MCP tool exposes the same projection, so an agent can recall memories and then

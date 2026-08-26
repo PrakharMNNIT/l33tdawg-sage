@@ -138,7 +138,7 @@ explicit, reviewed operator ceremony rather than a silent mutation.
 
 ## v11.19.6 release
 
-`POST /v1/memory/links` accepts a bounded memory-ID set and returns only typed
+`POST /v1/memory/links` accepts up to 256 memory IDs and returns only typed
 links whose two endpoints are both requested and readable by the caller. The
 new `sage_get_links` MCP tool exposes the same batched projection, allowing a
 recall result to be followed by explicit `supports`, `contradicts`,
