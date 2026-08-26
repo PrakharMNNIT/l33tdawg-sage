@@ -76,6 +76,7 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 		var body map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		require.Equal(t, "mcp-helper", body["from_session_id"])
+		require.Equal(t, float64(0), body["from_revision"])
 		require.Equal(t, claimantSessionID, body["to_session_id"])
 		_ = json.NewEncoder(w).Encode(map[string]any{"message_id": "local-a", "claimant_session_id": claimantSessionID})
 	})
@@ -118,8 +119,13 @@ func TestCanonicalMessageToolsSendReceiveReplyAndStatus(t *testing.T) {
 	require.ElementsMatch(t, []string{"/v1/messages/local-a/read", "/v1/messages/local-b/read"}, readPaths)
 	mu.Unlock()
 
+	_, err = s.toolMessageHandoff(context.Background(), map[string]any{
+		"message_id": "local-a", "from_session_id": "mcp-helper", "from_revision": 0.5,
+	})
+	require.ErrorContains(t, err, "exact non-negative integer")
+
 	handed, err := s.toolMessageHandoff(context.Background(), map[string]any{
-		"message_id": "local-a", "from_session_id": "mcp-helper",
+		"message_id": "local-a", "from_session_id": "mcp-helper", "from_revision": float64(0),
 	})
 	require.NoError(t, err)
 	require.Equal(t, claimantSessionID, handed.(map[string]any)["claimant_session_id"])

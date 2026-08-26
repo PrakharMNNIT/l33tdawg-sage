@@ -848,6 +848,7 @@ func (s *Server) setupRouter() chi.Router {
 			r.Post("/v1/messages", s.handleMessageSend)
 			r.Get("/v1/messages/wake", s.handleMessageWake)
 			r.Get("/v1/messages/wake-state", s.handleMessageWakeState)
+			r.Get("/v1/inbox/activity-state", s.handleInboxActivityState)
 			r.Get("/v1/messages/claimed-elsewhere", s.handleMessagesClaimedElsewhere)
 			r.Get("/v1/messages/own-claimed-unfinished", s.handleOwnClaimedUnfinishedMessages)
 			r.Post("/v1/messages/receive", s.handleMessagesReceive)

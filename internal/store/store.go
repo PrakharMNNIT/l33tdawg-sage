@@ -845,11 +845,14 @@ type PipelineMessage struct {
 	// ClaimedSessionID is opaque MCP coordination metadata. It distinguishes
 	// concurrent runtimes that intentionally share one signed agent identity;
 	// it is not an authorization principal.
-	ClaimedSessionID string     `json:"claimant_session_id,omitempty"`
-	ClaimedAt        *time.Time `json:"claimed_at,omitempty"`
-	CompletedAt      *time.Time `json:"completed_at,omitempty"`
-	ExpiresAt        time.Time  `json:"expires_at"`
-	JournalID        string     `json:"journal_id,omitempty"`
+	ClaimedSessionID string `json:"claimant_session_id,omitempty"`
+	// ClaimRevision is a monotonic ABA fence for explicit session handoff.
+	// It changes only when claimant-session ownership changes.
+	ClaimRevision uint64     `json:"claim_revision,omitempty"`
+	ClaimedAt     *time.Time `json:"claimed_at,omitempty"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`
+	ExpiresAt     time.Time  `json:"expires_at"`
+	JournalID     string     `json:"journal_id,omitempty"`
 	// Federation provenance is additive. Empty fields identify an ordinary
 	// local pipe. Imported work always receives a fresh local PipeID and keeps
 	// the peer's ID in SourcePipeID; outbound work names DestinationChainID so
@@ -1002,6 +1005,7 @@ type MessageWakeState struct {
 type ClaimedElsewhereMessage struct {
 	MessageID         string
 	ClaimantSessionID string
+	ClaimRevision     uint64
 	CreatedAt         time.Time
 	CreatedAtCursor   string
 	ClaimedAt         *time.Time
@@ -1023,14 +1027,24 @@ type MessageStore interface {
 	AdmitLocalMessage(ctx context.Context, msg *PipelineMessage) (*PipelineMessage, error)
 	SendFederatedMessage(ctx context.Context, idempotencyKey string, msg *PipelineMessage, event *PipelineTransportOutbox) (*PipelineMessage, bool, error)
 	ReceiveLocalMessages(ctx context.Context, agentID, provider, receiveToken string, limit int, claimantSessionID ...string) ([]*PipelineMessage, bool, error)
+	ClaimExactLocalMessageWithSession(ctx context.Context, receiverID, messageID, claimantSessionID string) error
 	GetOwnClaimedUnfinishedMessages(ctx context.Context, receiverID, claimantSessionID string, limit int) ([]*PipelineMessage, int, error)
 	CountClaimedLocalMessagesElsewhere(ctx context.Context, receiverID, claimantSessionID string) (int, error)
 	GetClaimedMessagesElsewhere(ctx context.Context, receiverID, claimantSessionID string, limit int, afterCreatedAt, afterMessageID string) ([]ClaimedElsewhereMessage, int, bool, error)
-	HandoffLocalMessageClaim(ctx context.Context, receiverID, messageID, fromSessionID, toSessionID string) (bool, error)
+	HandoffLocalMessageClaim(ctx context.Context, receiverID, messageID, fromSessionID, toSessionID string, expectedRevision uint64) (bool, uint64, error)
 	ReplyLocalMessage(ctx context.Context, receiverID, messageID, result string, claimantSessionID ...string) (bool, error)
 	AcknowledgeLocalMessageRead(ctx context.Context, receiverID, messageID string) (bool, error)
 	GetMessageStatusForSender(ctx context.Context, senderID, messageID string) (*MessageStatus, error)
 	GetMessageWakeState(ctx context.Context, recipientID string) (MessageWakeState, error)
+}
+
+// InboxActivityStore is the payload-free novelty clock shared by task notices
+// and sender-visible replies. It is deliberately separate from MessageWakeState:
+// activity is something to inspect, never unfinished work that may block Stop.
+type InboxActivityStore interface {
+	AdvanceInboxActivity(ctx context.Context, agentID string) (uint64, error)
+	GetInboxActivitySequence(ctx context.Context, agentID string) (uint64, error)
+	GetInboxActivityEpoch(ctx context.Context) (string, error)
 }
 
 // PipelineAgentProof preserves the exact already-verified local REST request

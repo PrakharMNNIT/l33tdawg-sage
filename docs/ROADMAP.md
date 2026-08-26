@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.4 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.5 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -114,6 +114,11 @@ unsupported targets still stop before executable mutation.
 v11.19.4 closes the v11.19.3 validation-to-fence race: it interrogates the
 replacement binary for its actual app-version ceiling and validates governance,
 height, and AppHash under one uninterrupted runtime fence.
+v11.19.5 repairs exact-local compatibility receipts, extends durable claimant
+identity across stdio, Streamable HTTP, and SSE, and revision-fences every
+explicit claim handoff. Its separate payload-free inbox activity sequence lets
+host hooks notice fresh task assignments and replies without changing message
+wake or Stop semantics.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -124,6 +129,33 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.5 release
+
+Both exact-local compatibility claim paths—`GET /v1/pipe/inbox` and explicit
+`PUT /v1/pipe/{pipe_id}/claim`—now bind the runtime claimant and create its
+session receipt in the same transaction as ownership. Durable claimant identities are scoped to
+the effective agent, provider, canonical project, and transport identity across
+stdio, Streamable HTTP, and SSE. MCP exposes `claimant_identity_mode` so a
+caller can distinguish durable ownership from concurrent-ephemeral fallback or
+a fail-closed unavailable identity.
+
+Claim ownership never expires merely with age. Passive claim projections carry
+`claim_revision`; `sage_message_handoff` requires that revision with the exact
+source session, and the store increments it on transfer so stale and A→B→A
+delayed handoffs fail visibly. For pre-v11.19.5 REST clients only, omitted
+`from_revision` means revision 0; it cannot move a claim that has ever advanced.
+
+Signed `GET /v1/inbox/activity-state` returns exactly `{version,epoch,seq}` and
+advances for fresh task-assignment and reply activity. Its opaque 32-character
+database-incarnation epoch survives restart and backup restore but changes for
+a fresh database, preventing a preserved host cursor from suppressing cues
+after reinitialization. It is deliberately
+separate from unfinished work: task/reply activity never changes the exact
+three-field v1 message-wake contract or blocks Stop, and a prompt hook cannot
+resurrect a host task that is already idle.
+
+Consensus behavior and the app-v27 ceiling are unchanged.
 
 ## v11.19.4 release
 

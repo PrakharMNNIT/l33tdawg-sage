@@ -27,7 +27,7 @@ sudo mv sage-gui /usr/local/bin/  # or add to your PATH
 
 ```bash
 sage-gui version
-# sage-gui v11.19.4
+# sage-gui v11.19.5
 ```
 
 ---
@@ -197,7 +197,7 @@ sage-gui setup
 
 ### 3. Start using it
 
-Just chat normally. SAGE v11.19.4 advertises 33 MCP tools. The core workflow is:
+Just chat normally. SAGE v11.19.5 advertises 33 MCP tools. The core workflow is:
 
 | Tool | What it does |
 |------|-------------|
@@ -226,6 +226,24 @@ corroboration tools complete the advertised set. See the authoritative
 [`reference/mcp-tools.md`](reference/mcp-tools.md). Deprecated `sage_pipe*`
 compatibility aliases remain callable for older clients but are intentionally
 absent from tool discovery.
+
+Message claims belong to a runtime identity, not merely to the agent key.
+`sage_inbox` reports `claimant_identity_mode` and includes `claim_revision` in
+claim coordination metadata. A takeover is always explicit: first decide that
+the prior claimant is gone, then pass its exact `claimant_session_id` and
+`claim_revision` to `sage_message_handoff`. SAGE does not auto-steal claims
+because they are old. Stdio, Streamable HTTP, and SSE each reuse a durable
+transport-scoped claimant identity when safe; corrupt identity state fails
+closed, while a genuinely concurrent runtime receives its own ephemeral fence.
+
+Claude Code and Codex hooks also compare the signed, payload-free inbox activity
+`{version,epoch,seq}` state. The opaque 32-character database-incarnation epoch
+survives restart and backup restore but changes with a fresh database, so a
+preserved host cursor cannot suppress new activity after reinitialization. A
+fresh assignment or reply can therefore be surfaced at the next
+prompt even when it is not unfinished message work. This does not wake an
+already-idle task, and replies/tasks never make the Stop hook block: message
+wake remains the separate exact `{version,seq,pending}` unfinished-work state.
 
 ### First Time: Inception
 

@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.19.4. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.19.5. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -1968,7 +1968,7 @@ vault-backed. A foreign request or result is never automatically journaled,
 embedded, indexed as memory, written to Badger/AppHash, or treated as trusted
 instructions (`internal/store/sqlite.go:4764-4837`,
 `internal/store/pipeline_transport.go:92-176`,
-	`shouldAutoJournalPipeline`, `api/rest/pipe_handler.go:2217-2226`).
+	`shouldAutoJournalPipeline`, `api/rest/pipe_handler.go:2243-2252`).
 
 ### `POST /v1/pipe/resolve`
 
@@ -2164,16 +2164,25 @@ principal.
 | `POST /v1/messages` | Exact-local-agent send. Requires `to_agent`, `payload`, and a 1–256-byte caller-scoped `idempotency_key`; optional `intent` and `ttl_minutes` 0–1440. Omitted/0 is durable until handled; 1–1440 requests explicit expiry. Exact retry returns the original `message_id`; same key/different request is HTTP 409. |
 | `GET /v1/messages/wake` | Exact-caller payload-free catch-up/SSE. Requires a 1–128-byte `consumer_id`; accepts `after_seq` or matching `Last-Event-ID`. Events use `id:<seq>` and data exactly `{version,seq,pending}`, where `pending` means unfinished canonical work (`pending` or `claimed`). If unfinished work remains at the supplied cursor, reconnect immediately replays that same sequence as state catch-up. One exact agent has one active consumer lease; same-consumer reconnect supersedes its stale stream, while a different live consumer receives HTTP 409. |
 | `GET /v1/messages/wake-state` | Exact-caller lease-free payload-free snapshot returning exactly `{version,seq,pending}`. It reads the same durable unfinished-work state as the wake stream without acquiring, replacing, or releasing the live consumer lease; intended for short-lived host hooks that compare a monotonic cursor. |
-| `GET /v1/messages/claimed-elsewhere` | Exact-caller payload-free coordination and recovery projection. Requires this runtime's 1–128-byte `claimant_session_id`; accepts `limit` 1–20 (default 5) and an optional opaque `cursor`. Returns the exact full `claimed_elsewhere_count` plus an oldest-first bounded `items` page, `limit`, `truncated`, and `next_cursor` only when more rows remain. Each item contains only `message_id`, its current `claimant_session_id`, `created_at`, optional `claimed_at`, `expires_at`, and `foreign`; sender/provider/chain identity, intent, payload, result, and content never cross this surface. The exact claimed-owner predicate includes still-actionable local, provider-addressed compatibility, and inbound-federated claims held by a different session and is not bounded by generic history's newest-100 window. |
+| `GET /v1/inbox/activity-state` | Fresh exact-signed, payload-free snapshot returning exactly `{version,epoch,seq}`. `epoch` is an opaque 32-character database-incarnation fence: it survives process restart and backup restore, but a fresh database receives a different epoch so a preserved client cursor cannot suppress new cues after reinitialization. The per-agent sequence advances for newly created task-assignment notices and newly persisted replies. It is coordination to inspect, not unfinished work: it never changes `/v1/messages/wake` or `/v1/messages/wake-state`, whose v1 payload remains exactly `{version,seq,pending}`, and it never makes Stop block. |
+| `GET /v1/messages/claimed-elsewhere` | Exact-caller payload-free coordination and recovery projection. Requires this runtime's 1–128-byte `claimant_session_id`; accepts `limit` 1–20 (default 5) and an optional opaque `cursor`. Returns the exact full `claimed_elsewhere_count` plus an oldest-first bounded `items` page, `limit`, `truncated`, and `next_cursor` only when more rows remain. Each item contains only `message_id`, its current `claimant_session_id` and `claim_revision`, `created_at`, optional `claimed_at`, `expires_at`, and `foreign`; sender/provider/chain identity, intent, payload, result, and content never cross this surface. The exact claimed-owner predicate includes still-actionable local, provider-addressed compatibility, and inbound-federated claims held by a different session and is not bounded by generic history's newest-100 window. |
 | `GET /v1/messages/own-claimed-unfinished` | Exact-caller, exact-session passive visibility for local, provider-addressed compatibility, or inbound-federated work already claimed by this runtime. Requires `claimant_session_id`; `limit` defaults to 5 and is capped at 20. Returns a bounded `items` list, exact `count`, `limit`, and `truncated`. Rows are marked `already_claimed_by_you:true`; the route never claims, reclaims, acknowledges, refreshes, hands off, or changes wake/workflow state. Another session or agent receives no matching IDs or payloads. |
 | `POST /v1/messages/receive` | Requires a 1–256-byte `receive_token`; optional limit 1–20 and opaque `claimant_session_id` up to 128 bytes. Claims and persists one exact ordered batch with session attribution. Same caller/token/limit replays that batch after a lost response; a different limit is HTTP 409. Replay metadata is retained for 48 hours and capped at 4096 tokens per agent: capacity returns HTTP 429, while a purged/incomplete exact batch returns HTTP 410 instead of claiming later work. |
 | `PUT /v1/messages/{message_id}/claim-session` | Exact claimed recipient of inbound federated work only. Binds an unbound claim to one opaque MCP session; repeating the same bind is idempotent and a competing bind is HTTP 409. Retained pre-v11.18.24 claims are instead migrated to the explicit `legacy` fence and require handoff. |
-| `PUT /v1/messages/{message_id}/handoff` | Exact fetched recipient only. Atomically compare-and-swaps `from_session_id` to `to_session_id` for one still-claimed local or inbound federated message. A stale expected session is HTTP 409; repeating an already-applied transfer is idempotent. Session IDs coordinate runtimes sharing one agent identity and confer no authorization. |
+| `PUT /v1/messages/{message_id}/handoff` | Exact fetched recipient only. Current clients send `from_session_id`, `to_session_id`, and the exact non-negative `from_revision` from passive history. For pre-v11.19.5 REST compatibility only, omitted `from_revision` defaults to 0; `sage_message_handoff` always requires it. The route atomically compare-and-swaps both source fences for one still-claimed local or inbound federated message and always returns the incremented `claim_revision`. A stale or A→B→A delayed fence is HTTP 409, so omission can transfer only an untouched revision-0 claim; repeating an already-applied transfer is idempotent. Session IDs coordinate runtimes sharing one agent identity and confer no authorization. No timeout or age-based auto-steal exists. |
 | `POST /v1/messages/{message_id}/reply` | Exact fetched recipient only. MCP supplies its opaque `claimant_session_id`, which must still own the claim after any handoff. Local replies and federated compatibility dispatch are idempotent; different second results are HTTP 409. Federated session check, completion, result fingerprint, and return event commit atomically. A live provider-addressed compatibility claim returns typed HTTP 409 `https://sage.dev/errors/message-legacy-provider-compatibility-scope` only after proving the exact persisted claimant identity and matching claimant session; only that signal authorizes MCP's retained completion route. Canonical typed 404 remains an authoritative non-enumerating denial. |
 | `PUT /v1/messages/{message_id}/read` | Fresh nonce-bound exact-recipient signature. The message must already have been returned to that caller by canonical receive. Same acknowledgement is idempotent. |
 | `PUT /v1/messages/read-batch` | One fresh exact-recipient request acknowledges 1–20 already-fetched exact message IDs. Every item is authorized independently and returns `confirmed` or a generic per-item failure; one failure never rolls back independent successes. Exact replay is idempotent. |
 | `GET /v1/messages/{message_id}/status` | Exact sender only, payload-free metadata projection. Returns independent transport/read/workflow state and never decrypts content/proofs. |
 | `GET /v1/messages/replies/{reply_event_id}/status` | Exact federated replier only. Returns payload-free outbound result-event transport state. It is not another inbox request and exposes no original-message workflow/read status or result content. |
+
+Deprecated exact-local `GET /v1/pipe/inbox` and explicit
+`PUT /v1/pipe/{pipe_id}/claim` use the same session-aware claim transaction as
+canonical Messages. Each exact-local path atomically changes the pending row to
+claimed and creates its session receipt, so a crash cannot commit ownership
+without the recovery fence. This retained pipeline surface is SQLite-only;
+PostgreSQL does not implement `PipelineStore`. Provider-only and federated
+paths keep their separate receipt rules.
 
 Claimed local items returned by `POST /v1/messages/receive` keep the persisted
 `from_agent` and `from_provider` fields unchanged and add response-only
@@ -2308,11 +2317,11 @@ local policy (`api/rest/pipe_handler.go`).
 
 For an exact local recipient, both keyed and unkeyed admissions insert the
 `msg-*` row and advance that recipient's durable wake sequence in one
-transaction. Keyed sends use `SendLocalMessage` (`internal/store/messages.go:295-373`);
-unkeyed sends use `AdmitLocalMessage` (`internal/store/messages.go:374-410`). The route publishes
+transaction. Keyed sends use `SendLocalMessage` (`internal/store/messages.go:324-402`);
+unkeyed sends use `AdmitLocalMessage` (`internal/store/messages.go:403-439`). The route publishes
 the returned non-zero generation only after commit. A backend without that
 atomic canonical capability returns HTTP 501 before insertion
-(`handlePipeSend`, `api/rest/pipe_handler.go:640-1054`). Provider-only and
+(`handlePipeSend`, `api/rest/pipe_handler.go:645-1059`). Provider-only and
 federated rows do not allocate an exact-local wake sequence.
 
 **Response** (HTTP 201 fresh; HTTP 200 exact keyed replay):
@@ -2326,7 +2335,7 @@ address resolved from a bounded legacy-status offline cache can be accepted
 locally while the peer is down. Delivery waits for that peer to return and pass
 the fresh live authorization preflight above.
 
-**Size caps → HTTP 413.** `payload` is capped at 256 KiB and `intent` at 8 KiB (`MaxPipeContentBytes`/`MaxPipeIntentBytes`, `internal/store/store.go:513-515`). The REST handler fast-fails an over-cap request with **413** before the store write; the store enforces the same caps at the `InsertPipeline` chokepoint (`internal/store/sqlite.go:6513` payload, `:6516` intent) as defense in depth, mapping `ErrPipePayloadTooLarge`/`ErrPipeIntentTooLarge` (`store.go:527-529`) to 413.
+**Size caps → HTTP 413.** `payload` is capped at 256 KiB and `intent` at 8 KiB (`MaxPipeContentBytes`/`MaxPipeIntentBytes`, `internal/store/store.go:771-777`). The REST handler fast-fails an over-cap request with **413** before the store write; the store enforces the same caps at the `InsertPipeline` chokepoint (`internal/store/sqlite.go:6525` declaration, `:6527` payload, `:6530` intent) as defense in depth, mapping `ErrPipePayloadTooLarge`/`ErrPipeIntentTooLarge` (`store.go:792-794`) to 413.
 
 **Open-pipe quota → HTTP 429 + `Retry-After`.** A single verified agent identity may hold at most 256 non-terminal (pending or claimed) pipes open at once, and a node caps 10000 across all requesters (`MaxOpenPipesPerAgent`/`MaxOpenPipesGlobal`). An index-backed COUNT and its INSERT run under the same write critical section, so parallel sends cannot race past either cap. Over-quota inserts are rejected as **429 with `Retry-After`** (`ErrPipeQuotaPerAgent`/`ErrPipeQuotaGlobal`), keyed on the Ed25519-verified `from_agent`, not the spoofable rate-limit header. This mirrors the mempool-full recipe (see `GET /v1/chain/backpressure` below): treat it as backpressure and retry after the hinted interval, not as a per-agent rate-limit breach.
 
@@ -2552,7 +2561,7 @@ HTTP 409 if already claimed.
 Submit a result for a claimed message. Purely local completion keeps the
 existing auto-journal summary. Federated completion does not journal and queues
 the result over the original agreement-bound return route
-(`handlePipeResult`, `api/rest/pipe_handler.go:1580-1869`).
+(`handlePipeResult`, `api/rest/pipe_handler.go:1606-1908`).
 
 **Request body:**
 
@@ -2563,7 +2572,7 @@ the result over the original agreement-bound return route
 | `source_chain_id` | string | for foreign work | Exact local reply-source chain returned as `reply_source_chain_id` by the pipe status preflight; prevents another node relabeling the signed result |
 | `claimant_session_id` | string | for foreign work; recommended for provider-addressed compatibility work | Opaque 1–128-byte session currently holding the claim. A provider-addressed row claimed by an older sessionless caller is fenced as `legacy`, and an omitted result session selects only that exact fence; it cannot bypass a named sibling session. |
 
-`result` is capped at 256 KiB (`MaxPipeContentBytes`, `store.go:513`); an over-cap submission is rejected **HTTP 413**, enforced both at the handler and at the `CompletePipeline` store chokepoint (`sqlite.go:6779`, mapping `ErrPipeResultTooLarge`).
+`result` is capped at 256 KiB (`MaxPipeContentBytes`, `store.go:775`); an over-cap submission is rejected **HTTP 413**, enforced both at the handler and at the `CompletePipeline` store chokepoint (`sqlite.go:6791`, mapping `ErrPipeResultTooLarge` at `:6793-6794`).
 
 **Response** (HTTP 200):
 `{"status":"completed","journal_id":"<memory_id or empty>","journaled":true|false}`.
