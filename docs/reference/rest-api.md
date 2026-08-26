@@ -675,6 +675,40 @@ Link two memories. Off-chain relation, no tx.
 
 ---
 
+### `POST /v1/memory/links`
+
+Read the typed links among a set of memories (the read side of the knowledge
+graph). Off-chain lookup, no tx. Requires an active registered agent identity.
+
+**Request body:**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `memory_ids` | string[] | yes | The set of memory IDs to look up links among. At most **256** per request. |
+
+**Response** (HTTP 200): `{"links": [{"source_id": "...", "target_id": "...", "link_type": "..."}, ...]}`
+
+A link is returned only when **both** of its endpoints are in `memory_ids` **and**
+readable by the caller under the same per-record read authority as
+`GET /v1/memory/{memory_id}` and `GET /v1/memory/list` (domain access, app-v23
+record disclosure, and classification/clearance). The requested IDs are filtered
+to the caller-readable subset before the lookup, so a link can never disclose the
+existence of a memory the caller cannot read. An unreadable, protected, or
+nonexistent ID is withheld identically — its presence or absence is never
+distinguishable from the response.
+
+**Errors:**
+
+| Status | When |
+|---|---|
+| `400` | `memory_ids` contains more than 256 entries (the request is rejected, never silently truncated). |
+| `403` | No active registered agent identity. |
+| `503` | Authorization or memory-lookup backend is temporarily unavailable (retry). Never returned to signal that a specific record exists. |
+
+An empty `memory_ids` returns `{"links": []}` (after the identity check).
+
+---
+
 ### `POST /v1/memory/pre-validate`
 
 Dry-run the per-node validation checks (dedup, quality, consistency) without submitting on-chain. Returns per-check decisions.

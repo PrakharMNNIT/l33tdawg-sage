@@ -606,6 +606,30 @@ to another memory for future traversal.
 
 ---
 
+### sage_get_links
+
+**Purpose:** Read the typed links among a set of memories — the read side of the
+knowledge graph.
+
+**Source:** `internal/mcp/tools.go` (`registerTools` entry `sage_get_links`; `Server.toolGetLinks`).
+
+**Parameters:**
+
+| Name         | Type     | Required | Description |
+|--------------|----------|----------|-------------|
+| `memory_ids` | string[] | yes      | Memory IDs to look up links among. Both endpoints of a returned link are in this set. |
+
+**Returns:**
+- `links`: array of `{source_id, target_id, link_type}`.
+
+**REST:** `POST /v1/memory/links`
+
+**When to call:** After a recall, to reason over the relationships among the
+memories you already have — what supersedes, contradicts, supports, or refines what.
+Discloses only links between memories the caller can read.
+
+---
+
 ### sage_list
 
 **Purpose:** Browse memories with filters. See what exists in a domain, with a

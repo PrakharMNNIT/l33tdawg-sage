@@ -870,7 +870,7 @@ func (s *PostgresStore) GetMemory(ctx context.Context, memoryID string) (*memory
 		&st, &parentHash, &r.CreatedAt, &r.CommittedAt, &r.DeprecatedAt, &taskStatus, &r.Assignee)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return nil, fmt.Errorf("memory not found: %s", memoryID)
+			return nil, fmt.Errorf("%w: %s", ErrMemoryNotFound, memoryID)
 		}
 		return nil, fmt.Errorf("get memory: %w", err)
 	}
