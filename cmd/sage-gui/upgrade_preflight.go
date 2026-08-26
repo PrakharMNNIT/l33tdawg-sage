@@ -125,8 +125,8 @@ func runUpgradePreflight(args []string) error {
 	fmt.Printf("  persisted height: %d\n", state.Height)
 	fmt.Printf("  binary supports : up to app-v%d\n", maxSupported)
 	fmt.Printf("  this binary     : sage-gui %s\n\n", version)
-	if printStoppedUpgradeGovernanceStatus(governanceStatus) {
-		return errors.New("upgrade preflight: binary replacement blocked by canonical pending upgrade governance state")
+	if compatibilityErr := printStoppedUpgradeGovernanceStatus(governanceStatus, maxSupported); compatibilityErr != nil {
+		return fmt.Errorf("upgrade preflight: binary replacement is incompatible with canonical upgrade governance state: %w", compatibilityErr)
 	}
 
 	// A chain born directly at app-v23 has no app-v6..v21 history and consensus
@@ -188,11 +188,10 @@ func runUpgradePreflight(args []string) error {
 	return nil
 }
 
-// printStoppedUpgradeGovernanceStatus returns true when replacing/restarting
-// binaries is unsafe. Preflight owns a read-only database handle, so unlike the
-// live status command this guard also works before the first fixed server has
-// started.
-func printStoppedUpgradeGovernanceStatus(status *sageabci.UpgradeGovernanceStatus) bool {
+// printStoppedUpgradeGovernanceStatus reports the same compatibility decision
+// the in-app updater makes automatically. A supported pending plan or upgrade
+// ballot is carried through the verified snapshot and is not a deadlock.
+func printStoppedUpgradeGovernanceStatus(status *sageabci.UpgradeGovernanceStatus, maxSupported uint64) error {
 	fmt.Println("Binary replacement guard (canonical stopped-node state):")
 	if status.PendingPlan == nil {
 		fmt.Println("  pending plan : none")
@@ -212,14 +211,16 @@ func printStoppedUpgradeGovernanceStatus(status *sageabci.UpgradeGovernanceStatu
 		}
 		fmt.Println(")")
 	}
-	blocked := status.PendingPlan != nil || status.ActiveProposal != nil
-	if blocked {
-		fmt.Println("  VERDICT      : BLOCKED — do not replace or restart binaries until both are absent.")
+	compatibilityErr := status.ValidateBinaryReplacement(maxSupported)
+	if compatibilityErr != nil {
+		fmt.Println("  VERDICT      : INCOMPATIBLE — replacement cannot safely execute canonical app state.")
+	} else if status.PendingPlan != nil || status.ActiveProposal != nil {
+		fmt.Println("  VERDICT      : COMPATIBLE — the supported in-flight operation continues after restart.")
 	} else {
-		fmt.Println("  VERDICT      : CLEAR — no pending upgrade plan or active governance ballot.")
+		fmt.Println("  VERDICT      : COMPATIBLE — no in-flight upgrade governance state.")
 	}
 	fmt.Println()
-	return blocked
+	return compatibilityErr
 }
 
 // printLadderFailureRecovery keeps preflight's operator guidance aligned with

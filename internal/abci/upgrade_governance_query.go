@@ -47,6 +47,66 @@ func (app *SageApp) buildUpgradeGovernanceStatus() (*UpgradeGovernanceStatus, er
 	return InspectUpgradeGovernanceState(app.badgerStore, app.currentAppVersion())
 }
 
+// UpgradeGovernanceStatus returns one runtime-consistent view for non-ABCI
+// callers such as the signed in-app updater. Keeping the runtime view lock here
+// prevents an updater from observing the transient gap between governance
+// execution clearing the active proposal and persisting its upgrade plan.
+func (app *SageApp) UpgradeGovernanceStatus() (*UpgradeGovernanceStatus, error) {
+	app.runtimeViewMu.RLock()
+	defer app.runtimeViewMu.RUnlock()
+	return app.buildUpgradeGovernanceStatus()
+}
+
+// ValidateBinaryReplacement proves that this binary can execute the current
+// chain and every canonical upgrade target that is already in flight. Ordinary
+// governance ballots do not affect binary compatibility. A supported upgrade
+// ballot or pending plan is safe to carry through an in-app patch update; it is
+// captured in the verified recovery snapshot and continues automatically after
+// restart. This deliberately rejects only unsupported or malformed state,
+// avoiding the deadlock where installing the supporting binary is blocked by
+// the very plan that needs it.
+func (status *UpgradeGovernanceStatus) ValidateBinaryReplacement(maxSupported uint64) error {
+	if status == nil {
+		return errors.New("upgrade governance status is unavailable")
+	}
+	if maxSupported == 0 {
+		return errors.New("binary reports zero max supported app version")
+	}
+	if status.CurrentAppVersion == 0 || status.CurrentAppVersion > maxSupported {
+		return fmt.Errorf(
+			"current app version %d exceeds binary support app-v%d",
+			status.CurrentAppVersion,
+			maxSupported,
+		)
+	}
+	if status.PendingPlan != nil && status.PendingPlan.TargetAppVersion > maxSupported {
+		return fmt.Errorf(
+			"pending plan %q targets app-v%d but binary supports only app-v%d",
+			status.PendingPlan.Name,
+			status.PendingPlan.TargetAppVersion,
+			maxSupported,
+		)
+	}
+	if status.ActiveProposal != nil &&
+		status.ActiveProposal.OperationCode == uint8(governance.OpUpgrade) {
+		if status.ActiveProposal.TargetAppVersion == nil {
+			return fmt.Errorf(
+				"active upgrade proposal %q has no decoded target app version",
+				status.ActiveProposal.ProposalID,
+			)
+		}
+		if *status.ActiveProposal.TargetAppVersion > maxSupported {
+			return fmt.Errorf(
+				"active upgrade proposal %q targets app-v%d but binary supports only app-v%d",
+				status.ActiveProposal.ProposalID,
+				*status.ActiveProposal.TargetAppVersion,
+				maxSupported,
+			)
+		}
+	}
+	return nil
+}
+
 // InspectUpgradeGovernanceState reads the exact pending-plan and active-ballot
 // records without mutating consensus storage. The live ABCI query calls it
 // under runtimeViewMu; stopped-node upgrade preflight calls it against a

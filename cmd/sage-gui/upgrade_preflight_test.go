@@ -93,19 +93,19 @@ func TestLadderAcceptsChainThatHasNotClimbedYet(t *testing.T) {
 	}
 }
 
-func TestStoppedUpgradeGovernanceGuardIsFailClosed(t *testing.T) {
+func TestStoppedUpgradeGovernanceGuardUsesCompatibilityInsteadOfPresence(t *testing.T) {
 	tests := []struct {
-		name    string
-		status  *sageabci.UpgradeGovernanceStatus
-		blocked bool
-		marker  string
+		name      string
+		status    *sageabci.UpgradeGovernanceStatus
+		wantError bool
+		marker    string
 	}{
 		{
 			name: "clear",
 			status: &sageabci.UpgradeGovernanceStatus{
 				CurrentAppVersion: 27,
 			},
-			marker: "VERDICT      : CLEAR",
+			marker: "VERDICT      : COMPATIBLE",
 		},
 		{
 			name: "pending plan",
@@ -115,8 +115,7 @@ func TestStoppedUpgradeGovernanceGuardIsFailClosed(t *testing.T) {
 					Name: "app-v27", TargetAppVersion: 27, ActivationHeight: 900,
 				},
 			},
-			blocked: true,
-			marker:  "VERDICT      : BLOCKED",
+			marker: "VERDICT      : COMPATIBLE",
 		},
 		{
 			name: "active upgrade ballot",
@@ -124,21 +123,31 @@ func TestStoppedUpgradeGovernanceGuardIsFailClosed(t *testing.T) {
 				CurrentAppVersion: 26,
 				ActiveProposal: &sageabci.UpgradeGovernanceActiveProposal{
 					ProposalID: "proposal-27", Operation: "upgrade", TargetID: "app-v27",
-					Status: "voting", TargetAppVersion: uint64Pointer(27),
+					OperationCode: 5, Status: "voting", TargetAppVersion: uint64Pointer(27),
 				},
 			},
-			blocked: true,
-			marker:  "target app-v27",
+			marker: "target app-v27",
+		},
+		{
+			name: "unsupported pending plan",
+			status: &sageabci.UpgradeGovernanceStatus{
+				CurrentAppVersion: 27,
+				PendingPlan: &sageabci.UpgradeGovernancePendingPlan{
+					Name: "app-v28", TargetAppVersion: 28, ActivationHeight: 900,
+				},
+			},
+			wantError: true,
+			marker:    "VERDICT      : INCOMPATIBLE",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var blocked bool
+			var compatibilityErr error
 			output := capturePreflightStdout(t, func() {
-				blocked = printStoppedUpgradeGovernanceStatus(tt.status)
+				compatibilityErr = printStoppedUpgradeGovernanceStatus(tt.status, sageabci.MaxSupportedAppVersion())
 			})
-			if blocked != tt.blocked {
-				t.Fatalf("blocked = %v, want %v", blocked, tt.blocked)
+			if (compatibilityErr != nil) != tt.wantError {
+				t.Fatalf("error = %v, wantError %v", compatibilityErr, tt.wantError)
 			}
 			if !strings.Contains(output, tt.marker) {
 				t.Fatalf("output missing %q:\n%s", tt.marker, output)

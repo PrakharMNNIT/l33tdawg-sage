@@ -1392,6 +1392,35 @@ func runServe(startupProof string) (rerr error) {
 		if snapshotScheduler == nil {
 			return nil, fmt.Errorf("snapshot scheduler is unavailable")
 		}
+		// Ordinary users never need to inspect governance or run a terminal
+		// preflight. The updater reads canonical state itself and carries every
+		// compatible pending plan/ballot through the verified snapshot. Only
+		// malformed state or an upgrade target this binary cannot execute blocks
+		// mutation; a supported in-flight upgrade is not a reason to deadlock the
+		// installation of a newer patch binary.
+		governanceStatus, governanceErr := app.UpgradeGovernanceStatus()
+		if governanceErr != nil {
+			return nil, fmt.Errorf("inspect canonical upgrade governance state: %w", governanceErr)
+		}
+		if compatibilityErr := governanceStatus.ValidateBinaryReplacement(sageabci.MaxSupportedAppVersion()); compatibilityErr != nil {
+			return nil, fmt.Errorf("prove automatic binary replacement compatibility: %w", compatibilityErr)
+		}
+		logEvent := logger.Info().
+			Str("target_release", targetVersion).
+			Uint64("current_app_version", governanceStatus.CurrentAppVersion)
+		if governanceStatus.PendingPlan != nil {
+			logEvent = logEvent.
+				Str("pending_plan", governanceStatus.PendingPlan.Name).
+				Uint64("pending_target_app_version", governanceStatus.PendingPlan.TargetAppVersion).
+				Int64("pending_activation_height", governanceStatus.PendingPlan.ActivationHeight)
+		}
+		if governanceStatus.ActiveProposal != nil {
+			logEvent = logEvent.
+				Str("active_proposal", governanceStatus.ActiveProposal.ProposalID).
+				Str("active_operation", governanceStatus.ActiveProposal.Operation)
+		}
+		logEvent.Msg("automatic updater governance compatibility verified")
+
 		height, appHash, release := app.AcquireSnapshotStateFence()
 		handedOff := false
 		defer func() {

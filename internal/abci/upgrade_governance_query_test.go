@@ -69,6 +69,125 @@ func TestUpgradeGovernanceStatusReportsExplicitAbsence(t *testing.T) {
 	require.Nil(t, status.ActiveProposal)
 }
 
+func TestUpgradeGovernanceStatusValidatesAutomaticBinaryReplacement(t *testing.T) {
+	target27 := uint64(27)
+	tests := []struct {
+		name       string
+		status     *UpgradeGovernanceStatus
+		maxSupport uint64
+		wantError  string
+	}{
+		{
+			name:       "missing status fails closed",
+			status:     nil,
+			maxSupport: 27,
+			wantError:  "status is unavailable",
+		},
+		{
+			name:       "zero binary support fails closed",
+			status:     &UpgradeGovernanceStatus{CurrentAppVersion: 27},
+			maxSupport: 0,
+			wantError:  "zero max supported app version",
+		},
+		{
+			name:       "zero current app version fails closed",
+			status:     &UpgradeGovernanceStatus{},
+			maxSupport: 27,
+			wantError:  "current app version 0",
+		},
+		{
+			name:       "clear current state",
+			status:     &UpgradeGovernanceStatus{CurrentAppVersion: 27},
+			maxSupport: 27,
+		},
+		{
+			name: "supported pending plan continues automatically",
+			status: &UpgradeGovernanceStatus{
+				CurrentAppVersion: 26,
+				PendingPlan: &UpgradeGovernancePendingPlan{
+					Name: "app-v27", TargetAppVersion: 27, ActivationHeight: 900,
+				},
+			},
+			maxSupport: 27,
+		},
+		{
+			name: "supported active upgrade ballot continues automatically",
+			status: &UpgradeGovernanceStatus{
+				CurrentAppVersion: 26,
+				ActiveProposal: &UpgradeGovernanceActiveProposal{
+					ProposalID: "proposal-27", Operation: "upgrade",
+					OperationCode:    uint8(governance.OpUpgrade),
+					TargetAppVersion: &target27,
+				},
+			},
+			maxSupport: 27,
+		},
+		{
+			name: "ordinary ballot is compatible",
+			status: &UpgradeGovernanceStatus{
+				CurrentAppVersion: 27,
+				ActiveProposal: &UpgradeGovernanceActiveProposal{
+					ProposalID: "validator-change",
+					Operation:  "add_validator", OperationCode: uint8(governance.OpAddValidator),
+				},
+			},
+			maxSupport: 27,
+		},
+		{
+			name:       "current chain exceeds support",
+			status:     &UpgradeGovernanceStatus{CurrentAppVersion: 28},
+			maxSupport: 27,
+			wantError:  "current app version 28",
+		},
+		{
+			name: "pending target exceeds support",
+			status: &UpgradeGovernanceStatus{
+				CurrentAppVersion: 27,
+				PendingPlan: &UpgradeGovernancePendingPlan{
+					Name: "app-v28", TargetAppVersion: 28, ActivationHeight: 900,
+				},
+			},
+			maxSupport: 27,
+			wantError:  "targets app-v28",
+		},
+		{
+			name: "active upgrade target must be decoded",
+			status: &UpgradeGovernanceStatus{
+				CurrentAppVersion: 27,
+				ActiveProposal: &UpgradeGovernanceActiveProposal{
+					ProposalID: "proposal-missing-target", Operation: "upgrade",
+					OperationCode: uint8(governance.OpUpgrade),
+				},
+			},
+			maxSupport: 27,
+			wantError:  "has no decoded target app version",
+		},
+		{
+			name: "active upgrade target exceeds support",
+			status: &UpgradeGovernanceStatus{
+				CurrentAppVersion: 27,
+				ActiveProposal: &UpgradeGovernanceActiveProposal{
+					ProposalID: "proposal-28", Operation: "upgrade",
+					OperationCode:    uint8(governance.OpUpgrade),
+					TargetAppVersion: func() *uint64 { value := uint64(28); return &value }(),
+				},
+			},
+			maxSupport: 27,
+			wantError:  "targets app-v28",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.status.ValidateBinaryReplacement(tt.maxSupport)
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
 func TestUpgradeGovernanceStatusReportsNonUpgradeBallotWithoutDecodingPayload(t *testing.T) {
 	app := setupTestApp(t)
 	proposal := &governance.ProposalState{
