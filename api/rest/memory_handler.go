@@ -1009,15 +1009,22 @@ func (s *Server) resolveVisibleSubmittersOrError(agentID string) ([]string, bool
 	if visibleAgents == "*" {
 		return nil, true, nil
 	}
-	if s.badgerStore != nil && s.agentHasTopSecretClearance(agentID) {
-		return nil, true, nil
+	if s.badgerStore != nil {
+		topSecret, clearanceErr := s.agentHasTopSecretClearanceOrError(agentID)
+		if clearanceErr != nil {
+			return nil, false, fmt.Errorf("%w: top-secret visibility state: %w", errAccessControlOperational, clearanceErr)
+		}
+		if topSecret {
+			return nil, true, nil
+		}
 	}
 	allowed := []string{agentID}
 	if visibleAgents != "" {
 		var list []string
-		if json.Unmarshal([]byte(visibleAgents), &list) == nil {
-			allowed = append(allowed, list...)
+		if err := json.Unmarshal([]byte(visibleAgents), &list); err != nil {
+			return nil, false, fmt.Errorf("%w: visible-agent policy is invalid: %w", errAccessControlOperational, err)
 		}
+		allowed = append(allowed, list...)
 	}
 	return allowed, false, nil
 }
@@ -1151,23 +1158,36 @@ func (s *Server) hasMemoryReadAccess(domain, agentID string, classification uint
 // for trusted agents without forcing admins to configure visible_agents="*"
 // per member. Iterates every org membership — TS in one org is enough.
 func (s *Server) agentHasTopSecretClearance(agentID string) bool {
+	allowed, err := s.agentHasTopSecretClearanceOrError(agentID)
+	return err == nil && allowed
+}
+
+// agentHasTopSecretClearanceOrError is the error-preserving variant used when
+// a caller must distinguish an ordinary lack of top-secret visibility from an
+// unavailable org-membership policy store. Existing list/recall paths retain
+// the historical fail-closed bool helper above; the link graph must instead
+// surface an operational failure so it never reports a false complete graph.
+func (s *Server) agentHasTopSecretClearanceOrError(agentID string) (bool, error) {
 	if s.badgerStore == nil {
-		return false
+		return false, nil
 	}
 	orgIDs, err := s.badgerStore.ListAgentOrgs(agentID)
-	if err != nil || len(orgIDs) == 0 {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if len(orgIDs) == 0 {
+		return false, nil
 	}
 	for _, orgID := range orgIDs {
 		clearance, _, gerr := s.badgerStore.GetMemberClearance(orgID, agentID)
 		if gerr != nil {
-			continue
+			return false, gerr
 		}
 		if clearance >= uint8(tx.ClearanceTopSecret) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // --- Handlers ----------------------------------------------------------------

@@ -280,6 +280,28 @@ func TestResolveVisibleSubmittersSurfacesDirectoryFailure(t *testing.T) {
 	require.Nil(t, allowed)
 }
 
+func TestResolveVisibleSubmittersSurfacesMalformedVisibilityPolicy(t *testing.T) {
+	srv, _, badger, _ := newRBACTestServer(t)
+	const agentID = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	require.NoError(t, badger.RegisterAgent(agentID, "a", "member", "", "test", "", 1))
+	require.NoError(t, badger.SetAgentPermission(agentID, 1, "", "not-json", "", ""))
+
+	allowed, seeAll, err := srv.resolveVisibleSubmittersOrError(agentID)
+	require.Error(t, err, "a malformed visibility policy must be surfaced")
+	require.True(t, isAccessControlOperationalError(err), "the failure must be typed operational")
+	require.False(t, seeAll)
+	require.Nil(t, allowed)
+}
+
+func TestTopSecretVisibilitySurfacesOrgStoreFailure(t *testing.T) {
+	srv, _, badger, _ := newRBACTestServer(t)
+	require.NoError(t, badger.CloseBadger())
+
+	allowed, err := srv.agentHasTopSecretClearanceOrError("some-agent-id")
+	require.Error(t, err, "an org-membership store failure must be surfaced")
+	require.False(t, allowed)
+}
+
 // TestGetLinksAmongDoesNotLeakProtectedRecordExistence is the blocker-1 regression:
 // a protected (unsafe/unpublished projection) record must be indistinguishable from
 // an absent id. Before the fix, a disclosure error on the protected record surfaced
