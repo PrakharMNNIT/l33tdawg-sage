@@ -25,6 +25,25 @@ restarts the node. A compatible pending plan or ballot is preserved and
 continues after restart. There is no terminal command or manual preflight in
 the normal desktop flow.
 
+> **Exception: leaving v11.19.3.** Do not use the v11.19.3 live updater for the
+> v11.19.4 transition. Its compatibility check and snapshot fence were separate
+> lock acquisitions. Follow the stopped-node v11.19.3 procedure below. Once
+> v11.19.4 is running, the live updater uses one atomic proof again.
+
+### Required one-time procedure: v11.19.3 to v11.19.4
+
+1. Stop SAGE. On a quorum chain, stop every validator under the coordinated
+   maintenance procedure.
+2. Retain a complete backup made while stopped: `sage-gui backup --full`.
+3. Install the v11.19.4 binary or app without starting it.
+4. Run `sage-gui upgrade preflight` against the exact stopped data directory.
+5. Continue only if every validator reports `COMPATIBLE` and the expected
+   identical application state; otherwise restore the previous executable and
+   resolve the canonical governance state before retrying.
+6. Start v11.19.4.
+
+This avoids executing the vulnerable v11.19.3 live-update sequence entirely.
+
 > **Install SAGE v11.18.0 or later before you back up.** That is the concrete
 > minimum for `backup --full`, `restore --from`, `upgrade preflight`, and the
 > `upgrade lineage` commands; v10.x and older v11 binaries do not provide this
@@ -140,6 +159,7 @@ Use this to work out how far your chain has to climb.
 | v11.19.1 | Payload-free cursor-paginated recovery for other-session claims, TTL-consistent counts, and session-fenced/idempotent recovery and reply for provider-addressed compatibility messages; includes an off-chain SQLite claim-receipt backfill, no consensus change, and app-v27 remains the ceiling |
 | v11.19.2 | Consensus-authoritative pending-plan and active-ballot inspection through live `upgrade status` and stopped-node `upgrade preflight`; malformed or inconsistent canonical state fails closed; no consensus change, and app-v27 remains the ceiling |
 | v11.19.3 | The normal updater performs the canonical compatibility check itself, carries supported in-flight governance through its verified recovery snapshot, and requires no user CLI or prompt; malformed or unsupported state still fails before executable mutation |
+| v11.19.4 | Replacement capability is read from the exact candidate binary, while governance validation plus committed height/AppHash capture remain under one uninterrupted runtime fence; fixes the v11.19.3 live-updater TOCTOU without changing app-v27 |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

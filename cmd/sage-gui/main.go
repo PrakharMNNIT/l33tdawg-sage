@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	sageabci "github.com/l33tdawg/sage/internal/abci"
 	"github.com/l33tdawg/sage/internal/store"
 	"github.com/l33tdawg/sage/web"
 )
@@ -182,7 +183,7 @@ func main() {
 	case "mcp-token":
 		err = runMCPToken()
 	case "version":
-		fmt.Printf("sage-gui %s (commit %s, built %s)\n", version, commit, date)
+		fmt.Printf("sage-gui %s (commit %s, built %s, max-app-v%d)\n", version, commit, date, sageabci.MaxSupportedAppVersion())
 	case "help", "--help", "-h":
 		printUsage()
 	default:
