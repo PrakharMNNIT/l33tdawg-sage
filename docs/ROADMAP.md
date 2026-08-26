@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.5 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.6 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -119,6 +119,12 @@ identity across stdio, Streamable HTTP, and SSE, and revision-fences every
 explicit claim handoff. Its separate payload-free inbox activity sequence lets
 host hooks notice fresh task assignments and replies without changing message
 wake or Stop semantics.
+v11.19.6 exposes typed memory relationships through one bounded REST projection
+and the `sage_get_links` MCP tool. It filters both endpoints through the
+caller's domain and record disclosure policy before querying the graph, and
+surfaces unavailable authorization state instead of returning a false complete
+empty graph. Personal-node upgrades remain automatic and updater-owned; manual
+stopped-node preflight is scoped to quorum or externally managed governance.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -129,6 +135,25 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.6 release
+
+`POST /v1/memory/links` accepts a bounded memory-ID set and returns only typed
+links whose two endpoints are both requested and readable by the caller. The
+new `sage_get_links` MCP tool exposes the same batched projection, allowing a
+recall result to be followed by explicit `supports`, `contradicts`,
+`supersedes`, and `refines` reasoning without N+1 reads.
+
+Domain and record-level authorization run before the link-store query, so an
+unreadable endpoint cannot leak through an edge. Malformed or unavailable
+legacy visibility policy is an explicit operational failure, never a false
+complete graph. The feature is read-only and off-consensus; app-v27 remains the
+ceiling.
+
+The personal desktop upgrade contract is explicitly one-click: SAGE performs
+the compatibility proof, recovery and stopped-state snapshots, coordinated
+shutdown, install, rollback on failure, and restart. Manual preflight remains
+an operator procedure for quorum or externally mutable governance only.
 
 ## v11.19.5 release
 
