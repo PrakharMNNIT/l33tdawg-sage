@@ -406,7 +406,7 @@ Applied when `domainAccessApproved == false` and the domain has a registered own
 - `agentID == nodeOperatorID` → `seeAll = true` (node operator bypass)
 - `role == "admin"` → `seeAll = true`
 - `visible_agents == "*"` → `seeAll = true`
-- **Any org member with clearance=4 (TOP SECRET)** → `seeAll = true` (`agentHasTopSecretClearance` check, `memory_handler.go:1153`)
+- **Any org member with clearance=4 (TOP SECRET)** → `seeAll = true` (`agentHasTopSecretClearance` check, `memory_handler.go:1160`)
 - Otherwise: agent sees memories from `[agentID] + parsed(visible_agents)` list
 
 If `seeAll == false`, `opts.SubmittingAgents` is set to the allowed list, which `QuerySimilar` uses to filter at the PostgreSQL level.
