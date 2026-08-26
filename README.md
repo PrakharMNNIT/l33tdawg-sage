@@ -51,6 +51,29 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.6
+
+**Typed memory relationships are now readable through the public API and MCP.**
+`POST /v1/memory/links` accepts up to 256 memory IDs and returns typed
+`supports`, `contradicts`, `supersedes`, and `refines` edges only when both
+endpoints are in that set and readable by the caller. The new `sage_get_links`
+MCP tool exposes the same projection, so an agent can recall memories and then
+reason over their explicit relationships without an N+1 query loop.
+
+The read path filters every requested memory through domain and record-level
+authorization before querying links. Unreadable endpoints—and therefore their
+existence—remain undisclosed. Authorization-policy storage failures are
+reported as unavailable instead of being flattened into a false complete empty
+graph. This is an off-consensus projection read: it changes no transaction,
+AppHash, fork target, or application version, and app-v27 remains the ceiling.
+
+Personal single-node upgrades remain one-click. The updater owns the canonical
+compatibility proof, recovery snapshot, coordinated shutdown, final stopped
+snapshot, atomic install, rollback, and restart. Manual stopped-node preflight
+is for quorum or externally managed governance, not the normal desktop flow.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.6`. SDK 11.19.6.
+
 ## What's New in v11.19.5
 
 **Claim recovery and host wake coordination now survive real multi-transport
@@ -2295,7 +2318,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.5`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.6`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
