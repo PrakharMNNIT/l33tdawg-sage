@@ -51,6 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.3
+
+**Normal upgrades now preserve compatible governance state automatically.**
+The desktop updater reads the canonical pending plan and active proposal under
+one runtime-consistent view before changing the executable. A supported
+in-flight upgrade is included in the existing verified recovery snapshot and
+continues after restart; it is not a reason to interrupt the user or block the
+update. No terminal command, preflight ceremony, or governance expertise is
+required.
+
+Malformed canonical state, an undecodable upgrade ballot, or a target newer
+than this binary supports still fails closed before executable mutation. The
+technical `upgrade status` and stopped-node `upgrade preflight` commands remain
+available for headless and quorum operators, but they are diagnostics rather
+than steps in the normal desktop upgrade flow.
+
+This patch changes no consensus rule, AppHash input, transaction type, key
+encoding, fork target, or application version. Existing app-v27 chains replay
+byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.3`. SDK 11.19.3.
+
 ## What's New in v11.19.2
 
 **Binary replacement now has consensus-authoritative upgrade-governance
@@ -64,17 +86,9 @@ instead of being misreported as an empty plan or ballot.
 `sage-gui upgrade status` now consumes that fail-closed query rather than
 inferring safety from `/abci_info` plus the off-chain dashboard projection. The
 stopped-node `sage-gui upgrade preflight` command uses the same canonical
-inspector before the new server starts and blocks binary replacement whenever
-either a pending plan or active governance ballot exists.
-
-**One-time rollout from v11.19.1 or earlier:** stop every validator, take and
-retain a full backup, install the v11.19.2 binary without starting SAGE, and run
-`sage-gui upgrade preflight` against every validator's stopped data directory.
-Continue only when every node reports the identical app state and
-`Binary replacement guard ... CLEAR`. If any node reports `BLOCKED` or an
-inspection error, do not replace or restart the validator set; resume the old
-binaries under the existing coordinated upgrade procedure until canonical
-pending state is resolved, then stop and inspect again.
+inspector before the new server starts. v11.19.3 integrates that compatibility
+decision into the normal updater and lets supported in-flight operations
+continue automatically.
 
 This patch changes no consensus rule, AppHash input, transaction type, key
 encoding, fork target, or application version. Existing app-v27 chains replay
@@ -2216,7 +2230,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.2`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.3`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
@@ -2255,11 +2269,10 @@ not an unauthenticated MCP endpoint.
 ### Upgrading from an older version?
 
 **Upgrading an existing node — including the v10.x → v11 jump — is
-[docs/UPGRADING.md](docs/UPGRADING.md).** Short version: install **v11.18.0 or
-later**, stop the node, `sage-gui backup --full`, `sage-gui upgrade preflight`,
-then start it. (The binary comes first because it is what provides those
-commands — an older one ignores `--full` and silently backs up the SQLite
-projection instead.)
+[docs/UPGRADING.md](docs/UPGRADING.md).** In the desktop app, accept the update:
+SAGE verifies canonical upgrade compatibility, captures a full recovery
+snapshot, installs, and restarts automatically. Headless and quorum operators
+have separate technical procedures in the guide.
 Your chain advances in place; a personal node climbs the consensus fork ladder by
 itself. Read the guide before a multi-admin chain crosses app-v23 — that
 activation re-derives administrator authority.

@@ -19,20 +19,11 @@ differently.
 
 ## TL;DR for a personal (single-node) install
 
-```bash
-# 1. Install the new binary FIRST. It does not touch your data directory,
-#    and it is what provides the backup/preflight commands below.
-# 2. Stop SAGE.
-# 3. Take a real backup and check the chain can make the climb:
-sage-gui backup --full
-sage-gui upgrade preflight
-
-# 4. Start the new binary:
-sage-gui serve
-
-# 5. Watch the ladder climb (it is automatic on a personal node):
-sage-gui upgrade status
-```
+Accept the update in SAGE. The updater checks canonical governance state,
+captures and verifies a full recovery snapshot, installs the new release, and
+restarts the node. A compatible pending plan or ballot is preserved and
+continues after restart. There is no terminal command or manual preflight in
+the normal desktop flow.
 
 > **Install SAGE v11.18.0 or later before you back up.** That is the concrete
 > minimum for `backup --full`, `restore --from`, `upgrade preflight`, and the
@@ -43,32 +34,31 @@ sage-gui upgrade status
 > `sage-gui upgrade lineage verify --help`; if it is not recognized, your
 > binary predates the complete v11.18.0 recovery toolset.
 
-### First upgrade to v11.19.2: prove replacement safety while stopped
+### Technical stopped-node compatibility check
 
-v11.19.1 and earlier cannot authoritatively expose a pending upgrade plan or
-active governance ballot through the live CLI. For the first upgrade to
-v11.19.2, stop every validator, retain a full backup, install the new binary
-without starting SAGE, and run:
+Headless and quorum operators replacing raw binaries can inspect canonical
+state while a node is stopped:
 
 ```bash
 sage-gui upgrade preflight
 ```
 
-The command opens canonical Badger state read-only and must report:
+The command opens canonical Badger state read-only and reports compatibility
+with the installed binary:
 
 ```text
 Binary replacement guard (canonical stopped-node state):
   pending plan : none
   active ballot: none
-  VERDICT      : CLEAR — no pending upgrade plan or active governance ballot.
+  VERDICT      : COMPATIBLE — no in-flight upgrade governance state.
 ```
 
-On a quorum chain, require this result and identical application state from
-every validator before restarting any of them. `BLOCKED`, an inspection error,
-or disagreement means do not replace or restart the validator set. Resume the
-old binaries under the existing coordinated upgrade procedure until canonical
-pending state is resolved, then stop, back up, and inspect again. Never edit
-Badger to manufacture a clear result.
+Supported pending plans and upgrade ballots are also `COMPATIBLE`: their exact
+state is retained and they continue after restart. `INCOMPATIBLE`, an
+inspection error, or validator disagreement means the target is malformed or
+newer than the installed binary supports; do not mutate the executable or edit
+Badger to manufacture a result. The desktop updater performs this same check
+automatically before it changes the installed application.
 
 On a personal node that is the whole upgrade. The node proposes and activates
 each consensus fork by itself until it reaches the binary's ceiling.
@@ -149,6 +139,7 @@ Use this to work out how far your chain has to climb.
 | v11.19.0 | app-v27: static reserved shared-domain record authors gain hard-denial-preserving challenge/reinstate authority; omitted new-task `task_status` canonicalizes to `planned` |
 | v11.19.1 | Payload-free cursor-paginated recovery for other-session claims, TTL-consistent counts, and session-fenced/idempotent recovery and reply for provider-addressed compatibility messages; includes an off-chain SQLite claim-receipt backfill, no consensus change, and app-v27 remains the ceiling |
 | v11.19.2 | Consensus-authoritative pending-plan and active-ballot inspection through live `upgrade status` and stopped-node `upgrade preflight`; malformed or inconsistent canonical state fails closed; no consensus change, and app-v27 remains the ceiling |
+| v11.19.3 | The normal updater performs the canonical compatibility check itself, carries supported in-flight governance through its verified recovery snapshot, and requires no user CLI or prompt; malformed or unsupported state still fails before executable mutation |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
@@ -530,9 +521,10 @@ comes from the local executable. `Pending plan` is the canonical
 `upgrade:plan` record; `Active ballot` is the canonical `state:gov:active`
 proposal and includes the decoded target app version for an upgrade ballot.
 The command exits non-zero if either record cannot be read or decoded. Do not
-substitute `sage_gov_status` for this pre-upgrade safety check: that MCP tool is
-useful for vote progress, but reads the off-chain dashboard projection rather
-than the canonical Badger state.
+substitute `sage_gov_status` for canonical diagnostics: that MCP tool is useful
+for vote progress, but reads the off-chain dashboard projection rather than the
+canonical Badger state. Normal desktop upgrades perform the canonical check
+internally and do not require this command.
 
 Thirteen rungs take a while: each activation waits out an upgrade delay of at
 least 200 blocks. **This is normal.** An idle SAGE chain mints no blocks at all,

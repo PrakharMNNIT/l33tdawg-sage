@@ -1,4 +1,4 @@
-<!-- Reference index reconciled for SAGE v11.19.2. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
+<!-- Reference index reconciled for SAGE v11.19.3. Core REST, MCP, concepts, Python SDK, federation/brain graph, reranker, and environment references are current-facing for v11. -->
 
 
 # SAGE Reference — Agent Integration Index
@@ -47,7 +47,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | You want to… | Go to |
 |--------------|-------|
 | Upgrade an existing node to a newer release (incl. v10.x → v11) | [`../UPGRADING.md`](../UPGRADING.md) — v11.18.0 minimum, full backup/restore, preflight, the app-version ladder, governed legacy-lineage recovery, and app-v23 admin migration |
-| Prove no upgrade plan or upgrade ballot is pending before replacing binaries | `sage-gui upgrade status` — fail-closed canonical `/upgrade/governance-status` ABCI state; see [`../UPGRADING.md`](../UPGRADING.md) |
+| Upgrade without handling governance state manually | Use the desktop updater; it validates canonical `/upgrade/governance-status`, snapshots compatible in-flight state, and restarts automatically. `sage-gui upgrade status` is a technical diagnostic; see [`../UPGRADING.md`](../UPGRADING.md) |
 | Boot your memory at conversation start | **Boot sequence** below, then [`mcp-tools.md`](mcp-tools.md) |
 | Submit a memory with a clearance level | [`python-sdk.md`](python-sdk.md) `propose()` / [`rest-api.md`](rest-api.md) `POST /v1/memory/submit` |
 | Understand why another agent can't see your memory | [`concepts/clearance-classification.md`](concepts/clearance-classification.md) + [`concepts/rbac-orgs-federation.md`](concepts/rbac-orgs-federation.md) |
@@ -207,7 +207,7 @@ are recorded here because agents may have cached them.
   `sage_message_replies`, or `sage_message_history(folder="outbox")` for the
   untruncated text.
 
-## Related docs (reconciled through v11.19.2)
+## Related docs (reconciled through v11.19.3)
 
 These were stale earlier in v8 and have now been reconciled against the code. Where any of them still disagrees with this reference, this reference wins.
 
