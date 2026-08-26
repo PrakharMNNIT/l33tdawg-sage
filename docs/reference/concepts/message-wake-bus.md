@@ -143,7 +143,7 @@ channel gate remains unverified. Enable it with `SAGE_CLAUDE_CHANNEL=1` only
 after confirming that delivery path. Codex is always refused because it cannot
 consume that method and must not occupy the exclusive wake lease. Other hosts
 remain off unless explicitly enabled
-(`claudeChannelEnabled`, `mcp.go:333`). Constructing an MCP `Server` never
+(`claudeChannelEnabled`, `mcp.go:347`). Constructing an MCP `Server` never
 advertises or emits the experimental protocol on its own; the executable still
 makes an explicit enablement call (`EnableRESTClaudeChannel`, `internal/mcp/claude_wake_source.go:85`)
 through `ConfigureClaudeChannel` (`internal/mcp/claude_channel.go:50`).
@@ -181,13 +181,13 @@ command hook for Claude Code and Codex that reads the signed, lease-free
 `/v1/messages/wake-state` snapshot as the verified continuation path. The check is on by default when
 `SAGE_PROVIDER=claude-code` or `SAGE_PROVIDER=codex`; legacy installed Stop
 hooks with no provider label also default on. Set `SAGE_STOP_NUDGE=0` (or another accepted false
-spelling) to opt out (`stopNudgeEnabled`, `cmd/sage-gui/hook.go:665`).
+spelling) to opt out (`stopNudgeEnabled`, `cmd/sage-gui/hook.go:701`).
 
 When the durable cursor has advanced and unfinished work exists, the hook emits
 Codex's documented top-level `{"decision":"block","reason":"..."}` result.
 The host converts that result into one continuation prompt for the same thread, so
 the agent calls the canonical inbox operation before the turn becomes idle
-(`runHookStopCheck`, `cmd/sage-gui/hook.go:681`). The check never acquires the
+(`runHookStopCheck`, `cmd/sage-gui/hook.go:717`). The check never acquires the
 SSE lease, never sees message content or sender, refuses `SubagentStop`, blocks
 at most once per newer cursor and session, and fails open on every error.
 

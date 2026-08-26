@@ -124,6 +124,8 @@ func main() {
 		}
 	case "hook":
 		err = runHook()
+	case "nevercompact":
+		err = runNeverCompact(os.Args[2:])
 	case "codex":
 		if len(os.Args) > 2 && os.Args[2] == "install" {
 			err = runCodexInstall()
