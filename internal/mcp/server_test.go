@@ -769,7 +769,7 @@ func TestAdvertisedToolsExactlyMatchReferenceHeadings(t *testing.T) {
 	doc, err := os.ReadFile(docPath)
 	require.NoError(t, err)
 	docText := string(doc)
-	assert.Contains(t, docText, "SAGE advertises exactly 33 MCP tools",
+	assert.Contains(t, docText, "SAGE advertises exactly 34 MCP tools",
 		"the human-readable inventory count must match tools/list")
 	assert.Contains(t, docText, "One call consumes at most one bounded peer page",
 		"sage_find_agent must document its advertised peer_cursor contract")
