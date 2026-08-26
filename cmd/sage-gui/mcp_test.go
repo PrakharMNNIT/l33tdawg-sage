@@ -152,7 +152,7 @@ func TestUserPromptHookModeBehavior(t *testing.T) {
 	}{
 		{name: "full", mode: "full", wantPointer: true, wantTurn: true},
 		{name: "bookend", mode: "bookend", wantPointer: true, wantTurn: false},
-		{name: "on-demand", mode: "on-demand", wantPointer: false, wantTurn: false},
+		{name: "on-demand", mode: "on-demand", wantPointer: true, wantTurn: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -188,8 +188,8 @@ func TestUserPromptHookReportsInboxProbeFailure(t *testing.T) {
 }
 
 func TestHookScripts_OnDemandModeCheck(t *testing.T) {
-	// All speaking scripts must honor on-demand mode by exiting/suppressing
-	// output. The Stop script is silent unconditionally so it's exempt.
+	// Memory automation honors on-demand mode. UserPromptSubmit still speaks
+	// when coordination changed, independently of memory cadence.
 	for _, s := range []string{
 		sageSessionStartTemplate,
 		sageSessionEndTemplate,

@@ -6,6 +6,10 @@ const root = new URL('../', import.meta.url);
 const read = (path) => readFileSync(new URL(path, root), 'utf8');
 const server = JSON.parse(read('server.json'));
 const version = server.version;
+const federationProjectVersion = version
+  .split('.')
+  .map((part, index) => index === 0 ? part : part.padStart(2, '0'))
+  .join('');
 
 test('release-facing version metadata stays aligned', () => {
   assert.match(
@@ -25,6 +29,7 @@ test('release-facing version metadata stays aligned', () => {
     ['sdk/python/pyproject.toml', `version = "${version}"`],
     ['sdk/python/src/sage_sdk/__init__.py', `__version__ = "${version}"`],
     ['api/openapi.yaml', `version: ${version}`],
+    ['api/openapi.yaml', 'required: [version, epoch, seq]'],
     ['desktop/sage-shell/Cargo.toml', `version = "${version}"`],
     ['desktop/sage-shell/Cargo.lock', `name = "sage-shell"\nversion = "${version}"`],
     ['desktop/sage-shell/tauri.conf.json', `"version": "${version}"`],
@@ -46,6 +51,7 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/reference/mcp-tools.md', `internal/mcp for SAGE v${version}`],
     ['docs/reference/python-sdk.md', `Version:** ${version}`],
     ['docs/reference/rest-api.md', `Reconciled through SAGE v${version}`],
+    ['docs/reference/rest-api.md', 'returning exactly `{version,epoch,seq}`'],
     ['docs/reference/concepts/rbac-orgs-federation.md', `reconciled through SAGE v${version}`],
     ['docs/reference/app-v23-access-control-design.md', `SAGE v${version}`],
     ['docs/reference/upgrade-lineage-repair.md', `SAGE v${version}`],
@@ -60,13 +66,13 @@ test('release-facing version metadata stays aligned', () => {
     ['deploy/federation-acceptance/README.md', `# v${version} federation Docker acceptance`],
     ['docs/FEDERATION.md', `Verified against SAGE v${version} federation behavior`],
     ['docs/reference/concepts/message-reply-lifecycle.md', `SAGE v${version} code`],
-    ['docs/UPGRADING.md', `| v${version} | Replacement capability is read from the exact candidate binary`],
+    ['docs/UPGRADING.md', `| v${version} | Exact-local receipt repair, durable transport-scoped claimant identities`],
     ['docs/ROADMAP.md', `## v${version} release`],
     ['docs/UPGRADING.md', 'The recovery commands in this guide require SAGE v11.18.0 or later.'],
     ['docs/UPGRADING.md', '`backup --full`, `restore --from`,'],
     ['docs/UPGRADING.md', '`upgrade lineage status|doctor|verify`'],
     ['deploy/federation-acceptance/Dockerfile.node', `ARG VERSION=v${version}-acceptance`],
-    ['deploy/federation-acceptance/docker-compose.yml', 'name: sage-v111904-federation'],
+    ['deploy/federation-acceptance/docker-compose.yml', `name: sage-v${federationProjectVersion}-federation`],
     ['deploy/federation-acceptance/docker-compose.yml', `VERSION: v${version}-acceptance`],
     ['docs/reference/app-v23-access-control-design.md', '## App-v24 readiness and memory-write barrier'],
     ['docs/reference/mcp-tools.md', 'A level-2 grant is never a remedy for a hard'],

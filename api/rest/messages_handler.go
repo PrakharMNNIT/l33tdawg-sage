@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -258,6 +259,7 @@ func (s *Server) handleMessagesReceive(w http.ResponseWriter, r *http.Request) {
 		Trust              string    `json:"trust"`
 		SecurityNotice     string    `json:"security_notice"`
 		ClaimantSessionID  string    `json:"claimant_session_id,omitempty"`
+		ClaimRevision      uint64    `json:"claim_revision"`
 	}
 	agentIDs := make([]string, 0, len(items))
 	for _, item := range items {
@@ -277,6 +279,7 @@ func (s *Server) handleMessagesReceive(w http.ResponseWriter, r *http.Request) {
 			Authority: pipeRequestAuthority, Trust: pipeLocalTrust,
 			SecurityNotice:    pipeRESTRequestSecurityNotice,
 			ClaimantSessionID: item.ClaimedSessionID,
+			ClaimRevision:     item.ClaimRevision,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -341,7 +344,8 @@ func (s *Server) handleMessagesClaimedElsewhere(w http.ResponseWriter, r *http.R
 	for _, item := range items {
 		entry := map[string]any{
 			"message_id": item.MessageID, "claimant_session_id": item.ClaimantSessionID,
-			"created_at": item.CreatedAt, "expires_at": item.ExpiresAt, "foreign": item.Foreign,
+			"claim_revision": item.ClaimRevision,
+			"created_at":     item.CreatedAt, "expires_at": item.ExpiresAt, "foreign": item.Foreign,
 		}
 		if item.ClaimedAt != nil {
 			entry["claimed_at"] = item.ClaimedAt
@@ -409,7 +413,7 @@ func (s *Server) handleOwnClaimedUnfinishedMessages(w http.ResponseWriter, r *ht
 			"message_id": item.PipeID, "from_agent": item.FromAgent,
 			"intent": item.Intent, "payload": item.Payload, "status": item.Status,
 			"created_at": item.CreatedAt, "expires_at": item.ExpiresAt,
-			"claimant_session_id": claimantSessionID, "already_claimed_by_you": true,
+			"claimant_session_id": claimantSessionID, "claim_revision": item.ClaimRevision, "already_claimed_by_you": true,
 			"requires_reply": true, "authority": pipeRequestAuthority, "trust": pipeLocalTrust,
 			"security_notice": pipeRESTRequestSecurityNotice,
 		}
@@ -440,16 +444,19 @@ func (s *Server) handleMessageHandoff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		FromSessionID string `json:"from_session_id"`
-		ToSessionID   string `json:"to_session_id"`
+		FromSessionID string  `json:"from_session_id"`
+		ToSessionID   string  `json:"to_session_id"`
+		FromRevision  *uint64 `json:"from_revision"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeProblem(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
 	if req.FromSessionID == "" || req.ToSessionID == "" ||
+		req.FromSessionID == req.ToSessionID ||
+		(req.FromRevision != nil && *req.FromRevision >= math.MaxInt64) ||
 		len(req.FromSessionID) > store.MaxMessageClaimantSessionBytes || len(req.ToSessionID) > store.MaxMessageClaimantSessionBytes {
-		writeProblem(w, http.StatusBadRequest, "Invalid claimant session", "from_session_id and to_session_id are required and bounded")
+		writeProblem(w, http.StatusBadRequest, "Invalid claimant fence", "distinct, bounded session IDs and a representable revision are required")
 		return
 	}
 	messageStore, ok := canonicalMessageStore(s)
@@ -457,8 +464,12 @@ func (s *Server) handleMessageHandoff(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusNotImplemented, "Messages unavailable", "The active store does not support canonical messages.")
 		return
 	}
-	replayed, err := messageStore.HandoffLocalMessageClaim(r.Context(), middleware.ContextAgentID(r.Context()),
-		chi.URLParam(r, "message_id"), req.FromSessionID, req.ToSessionID)
+	expectedRevision := uint64(0)
+	if req.FromRevision != nil {
+		expectedRevision = *req.FromRevision
+	}
+	replayed, revision, err := messageStore.HandoffLocalMessageClaim(r.Context(), middleware.ContextAgentID(r.Context()),
+		chi.URLParam(r, "message_id"), req.FromSessionID, req.ToSessionID, expectedRevision)
 	if err != nil {
 		if errors.Is(err, store.ErrMessageReceiveConflict) {
 			writeProblem(w, http.StatusConflict, "Claimant session changed", "The message is no longer assigned to from_session_id; refresh passive history before retrying.")
@@ -468,7 +479,7 @@ func (s *Server) handleMessageHandoff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"message_id": chi.URLParam(r, "message_id"),
-		"claimant_session_id": req.ToSessionID, "idempotent_replay": replayed})
+		"claimant_session_id": req.ToSessionID, "claim_revision": revision, "idempotent_replay": replayed})
 }
 
 func (s *Server) handleFederatedMessageClaimSession(w http.ResponseWriter, r *http.Request) {

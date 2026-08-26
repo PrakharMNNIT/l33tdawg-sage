@@ -570,6 +570,11 @@ func (s *SQLiteStore) ApplyFederatedPipelineResult(ctx context.Context, pipeID, 
 		if n, _ := res.RowsAffected(); n != 1 {
 			return fmt.Errorf("outbound pipeline %s is not awaiting a result", pipeID)
 		}
+		if msg.FromAgent != "" {
+			if _, activityErr := tx.AdvanceInboxActivity(ctx, msg.FromAgent); activityErr != nil {
+				return fmt.Errorf("advance federated reply inbox activity: %w", activityErr)
+			}
+		}
 		_, insertErr := tx.writeExecContext(ctx, `INSERT INTO pipeline_transport_dedup
 			(remote_chain_id, policy_epoch, agreement_id, contact_id, contact_revision,
 			 authorization_mode, linked_relation_digest,

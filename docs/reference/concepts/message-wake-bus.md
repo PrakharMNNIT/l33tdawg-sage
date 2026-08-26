@@ -9,7 +9,7 @@ claim, presence, or workflow evidence.
 
 ## Durable sequence
 
-The canonical `POST /v1/messages` path uses `SendLocalMessage` (`internal/store/messages.go:295-373`)
+The canonical `POST /v1/messages` path uses `SendLocalMessage` (`internal/store/messages.go:324-402`)
 to insert the pending `msg-*` row,
 caller-scoped idempotency binding, and the recipient's next
 `message_wake_state.seq` in one SQLite transaction. A fresh recipient begins at
@@ -18,10 +18,10 @@ advance the sequence. A rollback advances nothing.
 
 The deprecated `POST /v1/pipe/send` route now preserves the same wake invariant
 for exact local recipients. A request carrying `idempotency_key` uses the keyed
-`SendLocalMessage` (`internal/store/messages.go:295-373`) path. An unkeyed request uses
-`AdmitLocalMessage` (`internal/store/messages.go:374-410`), which inserts the row and allocates the
+`SendLocalMessage` (`internal/store/messages.go:324-402`) path. An unkeyed request uses
+`AdmitLocalMessage` (`internal/store/messages.go:403-439`), which inserts the row and allocates the
 sequence in one transaction without creating a replay mapping. After either
-fresh path commits, `handlePipeSend` (`api/rest/pipe_handler.go:640-1054`) publishes only the
+fresh path commits, `handlePipeSend` (`api/rest/pipe_handler.go:645-1059`) publishes only the
 returned process-local non-zero generation. A keyed replay loads
 the original row without `WakeSeq`, so it neither advances nor republishes the
 generation. Provider-only and federated rows have no exact local recipient and
@@ -83,6 +83,28 @@ frame to be strictly greater than the supplied cursor.
 without opening SSE or acquiring its exclusive consumer lease. It exists for
 short-lived host hooks that need a monotonic comparison but must not supersede,
 cancel, or compete with the long-running wake consumer.
+
+## Separate task and reply activity sequence
+
+`GET /v1/inbox/activity-state` is a fresh exact-signed, lease-free snapshot
+whose JSON contains exactly `version`, `epoch`, and `seq`. The opaque
+32-character `epoch` identifies the database incarnation. It survives process
+restart and backup restore with that database, while a fresh database generates
+a new value; clients compare epoch before seq so a preserved high cursor cannot
+suppress activity after reinitialization. The epoch carries no agent, message,
+task, or reply content. The per-agent sequence advances after a fresh task
+assignment notice is created and after a fresh local or federated reply is
+durably persisted. The activity increment shares the task/reply transaction, so
+a failed increment rolls that fresh write back instead of committing an event
+that the durable novelty surface cannot represent. Reads are passive. The
+activity state is coordination only, never delivery or workflow authority.
+
+This activity sequence is deliberately not the message wake sequence. It does
+not publish through `messageWakeBroker`, alter `pending`, or add a fourth field
+to the v1 `{version,seq,pending}` wake contract. Stop continues to inspect only
+unfinished message work. UserPromptSubmit may compare activity and ask the
+agent to call `sage_inbox` on the next prompt, but no hook can inject a turn
+after the host task is already idle.
 
 ## Broker and reconnect safety
 
@@ -159,13 +181,13 @@ command hook for Claude Code and Codex that reads the signed, lease-free
 `/v1/messages/wake-state` snapshot as the verified continuation path. The check is on by default when
 `SAGE_PROVIDER=claude-code` or `SAGE_PROVIDER=codex`; legacy installed Stop
 hooks with no provider label also default on. Set `SAGE_STOP_NUDGE=0` (or another accepted false
-spelling) to opt out (`stopNudgeEnabled`, `cmd/sage-gui/hook.go:455`).
+spelling) to opt out (`stopNudgeEnabled`, `cmd/sage-gui/hook.go:665`).
 
 When the durable cursor has advanced and unfinished work exists, the hook emits
 Codex's documented top-level `{"decision":"block","reason":"..."}` result.
 The host converts that result into one continuation prompt for the same thread, so
 the agent calls the canonical inbox operation before the turn becomes idle
-(`runHookStopCheck`, `cmd/sage-gui/hook.go:471`). The check never acquires the
+(`runHookStopCheck`, `cmd/sage-gui/hook.go:681`). The check never acquires the
 SSE lease, never sees message content or sender, refuses `SubagentStop`, blocks
 at most once per newer cursor and session, and fails open on every error.
 
