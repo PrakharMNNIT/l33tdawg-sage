@@ -741,6 +741,7 @@ func (s *Server) setupRouter() chi.Router {
 		r.Post("/v1/memory/{memory_id}/corroborate", s.handleCorroborateMemory)
 		r.Put("/v1/memory/{memory_id}/task-status", s.handleUpdateTaskStatus)
 		r.Post("/v1/memory/link", s.handleLinkMemories)
+		r.Post("/v1/memory/links", s.handleGetLinksAmong)
 		r.Get("/v1/memory/tasks", s.handleGetOpenTasks)
 		r.Get("/v1/memory/list", s.handleListMemoriesAuth)
 		r.Get("/v1/memory/timeline", s.handleTimelineAuth)

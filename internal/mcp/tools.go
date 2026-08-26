@@ -612,6 +612,22 @@ func (s *Server) registerTools() map[string]Tool {
 			},
 			Handler: s.toolLink,
 		},
+		"sage_get_links": {
+			Name:        "sage_get_links",
+			Description: "Read the typed links among a set of memories — the read side of the knowledge graph. Given memory IDs (e.g. the IDs a recall just returned), returns every typed link whose BOTH endpoints are in that set. Use it to reason over relationships: find what supersedes, contradicts, supports, or refines what among the memories you already have. Read-only; discloses only links between memories you can read.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"memory_ids": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Memory IDs to look up links among (both endpoints of a returned link are in this set).",
+					},
+				},
+				"required": []string{"memory_ids"},
+			},
+			Handler: s.toolGetLinks,
+		},
 	}
 	return tools
 }
@@ -2424,6 +2440,34 @@ func (s *Server) toolLink(ctx context.Context, params map[string]any) (any, erro
 		"link_type": linkType,
 		"status":    "linked",
 	}, nil
+}
+
+// toolGetLinks reads the typed links among a set of memories (the read side of the
+// knowledge graph). It wraps POST /v1/memory/links, which returns only links whose
+// both endpoints the caller may read.
+func (s *Server) toolGetLinks(ctx context.Context, params map[string]any) (any, error) {
+	raw, ok := params["memory_ids"].([]any)
+	if !ok || len(raw) == 0 {
+		return nil, fmt.Errorf("memory_ids is required and must be a non-empty array")
+	}
+	ids := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if str, ok := v.(string); ok && str != "" {
+			ids = append(ids, str)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("memory_ids must contain at least one non-empty ID")
+	}
+
+	body, _ := json.Marshal(map[string]any{"memory_ids": ids})
+	var resp struct {
+		Links []map[string]string `json:"links"`
+	}
+	if err := s.doSignedJSON(ctx, "POST", "/v1/memory/links", body, &resp); err != nil {
+		return nil, fmt.Errorf("get links: %w", err)
+	}
+	return map[string]any{"links": resp.Links}, nil
 }
 
 func (s *Server) toolList(ctx context.Context, params map[string]any) (any, error) {

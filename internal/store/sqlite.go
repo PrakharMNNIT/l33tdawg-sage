@@ -1944,7 +1944,7 @@ func (s *SQLiteStore) GetMemory(ctx context.Context, memoryID string) (*memory.M
 		&st, &parentHash, &createdAt, &committedAt, &deprecatedAt, &taskStatus, &r.Assignee)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("memory not found: %s", memoryID)
+			return nil, fmt.Errorf("%w: %s", ErrMemoryNotFound, memoryID)
 		}
 		return nil, fmt.Errorf("get memory: %w", err)
 	}
