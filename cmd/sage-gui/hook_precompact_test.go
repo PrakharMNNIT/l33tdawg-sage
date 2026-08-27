@@ -34,6 +34,8 @@ func TestDecodeConversationalText(t *testing.T) {
 		{"non-conversational role excluded", "system", `"x"`, "", false},
 		{"malformed object content", "user", `{"weird":true}`, "", false},
 		{"malformed number content", "assistant", `42`, "", false},
+		{"null content is malformed", "user", `null`, "", false},
+		{"absent content is malformed", "assistant", ``, "", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -64,6 +66,13 @@ func TestUnitsForRowGapSeparation(t *testing.T) {
 	g := unitsForRow(4, []byte(`not json`), 6000)
 	require.Len(t, g, 1)
 	require.Equal(t, unitRoleGap, g[0].Role)
+
+	// null conversational content → gap. json.Unmarshal(`null`) succeeds into both a
+	// string and a block slice, so without the explicit guard this silently decoded to
+	// empty and was excluded; it must instead emit one visible gap.
+	n := unitsForRow(6, []byte(`{"message":{"role":"user","content":null}}`), 6000)
+	require.Len(t, n, 1)
+	require.Equal(t, unitRoleGap, n[0].Role)
 
 	// a normal text turn → one text unit
 	x := unitsForRow(5, []byte(rowJSON("s", "user", "hi")), 6000)
@@ -148,6 +157,21 @@ func TestCaptureProgressCursor(t *testing.T) {
 	require.Equal(t, 2, part)
 }
 
+// TestCaptureProgressCursorRejectedMiddleSpan proves the cursor is the CONTIGUOUS
+// non-rejected prefix, not the maximum non-rejected end: a rejected MIDDLE span (11-20)
+// followed by a later accepted chunk (21-30) must roll the cursor back to 10 so 11-20 is
+// recaptured, not permanently skipped. Chunks are inserted out of start order to also
+// prove the ordering is by span, not insertion.
+func TestCaptureProgressCursorRejectedMiddleSpan(t *testing.T) {
+	p := &captureProgress{}
+	upsertChunk(p, chunkRecord{ChunkID: "m3", StartSeq: 21, StartPart: 0, EndSeq: 30, EndPart: 0, Status: "committed"})
+	upsertChunk(p, chunkRecord{ChunkID: "m1", StartSeq: 1, StartPart: 0, EndSeq: 10, EndPart: 0, Status: "committed"})
+	upsertChunk(p, chunkRecord{ChunkID: "m2", StartSeq: 11, StartPart: 0, EndSeq: 20, EndPart: 0, Status: "rejected"})
+	s, part := p.cursor()
+	require.Equal(t, 10, s, "cursor stops at the contiguous prefix; the rejected 11-20 span is recaptured, not skipped by 21-30")
+	require.Equal(t, 0, part)
+}
+
 func TestChunkUnitsResumeAfterCursorViaParse(t *testing.T) {
 	// Build a transcript file and parse with a cursor: only units strictly after the
 	// cursor are materialized (blocker 1/2 — no re-grouping of captured units).
@@ -219,6 +243,32 @@ func TestOpenValidatedTranscriptRejectsAncestorSymlink(t *testing.T) {
 	// request the transcript THROUGH the ancestor symlink
 	_, err := openValidatedTranscript(filepath.Join(link, "session.jsonl"))
 	require.Error(t, err, "a symlinked ancestor component must be rejected by the no-follow walk")
+}
+
+// TestOpenValidatedTranscriptCanonicalizedRoot reproduces the macOS canonicalized-root
+// failure on any platform: when the TRUSTED ROOT itself is reached through a symlink
+// (as /var → /private/var is on macOS), the root canonicalizes but the payload path
+// does not, so a namespace-mismatched comparison wrongly rejects a valid transcript.
+// The fix compares in the raw namespace while still walking from the canonical root, so
+// a valid transcript under the symlinked root is accepted — WITHOUT resolving any
+// below-root symlink (that rejection is covered by the test above).
+func TestOpenValidatedTranscriptCanonicalizedRoot(t *testing.T) {
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "realroot")
+	require.NoError(t, os.MkdirAll(filepath.Join(realRoot, "proj"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(realRoot, "proj", "session.jsonl"), []byte(`{"sessionId":"s"}`), 0o600))
+
+	// the configured root is a SYMLINK to the real root (models a symlinked ancestor
+	// like macOS /var). EvalSymlinks(root) != root, exactly the mismatch that bit.
+	linkRoot := filepath.Join(base, "linkroot")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	t.Setenv("SAGE_NEVERCOMPACT_TRANSCRIPT_ROOT", linkRoot)
+
+	f, err := openValidatedTranscript(filepath.Join(linkRoot, "proj", "session.jsonl"))
+	require.NoError(t, err, "a valid transcript under a symlinked (canonicalized) root must be accepted")
+	f.Close()
 }
 
 // ── consent (default-off, versioned) ────────────────────────────────────────

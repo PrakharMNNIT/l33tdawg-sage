@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -46,10 +47,10 @@ const (
 	preCompactDefaultBudgetMS   = 3_500 // under the 5s installed-hook budget
 	preCompactMaxBudgetMS       = 4_500
 	preCompactMaxTotalBytes     = 1 << 20   // total verbatim bytes submitted per invocation
-	preCompactMaxTranscript     = 256 << 20  // reject transcripts larger than this
-	preCompactMaxLineBytes      = 8 << 20    // per-JSONL-line cap for the streaming scanner
+	preCompactMaxTranscript     = 256 << 20 // reject transcripts larger than this
+	preCompactMaxLineBytes      = 8 << 20   // per-JSONL-line cap for the streaming scanner
 	preCompactStdinCap          = 256 << 10
-	preCompactSidecarVersion     = 2
+	preCompactSidecarVersion    = 2
 
 	// unitHeaderPrefix marks a byte-exact unit block inside a chunk body:
 	//   NCU\t<seq>\t<part>\t<role>\t<byteLen>\n<exactly byteLen raw bytes>
@@ -113,9 +114,10 @@ type chunkRecord struct {
 }
 
 // captureProgress is the per-thread sidecar. Progress is the set of governed chunk
-// identities and their (seq,part) spans; the capture cursor is the maximum end
-// span of all non-rejected chunks, so chunking always resumes after already
-// captured units and never re-groups or overlaps them.
+// identities and their (seq,part) spans; the capture cursor is the end of the
+// contiguous run of non-rejected chunks from the start (see cursor), so chunking
+// resumes after the already-captured prefix and a rejected middle span is recaptured
+// rather than skipped.
 type captureProgress struct {
 	Version        int           `json:"version"`
 	ThreadID       string        `json:"thread_id"`
@@ -132,14 +134,26 @@ func (p *captureProgress) byChunkID(id string) *chunkRecord {
 	return nil
 }
 
-// cursor returns the highest (seq, part) already covered by a non-rejected chunk,
-// or (0, -1) if none. Chunking resumes strictly after this.
+// cursor returns the end of the CONTIGUOUS run of non-rejected chunks from the start,
+// or (0, -1) if none. It is deliberately not the maximum end of all non-rejected
+// chunks: walking chunks in start order and stopping at the first rejected one means a
+// rejected MIDDLE span is recaptured on the next run instead of being permanently
+// skipped by a later accepted chunk's end (which reintroduces the tail-loss class).
+// Chunk starts jump over excluded non-conversational rows, so a rejected status — not
+// seq adjacency — is the only reliable contiguity boundary.
 func (p *captureProgress) cursor() (seq, part int) {
 	seq, part = 0, -1
-	for i := range p.Chunks {
-		c := &p.Chunks[i]
+	ordered := append([]chunkRecord(nil), p.Chunks...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].StartSeq != ordered[j].StartSeq {
+			return ordered[i].StartSeq < ordered[j].StartSeq
+		}
+		return ordered[i].StartPart < ordered[j].StartPart
+	})
+	for i := range ordered {
+		c := ordered[i]
 		if c.Status == "rejected" {
-			continue
+			break
 		}
 		if c.EndSeq > seq || (c.EndSeq == seq && c.EndPart > part) {
 			seq, part = c.EndSeq, c.EndPart
@@ -415,6 +429,14 @@ func gapUnit(seq int, reason string) captureUnit {
 // consisting solely of them decodes to empty text, which is excluded, not a gap.
 func decodeConversationalText(role string, content json.RawMessage) (string, string, bool) {
 	if role != unitRoleUser && role != unitRoleAssistant {
+		return role, "", false
+	}
+	// A conversational row with null or absent content is malformed, not legitimately
+	// empty: json.Unmarshal(`null`, ...) succeeds into BOTH a string ("") and a typed
+	// block slice (nil), so without this guard it would report decoded-but-empty and be
+	// silently excluded instead of emitting the required gap. A tool-only turn, by
+	// contrast, is a non-null array that decodes to empty text and is correctly excluded.
+	if t := bytes.TrimSpace(content); len(t) == 0 || bytes.Equal(t, []byte("null")) {
 		return role, "", false
 	}
 	var asString string
@@ -755,13 +777,21 @@ func transcriptRelComponents(payloadPath string) (root string, components []stri
 	if err != nil {
 		return "", nil, err
 	}
-	// The root itself is trusted; resolve it once so the walk starts from a real
-	// directory. Only the components BELOW the root are walked no-follow.
+	rootRaw := filepath.Clean(rawRoot)
+	// The root itself is trusted; resolve it once so the no-follow walk starts from a
+	// real directory. Only the components BELOW the root are walked no-follow.
 	rootReal, err := filepath.EvalSymlinks(rawRoot)
 	if err != nil {
-		rootReal = filepath.Clean(rawRoot)
+		rootReal = rootRaw
 	}
-	rel, err := filepath.Rel(rootReal, abs)
+	// Compare in a SINGLE namespace: abs is uncanonicalised (filepath.Abs, no symlink
+	// resolution), so the relative path must be taken against the equally uncanonicalised
+	// rootRaw — otherwise a symlinked ancestor of the trusted root (e.g. macOS
+	// /var → /private/var) makes a valid transcript look like it is outside the root.
+	// rootReal (canonical) is still the directory the no-follow walk starts from, and the
+	// below-root components are walked no-follow unchanged, so this fixes the comparison
+	// WITHOUT resolving any user-controlled path symlink.
+	rel, err := filepath.Rel(rootRaw, abs)
 	if err != nil {
 		return "", nil, fmt.Errorf("path not under trusted root")
 	}
