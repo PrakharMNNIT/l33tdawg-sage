@@ -2719,8 +2719,11 @@ var _ TaskAssignmentStore = (*PostgresStore)(nil)
 
 // LinkMemories creates a link between two memories.
 func (s *PostgresStore) LinkMemories(ctx context.Context, sourceID, targetID, linkType string) error {
+	// Re-linking an existing pair UPDATES its type rather than silently dropping the
+	// new type (see SQLiteStore.LinkMemories). Idempotent, last-write-wins upsert.
 	_, err := s.db.Exec(ctx,
-		`INSERT INTO memory_links (source_id, target_id, link_type) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+		`INSERT INTO memory_links (source_id, target_id, link_type) VALUES ($1, $2, $3)
+		 ON CONFLICT (source_id, target_id) DO UPDATE SET link_type = excluded.link_type`,
 		sourceID, targetID, linkType)
 	if err != nil {
 		return fmt.Errorf("link memories: %w", err)

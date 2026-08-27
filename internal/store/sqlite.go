@@ -5475,8 +5475,14 @@ func (s *SQLiteStore) UpdateTaskStatus(ctx context.Context, memoryID string, tas
 
 // LinkMemories creates a link between two memories.
 func (s *SQLiteStore) LinkMemories(ctx context.Context, sourceID, targetID, linkType string) error {
+	// A pair (source, target) holds one relationship (that is the primary key).
+	// Re-linking an existing pair UPDATES its type rather than silently dropping the
+	// new type: `ON CONFLICT DO NOTHING` discarded the second write with no error, so
+	// re-typing a relationship (e.g. related -> supersedes) vanished. This is an
+	// authorization-gated, idempotent upsert — last write wins.
 	_, err := s.writeExecContext(ctx,
-		`INSERT INTO memory_links (source_id, target_id, link_type) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+		`INSERT INTO memory_links (source_id, target_id, link_type) VALUES (?, ?, ?)
+		 ON CONFLICT(source_id, target_id) DO UPDATE SET link_type = excluded.link_type`,
 		sourceID, targetID, linkType)
 	if err != nil {
 		return fmt.Errorf("link memories: %w", err)
