@@ -26,6 +26,7 @@ type submittedMemory struct {
 	Classification int
 	Tags           []string
 	Status         string
+	submitIdx      int // 1-based submit ordinal, for rejection control in tests
 }
 
 // mockNode is a minimal SAGE REST node for the never-compact E2E tests.
@@ -37,6 +38,10 @@ type mockNode struct {
 	nextID   int
 	homeDom  string
 	forceCmt bool
+	// rejectIf, when set, makes the memory-detail GET report a memory as terminal
+	// rejected instead of committed, keyed by its 1-based submit ordinal. Used to
+	// exercise the rejected-span lifecycle.
+	rejectIf func(submitIdx int) bool
 }
 
 func newMockNode() *mockNode { return &mockNode{homeDom: "home.domain"} }
@@ -62,7 +67,7 @@ func (m *mockNode) handler() http.Handler {
 		if m.forceCmt {
 			status = "committed"
 		}
-		m.stored = append(m.stored, submittedMemory{id, req.Content, req.Classification, req.Tags, status})
+		m.stored = append(m.stored, submittedMemory{id, req.Content, req.Classification, req.Tags, status, m.submits})
 		m.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"memory_id": id, "status": status, "committed": true})
 	})
@@ -100,9 +105,15 @@ func (m *mockNode) handler() http.Handler {
 		}
 		m.mu.Lock()
 		var found bool
+		outStatus := "committed"
 		for i := range m.stored {
 			if m.stored[i].MemoryID == id {
-				m.stored[i].Status = "committed"
+				if m.rejectIf != nil && m.rejectIf(m.stored[i].submitIdx) {
+					m.stored[i].Status = "rejected"
+					outStatus = "rejected"
+				} else {
+					m.stored[i].Status = "committed"
+				}
 				found = true
 			}
 		}
@@ -111,7 +122,7 @@ func (m *mockNode) handler() http.Handler {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "committed"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": outStatus})
 	})
 	return mux
 }
@@ -264,6 +275,73 @@ func TestTailEventuallyCommitted(t *testing.T) {
 	for i := range turns {
 		require.Equal(t, turns[i], got[i].text)
 	}
+}
+
+// ── rejected-span lifecycle: forward progress + bounded abandonment ──────────
+
+// TestRejectedSpanResubmitsAndProgresses proves a span whose governed memory ends
+// terminal-rejected is RESUBMITTED on the next invocation (not re-adopted forever by
+// its deterministic tag) and then reaches a committed outcome. Reproduces the round-4
+// blocker: cursor rollback alone left the submit count at 1.
+func TestRejectedSpanResubmitsAndProgresses(t *testing.T) {
+	node := newMockNode()
+	node.rejectIf = func(submitIdx int) bool { return submitIdx == 1 } // only the first submit is rejected
+	root := setupNeverCompactEnv(t, node)
+	path := writeTranscriptFile(t, root, "sess-rej", []string{"only turn"})
+	payload := payloadFor("sess-rej", path)
+
+	// Invocation 1: submit #1 is transitioned to rejected.
+	feedStdin(t, payload, func() { _ = runHookPreCompact() })
+	node.mu.Lock()
+	require.Equal(t, 1, node.submits, "first invocation submits once")
+	require.Equal(t, "rejected", node.stored[0].Status, "the chunk's memory ends terminal-rejected")
+	node.mu.Unlock()
+
+	// Invocation 2: the rejected span must resubmit (forward progress) rather than
+	// re-adopt the terminal-rejected tag forever. Submit #2 is not rejected → it commits.
+	feedStdin(t, payload, func() { _ = runHookPreCompact() })
+	node.mu.Lock()
+	require.Greater(t, node.submits, 1, "the rejected span is resubmitted, not stuck re-adopting the rejected tag")
+	node.mu.Unlock()
+
+	turns := reconstructTurns(node.committedUnits())
+	require.Len(t, turns, 1, "the resubmitted span reaches a committed outcome")
+	require.Equal(t, "only turn", turns[0].text)
+}
+
+// TestPersistentlyRejectedSpanIsBoundedAndBecomesGap proves a span that stays rejected
+// past the retry cap is abandoned as a visible gap rather than resubmitting forever:
+// resubmits are bounded, a gap marker is submitted for recall visibility, and further
+// invocations add no submits (the span is terminal).
+func TestPersistentlyRejectedSpanIsBoundedAndBecomesGap(t *testing.T) {
+	node := newMockNode()
+	node.rejectIf = func(int) bool { return true } // every governed memory is rejected
+	root := setupNeverCompactEnv(t, node)
+	path := writeTranscriptFile(t, root, "sess-gap", []string{"cursed turn"})
+	payload := payloadFor("sess-gap", path)
+
+	for i := 0; i < preCompactMaxChunkRetries+5; i++ {
+		feedStdin(t, payload, func() { _ = runHookPreCompact() })
+	}
+	node.mu.Lock()
+	submits := node.submits
+	var sawGapMarker bool
+	for _, s := range node.stored {
+		if strings.Contains(s.Content, "capture gap") {
+			sawGapMarker = true
+		}
+	}
+	node.mu.Unlock()
+	// content submitted at reject counts 0..cap, plus one gap-marker submit at abandonment.
+	require.LessOrEqual(t, submits, preCompactMaxChunkRetries+2,
+		"resubmits of a persistently-rejected span are bounded, not infinite")
+	require.True(t, sawGapMarker, "an abandoned span submits a gap marker for recall visibility")
+
+	// one more invocation must add no further submits: the span is a terminal gap.
+	feedStdin(t, payload, func() { _ = runHookPreCompact() })
+	node.mu.Lock()
+	require.Equal(t, submits, node.submits, "an abandoned (gap) span is never resubmitted again")
+	node.mu.Unlock()
 }
 
 // ── blocker 2: appending never creates overlapping/duplicate chunks ─────────

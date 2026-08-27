@@ -52,6 +52,18 @@ const (
 	preCompactStdinCap          = 256 << 10
 	preCompactSidecarVersion    = 2
 
+	// preCompactMaxChunkRetries bounds how many times a span whose governed memory
+	// ended terminal-rejected is resubmitted before it is abandoned as a visible gap.
+	// A transient/ambiguous rejection clears on the first retry; a persistently
+	// rejected span becomes a gap instead of resubmitting forever.
+	preCompactMaxChunkRetries = 3
+
+	// chunkStatusGap is a terminal sidecar status: the span was rejected past the retry
+	// cap and is recorded as a capture gap. The cursor advances past it (it is not
+	// "rejected"), the capture loop skips it, and a best-effort committed gap memory
+	// carries its visibility into recall.
+	chunkStatusGap = "gap"
+
 	// unitHeaderPrefix marks a byte-exact unit block inside a chunk body:
 	//   NCU\t<seq>\t<part>\t<role>\t<byteLen>\n<exactly byteLen raw bytes>
 	// The length prefix makes the raw bytes recoverable verbatim with no escaping.
@@ -109,8 +121,11 @@ type chunkRecord struct {
 	EndSeq    int    `json:"end_seq"`
 	EndPart   int    `json:"end_part"`
 	MemoryID  string `json:"memory_id"`
-	Status    string `json:"status"` // proposed | committed | rejected
+	Status    string `json:"status"` // proposed | committed | rejected | gap
 	Bytes     int    `json:"bytes"`
+	// RejectCount is how many times this span's governed memory has ended
+	// terminal-rejected; at preCompactMaxChunkRetries the span is abandoned as a gap.
+	RejectCount int `json:"reject_count,omitempty"`
 }
 
 // captureProgress is the per-thread sidecar. Progress is the set of governed chunk
@@ -287,16 +302,35 @@ func runHookPreCompact() error {
 		if ctx.Err() != nil {
 			break // budget exhausted; the rest is picked up next PreCompact
 		}
-		if existing := prog.byChunkID(ch.id); existing != nil && existing.Status == "committed" {
+		existing := prog.byChunkID(ch.id)
+		// Terminal states need no work: a committed span is done; a gap span was
+		// abandoned after the retry cap and is carried as a visible gap.
+		if existing != nil && (existing.Status == "committed" || existing.Status == chunkStatusGap) {
 			continue
 		}
 		// Blocker 2 (idempotent replay): deterministic identity → look up before
-		// submit → adopt if already governed, so an ambiguous timeout on a prior
-		// run never creates a duplicate.
+		// submit → adopt an already-governed NON-REJECTED copy, so an ambiguous timeout
+		// on a prior run never creates a duplicate.
 		if adopted := reconcileChunkByTag(ctx, ch.id); adopted != nil {
-			upsertChunk(prog, ch.record(adopted.MemoryID, adopted.Status))
+			rec := ch.record(adopted.MemoryID, adopted.Status)
+			if existing != nil {
+				rec.RejectCount = existing.RejectCount
+			}
+			upsertChunk(prog, rec)
 			saveCaptureProgress(prog)
 			continue
+		}
+		// A span whose only governed copy is terminal-rejected makes forward progress
+		// by resubmitting, bounded so it cannot resubmit forever: past the cap it is
+		// abandoned as a visible capture gap.
+		rejectCount := 0
+		if existing != nil && existing.Status == "rejected" {
+			rejectCount = existing.RejectCount + 1
+			if rejectCount > preCompactMaxChunkRetries {
+				abandonRejectedSpanAsGap(ctx, prog, domain, threadID, class, existing)
+				saveCaptureProgress(prog)
+				continue
+			}
 		}
 
 		memID, status, err := submitCapturedChunk(ctx, domain, threadID, class, ch)
@@ -304,7 +338,9 @@ func runHookPreCompact() error {
 			fmt.Fprintf(os.Stderr, "nevercompact: submit chunk %s: %v\n", ch.id[:12], err)
 			break // stop on first failure; deferred chunks retry next PreCompact
 		}
-		upsertChunk(prog, ch.record(memID, status))
+		rec := ch.record(memID, status)
+		rec.RejectCount = rejectCount
+		upsertChunk(prog, rec)
 		saveCaptureProgress(prog) // persist after every chunk: a crash loses no identity
 	}
 
@@ -629,12 +665,17 @@ func submitCapturedChunk(ctx context.Context, domain, threadID string, class int
 	return resp.MemoryID, resp.Status, nil
 }
 
-// reconcileChunkByTag adopts an already-governed copy of a chunk by its
-// deterministic tag (idempotent-replay backstop for the ambiguous-timeout case).
+// reconcileChunkByTag adopts an already-governed, NON-REJECTED copy of a chunk by its
+// deterministic tag (idempotent-replay backstop for the ambiguous-timeout case). It
+// deliberately skips terminal rejected/deprecated copies: adopting one would re-mark the
+// span rejected on every invocation and it could never make forward progress. Scanning a
+// few newest (rather than only the single newest) lets a fresh committed resubmission be
+// adopted even when an older rejected copy shares the tag, so the ambiguous-timeout dedup
+// still holds for the live copy.
 func reconcileChunkByTag(ctx context.Context, chunkID string) *chunkRecord {
 	q := url.Values{}
 	q.Set("tag", neverCompactChunkTagPrefix+chunkID)
-	q.Set("limit", "1")
+	q.Set("limit", "8")
 	q.Set("sort", "newest")
 	var payload struct {
 		Memories []struct {
@@ -645,10 +686,13 @@ func reconcileChunkByTag(ctx context.Context, chunkID string) *chunkRecord {
 	if err := hookSignedJSONCtx(ctx, http.MethodGet, "/v1/memory/list?"+q.Encode(), nil, &payload); err != nil {
 		return nil
 	}
-	if len(payload.Memories) == 0 {
-		return nil
+	for _, mem := range payload.Memories {
+		if mem.Status == "rejected" || mem.Status == "deprecated" {
+			continue // terminal-rejected: the span must retry, not adopt this copy
+		}
+		return &chunkRecord{MemoryID: mem.MemoryID, Status: mem.Status}
 	}
-	return &chunkRecord{MemoryID: payload.Memories[0].MemoryID, Status: payload.Memories[0].Status}
+	return nil
 }
 
 // reconcileProgress advances proposed chunks toward their final lifecycle status:
@@ -685,6 +729,50 @@ func upsertChunk(prog *captureProgress, rec chunkRecord) {
 		return
 	}
 	prog.Chunks = append(prog.Chunks, rec)
+}
+
+// abandonRejectedSpanAsGap gives up on a span that stayed terminal-rejected past the
+// retry cap. It replaces the rejected record in place with a terminal gap tombstone
+// (no memory, status gap) so the cursor advances past the span and the loop never
+// resubmits it again — which also means the retry count cannot reset. Separately it
+// best-effort submits ONE committed gap memory so recall surfaces a visible gap for the
+// span; that memory is fire-and-forget (never tracked in the sidecar), so its own
+// governance outcome can never block the cursor. This keeps the byte-lossless contract:
+// the span is either eventually governed or represented as a visible capture gap.
+func abandonRejectedSpanAsGap(ctx context.Context, prog *captureProgress, domain, threadID string, class int, rej *chunkRecord) {
+	gapText := fmt.Sprintf("[capture gap: rows %d-%d were rejected by governance after %d attempts]",
+		rej.StartSeq, rej.EndSeq, preCompactMaxChunkRetries)
+	body := encodeUnit(captureUnit{Seq: rej.StartSeq, Part: 0, Role: unitRoleGap, Text: gapText})
+	// A distinct, deterministic id (the "gap" domain separator keeps it clear of the
+	// content chunk's id), so a repeat abandonment dedups rather than duplicating.
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00gap\x00%d\x00%d\x00%d\x00%d\x00", threadID, rej.StartSeq, rej.StartPart, rej.EndSeq, rej.EndPart)
+	h.Write([]byte(body))
+	gap := preCompactChunk{
+		id:        hex.EncodeToString(h.Sum(nil)),
+		startSeq:  rej.StartSeq,
+		startPart: rej.StartPart,
+		endSeq:    rej.EndSeq,
+		endPart:   rej.EndPart,
+		body:      body,
+		bytes:     len(body),
+		unitCount: 1,
+	}
+	if _, _, err := submitCapturedChunk(ctx, domain, threadID, class, gap); err != nil {
+		fmt.Fprintf(os.Stderr, "nevercompact: gap marker for rows %d-%d not submitted: %v\n", rej.StartSeq, rej.EndSeq, err)
+	}
+
+	upsertChunk(prog, chunkRecord{
+		ChunkID:     rej.ChunkID,
+		StartSeq:    rej.StartSeq,
+		StartPart:   rej.StartPart,
+		EndSeq:      rej.EndSeq,
+		EndPart:     rej.EndPart,
+		MemoryID:    "",
+		Status:      chunkStatusGap,
+		Bytes:       0,
+		RejectCount: rej.RejectCount + 1,
+	})
 }
 
 // ── knobs & helpers ─────────────────────────────────────────────────────────
