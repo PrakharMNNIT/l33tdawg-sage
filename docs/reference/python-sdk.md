@@ -1,8 +1,8 @@
-Verified against SDK source for SAGE v11.19.7. Package: sage-agent-sdk.
+Verified against SDK source for SAGE v11.19.8. Package: sage-agent-sdk.
 
 # SAGE Python SDK Reference
 
-**Package:** `sage-agent-sdk` **Version:** 11.19.7
+**Package:** `sage-agent-sdk` **Version:** 11.19.8
 **Requires:** Python 3.10+ | httpx ≥ 0.25 | pydantic ≥ 2.0 | PyNaCl ≥ 1.5
 
 ```bash
@@ -684,8 +684,11 @@ domain_access_sample() -> AgentDomainAccessSample
 
 Signed `GET /v1/agent/me/domains`. Returns bounded `owned_domains`,
 `readable_domains`, and `writable_domains` policy samples plus `truncated`.
-Use it to choose an exact recall/write scope cheaply; use `owned_domains()`
-when the authoritative complete ownership set is required.
+The readable/write samples include re-authorized candidates from the bounded
+current owned-domain indexes of active local Access Group peers, including
+transferred domains that the peer never authored. Use it to choose an exact
+recall/write scope cheaply; use `owned_domains()` when the authoritative
+complete ownership set is required.
 
 ---
 

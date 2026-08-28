@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.7 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.8 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -141,6 +141,20 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.8 release
+
+The bounded caller-domain projection now consults the authoritative current
+owner index for both the caller and active local Access Group peers. This makes
+transferred historical domains discoverable even when their current owner never
+authored a memory there, while preserving the existing 64-result output bound,
+candidate and peer-scan caps, truncation signal, and exact live-policy
+reauthorization. Access Group authority remains dynamic and ownership-based;
+the projection does not copy grants or disclose a global domain roster.
+
+This is an off-consensus REST/MCP discovery correction. It changes no
+transaction, AppHash, key encoding, fork target, or application version;
+app-v27 remains the ceiling.
 
 ## v11.19.7 release
 

@@ -66,7 +66,7 @@ test('release-facing version metadata stays aligned', () => {
     ['deploy/federation-acceptance/README.md', `# v${version} federation Docker acceptance`],
     ['docs/FEDERATION.md', `Verified against SAGE v${version} federation behavior`],
     ['docs/reference/concepts/message-reply-lifecycle.md', `SAGE v${version} code`],
-    ['docs/UPGRADING.md', `| v${version} | Default-off consent-gated recall-backed compaction`],
+    ['docs/UPGRADING.md', `| v${version} | Bounded caller-domain discovery`],
     ['docs/ROADMAP.md', `## v${version} release`],
     ['docs/UPGRADING.md', 'The recovery commands in this guide require SAGE v11.18.0 or later.'],
     ['docs/UPGRADING.md', '`backup --full`, `restore --from`,'],
