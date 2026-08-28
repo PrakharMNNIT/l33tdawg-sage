@@ -58,12 +58,6 @@ const (
 	// rejected span becomes a gap instead of resubmitting forever.
 	preCompactMaxChunkRetries = 3
 
-	// chunkStatusGap is a terminal sidecar status: the span was rejected past the retry
-	// cap and is recorded as a capture gap. The cursor advances past it (it is not
-	// "rejected"), the capture loop skips it, and a best-effort committed gap memory
-	// carries its visibility into recall.
-	chunkStatusGap = "gap"
-
 	// unitHeaderPrefix marks a byte-exact unit block inside a chunk body:
 	//   NCU\t<seq>\t<part>\t<role>\t<byteLen>\n<exactly byteLen raw bytes>
 	// The length prefix makes the raw bytes recoverable verbatim with no escaping.
@@ -121,11 +115,17 @@ type chunkRecord struct {
 	EndSeq    int    `json:"end_seq"`
 	EndPart   int    `json:"end_part"`
 	MemoryID  string `json:"memory_id"`
-	Status    string `json:"status"` // proposed | committed | rejected | gap
+	Status    string `json:"status"` // proposed | committed | rejected
 	Bytes     int    `json:"bytes"`
-	// RejectCount is how many times this span's governed memory has ended
-	// terminal-rejected; at preCompactMaxChunkRetries the span is abandoned as a gap.
+	// RejectCount is how many times this span's CONTENT memory has ended
+	// terminal-rejected; at preCompactMaxChunkRetries the span switches to gap mode.
 	RejectCount int `json:"reject_count,omitempty"`
+	// Gap marks a span whose content was rejected past the cap: this record now tracks
+	// a GAP-marker memory (MemoryID/Status follow the gap's lifecycle) instead of the
+	// content, and the content is never resubmitted again. The cursor advances past the
+	// span only once the gap marker is committed, so an errored or rejected gap submit
+	// retries safely instead of silently dropping the span.
+	Gap bool `json:"gap,omitempty"`
 }
 
 // captureProgress is the per-thread sidecar. Progress is the set of governed chunk
@@ -168,6 +168,13 @@ func (p *captureProgress) cursor() (seq, part int) {
 	for i := range ordered {
 		c := ordered[i]
 		if c.Status == "rejected" {
+			break
+		}
+		// A gap-mode span (content abandoned to a gap marker) advances the cursor only
+		// once the gap marker is committed — never on a merely-submitted or errored gap,
+		// so a rejected/failed gap submit holds the cursor and retries instead of
+		// silently dropping the span.
+		if c.Gap && c.Status != memoryStatusCommitted {
 			break
 		}
 		if c.EndSeq > seq || (c.EndSeq == seq && c.EndPart > part) {
@@ -303,9 +310,16 @@ func runHookPreCompact() error {
 			break // budget exhausted; the rest is picked up next PreCompact
 		}
 		existing := prog.byChunkID(ch.id)
-		// Terminal states need no work: a committed span is done; a gap span was
-		// abandoned after the retry cap and is carried as a visible gap.
-		if existing != nil && (existing.Status == "committed" || existing.Status == chunkStatusGap) {
+		// A committed span is done.
+		if existing != nil && existing.Status == "committed" {
+			continue
+		}
+		// A gap-mode span (content abandoned past the cap) never resubmits its content;
+		// it drives its GAP marker toward a committed, recall-visible outcome. The cursor
+		// only advances past it once that gap commits, so this retries safely.
+		if existing != nil && existing.Gap {
+			driveGapMarker(ctx, prog, domain, threadID, class, existing)
+			saveCaptureProgress(prog)
 			continue
 		}
 		// Blocker 2 (idempotent replay): deterministic identity → look up before
@@ -320,14 +334,18 @@ func runHookPreCompact() error {
 			saveCaptureProgress(prog)
 			continue
 		}
-		// A span whose only governed copy is terminal-rejected makes forward progress
-		// by resubmitting, bounded so it cannot resubmit forever: past the cap it is
-		// abandoned as a visible capture gap.
+		// A span whose only governed copy is terminal-rejected makes forward progress by
+		// resubmitting, bounded so the CONTENT cannot resubmit forever: past the cap the
+		// span switches to gap mode (a tracked gap marker), driven this same invocation.
 		rejectCount := 0
 		if existing != nil && existing.Status == "rejected" {
 			rejectCount = existing.RejectCount + 1
 			if rejectCount > preCompactMaxChunkRetries {
-				abandonRejectedSpanAsGap(ctx, prog, domain, threadID, class, existing)
+				existing.Gap = true
+				existing.RejectCount = rejectCount
+				existing.MemoryID = ""
+				existing.Status = "proposed"
+				driveGapMarker(ctx, prog, domain, threadID, class, existing)
 				saveCaptureProgress(prog)
 				continue
 			}
@@ -731,48 +749,53 @@ func upsertChunk(prog *captureProgress, rec chunkRecord) {
 	prog.Chunks = append(prog.Chunks, rec)
 }
 
-// abandonRejectedSpanAsGap gives up on a span that stayed terminal-rejected past the
-// retry cap. It replaces the rejected record in place with a terminal gap tombstone
-// (no memory, status gap) so the cursor advances past the span and the loop never
-// resubmits it again — which also means the retry count cannot reset. Separately it
-// best-effort submits ONE committed gap memory so recall surfaces a visible gap for the
-// span; that memory is fire-and-forget (never tracked in the sidecar), so its own
-// governance outcome can never block the cursor. This keeps the byte-lossless contract:
-// the span is either eventually governed or represented as a visible capture gap.
-func abandonRejectedSpanAsGap(ctx context.Context, prog *captureProgress, domain, threadID string, class int, rej *chunkRecord) {
+// buildGapChunk builds the deterministic gap-marker chunk for an abandoned content span:
+// one gap unit covering the span, under a distinct id (the "gap" separator keeps it clear
+// of the content chunk's id) so a repeated abandonment dedups by tag rather than
+// duplicating.
+func buildGapChunk(threadID string, span *chunkRecord) preCompactChunk {
 	gapText := fmt.Sprintf("[capture gap: rows %d-%d were rejected by governance after %d attempts]",
-		rej.StartSeq, rej.EndSeq, preCompactMaxChunkRetries)
-	body := encodeUnit(captureUnit{Seq: rej.StartSeq, Part: 0, Role: unitRoleGap, Text: gapText})
-	// A distinct, deterministic id (the "gap" domain separator keeps it clear of the
-	// content chunk's id), so a repeat abandonment dedups rather than duplicating.
+		span.StartSeq, span.EndSeq, preCompactMaxChunkRetries)
+	body := encodeUnit(captureUnit{Seq: span.StartSeq, Part: 0, Role: unitRoleGap, Text: gapText})
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00gap\x00%d\x00%d\x00%d\x00%d\x00", threadID, rej.StartSeq, rej.StartPart, rej.EndSeq, rej.EndPart)
+	fmt.Fprintf(h, "%s\x00gap\x00%d\x00%d\x00%d\x00%d\x00", threadID, span.StartSeq, span.StartPart, span.EndSeq, span.EndPart)
 	h.Write([]byte(body))
-	gap := preCompactChunk{
+	return preCompactChunk{
 		id:        hex.EncodeToString(h.Sum(nil)),
-		startSeq:  rej.StartSeq,
-		startPart: rej.StartPart,
-		endSeq:    rej.EndSeq,
-		endPart:   rej.EndPart,
+		startSeq:  span.StartSeq,
+		startPart: span.StartPart,
+		endSeq:    span.EndSeq,
+		endPart:   span.EndPart,
 		body:      body,
 		bytes:     len(body),
 		unitCount: 1,
 	}
-	if _, _, err := submitCapturedChunk(ctx, domain, threadID, class, gap); err != nil {
-		fmt.Fprintf(os.Stderr, "nevercompact: gap marker for rows %d-%d not submitted: %v\n", rej.StartSeq, rej.EndSeq, err)
-	}
+}
 
-	upsertChunk(prog, chunkRecord{
-		ChunkID:     rej.ChunkID,
-		StartSeq:    rej.StartSeq,
-		StartPart:   rej.StartPart,
-		EndSeq:      rej.EndSeq,
-		EndPart:     rej.EndPart,
-		MemoryID:    "",
-		Status:      chunkStatusGap,
-		Bytes:       0,
-		RejectCount: rej.RejectCount + 1,
-	})
+// driveGapMarker submits/adopts and TRACKS the gap marker for a gap-mode span, updating
+// the sidecar record (a pointer into prog.Chunks) so its MemoryID/Status follow the gap
+// marker's lifecycle. The record keeps Gap set and never resubmits the content. Because
+// the cursor advances past a gap span only once its marker is committed (see cursor), a
+// submit error or a rejected gap leaves the record non-committed and the span is retried
+// next invocation — the abandoned bytes are represented by a committed, recall-visible
+// gap or not skipped at all, never silently dropped.
+func driveGapMarker(ctx context.Context, prog *captureProgress, domain, threadID string, class int, span *chunkRecord) {
+	_ = prog // the span pointer already aliases prog.Chunks; kept for call-site symmetry
+	gap := buildGapChunk(threadID, span)
+	// Adopt an already-governed, non-rejected gap copy (ambiguous-timeout dedup for the
+	// gap submit itself), else submit a fresh gap marker.
+	if adopted := reconcileChunkByTag(ctx, gap.id); adopted != nil {
+		span.MemoryID = adopted.MemoryID
+		span.Status = adopted.Status
+		return
+	}
+	memID, status, err := submitCapturedChunk(ctx, domain, threadID, class, gap)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "nevercompact: gap marker for rows %d-%d not submitted: %v\n", span.StartSeq, span.EndSeq, err)
+		return // leave the record non-committed; retried next invocation (no silent drop)
+	}
+	span.MemoryID = memID
+	span.Status = status
 }
 
 // ── knobs & helpers ─────────────────────────────────────────────────────────

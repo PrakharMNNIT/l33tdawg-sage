@@ -39,9 +39,10 @@ type mockNode struct {
 	homeDom  string
 	forceCmt bool
 	// rejectIf, when set, makes the memory-detail GET report a memory as terminal
-	// rejected instead of committed, keyed by its 1-based submit ordinal. Used to
-	// exercise the rejected-span lifecycle.
-	rejectIf func(submitIdx int) bool
+	// rejected instead of committed, keyed by its 1-based submit ordinal and content.
+	// Used to exercise the rejected-span lifecycle (e.g. reject content but commit a
+	// benign gap marker).
+	rejectIf func(submitIdx int, content string) bool
 }
 
 func newMockNode() *mockNode { return &mockNode{homeDom: "home.domain"} }
@@ -108,7 +109,7 @@ func (m *mockNode) handler() http.Handler {
 		outStatus := "committed"
 		for i := range m.stored {
 			if m.stored[i].MemoryID == id {
-				if m.rejectIf != nil && m.rejectIf(m.stored[i].submitIdx) {
+				if m.rejectIf != nil && m.rejectIf(m.stored[i].submitIdx, m.stored[i].Content) {
 					m.stored[i].Status = "rejected"
 					outStatus = "rejected"
 				} else {
@@ -285,7 +286,7 @@ func TestTailEventuallyCommitted(t *testing.T) {
 // blocker: cursor rollback alone left the submit count at 1.
 func TestRejectedSpanResubmitsAndProgresses(t *testing.T) {
 	node := newMockNode()
-	node.rejectIf = func(submitIdx int) bool { return submitIdx == 1 } // only the first submit is rejected
+	node.rejectIf = func(submitIdx int, _ string) bool { return submitIdx == 1 } // only the first submit is rejected
 	root := setupNeverCompactEnv(t, node)
 	path := writeTranscriptFile(t, root, "sess-rej", []string{"only turn"})
 	payload := payloadFor("sess-rej", path)
@@ -309,39 +310,50 @@ func TestRejectedSpanResubmitsAndProgresses(t *testing.T) {
 	require.Equal(t, "only turn", turns[0].text)
 }
 
-// TestPersistentlyRejectedSpanIsBoundedAndBecomesGap proves a span that stays rejected
-// past the retry cap is abandoned as a visible gap rather than resubmitting forever:
-// resubmits are bounded, a gap marker is submitted for recall visibility, and further
-// invocations add no submits (the span is terminal).
-func TestPersistentlyRejectedSpanIsBoundedAndBecomesGap(t *testing.T) {
+// TestAbandonedSpanRetriesGapUntilCommittedAndVisible proves the bounded-abandonment
+// fallback never silently loses the span, addressing the fire-and-forget hole:
+//   - while governance rejects even the benign gap marker, NOTHING is committed and the
+//     cursor does not advance past the span (the bytes are retained, not skipped);
+//   - once governance accepts the gap marker, the retained span surfaces as exactly one
+//     committed, recall-visible gap.
+func TestAbandonedSpanRetriesGapUntilCommittedAndVisible(t *testing.T) {
 	node := newMockNode()
-	node.rejectIf = func(int) bool { return true } // every governed memory is rejected
+	// Phase 1: reject everything, including the gap marker.
+	node.rejectIf = func(int, string) bool { return true }
 	root := setupNeverCompactEnv(t, node)
 	path := writeTranscriptFile(t, root, "sess-gap", []string{"cursed turn"})
 	payload := payloadFor("sess-gap", path)
 
-	for i := 0; i < preCompactMaxChunkRetries+5; i++ {
+	// Drive past the content retry cap and several more invocations: the span switches to
+	// gap mode and keeps retrying the (rejected) gap marker.
+	for i := 0; i < preCompactMaxChunkRetries+4; i++ {
 		feedStdin(t, payload, func() { _ = runHookPreCompact() })
 	}
+	require.Empty(t, node.committedUnits(),
+		"while the gap marker is rejected, nothing is committed and the span is not silently advanced")
 	node.mu.Lock()
-	submits := node.submits
-	var sawGapMarker bool
+	var attemptedGap bool
 	for _, s := range node.stored {
 		if strings.Contains(s.Content, "capture gap") {
-			sawGapMarker = true
+			attemptedGap = true
 		}
 	}
 	node.mu.Unlock()
-	// content submitted at reject counts 0..cap, plus one gap-marker submit at abandonment.
-	require.LessOrEqual(t, submits, preCompactMaxChunkRetries+2,
-		"resubmits of a persistently-rejected span are bounded, not infinite")
-	require.True(t, sawGapMarker, "an abandoned span submits a gap marker for recall visibility")
+	require.True(t, attemptedGap, "a gap marker is submitted for the abandoned span")
 
-	// one more invocation must add no further submits: the span is a terminal gap.
-	feedStdin(t, payload, func() { _ = runHookPreCompact() })
-	node.mu.Lock()
-	require.Equal(t, submits, node.submits, "an abandoned (gap) span is never resubmitted again")
-	node.mu.Unlock()
+	// Phase 2: governance now accepts the benign gap marker (still rejects real content).
+	node.rejectIf = func(_ int, content string) bool { return !strings.Contains(content, "capture gap") }
+	for i := 0; i < 3; i++ {
+		feedStdin(t, payload, func() { _ = runHookPreCompact() })
+	}
+	var gapUnits int
+	for _, u := range node.committedUnits() {
+		if u.Role == unitRoleGap && strings.Contains(u.Text, "capture gap") {
+			gapUnits++
+		}
+	}
+	require.Equal(t, 1, gapUnits,
+		"once governance accepts the gap marker, the retained span surfaces as one committed, recall-visible gap")
 }
 
 // ── blocker 2: appending never creates overlapping/duplicate chunks ─────────
