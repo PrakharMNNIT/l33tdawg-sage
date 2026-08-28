@@ -457,7 +457,7 @@ func (h *DashboardHandler) appV23SignedRequestActorID(r *http.Request) string {
 
 func (h *DashboardHandler) appV23SessionHasRootAuthority(r *http.Request) bool {
 	if !isLoopbackRemote(r.RemoteAddr) ||
-		!hostIsLoopback(r.Host) ||
+		!hostIsTrustedCEREBRUMHost(r.Host) ||
 		!isLocalRequest(r) {
 		return false
 	}
