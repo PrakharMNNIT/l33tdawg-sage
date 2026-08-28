@@ -1,4 +1,4 @@
-<!-- Reconciled through SAGE v11.19.7. Cite file:line when behavior is non-obvious. -->
+<!-- Reconciled through SAGE v11.19.8. Cite file:line when behavior is non-obvious. -->
 
 # SAGE REST API Reference
 
@@ -945,7 +945,11 @@ Signed caller-only bounded policy projection. `domains` and
 `owned_domains` is a bounded ownership sample. `truncated:true` means at least
 one sample is incomplete. These arrays deliberately avoid a global roster or
 memory scan and are suitable for choosing an exact scope, not proving complete
-ownership.
+ownership. Candidate discovery includes the caller's current owned-domain index
+and the bounded current owned-domain indexes of active local Access Group peers,
+so a transferred historical domain can appear even when its current owner never
+authored a memory there. Every candidate is re-authorized against live policy;
+group membership never turns the peer's domain into caller ownership.
 
 ### `GET /v1/agent/me/domains/owned`
 

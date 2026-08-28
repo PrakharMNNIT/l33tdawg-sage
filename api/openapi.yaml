@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: (S)AGE API
-  version: 11.19.7
+  version: 11.19.8
   description: |-
     (Sovereign) Agent Governed Experience — network REST API for memory
     submission, validation, and query.
@@ -3580,10 +3580,13 @@ paths:
       summary: Retrieve bounded readable domains for the authenticated agent.
       description: >-
         Returns only current caller-authorized domain identifiers derived from
-        the caller's own home/provenance, direct grants, and local Access
-        Groups. Candidates are re-authorized against live policy. The result is
-        bounded and may be truncated; it is not a global domain roster or a
-        complete expansion of read-all/ancestor authority.
+        the caller's current owned-domain index and home/provenance, direct
+        grants, and the bounded current owned-domain indexes of active local
+        Access Group peers. This includes transferred domains that were never
+        authored by their current owner. Candidates are re-authorized against
+        live policy. The result is bounded and may be truncated; it is not a
+        global domain roster or a complete expansion of read-all/ancestor
+        authority.
       tags:
         - Agent
       responses:

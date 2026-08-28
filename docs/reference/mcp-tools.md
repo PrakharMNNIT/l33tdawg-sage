@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.19.7.
+Reconciled against internal/mcp for SAGE v11.19.8.
 
 # SAGE MCP Tools Reference
 
@@ -720,9 +720,12 @@ are bounded caller-only samples: owned identifies domains whose current owning
 ancestor is the caller, readable identifies scoped recall targets, and writable
 identifies candidates that pass current effective write policy. The readable-domain list is a bounded sample of
 currently authorized targets derived from the caller's own home/provenance,
-direct grants, and local Access Groups; every candidate is checked against
-live policy before it is returned. It is not a global domain roster and does
-not claim to enumerate every domain a read-all or ancestor grant can reach.
+current owned-domain index, direct grants, and the bounded current owned-domain
+indexes of active local Access Group peers; every candidate is checked against
+live policy before it is returned. This lets transferred domains appear even
+when their current owner never authored a memory there. It is not a global
+domain roster and does not claim to enumerate every domain a read-all or
+ancestor grant can reach.
 The access booleans are explicitly scoped to `home_domain`. A
 pending or inactive caller receives this standing with
 `memory_access_available:false` and SAGE does not probe a forbidden memory

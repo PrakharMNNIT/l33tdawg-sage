@@ -51,28 +51,26 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.19.7
+## What's New in v11.19.8
 
-**Recall-backed compaction can now preserve a Claude thread verbatim in governed
-SAGE memory and restore it when that same thread resumes.** The feature is
-default-off and requires an explicit, versioned acknowledgment (or the managed
-`SAGE_NEVERCOMPACT=1` setting). Capture is byte-exact, bounded, thread-scoped,
-idempotent across ambiguous network outcomes, and advances its durable cursor
-only after every chunk—or visible gap marker—is committed. Transcript path,
-ownership, session identity, and file-descriptor authority are validated before
-content leaves the host. Governed deprecation is available through
-`sage-gui nevercompact purge`; SAGE does not claim hard deletion.
+**Access Groups now discover transferred historical domains, not only each
+member's enrollment-time home domain.** CEREBRUM's bounded caller-domain
+projection consults the consensus-maintained current-owner index for the caller
+and active local group peers. A transferred `user-*` domain therefore appears
+as a usable exact recall or write target even when its current owner never
+authored a memory there.
 
-CEREBRUM's memory MRI gains a `◈ links` view that isolates sparse typed
-reasoning relationships from domain and lineage scaffolding, with first-class
-styling for `supersedes` and `duplicates`. Re-linking an existing memory pair
-now updates its type instead of silently retaining the old relationship.
+Every discovered candidate is still re-authorized against current ownership,
+group authority, profile restrictions, and hard denies before it is returned.
+Per-record classification checks remain on the memory disclosure path. The
+result remains bounded and explicitly reports truncation; it does
+not expose a global domain roster, change ownership, copy grants, or weaken
+shared-domain and foreign-write restrictions.
 
-The Go dependency baseline and pinned GitHub Actions have also been refreshed.
-All changes are off-consensus: there is no transaction, AppHash, fork-target, or
-application-version change, and app-v27 remains the ceiling.
+This patch changes no transaction, AppHash input, key encoding, fork target, or
+application version. Existing app-v27 chains replay byte-identically.
 
-Container: `ghcr.io/l33tdawg/sage:11.19.7`. SDK 11.19.7.
+Container: `ghcr.io/l33tdawg/sage:11.19.8`. SDK 11.19.8.
 
 ## What's New in v11.19.5
 
@@ -2318,7 +2316,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.7`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.8`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
