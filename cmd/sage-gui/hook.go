@@ -50,6 +50,11 @@ func runHook() error {
 		if err != nil {
 			return err
 		}
+		// Thread-scoped complete recall of any captured, since-compacted turns for
+		// this resumed thread, printed before the recency prefetch. Silent when
+		// nothing was captured; never gated (it reads already-governed data).
+		payload, _ := io.ReadAll(io.LimitReader(os.Stdin, preCompactStdinCap))
+		emitThreadScopedRecall(payload)
 		return runHookSessionStartForDomain(domain)
 	case "session-end":
 		if len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
@@ -57,6 +62,12 @@ func runHook() error {
 			return nil
 		}
 		return runHookSessionEnd()
+	case "pre-compact":
+		if len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
+			printHookUsage()
+			return nil
+		}
+		return runHookPreCompact()
 	case "inbox-status":
 		if len(args) > 1 {
 			return fmt.Errorf("hook inbox-status: unexpected arguments")
@@ -466,6 +477,21 @@ func hookSignedJSON(method, path string, body []byte, out any) error {
 	return nil
 }
 
+// hookSignedJSONCtx is hookSignedJSON bound to a caller-supplied context.
+func hookSignedJSONCtx(ctx context.Context, method, path string, body []byte, out any) error {
+	resp, err := hookSignedRequestCtx(ctx, method, path, body)
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(resp, out); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+	return nil
+}
+
 // runHookSessionEnd posts a lifecycle observation. Reads the hook payload
 // (session_id, reason) from stdin if present.
 func runHookSessionEnd() error {
@@ -508,6 +534,16 @@ func runHookSessionEnd() error {
 // SAGE node, mirroring the protocol used by internal/mcp.Server.signedRequest.
 // Returns the response body on 2xx, error otherwise.
 func hookSignedRequest(method, path string, body []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), hookHTTPTimeout)
+	defer cancel()
+	return hookSignedRequestCtx(ctx, method, path, body)
+}
+
+// hookSignedRequestCtx is hookSignedRequest bound to a caller-supplied context, so
+// a single command-level deadline can be propagated through every network call
+// (the recall-backed-compaction capture path relies on this). Each call is still
+// individually capped at hookHTTPTimeout via a sub-context.
+func hookSignedRequestCtx(ctx context.Context, method, path string, body []byte) ([]byte, error) {
 	seed, err := loadHookSeed()
 	if err != nil {
 		return nil, err
@@ -524,9 +560,9 @@ func hookSignedRequest(method, path string, body []byte) ([]byte, error) {
 	}
 	sig := auth.SignRequestWithNonce(priv, method, path, body, ts, nonce)
 
-	ctx, cancel := context.WithTimeout(context.Background(), hookHTTPTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, hookHTTPTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(callCtx, method, baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
