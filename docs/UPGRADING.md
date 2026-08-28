@@ -170,6 +170,7 @@ Use this to work out how far your chain has to climb.
 | v11.19.4 | Replacement capability is read from the exact candidate binary, while governance validation plus committed height/AppHash capture remain under one uninterrupted runtime fence; fixes the v11.19.3 live-updater TOCTOU without changing app-v27 |
 | v11.19.5 | Exact-local receipt repair, durable transport-scoped claimant identities, revision-fenced explicit handoff with legacy REST revision-0 compatibility, and database-incarnation-fenced payload-free nonblocking task/reply activity wake; no consensus change and app-v27 remains the ceiling |
 | v11.19.6 | Typed memory-link reads over REST and `sage_get_links`, with both endpoints filtered through caller disclosure policy before graph lookup; personal-node upgrades remain automatic while stopped-node preflight is operator-only; no consensus change and app-v27 remains the ceiling |
+| v11.19.7 | Default-off consent-gated recall-backed compaction with commit-backed byte-exact capture, visible gaps, complete same-thread restoration, and governed purge; isolated typed-link MRI rendering and correct last-write-wins memory re-typing; refreshed Go modules and CI actions; no consensus change and app-v27 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

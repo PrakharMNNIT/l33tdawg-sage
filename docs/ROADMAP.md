@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.6 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.7 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -125,6 +125,12 @@ caller's domain and record disclosure policy before querying the graph, and
 surfaces unavailable authorization state instead of returning a false complete
 empty graph. Personal-node upgrades remain automatic and updater-owned; manual
 stopped-node preflight is scoped to quorum or externally managed governance.
+v11.19.7 adds default-off, consent-gated recall-backed compaction with
+byte-exact governed capture and complete same-thread restoration; cursor
+progress is commit-backed and uncaptured spans remain visible. CEREBRUM can
+isolate typed reasoning links from structural graph edges, re-linking a memory
+pair correctly updates its type, and the dependency/action baselines are
+refreshed. These changes are off-consensus and app-v27 remains the ceiling.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -135,6 +141,24 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.7 release
+
+Recall-backed compaction is an explicitly enabled personal-node feature. The
+PreCompact hook validates and binds the canonical transcript descriptor,
+streams bounded byte-exact chunks into governed memory with deterministic IDs,
+and advances per-thread progress only after committed reconciliation. Malformed
+or abandoned spans become committed, recall-visible gap markers rather than
+silent loss. SessionStart restores the complete captured thread in order before
+ordinary recall. Operators can revoke future capture or govern prior records
+with `sage-gui nevercompact purge`; SAGE does not promise physical hard delete.
+
+CEREBRUM's memory view can isolate typed reasoning links from domain and parent
+edges, including distinct `supersedes` and `duplicates` styles. Store upserts
+also make re-typing an existing directed memory pair last-write-wins instead of
+silently discarding the new type. Go modules and pinned CI actions are updated.
+No transaction, AppHash, fork target, or application version changes; app-v27
+remains the ceiling.
 
 ## v11.19.6 release
 

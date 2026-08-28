@@ -51,28 +51,28 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
-## What's New in v11.19.6
+## What's New in v11.19.7
 
-**Typed memory relationships are now readable through the public API and MCP.**
-`POST /v1/memory/links` accepts up to 256 memory IDs and returns typed
-`supports`, `contradicts`, `supersedes`, and `refines` edges only when both
-endpoints are in that set and readable by the caller. The new `sage_get_links`
-MCP tool exposes the same projection, so an agent can recall memories and then
-reason over their explicit relationships without an N+1 query loop.
+**Recall-backed compaction can now preserve a Claude thread verbatim in governed
+SAGE memory and restore it when that same thread resumes.** The feature is
+default-off and requires an explicit, versioned acknowledgment (or the managed
+`SAGE_NEVERCOMPACT=1` setting). Capture is byte-exact, bounded, thread-scoped,
+idempotent across ambiguous network outcomes, and advances its durable cursor
+only after every chunk—or visible gap marker—is committed. Transcript path,
+ownership, session identity, and file-descriptor authority are validated before
+content leaves the host. Governed deprecation is available through
+`sage-gui nevercompact purge`; SAGE does not claim hard deletion.
 
-The read path filters every requested memory through domain and record-level
-authorization before querying links. Unreadable endpoints—and therefore their
-existence—remain undisclosed. Authorization-policy storage failures are
-reported as unavailable instead of being flattened into a false complete empty
-graph. This is an off-consensus projection read: it changes no transaction,
-AppHash, fork target, or application version, and app-v27 remains the ceiling.
+CEREBRUM's memory MRI gains a `◈ links` view that isolates sparse typed
+reasoning relationships from domain and lineage scaffolding, with first-class
+styling for `supersedes` and `duplicates`. Re-linking an existing memory pair
+now updates its type instead of silently retaining the old relationship.
 
-Personal single-node upgrades remain one-click. The updater owns the canonical
-compatibility proof, recovery snapshot, coordinated shutdown, final stopped
-snapshot, atomic install, rollback, and restart. Manual stopped-node preflight
-is for quorum or externally managed governance, not the normal desktop flow.
+The Go dependency baseline and pinned GitHub Actions have also been refreshed.
+All changes are off-consensus: there is no transaction, AppHash, fork-target, or
+application-version change, and app-v27 remains the ceiling.
 
-Container: `ghcr.io/l33tdawg/sage:11.19.6`. SDK 11.19.6.
+Container: `ghcr.io/l33tdawg/sage:11.19.7`. SDK 11.19.7.
 
 ## What's New in v11.19.5
 
@@ -2318,7 +2318,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.6`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.7`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
