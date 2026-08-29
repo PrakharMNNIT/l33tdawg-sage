@@ -172,6 +172,7 @@ Use this to work out how far your chain has to climb.
 | v11.19.6 | Typed memory-link reads over REST and `sage_get_links`, with both endpoints filtered through caller disclosure policy before graph lookup; personal-node upgrades remain automatic while stopped-node preflight is operator-only; no consensus change and app-v27 remains the ceiling |
 | v11.19.7 | Default-off consent-gated recall-backed compaction with commit-backed byte-exact capture, visible gaps, complete same-thread restoration, and governed purge; isolated typed-link MRI rendering and correct last-write-wins memory re-typing; refreshed Go modules and CI actions; no consensus change and app-v27 remains the ceiling |
 | v11.19.8 | Bounded caller-domain discovery now includes re-authorized current-owned domains of active local Access Group peers, so transferred historical domains remain discoverable without a global roster or grant copying; no consensus change and app-v27 remains the ceiling |
+| v11.19.9 | Unpinned Codex MCP sessions reject filesystem-root workspace resolution before key loading or generation, preventing retired `global-codex` reuse and synthetic `codex//` registration; no consensus change and app-v27 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
