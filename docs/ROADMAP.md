@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.9 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.10 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -131,6 +131,13 @@ progress is commit-backed and uncaptured spans remain visible. CEREBRUM can
 isolate typed reasoning links from structural graph edges, re-linking a memory
 pair correctly updates its type, and the dependency/action baselines are
 refreshed. These changes are off-consensus and app-v27 remains the ceiling.
+v11.19.8 restores bounded discovery of transferred historical domains for
+active local Access Groups. v11.19.9 fails closed when an unpinned Codex MCP
+session resolves to the filesystem root. v11.19.10 repairs returning-agent
+review: exact retired home domains can be reclaimed from Root during approval,
+and deprecated audit history no longer masquerades as active memory ownership
+during rejection. These patches remain off-consensus and app-v27 stays the
+ceiling.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -141,6 +148,21 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.10 release
+
+CEREBRUM can approve a returning identity whose exact recorded home domain was
+retired to the stable Root principal. The approval binds the live Root owner and
+uses the existing owner-fenced transfer fields; it never infers ownership for a
+fresh or operator-entered domain. Pending-registration rejection now checks the
+active-memory lifecycle projection rather than the all-history attribution
+count, so deprecated audit records remain preserved without creating an
+impossible remediation loop.
+
+This is an off-consensus dashboard lifecycle correction using existing
+transaction fields and authorization rules. It changes no consensus rule,
+AppHash input, key encoding, fork target, or application version; app-v27
+remains the ceiling.
 
 ## v11.19.9 release
 
