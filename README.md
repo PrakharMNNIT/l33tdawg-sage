@@ -51,6 +51,41 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.10
+
+**Returning agents can be reviewed normally again.** When app-v26 retirement
+has handed an agent's former home domain to the stable Root principal,
+CEREBRUM reapproval now binds the existing owner and uses the established
+Root-to-agent recovery transfer for that exact recorded home. Fresh or
+operator-entered domains never receive an implicit transfer.
+
+Rejecting a pending registration now counts active memories—the same lifecycle
+view shown by the recovery panel—instead of treating deprecated audit history
+as work the operator can still remediate. Active records continue to block
+ordinary rejection unless they are deprecated, transferred, or the explicit
+attribution-preserving force path is chosen.
+
+This patch changes no consensus rule, AppHash input, key encoding, fork target,
+or application version. Existing app-v27 chains replay byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.10`. SDK 11.19.10.
+
+## What's New in v11.19.9
+
+**Codex workspace identity resolution now fails closed at the filesystem
+root.** A user-level Codex MCP process launched from `/` can no longer reuse the
+retired `global-codex` signer or auto-register the synthetic name `codex//`.
+SAGE rejects that broad, untrustworthy boundary before Git discovery,
+project-config lookup, key loading, or key generation. Real project and linked
+worktree roots continue to resolve to their stable workspace identities;
+operators who intentionally need a non-workspace shared identity must pin it
+explicitly with `SAGE_IDENTITY_PATH`.
+
+This patch changes no transaction, AppHash input, key encoding, fork target, or
+application version. Existing app-v27 chains replay byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.9`. SDK 11.19.9.
+
 ## What's New in v11.19.8
 
 **Access Groups now discover transferred historical domains, not only each
@@ -2316,7 +2351,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.8`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.10`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

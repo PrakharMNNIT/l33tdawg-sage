@@ -820,12 +820,36 @@ func (h *DashboardHandler) handleRemoveAgent(agentStore store.AgentStore) http.H
 			return
 		}
 		if agent.MemoryCount > 0 && r.URL.Query().Get("force") != "true" {
-			writeJSONResp(w, http.StatusConflict, map[string]any{
-				"ok": false, "code": "agent_has_memories", "error": "Agent has memories.",
-				"memory_count": agent.MemoryCount,
-				"message":      "Use ?force=true to deactivate it while preserving original memory attribution.",
+			// AgentEntry.MemoryCount deliberately includes deprecated audit history,
+			// while the recovery panel and the operator's remediation workflow show
+			// only active records. Reusing the all-history count here made a fully
+			// deprecated identity impossible to reject: the UI truthfully showed
+			// zero records left to deprecate, but this gate could never reach zero.
+			// Count with the same shared "active" lifecycle filter before blocking.
+			memoryStore, ok := agentStore.(store.MemoryStore)
+			if !ok {
+				writeAppV23AccessError(w, http.StatusServiceUnavailable, "memory_state_unavailable",
+					"Active memory ownership could not be verified; the agent was left unchanged.")
+				return
+			}
+			_, activeMemoryCount, countErr := memoryStore.ListMemories(r.Context(), store.ListOptions{
+				SubmittingAgent: id,
+				Status:          "active",
+				Limit:           1,
 			})
-			return
+			if countErr != nil {
+				writeAppV23AccessError(w, http.StatusServiceUnavailable, "memory_state_unavailable",
+					"Active memory ownership could not be verified; the agent was left unchanged.")
+				return
+			}
+			if activeMemoryCount > 0 {
+				writeJSONResp(w, http.StatusConflict, map[string]any{
+					"ok": false, "code": "agent_has_memories", "error": "Agent has active memories.",
+					"memory_count": activeMemoryCount,
+					"message":      "Deprecate the active memories, transfer their domains, or use ?force=true while preserving original attribution.",
+				})
+				return
+			}
 		}
 		if enrollment == nil {
 			// Directory-only / historical records have never held an active

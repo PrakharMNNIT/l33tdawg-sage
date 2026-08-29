@@ -271,6 +271,14 @@ func canonicalWorkspaceRootWithProbe(projectDir string, probe func(context.Conte
 	if err != nil {
 		return "", err
 	}
+	// A filesystem root is not a project boundary. In particular, the Codex
+	// desktop app-server itself runs from `/`; accepting that cwd would reuse
+	// the retired global-codex signer and auto-register the misleading name
+	// `codex//` instead of the task's actual workspace identity. Fail before
+	// probing Git, reading project config, or generating any key material.
+	if filepath.Dir(clean) == clean {
+		return "", fmt.Errorf("refusing broad workspace identity root")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	out, gitErr := probe(ctx, clean)

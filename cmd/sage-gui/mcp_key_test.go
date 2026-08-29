@@ -94,6 +94,31 @@ func TestCanonicalWorkspaceRootFailsClosedWhenGitProbeTimesOut(t *testing.T) {
 		"identity resolution must fail closed promptly when Git stalls")
 }
 
+func TestCanonicalWorkspaceRootRejectsFilesystemRootWithoutGit(t *testing.T) {
+	root := string(filepath.Separator)
+	probed := false
+
+	resolved, err := canonicalWorkspaceRootWithProbe(root, func(context.Context, string) ([]byte, error) {
+		probed = true
+		return nil, exec.ErrNotFound
+	})
+
+	require.ErrorContains(t, err, "refusing broad workspace identity root")
+	require.Empty(t, resolved)
+	require.False(t, probed, "a filesystem-root workspace must fail before Git probing or identity generation")
+}
+
+func TestResolveImplicitWorkspaceIdentityRejectsFilesystemRoot(t *testing.T) {
+	keyPath, provider, project, err := resolveImplicitWorkspaceIdentity(
+		t.TempDir(), string(filepath.Separator), "codex", "",
+	)
+
+	require.ErrorContains(t, err, "refusing broad workspace identity root")
+	require.Empty(t, keyPath)
+	require.Equal(t, "codex", provider)
+	require.Empty(t, project)
+}
+
 func TestPrimaryWorkspaceMCPEnvPreservesPinnedProviderIdentity(t *testing.T) {
 	root := t.TempDir()
 	key := filepath.Join(t.TempDir(), "agent.key")
