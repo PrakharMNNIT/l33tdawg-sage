@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.19.8.
+Reconciled against internal/mcp for SAGE v11.19.9.
 
 # SAGE MCP Tools Reference
 
@@ -131,6 +131,15 @@ CEREBRUM operator-only `/v1/dashboard/stats` surface.
 `GET /v1/dashboard/settings/boot-instructions`,
 `GET /v1/dashboard/settings/memory-mode`, `POST /v1/embed`,
 `POST /v1/memory/submit`
+
+For an unpinned user-level Codex MCP registration, the MCP process working
+directory must resolve to a real workspace boundary. A filesystem-root working
+directory is rejected before Git discovery, project-config lookup, key loading,
+or key generation; it never falls back to the retired `global-codex` signer and
+cannot auto-register a synthetic `codex//` identity. Start the task in its
+intended workspace, or deliberately configure `SAGE_IDENTITY_PATH` when a
+non-workspace, explicitly shared identity is required (`cmd/sage-gui/mcp.go`,
+`canonicalWorkspaceRootWithProbe`).
 
 **When to call:** First action of every new conversation. No exceptions —
 not even for greetings. Since v11.18.1, a compliant MCP session runs the

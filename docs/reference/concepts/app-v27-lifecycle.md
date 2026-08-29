@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.19.8/app-v27 code (2026-08-28). -->
+<!-- Verified against SAGE v11.19.9/app-v27 code (2026-08-29). -->
 
 # App-v27 record lifecycle and task canonicalization
 

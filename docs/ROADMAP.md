@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.8 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.9 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -141,6 +141,20 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.9 release
+
+Unpinned Codex MCP identity resolution now rejects the filesystem root before
+probing Git, reading workspace configuration, or generating a signer. This
+prevents the desktop app-server's `/` working directory from resurrecting the
+retired `global-codex` identity and registering the misleading `codex//`
+principal. Real repository and worktree roots retain their existing stable
+identity derivation, and explicit `SAGE_IDENTITY_PATH` pins remain available
+for intentional non-workspace identities.
+
+This is an off-consensus client identity-boundary correction. It changes no
+transaction, AppHash, key encoding, fork target, or application version;
+app-v27 remains the ceiling.
 
 ## v11.19.8 release
 

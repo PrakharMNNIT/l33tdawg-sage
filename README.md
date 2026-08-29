@@ -51,6 +51,22 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.9
+
+**Codex workspace identity resolution now fails closed at the filesystem
+root.** A user-level Codex MCP process launched from `/` can no longer reuse the
+retired `global-codex` signer or auto-register the synthetic name `codex//`.
+SAGE rejects that broad, untrustworthy boundary before Git discovery,
+project-config lookup, key loading, or key generation. Real project and linked
+worktree roots continue to resolve to their stable workspace identities;
+operators who intentionally need a non-workspace shared identity must pin it
+explicitly with `SAGE_IDENTITY_PATH`.
+
+This patch changes no transaction, AppHash input, key encoding, fork target, or
+application version. Existing app-v27 chains replay byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.9`. SDK 11.19.9.
+
 ## What's New in v11.19.8
 
 **Access Groups now discover transferred historical domains, not only each
@@ -2316,7 +2332,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.8`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.9`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
