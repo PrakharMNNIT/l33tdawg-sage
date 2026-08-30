@@ -582,17 +582,20 @@ func verifiedDashboardAgentID(ctx context.Context) string {
 // control plane. Check both the connected peer and Host: the peer blocks LAN
 // management while Host blocks DNS-rebinding and misleading forwarded hosts.
 func isLoopbackCEREBRUMRequest(r *http.Request) bool {
-	if r == nil || !isLoopbackRemote(r.RemoteAddr) || !hostIsLoopback(r.Host) {
+	if r == nil || !isLoopbackRemote(r.RemoteAddr) || !hostIsTrustedCEREBRUMHost(r.Host) {
 		return false
 	}
 	// Forwarding metadata is deny-only corroboration. A remote browser reaching
 	// SAGE through a loopback reverse-proxy socket must not become CEREBRUM just
 	// because that proxy rewrote Host to localhost. Conversely, no forwarded
 	// header can ever turn a non-loopback socket/Host into a local request.
+	// Forwarded HOST values additionally accept operator-configured extra
+	// hostnames (SAGE_ALLOWED_CEREBRUM_HOSTS) so a local proxy may pass the
+	// original Host through instead of rewriting it.
 	return forwardedIPListIsLoopback(r.Header.Values("X-Forwarded-For")) &&
 		forwardedIPListIsLoopback(r.Header.Values("X-Real-IP")) &&
-		forwardedHostListIsLoopback(r.Header.Values("X-Forwarded-Host")) &&
-		rfcForwardedIsLoopback(r.Header.Values("Forwarded"))
+		forwardedHostListIsTrusted(r.Header.Values("X-Forwarded-Host")) &&
+		rfcForwardedIsTrusted(r.Header.Values("Forwarded"))
 }
 
 // isCEREBRUMOperatorRequest distinguishes the dashboard operator from an
@@ -657,14 +660,15 @@ func (h *DashboardHandler) isCEREBRUMReadRequest(r *http.Request) bool {
 // isLoopbackCEREBRUMBrowserRequest recognizes the local dashboard SPA without
 // treating every process that can connect to localhost as the human operator.
 // Fetch Metadata is browser-controlled; Origin is the fallback for older
-// browsers on requests that carry one. Host and peer must both be loopback so
-// an unencrypted node opened over the LAN never acquires operator authority.
+// browsers on requests that carry one. The peer must be loopback and Host must
+// be loopback or explicitly operator-configured, so an unencrypted node opened
+// over the LAN never acquires operator authority.
 func isLoopbackCEREBRUMBrowserRequest(r *http.Request) bool {
 	if verifiedDashboardAgentID(r.Context()) != "" ||
 		strings.TrimSpace(r.Header.Get("X-Agent-ID")) != "" {
 		return false
 	}
-	if !isLoopbackRemote(r.RemoteAddr) || !hostIsLoopback(r.Host) || !isLocalRequest(r) {
+	if !isLoopbackRemote(r.RemoteAddr) || !hostIsTrustedCEREBRUMHost(r.Host) || !isLocalRequest(r) {
 		return false
 	}
 	secFetch := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
@@ -707,10 +711,10 @@ func forwardedIPListIsLoopback(values []string) bool {
 	return true
 }
 
-func forwardedHostListIsLoopback(values []string) bool {
+func forwardedHostListIsTrusted(values []string) bool {
 	for _, value := range values {
 		for _, entry := range strings.Split(value, ",") {
-			if !hostIsLoopback(strings.Trim(strings.TrimSpace(entry), `"`)) {
+			if !hostIsTrustedCEREBRUMHost(strings.Trim(strings.TrimSpace(entry), `"`)) {
 				return false
 			}
 		}
@@ -734,7 +738,7 @@ func forwardedAddressIsLoopback(raw string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func rfcForwardedIsLoopback(values []string) bool {
+func rfcForwardedIsTrusted(values []string) bool {
 	for _, value := range values {
 		for _, element := range strings.Split(value, ",") {
 			for _, parameter := range strings.Split(element, ";") {
@@ -748,7 +752,7 @@ func rfcForwardedIsLoopback(values []string) bool {
 						return false
 					}
 				case "host":
-					if !hostIsLoopback(strings.Trim(strings.TrimSpace(raw), `"`)) {
+					if !hostIsTrustedCEREBRUMHost(strings.Trim(strings.TrimSpace(raw), `"`)) {
 						return false
 					}
 				}
@@ -1682,7 +1686,10 @@ func isLocalRequest(r *http.Request) bool {
 	// not constrained here. Sec-Fetch-Site is a browser-set forbidden header that
 	// page JS cannot suppress when the browser supplies Fetch Metadata; older
 	// WebViews may omit it and are handled by the stricter operator gate above.
-	if (secFetch != "" || origin != "") && !hostIsLoopbackOrIP(r.Host) {
+	// Operator-configured extra hostnames (SAGE_ALLOWED_CEREBRUM_HOSTS) count
+	// as local here too, so a loopback reverse proxy presenting its own
+	// hostname is not mistaken for a rebinding page.
+	if (secFetch != "" || origin != "") && !hostIsAllowedBrowserHost(r.Host) {
 		return false
 	}
 	switch secFetch {
@@ -1736,6 +1743,17 @@ func originMatchesRequest(r *http.Request, origin string) bool {
 	requestScheme := "http"
 	if r.TLS != nil {
 		requestScheme = "https"
+	}
+	// A loopback TLS-terminating reverse proxy presents the request as plain
+	// HTTP while the browser origin is HTTPS. Trust X-Forwarded-Proto only when
+	// every field-line and comma-joined hop is valid and agrees; ambiguous or
+	// malformed forwarding metadata fails closed.
+	if forwardedProto := r.Header.Values("X-Forwarded-Proto"); len(forwardedProto) > 0 {
+		var ok bool
+		requestScheme, ok = forwardedProtoScheme(forwardedProto)
+		if !ok {
+			return false
+		}
 	}
 	if u.Scheme != requestScheme {
 		return false
