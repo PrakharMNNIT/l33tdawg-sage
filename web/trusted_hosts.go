@@ -49,7 +49,32 @@ func allowedCEREBRUMHosts() []string {
 		seen[entry] = struct{}{}
 		hosts = append(hosts, entry)
 	}
+	if len(hosts) == 0 {
+		return nil
+	}
 	return hosts
+}
+
+// forwardedProtoScheme parses all X-Forwarded-Proto field-lines and
+// comma-joined hop values. A proxy chain is usable only when every token is a
+// valid, case-insensitive HTTP scheme and all hops agree. Rejecting empty,
+// malformed, and mixed chains prevents client-supplied forwarding metadata
+// from overriding the request's actual transport ambiguously.
+func forwardedProtoScheme(values []string) (string, bool) {
+	var scheme string
+	for _, value := range values {
+		for _, entry := range strings.Split(value, ",") {
+			entry = strings.ToLower(strings.TrimSpace(entry))
+			if entry != "http" && entry != "https" {
+				return "", false
+			}
+			if scheme != "" && entry != scheme {
+				return "", false
+			}
+			scheme = entry
+		}
+	}
+	return scheme, scheme != ""
 }
 
 // hostIsTrustedCEREBRUMHost reports whether host is loopback or an

@@ -20,6 +20,10 @@ func TestAllowedCEREBRUMHostsParsing(t *testing.T) {
 	if got := allowedCEREBRUMHosts(); got != nil {
 		t.Fatalf("expected nil for empty env, got %v", got)
 	}
+	t.Setenv(allowedCEREBRUMHostsEnv, " , , ")
+	if got := allowedCEREBRUMHosts(); got != nil {
+		t.Fatalf("expected nil for separator-only env, got %v", got)
+	}
 }
 
 func TestHostIsTrustedCEREBRUMHost(t *testing.T) {
@@ -122,10 +126,14 @@ func TestIsLocalRequestAllowedBrowserHost(t *testing.T) {
 }
 
 func TestOriginMatchesRequestForwardedProto(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/ui/", nil) // plain HTTP behind proxy
-	r.Host = "sage.stands-macbook-pro.local:443"
-
 	httpsOrigin := "https://sage.stands-macbook-pro.local"
+	newRequest := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/ui/", nil) // plain HTTP behind proxy
+		r.Host = "sage.stands-macbook-pro.local:443"
+		return r
+	}
+
+	r := newRequest()
 	if originMatchesRequest(r, httpsOrigin) {
 		t.Fatal("https origin must not match a plain-HTTP request without X-Forwarded-Proto")
 	}
@@ -140,5 +148,33 @@ func TestOriginMatchesRequestForwardedProto(t *testing.T) {
 	}
 	if originMatchesRequest(r, "https://evil.example.com") {
 		t.Fatal("different origin host must never match")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		values []string
+		origin string
+		match  bool
+	}{
+		{name: "mixed case", values: []string{"HTTPS"}, origin: httpsOrigin, match: true},
+		{name: "unanimous comma chain", values: []string{"https, HTTPS"}, origin: httpsOrigin, match: true},
+		{name: "unanimous field lines", values: []string{"https", "HTTPS"}, origin: httpsOrigin, match: true},
+		{name: "unanimous HTTP chain", values: []string{"HTTP, http"}, origin: "http://sage.stands-macbook-pro.local:443", match: true},
+		{name: "mixed scheme chain matching first", values: []string{"http, https"}, origin: "http://sage.stands-macbook-pro.local:443"},
+		{name: "mixed scheme chain matching last", values: []string{"https, http"}, origin: httpsOrigin},
+		{name: "mixed scheme field lines", values: []string{"https", "http"}, origin: httpsOrigin},
+		{name: "malformed scheme", values: []string{"ftp"}, origin: "http://sage.stands-macbook-pro.local:443"},
+		{name: "empty chain token", values: []string{"http,"}, origin: "http://sage.stands-macbook-pro.local:443"},
+		{name: "empty field line", values: []string{""}, origin: "http://sage.stands-macbook-pro.local:443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRequest()
+			for _, value := range tc.values {
+				r.Header.Add("X-Forwarded-Proto", value)
+			}
+			if got := originMatchesRequest(r, tc.origin); got != tc.match {
+				t.Fatalf("originMatchesRequest() = %v, want %v for values %q", got, tc.match, tc.values)
+			}
+		})
 	}
 }

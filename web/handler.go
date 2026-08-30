@@ -660,8 +660,9 @@ func (h *DashboardHandler) isCEREBRUMReadRequest(r *http.Request) bool {
 // isLoopbackCEREBRUMBrowserRequest recognizes the local dashboard SPA without
 // treating every process that can connect to localhost as the human operator.
 // Fetch Metadata is browser-controlled; Origin is the fallback for older
-// browsers on requests that carry one. Host and peer must both be loopback so
-// an unencrypted node opened over the LAN never acquires operator authority.
+// browsers on requests that carry one. The peer must be loopback and Host must
+// be loopback or explicitly operator-configured, so an unencrypted node opened
+// over the LAN never acquires operator authority.
 func isLoopbackCEREBRUMBrowserRequest(r *http.Request) bool {
 	if verifiedDashboardAgentID(r.Context()) != "" ||
 		strings.TrimSpace(r.Header.Get("X-Agent-ID")) != "" {
@@ -1743,14 +1744,16 @@ func originMatchesRequest(r *http.Request, origin string) bool {
 	if r.TLS != nil {
 		requestScheme = "https"
 	}
-	// A loopback TLS-terminating reverse proxy (Caddy, Traefik, ...) presents
-	// the request as plain HTTP while the browser origin is https. Honor
-	// X-Forwarded-Proto for the scheme comparison: browsers cannot set the
-	// header (fetch forbidden header), and this boundary is only reached for
-	// loopback peers, so a spoofed value can only relax the check for the
-	// caller's own request on this machine.
-	if fp := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); fp == "http" || fp == "https" {
-		requestScheme = fp
+	// A loopback TLS-terminating reverse proxy presents the request as plain
+	// HTTP while the browser origin is HTTPS. Trust X-Forwarded-Proto only when
+	// every field-line and comma-joined hop is valid and agrees; ambiguous or
+	// malformed forwarding metadata fails closed.
+	if forwardedProto := r.Header.Values("X-Forwarded-Proto"); len(forwardedProto) > 0 {
+		var ok bool
+		requestScheme, ok = forwardedProtoScheme(forwardedProto)
+		if !ok {
+			return false
+		}
 	}
 	if u.Scheme != requestScheme {
 		return false
