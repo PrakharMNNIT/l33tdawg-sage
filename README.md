@@ -51,6 +51,25 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.11
+
+**CEREBRUM now supports operator-configured hostnames behind a local TLS
+reverse proxy.** Set `SAGE_ALLOWED_CEREBRUM_HOSTS` to an exact comma-separated
+hostname allowlist when Caddy, Traefik, or another loopback proxy preserves the
+browser-facing `Host` instead of rewriting it to `localhost`. Ports are
+normalized and wildcards are deliberately unsupported.
+
+The trust boundary stays local: the connected peer and every forwarded IP hop
+must still be loopback, unconfigured hostnames still fail closed, and browser
+origin matching accepts `X-Forwarded-Proto` only when every field-line and
+comma-joined token is a valid, case-insensitive `http` or `https` value and all
+hops agree. Empty, malformed, or mixed scheme chains are rejected.
+
+This patch changes no consensus rule, AppHash input, key encoding, fork target,
+or application version. Existing app-v27 chains replay byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.11`. SDK 11.19.11.
+
 ## What's New in v11.19.10
 
 **Returning agents can be reviewed normally again.** When app-v26 retirement
@@ -2351,7 +2370,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.10`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.11`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
