@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.10 is the current release.** It keeps the
+**Status (2026-08):** **v11.19.11 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -136,8 +136,10 @@ active local Access Groups. v11.19.9 fails closed when an unpinned Codex MCP
 session resolves to the filesystem root. v11.19.10 repairs returning-agent
 review: exact retired home domains can be reclaimed from Root during approval,
 and deprecated audit history no longer masquerades as active memory ownership
-during rejection. These patches remain off-consensus and app-v27 stays the
-ceiling.
+during rejection. v11.19.11 adds an exact operator-configured CEREBRUM hostname
+allowlist for loopback TLS reverse proxies and rejects ambiguous or malformed
+forwarded-proto chains. These patches remain off-consensus and app-v27 stays
+the ceiling.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -148,6 +150,22 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.11 release
+
+CEREBRUM can now sit behind a loopback TLS-terminating reverse proxy without
+requiring that proxy to rewrite the browser-facing hostname to `localhost`.
+`SAGE_ALLOWED_CEREBRUM_HOSTS` adds exact, port-normalized hostnames to the
+existing Host and forwarded-host checks; it deliberately supports no wildcard.
+The connected peer and every forwarded IP hop remain loopback-only.
+
+Browser origin matching consumes `X-Forwarded-Proto` only when every header
+field-line and comma-joined hop is a valid case-insensitive `http` or `https`
+token and all values agree. Empty, malformed, or mixed chains fail closed.
+
+This is an off-consensus local dashboard boundary extension. It changes no
+transaction, AppHash input, key encoding, fork target, or application version;
+app-v27 remains the ceiling.
 
 ## v11.19.10 release
 
