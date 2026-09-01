@@ -505,6 +505,34 @@ func sanitizeDirName(name string) string {
 	return name
 }
 
+// errIfInstallTargetsHome refuses a project-scoped install that would land in the
+// user's home directory. runMCPInstall and runCodexInstall write their config under
+// the working directory (.claude/ or .codex/) and register hook commands with
+// ${CLAUDE_PROJECT_DIR}-relative paths. Run from $HOME, that config lands in the
+// user-global config directory, where ${CLAUDE_PROJECT_DIR} later resolves to
+// whichever project is open — so the hooks fail in every other project. Refuse
+// rather than write a guaranteed-broken install. Fails open when $HOME cannot be
+// resolved, so it never blocks a legitimate install.
+func errIfInstallTargetsHome(projectDir string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	projectAbs, projectErr := filepath.Abs(projectDir)
+	homeAbs, homeErr := filepath.Abs(home)
+	if projectErr != nil || homeErr != nil {
+		return nil
+	}
+	if filepath.Clean(projectAbs) == filepath.Clean(homeAbs) {
+		return fmt.Errorf(
+			"refusing to install into the home directory (%s): install writes a "+
+				"project-scoped config whose hooks are ${CLAUDE_PROJECT_DIR}-relative, "+
+				"which would land in the user-global config and break in every project; "+
+				"cd into a project directory and run install there", homeAbs)
+	}
+	return nil
+}
+
 // runMCPInstall creates a .mcp.json in the current directory so Claude Code
 // (or any MCP-compatible client) can connect to SAGE automatically.
 //
@@ -536,6 +564,9 @@ func runMCPInstall() error {
 	projectDir, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("get working directory: %w", err)
+	}
+	if guardErr := errIfInstallTargetsHome(projectDir); guardErr != nil {
+		return guardErr
 	}
 
 	// Determine SAGE_HOME

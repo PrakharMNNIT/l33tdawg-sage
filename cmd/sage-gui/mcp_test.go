@@ -36,6 +36,24 @@ func TestClaudeChannelRequiresExplicitCapableHostOptIn(t *testing.T) {
 	}
 }
 
+func TestErrIfInstallTargetsHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Refuses when the install target is the home directory itself: a
+	// project-scoped install there pollutes the user-global config with
+	// ${CLAUDE_PROJECT_DIR}-relative hooks that break in every project.
+	err := errIfInstallTargetsHome(home)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "home directory")
+
+	// Refuses regardless of a trailing separator or otherwise uncleaned path.
+	assert.Error(t, errIfInstallTargetsHome(home+string(os.PathSeparator)))
+
+	// Allows a normal project directory.
+	assert.NoError(t, errIfInstallTargetsHome(t.TempDir()))
+}
+
 func TestInstallClaudeMD_CreateNew(t *testing.T) {
 	projectDir := t.TempDir()
 	err := installClaudeMD(projectDir)
