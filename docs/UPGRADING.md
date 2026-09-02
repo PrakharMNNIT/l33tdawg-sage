@@ -175,6 +175,7 @@ Use this to work out how far your chain has to climb.
 | v11.19.9 | Unpinned Codex MCP sessions reject filesystem-root workspace resolution before key loading or generation, preventing retired `global-codex` reuse and synthetic `codex//` registration; no consensus change and app-v27 remains the ceiling |
 | v11.19.10 | Returning-agent approval reclaims only the identity's exact Root-retired home through the existing owner-bound transfer path; pending rejection counts active memories rather than deprecated audit history; no consensus change and app-v27 remains the ceiling |
 | v11.19.11 | Exact operator-configured CEREBRUM hostnames for loopback TLS reverse proxies, with loopback-only peer/forwarded-IP enforcement and unanimous fail-closed `X-Forwarded-Proto` parsing; no consensus change and app-v27 remains the ceiling |
+| v11.19.12 | Project-scoped MCP and Codex installs reject the user's home directory to prevent global host-config pollution; the Linux native-shell gate admits the independently verified September AppImage-helper rebuild by exact SHA-256; no consensus change and app-v27 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
