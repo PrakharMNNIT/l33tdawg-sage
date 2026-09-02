@@ -51,6 +51,25 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.12
+
+**Project-scoped MCP and Codex installs can no longer corrupt user-global host
+configuration.** `sage-gui mcp install` and `sage-gui codex install` now refuse
+to run when the working directory resolves to the user's home directory. Run
+the command from the intended project instead; ordinary project installs are
+unchanged.
+
+The native-shell build also refreshes its fail-closed checksum for the official
+September `linuxdeploy-plugin-appimage` rebuild. The replacement was produced
+by the upstream project's successful scheduled workflow from its unchanged
+source commit, and its downloaded SHA-256 matches GitHub's release-asset
+digest. An unexpected future replacement will continue to stop the build.
+
+This patch changes no consensus rule, AppHash input, key encoding, fork target,
+or application version. Existing app-v27 chains replay byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.12`. SDK 11.19.12.
+
 ## What's New in v11.19.11
 
 **CEREBRUM now supports operator-configured hostnames behind a local TLS
@@ -2370,7 +2389,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.11`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.12`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

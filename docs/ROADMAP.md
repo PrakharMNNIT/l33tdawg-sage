@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-08):** **v11.19.11 is the current release.** It keeps the
+**Status (2026-09):** **v11.19.12 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -139,7 +139,10 @@ and deprecated audit history no longer masquerades as active memory ownership
 during rejection. v11.19.11 adds an exact operator-configured CEREBRUM hostname
 allowlist for loopback TLS reverse proxies and rejects ambiguous or malformed
 forwarded-proto chains. These patches remain off-consensus and app-v27 stays
-the ceiling.
+the ceiling. v11.19.12 refuses project-scoped MCP and Codex installs from the
+user's home directory, preventing project-relative hook registrations from
+polluting global host configuration, and refreshes the fail-closed checksum for
+the verified September AppImage helper rebuild.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -150,6 +153,25 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.12 release
+
+`sage-gui mcp install` and `sage-gui codex install` now reject a working
+directory that resolves to the user's home directory. Both commands emit
+project-relative configuration and hooks; allowing that output to land in
+`~/.claude` or `~/.codex` creates a global configuration whose hook paths break
+as soon as another project is opened. Normal project-directory installs are
+unchanged.
+
+The Linux native-shell gate now admits the exact SHA-256 of the official
+September `linuxdeploy-plugin-appimage` scheduled rebuild. The downloaded
+binary matches GitHub's release-asset digest and was built from the same
+upstream source commit as the prior admitted artifact. Digest verification
+remains fail closed.
+
+This is an off-consensus installer and release-build correction. It changes no
+transaction, AppHash input, key encoding, fork target, or application version;
+app-v27 remains the ceiling.
 
 ## v11.19.11 release
 
