@@ -513,24 +513,34 @@ func sanitizeDirName(name string) string {
 // whichever project is open — so the hooks fail in every other project. Refuse
 // rather than write a guaranteed-broken install. Fails open when $HOME cannot be
 // resolved, so it never blocks a legitimate install.
-func errIfInstallTargetsHome(projectDir string) error {
+// installTargetsHome reports whether projectDir resolves to the user's home
+// directory — where a project-scoped .claude/.codex write would land in the
+// user-global config and its ${CLAUDE_PROJECT_DIR}-relative hooks would then break
+// in every project. Fails safe (false) when home cannot be resolved, so it never
+// blocks a legitimate install/heal.
+func installTargetsHome(projectDir string) bool {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil
+		return false
 	}
 	projectAbs, projectErr := filepath.Abs(projectDir)
 	homeAbs, homeErr := filepath.Abs(home)
 	if projectErr != nil || homeErr != nil {
+		return false
+	}
+	return filepath.Clean(projectAbs) == filepath.Clean(homeAbs)
+}
+
+func errIfInstallTargetsHome(projectDir string) error {
+	if !installTargetsHome(projectDir) {
 		return nil
 	}
-	if filepath.Clean(projectAbs) == filepath.Clean(homeAbs) {
-		return fmt.Errorf(
-			"refusing to install into the home directory (%s): install writes a "+
-				"project-scoped config whose hooks are ${CLAUDE_PROJECT_DIR}-relative, "+
-				"which would land in the user-global config and break in every project; "+
-				"cd into a project directory and run install there", homeAbs)
-	}
-	return nil
+	home, _ := os.UserHomeDir()
+	return fmt.Errorf(
+		"refusing to install into the home directory (%s): install writes a "+
+			"project-scoped config whose hooks are ${CLAUDE_PROJECT_DIR}-relative, "+
+			"which would land in the user-global config and break in every project; "+
+			"cd into a project directory and run install there", home)
 }
 
 // runMCPInstall creates a .mcp.json in the current directory so Claude Code
@@ -1317,6 +1327,18 @@ func claimAgentIdentity(sageHome, token, keyPath string) error {
 //     __SAGE_GUI_BIN__ path (e.g. user upgraded sage-gui to a new location)
 //     get re-templated.
 func selfHealProject(projectDir, sageHome string, active ...string) {
+	// The stdio bridge auto-heals a project's .claude/.codex hooks on every
+	// startup. Skip it only when projectDir == $HOME: there <cwd>/.claude IS the
+	// user-global config directory, so the ${CLAUDE_PROJECT_DIR}-relative hooks
+	// land in it and then break in every OTHER project (the same hazard
+	// errIfInstallTargetsHome guards for `install`). CLAUDE_CONFIG_DIR is NOT a
+	// reason to skip: it overrides the user config dir, not project config, so
+	// projectDir/.claude/settings.json remains the correct, cwd-discovered
+	// project scope regardless. The bridge only needs to sign requests; `mcp
+	// install` remains the explicit, directory-aware way to (re)install hooks.
+	if installTargetsHome(projectDir) {
+		return
+	}
 	activeProvider, activeIdentityPath := "", ""
 	if len(active) > 0 {
 		activeProvider = active[0]
