@@ -51,6 +51,22 @@ The dashboard also includes agent management, domain permissions, key rotation, 
 
 ---
 
+## What's New in v11.19.13
+
+**The stdio MCP bridge no longer self-installs project hooks into the user’s
+home directory.** When `sage-gui mcp` starts with `$HOME` as its working
+directory, automatic project repair now returns without writing `.claude`
+hooks or project-relative hook registrations into user-global configuration.
+
+Explicit `sage-gui mcp install` and `sage-gui codex install` commands keep their
+existing home-directory refusal. Normal project-directory self-healing also
+remains unchanged, including when `CLAUDE_CONFIG_DIR` points elsewhere.
+
+This patch changes no consensus rule, AppHash input, key encoding, fork target,
+or application version. Existing app-v27 chains replay byte-identically.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.13`. SDK 11.19.13.
+
 ## What's New in v11.19.12
 
 **Project-scoped MCP and Codex installs can no longer corrupt user-global host
@@ -2389,7 +2405,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.12`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.13`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:

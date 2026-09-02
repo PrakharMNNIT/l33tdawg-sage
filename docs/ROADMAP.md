@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-09):** **v11.19.12 is the current release.** It keeps the
+**Status (2026-09):** **v11.19.13 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -143,6 +143,10 @@ the ceiling. v11.19.12 refuses project-scoped MCP and Codex installs from the
 user's home directory, preventing project-relative hook registrations from
 polluting global host configuration, and refreshes the fail-closed checksum for
 the verified September AppImage helper rebuild.
+v11.19.13 prevents stdio MCP startup from self-healing project-relative Claude
+hooks into user-global configuration when its working directory is the user's
+home directory. Explicit installs retain their existing refusal, while normal
+project self-healing—including with `CLAUDE_CONFIG_DIR` set—remains unchanged.
 v11.18.19 prevents Codex project-hook
 self-healing from ever targeting the user-global `~/.codex` scope and removes
 the Connectome's competing DOM/ForceGraph click paths while bounding raw access
@@ -153,6 +157,22 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.13 release
+
+The stdio MCP bridge now skips automatic project hook repair when its working
+directory resolves to the user's home directory. This closes the remaining
+implicit path that could write `.claude/hooks` and project-relative hook
+registrations into user-global host configuration merely by starting the
+bridge from `$HOME`.
+
+The explicit MCP and Codex install commands retain the home-directory refusal
+added in v11.19.12. Ordinary project-directory self-healing is unchanged, and
+`CLAUDE_CONFIG_DIR` deliberately does not suppress valid project repair.
+
+This is an off-consensus bridge safety correction. It changes no transaction,
+AppHash input, key encoding, fork target, or application version; app-v27
+remains the ceiling.
 
 ## v11.19.12 release
 
