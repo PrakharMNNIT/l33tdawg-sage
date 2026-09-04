@@ -48,7 +48,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.14`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.15`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
@@ -207,6 +207,23 @@ software updates, and encryption controls. Ordinary agent identity replacement
 uses re-enrollment; historical memory authorship is preserved.
 
 ---
+
+## What's New in v11.19.15
+
+**Consensus-safe memory cleanup, without the 500-record cap.** CEREBRUM now
+scans the full inventory, previews verified eligible counts, and processes
+manual or automatic cleanup through existing consensus challenge transactions.
+Open tasks and internal records are protected. The UI distinguishes queued work,
+confirmed submissions, and observed outcomes instead of reporting premature success.
+
+Automatic cleanup requires **fresh current-Root authorization after upgrading**;
+old enabled toggles do not silently activate it. Preview does not enable cleanup.
+Exact signed transactions are saved before submission for safe recovery. A
+challenge may need further votes; audit history is retained. See the
+[cleanup guide](docs/reference/concepts/memory-cleanup.md).
+
+No consensus-rule or application-version change; app-v27 remains the ceiling.
+Container: `ghcr.io/l33tdawg/sage:11.19.15`. SDK 11.19.15.
 
 ## What's New in v11.19.14
 
