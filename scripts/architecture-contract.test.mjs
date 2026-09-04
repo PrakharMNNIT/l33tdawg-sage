@@ -30,3 +30,21 @@ test('architecture relative documentation links resolve', () => {
     assert.doesNotThrow(() => readFileSync(new URL(`../docs/${match[1]}`, import.meta.url)), match[1]);
   }
 });
+
+test('architecture visuals preserve current trust and lifecycle boundaries', () => {
+  assert.equal([...guide.matchAll(/```mermaid\n/g)].length, 5);
+  assert.ok(guide.includes('diagrams/architecture-overview.svg'));
+  for (const stale of ['clearance 4 (admin)', 'LOCK → BACKUP → STOP → GENESIS → WIPE',
+    'All memories where `agent_id` matches the old public key are updated']) {
+    assert.ok(!guide.includes(stale), `Stale diagram or companion claim: ${stale}`);
+  }
+  for (const marker of ['Block inclusion is not memory acceptance',
+    'Handoff expected session A + revision', 'Original session continues',
+    'agent_key_rotation_requires_reenrollment']) assert.ok(guide.includes(marker), marker);
+  const svg = readFileSync(new URL('../docs/diagrams/architecture-overview.svg', import.meta.url), 'utf8');
+  for (const marker of ['<title', '<desc', 'viewBox=', 'authoritative chain state',
+    'NODE-LOCAL COORDINATION', 'separate SAGE chains', 'no Byzantine redundancy']) {
+    assert.ok(svg.includes(marker), `Missing overview boundary: ${marker}`);
+  }
+  assert.doesNotMatch(svg, /<script\b|<foreignObject\b|https?:\/\/(?!www\.w3\.org)/);
+});

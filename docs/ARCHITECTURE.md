@@ -19,7 +19,7 @@ contracts, use the authoritative [reference index](reference/INDEX.md).
 6. [Python SDK](#python-sdk)
 7. [Sovereign Layer (RBAC & Federation)](#sovereign-layer-rbac--federation)
 8. [Agent Management & Network Topology](#agent-management--network-topology)
-9. [Pipeline Architecture (Agent-to-Agent Messaging)](#pipeline-architecture-agent-to-agent-messaging)
+9. [Messages Architecture (Agent-to-Agent Messaging)](#messages-architecture-agent-to-agent-messaging)
 10. [Task Management](#task-management)
 11. [CLI Tools](#cli-tools)
 12. [REST API](#rest-api)
@@ -33,9 +33,13 @@ contracts, use the authoritative [reference index](reference/INDEX.md).
 
 ## Architecture Overview
 
-![SAGE Architecture — Self-Governed, Byzantine Fault Tolerant Memory Infrastructure for AI Agents](sage_architecture-17062026.png)
+![SAGE architecture: consensus-backed memory and policy, separate node-local coordination, and explicit federation boundaries](diagrams/architecture-overview.svg)
 
-*Editable vector source: `docs/sage_architecture-17062026.svg` (kept locally). Regenerate this PNG with: `rsvg-convert -w 2400 docs/sage_architecture-17062026.svg -o docs/sage_architecture-17062026.png`. Reconciled against [`docs/reference/`](reference/INDEX.md) for v11.*
+*The [editable SVG](diagrams/architecture-overview.svg) is tracked in Git. Diagram
+sources, scope, and rendering commands are documented in
+[diagrams/README.md](diagrams/README.md). The earlier dated PNG is retained as a
+historical asset, not the current architecture. The diagrams are explanatory;
+the [reference contracts](reference/INDEX.md) define exact behavior.*
 
 ### How it works
 
@@ -407,52 +411,31 @@ python examples/complete_walkthrough.py # Every SDK operation explained
 
 ## Sovereign Layer (RBAC & Federation)
 
-The **(S)** in (S)AGE is the optional governance layer. Without it, you have AGE -- agents proposing and querying memories with PoE consensus. Add the Sovereign layer when you need multi-org governance:
+Current SAGE separates **who may act**, **which resource they may act on**, and
+**which classifications they may read**. The diagram shows those independent
+checks; clearance is never a role or a write grant.
 
 ```mermaid
-graph TB
-    subgraph Fed["Federation (Cross-Org)"]
-        direction TB
-        subgraph OrgA["Organization A"]
-            direction TB
-            subgraph DeptA1["Dept: Red Team"]
-                AA1["Agent<br/><small>clearance 4 (admin)</small>"]
-                AA2["Agent<br/><small>clearance 3 (validate)</small>"]
-            end
-            subgraph DeptA2["Dept: Blue Team"]
-                AA3["Agent<br/><small>clearance 2 (write)</small>"]
-                AA4["Agent<br/><small>clearance 1 (read)</small>"]
-            end
-        end
-        subgraph OrgB["Organization B"]
-            direction TB
-            subgraph DeptB1["Dept: Research"]
-                AB1["Agent<br/><small>clearance 3</small>"]
-            end
-        end
-        OrgA <-->|"federated domains<br/><small>max clearance 2</small>"| OrgB
-    end
-
-    subgraph Domains["Knowledge Domains"]
-        D1["classified_intel"]
-        D2["operational_data"]
-        D3["public_advisories"]
-    end
-
-    AA1 -->|"level 4"| D1 & D2 & D3
-    AA2 -->|"level 3"| D1
-    AA3 -->|"level 2"| D2
-    AA4 -->|"level 1"| D3
-    AB1 -.->|"federated<br/>level 2"| D2
-
-    style Fed fill:#f3e5f5,stroke:#9C27B0,color:#000
-    style OrgA fill:#e8f4f8,stroke:#2196F3,color:#000
-    style OrgB fill:#fff3e0,stroke:#FF9800,color:#000
-    style Domains fill:#e8f5e9,stroke:#4CAF50,color:#000
+flowchart TB
+    A["Signed local agent"] --> E["Active enrollment"]
+    E --> R["Role + security profile<br/>allowed operation"]
+    R --> S["Live resource scope<br/>owner / Access Group / compatible grant"]
+    S --> C["Classification clearance<br/>and applicable hard denials"]
+    C --> D["Permit the exact action"]
+    H["Local human · CEREBRUM"] -. "governed policy changes" .-> R
+    H -. "governed policy changes" .-> S
+    F["Peer agent · separate chain"] --> P["Explicit export / sharing policy"]
+    P --> B["Bounded Read / receiver-controlled Copy<br/>not local membership or mutation authority"]
+    classDef local fill:#eef2ff,stroke:#6366f1,color:#1e293b
+    classDef policy fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef remote fill:#fff7ed,stroke:#d97706,color:#7c2d12
+    class A,E local
+    class R,S,C,D,H policy
+    class F,P,B remote
 ```
 
 **Historical operational levels (pre-app-v23)** described what agents could do.
-The preceding organization diagram and this table describe that legacy model,
+This table describes that legacy model,
 not current role or classification authority:
 
 | Level | Access | Description |
@@ -529,39 +512,36 @@ When agent A needs to write to a domain that agent B owns (or that hasn't been w
 
 ### Domain Access + Clearance Interaction
 
-Access to a memory requires passing three checks, evaluated in order:
+Evaluate the actual record and operation, not a clearance-as-role shortcut:
 
-1. **Clearance gate** — the agent's clearance level must be >= the domain's classification level. An agent with clearance 1 cannot access a domain classified at level 2, regardless of other grants.
-2. **Domain access grant** — the agent's `domain_access` map must include the target domain with the appropriate permission (`read: true` for queries, `write: true` for proposals/votes/challenges).
-3. **Department membership** — if the domain is scoped to a department, the agent must be a member of that department (or the parent organization's admin).
+1. Resolve the signed principal's active enrollment and allowed role/profile.
+2. Resolve live owner, Access Group, or compatible grant scope for the resource.
+3. Check the record's classification against clearance and applicable ceilings.
+4. Preserve all hard denials; a positive grant never cancels a profile denial.
 
-**Federation caps:** When two organizations establish a federation agreement, they set a `max_clearance` ceiling. Even if an agent in Org B has clearance 4, their effective clearance for federated domains from Org A is capped by the federation agreement (e.g., `max_clearance: 2` means they can only see level-0, level-1, and level-2 data from Org A).
-
-**Precedence:** The most restrictive rule wins. If an agent has clearance 3 but the federation cap is 2, their effective clearance for federated domains is 2. If an agent has clearance 3 and a domain grant with `write: true`, but the domain is classified at level 4, they cannot access it at all.
+For shared resources, use the shared-domain rules rather than assuming that a
+shared name means unrestricted Write. For cross-chain reads, also enforce the
+current peer export/sharing policy, classification ceiling, and reader
+restrictions. Pairing alone does not grant unrestricted access.
 
 ### Common RBAC Patterns
 
-**Read-only research domain:**
-- Create a domain `research` with classification level 1 (Internal)
-- Grant agents `{"research": {"read": true, "write": false}}`
-- Only designated curators get `write: true` to add new research memories
+- **Read-only research:** give approved local agents a Read relationship over
+  the curator's owned domain tree; set classification explicitly on each record.
+- **Collaborative operations:** use an Access Group with the required Read,
+  Read+Write, or Read+Write+Modify tier. Verify each member's live profile and
+  clearance; group membership does not move ownership.
+- **Cross-chain collaboration:** pair separate SAGE nodes, export approved
+  agents or configure explicit sharing, and narrow Read/Copy policy as needed.
+  A remote peer never becomes a local group member or writer through pairing.
+- **Troubleshooting:** check active identity, effective scope, profile denials,
+  per-record classification, peer policy where applicable, and lifecycle/query
+  filters. Do not infer authority from display names or legacy
+  `domain_access` / `visible_agents` projections.
 
-**Write-restricted operational domain:**
-- Domain `ops` at classification level 2 (Confidential)
-- Field agents get `{"ops": {"read": true, "write": true}}` with clearance 2
-- Analysts get `{"ops": {"read": true, "write": false}}` — they can query but not add data
-
-**Cross-department visibility via federation:**
-- Org A (Red Team) and Org B (Blue Team) federate with `max_clearance: 1`
-- Both sides can see each other's Internal-level findings
-- Secret and Top Secret data stays within each org
-
-**Troubleshooting: "agent can't see memories":**
-1. Check the agent's clearance level — is it >= the domain's classification? (`GET /v1/agent/me` shows current clearance)
-2. Check domain access grants — does the agent have `read: true` for the target domain?
-3. Check `visible_agents` — if the field is set, the agent can only see memories from listed agent IDs. An empty list or `"*"` means no restriction.
-4. Check federation caps — for cross-org queries, is the federation `max_clearance` high enough?
-5. Check memory status — is the agent querying for `committed` memories but the memory is still `proposed`?
+See the [current local policy](#current-domain-authority-and-app-v27),
+[Access Group contract](reference/concepts/app-v26-access-groups.md), and
+[federation contract](reference/federation-and-brain-api.md).
 
 ---
 
@@ -694,11 +674,17 @@ See [the app-v27 contract](reference/concepts/app-v27-lifecycle.md).
 
 ### Agent Lifecycle
 
-```
-Pending review → Active → Suspended/Retired
-                    ↓
-          governed ownership handover
-          (authorship/history unchanged)
+```mermaid
+flowchart LR
+    P["Pending identity"] -->|"governed approval"| A["Active identity"]
+    A -->|"suspend"| S["Suspended"]
+    A -->|"retire"| R["Retired"]
+    A -. "separate governed operation" .-> O["Current domain ownership handover"]
+    O --> I["Historical authorship unchanged"]
+    classDef state fill:#eef2ff,stroke:#6366f1,color:#1e293b
+    classDef audit fill:#ecfdf5,stroke:#059669,color:#064e3b
+    class P,A,S,R state
+    class O,I audit
 ```
 
 1. **Creation** — An agent generates and keeps its own Ed25519 key, then self-registers as a pending ordinary identity. CEREBRUM Root/Admin approves its atomic role, profile, clearance, capabilities, and home-domain policy.
@@ -734,74 +720,60 @@ federated linked readers remain separate and read-only. Removing a local agent
 from a group removes only group-derived access and never its own home-domain
 authority.
 
-### Redeployment Orchestrator
+### Agent lifecycle is not validator redeployment
 
-When the validator set changes (agents added or removed), the CometBFT chain must be redeployed with a new genesis. The orchestrator handles this as a 9-phase state machine:
+An ordinary agent identity is not a CometBFT validator. Approval, suspension,
+retirement, and governed domain handover do not require a new genesis or a
+chain wipe. Current lifecycle actions preserve memory provenance and existing
+chain history. Legacy redeployment machinery must not be used as routine agent
+onboarding or as an upgrade recipe.
 
-```
-LOCK → BACKUP → STOP → GENESIS → WIPE → RESTART → VERIFY → RBAC → COMPLETE
-```
-
-| Phase | Action | Rollback |
-|-------|--------|----------|
-| `LOCK` | Acquire startup lock, reject new requests (503 middleware) | Release lock |
-| `BACKUP` | Snapshot SQLite database and CometBFT state | Delete snapshot |
-| `STOP` | Stop CometBFT node via `node.Stop()` | — |
-| `GENESIS` | Generate new genesis.json with updated validator set | Restore old genesis |
-| `WIPE` | Remove CometBFT data directory (blocks, WAL) | Restore from backup |
-| `RESTART` | Create fresh `node.NewNode()` and start it | Restore backup and restart with old genesis |
-| `VERIFY` | Wait for first block, confirm node is syncing | Retry or rollback |
-| `RBAC` | Apply RBAC permissions for new validator set | — |
-| `COMPLETE` | Release startup lock, resume accepting requests | — |
-
-Key implementation detail: CometBFT nodes cannot be restarted after `Stop()` — a fresh `node.NewNode()` must be created. The `FilePV` validator state must be reset to height 0 before starting with a new genesis.
-
-If any phase fails, the orchestrator rolls back to the `BACKUP` phase state and restarts with the original configuration. The 503 middleware ensures no client requests are lost during redeployment — they receive a `503 Service Unavailable` with a `Retry-After` header.
+For chain changes, use the [upgrade machinery](#upgrade-machinery) and
+[upgrade guide](UPGRADING.md), with the applicable governance and recovery
+checks. A temporary 503/retry response is not evidence that a mutation was
+durably accepted; clients must reconcile the operation's actual outcome.
 
 ### Domain Access Enforcement
 
-Every memory operation (propose, query, vote, challenge, corroborate) is checked against the agent's `domain_access` map:
+The current authority path is the [policy diagram](#sovereign-layer-rbac--federation)
+above. Legacy `domain_access` JSON and clearance-as-role labels are not
+authoritative substitutes for consensus enrollment, role/profile, ownership,
+Access Groups, compatible grants, and per-record classification checks.
+Read, Write, Modify, task assignment, and validator voting authority must not
+be collapsed into one generic write flag.
 
-- **Read side** — `GET /v1/memory/{id}` and `POST /v1/memory/query` check that the agent has `read: true` for the memory's `domain_tag`.
-- **Write side** — `POST /v1/memory/submit`, `/vote`, `/challenge`, `/corroborate` check that the agent has `write: true` for the target domain.
-- **Observer role** — Agents with role `observer` are blocked from all write operations regardless of domain access.
-- **Clearance tiers** — Five levels (0=Guest, 1=Reader, 2=Writer, 3=Validator, 4=Admin) provide coarse-grained access control on top of domain-specific permissions.
+### Federation Pairing Flow
 
-The `domain_access` field is a JSON object mapping domain names to permission objects:
+Pairing links **separate SAGE nodes**, not a new local agent to its role:
 
-```json
-{
-  "security": {"read": true, "write": true},
-  "finance": {"read": true, "write": false},
-  "personal": {"read": false, "write": false}
-}
-```
+1. Operators establish a reachable peer route and perform the human-verified
+   JOIN ceremony.
+2. Each side verifies and pins the peer's transport identity.
+3. Operators review explicit local-agent exports and any independent domain
+   Read/Copy policy; trust alone is not unrestricted sharing.
+4. Active authorized peer agents receive only the exported/narrowed scope.
+   Borrowed Read stays off-chain; receiver-controlled Copy enters the
+   receiver's normal local submission and consensus path.
+5. Revocation and reader restrictions remain enforced on later operations.
 
-### LAN Pairing Flow
-
-For adding agents on a local network without manual key exchange:
-
-1. Admin clicks "Add Agent" in the CEREBRUM dashboard and selects "LAN Pairing"
-2. Server generates a 6-character alphanumeric pairing code (expires after 5 minutes)
-3. New agent runs `sage-gui pair <code>` or enters the code in their setup wizard
-4. Agent and server perform a key exchange over the LAN
-5. Server registers the agent with its Ed25519 public key, assigns default role and permissions
-6. Admin can then adjust role, clearance, and domain access from the dashboard
-
-The pairing code is single-use and time-limited. The exchange happens over the local network only — no external servers involved.
+Transport may use direct HTTPS or the supported relay path; federation is not
+limited to a LAN. Local agent approval/re-enrollment remains a separate
+CEREBRUM operation. See [federation](reference/federation-and-brain-api.md).
 
 ### Key Rotation Mechanics
 
-Key rotation replaces an agent's Ed25519 keypair without losing memory attribution:
+Ordinary app-v23+ agent identities are replaced through **re-enrollment**;
+the legacy rotate-key route rejects the request with
+`agent_key_rotation_requires_reenrollment`. CEREBRUM Root credential handover
+is a separate governed operation, keeping its stable authority principal while
+changing the current signing credential.
 
-1. Admin initiates rotation from the dashboard (or agent requests it via REST API)
-2. Server generates a new Ed25519 keypair for the agent
-3. All memories where `agent_id` matches the old public key are updated to the new public key in a single database transaction
-4. The old public key is added to a `retired_keys` list on the agent record
-5. The new private key is delivered to the agent (via LAN pairing channel or manual download)
-6. Subsequent requests from the old key are rejected
-
-This is an atomic operation — if any step fails, the entire rotation is rolled back and the old key remains active.
+Neither operation rewrites historical memory authorship or prior blocks.
+Domain ownership is a separate governed transfer, not a bulk rewrite of
+`submitting_agent`. Root handover also does not silently rotate federation
+transport keys or peer pins. See the
+[Root and identity contract](reference/app-v23-access-control-design.md)
+and `web/network_handler.go` (`handleRotateAgentKey`).
 
 ---
 
@@ -824,10 +796,32 @@ the 48-hour stale-row and 24-hour terminal cleanup policy.
 
 ### Message Lifecycle
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sender as Sender agent
+    participant Store as Durable message store
+    participant A as Recipient · runtime A
+    participant B as Recipient · runtime B
+    Sender->>Store: Send to exact recipient + idempotency key
+    A->>Store: Receive with token + session A
+    Store-->>A: Claimed request
+    B->>Store: Inspect claimed-elsewhere metadata
+    alt Deliberate same-agent takeover
+        B->>Store: Handoff expected session A + revision
+        Store-->>B: Claim transferred, revision increments
+        A->>Store: New reply from stale MCP session
+        Store-->>A: Conflict
+        B->>Store: Idempotent reply under current claim
+    else Original session continues
+        A->>Store: Idempotent reply under current claim
+    end
+    Sender->>Store: Read reply_items / page replies
+    Store-->>Sender: Passive result, not new assigned work
 ```
-send → pending → claimed → completed
-                    ↘ expired (TTL exceeded)
-```
+
+The sequence illustrates session-aware MCP coordination, not every transport
+compatibility path. Expiry, if requested, can end actionable work before reply.
 
 1. **Send** — `POST /v1/messages` requires an exact recipient and a caller-scoped idempotency key. Exact retries return the original message; key reuse with different content conflicts.
 2. **Pending** — The durable row waits in the exact recipient's inbox. A federated send may remain safely queued while the trusted peer is offline.
@@ -929,9 +923,16 @@ acting. Group Modify does not authorize changing a teammate's task.
 
 ### Task Status Lifecycle
 
-```
-planned → in_progress → done
-                ↘ dropped
+```mermaid
+stateDiagram-v2
+    [*] --> Planned: Create once by permanent task identity
+    Planned --> InProgress: Exact assignee starts
+    Planned --> Done: Authorized completion
+    Planned --> Dropped: Authorized cancellation
+    InProgress --> Done: Authorized completion
+    InProgress --> Dropped: Authorized cancellation
+    note right of Planned: app-v27 defaults omitted new status to planned
+    note right of InProgress: Open tasks do not decay
 ```
 
 - **planned** — Task is defined but work has not started
@@ -1092,16 +1093,24 @@ marker; see `docs/reference/rest-api.md` for the authoritative details.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Proposed: Agent submits via SDK
-    Proposed --> Committed: Quorum reached (>= 2/3 weighted vote)
-    Committed --> Challenged: Agent disputes with evidence
-    Challenged --> Deprecated: Challenge upheld
-    Challenged --> Committed: Challenge rejected
-    Committed --> Committed: Corroborated (confidence increases)
-
-    note right of Proposed: Validators vote\n(accept / reject / abstain)
-    note right of Committed: Consensus-validated\nreplicated across all nodes
+    [*] --> Proposed: Signed submit transaction included
+    Proposed --> Committed: PoE acceptance quorum
+    Proposed --> Deprecated: All votes cast without acceptance quorum
+    Committed --> Challenged: Authorized challenge opens a weighted round
+    Committed --> Deprecated: Authorized immediate deprecation
+    Challenged --> Deprecated: Frozen round threshold reached
+    Challenged --> Committed: Authorized reinstatement
+    note right of Proposed: Block inclusion is not memory acceptance
+    note right of Challenged: Recallable as disputed while the round is open
+    note right of Deprecated: Terminal, not resurrected by reinstatement
 ```
+
+This is the public consensus lifecycle, not the intermediate internal
+`validated` state. Corroboration records support without changing lifecycle
+status. App-v21 challenge thresholds/electorates and app-v27 record-author
+eligibility are described in the
+[memory lifecycle](reference/concepts/memory-lifecycle.md) and
+[app-v27](reference/concepts/app-v27-lifecycle.md) references.
 
 1. An agent submits a memory via `/v1/memory/submit` (status: `proposed`)
 2. Each node's memory auto-voter runs the validation checks (dedup, quality, consistency) and signs ONE vote transaction with the node's own consensus key, broadcast through CometBFT
