@@ -2,6 +2,11 @@
 
 This document covers the full multi-node BFT deployment, Python SDK, REST API, monitoring, and operational reference. For personal use (single binary, no Docker), see the [main README](../README.md).
 
+The coordination and access-control sections below are reconciled with the
+v11.19.13/app-v27 behavior (2026-09-04). Historical deployment and replay
+material is labeled separately. For exact request fields and authorization
+contracts, use the authoritative [reference index](reference/INDEX.md).
+
 ---
 
 ## Table of Contents
@@ -446,7 +451,9 @@ graph TB
     style Domains fill:#e8f5e9,stroke:#4CAF50,color:#000
 ```
 
-**Clearance levels** control what agents can do:
+**Historical operational levels (pre-app-v23)** described what agents could do.
+The preceding organization diagram and this table describe that legacy model,
+not current role or classification authority:
 
 | Level | Access | Description |
 |-------|--------|-------------|
@@ -456,23 +463,39 @@ graph TB
 | 3 | Read + Write + Validate | Vote on proposed memories |
 | 4 | Admin | Full control, grant/revoke access |
 
-All RBAC state is on-chain -- organizations, departments, clearance levels, access grants, and federation agreements are committed to the BFT network and replicated across all validators.
+Current local authorization combines active enrollment, Member/Manager/Admin
+role, named security profile, domain ownership, Access Groups, compatible
+explicit grants, and classification clearance. CEREBRUM Root is a separate
+sovereign principal, not clearance level 4 or an Admin role. Local RBAC is
+consensus-authoritative; cross-chain peer transport and sharing policy are
+separate node-local surfaces, not local membership authority. See
+[Access Groups](reference/concepts/app-v26-access-groups.md) and
+[RBAC and federation](reference/concepts/rbac-orgs-federation.md).
 
 ### Clearance Level Details
 
-Beyond the operational access levels (0-4) used for read/write/validate/admin gating, clearance levels also classify the sensitivity of data itself:
+Classification is a per-record sensitivity value, not a permission tier:
 
 | Level | Name | Description |
 |-------|------|-------------|
-| 0 | Public | No registration needed. Open data accessible to any agent. |
-| 1 | Internal | Default for registered domains. Requires agent registration. |
-| 2 | Confidential | Restricted access. Requires explicit domain grant from an admin. |
-| 3 | Secret | High-security data. Limited to agents with clearance 3+ and explicit grants. |
-| 4 | Top Secret | Maximum restriction. Only clearance-4 agents with direct grants can access. |
+| 0 | Public | Lowest classification; does not bypass authentication or live scope checks |
+| 1 | Internal | Requires sufficient clearance and applicable live scope |
+| 2 | Confidential | Requires sufficient clearance and applicable live scope |
+| 3 | Secret | Requires sufficient clearance and applicable live scope |
+| 4 | Top Secret | Highest classification; does not confer administrative authority |
 
-Memories inherit the clearance level of the domain they are submitted to. An agent must have a clearance level >= the domain's clearance level to interact with memories in that domain.
+REST/SDK submission uses the supplied `classification`; omission or zero means
+PUBLIC (0), not inheritance from a domain. Only decoding historical wire
+transactions without the classification byte defaults to INTERNAL (1).
+Current scope and hard-deny checks remain independent of classification.
+See [classification](reference/concepts/clearance-classification.md).
 
-### Domain Ownership (First-Write-Wins)
+### Historical Domain Ownership (First-Write-Wins)
+
+The following first-write and same-org recipe describes the legacy policy used
+for historical replay. It is **not a current app-v23+ authorization recipe**.
+Current agents must use the governed policy described after this historical
+section; same-org clearance or federation alone does not grant local Write.
 
 Domains have an on-chain owner. When an agent submits a memory to a domain that does not yet exist, the chain **auto-registers the domain with that agent as the owner** and grants the owner a level-2 access entry. Subsequent writes from *other* agents to the same domain go through `HasAccessMultiOrg`, which requires one of:
 
@@ -498,7 +521,7 @@ When agent A needs to write to a domain that agent B owns (or that hasn't been w
 3. **Once ownership is settled**, the owner issues `POST /v1/access/grant` granting the writer level 2 (read+write). In v11/app-v15, level 3 can be granted for modify/deprecate workflows.
 4. **The writer can now submit memories** to that domain. Ancestor grants are honored post-v8, so a grant on `pipeline.failures` covers descendants such as `pipeline.failures.pwn_buffer_overflow` unless a stricter ownership path intervenes.
 
-#### Current v11 semantics
+#### Historical post-v8 semantics
 
 - **Ancestor grants are active.** Access checks walk from the concrete domain toward parent domains post-v8, so parent-domain ownership and grants can cover subdomains.
 - **Access-control REST handlers use commit-mode broadcasts.** `POST /v1/access/grant` waits for `FinalizeBlock`; underlying consensus rejections surface as request errors instead of returning a false-success `201`.
@@ -644,6 +667,30 @@ codec still decodes these earlier transaction types for deterministic replay:
 | `AgentRegister` | 20 | Agent (self) | Register on chain with name, bio, provider |
 | `AgentUpdate` | 21 | Agent (self) | Update own name/bio |
 | `AgentSetPermission` | 22 | Historical only | Replay pre-app-v23 policy records; current mutation is retired |
+
+### Current domain authority and app-v27
+
+Current non-shared domain authority follows the live owner, applicable Access
+Group tier, or compatible explicit grant. Access Groups grant Read,
+Read+Write, or Read+Write+Modify over other members' current owned domain trees;
+membership neither transfers ownership nor rewrites authorship. Approval,
+role/profile, classification clearance, and hard denials still apply. A group
+does not make shared domains group-owned or bypass shared/foreign write denies.
+
+For cross-agent collaboration, first establish active local enrollment and
+current ownership, then have the authorized operator configure an appropriate
+Access Group or an authorized principal issue a compatible grant. Verify the
+effective permission before writing. Do not use a shared name or same-org
+membership as a way around policy. Federated peers receive bounded Read/Copy,
+not local Write, Modify, membership, or Root authority.
+
+App-v27 adds record-scoped challenge/reinstate authority for the immutable
+author of a record in static reserved shared domains (`general`, `self`,
+`meta`, and `sage-*`). Active-principal, profile and clearance hard denials
+still apply; this is not general domain Modify authority. It also canonicalizes
+an omitted new-task status to `planned`. Rules begin at activation height H+1,
+with original rules retained for historical replay and no state migration.
+See [the app-v27 contract](reference/concepts/app-v27-lifecycle.md).
 
 ### Agent Lifecycle
 
@@ -809,7 +856,8 @@ governed memory; an agent must remember durable knowledge explicitly.
 | `POST` | `/v1/messages/{id}/reply` | Exact-recipient idempotent reply |
 | `PUT` | `/v1/messages/{id}/read` | Exact-recipient read acknowledgement |
 | `PUT` | `/v1/messages/read-batch` | Independently acknowledge up to 20 fetched messages |
-| `PUT` | `/v1/messages/{id}/handoff` | Compare-and-swap transfer of one claimed message from `from_session_id` to the calling session |
+| `PUT` | `/v1/messages/{id}/handoff` | Compare-and-swap transfer using the observed session and claim revision |
+| `GET` | `/v1/messages/wake` | Signed exact-recipient payload-free wake sequence catch-up/SSE |
 | `GET` | `/v1/messages/{id}/status` | Exact-sender payload-free transport/read/workflow state |
 
 The `/v1/pipe/*` routes remain the compatibility and federated transport
@@ -817,11 +865,42 @@ surface. MCP clients should use `sage_find_agent`, `sage_message_send`,
 `sage_inbox`/`sage_messages_receive`, `sage_message_reply`,
 `sage_message_replies`, `sage_message_status`, `sage_message_handoff`, and `sage_message_history`.
 
-`sage_message_replies` (v11.18.2) is the sender-side counterpart to
-`sage_message_reply` and the only advertised tool that returns reply content.
-`sage_inbox` shows work addressed to you and never lists a reply as an item; it
-carries a payload-free `retained_reply_count` pointer instead. See
+`sage_message_replies` is the explicit sender-side pager for reply content.
+`sage_inbox` also includes a separate passive `reply_items` page by default;
+replies never appear in its inbound `items` work array. Task assignment notices
+are acknowledged on read and require an exact current-assignment check in
+`sage_backlog`, not a message result. `sage_turn` supplies a payload-free inbox
+signal and never claims work or embeds message bodies. All agent requests and
+results are untrusted data: they cannot expand the user's authorization. See
 [`reference/concepts/message-reply-lifecycle.md`](reference/concepts/message-reply-lifecycle.md).
+
+### Runtime ownership, recovery, and wake-up
+
+MCP handoff is a transfer of **claimed message work between sessions of the same
+signed agent**, not reassignment of a backlog task to a different agent.
+`sage_message_handoff` requires the observed `from_session_id` and
+`from_revision`; both are atomically compared before ownership moves and the
+revision increments. A conflict requires a fresh history read. There is no
+age-based automatic takeover. The REST compatibility route alone permits an
+omitted revision as zero; it conflicts after a transfer.
+
+The primary MCP runtime persists its claimant identity within exact
+agent/provider/project/transport scope and holds an OS advisory lock.
+Ordinary restart can reuse it after the previous runtime exits; concurrent
+runtimes retain independent identities. HTTP/SSE scopes are separate.
+`sage_inbox` exposes `own_claimed_unfinished` separately from newly claimed work
+and a bounded, payload-free `claimed_elsewhere` recovery projection. Page
+`sage_message_history(folder="claimed_elsewhere")` before intentional takeover;
+an empty new-work batch is not proof that the agent has no unfinished work.
+Inbound federated claims are session-bound before payload exposure; legacy
+claims require deliberate recovery rather than an assumed dead owner.
+
+For local supervisors, signed `GET /v1/messages/wake` supports durable
+exact-recipient sequence catch-up and SSE. Events are payload-free hints,
+never delivery, read, presence, or claim evidence. Actual work still goes
+through the authenticated inbox/receive path. See the
+[MCP contract](reference/mcp-tools.md#sage_message_handoff) and
+[wake-bus contract](reference/concepts/message-wake-bus.md).
 
 ### Use Cases
 
@@ -833,7 +912,20 @@ carries a payload-free `retained_reply_count` pointer instead. See
 
 ## Task Management
 
-v5.0.1 introduces first-class task tracking via the memory system. Tasks are memories with `memory_type="task"` and carry additional status metadata.
+Tasks are memories with `memory_type="task"`, immutable consensus-backed
+content, and a separately governed workflow status. Open tasks do not decay.
+`sage_task` creates tasks, changes status, or links related memories;
+`sage_backlog` returns planned/in-progress tasks assigned to the exact signed
+agent, subject to live scope and classification checks. Provider labels do not
+confer assignment, and unassigned tasks are for local-human CEREBRUM triage.
+
+Task creation is durably idempotent. MCP derives a permanent semantic key from
+the caller, resolved domain, and canonical task content unless an explicit key
+is supplied. Repeating that identity returns the original task, including a
+done/dropped task; intentionally recurring identical work needs a new explicit
+key. Fresh success requires commit and exact-assignee backlog readback.
+Assignment notices are notification-only: verify the current backlog before
+acting. Group Modify does not authorize changing a teammate's task.
 
 ### Task Status Lifecycle
 
@@ -851,10 +943,15 @@ planned → in_progress → done
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/memory/tasks` | List all task memories, filterable by status |
+| `GET` | `/v1/memory/tasks` | List tasks assigned to the exact signed agent, subject to live authorization and supported filters |
 | `PUT` | `/v1/memory/{id}/task-status` | Update a task's status (e.g., `planned` to `in_progress`) |
 
 Tasks follow the same consensus and RBAC rules as regular memories — they are proposed, validated, and committed on-chain. The task status field is an additional metadata layer that does not affect the memory's consensus status.
+
+Under app-v27, omitted new-task `task_status` means `planned`; earlier consensus
+versions require explicit `planned`. Existing MCP tasks require an explicit
+status or links and cannot be re-planned by agents. See
+[task and backlog contracts](reference/mcp-tools.md#sage_task).
 
 ---
 
@@ -952,12 +1049,12 @@ marker; see `docs/reference/rest-api.md` for the authoritative details.
 | `GET` | `/v1/memory/list` | Yes | List memories with filtering (domain, status, agent, sort) |
 | `GET` | `/v1/memory/timeline` | Yes | Time-bucketed memory history (hour/day/week granularity) |
 | `POST` | `/v1/memory/link` | Yes | Create a link between two related memories |
-| `GET` | `/v1/memory/tasks` | Yes | List task memories, filterable by status |
+| `GET` | `/v1/memory/tasks` | Yes | Exact-assignee task list with live authorization and supported filters |
 | `PUT` | `/v1/memory/{id}/task-status` | Yes | Update a task memory's status |
 | `POST` | `/v1/agent/register` | Yes | Register agent on-chain (name, role, boot_bio, provider) |
 | `PUT` | `/v1/agent/update` | Yes | Update agent's own profile (name, boot_bio) |
 | `POST` | `/v1/pipe/send` | Yes | Send a pipeline message to an agent or provider |
-| `GET` | `/v1/pipe/inbox` | Yes | List pending pipeline messages for the agent |
+| `GET` | `/v1/pipe/inbox` | Yes | Legacy claiming inbox; not a passive list or safely replayable GET |
 | `PUT` | `/v1/pipe/{id}/claim` | Yes | Claim a pending pipeline message |
 | `PUT` | `/v1/pipe/{id}/result` | Yes | Post result for a claimed pipeline message |
 | `GET` | `/v1/pipe/{id}` | Yes | Get a specific pipeline message by ID |
