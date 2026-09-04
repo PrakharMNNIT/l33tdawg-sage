@@ -116,6 +116,7 @@ AGENTS.md
 # (whitepapers, comms, arxiv, medium, figures) but allow the public docs.
 # NOTE: the landing site (index.html etc.) now lives on the gh-pages branch.
 docs/*
+!docs/diagrams/
 !docs/README.md
 !docs/ARCHITECTURE.md
 !docs/GETTING_STARTED.md
