@@ -796,15 +796,12 @@ test('search and maintenance controls keep useful screen-reader names', () => {
         assert.match(search, new RegExp(`aria-label="${label}"`));
     }
     assert.match(search, /aria-label=\$\{`Select memory from \$\{m\.domain_tag\} for bulk actions`\}/);
-    for (const label of [
-        'Enable automatic memory cleanup',
-        'Observation lifetime in days',
-        'Session context lifetime in days',
-        'Stale confidence threshold',
-        'Cleanup interval in hours',
-    ]) {
-        assert.match(cleanup, new RegExp(`aria-label="${label}"`));
+    assert.match(cleanup, /aria-label="Enable automatic memory cleanup"/);
+    for (const label of ['Observation lifetime (days)', 'Session-context lifetime (days)',
+        'Computed confidence threshold', 'Automatic interval (hours)']) {
+        assert.ok(cleanup.includes(label));
     }
+    assert.match(cleanup, /aria-label=\$\{label\}/);
     assert.match(settings, /aria-label="Enable contextual tooltips"/);
     assert.match(appSource, /aria-label="Open SAGE at login"/);
 });
@@ -825,10 +822,10 @@ test('destructive memory actions use the consistent explanatory dialog', () => {
         'memory deletion must not use an undiscoverable click-twice interaction');
 
     assert.match(cleanup, /Clean Synaptic Ledger\?/);
-    assert.match(cleanup, /Use Preview first if you want to see the exact count/,
+    assert.match(cleanup, /Preview first to inspect the full eligible count/,
         'cleanup must provide a concrete next step before mutation');
-    assert.match(cleanup, /remain in the audit history/);
-    assert.match(cleanup, /Memories outside the current rules stay active/,
+    assert.match(cleanup, /retain audit history/);
+    assert.match(cleanup, /Open tasks and internal records are protected/,
         'cleanup must say what remains safe');
     assert.doesNotMatch(cleanup, /Click again to confirm|confirmCleanup/,
         'cleanup must use the shared accessible dialog instead of a five-second click-twice latch');

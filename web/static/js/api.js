@@ -275,7 +275,13 @@ export async function importConfirm(importId) {
 
 export async function fetchCleanupSettings() {
     const res = await fetch(`${API_BASE}/v1/dashboard/settings/cleanup`);
-    return res.json();
+    return cleanupResponse(res);
+}
+
+async function cleanupResponse(res) {
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `Cleanup request failed (${res.status})`);
+    return data;
 }
 
 export async function saveCleanupSettings(config) {
@@ -284,16 +290,16 @@ export async function saveCleanupSettings(config) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config),
     });
-    return res.json();
+    return cleanupResponse(res);
 }
 
-export async function runCleanup(dryRun = true) {
+export async function runCleanup(dryRun = true, config = undefined) {
     const res = await fetch(`${API_BASE}/v1/dashboard/cleanup/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dry_run: dryRun }),
+        body: JSON.stringify({ dry_run: dryRun, config }),
     });
-    return res.json();
+    return cleanupResponse(res);
 }
 
 // ─── Synaptic Ledger (Encryption) API ───

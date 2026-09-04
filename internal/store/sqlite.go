@@ -5306,62 +5306,6 @@ func (s *SQLiteStore) GetAllPreferences(ctx context.Context) (map[string]string,
 	return prefs, rows.Err()
 }
 
-// GetCleanupCandidates returns memories eligible for auto-deprecation.
-// It finds: (1) observations older than ttlDays, (2) memories with computed confidence below threshold.
-func (s *SQLiteStore) GetCleanupCandidates(ctx context.Context, observationTTLDays int, sessionTTLDays int, staleThreshold float64) ([]*memory.MemoryRecord, error) {
-	// Find non-deprecated observations and low-confidence memories
-	rows, err := s.conn.QueryContext(ctx,
-		`SELECT memory_id, submitting_agent, content, content_hash, embedding, embedding_hash,
-			memory_type, domain_tag, provider, confidence_score, status, parent_hash, created_at, committed_at, deprecated_at, COALESCE(task_status, '')
-		FROM memories
-		WHERE status NOT IN ('deprecated')
-		AND (
-			(memory_type = 'observation' AND created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ? || ' days'))
-			OR (memory_type = 'observation' AND domain_tag = 'session-context' AND created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ? || ' days'))
-		)
-		ORDER BY created_at ASC
-		LIMIT 500`,
-		fmt.Sprintf("-%d", observationTTLDays),
-		fmt.Sprintf("-%d", sessionTTLDays))
-	if err != nil {
-		return nil, fmt.Errorf("query cleanup candidates: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	records := make([]*memory.MemoryRecord, 0)
-	for rows.Next() {
-		rec, err := s.scanMemoryRow(rows)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, rec)
-	}
-	return records, rows.Err()
-}
-
-// DeprecateMemories batch-deprecates memories by IDs.
-func (s *SQLiteStore) DeprecateMemories(ctx context.Context, memoryIDs []string) (int, error) {
-	if len(memoryIDs) == 0 {
-		return 0, nil
-	}
-	placeholders := make([]string, len(memoryIDs))
-	args := make([]any, len(memoryIDs))
-	for i, id := range memoryIDs {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	query := fmt.Sprintf(
-		`UPDATE memories SET status = 'deprecated', deprecated_at = strftime('%%Y-%%m-%%dT%%H:%%M:%%fZ', 'now')
-		WHERE memory_id IN (%s) AND status != 'deprecated'`,
-		strings.Join(placeholders, ","))
-	result, err := s.writeExecContext(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("deprecate memories: %w", err)
-	}
-	n, _ := result.RowsAffected()
-	return int(n), nil
-}
-
 // ResolveChallengedMemories sweeps LEGACY stale "challenged" rows to "deprecated"
 // at boot. Before v4.5.0 a challenge could leave a memory limbo-'challenged'; this
 // one-shot migration cleans those up.

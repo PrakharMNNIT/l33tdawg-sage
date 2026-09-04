@@ -1804,11 +1804,9 @@ func runServe(startupProof string) (rerr error) {
 	rest.MountOAuthRoutes(r, oauthHandler)
 	logger.Info().Msg("OAuth 2.0 + PKCE wrapper enabled (/.well-known/oauth-authorization-server, /oauth/authorize, /oauth/token)")
 
-	// App-v23+ lifecycle state is consensus-authoritative. The historical
-	// cleanup loop changed only SQLite, so its next projection audit hid each
-	// affected memory as divergent. Cleanup remains available as a dry run in
-	// CEREBRUM; an actual forget must travel through the canonical challenge
-	// transaction path.
+	// Explicitly authorized cleanup uses canonical challenge transactions only.
+	// Supervise shutdown so it never outlives stores or the signing runtime.
+	startWorker(func() { dashboard.RunCanonicalCleanupWorker(ctx) })
 
 	// Prometheus scrape endpoint. amid serves this via internal/metrics's
 	// dedicated metrics server; sage-gui has no such listener, so the default
