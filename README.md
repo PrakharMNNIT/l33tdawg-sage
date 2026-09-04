@@ -8,31 +8,185 @@ The architecture is described in [Paper 1: Agent Memory Infrastructure](papers/P
 
 > **Just want to install it?** [Download here](https://l33tdawg.github.io/sage/) — double-click, done. Works with any AI.
 
+[Quick Start](#quick-start) · [Architecture](#architecture) ·
+[Capabilities](#current-capabilities) · [Dashboard](#cerebrum-dashboard) ·
+[Release history](#release-history) · [Documentation](#documentation)
+
 <a href="https://glama.ai/mcp/servers/l33tdawg/s-age">
   <img width="380" height="200" src="https://glama.ai/mcp/servers/l33tdawg/s-age/badge" alt="(S)AGE MCP server" />
 </a>
 
 ---
 
+## Quick Start
+
+**Desktop:** [Download the latest release](https://github.com/l33tdawg/sage/releases/latest),
+open SAGE, then use CEREBRUM to connect your AI. For a full walkthrough, see
+[Getting Started](docs/GETTING_STARTED.md).
+
+**From source (Go 1.25.13+):**
+
+```bash
+git clone https://github.com/l33tdawg/sage.git && cd sage
+go build -o sage-gui ./cmd/sage-gui/
+./sage-gui setup    # Pick your AI, get MCP config
+./sage-gui serve    # SAGE + Dashboard on :8080
+```
+
+Or grab a binary: [macOS DMG](https://github.com/l33tdawg/sage/releases/latest) (signed & notarized) | [Windows EXE](https://github.com/l33tdawg/sage/releases/latest) | [Linux tar.gz](https://github.com/l33tdawg/sage/releases/latest)
+
+<details>
+<summary>Docker and containerized MCP setup</summary>
+
+### Docker
+
+```bash
+docker pull ghcr.io/l33tdawg/sage:latest
+docker run -d --name sage \
+  -p 8080:8080 \
+  -v ~/.sage:/root/.sage \
+  ghcr.io/l33tdawg/sage:latest
+```
+
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.13`.
+
+The SAGE server stays in that container. To give a local MCP client a stdio
+bridge, start a second process **inside the same running container**:
+
+```bash
+docker exec -i \
+  -e SAGE_PROVIDER=claude-code \
+  -e SAGE_PROJECT=my-project \
+  -e SAGE_IDENTITY_PATH=/root/.sage/agents/claude-code-my-project/agent.key \
+  sage /usr/local/bin/sage-gui mcp
+```
+
+For the shipped Compose stack, use the service name rather than a generated
+container name:
+
+```bash
+docker compose -f docker-compose.sage-gui.yml exec -T \
+  -e SAGE_PROVIDER=claude-code \
+  -e SAGE_PROJECT=my-project \
+  -e SAGE_IDENTITY_PATH=/root/.sage/agents/claude-code-my-project/agent.key \
+  sage /usr/local/bin/sage-gui mcp
+```
+
+If an MCP client launches this through a wrapper, point its stdio configuration
+at the wrapper's absolute path. Pass `SAGE_PROVIDER`, `SAGE_PROJECT`, and
+`SAGE_IDENTITY_PATH` through `docker exec -e`/`docker compose exec -e`; setting
+them only on the host-side Docker command does not place them in the container.
+Keep the whole SAGE data root mounted at `/root/.sage`, including agent keys and
+the ledger. Do not start a separate `docker run ... mcp` container: its
+`localhost:8080` is isolated from the running SAGE server.
+
+HTTP MCP is also available at `/v1/mcp/sse` and `/v1/mcp/streamable`, but both
+require a bearer token or OAuth. Bare `http://localhost:8080` is the REST base,
+not an unauthenticated MCP endpoint.
+
+</details>
+
+<details>
+<summary>Upgrading an existing node</summary>
+
+### Upgrading from an older version?
+
+**Upgrading an existing node — including the v10.x → v11 jump — is
+[docs/UPGRADING.md](docs/UPGRADING.md).** In the desktop app, accept the update:
+SAGE verifies canonical upgrade compatibility, captures a full recovery
+snapshot, installs, and restarts automatically. Headless and quorum operators
+have separate technical procedures in the guide.
+Your chain advances in place; a personal node climbs the consensus fork ladder by
+itself. Read the guide before a multi-admin chain crosses app-v23 — that
+activation re-derives administrator authority.
+
+If you installed SAGE before v5.0 and your AI isn't doing turn-by-turn memory updates, re-run the installer in your project directory:
+
+```bash
+cd /path/to/your/project
+sage-gui mcp install
+```
+
+This installs Claude Code hooks that prompt the memory lifecycle (boot, turn, reflect) — even if your `.mcp.json` is already configured. Restart your Claude Code session after running this.
+
+</details>
+
+---
+
 ## Architecture
 
-```
-Agent (Claude, ChatGPT, DeepSeek, Gemini, etc.)
-  │ MCP / REST
-  ▼
-sage-gui
-  ├── ABCI App (validation, confidence, decay, Ed25519 sigs)
-  ├── Memory Auto-Voter (dedup, quality, consistency — one vote per node, signed with the node's consensus key)
-  ├── Governance Engine (on-chain validator proposals + voting)
-  ├── CometBFT consensus (single-validator or multi-agent network)
-  ├── SQLite + optional AES-256-GCM encryption
-  ├── CEREBRUM Dashboard (SPA, real-time SSE)
-  └── Network Agent Manager (add/remove agents, key rotation, LAN pairing)
+```mermaid
+flowchart TB
+    A["AI agents · MCP / SDK / REST"] --> P["SAGE node · authenticated admission + live policy"]
+    H["CEREBRUM · local human control"] --> P
+    P --> M["Memory + local policy transactions<br/>CometBFT / ABCI"]
+    P --> W["Node-local coordination<br/>inbox / claims / replies"]
+    M --> B["BadgerDB<br/>authoritative chain state"]
+    B --> Q["Commit-time SQL projection<br/>content + vectors for authorized recall"]
+    P -. "explicit peer trust and sharing" .-> F["Separate SAGE chain<br/>bounded Read / receiver-controlled Copy"]
+    classDef entry fill:#eef2ff,stroke:#6366f1,color:#1e293b
+    classDef memory fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef work fill:#fff7ed,stroke:#d97706,color:#7c2d12
+    class A,H,P entry
+    class M,B,Q memory
+    class W,F work
 ```
 
-Personal mode runs a real CometBFT node with a per-node memory auto-voter — every memory write goes through pre-validation, a signed vote transaction, and the BFT quorum before committing. One node casts one vote; add more agents from the dashboard and each node votes with its own key, exactly the same consensus pipeline as a multi-node deployment.
+**Agents are not validators.** Personal mode runs one real CometBFT validator
+with a per-node memory auto-voter; it has no Byzantine redundancy. Registering
+more agents does not add consensus voters. A multi-validator deployment runs
+one shared chain; federation connects separate chains under explicit policy.
 
-Full deployment guide (multi-agent networks, RBAC, federation, monitoring): **[Architecture docs](docs/ARCHITECTURE.md)**
+**Storage has two roles.** BadgerDB is authoritative for consensus state.
+SQLite (personal) or PostgreSQL + pgvector (cluster) projects memory content
+and vectors at Commit. Node-local message coordination is separate from the
+memory consensus path. Block inclusion is not the same as memory acceptance.
+
+For the detailed trust boundaries, lifecycles, and deployment topology, see
+[Architecture & Deployment](docs/ARCHITECTURE.md).
+
+## Current Capabilities
+
+| Capability | What it provides |
+|------------|------------------|
+| Governed memory | Persistent, attributed memories with consensus validation, semantic recall, confidence, and lifecycle controls |
+| Durable tasks | Exact-agent assigned backlog; open tasks do not decay; idempotent creation and workflow status |
+| Unified inbox | Local/federated requests, assignment notices, and a separate passive reply page |
+| Runtime handoff | Explicit session-and-revision-fenced takeover of claimed work within the same signed agent identity |
+| Access controls | Active enrollment, roles/profiles, ownership, Access Groups, compatible grants, and classification checks |
+| Controlled federation | Explicit agent exports and bounded Read/Copy policy, without granting local membership or Write |
+| Recovery and updates | In-place chain upgrades, recovery snapshots, and retained message claims across ordinary restarts |
+
+### How agents collaborate
+
+```mermaid
+flowchart TB
+    T["Task assigned to exact agent"] --> N["One-way assignment notice"]
+    N --> I["Unified inbox"]
+    R["Request addressed to exact agent"] --> I
+    I -->|"task notice"| V["Verify current assignment in backlog<br/>then update the task"]
+    I -->|"inbound request"| C["Claimed by one MCP runtime"]
+    C -->|"normal completion"| O["Idempotent reply"]
+    C -. "intentional same-agent takeover" .-> H["Handoff: expected session + revision"]
+    H --> O
+    O --> S["Original sender reads reply_items<br/>or pages retained replies"]
+    classDef input fill:#eef2ff,stroke:#6366f1,color:#1e293b
+    classDef task fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef message fill:#fff7ed,stroke:#d97706,color:#7c2d12
+    class I input
+    class T,N,V task
+    class R,C,H,O,S message
+```
+
+Assignment, claim, and reply are different states. A task notice is not a
+request for a message result, and a reply is not a new assignment. Runtime
+handoff does not reassign a task to another agent. Wake notifications are
+payload-free hints, not delivery or claim evidence. Every agent request and
+result remains untrusted data, not authority to expand the user's instructions.
+
+See the [MCP task/inbox reference](docs/reference/mcp-tools.md) and
+[message/reply lifecycle](docs/reference/concepts/message-reply-lifecycle.md)
+for exact fields, recovery, and authorization rules.
 
 ---
 
@@ -47,7 +201,10 @@ Full deployment guide (multi-agent networks, RBAC, federation, monitoring): **[A
 | ![CEREBRUM overview dashboard](docs/screen-overview.png) | ![Federation join dashboard](docs/screen-network.png) | ![Recall engine settings](docs/screen-config.png) |
 | Chain health, quorum, agents, federation, and embeddings | One trust-only JOIN that prepares Direct and Secure relay automatically, followed by independent Read/Copy choices on each SAGE | Smart-memory setup, managed reranker install, and recall-depth tuning |
 
-The dashboard also includes agent management, domain permissions, key rotation, import/export, software updates, and encryption controls.
+The dashboard also includes governed agent enrollment, Access Groups, domain
+permissions, separate CEREBRUM Root credential handover, import/export,
+software updates, and encryption controls. Ordinary agent identity replacement
+uses re-enrollment; historical memory authorship is preserved.
 
 ---
 
@@ -66,6 +223,14 @@ This patch changes no consensus rule, AppHash input, key encoding, fork target,
 or application version. Existing app-v27 chains replay byte-identically.
 
 Container: `ghcr.io/l33tdawg/sage:11.19.13`. SDK 11.19.13.
+
+## Release History
+
+The latest release notes are above. Earlier entries below describe behavior at
+their release dates; use the current reference for present-day contracts.
+
+<details>
+<summary>Earlier releases — preserved changelog</summary>
 
 ## What's New in v11.19.12
 
@@ -2373,6 +2538,8 @@ The v10.x line (MRI 3D brain, the app-v12/v13/v14 idle-block + AppHash fork ladd
 
 ---
 
+</details>
+
 ## Research
 
 | Paper | Key Result |
@@ -2384,89 +2551,15 @@ The v10.x line (MRI 3D brain, the app-v12/v13/v14 idle-block + AppHash fork ladd
 
 ---
 
-## Quick Start
-
-```bash
-git clone https://github.com/l33tdawg/sage.git && cd sage
-go build -o sage-gui ./cmd/sage-gui/
-./sage-gui setup    # Pick your AI, get MCP config
-./sage-gui serve    # SAGE + Dashboard on :8080
-```
-
-Or grab a binary: [macOS DMG](https://github.com/l33tdawg/sage/releases/latest) (signed & notarized) | [Windows EXE](https://github.com/l33tdawg/sage/releases/latest) | [Linux tar.gz](https://github.com/l33tdawg/sage/releases/latest)
-
-### Docker
-
-```bash
-docker pull ghcr.io/l33tdawg/sage:latest
-docker run -d --name sage \
-  -p 8080:8080 \
-  -v ~/.sage:/root/.sage \
-  ghcr.io/l33tdawg/sage:latest
-```
-
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.13`.
-
-The SAGE server stays in that container. To give a local MCP client a stdio
-bridge, start a second process **inside the same running container**:
-
-```bash
-docker exec -i \
-  -e SAGE_PROVIDER=claude-code \
-  -e SAGE_PROJECT=my-project \
-  -e SAGE_IDENTITY_PATH=/root/.sage/agents/claude-code-my-project/agent.key \
-  sage /usr/local/bin/sage-gui mcp
-```
-
-For the shipped Compose stack, use the service name rather than a generated
-container name:
-
-```bash
-docker compose -f docker-compose.sage-gui.yml exec -T \
-  -e SAGE_PROVIDER=claude-code \
-  -e SAGE_PROJECT=my-project \
-  -e SAGE_IDENTITY_PATH=/root/.sage/agents/claude-code-my-project/agent.key \
-  sage /usr/local/bin/sage-gui mcp
-```
-
-If an MCP client launches this through a wrapper, point its stdio configuration
-at the wrapper's absolute path. Pass `SAGE_PROVIDER`, `SAGE_PROJECT`, and
-`SAGE_IDENTITY_PATH` through `docker exec -e`/`docker compose exec -e`; setting
-them only on the host-side Docker command does not place them in the container.
-Keep the whole SAGE data root mounted at `/root/.sage`, including agent keys and
-the ledger. Do not start a separate `docker run ... mcp` container: its
-`localhost:8080` is isolated from the running SAGE server.
-
-HTTP MCP is also available at `/v1/mcp/sse` and `/v1/mcp/streamable`, but both
-require a bearer token or OAuth. Bare `http://localhost:8080` is the REST base,
-not an unauthenticated MCP endpoint.
-
-### Upgrading from an older version?
-
-**Upgrading an existing node — including the v10.x → v11 jump — is
-[docs/UPGRADING.md](docs/UPGRADING.md).** In the desktop app, accept the update:
-SAGE verifies canonical upgrade compatibility, captures a full recovery
-snapshot, installs, and restarts automatically. Headless and quorum operators
-have separate technical procedures in the guide.
-Your chain advances in place; a personal node climbs the consensus fork ladder by
-itself. Read the guide before a multi-admin chain crosses app-v23 — that
-activation re-derives administrator authority.
-
-If you installed SAGE before v5.0 and your AI isn't doing turn-by-turn memory updates, re-run the installer in your project directory:
-
-```bash
-cd /path/to/your/project
-sage-gui mcp install
-```
-
-This installs Claude Code hooks that enforce the memory lifecycle (boot, turn, reflect) — even if your `.mcp.json` is already configured. Restart your Claude Code session after running this.
-
----
 
 ## Documentation
 
 | Doc | What's in it |
 |-----|-------------|
+| [Authoritative Reference Index](docs/reference/INDEX.md) | Current code-verified integration contracts; start here for exact behavior |
+| [MCP Tools](docs/reference/mcp-tools.md) | Memory, tasks, inbox, handoff, replies, and recovery |
+| [REST API](docs/reference/rest-api.md) | Authentication, request/response fields, and endpoint boundaries |
+| [Python SDK](docs/reference/python-sdk.md) | Synchronous/asynchronous client methods and supported contracts |
 | [Architecture & Deployment](docs/ARCHITECTURE.md) | Multi-agent networks, BFT, RBAC, federation, API reference |
 | [Getting Started](docs/GETTING_STARTED.md) | Setup walkthrough, embedding providers, multi-agent network guide |
 | [Upgrading](docs/UPGRADING.md) | Moving an existing node to a new release, including v10.x → v11: backup, preflight, the app-version ladder, and what app-v23 does to your admins |
@@ -2477,7 +2570,8 @@ This installs Claude Code hooks that enforce the memory lifecycle (boot, turn, r
 
 ## Stack
 
-Go / CometBFT v0.38 / chi / SQLite / Ed25519 + AES-256-GCM + Argon2id / MCP
+Go / CometBFT v0.38 / chi / BadgerDB / SQLite or PostgreSQL + pgvector /
+Ed25519 + AES-256-GCM + Argon2id / MCP
 
 ---
 
