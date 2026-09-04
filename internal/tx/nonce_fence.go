@@ -1915,6 +1915,12 @@ func CometTxResolver(cometRPC string) TxResolveFunc {
 	}
 }
 
+// LookupCometTxOutcome checks exact indexed bytes without re-submitting them.
+// A missing transaction is unresolved, never proof of rejection.
+func LookupCometTxOutcome(ctx context.Context, cometRPC string, encoded []byte) (TxOutcome, error) {
+	return cometIndexedOutcome(ctx, strings.TrimRight(strings.TrimSpace(cometRPC), "/"), encoded, CometTxHash(encoded))
+}
+
 // cometResolve is the two-step reconciliation: ask whether the exact hash is in
 // a block, and if that does not prove anything, RE-SUBMIT the exact bytes to
 // make consensus answer.

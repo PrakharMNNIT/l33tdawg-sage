@@ -5407,285 +5407,155 @@ function RecallSettings() {
 function CleanupSettings() {
     const [config, setConfig] = useState(null);
     const [saving, setSaving] = useState(false);
-    const [lastRun, setLastRun] = useState(null);
+    const [busy, setBusy] = useState(false);
     const [lastResult, setLastResult] = useState(null);
-    const [cleanupRunning, setCleanupRunning] = useState(false);
-    const [cleanupResult, setCleanupResult] = useState(null);
+    const [preview, setPreview] = useState(null);
+    const [error, setError] = useState('');
+    const [available, setAvailable] = useState(false);
+    const [authorized, setAuthorized] = useState(false);
     const [expanded, setExpanded] = useState(false);
+    const active = lastResult && ['queued', 'scanning', 'running', 'confirmation_pending'].includes(lastResult.state);
 
     useEffect(() => {
-        fetchCleanupSettings().then(data => {
-            if (data.config) setConfig(data.config);
-            if (data.last_run) setLastRun(data.last_run);
-            if (data.last_result) {
-                try { setLastResult(JSON.parse(data.last_result)); } catch(e) {}
+        let cancelled = false;
+        let timer;
+        const refresh = async () => {
+            try {
+                const data = await fetchCleanupSettings();
+                if (cancelled) return;
+                setConfig(prev => prev || data.config);
+                setLastResult(data.last_result);
+                setAvailable(data.worker_available);
+                setAuthorized(data.authorized);
+            } catch (e) {
+                if (!cancelled) setError(e.message);
+            } finally {
+                if (!cancelled) timer = setTimeout(refresh, 3000);
             }
-        }).catch(() => {});
+        };
+        refresh();
+        return () => { cancelled = true; clearTimeout(timer); };
     }, []);
 
     const updateField = (field, value) => {
+        setPreview(null);
         setConfig(prev => ({ ...prev, [field]: value }));
     };
-
+    const save = async (next) => {
+        const data = await saveCleanupSettings(next);
+        setConfig(data.config);
+        setAuthorized(true);
+        setPreview(null);
+    };
     const handleSave = async () => {
-        if (!config || saving) return;
-        setSaving(true);
-        try {
-            const res = await saveCleanupSettings(config);
-            if (res.config) setConfig(res.config);
-        } catch(e) {}
-        setSaving(false);
-    };
-
-    const handleDryRun = async () => {
-        setCleanupRunning(true);
-        setCleanupResult(null);
-        try {
-            const res = await runCleanup(true);
-            setCleanupResult(res);
-        } catch(e) {
-            setCleanupResult({ error: 'Failed to run preview' });
-        }
-        setCleanupRunning(false);
-    };
-
-    const handleCleanup = async () => {
-        const previewCount = cleanupResult && cleanupResult.dry_run ? Number(cleanupResult.deprecated || 0) : null;
-        const previewNote = previewCount === null
-            ? 'Use Preview first if you want to see the exact count before continuing. '
-            : `Your latest preview found ${previewCount} ${previewCount === 1 ? 'memory' : 'memories'} to clean. `;
-        if (!await showConfirmation(
-            `${previewNote}Run cleanup using the current rules? Matching memories stop appearing in normal recall but remain in the audit history. Memories outside the current rules stay active.`,
-            { title: 'Clean Synaptic Ledger?', confirmLabel: 'Run cleanup', tone: 'danger' }
+        if (config.enabled && !await showConfirmation(
+            'Authorize automatic consensus cleanup using these updated rules? A run may begin immediately.',
+            { title: 'Authorize cleanup rules?', confirmLabel: 'Save and authorize', tone: 'danger' }
         )) return;
-        setCleanupRunning(true);
-        setCleanupResult(null);
+        setSaving(true);
+        setError('');
+        try { await save(config); } catch (e) { setError(e.message); }
+        finally { setSaving(false); }
+    };
+    const handleToggle = async (event) => {
+        const enabled = event.target.checked;
+        event.target.checked = config.enabled;
+        if (enabled && !await showConfirmation(
+            'Authorize periodic consensus cleanup using these rules? It can begin immediately. Eligible memories may be retired or enter a challenge round; audit history is retained. Open tasks and internal records are protected. Preview first to inspect the full eligible count.',
+            { title: 'Enable automatic cleanup?', confirmLabel: 'Authorize cleanup', tone: 'danger' }
+        )) return;
+        setSaving(true);
+        setError('');
+        try { await save({ ...config, enabled }); } catch (e) { setError(e.message); }
+        finally { setSaving(false); }
+    };
+    const handleDryRun = async () => {
+        setBusy(true);
+        setError('');
         try {
-            const res = await runCleanup(false);
-            setCleanupResult(res);
-            setLastRun(new Date().toISOString());
-            setLastResult(res);
-        } catch(e) {
-            setCleanupResult({ error: 'Failed to run cleanup' });
-        }
-        setCleanupRunning(false);
+            setPreview(await runCleanup(true, config));
+        } catch (e) { setError(e.message); }
+        finally { setBusy(false); }
+    };
+    const handleCleanup = async () => {
+        const count = preview && preview.complete ? preview.eligible : null;
+        if (!await showConfirmation(
+            (count === null ? 'Preview first to inspect the full eligible count. ' : `The latest full scan found ${count} eligible memories. `) +
+            'Run consensus cleanup with these rules? Eligibility is checked again before each submission. Confirmed retirements stop normal recall but retain audit history; some memories require further challenge votes.',
+            { title: 'Clean Synaptic Ledger?', confirmLabel: 'Queue cleanup', tone: 'danger' }
+        )) return;
+        setBusy(true);
+        setError('');
+        try {
+            setPreview(null);
+            setLastResult(await runCleanup(false, config));
+        } catch (e) { setError(e.message); }
+        finally { setBusy(false); }
     };
 
-    if (!config) return null;
-
+    if (!config) return html`<div class="settings-section">${error || 'Loading memory cleanup…'}</div>`;
+    const controls = [
+        ['observation_ttl_days', 'Observation lifetime (days)', 1, 90, 1],
+        ['session_ttl_days', 'Session-context lifetime (days)', 1, 30, 1],
+        ['stale_threshold', 'Computed confidence threshold', 0.01, 0.5, 0.01],
+        ['cleanup_interval_hours', 'Automatic interval (hours)', 1, 168, 1],
+    ];
     return html`
         <div class="settings-section cleanup-section">
-            <h3 style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onClick=${() => setExpanded(!expanded)}>
-                <span>
-                    <svg width="16" height="16" viewBox="0 0 16 16" style="vertical-align:-2px;margin-right:6px">
-                        <path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM8 5v3.5l2.5 1.5" stroke="currentColor" fill="none" stroke-width="1.5" stroke-linecap="round"/>
-                    </svg>
-                    Memory Auto-Cleanup <${HelpTip} text="Automatically removes stale observations and low-confidence memories over time. Keeps your brain focused on high-value knowledge." align="right" />
-                </span>
-                <span style="font-size:12px;color:var(--text-muted)">${expanded ? '▲' : '▼'}</span>
-            </h3>
-
-            <div class="cleanup-description">
-                <p style="color:var(--text-dim);font-size:13px;line-height:1.5;margin:8px 0">
-                    Automatically deprecate stale memories whose confidence has decayed below a threshold,
-                    or observations that have outlived their usefulness.
-                </p>
-            </div>
-
-            <!-- Master toggle — always visible -->
-            <div class="settings-row" style="padding:12px 0;border-bottom:1px solid var(--border)">
-                <div style="flex:1">
-                    <span class="label" style="font-weight:600">Enable Auto-Cleanup</span>
-                    <div class="setting-help">
-                        <span style="color:var(--accent);font-size:11px;font-weight:500">ON:</span>
-                        <span style="color:var(--text-dim);font-size:11px"> SAGE periodically removes stale session observations and low-confidence memories. Good for long-running agents that accumulate thousands of memories.</span>
-                    </div>
-                    <div class="setting-help" style="margin-top:2px">
-                        <span style="color:var(--danger);font-size:11px;font-weight:500">OFF:</span>
-                        <span style="color:var(--text-dim);font-size:11px"> Nothing is ever auto-removed. You control what stays. Best if you want complete history or have a small memory set.</span>
-                    </div>
-                </div>
+            <h3>Memory Auto-Cleanup</h3>
+            <p class="setting-help">Retire expired observations and low-confidence memories through consensus. Open tasks and internal records are protected. Audit history is retained.</p>
+            ${error && html`<p role="alert" style="color:var(--danger)">${error}</p>`}
+            ${!available && html`<p role="status">Cleanup worker is unavailable. No new cleanup can run.</p>`}
+            ${config.enabled && !authorized && html`<p role="status">Automatic cleanup authorization is no longer valid. Disable, review the rules, then enable again to authorize the current Root.</p>`}
+            <div class="settings-row">
+                <span>Enable automatic cleanup</span>
                 <label class="toggle-switch">
                     <input type="checkbox" aria-label="Enable automatic memory cleanup" checked=${config.enabled}
-                        onChange=${(e) => {
-                            const newVal = e.target.checked;
-                            updateField('enabled', newVal);
-                            saveCleanupSettings({ ...config, enabled: newVal }).catch(() => {});
-                        }} />
+                        disabled=${saving || busy || (!available && !config.enabled)} onChange=${handleToggle} />
                     <span class="toggle-slider"></span>
                 </label>
             </div>
-
-            <!-- Quick actions — always visible -->
-            <div style="display:flex;gap:8px;padding:12px 0;flex-wrap:wrap;align-items:center">
-                <button class="btn btn-danger" onClick=${handleCleanup} disabled=${cleanupRunning} style="font-size:12px;">
-                    ${cleanupRunning ? 'Cleaning...' : 'Clean Synaptic Ledger…'}
-                </button>
-                <button class="btn" onClick=${handleDryRun} disabled=${cleanupRunning} style="font-size:12px">
-                    ${cleanupRunning ? 'Running...' : 'Preview'}
-                </button>
-                ${lastRun && html`<span style="font-size:11px;color:var(--text-muted)">Last run: ${new Date(lastRun).toLocaleString()}</span>`}
+            <p class="setting-help">OFF prevents new automatic submissions; an already-submitted transaction may still complete. Legacy settings require fresh authorization after upgrading.</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0">
+                <button class="btn btn-danger" onClick=${handleCleanup} disabled=${busy || saving || active || !available}>Clean Synaptic Ledger…</button>
+                <button class="btn" onClick=${handleDryRun} disabled=${busy || saving || active}>${busy ? 'Working…' : 'Preview'}</button>
+                <button class="btn" onClick=${() => setExpanded(!expanded)} aria-expanded=${expanded}>Cleanup rules</button>
             </div>
-
-            <!-- Cleanup result — always visible -->
-            ${cleanupResult && html`
-                <div class="cleanup-result" style="margin-bottom:12px;padding:12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius)">
-                    ${cleanupResult.error ? html`
-                        <span style="color:var(--danger)">${cleanupResult.error}</span>
-                    ` : html`
-                        <div style="font-size:13px;color:var(--text-dim)">
-                            <strong>${cleanupResult.dry_run ? 'Preview' : 'Done'}:</strong>
-                            ${cleanupResult.deprecated || 0} memories ${cleanupResult.dry_run ? 'would be' : ''} deprecated
-                            (${cleanupResult.checked || 0} checked)
-                        </div>
-                    `}
+            ${preview && html`
+                <div class="cleanup-result">
+                    <strong>${preview.complete ? 'Full preview' : 'Incomplete preview'}</strong>:
+                    ${preview.eligible} eligible · ${preview.checked} scanned · ${preview.skipped} unverifiable rows skipped.
+                    <p class="setting-help">All pages scanned; no 500-memory total limit. Counts reflect this scan, not a frozen snapshot. Every target is rechecked before submission.</p>
                 </div>
             `}
-
+            ${lastResult && lastResult.state && html`
+                <div class="cleanup-result" role="status">
+                    <strong>Cleanup: ${lastResult.state.replaceAll('_', ' ')}</strong>
+                    ${['queued', 'scanning'].includes(lastResult.state) ? html`<p>Full inventory scan pending or in progress; totals are not yet available.</p>` : html`
+                        <p>${lastResult.checked} scanned · ${lastResult.eligible} verified eligible · ${lastResult.submitted} confirmed submissions ·
+                        ${lastResult.deprecated} observed retired · ${lastResult.challenged} observed challenged · ${lastResult.unchanged || 0} no longer retired/challenged · ${lastResult.skipped} skipped</p>
+                    `}
+                    ${lastResult.confirmation_pending && html`<p>Waiting for canonical confirmation. No duplicate submission will be sent.</p>`}
+                    ${lastResult.error && html`<p style="color:var(--danger)">${lastResult.error}</p>`}
+                    ${lastResult.finished_at && html`<p class="setting-help">Attempt ended: ${new Date(lastResult.finished_at).toLocaleString()}</p>`}
+                </div>
+            `}
             ${expanded && html`
-                <!-- Observation TTL -->
-                <div class="settings-row setting-detail" style="padding:12px 0;border-bottom:1px solid var(--border)">
-                    <div style="flex:1">
-                        <span class="label">Observation TTL</span>
-                        <div class="setting-help">
-                            <span style="color:var(--text-dim);font-size:11px">
-                                How many days before general observations are auto-deprecated.
-                                Observations are things like "user asked about X" or "noticed pattern Y" — useful short-term, less so after a week.
-                            </span>
-                        </div>
-                        <div class="setting-help" style="margin-top:2px">
-                            <span style="color:var(--text-muted);font-size:11px;font-style:italic">
-                                Example: Set to 7 days if your agent logs dozens of observations per session. Set to 30+ if observations are rare and valuable.
-                            </span>
-                        </div>
+                <p class="setting-help">Observations qualify when their lifetime expires, or when computed confidence falls below the threshold. Other memory types qualify by confidence. Session-context observations use their own lifetime.</p>
+                ${controls.map(([field, label, min, max, step]) => html`
+                    <div class="settings-row">
+                        <label>${label}
+                            <input type="range" aria-label=${label} min=${min} max=${max} step=${step} value=${config[field]}
+                                disabled=${saving || busy} onInput=${e => updateField(field, Number(e.target.value))} />
+                        </label>
+                        <span>${config[field]}</span>
                     </div>
-                    <div style="display:flex;align-items:center;gap:8px">
-                        <input type="range" aria-label="Observation lifetime in days" min="1" max="90" value=${config.observation_ttl_days}
-                            onInput=${(e) => updateField('observation_ttl_days', parseInt(e.target.value))}
-                            style="width:120px" />
-                        <span class="value" style="min-width:50px;text-align:right">${config.observation_ttl_days}d</span>
-                    </div>
-                </div>
-
-                <!-- Session TTL -->
-                <div class="settings-row setting-detail" style="padding:12px 0;border-bottom:1px solid var(--border)">
-                    <div style="flex:1">
-                        <span class="label">Session Context TTL</span>
-                        <div class="setting-help">
-                            <span style="color:var(--text-dim);font-size:11px">
-                                How many days before session-context observations expire. These are ephemeral notes like
-                                "user said good morning" or "started new session" — they clutter your memory fast.
-                            </span>
-                        </div>
-                        <div class="setting-help" style="margin-top:2px">
-                            <span style="color:var(--text-muted);font-size:11px;font-style:italic">
-                                Example: Set to 1-2 days for aggressive cleanup. Set to 7 if you want a week of session history.
-                            </span>
-                        </div>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:8px">
-                        <input type="range" aria-label="Session context lifetime in days" min="1" max="30" value=${config.session_ttl_days}
-                            onInput=${(e) => updateField('session_ttl_days', parseInt(e.target.value))}
-                            style="width:120px" />
-                        <span class="value" style="min-width:50px;text-align:right">${config.session_ttl_days}d</span>
-                    </div>
-                </div>
-
-                <!-- Stale Threshold -->
-                <div class="settings-row setting-detail" style="padding:12px 0;border-bottom:1px solid var(--border)">
-                    <div style="flex:1">
-                        <span class="label">Stale Confidence Threshold</span>
-                        <div class="setting-help">
-                            <span style="color:var(--text-dim);font-size:11px">
-                                Memories whose computed confidence drops below this value get auto-deprecated.
-                                Confidence decays naturally over time — facts decay slowly (~139 day half-life),
-                                while observations decay faster.
-                            </span>
-                        </div>
-                        <div class="setting-help" style="margin-top:2px">
-                            <span style="color:var(--text-muted);font-size:11px;font-style:italic">
-                                Example: 0.10 is conservative (only removes very stale memories). 0.25 is aggressive (removes anything that's lost 75% confidence).
-                            </span>
-                        </div>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:8px">
-                        <input type="range" aria-label="Stale confidence threshold" min="1" max="50" value=${Math.round(config.stale_threshold * 100)}
-                            onInput=${(e) => updateField('stale_threshold', parseInt(e.target.value) / 100)}
-                            style="width:120px" />
-                        <span class="value" style="min-width:50px;text-align:right">${(config.stale_threshold * 100).toFixed(0)}%</span>
-                    </div>
-                </div>
-
-                <!-- Cleanup Interval -->
-                <div class="settings-row setting-detail" style="padding:12px 0;border-bottom:1px solid var(--border)">
-                    <div style="flex:1">
-                        <span class="label">Cleanup Interval</span>
-                        <div class="setting-help">
-                            <span style="color:var(--text-dim);font-size:11px">
-                                How often the background cleanup runs (in hours). Lower = more frequent checks.
-                            </span>
-                        </div>
-                        <div class="setting-help" style="margin-top:2px">
-                            <span style="color:var(--text-muted);font-size:11px;font-style:italic">
-                                Example: 24h (once a day) is fine for most users. Set to 1h if you're generating memories rapidly.
-                            </span>
-                        </div>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:8px">
-                        <input type="range" aria-label="Cleanup interval in hours" min="1" max="168" value=${config.cleanup_interval_hours}
-                            onInput=${(e) => updateField('cleanup_interval_hours', parseInt(e.target.value))}
-                            style="width:120px" />
-                        <span class="value" style="min-width:50px;text-align:right">${config.cleanup_interval_hours}h</span>
-                    </div>
-                </div>
-
-                <!-- Save button -->
-                <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
-                    <button class="btn btn-primary" onClick=${handleSave} disabled=${saving}>
-                        ${saving ? 'Saving...' : 'Save Settings'}
-                    </button>
-                    <button class="btn" onClick=${handleDryRun} disabled=${cleanupRunning}>
-                        ${cleanupRunning ? 'Running...' : 'Preview Cleanup'}
-                    </button>
-                    <button class="btn btn-danger" onClick=${handleCleanup} disabled=${cleanupRunning}>
-                        Run Cleanup Now
-                    </button>
-                </div>
-
-                <!-- Cleanup result -->
-                ${cleanupResult && html`
-                    <div class="cleanup-result" style="margin-top:12px;padding:12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius)">
-                        ${cleanupResult.error ? html`
-                            <span style="color:var(--danger)">${cleanupResult.error}</span>
-                        ` : html`
-                            <div style="font-size:13px;color:var(--text-dim)">
-                                <strong style="color:var(--text)">${cleanupResult.dry_run ? 'Preview' : 'Cleanup Complete'}</strong>
-                                <span style="margin-left:8px">
-                                    Checked: ${cleanupResult.checked} ·
-                                    ${cleanupResult.dry_run ? 'Would deprecate' : 'Deprecated'}: <strong style="color:${cleanupResult.deprecated > 0 ? 'var(--warning)' : 'var(--accent)'}">${cleanupResult.deprecated}</strong>
-                                </span>
-                            </div>
-                            ${cleanupResult.deprecated_ids && cleanupResult.deprecated_ids.length > 0 && html`
-                                <div style="margin-top:8px;font-size:11px;color:var(--text-muted);max-height:100px;overflow-y:auto">
-                                    ${cleanupResult.deprecated_ids.map(id => html`<div style="font-family:monospace">${id.substring(0, 8)}...</div>`)}
-                                </div>
-                            `}
-                        `}
-                    </div>
-                `}
-
-                <!-- Last run info -->
-                ${lastRun && html`
-                    <div style="margin-top:8px;font-size:11px;color:var(--text-muted)">
-                        Last cleanup: ${new Date(lastRun).toLocaleString()}
-                        ${lastResult && lastResult.deprecated != null ? html` · Deprecated: ${lastResult.deprecated}` : ''}
-                    </div>
-                `}
+                `)}
+                <button class="btn btn-primary" onClick=${handleSave} disabled=${saving || busy}>${saving ? 'Saving…' : 'Save rules'}</button>
             `}
         </div>
     `;
 }
-
 // ============================================================================
 // Settings Page
 // ============================================================================

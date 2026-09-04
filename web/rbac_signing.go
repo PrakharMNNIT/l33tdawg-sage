@@ -553,6 +553,15 @@ func (h *DashboardHandler) signAndBroadcastCommitPrepared(
 	key ed25519.PrivateKey,
 	prepare func(*tx.ParsedTx) error,
 ) (string, int64, string, error) {
+	return h.signAndBroadcastCommitDurable(ctx, ptx, key, prepare, nil)
+}
+
+// beforeSend persists an exact-byte recovery intent inside the nonce lease.
+// A persistence failure is definitive and prevents any network submission.
+func (h *DashboardHandler) signAndBroadcastCommitDurable(
+	ctx context.Context, ptx *tx.ParsedTx, key ed25519.PrivateKey,
+	prepare func(*tx.ParsedTx) error, beforeSend func([]byte) error,
+) (string, int64, string, error) {
 	var (
 		hash   string
 		height int64
@@ -593,6 +602,12 @@ func (h *DashboardHandler) signAndBroadcastCommitPrepared(
 		if encErr != nil {
 			txErr = fmt.Errorf("encode tx: %w", encErr)
 			return txErr
+		}
+		if beforeSend != nil {
+			if persistErr := beforeSend(encoded); persistErr != nil {
+				txErr = fmt.Errorf("persist submission intent: %w", persistErr)
+				return txErr
+			}
 		}
 		hash, height, txLog, txErr = broadcastTxCommitWebContext(ctx, h.CometBFTRPC, key, encoded)
 		if isIndeterminateCommitError(txErr) {

@@ -131,7 +131,7 @@ tools read: `recall_top_k` and `recall_min_confidence`. Routes at
 
 ### `GET /v1/dashboard/settings/recall`
 
-Returns the current values (`handleGetRecallSettings`, `web/handler.go:5351-5381`).
+Returns the current values (`handleGetRecallSettings`, `web/handler.go:5254-5286`).
 
 **Response** (HTTP 200): `{"top_k": 5, "min_confidence": 70}`
 
@@ -141,7 +141,7 @@ and inferences (0.60+), not just facts.
 
 ### `POST /v1/dashboard/settings/recall`
 
-Saves both values, **clamped** (`handleSaveRecallSettings`, `web/handler.go:5384-5433`).
+Saves both values, **clamped** (`handleSaveRecallSettings`, `web/handler.go:5287-5338`).
 
 **Request:** `{"top_k": 10, "min_confidence": 75}`
 **Response** (HTTP 200): `{"ok": true, "top_k": 10, "min_confidence": 75}`

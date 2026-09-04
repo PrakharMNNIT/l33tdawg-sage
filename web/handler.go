@@ -59,8 +59,6 @@ type PreferencesStore interface {
 	GetPreference(ctx context.Context, key string) (string, error)
 	SetPreference(ctx context.Context, key, value string) error
 	GetAllPreferences(ctx context.Context) (map[string]string, error)
-	GetCleanupCandidates(ctx context.Context, observationTTLDays int, sessionTTLDays int, staleThreshold float64) ([]*memory.MemoryRecord, error)
-	DeprecateMemories(ctx context.Context, memoryIDs []string) (int, error)
 }
 
 // Embedder generates vector embeddings for text content. The dashboard
@@ -92,12 +90,14 @@ type rerankerInfoProvider interface {
 
 // DashboardHandler serves the CEREBRUM dashboard UI and its API endpoints.
 type DashboardHandler struct {
-	store     store.MemoryStore
-	prefStore PreferencesStore
-	embedder  Embedder
-	SSE       *SSEBroadcaster
-	Version   string
-	BootID    string // unique per serve process; restart verification must observe a change
+	cleanupMu          sync.Mutex
+	cleanupWorkerReady atomic.Bool
+	store              store.MemoryStore
+	prefStore          PreferencesStore
+	embedder           Embedder
+	SSE                *SSEBroadcaster
+	Version            string
+	BootID             string // unique per serve process; restart verification must observe a change
 	// NodeOperatorAgentID is the identity actually held by HTTP MCP's signing
 	// key. OAuth/wizard bearer metadata must use this exact ID.
 	NodeOperatorAgentID string
@@ -5206,111 +5206,14 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-// handleGetCleanupSettings returns the current cleanup configuration.
 func (h *DashboardHandler) handleGetCleanupSettings(w http.ResponseWriter, r *http.Request) {
-	if h.prefStore == nil {
-		writeError(w, http.StatusNotImplemented, "preferences not available")
-		return
-	}
-
-	prefs, err := h.prefStore.GetAllPreferences(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	cfg := memory.CleanupConfigFromPrefs(prefs)
-
-	// Also include last run info
-	resp := map[string]any{
-		"config":      cfg,
-		"last_run":    prefs["cleanup_last_run"],
-		"last_result": prefs["cleanup_last_result"],
-	}
-
-	writeJSONResp(w, http.StatusOK, resp)
+	h.canonicalCleanupSettings(w, r)
 }
-
-// handleSaveCleanupSettings saves the cleanup configuration.
 func (h *DashboardHandler) handleSaveCleanupSettings(w http.ResponseWriter, r *http.Request) {
-	if h.prefStore == nil {
-		writeError(w, http.StatusNotImplemented, "preferences not available")
-		return
-	}
-
-	var cfg memory.CleanupConfig
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-
-	// Validate bounds
-	if cfg.ObservationTTLDays < 1 {
-		cfg.ObservationTTLDays = 1
-	}
-	if cfg.SessionTTLDays < 1 {
-		cfg.SessionTTLDays = 1
-	}
-	if cfg.StaleThreshold < 0.01 {
-		cfg.StaleThreshold = 0.01
-	}
-	if cfg.StaleThreshold > 0.5 {
-		cfg.StaleThreshold = 0.5
-	}
-	if cfg.CleanupIntervalHours < 1 {
-		cfg.CleanupIntervalHours = 1
-	}
-
-	prefs := memory.CleanupConfigToPrefs(cfg)
-	for k, v := range prefs {
-		if err := h.prefStore.SetPreference(r.Context(), k, v); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-
-	writeJSONResp(w, http.StatusOK, map[string]any{"ok": true, "config": cfg})
+	h.canonicalSaveCleanup(w, r)
 }
-
-// handleRunCleanup triggers an on-demand cleanup (supports dry_run).
 func (h *DashboardHandler) handleRunCleanup(w http.ResponseWriter, r *http.Request) {
-	if h.prefStore == nil {
-		writeError(w, http.StatusNotImplemented, "preferences not available")
-		return
-	}
-
-	var body struct {
-		DryRun bool `json:"dry_run"`
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		// Default to dry run for safety
-		body.DryRun = true
-	}
-	if h.appV23IsActive() && !body.DryRun {
-		writeAppV23AccessError(w, http.StatusConflict, "canonical_cleanup_required",
-			"Automatic cleanup cannot rewrite only CEREBRUM's local index. Review the dry run and forget memories through consensus.")
-		return
-	}
-
-	prefs, err := h.prefStore.GetAllPreferences(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	cfg := memory.CleanupConfigFromPrefs(prefs)
-	// For manual runs, force enabled so it actually runs
-	cfg.Enabled = true
-
-	result, err := memory.RunCleanup(r.Context(), h.prefStore, cfg, body.DryRun)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	writeJSONResp(w, http.StatusOK, result)
+	h.canonicalRunCleanup(w, r)
 }
 
 // handleGetBootInstructions returns the custom boot instructions for MCP inception.

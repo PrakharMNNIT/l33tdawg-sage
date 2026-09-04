@@ -55,6 +55,7 @@ or `api/openapi.yaml`, **trust this reference** — those two have known drift (
 | Sign a request correctly | **Request signing** below |
 | Know what "committed" actually means | [`concepts/consensus-confidence-decay.md`](concepts/consensus-confidence-decay.md) |
 | Know if a memory will decay | [`concepts/memory-lifecycle.md`](concepts/memory-lifecycle.md) |
+| Configure uncapped, consensus-safe memory cleanup | [`concepts/memory-cleanup.md`](concepts/memory-cleanup.md) |
 | Understand why your chain's block height isn't moving | [`concepts/block-production-and-idle.md`](concepts/block-production-and-idle.md) |
 | Make sure submitted memories actually get committed (not stuck at `proposed`) | [`concepts/voter-operations.md`](concepts/voter-operations.md) |
 | Work out why one signing key suddenly refuses everything with `ErrSignerFenced` (503), or why an update refuses to restart | [`concepts/signer-nonce-fence.md`](concepts/signer-nonce-fence.md) — and do **not** restart to clear it; that is the action that loses the transaction |
