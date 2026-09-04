@@ -48,7 +48,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.13`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.14`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
@@ -207,6 +207,18 @@ software updates, and encryption controls. Ordinary agent identity replacement
 uses re-enrollment; historical memory authorship is preserved.
 
 ---
+
+## What's New in v11.19.14
+
+**Security dependency update:** gRPC-Go is upgraded to v1.83.1 to address
+HTTP/2 DATA-frame fragmentation heap exhaustion (CVE-2026-84304, Dependabot
+alert #45). The required genproto and OpenTelemetry dependencies are refreshed
+alongside it. CodeQL workflow actions are pinned to the verified v4.37.9 commit.
+
+This patch introduces no consensus-rule, AppHash-input, key-encoding, fork-target,
+or application-version changes. App-v27 remains the supported ceiling.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.14`. SDK 11.19.14.
 
 ## What's New in v11.19.13
 

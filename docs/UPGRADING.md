@@ -177,6 +177,7 @@ Use this to work out how far your chain has to climb.
 | v11.19.11 | Exact operator-configured CEREBRUM hostnames for loopback TLS reverse proxies, with loopback-only peer/forwarded-IP enforcement and unanimous fail-closed `X-Forwarded-Proto` parsing; no consensus change and app-v27 remains the ceiling |
 | v11.19.12 | Project-scoped MCP and Codex installs reject the user's home directory to prevent global host-config pollution; the Linux native-shell gate admits the independently verified September AppImage-helper rebuild by exact SHA-256; no consensus change and app-v27 remains the ceiling |
 | v11.19.13 | Stdio MCP startup skips automatic Claude project-hook repair when its working directory is the user's home directory, while normal project repair and explicit-install safeguards remain unchanged; no consensus change and app-v27 remains the ceiling |
+| v11.19.14 | gRPC-Go v1.83.1 fixes HTTP/2 DATA-frame fragmentation heap exhaustion (CVE-2026-84304), with required genproto/OpenTelemetry updates and CodeQL action v4.37.9 pins; no consensus change and app-v27 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 

@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-09):** **v11.19.13 is the current release.** It keeps the
+**Status (2026-09):** **v11.19.14 is the current release.** It keeps the
 pairwise exported-agent federation model, safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
@@ -157,6 +157,16 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.14 release
+
+gRPC-Go v1.83.1 fixes HTTP/2 DATA-frame fragmentation heap exhaustion
+(CVE-2026-84304, Dependabot alert #45), with the required genproto and
+OpenTelemetry dependency refresh. CodeQL init, analyze, and upload-sarif
+actions are pinned to the verified v4.37.9 commit.
+
+This release introduces no consensus-rule, AppHash-input, key-encoding,
+fork-target, or application-version changes; app-v27 remains the ceiling.
 
 ## v11.19.13 release
 
