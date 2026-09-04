@@ -315,7 +315,7 @@ func (h *DashboardHandler) cleanupTick(ctx context.Context) {
 		}
 		run = cleanupRun{State: "queued", Policy: p, Automatic: true, Started: time.Now().UTC().Format(time.RFC3339Nano)}
 	}
-	root, key, broker := h.appV23RootBrokerKey()
+	root, _, broker := h.appV23RootBrokerKey()
 	authorized := broker.Available && root != nil && root.CredentialID == run.Policy.Credential && root.Generation == run.Policy.Generation
 	if !authorized && run.Pending == "" {
 		run.State = "failed"
@@ -470,7 +470,7 @@ func (h *DashboardHandler) cleanupTick(ctx context.Context) {
 		} else {
 			// A full scan can take time; resolve the exact current credential again
 			// immediately before persisting intent and signing.
-			root, key, broker = h.appV23RootBrokerKey()
+			root, key, broker := h.appV23RootBrokerKey()
 			if !broker.Available || root == nil || root.CredentialID != run.Policy.Credential || root.Generation != run.Policy.Generation {
 				run.State = "failed"
 				run.Error = "Cleanup authorization changed before submission"
