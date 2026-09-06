@@ -232,6 +232,15 @@ func exercisePipeDisconnectRestart(t *testing.T, source, destination *testChain,
 	t.Helper()
 	ctx := context.Background()
 	fixture := configurePipeFaultFixture(t, source, destination)
+	legacyTicket := *fixture.target
+	legacyTicket.AuthorizationMode = ""
+	legacyTicket.Domains = []PipeContactDomain{{Domain: "previously-exported"}}
+	require.NoError(t, source.mgr.rememberRemoteMessageTarget(ctx, fixture.sourceAgent, &legacyTicket))
+	upgraded, err := source.mgr.ResolveRemotePipeTargetForCaller(ctx, fixture.sourceAgent, fixture.target.Address)
+	require.NoError(t, err)
+	require.Equal(t, NodeMessageAuthorizationMode, upgraded.AuthorizationMode,
+		"a new send must upgrade its old admission ticket even after the memory export is gone")
+	require.Empty(t, upgraded.Domains)
 	sourceMsg, sendOutbox := enqueueFaultGateSend(t, source, destination, fixture)
 
 	// The receiver is unreachable. The durable row must remain pending.

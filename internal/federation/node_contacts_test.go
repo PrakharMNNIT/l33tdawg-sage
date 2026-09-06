@@ -92,3 +92,29 @@ func TestNodeContactPagesEnumerateEveryEligibleAgent(t *testing.T) {
 	}
 	require.Len(t, seen, 7)
 }
+
+func TestNodeMessagingPreservesAlreadyQueuedLegacyAuthorization(t *testing.T) {
+	ctx := context.Background()
+	source, destination := newTestChain(t, "upgrade-source"), newTestChain(t, "upgrade-destination")
+	sourceServer, destinationServer := startRestartablePipeServer(t, source, ""), startRestartablePipeServer(t, destination, "")
+	defer func() { sourceServer.stop(t); destinationServer.stop(t) }()
+	federate(t, source, destination, "https://"+destinationServer.address, nil, 4, 0)
+	federate(t, destination, source, "https://"+sourceServer.address, nil, 4, 0)
+	activatePipePeer(t, source, destination, "host")
+	activatePipePeer(t, destination, source, "guest")
+	fixture := configurePipeFaultFixture(t, source, destination)
+	exportPipeContactAgent(t, destination.mgr, source.chainID, fixture.targetAgent)
+	legacy, err := source.mgr.resolveRemotePipeTarget(ctx, fixture.target.Address, false, "")
+	require.NoError(t, err)
+	require.Empty(t, legacy.AuthorizationMode)
+	require.NotEmpty(t, legacy.Domains)
+	fixture.target = legacy
+	_, outbox := enqueueFaultGateSend(t, source, destination, fixture)
+	event, terminal, err := source.mgr.buildPipelineEvent(ctx, pipeSQLite(t, source), outbox)
+	require.NoError(t, err)
+	require.False(t, terminal)
+	require.Empty(t, event.AuthorizationMode, "an upgrade must not reinterpret the authority of a queued message")
+	accepted, err := source.mgr.PushPipeEvent(ctx, destination.chainID, event)
+	require.NoError(t, err)
+	require.Equal(t, "accepted", accepted.Status)
+}

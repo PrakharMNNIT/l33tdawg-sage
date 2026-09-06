@@ -355,13 +355,21 @@ func (m *Manager) ResolveRemotePipeTarget(ctx context.Context, target string) (*
 func (m *Manager) ResolveRemotePipeTargetForCaller(
 	ctx context.Context, callerAgentID, target string,
 ) (*RemotePipeTarget, error) {
-	if known, err := m.knownRemoteMessageTarget(ctx, callerAgentID, target); err != nil {
+	known, err := m.knownRemoteMessageTarget(ctx, callerAgentID, target)
+	if err != nil {
 		return nil, err
-	} else if known != nil && (known.AuthorizationMode == "" || known.AuthorizationMode == NodeMessageAuthorizationMode) {
+	} else if known != nil && known.AuthorizationMode == NodeMessageAuthorizationMode {
 		return known, nil
 	}
 	resolved, err := m.resolveRemotePipeTarget(ctx, target, true)
 	if err != nil {
+		// Upgrade a legacy admission ticket for NEW messages when the peer is
+		// reachable. Otherwise a removed memory export could keep poisoning new
+		// sends after both nodes support independent messaging. Offline legacy
+		// tickets remain admit-only hints; queued events retain their saved mode.
+		if known != nil && known.AuthorizationMode == "" && errors.Is(err, ErrPeerOffline) {
+			return known, nil
+		}
 		return nil, err
 	}
 	if err := m.rememberRemoteMessageTarget(ctx, callerAgentID, resolved); err != nil {
