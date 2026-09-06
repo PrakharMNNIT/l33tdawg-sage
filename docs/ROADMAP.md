@@ -1,6 +1,6 @@
 # SAGE Roadmap
 
-**Status (2026-09):** **v11.19.16 is the current release.** Trusted paired nodes now discover and
+**Status (2026-09):** **v11.19.17 is the current release.** CEREBRUM adds a federation connectome, live metadata activity, clearer pairing steps, and explicit memory-sharing drafts. Trusted paired nodes now discover and
 message eligible ordinary agents automatically, with memory sharing separately
 configured. It keeps safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
@@ -158,6 +158,12 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.17 release
+
+Interactive federation connectome, bounded operator-only SSE transport activity,
+clear node identity, and streamlined trust-only onboarding. The broader v12
+standalone/web design system remains future work.
 
 ## v11.19.16 release
 

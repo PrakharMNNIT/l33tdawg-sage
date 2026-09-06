@@ -11,7 +11,7 @@ import { FederationDirectory } from '/ui/js/federation-directory.js';
 const agent=(id,name,accepting=true)=>({agent_id:id.repeat(64),display_name:name,provider:'codex',available:true,accepting,address:id.repeat(64)+'@test-chain',domains:[]});
 const local={contacts:[agent('a','codex/sage'),agent('b','codex/tii-sage',false)],next_cursor:'b'.repeat(64)};
 const remote={contacts:[agent('c','codex/autoresearch-benchmark'),agent('d','claude-code/Projects')],paused:false};
-preact.render(window.html\`<\$\{FederationDirectory} peerName="Research laptop" local=\$\{local} remote=\$\{remote} automatic=\$\{true}
+preact.render(window.html\`<\$\{FederationDirectory} peerName="Research laptop" localName="Home SAGE" local=\$\{local} remote=\$\{remote} automatic=\$\{true}
 catalog=\$\{{research:{can_share:true},notes:{can_share:true},private:{can_share:false}}}
 copyAddress=\$\{agent=>window.copied=agent.address} loadMore=\$\{async side=>{window.pages.push(side);return {contacts:[]};}}
 stageDomains=\$\{(domains,permission)=>window.staged.push({domains,permission})} />\`,document.getElementById('fixture'));
@@ -55,6 +55,8 @@ test('bulk selection and drag/drop stage explicit memory choices without applyin
     await page.locator('.fed-directory-domain').filter({ hasText: 'research' }).dragTo(page.getByRole('button', { name: /Offer Copy/ }));
     await expect.poll(() => page.evaluate(() => window.staged.length)).toBe(2);
     await expect.poll(() => page.evaluate(() => window.staged[1])).toEqual({ domains: ['research'], permission: 'copy' });
+    await page.locator('.fed-directory-domain').filter({ hasText: 'research' }).dragTo(page.getByRole('button', { name: /Clear domain permissions/ }));
+    await expect.poll(() => page.evaluate(() => window.staged[2])).toEqual({ domains: ['research'], permission: 'remove' });
     await page.screenshot({ path: test.info().outputPath('directory-desktop.png'), fullPage: true });
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(page.getByRole('heading', { name: 'Agents across this connection' })).toBeVisible();

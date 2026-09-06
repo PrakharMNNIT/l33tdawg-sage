@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.19.16 federation behavior. -->
+<!-- Verified against SAGE v11.19.17 federation behavior. -->
 
 # Connect your SAGE to another network
 

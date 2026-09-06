@@ -89,6 +89,8 @@ func (s *SQLiteStore) migratePipelineTransport(ctx context.Context) {
 		expires_at      TEXT NOT NULL,
 		PRIMARY KEY (remote_chain_id, policy_epoch, agreement_id, source_agent_id, event_kind, remote_pipe_id)
 	)`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_transport_activity ON pipeline_transport_outbox(created_at) WHERE event_kind IN ('send','result')`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_transport_activity_delivered ON pipeline_transport_outbox(delivered_at) WHERE event_kind IN ('send','result')`)
 	// Development builds may already have created the pre-v11.10 draft table.
 	// These additive migrations are harmless on the final schema; errors mean
 	// the column already exists and are intentionally ignored.

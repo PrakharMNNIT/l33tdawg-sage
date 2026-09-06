@@ -1,3 +1,4 @@
+import { FederationConnectome } from './federation-connectome.js';
 // CEREBRUM — Your SAGE Brain
 import { SSEClient } from './sse.js';
 import { FederationDirectory, stageFederationDomains } from './federation-directory.js';
@@ -77,7 +78,7 @@ const html = window.html;
 // `go build` dev binary where main.version is "dev"). Keep in sync with the
 // release being built; stamped release builds override this via the live
 // /health read below.
-const SAGE_VERSION = 'v11.19.16';
+const SAGE_VERSION = 'v11.19.17';
 
 // Promise-based, themed replacement for the browser's blocking confirmation API.
 // Requests are immutable and serialized so independent actions cannot replace
@@ -15652,7 +15653,7 @@ function App() {
 function FedGreenRail() {
     return html`<div class="fed-green-rail">
         <span class="fed-green-dot">✓</span>
-        Nothing is deleted. This only adds a connection to another network. Your memories are never touched.
+        Connecting does not share or delete memories. You choose memory access after connecting.
     </div>`;
 }
 
@@ -15661,9 +15662,9 @@ function FedGreenRail() {
 // but the operator should not have to think in implementation steps.
 function FedCeremonyProgress({ stage }) {
     const stages = [
-        ['scan', 'Scan each other'],
-        ['check', 'Confirm colleague'],
-        ['done', 'Connected'],
+        ['scan', 'Exchange codes'],
+        ['check', 'Verify together'],
+        ['done', 'Explore agents'],
     ];
     const active = Math.max(0, stages.findIndex(([id]) => id === stage));
     return html`<div class="fed-ceremony-progress" aria-label="Connection progress">
@@ -16149,7 +16150,7 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
                 const state = classifyFederationFailure(e, 'offline');
                 setRouteFailure(state);
                 if (misses >= 4) setPollNote(`${federationRoutePresentation({ state, last_error: e && e.message }).label}: ${e && e.message ? e.message : 'no response'}. SAGE will keep trying prepared Direct and Secure relay routes.`);
-                if (misses >= 15) { setEndedReason('SAGE could not reach the other computer for about 30 seconds over either prepared route. Your connection has not been approved.'); setStep('interrupted'); }
+                if (misses >= 15) { setEndedReason('SAGE could not reach the other computer for about 30 seconds. Check the connection, then retry to recover the latest status.'); setStep('interrupted'); }
             }
         };
         const id = setInterval(tick, 2000); tick();
@@ -16164,7 +16165,7 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
     return html`<div class="fed-wizard" ref=${wizardRef}>
         <div class="fed-wizard-head">
             <button class="btn fed-back" disabled=${busy} onClick=${exitGuest}>← Back</button>
-            <span class="fed-wizard-title">${recoveryPeer ? `Pair again with ${recoveryPeer}` : 'Join someone’s network'}</span>
+            <span class="fed-wizard-title">${recoveryPeer ? `Pair again with ${recoveryPeer}` : 'Use a connection code'}</span>
         </div>
         ${!['aborted', 'ended', 'interrupted'].includes(step) && html`<${FedCeremonyProgress} stage=${progressStage} />`}
         ${err && html`<div class="fed-err" role="alert">${err}</div>`}
@@ -16172,10 +16173,10 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
 
         ${step === 'scan' && html`<div class="fed-step">
             <${FedGreenRail} />
-            <h2>${recoveryPeer ? `Pair again with ${recoveryPeer}` : 'Scan their SAGE'}</h2>
+            <h2>${recoveryPeer ? `Pair again with ${recoveryPeer}` : 'Use a connection code'}</h2>
             ${recoveryPeer
                 ? html`<p class="fed-recovery-lead">Ask <strong>${recoveryPeer}</strong> to create a new connection code on their SAGE. Then scan it here, or paste the code they send you. They will need to approve the reconnection before anything can be shared.</p>`
-                : html`<p class="muted">Point your camera at the connection code your colleague is showing you.</p>`}
+                : html`<p class="muted">Scan the code on the other SAGE, or paste the code they send you. Keep both screens open for the return code and number check.</p>`}
             ${tier4 && html`<div class="fed-tier4-note">Connecting remotely or using a pasted image? The short number check later protects against a code being swapped or relayed.</div>`}
             ${!endpointReady && html`<div class="muted">Finding this computer’s network address…</div>`}
             ${endpointMissing && html`<div class="fed-tier4-note" role="status">No Direct address was detected. You can still scan a code that contains a Secure relay route.</div>`}
@@ -16195,12 +16196,12 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
 
         ${step === 'return' && scan && html`<div class="fed-step">
             <${FedGreenRail} />
-            <h3>Now let them scan you</h3>
+            <h3>Send your return code</h3>
             <p class="muted">Connecting to <strong>${scan.host_name || 'the other SAGE'}</strong>. SAGE automatically chose the best prepared route. Hold this up to their camera, or send it for them to paste.</p>
             ${routePlan && html`<${FedRouteDiagnostic} plan=${routePlan} compact=${true} />`}
             <${FedQr} text=${scan.return_uri} caption="Their SAGE scans this to check it's really you." />
             <div class="fed-step-actions">
-                <button class="btn btn-primary" disabled=${busy} onClick=${doRequest}>${busy ? 'Working…' : "They've scanned me — continue"}</button>
+                <button class="btn btn-primary" disabled=${busy} onClick=${doRequest}>${busy ? 'Working…' : "They used my code — continue"}</button>
             </div>
         </div>`}
 
@@ -16220,6 +16221,8 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
             instruction=${tier4
                 ? "They'll read you one final code. Type exactly what you hear."
                 : "Compare with their screen, or type exactly what they read aloud."}
+            peerName=${scan && scan.host_name}
+            trustOnly=${true}
             expectedCode=${codes.code_h}
             tier4=${tier4}
             confirmLabel="Yes - connect"
@@ -16231,7 +16234,7 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
             <div class="fed-done-check">✓</div>
             <h2>You're connected to ${(scan && scan.host_name) || 'the other SAGE'}</h2>
             <p class="muted">Your agents can discover and message each other automatically when both SAGEs support automatic node messaging. No memory domains are shared by connecting. Open the agent directory to check both sides, then optionally configure Read or Copy.</p>
-            <button class="btn btn-primary" onClick=${onExit}>Done</button>
+            <button class="btn btn-primary" onClick=${onExit}>Explore federation</button>
         </div>`}
 
         ${step === 'aborted' && html`<div class="fed-step">
@@ -16442,7 +16445,7 @@ function HostJoinWizard({ onExit }) {
         ${step === 'prepare' && html`<div class="fed-step">
             <h2>Connect another SAGE</h2>
             <${FedGreenRail} />
-            <p class="muted">SAGE checks Direct and Secure relay routes and chooses the best one automatically. The encrypted trust ceremony is the same nearby or across the internet.</p>
+            <p class="muted">Create a code for the other SAGE to scan or paste. Keep both screens open; you will each verify a short number before connecting. SAGE chooses the best available route automatically.</p>
             ${!endpointReady || !routePlan
                 ? html`<div class="fed-route-loading"><span class="fed-spinner"></span> Preparing secure routes…</div>`
                 : html`<${FedRouteDiagnostic} plan=${routePlan} />`}
@@ -16515,7 +16518,7 @@ function HostJoinWizard({ onExit }) {
             <h2>Connected to ${(view && view.guest_name) || 'the other SAGE'}</h2>
             <h3>Trust is established</h3>
             <p class="muted">Your agents can discover and message each other automatically when both SAGEs support automatic node messaging. No memory domains are shared by connecting. Open the agent directory to check both sides, then optionally configure Read or Copy.</p>
-            <button class="btn btn-primary" onClick=${onExit}>Done</button>
+            <button class="btn btn-primary" onClick=${onExit}>Explore federation</button>
         </div>`}
 
         ${step === 'aborted' && html`<div class="fed-step">
@@ -16666,7 +16669,7 @@ function fedFriendlyLocalAgentLabel(agent) {
 
 // FedPermissionsPanel keeps identity/trust separate from ongoing authorization.
 // Each node edits only its own grants and observes the peer's grants read-only.
-function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
+function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy, localName }) {
     const chain = conn.remote_chain_id;
     const peerName = conn.peer_name || 'Other SAGE';
     const automaticNodeMessaging = connectionStatus ? (connectionStatus.capabilities || []).includes('federated-node-messaging-v1') : null;
@@ -17447,9 +17450,9 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 		</div>
 
 		${roleKnown && html`<${FederationDirectory} key=${chain}
-            peerName=${peerName} local=${localNodeContacts} remote=${remotePipeContacts}
+            peerName=${peerName} localName=${localName} local=${localNodeContacts} remote=${remotePipeContacts}
             automatic=${automaticNodeMessaging}
-            copyAddress=${copyPipeContact} catalog=${catalog || {}} disabled=${busy || !draft}
+            copyAddress=${copyPipeContact} catalog=${catalog || {}} draft=${draft} disabled=${busy || !draft}
             stageDomains=${(domains, permission) => setDraft(current => stageFederationDomains(current, catalog || {}, domains, permission))}
             loadMore=${async (side, cursor) => {
                 const page = await fedPipeContactsGet(chain, side === 'remote', '', { [side]: cursor });
@@ -18219,6 +18222,7 @@ function FederationPage() {
     const [recoveryPeer, setRecoveryPeer] = useState('');
     const [conns, setConns] = useState(null);
     const [localChain, setLocalChain] = useState('');
+    const [localName, setLocalName] = useState('');
     const [err, setErr] = useState('');
     const [remoteNotice, setRemoteNotice] = useState(null);
     const [connectionReachability, setConnectionReachability] = useState({});
@@ -18275,7 +18279,7 @@ function FederationPage() {
             // last-known route diagnostics are all local facts. Paint them
             // before probing an offline peer so this section never sits blank
             // for the network timeout.
-            setConns(next); setLocalChain(r.local_chain_id || ''); setErr('');
+            setConns(next); setLocalChain(r.local_chain_id || ''); setLocalName(r.local_network_name || r.local_chain_id || ''); setErr('');
             setConnectionReachability(current => {
                 const seeded = { ...current };
                 active.forEach(connection => {
@@ -18424,7 +18428,7 @@ function FederationPage() {
     return html`<div class="page fed-page">
         <div class="fed-landing">
             <h1>Federation</h1>
-            <p class="fed-landing-sub muted">Link your <strong>whole SAGE</strong> to <strong>someone else's SAGE</strong> so the two can share the topics you choose — on the same LAN or across the internet. A paired laptop can roam between networks and reconnect without pairing again. This is different from adding an AI tool to your own SAGE (do that under <strong>Agents</strong>) — here you're linking two separate brains.</p>
+            <p class="fed-landing-sub muted">Connect independent SAGE nodes so their agents can find and message each other. Memory sharing stays optional and explicitly configured.</p>
             <${FedGreenRail} />
             <${FederationMasterSwitch} onChange=${setFedOn} />
             ${fedOn && html`<${NetworkNameEditor} />`}
@@ -18441,29 +18445,37 @@ function FederationPage() {
             </div>`}
             ${fedOn === false && html`<div class="fed-off-note muted">Federation is off, so joining or hosting a connection is unavailable. Turn it on above to connect.</div>`}
             ${html`<${FederationWarmup} onState=${(ready) => setWarming(!ready)} />`}
-            ${fedOn && !warming && html`<div class="fed-roles">
+            ${liveConns.length > 0 && html`<${FederationConnectome}
+                connections=${liveConns} statuses=${connectionReachability} localChain=${localChain} localName=${localName}
+                enabled=${fedOn === true} busyChain=${busyChain} onPause=${pause} onRevoke=${revoke}
+                onManage=${conn => { setOpenChain(conn.remote_chain_id); setTimeout(() => document.getElementById(`fed-connection-${conn.remote_chain_id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100); }} />`}
+            ${fedOn && !warming && html`<section class="fed-onboarding" aria-label="Connect another SAGE">
+                <h2>Connect another SAGE</h2><p>Open Federation on both computers. Create a code on one, then scan or paste it on the other.</p>
+                <ol class="fed-onboarding-steps"><li><span>1</span><div><strong>Exchange codes</strong><small>Introduce the two computers.</small></div></li><li><span>2</span><div><strong>Verify together</strong><small>Each person confirms a short number.</small></div></li><li><span>3</span><div><strong>Explore agents</strong><small>Find agents. Choose memory sharing separately.</small></div></li></ol>
+                <div class="fed-roles">
                 <button class="fed-role-card" onClick=${() => setMode('guest')}>
                     <div class="fed-role-glyph">${icons.federation}</div>
-                    <div class="fed-role-title">Scan a connection code</div>
-                    <div class="fed-role-desc">Use the code shown by the other SAGE. Both sides manage their own sharing after trust is established.</div>
+                    <div class="fed-role-title">I have a connection code</div>
+                    <div class="fed-role-desc">Scan or paste the code from the other computer to begin.</div>
                 </button>
                 <button class="fed-role-card" onClick=${() => setMode('host')}>
                     <div class="fed-role-glyph">${icons.federation}</div>
                     <div class="fed-role-title">Create a connection code</div>
-                    <div class="fed-role-desc">SAGE automatically chooses Direct or Secure relay. Pairing alone shares no domains.</div>
+                    <div class="fed-role-desc">Start here if neither computer has a code yet. Show it to the other SAGE.</div>
                 </button>
-            </div>`}
+                </div><p class="fed-onboarding-note">Already paired? Use your existing connection above. A laptop can move between networks without pairing again.</p>
+            </section>`}
             ${(fedOn || (conns && conns.length > 0)) && html`<div class="fed-conns">
                 <h3>Your trusted SAGEs <${HelpTip} text="A trusted SAGE is a live, approved link to another SAGE. Its sharing and sync controls only work while this link is active." /></h3>
-                ${liveConns.length > 0 && html`<div class="fed-conns-explain muted">The scan and spoken code establish <strong>trust</strong>. Open a connection to manage domain permissions. <strong>Pause</strong> temporarily stops what you share without losing the pairing; permanent revocation lives inside the connection details.</div>`}
+                ${liveConns.length > 0 && html`<div class="fed-conns-explain muted">The scan and spoken code establish <strong>trust</strong>. Open a connection to manage domain permissions. <strong>Pause</strong> temporarily stops sharing and work requests without losing the pairing; permanent revocation lives inside the connection details.</div>`}
                 ${conns === null && html`<div class="muted">Loading…</div>`}
                 ${conns && liveConns.length === 0 && html`
                     <${EmptyState} icon="federation"
-                        headline="No trusted SAGE is connected"
+                        headline="Your federation starts here"
                         hint=${fedOn
-                            ? "Link your whole SAGE to another SAGE to share memories across networks. Join someone's network with a code they share, or host one and hand out a code."
-                            : "Turn federation on above to link your whole SAGE to another SAGE and share memories across networks."}
-                        actionLabel=${fedOn ? 'Join someone’s network' : null}
+                            ? "Connect another SAGE to discover its agents and collaborate across computers. Choose memory access after connecting."
+                            : "Turn federation on above to connect another SAGE and discover its agents."}
+                        actionLabel=${fedOn ? 'Use a connection code' : null}
                         onAction=${fedOn ? (() => setMode('guest')) : null} />
                 `}
                 ${liveConns.map(c => {
@@ -18500,7 +18512,7 @@ function FederationPage() {
                                     : pause(c, !c.sharing_paused)}>${busyChain === c.remote_chain_id ? 'Working…' : actionLabel}</button>
                     </div>
                     ${openChain === c.remote_chain_id && html`<div id=${`fed-connection-${c.remote_chain_id}`}>
-                        <${FedPermissionsPanel} conn=${c} connectionStatus=${status} revokeBusy=${busyChain === c.remote_chain_id} onRevoke=${() => revoke(c)} />
+                        <${FedPermissionsPanel} conn=${c} localName=${localName} connectionStatus=${status} revokeBusy=${busyChain === c.remote_chain_id} onRevoke=${() => revoke(c)} />
                     </div>`}
                 </div>`; })}
                 ${pastConns.length > 0 && html`<div class="fed-past">
