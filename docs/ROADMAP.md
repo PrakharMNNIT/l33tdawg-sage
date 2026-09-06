@@ -1,7 +1,8 @@
 # SAGE Roadmap
 
-**Status (2026-09):** **v11.19.15 is the current release.** It keeps the
-pairwise exported-agent federation model, safe registered-name addressing and
+**Status (2026-09):** **v11.19.16 is the current release.** Trusted paired nodes now discover and
+message eligible ordinary agents automatically, with memory sharing separately
+configured. It keeps safe registered-name addressing and
 reply-event visibility, the three-tab Access Controls redesign, five-minute
 JOIN route discovery, complete stopped-node backup/restore/preflight tooling,
 and the governed app-v21 → app-v22 legacy-lineage recovery ceremony from
@@ -157,6 +158,25 @@ ceiling is app-v27.
 upgrade in place across all future releases. Routine personal-node upgrades
 remain automatic; the exceptional legacy-lineage repair is deliberately an
 explicit, reviewed operator ceremony rather than a silent mutation.
+
+## v11.19.16 release
+
+Trusted paired nodes automatically expose eligible ordinary agents for discovery
+and messaging when both peers support the new protocol. Memory domains are not
+shared by pairing; Read and Copy remain explicit operator choices. Root identities,
+explicit messaging blocks, pairing generations, and message proof checks remain
+enforced. Existing approved exports remain intact, and older peers retain the
+legacy export-based protocol.
+
+CEREBRUM provides a searchable node/agent directory, exact-address copying, bounded
+pagination, and bulk/drag-and-drop Read/Copy drafts with explicit Save. MCP directory
+lookup includes federated agents by default. New sends refresh legacy recipient
+tickets; already-queued events preserve their original authorization mode.
+Session-bound MCP replies now pass strict peer proof decoding, and retries report
+retained delivery state and untrusted diagnostics without silently requeuing
+failed events.
+
+No consensus-rule or application-version change; app-v27 remains the ceiling.
 
 ## v11.19.15 release
 

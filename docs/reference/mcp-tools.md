@@ -1,4 +1,4 @@
-Reconciled against internal/mcp for SAGE v11.19.15.
+Reconciled against internal/mcp for SAGE v11.19.16.
 
 # SAGE MCP Tools Reference
 
@@ -1144,8 +1144,10 @@ retained provider pipeline endpoint, carrying the same claimant session. A
 generic 409, canonical typed 404, mismatched body status/type, or wrong content
 type never enables that path.
 
-A federated reply result includes an immutable `reply_event_id` and its initial
-`reply_status:queued`. This is the signed result outbox event already created by
+A federated reply result includes an immutable `reply_event_id` and its current
+retained `reply_status` (`queued`, `delivered`, or `failed`). An identical retry
+reports that same event state; it does not requeue a terminal failure. Retained
+`last_error` text is labeled untrusted diagnostic data. This is the signed result outbox event already created by
 the reply transaction, not a new ordinary message. Pass that event ID to
 `sage_message_status` to inspect only the replying agent's outbound transport
 state; no original request workflow/read state or result content is exposed.

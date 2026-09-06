@@ -88,9 +88,12 @@ type signedPipeSendRequest struct {
 }
 
 type signedPipeResultRequest struct {
-	Result        string `json:"result"`
-	SourcePipeID  string `json:"source_pipe_id"`
-	SourceChainID string `json:"source_chain_id"`
+	// The completing node enforces this local claim fence before queuing the
+	// signed reply. Peers preserve it in the proof, but it grants no remote authority.
+	ClaimantSessionID string `json:"claimant_session_id,omitempty"`
+	Result            string `json:"result"`
+	SourcePipeID      string `json:"source_pipe_id"`
+	SourceChainID     string `json:"source_chain_id"`
 }
 
 // PipelineProofHash is the stable replay identity for an already-verified

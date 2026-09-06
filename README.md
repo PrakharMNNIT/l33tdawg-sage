@@ -48,7 +48,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.15`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.16`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
@@ -207,6 +207,31 @@ software updates, and encryption controls. Ordinary agent identity replacement
 uses re-enrollment; historical memory authorship is preserved.
 
 ---
+
+## What's New in v11.19.16
+
+**Connect nodes, find agents, send messages.** Trusted peers running v11.19.16
+make eligible ordinary agents discoverable and messageable automatically, without
+exporting each agent or granting access to memory domains. Root identities stay
+excluded, and explicit messaging blocks still apply.
+
+CEREBRUM adds a searchable directory grouped by node, exact-address copying, and
+paged agent lists. Bulk selection and drag-and-drop prepare Read/Copy sharing
+choices; saving those choices explicitly grants memory access. Pairing alone
+shares no memory domains, and existing approved grants remain in place.
+
+MCP `sage_directory` searches local and federated agents by default. Upgrade both
+peers for automatic node messaging; older peers retain their export-based behavior.
+New sends refresh legacy recipient tickets, while queued messages retain their
+original authorization mode.
+
+Federated replies now accept the signed claimant-session field emitted by MCP,
+fixing peer rejection of otherwise valid replies. Reply retries report the actual
+retained delivery state and diagnostic instead of always claiming "queued".
+Existing failed events remain failed; the upgrade does not silently resend them.
+
+No consensus-rule or application-version change; app-v27 remains the ceiling.
+Container: `ghcr.io/l33tdawg/sage:11.19.16`. SDK 11.19.16.
 
 ## What's New in v11.19.15
 

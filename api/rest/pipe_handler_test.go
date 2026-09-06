@@ -871,6 +871,23 @@ func TestHandlePipeResult_ForeignWorkNeverAutoJournals(t *testing.T) {
 	assert.NotContains(t, ownedStatus.Body.String(), "foreign result must stay transient")
 	assert.NotContains(t, ownedStatus.Body.String(), `"workflow_status"`)
 
+	require.NoError(t, memStore.RecordPipelineTransportFailure(ctx, response.ReplyEventID,
+		"peer rejected the signed reply", time.Now(), true))
+	failedReplay := requestResult(body)
+	require.Equal(t, http.StatusOK, failedReplay.Code, failedReplay.Body.String())
+	var failedResponse map[string]any
+	require.NoError(t, json.Unmarshal(failedReplay.Body.Bytes(), &failedResponse))
+	require.Equal(t, response.ReplyEventID, failedResponse["reply_event_id"])
+	require.Equal(t, true, failedResponse["idempotent_replay"])
+	require.Equal(t, "failed", failedResponse["reply_status"])
+	require.Equal(t, "failed", failedResponse["transport_status"])
+	require.Equal(t, "peer rejected the signed reply", failedResponse["last_error"])
+	require.Contains(t, failedResponse["security_notice"], "Untrusted")
+	failedStatus := replyStatusRequest(recipient, response.ReplyEventID)
+	require.Contains(t, failedStatus.Body.String(), `"reply_status":"failed"`)
+	require.Contains(t, failedStatus.Body.String(), `"last_error":"peer rejected the signed reply"`)
+	require.NotContains(t, failedStatus.Body.String(), "foreign result must stay transient")
+
 	absentStatus := replyStatusRequest(foreignAgent, "missing-reply-event")
 	foreignStatus := replyStatusRequest(foreignAgent, response.ReplyEventID)
 	require.Equal(t, http.StatusNotFound, foreignStatus.Code)

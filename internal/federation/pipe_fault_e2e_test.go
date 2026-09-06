@@ -286,7 +286,8 @@ func exercisePipeDisconnectRestart(t *testing.T, source, destination *testChain,
 	now := time.Now().UTC().Truncate(time.Second)
 	result := "completed exactly once after restart"
 	resultBody, err := json.Marshal(signedPipeResultRequest{
-		Result: result, SourcePipeID: imported.SourcePipeID, SourceChainID: destination.chainID,
+		ClaimantSessionID: "mcp-real-peer-reply",
+		Result:            result, SourcePipeID: imported.SourcePipeID, SourceChainID: destination.chainID,
 	})
 	require.NoError(t, err)
 	resultProof := signedPipeProof(t, fixture.targetKey, fixture.targetAgent, http.MethodPut,
@@ -300,9 +301,13 @@ func exercisePipeDisconnectRestart(t *testing.T, source, destination *testChain,
 		TargetAgentID: fixture.sourceAgent, Proof: resultProof, CreatedAt: now,
 		ExpiresAt: now.Add(pipeEventResultLifetime),
 	}
-	require.NoError(t, pipeSQLite(t, destination).CompleteFederatedPipelineWithTransport(
-		ctx, imported.PipeID, fixture.targetAgent, result, resultOutbox,
-	))
+	_, err = pipeSQLite(t, destination).BindFederatedMessageClaimSession(ctx, fixture.targetAgent, imported.PipeID, "mcp-real-peer-reply")
+	require.NoError(t, err)
+	_, replayed, err := pipeSQLite(t, destination).CompleteFederatedMessageReplyWithTransport(
+		ctx, imported.PipeID, fixture.targetAgent, "mcp-real-peer-reply", result, resultOutbox,
+	)
+	require.NoError(t, err)
+	require.False(t, replayed)
 	stopSource()
 	destination.mgr.pipelineDrain(ctx, pipeSQLite(t, destination))
 	failedResult, err := pipeSQLite(t, destination).GetPipelineTransport(ctx, resultOutbox.EventID)

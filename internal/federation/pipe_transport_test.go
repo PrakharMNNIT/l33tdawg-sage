@@ -285,7 +285,7 @@ func TestHandlePipeEventResultAppliesOnlyToBoundOriginAndDeduplicates(t *testing
 	}
 	require.NoError(t, ss.InsertPipelineWithTransport(ctx, msg, outbox))
 
-	resultBody, _ := json.Marshal(map[string]any{"result": "done safely", "source_pipe_id": originEventID, "source_chain_id": "chain-peer"})
+	resultBody, _ := json.Marshal(map[string]any{"result": "done safely", "source_pipe_id": originEventID, "source_chain_id": "chain-peer", "claimant_session_id": "mcp-replying-session"})
 	resultProof := signedPipeProof(t, remotePriv, remoteAgent, http.MethodPut, "/v1/pipe/pipe-remote-import/result", resultBody, now.Add(time.Minute).Unix())
 	event := &PipeEvent{
 		Version: PipeEventVersion, Kind: "result", OriginEventID: originEventID, SourcePipeID: "pipe-remote-import",
@@ -1007,4 +1007,43 @@ func TestImportedPipeActionHoldsAgentAvailabilityLeaseThroughSideEffect(t *testi
 	require.NoError(t, <-authorized)
 	require.NoError(t, <-suspended)
 	require.Error(t, m.AuthorizeImportedPipe(ctx, msg), "an unavailable target must fail the next authorization")
+}
+
+func TestSessionBoundReplyProofRemainsStrictAndSigned(t *testing.T) {
+	pub, key, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	agent := hex.EncodeToString(pub)
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, tc := range []struct {
+		name           string
+		session, extra bool
+		wantError      bool
+	}{
+		{"legacy", false, false, false},
+		{"session", true, false, false},
+		{"unknown-field", true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]any{"result": "done", "source_pipe_id": "origin", "source_chain_id": "replying-chain"}
+			if tc.session {
+				body["claimant_session_id"] = "mcp-owner"
+			}
+			if tc.extra {
+				body["unexpected_authority"] = "root"
+			}
+			encoded, err := json.Marshal(body)
+			require.NoError(t, err)
+			proof := signedPipeProof(t, key, agent, http.MethodPut, "/v1/pipe/imported/result", encoded, now.Unix())
+			event := &PipeEvent{Kind: "result", SourceChainID: "replying-chain", SourcePipeID: "imported", OriginEventID: "origin", Result: "done", CreatedAt: now, ExpiresAt: now.Add(pipeEventResultLifetime), Proof: proof}
+			if tc.wantError {
+				require.Error(t, prevalidatePipeEventAgentProof(event))
+				return
+			}
+			require.NoError(t, prevalidatePipeEventAgentProof(event))
+			if tc.session {
+				event.Proof.CanonicalRequest = bytes.Replace(event.Proof.CanonicalRequest, []byte("mcp-owner"), []byte("mcp-other"), 1)
+				require.Error(t, prevalidatePipeEventAgentProof(event), "the session field remains covered by the exact agent signature")
+			}
+		})
+	}
 }

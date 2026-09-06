@@ -179,6 +179,7 @@ Use this to work out how far your chain has to climb.
 | v11.19.13 | Stdio MCP startup skips automatic Claude project-hook repair when its working directory is the user's home directory, while normal project repair and explicit-install safeguards remain unchanged; no consensus change and app-v27 remains the ceiling |
 | v11.19.14 | gRPC-Go v1.83.1 fixes HTTP/2 DATA-frame fragmentation heap exhaustion (CVE-2026-84304), with required genproto/OpenTelemetry updates and CodeQL action v4.37.9 pins; no consensus change and app-v27 remains the ceiling |
 | v11.19.15 | Consensus-safe memory cleanup with uncapped full-inventory previews, durable exact-byte recovery, and honest progress counts; automatic cleanup requires fresh current-Root opt-in after upgrade, open tasks/internal records stay protected, and audit history remains; no consensus change and app-v27 remains the ceiling |
+| v11.19.16 | Automatic trusted-node agent discovery and messaging when both peers are upgraded; memory sharing remains explicit and existing approved grants remain; searchable CEREBRUM directory and bulk/drag-and-drop Read/Copy drafts; no consensus change and app-v27 remains the ceiling |
 
 ### v11.18.3 — the signer fence, and what it does *not* cover
 
