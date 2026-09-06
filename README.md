@@ -48,7 +48,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.17`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.18`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
@@ -207,6 +207,12 @@ software updates, and encryption controls. Ordinary agent identity replacement
 uses re-enrollment; historical memory authorship is preserved.
 
 ---
+
+## What's New in v11.19.18
+
+Federation agents now visibly orbit their nodes. Motion continues over empty map space and resumes after pointer selection; hovering an agent, keyboard inspection, and dragging keep targets steady. Pause motion and reduced-motion preferences remain supported.
+
+Container: `ghcr.io/l33tdawg/sage:11.19.18`. SDK 11.19.18.
 
 ## What's New in v11.19.17
 

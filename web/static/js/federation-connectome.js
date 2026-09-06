@@ -34,7 +34,7 @@ export function driftConstellation(nodes, seconds) {
     return nodes.map(node => ({ ...node, agents: node.agents.map((agent, index) => {
         const phase = index * 2.399963;
         const dx = agent.x - node.x, dy = agent.y - node.y;
-        const angle = Math.atan2(dy, dx) + (Math.sin(seconds / 13 + phase) - Math.sin(phase)) * .065;
+        const angle = Math.atan2(dy, dx) + seconds * .045 + (Math.sin(seconds / 7 + phase) - Math.sin(phase)) * .025;
         const radius = Math.hypot(dx, dy) + (Math.sin(seconds / 5 + phase) - Math.sin(phase)) * 3;
         return { ...agent, x: node.x + Math.cos(angle) * radius, y: node.y + Math.sin(angle) * radius };
     }) }));
@@ -63,11 +63,12 @@ export function FederationConnectome({ connections, statuses, localChain, localN
     const [cursors, setCursors] = useState({});
     const [motionOn, setMotionOn] = useState(true);
     const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
-    const [mapHovered, setMapHovered] = useState(false);
+    const [agentHovered, setAgentHovered] = useState(false);
+    const [mapDragging, setMapDragging] = useState(false);
     const [mapFocused, setMapFocused] = useState(false);
     const [ambientTime, setAmbientTime] = useState(0);
     const ambientClock = useRef(0);
-    const ambientRunning = motionOn && !reducedMotion && enabled && view === 'graph' && !mapHovered && !mapFocused;
+    const ambientRunning = motionOn && !reducedMotion && enabled && view === 'graph' && !agentHovered && !mapFocused && !mapDragging;
     useEffect(() => {
         const media = window.matchMedia('(prefers-reduced-motion: reduce)');
         const changed = () => setReducedMotion(media.matches);
@@ -224,11 +225,11 @@ export function FederationConnectome({ connections, statuses, localChain, localN
         </div>
         <div class="fc-workspace"><div class="fc-map-area">
         ${view === 'graph' ? html`<div class=${`fc-map ${ambientRunning ? 'fc-ambient-running' : 'fc-ambient-paused'}`}
-            onMouseEnter=${() => setMapHovered(true)} onMouseLeave=${() => setMapHovered(false)}
-            onFocusCapture=${event => setMapFocused(!!event.target.closest('[data-entity]'))} onBlurCapture=${event => { if (!event.currentTarget.contains(event.relatedTarget)) setMapFocused(false); }}><svg ref=${svgRef} viewBox=${mapViewBox} aria-label="Interactive federation map. Tab to a node or agent and press Enter for details."
-            onPointerDown=${event => { if (event.target.closest('[data-entity]')) return; drag.current = { ...point(event), camera }; event.currentTarget.setPointerCapture(event.pointerId); }}
+            onMouseMove=${event => setAgentHovered(!!event.target.closest('[data-entity="agent"]'))} onMouseLeave=${() => setAgentHovered(false)}
+            onFocusCapture=${event => setMapFocused(!!event.target.closest('[data-entity]') && event.target.matches(':focus-visible'))} onBlurCapture=${event => { setMapFocused(false); }}><svg ref=${svgRef} viewBox=${mapViewBox} aria-label="Interactive federation map. Tab to a node or agent and press Enter for details."
+            onPointerDown=${event => { if (event.target.closest('[data-entity]')) return; setMapDragging(true); drag.current = { ...point(event), camera }; event.currentTarget.setPointerCapture(event.pointerId); }}
             onPointerMove=${event => { if (!drag.current) return; const p = point(event); setCamera({ ...drag.current.camera, x: drag.current.camera.x + p.x - drag.current.x, y: drag.current.camera.y + p.y - drag.current.y }); }}
-            onPointerUp=${() => { drag.current = null; }} onPointerCancel=${() => { drag.current = null; }}>
+            onPointerUp=${() => { drag.current = null; setMapDragging(false); }} onPointerCancel=${() => { drag.current = null; setMapDragging(false); }}>
             <defs><radialGradient id="fc-halo"><stop offset="0" stop-color="#42d7c4" stop-opacity=".15"/><stop offset="1" stop-color="#42d7c4" stop-opacity="0"/></radialGradient></defs>
             <g transform=${`translate(${camera.x} ${camera.y}) translate(600 380) scale(${camera.zoom}) translate(-600 -380)`}>
             ${nodes.slice(1).map(node => html`<g key=${node.id} class=${`fc-trust ${node.state === 'Reachable' ? 'is-reachable' : ''}`}>
@@ -253,7 +254,7 @@ export function FederationConnectome({ connections, statuses, localChain, localN
                 </g>
             </g>`)}
             ${pulses.map(item => { const endpoints = activityNodes(item); if (!endpoints) return null; return html`<g key=${item.key} class=${`fc-pulse fc-pulse-${item.state}`} aria-hidden="true"><path pathLength="1" d=${`M ${endpoints.source.x} ${endpoints.source.y} L ${endpoints.target.x} ${endpoints.target.y}`} /></g>`; })}
-            </g></svg><div class="fc-map-tools"><button class="btn" aria-pressed=${motionOn && !reducedMotion} disabled=${reducedMotion} title="Decorative movement; pauses while you interact. It does not indicate agent presence." onClick=${() => setMotionOn(value => !value)}>${reducedMotion ? 'Reduced motion' : motionOn ? 'Pause motion' : 'Resume motion'}</button><button class="btn" aria-label="Zoom in" onClick=${() => setCamera(c => ({ ...c, zoom: Math.min(2.5,c.zoom + .2) }))}>+</button><button class="btn" aria-label="Zoom out" onClick=${() => setCamera(c => ({ ...c, zoom: Math.max(.5,c.zoom - .2) }))}>−</button><button class="btn" onClick=${() => setCamera({ x:0,y:0,zoom:1 })}>Fit view</button></div><div class="fc-map-hint">Drag space to pan · select a dot to inspect an agent</div></div>` : html`<div class="fc-list">${nodes.filter(nodeVisible).map(node => html`<section key=${node.id}><button class="fc-list-node" onClick=${() => select(node)}>${node.name}<small>${node.state}</small></button>${filterFederationAgents(node.loadedAgents,nodeMatches(node) ? '' : query).map(agent => html`<button class="fc-list-agent" key=${agent.agent_id} onClick=${() => select(node,agent)}><strong>${agentLabel(agent)}</strong><small>${access(node,agent)}</small></button>`)}</section>`)}</div>`}
+            </g></svg><div class="fc-map-tools"><button class="btn" aria-pressed=${motionOn && !reducedMotion} disabled=${reducedMotion} title="Decorative movement; pauses over an agent, during keyboard inspection, or while dragging. It does not indicate agent presence." onClick=${() => setMotionOn(value => !value)}>${reducedMotion ? 'Reduced motion' : motionOn ? 'Pause motion' : 'Resume motion'}</button><button class="btn" aria-label="Zoom in" onClick=${() => setCamera(c => ({ ...c, zoom: Math.min(2.5,c.zoom + .2) }))}>+</button><button class="btn" aria-label="Zoom out" onClick=${() => setCamera(c => ({ ...c, zoom: Math.max(.5,c.zoom - .2) }))}>−</button><button class="btn" onClick=${() => setCamera({ x:0,y:0,zoom:1 })}>Fit view</button></div><div class="fc-map-hint">Drag space to pan · select a dot to inspect an agent</div></div>` : html`<div class="fc-list">${nodes.filter(nodeVisible).map(node => html`<section key=${node.id}><button class="fc-list-node" onClick=${() => select(node)}>${node.name}<small>${node.state}</small></button>${filterFederationAgents(node.loadedAgents,nodeMatches(node) ? '' : query).map(agent => html`<button class="fc-list-agent" key=${agent.agent_id} onClick=${() => select(node,agent)}><strong>${agentLabel(agent)}</strong><small>${access(node,agent)}</small></button>`)}</section>`)}</div>`}
         <div class="fc-legend"><span>● Agent</span><span>─ Trusted connection</span><span>┄ Allowed messaging on selection</span><span>Pulse = message status update</span><span>Gentle drift is decorative</span></div>
         <div class="fc-pagination">${nodes.filter(n => n.grant?.next_cursor || (n.local ? cursors[localSourceChain]?.local : cursors[n.id]?.remote)).map(n => html`<div key=${n.id}><span>${n.name}</span><button class="btn btn-sm" onClick=${() => navigate(n,n.local ? 'local':'remote','')}>First agents</button>${n.grant?.next_cursor && html`<button class="btn btn-sm" onClick=${() => navigate(n,n.local ? 'local':'remote',n.grant.next_cursor)}>Next agents</button>`}</div>`)}
             ${connections.length > pageSize && html`<button class="btn" disabled=${activePage === 0} onClick=${() => { setPage(activePage-1);setSelection(null); }}>Previous nodes</button><span>Node page ${activePage+1}</span><button class="btn" disabled=${(activePage+1)*pageSize>=connections.length} onClick=${() => {setPage(activePage+1);setSelection(null);}}>Next nodes</button>`}</div>

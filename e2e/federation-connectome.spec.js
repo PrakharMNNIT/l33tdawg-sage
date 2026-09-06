@@ -76,3 +76,36 @@ test('ambient agents drift, pause for interaction and respect reduced motion',as
  await page.waitForTimeout(250);
  expect(await dot.getAttribute('cx')).toBe(reduced);
 });
+
+
+test('motion is visible over empty map space and resumes after inspecting an agent',async({page})=>{
+ await openMap(page);
+ const map=page.locator('.fc-map');
+ await map.hover({position:{x:30,y:30}});
+ const dot=page.locator('.fc-agent-core').first();
+ const position=()=>dot.evaluate(el=>{const r=el.getBoundingClientRect();return {x:r.x,y:r.y}});
+ const initial=await position();
+ await expect.poll(async()=>{const p=await position();return Math.hypot(p.x-initial.x,p.y-initial.y)},{timeout:4000}).toBeGreaterThan(8);
+ await page.locator('[data-entity="agent"]').first().hover();
+ await expect(map).toHaveClass(/fc-ambient-paused/);
+ const paused=await position();
+ await page.waitForTimeout(300);
+ expect(await position()).toEqual(paused);
+ await map.hover({position:{x:30,y:30}});
+ await expect(map).toHaveClass(/fc-ambient-running/);
+ await expect.poll(async()=>{const p=await position();return Math.hypot(p.x-paused.x,p.y-paused.y)},{timeout:4000}).toBeGreaterThan(8);
+});
+
+
+test('pointer selection releases motion and keyboard inspection holds targets steady',async({page})=>{
+ await openMap(page);
+ const map=page.locator('.fc-map');
+ const agent=page.locator('[data-entity="agent"]').first();
+ await agent.click();
+ await map.hover({position:{x:30,y:30}});
+ await expect(map).toHaveClass(/fc-ambient-running/);
+ await page.keyboard.press('Tab');
+ await expect(map).toHaveClass(/fc-ambient-paused/);
+ await page.getByRole('button',{name:'Pause motion',exact:true}).focus();
+ await expect(map).toHaveClass(/fc-ambient-running/);
+});
