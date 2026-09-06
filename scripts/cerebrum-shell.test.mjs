@@ -1026,7 +1026,7 @@ test('federation ceremony presents one clear two-way scan flow without dropping 
     assert.match(hostWizard, /They scan this SAGE/);
     assert.match(hostWizard, /Scan their SAGE back/);
     assert.ok(hostWizard.indexOf('They scan this SAGE') < hostWizard.indexOf('Scan their SAGE back'));
-    assert.match(appSource, /Scan each other[\s\S]*Confirm colleague[\s\S]*Connected/,
+    assert.match(appSource, /Exchange codes[\s\S]*Verify together[\s\S]*Explore agents/,
         'operators should see three human stages rather than protocol internals');
     assert.match(hostWizard, /expectedCode=\$\{view\.code_g\}/,
         'the pin-bound anti-relay safety code remains deliberate and unskippable');
@@ -1063,7 +1063,7 @@ test('federation uses one automatic route flow and explains every actionable rou
     assert.match(apiSource, /fedHostCreate\(endpoint, transport = 'auto'\)/);
     assert.match(appSource, /from '\.\/federation-route-state\.js'/);
     assert.match(hostWizard, /<h2>Connect another SAGE<\/h2>/);
-    assert.match(hostWizard, /checks Direct and Secure relay routes and chooses the best one automatically/);
+    assert.match(hostWizard, /chooses the best available route automatically/);
     assert.match(hostWizard, /phase: 'prepared'/);
     assert.doesNotMatch(hostWizard, /Same Wi|local network<\/button>|Across the internet|setRouteMode/,
         'operators must not choose topology that SAGE can negotiate itself');
@@ -1494,7 +1494,7 @@ test('federation keeps temporary pause separate from permanent revocation and ma
     assert.match(page, /ended_at/);
     assert.match(page, /const reconnect = async \(conn\)/,
         'an intact but unreachable relationship must offer a retry path');
-    assert.match(page, /Scan a connection code/);
+    assert.match(page, /I have a connection code/);
     assert.match(page, /Create a connection code/);
 });
 

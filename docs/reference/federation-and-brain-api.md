@@ -1,4 +1,4 @@
-<!-- Verified against SAGE v11.19.16 code (2026-09-02). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
+<!-- Verified against SAGE v11.19.17 code (2026-09-02). Cite file:line when behavior is non-obvious. This doc covers the v11 federation and brain graph surface; rest-api.md governs the core /v1/* endpoints. -->
 
 # SAGE Federation and Brain HTTP API Reference (v11)
 
@@ -717,7 +717,7 @@ Every route 501s when the transport is not wired (`fedReady`,
 | Method + path | Handler | Purpose |
 |---|---|---|
 | `GET /v1/dashboard/federation/shareable-domains` | `handleFedShareableDomains` (`web/federation_permissions.go`) | List existing registered/observed local domains and whether this operator may share them; never creates a domain. A row may include durable `copy_sources:[{chain_id,memory_count}]` from admitted local copies, without peer endpoints, keys, content, or policy metadata. |
-| `GET /v1/dashboard/federation/connections` | `handleFedConnections` (`web/federation_join.go:849-912`) | List agreements with `sharing_paused` and durable end-event context for past rows. |
+| `GET /v1/dashboard/federation/connections` | `handleFedConnections` (`web/federation_join.go:850-913`) | List agreements with `sharing_paused` and durable end-event context for past rows. |
 | `GET /v1/dashboard/federation/connections/{chain_id}/permissions` | `handleFedPermissionsGet` (`web/federation_permissions.go:212-300`) | Return editable `local_permissions`, `local_paused`, and the authenticated peer's read-only permissions/pause state. `?live=0` deliberately skips the peer probe and returns the durable local snapshot immediately with `remote_known:false`; CEREBRUM uses that for first paint, then consumes the single authenticated connection-status refresh owned by the parent page. |
 | `PUT /v1/dashboard/federation/connections/{chain_id}/permissions` | `handleFedPermissionsPut` (`web/federation_permissions.go:375-539`) | Replace this node's complete existing-domain Read/Copy snapshot for the frozen peer. A true `write` field is rejected. |
 | `GET/PUT /v1/dashboard/federation/connections/{chain_id}/agent-exports` | `handleFedAgentExportsGet/Put` (`web/federation_agent_exports.go`) | List or CAS-mutate (`active`/`paused`) the exact active ordinary local agents exported into this pairwise federation. Current owned domains are derived live; classification ceiling and domain exclusions may narrow them. Pause removes the derived memory Read grant. On peers using `node-messaging-v1`, discovery and messaging are independent of exports; legacy contacts still require an export. Revocation is reserved for internal generation retirement. |
@@ -731,15 +731,15 @@ Every route 501s when the transport is not wired (`fedReady`,
 | `POST /v1/dashboard/federation/groups/refresh` | `handleFedGroupRefresh` (`web/federation_join.go`) | Prompt one bounded group-journal anti-entropy pass and wait for it to finish before CEREBRUM reloads the local group projection. Ordinary group-list polling remains a local SQLite read. |
 | `GET /v1/dashboard/federation/join/routes` | `handleFedJoinRoutes` (`web/federation_join.go`) | Return locally prepared Direct/Secure relay candidates. `ready` means prepared locally, not proven reachable and not currently selected. |
 | `POST /v1/dashboard/federation/join/host/create` | `handleFedHostCreate` (`web/federation_join.go`) | Host H1; current CEREBRUM sends `transport:"auto"`. `lan` and `internet` remain compatibility inputs for older clients. |
-| `POST /v1/dashboard/federation/join/host/scan-return` | `handleFedHostScanReturn` (`web/federation_join.go:1112`) | Host scans guest return QR |
-| `GET /v1/dashboard/federation/join/host/{session_id}` | `handleFedHostStatus` (`web/federation_join.go:1131`) | Host wizard poll |
-| `POST /v1/dashboard/federation/join/host/{session_id}/approve` | `handleFedHostApprove` (`web/federation_join.go:1143`) | Host approval #1 |
-| `POST /v1/dashboard/federation/join/host/{session_id}/abort` | `handleFedHostAbort` (`web/federation_join.go:1193`) | Burn session |
-| `POST /v1/dashboard/federation/join/guest/scan` | `handleFedGuestScan` (`web/federation_join.go:1210`) | Guest scan host QR |
-| `POST /v1/dashboard/federation/join/guest/request` | `handleFedGuestRequest` (`web/federation_join.go:1236`) | Guest request |
-| `GET /v1/dashboard/federation/join/guest/{session_id}/status` | `handleFedGuestStatus` (`web/federation_join.go:1267`) | Guest poll host approval |
+| `POST /v1/dashboard/federation/join/host/scan-return` | `handleFedHostScanReturn` (`web/federation_join.go:1113`) | Host scans guest return QR |
+| `GET /v1/dashboard/federation/join/host/{session_id}` | `handleFedHostStatus` (`web/federation_join.go:1132`) | Host wizard poll |
+| `POST /v1/dashboard/federation/join/host/{session_id}/approve` | `handleFedHostApprove` (`web/federation_join.go:1144`) | Host approval #1 |
+| `POST /v1/dashboard/federation/join/host/{session_id}/abort` | `handleFedHostAbort` (`web/federation_join.go:1194`) | Burn session |
+| `POST /v1/dashboard/federation/join/guest/scan` | `handleFedGuestScan` (`web/federation_join.go:1211`) | Guest scan host QR |
+| `POST /v1/dashboard/federation/join/guest/request` | `handleFedGuestRequest` (`web/federation_join.go:1237`) | Guest request |
+| `GET /v1/dashboard/federation/join/guest/{session_id}/status` | `handleFedGuestStatus` (`web/federation_join.go:1268`) | Guest poll host approval |
 | `POST /v1/dashboard/federation/join/guest/{session_id}/abort` | `handleFedGuestAbort` (`web/federation_join.go`) | Propagate a guest-side Stop and zeroize the local draft |
-| `POST /v1/dashboard/federation/join/guest/confirm` | `handleFedGuestConfirm` (`web/federation_join.go:1301`) | Guest approval #2 |
+| `POST /v1/dashboard/federation/join/guest/confirm` | `handleFedGuestConfirm` (`web/federation_join.go:1302`) | Guest approval #2 |
 
 (JOIN handlers live in `web/federation_join.go`.) The dashboard owns automatic
 route intent and the fixed trust-only compatibility scope; the remaining join
@@ -1046,3 +1046,47 @@ Sources: `internal/federation/node_contacts.go` (`buildNodeContactPage`,
 `internal/federation/pipe_targets.go` (`lookupRemotePipeContacts`);
 `api/rest/federation_handler.go` (`handleFederationAvailable`);
 `internal/store/pipeline_transport.go` (transport mode persistence).
+
+### Federation connectome and operator activity (v11.19.17)
+
+The Federation landing page provides a connectome and a text-equivalent List
+view. Each cluster is one trusted SAGE; agents are loaded through the existing
+operator-only, bounded `pipe-contacts` pages. Search covers the loaded pages.
+The diagram displays at most 24 matching agents per node; List retains all
+loaded agents. At most six peers are displayed per node page, with two directory
+requests in flight. Agent paths appear only for the selected agent and only
+when both peer-specific contact grants support automatic node messaging.
+They describe permitted messaging, not running-agent presence or memory access.
+See `web/static/js/federation-connectome.js` (`FederationConnectome`,
+`permittedNodePair`).
+
+`GET /v1/dashboard/federation/activity` is an operator-only metadata snapshot;
+`Accept: text/event-stream` streams named `federation_activity` snapshots. This
+route is separate from the global dashboard event vocabulary. Each item has
+`id`, `chain_id`, `source`, `target`, `direction`, `kind`, `state`, and `at`.
+It contains no payload, intent, result text, proof, or diagnostic error. It reads
+at most the latest 100 transport observations for records created or delivered
+in the last 24 hours, plus replies received during that window, and filters to
+currently active, unexpired trusted chains. Outbound states distinguish pending,
+delivered and failed; inbound observations are received sends or replies.
+`at` is delivery/receipt time when available, otherwise creation time, not a
+fabricated failure timestamp. This is a bounded view of records observed by
+this node, not a federation-wide durable event log.
+
+The stream reconciles snapshots every two seconds, rechecks operator access
+and active trust, uses the existing stream admission budget, and reconnects
+through authentication after 20 seconds. Initial/reconnected snapshots populate
+history without pulses; changes on an uninterrupted stream may animate only
+when both endpoints are in the loaded diagram. Hidden pages close the stream.
+No activity read claims, acknowledges, retries, or sends work. See
+`web/federation_activity.go` (`handleFedActivity`) and
+`internal/store/federation_activity.go` (`RecentFederationActivity`).
+
+Connection selection opens controls for existing pause/revoke operations and
+memory sharing. Removing trust retains its existing explicit confirmation.
+Dragging or selecting domains into Read, Copy or Remove sharing changes only
+the permission draft; saving remains explicit. Removing a memory grant does
+not remove automatic node messaging or erase copies already held by a peer.
+The pairing flow remains the same independently verified, two-sided trust
+ceremony; the revised onboarding explains Exchange codes → Verify together →
+Explore agents without changing proofs or approval conditions.

@@ -73,7 +73,7 @@ test('release-facing version metadata stays aligned', () => {
     ['docs/UPGRADING.md', '| v11.19.13 | Stdio MCP startup skips automatic Claude project-hook repair'],
     ['docs/UPGRADING.md', '| v11.19.14 | gRPC-Go v1.83.1'],
     ['docs/UPGRADING.md', '| v11.19.15 | Consensus-safe memory cleanup'],
-    ['docs/UPGRADING.md', `| v${version} | Automatic trusted-node agent discovery and messaging`],
+    ['docs/UPGRADING.md', `| v${version} | Federation connectome, operator-only metadata activity stream`],
     ['docs/ROADMAP.md', `## v${version} release`],
     ['docs/UPGRADING.md', 'The recovery commands in this guide require SAGE v11.18.0 or later.'],
     ['docs/UPGRADING.md', '`backup --full`, `restore --from`,'],

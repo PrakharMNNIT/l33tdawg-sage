@@ -6381,6 +6381,8 @@ func (s *SQLiteStore) migratePipeline(ctx context.Context) {
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_destination ON pipeline_messages(destination_chain_id, status)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_source ON pipeline_messages(source_chain_id, source_pipe_id)`)
 	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_source_status ON pipeline_messages(source_chain_id, status)`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_federation_activity ON pipeline_messages(created_at) WHERE source_chain_id != ''`)
+	_, _ = s.writeExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_pipe_federation_reply_activity ON pipeline_messages(completed_at) WHERE destination_chain_id != '' AND status = 'completed'`)
 	// Partial covering index for the CEREBRUM connectome aggregation
 	// (GetPipeSynapses). The general idx_pipe_* indexes are all (col, status)
 	// and cannot serve a GROUP BY on the agent pair, so without this the

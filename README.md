@@ -48,7 +48,7 @@ docker run -d --name sage \
   ghcr.io/l33tdawg/sage:latest
 ```
 
-Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.16`.
+Pin a specific version with `ghcr.io/l33tdawg/sage:11.19.17`.
 
 The SAGE server stays in that container. To give a local MCP client a stdio
 bridge, start a second process **inside the same running container**:
@@ -207,6 +207,28 @@ software updates, and encryption controls. Ordinary agent identity replacement
 uses re-enrollment; historical memory authorship is preserved.
 
 ---
+
+## What's New in v11.19.17
+
+**See your federation.** CEREBRUM opens connected nodes as an interactive
+connectome with agent clusters, search, zoom, a List view, and a selection panel
+for exact addresses and connection controls. Actual node names make the viewed
+node clear, including when you open another SAGE through a tunnel.
+
+A dedicated operator-only SSE stream shows recent message and reply transport
+status without exposing message text or proofs. Live changes animate when their
+endpoints are loaded; reconnecting refreshes history without replaying old
+traffic. The view is bounded, with explicit agent and node paging.
+
+Federation onboarding now explains **Exchange codes → Verify together → Explore
+agents**. Both confirmation screens preserve the explicit number check and
+explain that memory sharing is optional. Read, Copy, and Remove sharing accept
+bulk selection or drag-and-drop into a draft, with an explicit save. Removing
+trust keeps its separate confirmation and pairing-again explanation.
+
+No consensus-rule or application-version change; app-v27 remains the ceiling.
+Existing permissions and trust agreements stay in place.
+Container: `ghcr.io/l33tdawg/sage:11.19.17`. SDK 11.19.17.
 
 ## What's New in v11.19.16
 

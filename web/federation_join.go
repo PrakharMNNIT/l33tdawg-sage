@@ -116,6 +116,7 @@ func (h *DashboardHandler) registerFederationRoutes(r chi.Router) {
 	fr.Put("/v1/dashboard/federation/network-name", h.handleSetNetworkName)
 	fr.Get("/v1/dashboard/federation/shareable-domains", h.handleFedShareableDomains)
 	fr.Get("/v1/dashboard/federation/connections", h.handleFedConnections)
+	fr.Get("/v1/dashboard/federation/activity", h.handleFedActivity)
 	fr.Get("/v1/dashboard/federation/connections/{chain_id}/permissions", h.handleFedPermissionsGet)
 	fr.Put("/v1/dashboard/federation/connections/{chain_id}/permissions", h.handleFedPermissionsPut)
 	fr.Get("/v1/dashboard/federation/connections/{chain_id}/agent-exports", h.handleFedAgentExportsGet)
