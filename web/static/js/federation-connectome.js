@@ -29,6 +29,17 @@ export function constellationLayout(nodes) {
     });
 }
 
+// Ambient movement is decorative, independent of transport and presence.
+export function driftConstellation(nodes, seconds) {
+    return nodes.map(node => ({ ...node, agents: node.agents.map((agent, index) => {
+        const phase = index * 2.399963;
+        const dx = agent.x - node.x, dy = agent.y - node.y;
+        const angle = Math.atan2(dy, dx) + (Math.sin(seconds / 13 + phase) - Math.sin(phase)) * .065;
+        const radius = Math.hypot(dx, dy) + (Math.sin(seconds / 5 + phase) - Math.sin(phase)) * 3;
+        return { ...agent, x: node.x + Math.cos(angle) * radius, y: node.y + Math.sin(angle) * radius };
+    }) }));
+}
+
 export function permittedNodePair(enabled, remote, localAgent, remoteAgent) {
         const localContact = remote.localGrant?.contacts?.find(a => a.agent_id === localAgent.agent_id);
         return enabled && remote.known && !remote.conn?.sharing_paused && !remote.grant?.paused && !remote.localGrant?.paused &&
@@ -50,6 +61,34 @@ export function FederationConnectome({ connections, statuses, localChain, localN
     const [streamState, setStreamState] = useState('Connecting');
     const [notice, setNotice] = useState('');
     const [cursors, setCursors] = useState({});
+    const [motionOn, setMotionOn] = useState(true);
+    const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    const [mapHovered, setMapHovered] = useState(false);
+    const [mapFocused, setMapFocused] = useState(false);
+    const [ambientTime, setAmbientTime] = useState(0);
+    const ambientClock = useRef(0);
+    const ambientRunning = motionOn && !reducedMotion && enabled && view === 'graph' && !mapHovered && !mapFocused;
+    useEffect(() => {
+        const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+        const changed = () => setReducedMotion(media.matches);
+        media.addEventListener('change', changed);
+        return () => media.removeEventListener('change', changed);
+    }, []);
+    useEffect(() => {
+        if (!ambientRunning) return;
+        let frame = 0, last = performance.now();
+        const animate = now => {
+            if (document.hidden) { frame = 0; return; }
+            if (now - last >= 50) {
+                ambientClock.current += Math.min(now - last, 100) / 1000;
+                last = now; setAmbientTime(ambientClock.current);
+            }
+            frame = requestAnimationFrame(animate);
+        };
+        const visibility = () => { cancelAnimationFrame(frame); frame = 0; if (!document.hidden) { last = performance.now(); frame = requestAnimationFrame(animate); } };
+        visibility(); document.addEventListener('visibilitychange', visibility);
+        return () => { cancelAnimationFrame(frame); document.removeEventListener('visibilitychange', visibility); };
+    }, [ambientRunning]);
     const svgRef = useRef(null);
     const drag = useRef(null);
     const activitySeen = useRef(null);
@@ -128,13 +167,13 @@ export function FederationConnectome({ connections, statuses, localChain, localN
     const firstData = directories[localSourceChain]?.data;
     const localGrant = firstData?.local_node_contacts;
     const localNode = { id: localChain || 'local', name: localName || localChain || 'Viewing this node', state: enabled ? 'Viewing this node' : 'Federation off', agents: localGrant?.contacts || [], grant: localGrant, known: !!localGrant, local: true };
-    const nodes = constellationLayout([localNode, ...remoteNodes].map(node => {
+    const nodes = driftConstellation(constellationLayout([localNode, ...remoteNodes].map(node => {
         const loadedAgents = node.agents;
         const filtered = filterFederationAgents(loadedAgents, node.name.toLowerCase().includes(query.trim().toLowerCase()) ? '' : query);
         const selected = selection?.nodeID === node.id ? loadedAgents.find(a => a.agent_id === selection.agentID) : null;
         const candidates = selected && !filtered.slice(0, 24).some(a => a.agent_id === selected.agent_id) ? [selected, ...filtered.filter(a => a.agent_id !== selected.agent_id)] : filtered;
         return { ...node, loadedAgents, matchingCount: filtered.length, agents: candidates.slice(0, 24) };
-    }));
+    })), ambientTime);
     // Preserve readable hit targets: fit the cluster extents, then let users
     // focus/zoom. Never stack six clusters or hundreds of agent targets.
     const halfWidth = Math.max(600, ...nodes.map(n => Math.abs(n.x - 600) + 185));
@@ -184,7 +223,9 @@ export function FederationConnectome({ connections, statuses, localChain, localN
             <span class="muted">${connections.length} trusted ${connections.length === 1 ? 'node' : 'nodes'} · ${nodes.reduce((n, node) => n + node.loadedAgents.length, 0)} agents loaded</span>
         </div>
         <div class="fc-workspace"><div class="fc-map-area">
-        ${view === 'graph' ? html`<div class="fc-map"><svg ref=${svgRef} viewBox=${mapViewBox} aria-label="Interactive federation map. Tab to a node or agent and press Enter for details."
+        ${view === 'graph' ? html`<div class=${`fc-map ${ambientRunning ? 'fc-ambient-running' : 'fc-ambient-paused'}`}
+            onMouseEnter=${() => setMapHovered(true)} onMouseLeave=${() => setMapHovered(false)}
+            onFocusCapture=${event => setMapFocused(!!event.target.closest('[data-entity]'))} onBlurCapture=${event => { if (!event.currentTarget.contains(event.relatedTarget)) setMapFocused(false); }}><svg ref=${svgRef} viewBox=${mapViewBox} aria-label="Interactive federation map. Tab to a node or agent and press Enter for details."
             onPointerDown=${event => { if (event.target.closest('[data-entity]')) return; drag.current = { ...point(event), camera }; event.currentTarget.setPointerCapture(event.pointerId); }}
             onPointerMove=${event => { if (!drag.current) return; const p = point(event); setCamera({ ...drag.current.camera, x: drag.current.camera.x + p.x - drag.current.x, y: drag.current.camera.y + p.y - drag.current.y }); }}
             onPointerUp=${() => { drag.current = null; }} onPointerCancel=${() => { drag.current = null; }}>
@@ -212,8 +253,8 @@ export function FederationConnectome({ connections, statuses, localChain, localN
                 </g>
             </g>`)}
             ${pulses.map(item => { const endpoints = activityNodes(item); if (!endpoints) return null; return html`<g key=${item.key} class=${`fc-pulse fc-pulse-${item.state}`} aria-hidden="true"><path pathLength="1" d=${`M ${endpoints.source.x} ${endpoints.source.y} L ${endpoints.target.x} ${endpoints.target.y}`} /></g>`; })}
-            </g></svg><div class="fc-map-tools"><button class="btn" aria-label="Zoom in" onClick=${() => setCamera(c => ({ ...c, zoom: Math.min(2.5,c.zoom + .2) }))}>+</button><button class="btn" aria-label="Zoom out" onClick=${() => setCamera(c => ({ ...c, zoom: Math.max(.5,c.zoom - .2) }))}>−</button><button class="btn" onClick=${() => setCamera({ x:0,y:0,zoom:1 })}>Fit view</button></div><div class="fc-map-hint">Drag space to pan · select a dot to inspect an agent</div></div>` : html`<div class="fc-list">${nodes.filter(nodeVisible).map(node => html`<section key=${node.id}><button class="fc-list-node" onClick=${() => select(node)}>${node.name}<small>${node.state}</small></button>${filterFederationAgents(node.loadedAgents,nodeMatches(node) ? '' : query).map(agent => html`<button class="fc-list-agent" key=${agent.agent_id} onClick=${() => select(node,agent)}><strong>${agentLabel(agent)}</strong><small>${access(node,agent)}</small></button>`)}</section>`)}</div>`}
-        <div class="fc-legend"><span>● Agent</span><span>─ Trusted connection</span><span>┄ Allowed messaging on selection</span><span>Pulse = message status update</span></div>
+            </g></svg><div class="fc-map-tools"><button class="btn" aria-pressed=${motionOn && !reducedMotion} disabled=${reducedMotion} title="Decorative movement; pauses while you interact. It does not indicate agent presence." onClick=${() => setMotionOn(value => !value)}>${reducedMotion ? 'Reduced motion' : motionOn ? 'Pause motion' : 'Resume motion'}</button><button class="btn" aria-label="Zoom in" onClick=${() => setCamera(c => ({ ...c, zoom: Math.min(2.5,c.zoom + .2) }))}>+</button><button class="btn" aria-label="Zoom out" onClick=${() => setCamera(c => ({ ...c, zoom: Math.max(.5,c.zoom - .2) }))}>−</button><button class="btn" onClick=${() => setCamera({ x:0,y:0,zoom:1 })}>Fit view</button></div><div class="fc-map-hint">Drag space to pan · select a dot to inspect an agent</div></div>` : html`<div class="fc-list">${nodes.filter(nodeVisible).map(node => html`<section key=${node.id}><button class="fc-list-node" onClick=${() => select(node)}>${node.name}<small>${node.state}</small></button>${filterFederationAgents(node.loadedAgents,nodeMatches(node) ? '' : query).map(agent => html`<button class="fc-list-agent" key=${agent.agent_id} onClick=${() => select(node,agent)}><strong>${agentLabel(agent)}</strong><small>${access(node,agent)}</small></button>`)}</section>`)}</div>`}
+        <div class="fc-legend"><span>● Agent</span><span>─ Trusted connection</span><span>┄ Allowed messaging on selection</span><span>Pulse = message status update</span><span>Gentle drift is decorative</span></div>
         <div class="fc-pagination">${nodes.filter(n => n.grant?.next_cursor || (n.local ? cursors[localSourceChain]?.local : cursors[n.id]?.remote)).map(n => html`<div key=${n.id}><span>${n.name}</span><button class="btn btn-sm" onClick=${() => navigate(n,n.local ? 'local':'remote','')}>First agents</button>${n.grant?.next_cursor && html`<button class="btn btn-sm" onClick=${() => navigate(n,n.local ? 'local':'remote',n.grant.next_cursor)}>Next agents</button>`}</div>`)}
             ${connections.length > pageSize && html`<button class="btn" disabled=${activePage === 0} onClick=${() => { setPage(activePage-1);setSelection(null); }}>Previous nodes</button><span>Node page ${activePage+1}</span><button class="btn" disabled=${(activePage+1)*pageSize>=connections.length} onClick=${() => {setPage(activePage+1);setSelection(null);}}>Next nodes</button>`}</div>
         <p class="fc-footnote">The map shows up to 24 matching agents per node. List shows all loaded agents; search brings matching agents onto the map. Search covers loaded agents and nodes. Use Next agents or Next nodes for more. Listed agents may be idle; membership is not presence.</p>
@@ -222,7 +263,7 @@ export function FederationConnectome({ connections, statuses, localChain, localN
                 ${selectedAgent && html`<p class="muted">${selectedAgent.provider || 'Agent'} · ${selectedNode.name}</p><label>Exact message address<input readonly value=${selectedAgent.address || ''}/></label><button class="btn btn-primary" disabled=${!selectedAgent.address} onClick=${() => copy(selectedAgent)}>Copy message address</button><p class="fc-footnote">Use this address in your agent’s messaging tool. Memory access is configured separately.</p>`}
                 ${selectedConn && html`<button class="btn btn-primary" onClick=${() => onManage(selectedConn)}>Manage memory sharing</button><button class="btn" disabled=${busyChain === selectedConn.remote_chain_id || !enabled} onClick=${() => onPause(selectedConn,!selectedConn.sharing_paused)}>${selectedConn.sharing_paused ? 'Resume connection' : 'Pause connection'}</button><button class="btn btn-danger" disabled=${busyChain === selectedConn.remote_chain_id} onClick=${() => onRevoke(selectedConn)}>Remove trusted connection…</button><p class="fc-footnote">Pause stops sharing and work requests while preserving trust. Removing trust requires pairing again.</p>`}
                 ${selectedNode.local && html`<p class="fc-footnote">Select a connected SAGE to manage its sharing or remove its trusted connection.</p>`}
-                <button class="btn btn-sm" onClick=${() => { setView('graph'); focus(selectedNode, selectedAgent); }}>Focus on map</button><button class="btn btn-sm" onClick=${() => setSelection(null)}>Clear selection</button></div>` : html`<div class="fc-inspector-empty"><span class="fc-eyebrow">EXPLORE THE NETWORK</span><h3>Every dot is an agent.</h3><p>Select a brain, agent, or connection to see its permissions and controls.</p><p>Solid links connect trusted SAGEs. Verified node-messaging paths between loaded agents appear on selection. Older peers may require shared contacts and do not show these paths.</p></div>`}
+                <button class="btn btn-sm" onClick=${() => { setView('graph'); focus(selectedNode, selectedAgent); }}>Focus on map</button><button class="btn btn-sm" onClick=${() => setSelection(null)}>Clear selection</button></div>` : html`<div class="fc-inspector-empty"><span class="fc-eyebrow">EXPLORE THE NETWORK</span><h3>Every dot is an agent.</h3><p>Select a brain, agent, or connection to see its permissions and controls.</p><p>Solid links connect trusted SAGEs. Select an agent to see who it can message. Older SAGE versions may need an update to show these paths.</p></div>`}
             <div class="fc-activity"><h3>Message activity <small>${streamState}</small></h3><p class="fc-footnote">Recent message and reply delivery on this SAGE. Up to 100 records from the last 24 hours.</p>
             ${shownActivity.slice(0,8).map(item => { const e = activityNodes(item); return html`<div class="fc-activity-row" key=${item.id}><strong>${activityLabel(item)}</strong><small>${e ? `${agentLabel(e.source)} → ${agentLabel(e.target)}` : `${item.direction === 'inbound' ? 'From' : 'To'} ${connections.find(c => c.remote_chain_id === item.chain_id)?.peer_name || 'connected node'}`}</small><time>${new Date(item.at).toLocaleTimeString()}</time></div>`; })}
             ${!shownActivity.length && html`<p class="muted">${streamState === 'Live' ? 'No recent activity in this view.' : 'Waiting for activity status…'}</p>`}</div>

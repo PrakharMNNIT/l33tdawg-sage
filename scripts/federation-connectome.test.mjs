@@ -41,3 +41,16 @@ test('allowed graph paths are bound to each peer and do not infer legacy relatio
  assert.equal(permittedNodePair(true,peer,local,{...target,accepting:false}),false);
  assert.equal(permittedNodePair(false,peer,local,target),false);
 });
+
+test('ambient drift is bounded, deterministic and preserves message identities',async()=>{
+ const {driftConstellation}=await import('../web/static/js/federation-connectome.js');
+ const initial=constellationLayout([{id:'local',agents:[{agent_id:'exact',address:'exact@chain'}]}]);
+ const drift=driftConstellation(initial,10);
+ assert.equal(drift[0].agents[0].address,'exact@chain');
+ assert.notEqual(drift[0].agents[0].x,initial[0].agents[0].x);
+ for(const seconds of [0,10,100,1000]) {
+  const point=driftConstellation(initial,seconds)[0].agents[0],base=initial[0].agents[0];
+  assert.ok(Math.hypot(point.x-base.x,point.y-base.y)<22);
+ }
+ assert.deepEqual(drift,driftConstellation(initial,10));
+});

@@ -7682,3 +7682,9 @@ input[type="range"]::-moz-range-thumb {
 .fed-onboarding-note { font-size:11px !important; margin-bottom:0; }
 @media(max-width:640px) { .fed-onboarding { padding:18px; } .fed-onboarding-steps { grid-template-columns:1fr; gap:14px; } }
 .fed-node-viewing { display:block; margin-top:3px; font-size:10px; font-weight:400; color:var(--text-secondary); }
+.fc-map .fc-orbit { animation:fc-orbit-breathe 7s ease-in-out infinite; }
+.fc-map .fc-cluster:nth-of-type(even) .fc-orbit { animation-delay:-3s; }
+.fc-map.fc-ambient-paused .fc-orbit { animation-play-state:paused; }
+@keyframes fc-orbit-breathe { 0%,100% { stroke-opacity:.12; } 50% { stroke-opacity:.4; } }
+@media(prefers-reduced-motion:reduce) { .fc-map .fc-orbit { animation:none; } }
+@media(max-width:420px) { .fc-map-tools .btn { padding:5px 8px; font-size:10px; } }

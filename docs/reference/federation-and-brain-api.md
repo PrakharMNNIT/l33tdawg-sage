@@ -1057,6 +1057,9 @@ loaded agents. At most six peers are displayed per node page, with two directory
 requests in flight. Agent paths appear only for the selected agent and only
 when both peer-specific contact grants support automatic node messaging.
 They describe permitted messaging, not running-agent presence or memory access.
+Ambient drift is decorative and independent of transport; it pauses for pointer
+or keyboard interaction and hidden tabs, has an explicit toggle, and respects
+reduced-motion preferences.
 See `web/static/js/federation-connectome.js` (`FederationConnectome`,
 `permittedNodePair`).
 

@@ -56,3 +56,23 @@ test('real activity changes pulse; history and reconnect do not; mobile fits',as
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
  await page.screenshot({path:test.info().outputPath('connectome-mobile.png'),fullPage:true});
 });
+
+test('ambient agents drift, pause for interaction and respect reduced motion',async({page})=>{
+ await openMap(page);
+ const dot=page.locator('.fc-agent-core').first();
+ const before=await dot.getAttribute('cx');
+ await expect.poll(()=>dot.getAttribute('cx')).not.toBe(before);
+ await page.getByRole('button',{name:'Pause motion',exact:true}).click();
+ await page.mouse.move(0,0);
+ const paused=await dot.getAttribute('cx');
+ await page.waitForTimeout(250);
+ expect(await dot.getAttribute('cx')).toBe(paused);
+ await page.getByRole('button',{name:'Resume motion',exact:true}).click();
+ await page.mouse.move(0,0);
+ await expect.poll(()=>dot.getAttribute('cx')).not.toBe(paused);
+ await page.emulateMedia({reducedMotion:'reduce'});
+ await expect(page.getByRole('button',{name:'Reduced motion',exact:true})).toBeDisabled();
+ const reduced=await dot.getAttribute('cx');
+ await page.waitForTimeout(250);
+ expect(await dot.getAttribute('cx')).toBe(reduced);
+});

@@ -212,7 +212,9 @@ uses re-enrollment; historical memory authorship is preserved.
 
 **See your federation.** CEREBRUM opens connected nodes as an interactive
 connectome with agent clusters, search, zoom, a List view, and a selection panel
-for exact addresses and connection controls. Actual node names make the viewed
+for exact addresses and connection controls. Gentle ambient agent drift includes
+a pause toggle, stops during interaction, and respects reduced-motion settings.
+Actual node names make the viewed
 node clear, including when you open another SAGE through a tunnel.
 
 A dedicated operator-only SSE stream shows recent message and reply transport
