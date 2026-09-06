@@ -1755,10 +1755,13 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if replayed {
-			writeJSON(w, http.StatusOK, map[string]any{
+			response := map[string]any{
 				"status": "completed", "journal_id": "", "journaled": false,
-				"reply_event_id": replyEventID, "reply_status": "queued", "idempotent_replay": true,
-			})
+				"reply_event_id": replyEventID, "idempotent_replay": true,
+			}
+			if s.addFederatedReplyTransportStatus(w, r, replyEventID, response) {
+				writeJSON(w, http.StatusOK, response)
+			}
 			return
 		}
 		if time.Now().UTC().After(msg.ExpiresAt) {
@@ -1901,8 +1904,10 @@ func (s *Server) handlePipeResult(w http.ResponseWriter, r *http.Request) {
 	}
 	if replyEventID != "" {
 		response["reply_event_id"] = replyEventID
-		response["reply_status"] = "queued"
 		response["idempotent_replay"] = idempotentReplay
+		if !s.addFederatedReplyTransportStatus(w, r, replyEventID, response) {
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, response)
 }

@@ -698,19 +698,41 @@ func (s *Server) handleMessageReplyStatus(w http.ResponseWriter, r *http.Request
 		writeCanonicalMessageNotFound(w, replyEventID)
 		return
 	}
+	response := map[string]any{"reply_event_id": replyEventID, "scope": "federated"}
+	appendFederatedReplyTransportStatus(response, event)
+	writeJSON(w, http.StatusOK, response)
+}
+
+// appendFederatedReplyTransportStatus reports retained delivery evidence, never
+// inferring that an idempotent reply replay requeued a terminal transport event.
+func appendFederatedReplyTransportStatus(response map[string]any, event *store.PipelineTransportOutbox) {
 	transportStatus := event.State
 	if transportStatus == "pending" {
 		transportStatus = "queued"
 	}
-	response := map[string]any{
-		"reply_event_id":   replyEventID,
-		"scope":            "federated",
-		"reply_status":     transportStatus,
-		"transport_status": transportStatus,
-		"created_at":       event.CreatedAt,
-	}
+	response["reply_status"] = transportStatus
+	response["transport_status"] = transportStatus
+	response["created_at"] = event.CreatedAt
 	if event.DeliveredAt != nil {
 		response["delivered_at"] = event.DeliveredAt
 	}
-	writeJSON(w, http.StatusOK, response)
+	if event.LastError != "" {
+		response["last_error"] = event.LastError
+		response["security_notice"] = pipeRESTUpdateSecurityNotice
+	}
+}
+
+func (s *Server) addFederatedReplyTransportStatus(w http.ResponseWriter, r *http.Request, replyEventID string, response map[string]any) bool {
+	transportStore, ok := s.store.(store.FederatedPipelineStore)
+	if ok {
+		event, err := transportStore.GetPipelineTransport(r.Context(), replyEventID)
+		if err == nil && event != nil && event.EventKind == "result" &&
+			event.SourceAgentID == middleware.ContextAgentID(r.Context()) {
+			appendFederatedReplyTransportStatus(response, event)
+			return true
+		}
+	}
+	writeProblem(w, http.StatusServiceUnavailable, "Reply delivery status unavailable",
+		"The reply was recorded, but its delivery status could not be read. Retry the same reply or query its event status; do not assume it is queued or delivered.")
+	return false
 }

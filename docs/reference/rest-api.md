@@ -2011,7 +2011,7 @@ vault-backed. A foreign request or result is never automatically journaled,
 embedded, indexed as memory, written to Badger/AppHash, or treated as trusted
 instructions (`internal/store/sqlite.go:4764-4837`,
 `internal/store/pipeline_transport.go:92-176`,
-	`shouldAutoJournalPipeline`, `api/rest/pipe_handler.go:2246-2255`).
+	`shouldAutoJournalPipeline`, `api/rest/pipe_handler.go:2251-2260`).
 
 ### `POST /v1/pipe/resolve`
 
@@ -2287,8 +2287,11 @@ recipient is online. Stdio and Streamable HTTP have no server-push contract.
 This compatibility notification is separate from the durable ordinary-agent
 Wake Bus above and does not use its sequence or consumer lease.
 
-A successful federated reply returns its immutable `reply_event_id` and
-`reply_status:queued`. That ID names the already-existing signed result outbox
+A recorded federated reply returns its immutable `reply_event_id` and the
+current retained `reply_status`/`transport_status`: `queued`, `delivered`, or
+`failed`. Identical retries preserve that state and never imply a terminal event
+was requeued. A retained `last_error` is explicitly untrusted diagnostic data.
+That ID names the already-existing signed result outbox
 event; it does not create a duplicate message. Only its signing replier can use
 the reply-status route, and unrelated/missing IDs share the same generic 404.
 
@@ -2640,8 +2643,9 @@ without duplicating its journal; a different result returns HTTP 409 `Reply
 conflict`.
 
 `completed` means the foreign result and its signed return event were committed
-atomically to the local durable outbox. It is queued, not yet a peer delivery
-receipt; terminal delivery feedback is claimed through `/v1/pipe/updates`.
+atomically to the local durable outbox. This workflow state alone does not prove
+peer delivery; the response separately reads the current transport state, and
+terminal delivery feedback is claimed through `/v1/pipe/updates`.
 An identical lost-response retry returns the original `reply_event_id` with
 `idempotent_replay:true`, even if the federation relationship was paused or
 revoked after commit. A different retry conflicts; only a genuinely new

@@ -6138,7 +6138,7 @@ func TestSagePipeResultSignsFederatedSourceBinding(t *testing.T) {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			resultSeen <- body
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status": "completed", "journal_id": "", "journaled": false,
+				"status": "completed", "journal_id": "", "journaled": false, "reply_event_id": "reply-1", "reply_status": "queued",
 			})
 		} else {
 			http.Error(w, "method", http.StatusMethodNotAllowed)

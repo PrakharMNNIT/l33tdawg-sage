@@ -225,6 +225,11 @@ peers for automatic node messaging; older peers retain their export-based behavi
 New sends refresh legacy recipient tickets, while queued messages retain their
 original authorization mode.
 
+Federated replies now accept the signed claimant-session field emitted by MCP,
+fixing peer rejection of otherwise valid replies. Reply retries report the actual
+retained delivery state and diagnostic instead of always claiming "queued".
+Existing failed events remain failed; the upgrade does not silently resend them.
+
 No consensus-rule or application-version change; app-v27 remains the ceiling.
 Container: `ghcr.io/l33tdawg/sage:11.19.16`. SDK 11.19.16.
 

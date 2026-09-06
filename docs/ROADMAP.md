@@ -172,6 +172,9 @@ CEREBRUM provides a searchable node/agent directory, exact-address copying, boun
 pagination, and bulk/drag-and-drop Read/Copy drafts with explicit Save. MCP directory
 lookup includes federated agents by default. New sends refresh legacy recipient
 tickets; already-queued events preserve their original authorization mode.
+Session-bound MCP replies now pass strict peer proof decoding, and retries report
+retained delivery state and untrusted diagnostics without silently requeuing
+failed events.
 
 No consensus-rule or application-version change; app-v27 remains the ceiling.
 
