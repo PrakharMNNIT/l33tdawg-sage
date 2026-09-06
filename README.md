@@ -224,7 +224,7 @@ traffic. The view is bounded, with explicit agent and node paging.
 
 Federation onboarding now explains **Exchange codes → Verify together → Explore
 agents**. Both confirmation screens preserve the explicit number check and
-explain that memory sharing is optional. Read, Copy, and Remove sharing accept
+explain that memory sharing is optional. Read, Copy, and Clear domain permissions accept
 bulk selection or drag-and-drop into a draft, with an explicit save. Removing
 trust keeps its separate confirmation and pairing-again explanation.
 

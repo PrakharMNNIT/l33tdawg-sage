@@ -55,7 +55,7 @@ test('bulk selection and drag/drop stage explicit memory choices without applyin
     await page.locator('.fed-directory-domain').filter({ hasText: 'research' }).dragTo(page.getByRole('button', { name: /Offer Copy/ }));
     await expect.poll(() => page.evaluate(() => window.staged.length)).toBe(2);
     await expect.poll(() => page.evaluate(() => window.staged[1])).toEqual({ domains: ['research'], permission: 'copy' });
-    await page.locator('.fed-directory-domain').filter({ hasText: 'research' }).dragTo(page.getByRole('button', { name: /Remove sharing/ }));
+    await page.locator('.fed-directory-domain').filter({ hasText: 'research' }).dragTo(page.getByRole('button', { name: /Clear domain permissions/ }));
     await expect.poll(() => page.evaluate(() => window.staged[2])).toEqual({ domains: ['research'], permission: 'remove' });
     await page.screenshot({ path: test.info().outputPath('directory-desktop.png'), fullPage: true });
     await page.setViewportSize({ width: 390, height: 844 });

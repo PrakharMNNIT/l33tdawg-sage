@@ -1087,9 +1087,10 @@ No activity read claims, acknowledges, retries, or sends work. See
 
 Connection selection opens controls for existing pause/revoke operations and
 memory sharing. Removing trust retains its existing explicit confirmation.
-Dragging or selecting domains into Read, Copy or Remove sharing changes only
+Dragging or selecting domains into Read, Copy or Clear domain permissions changes only
 the permission draft; saving remains explicit. Removing a memory grant does
-not remove automatic node messaging or erase copies already held by a peer.
+not remove automatic node messaging, revoke separate agent exports or matching
+ancestor-domain permissions, or erase copies already held by a peer.
 The pairing flow remains the same independently verified, two-sided trust
 ceremony; the revised onboarding explains Exchange codes → Verify together →
 Explore agents without changing proofs or approval conditions.

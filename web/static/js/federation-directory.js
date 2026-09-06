@@ -100,7 +100,7 @@ export function FederationDirectory({ peerName, localName, local, remote, automa
         <p class="muted">Agent policies still apply. Being listed does not mean an agent is currently running. Copy an address to send it from your agent’s messaging tool.</p>
         <details class="fed-directory-sharing">
             <summary>Share memory with ${peerName} — optional</summary>
-            <p>Select domains together, then choose Read, Copy, or Remove sharing. You can also drag a domain or your selection onto an area. Changes stay in the permission draft until you save.</p>
+            <p>Select domains together, then choose Read, Copy, or Clear domain permissions. You can also drag a domain or your selection onto an area. Changes stay in the permission draft until you save.</p>
             <label>Find a domain<input type="search" value=${domainQuery} onInput=${e => { setDomainQuery(e.target.value); setDomainLimit(24); }} /></label>
             <div class="fed-directory-domain-actions"><button type="button" class="btn" disabled=${disabled || !domains.length} onClick=${() => setSelected(domains)}>Select matching domains (${domains.length})</button>
                 <button type="button" class="btn" disabled=${!selected.length} onClick=${() => setSelected([])}>Clear selection</button></div>
@@ -112,7 +112,7 @@ export function FederationDirectory({ peerName, localName, local, remote, automa
                 onDragOver=${e => { if (!disabled && Array.from(e.dataTransfer.types).includes('application/x-sage-domains')) e.preventDefault(); }}
                 onDrop=${e => { e.preventDefault(); try { const items = JSON.parse(e.dataTransfer.getData('application/x-sage-domains')); if (Array.isArray(items)) stage(items.filter(item => typeof item === 'string' && Object.hasOwn(catalog, item) && catalog[item].can_share !== false), permission); } catch {} }}
                 onClick=${() => stage(selected, permission)}>
-                <strong>${permission === 'remove' ? 'Remove sharing' : permission === 'read' ? 'Live Read' : 'Offer Copy'}</strong><span>${permission === 'remove' ? 'Stop future Read and Copy. Existing copies remain on their SAGE.' : permission === 'read' ? 'They may query these memories here.' : 'They may keep local copies after subscribing.'}</span>
+                <strong>${permission === 'remove' ? 'Clear domain permissions' : permission === 'read' ? 'Live Read' : 'Offer Copy'}</strong><span>${permission === 'remove' ? 'Clear these Read/Copy choices after saving. Other domain or agent sharing may still allow access. Existing copies remain.' : permission === 'read' ? 'They may query these memories here.' : 'They may keep local copies after subscribing.'}</span>
                 <small>${selected.length ? `Add ${selected.length} selected domains to draft` : 'Drop domains here'}</small></button>`)}</div>
         </details>
         ${notice && html`<p role="status" aria-live="polite">${notice}</p>`}
