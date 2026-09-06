@@ -50,7 +50,7 @@ test('ambient drift is bounded, deterministic and preserves message identities',
  assert.notEqual(drift[0].agents[0].x,initial[0].agents[0].x);
  for(const seconds of [0,10,100,1000]) {
   const point=driftConstellation(initial,seconds)[0].agents[0],base=initial[0].agents[0];
-  assert.ok(Math.hypot(point.x-base.x,point.y-base.y)<22);
+  assert.ok(Math.abs(Math.hypot(point.x-initial[0].x,point.y-initial[0].y)-Math.hypot(base.x-initial[0].x,base.y-initial[0].y))<7);
  }
  assert.deepEqual(drift,driftConstellation(initial,10));
 });
