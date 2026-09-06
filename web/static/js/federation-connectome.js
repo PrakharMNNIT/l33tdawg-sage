@@ -111,7 +111,7 @@ export function FederationConnectome({ connections, statuses, localChain, localN
         connect(); document.addEventListener('visibilitychange', visibility);
         return () => { live = false; clearTimeout(timer); if (es) es.close(); document.removeEventListener('visibilitychange', visibility); activitySeen.current = null; };
     }, [enabled]);
-    useEffect(() => { const timer = setTimeout(() => setPulses([]), 2500); return () => clearTimeout(timer); }, [pulses]);
+    useEffect(() => { if (!pulses.length) return; const timer = setTimeout(() => setPulses([]), 2500); return () => clearTimeout(timer); }, [pulses]);
     const remoteNodes = visibleConnections.map(conn => {
         const entry = directories[conn.remote_chain_id];
         const data = entry && entry.data;
@@ -132,7 +132,7 @@ export function FederationConnectome({ connections, statuses, localChain, localN
         const loadedAgents = node.agents;
         const filtered = filterFederationAgents(loadedAgents, node.name.toLowerCase().includes(query.trim().toLowerCase()) ? '' : query);
         const selected = selection?.nodeID === node.id ? loadedAgents.find(a => a.agent_id === selection.agentID) : null;
-        const candidates = selected ? [selected, ...filtered.filter(a => a.agent_id !== selected.agent_id)] : filtered;
+        const candidates = selected && !filtered.slice(0, 24).some(a => a.agent_id === selected.agent_id) ? [selected, ...filtered.filter(a => a.agent_id !== selected.agent_id)] : filtered;
         return { ...node, loadedAgents, matchingCount: filtered.length, agents: candidates.slice(0, 24) };
     }));
     // Preserve readable hit targets: fit the cluster extents, then let users
