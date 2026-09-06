@@ -318,7 +318,7 @@ The whole inner proof plus intent/payload/result use the local vault-backed
 storage path. Foreign completion creates no memory journal, and the result is
 atomically paired with its durable return outbox event before the peer is
 acknowledged (`internal/store/pipeline_transport.go:126-189`, `:256-326`;
-`handlePipeResult`, `api/rest/pipe_handler.go:1606-1908`).
+`handlePipeResult`, `api/rest/pipe_handler.go:1609-1911`).
 
 ### `POST /fed/v1/query/available`
 
@@ -720,12 +720,12 @@ Every route 501s when the transport is not wired (`fedReady`,
 | `GET /v1/dashboard/federation/connections` | `handleFedConnections` (`web/federation_join.go:849-912`) | List agreements with `sharing_paused` and durable end-event context for past rows. |
 | `GET /v1/dashboard/federation/connections/{chain_id}/permissions` | `handleFedPermissionsGet` (`web/federation_permissions.go:212-300`) | Return editable `local_permissions`, `local_paused`, and the authenticated peer's read-only permissions/pause state. `?live=0` deliberately skips the peer probe and returns the durable local snapshot immediately with `remote_known:false`; CEREBRUM uses that for first paint, then consumes the single authenticated connection-status refresh owned by the parent page. |
 | `PUT /v1/dashboard/federation/connections/{chain_id}/permissions` | `handleFedPermissionsPut` (`web/federation_permissions.go:375-539`) | Replace this node's complete existing-domain Read/Copy snapshot for the frozen peer. A true `write` field is rejected. |
-| `GET/PUT /v1/dashboard/federation/connections/{chain_id}/agent-exports` | `handleFedAgentExportsGet/Put` (`web/federation_agent_exports.go`) | List or CAS-mutate (`active`/`paused`) the exact active ordinary local agents exported into this pairwise federation. Current owned domains are derived live; classification ceiling and domain exclusions may narrow them. Pause immediately removes derived identity, Read, and messaging. Revocation is reserved for internal generation retirement. |
+| `GET/PUT /v1/dashboard/federation/connections/{chain_id}/agent-exports` | `handleFedAgentExportsGet/Put` (`web/federation_agent_exports.go`) | List or CAS-mutate (`active`/`paused`) the exact active ordinary local agents exported into this pairwise federation. Current owned domains are derived live; classification ceiling and domain exclusions may narrow them. Pause removes the derived memory Read grant. On peers using `node-messaging-v1`, discovery and messaging are independent of exports; legacy contacts still require an export. Revocation is reserved for internal generation retirement. |
 | `GET/PUT /v1/dashboard/federation/connections/{chain_id}/reader-restrictions` | `handleFedReaderRestrictionsGet/Put` (`web/federation_reader_restrictions.go`) | List or CAS-mutate receiver-local per-agent deny-all/domain-subtree exceptions. Absent/revoked means default allow; ceremony binding is server-derived and cannot be supplied by the browser. |
 | `PUT /v1/dashboard/federation/connections/{chain_id}/pause` | `handleFedPause` (`web/federation_permissions.go:301-339`) | Set `{"paused":true|false}` for this node's directional grant without deleting trust or saved domains. |
 | `GET/PUT /v1/dashboard/federation/connections/{chain_id}/sync` | `handleFedSyncGet/Set` (`web/federation_join.go:344-579`) | Read or change directional copy lanes; current UI changes only the receiver's `subscribe_domains` choice. |
-| `GET /v1/dashboard/federation/connections/{chain_id}/pipe-contacts` | `handleFedPipeContactsGet` (`web/federation_pipe_contacts.go:29-92`) | Return the current explicit-export contact projection and the peer's authenticated read-only snapshot. Manual domain-only policy never creates a contact. `?live=0` skips the peer probe and reports `remote_known:false`. |
-| `PUT /v1/dashboard/federation/connections/{chain_id}/pipe-contacts` | `handleFedPipeContactsPut` (`web/federation_pipe_contacts.go:118-165`) | Legacy exact-contact acceptance control. Current exported agents accept messaging by membership unless `DenyFederatedPipe`; this route never creates export membership or memory authority. |
+| `GET /v1/dashboard/federation/connections/{chain_id}/pipe-contacts` | `handleFedPipeContactsGet` (`web/federation_pipe_contacts.go:34-119`) | Return the explicit memory-export projection as `local_contacts`, automatic messaging membership as `local_node_contacts`, and the peer's authenticated contacts. `local_cursor` and `remote_cursor` continue bounded node-agent pages. Manual domain-only policy never creates a legacy contact. `?live=0` skips the peer probe and reports `remote_known:false`. |
+| `PUT /v1/dashboard/federation/connections/{chain_id}/pipe-contacts` | `handleFedPipeContactsPut` (`web/federation_pipe_contacts.go:145-192`) | Legacy exact-contact acceptance control. Current exported agents accept messaging by membership unless `DenyFederatedPipe`; this route never creates export membership or memory authority. |
 | `POST /v1/dashboard/federation/connections/{chain_id}/revoke` | `handleFedRevoke` (`web/federation_join.go`) | Commit local tx-34, best-effort notify the peer with the retained exact old credentials, purge locally, and return notification status. |
 | `GET /v1/dashboard/federation/connections/{chain_id}/status` | `handleFedPeerStatus` (`web/federation_join.go`) | The panel's cheap authenticated peer reachability preflight. `?retry=1` is reserved for an operator click: concurrent clicks share one bounded route refresh for the exact active JOIN/policy generation and then exactly one authenticated status re-probe. Polling never enters that recovery workflow. Retry copies the exact checked snapshot targets before dialing, treats route-exchange 401/403 as a typed security stop, and revalidates the complete agreement/control tuple after the status response before success. A stale generation is never dialed; an unprovable legacy binding returns explicit pair-again guidance instead of inventing a P2P identity. Typed manager diagnostics distinguish disabled, missing/expired bundles, stale Direct, relay unavailable, trust-generation mismatch, security block, and legacy pair-again. On success the route preserves the peer's advertised `capabilities` plus the peer-scoped `peer_rbac_grant`, legacy `sharing_grant`, and `pipe_contacts` projections from `/fed/v1/status`, while omitting the agreement-binding digest and transport internals. CEREBRUM uses missing current capabilities only as a non-blocking mixed-version warning; capability advertisement is not read authorization, presence, or delivery evidence. |
 | `POST /v1/dashboard/federation/groups/refresh` | `handleFedGroupRefresh` (`web/federation_join.go`) | Prompt one bounded group-journal anti-entropy pass and wait for it to finish before CEREBRUM reloads the local group projection. Ordinary group-list polling remains a local SQLite read. |
@@ -1014,3 +1014,35 @@ make a committed foreign copy look native.
 - SQLite-only: Postgres-backed nodes disable sync loudly (501 on the routes, drainer no-op, no `sync` capability).
 - **First sync into a domain that does not yet exist on the receiver auto-registers that domain** with the receiving node's operator agent as owner (a level-2 self-grant), exactly as an ordinary local submit into a new domain does. This is a consensus-visible RBAC effect triggered by a peer's push - benign (the receiver's own operator owns it, never the peer) but worth knowing: an operator wanting tighter control should pre-create the domains they consent to sync.
 - **Rejections are re-evaluable, not permanent.** Only admissions are recorded on the receiver; a `rejected_not_consented` / `rejected_domain_scope` / `rejected_clearance` outcome is receiver-config-dependent and stays retryable on the sender (long backoff, attempt-capped), so widening permission, subscription, or clearance later lets a backlog self-heal. A `rejected_cross_domain_dup` is content-derived and terminal on the sender. The duplicate check only inspects domains visible to that peer (peer-RBAC Read for v3, treaty scope for legacy), so it never reveals hidden-domain holdings.
+
+
+### Automatic agent messaging after trusted pairing
+
+Peers negotiate `federated-node-messaging-v1` in authenticated status and the
+client capability header. Their active ordinary agents are exposed as
+`node-messaging-v1` contacts with an empty domain list. Memory ownership,
+agent exports, Read grants and Copy subscriptions are not required. Root and
+historical Root credentials, inactive or inconsistent enrollments are excluded;
+`DenyFederatedPipe` remains a hard messaging block. These contacts grant no
+memory authority. Existing domain Read/Copy checks are unchanged.
+
+`POST /fed/v1/pipe/contacts/lookup` accepts a targeted `target` or `name` with
+`authorization_mode:"node-messaging-v1"`. Enumeration instead supplies
+`list:true`, an optional `after` agent cursor, and a bounded `limit` (maximum 20).
+`grant.next_cursor` continues the scan even when a candidate page contains no
+eligible contacts. The cursor is an encrypted roster position bound to the exact agreement and
+expires after 30 minutes. It grants no authority; each page evaluates current
+standing. Filtering a credential also hides its identity from continuation metadata. `total` on enumeration is the returned
+count plus one when another candidate page exists, not a global roster count.
+
+Ordinary `GET /v1/federation/available` exposes continuation as
+`next_agent_cursor` per connection; pass it as `agent_cursor` alongside the exact
+`peer_chain`. Old peers retain their explicit-export protocol, and queued
+messages retain their original authorization mode throughout delivery/retry.
+
+Sources: `internal/federation/node_contacts.go` (`buildNodeContactPage`,
+`ListRemoteNodeContacts`); `internal/federation/pipe_contacts.go`
+(`buildPipeContactGrantForCandidates`, `pipeContactID`);
+`internal/federation/pipe_targets.go` (`lookupRemotePipeContacts`);
+`api/rest/federation_handler.go` (`handleFederationAvailable`);
+`internal/store/pipeline_transport.go` (transport mode persistence).

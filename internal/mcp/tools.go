@@ -106,15 +106,17 @@ func (s *Server) registerTools() map[string]Tool {
 		},
 		"sage_directory": {
 			Name:        "sage_directory",
-			Description: "List recipients this signed caller is currently authorized to address. The default local scope is one metadata-only database read and performs no federation probes. Request scope=all explicitly to add live-revalidated federated contacts already authorized by an exact shared-domain or linked-reader messaging edge. Each row includes display name, immutable registered name, provider, exact agent_id/to, and local/federated provenance. This is authorization metadata, never online presence, reachability, delivery, or read evidence. Older peers without safe enumeration support are omitted and reported as an incomplete federated view.",
+			Description: "List recipients this signed caller is currently authorized to address. By default, include local agents and agents on connected trusted nodes. Upgraded nodes support discovery and messaging without sharing memory domains. Use scope=local for a local-only view. Each row includes display name, immutable registered name, provider, exact agent_id/to, and local/federated provenance. This is authorization metadata, never online presence, reachability, delivery, or read evidence. Older peers without safe enumeration support are omitted and reported as an incomplete federated view.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"scope": map[string]any{
 						"type": "string", "enum": []string{"all", "local"},
-						"default": "local", "description": "The default local scope performs no federation network checks; all explicitly requests the caller-authorized local/federated union.",
+						"default": "all", "description": "Include connected-node agents by default. Use local to skip federation network checks.",
 					},
-					"peer_cursor": map[string]any{"type": "string", "description": "Bounded federated continuation returned by a previous scope=all call. Ignored for local scope."},
+					"peer_cursor":  map[string]any{"type": "string", "description": "Bounded federated continuation returned by a previous scope=all call. Ignored for local scope."},
+					"peer_chain":   map[string]any{"type": "string", "description": "Optional exact node to browse."},
+					"agent_cursor": map[string]any{"type": "string", "description": "Agent continuation from agent_pages; pass with its peer_chain."},
 				},
 			},
 			Handler: s.toolDirectory,
@@ -1533,7 +1535,7 @@ func (s *Server) toolDirectory(ctx context.Context, args map[string]any) (any, e
 	}
 	scope, _ := args["scope"].(string)
 	if scope == "" {
-		scope = "local"
+		scope = "all"
 	}
 	if scope != "all" && scope != "local" {
 		return nil, fmt.Errorf("scope must be all or local")
@@ -1567,6 +1569,7 @@ func (s *Server) toolDirectory(ctx context.Context, args map[string]any) (any, e
 	complete := true
 	warnings := make([]string, 0)
 	nextPeerCursor := ""
+	agentPages := make([]map[string]string, 0)
 	if roster.Truncated {
 		complete = false
 		warnings = append(warnings,
@@ -1586,8 +1589,14 @@ func (s *Server) toolDirectory(ctx context.Context, args map[string]any) (any, e
 			NextCursor  string                         `json:"next_peer_cursor"`
 		}
 		path := "/v1/federation/available"
-		if cursor := strings.TrimSpace(stringParam(args, "peer_cursor", "")); cursor != "" {
-			path += "?peer_cursor=" + url.QueryEscape(cursor)
+		query := url.Values{}
+		for _, key := range []string{"peer_cursor", "peer_chain", "agent_cursor"} {
+			if value := strings.TrimSpace(stringParam(args, key, "")); value != "" {
+				query.Set(key, value)
+			}
+		}
+		if len(query) > 0 {
+			path += "?" + query.Encode()
 		}
 		if err := s.doSignedJSON(ctx, "GET", path, nil, &available); err != nil {
 			warnings = append(warnings, "Federated directory could not be revalidated; local recipients are still shown.")
@@ -1602,6 +1611,12 @@ func (s *Server) toolDirectory(ctx context.Context, args map[string]any) (any, e
 				seen["local:"+agent["agent_id"].(string)] = struct{}{}
 			}
 			for _, connection := range available.Connections {
+				if connection.AgentDirectoryUnavailable {
+					warnings = append(warnings, "An agent page could not be revalidated. Retry its agent_pages continuation, or restart the directory if the cursor expired.")
+				}
+				if connection.NextAgentCursor != "" {
+					agentPages = append(agentPages, map[string]string{"peer_chain": connection.RemoteChainID, "agent_cursor": connection.NextAgentCursor})
+				}
 				if connection.RemoteAgentsTruncated {
 					complete = false
 					warnings = append(warnings, "A federated peer returned a bounded contact view; use sage_find_agent for a recipient not shown.")
@@ -1645,6 +1660,7 @@ func (s *Server) toolDirectory(ctx context.Context, args map[string]any) (any, e
 		"scope":            scope,
 		"complete":         complete,
 		"next_peer_cursor": nextPeerCursor,
+		"agent_pages":      agentPages,
 		"warnings":         warnings,
 		"message": "Caller-authorized recipient directory. Pass an agent's exact to value to " +
 			"sage_message_send. Membership proves neither presence nor delivery; use sage_message_status " +
@@ -1670,10 +1686,12 @@ type findAgentFederatedDomain struct {
 }
 
 type findAgentFederatedConnection struct {
-	RemoteChainID         string                      `json:"remote_chain_id"`
-	NetworkName           string                      `json:"network_name"`
-	RemoteAgents          []findAgentFederatedContact `json:"remote_agents"`
-	RemoteAgentsTruncated bool                        `json:"remote_agents_truncated"`
+	AgentDirectoryUnavailable bool                        `json:"agent_directory_unavailable"`
+	NextAgentCursor           string                      `json:"next_agent_cursor"`
+	RemoteChainID             string                      `json:"remote_chain_id"`
+	NetworkName               string                      `json:"network_name"`
+	RemoteAgents              []findAgentFederatedContact `json:"remote_agents"`
+	RemoteAgentsTruncated     bool                        `json:"remote_agents_truncated"`
 }
 
 const (
@@ -1698,10 +1716,16 @@ func isLinkedFederatedAgentContact(contact findAgentFederatedContact) bool {
 		len(contact.Domains) == 0
 }
 
-func hasLinkedFederatedAgentContacts(connections []findAgentFederatedConnection) bool {
+func isNodeFederatedAgentContact(contact findAgentFederatedContact) bool {
+	return contact.AuthorizationMode == "node-messaging-v1" && contact.Available && contact.Accepting && len(contact.Domains) == 0
+}
+
+// Domain-free contacts must be revalidated through the signed directory, not
+// the legacy domain-intersection cache authorization endpoint.
+func hasDomainFreeFederatedContacts(connections []findAgentFederatedConnection) bool {
 	for _, connection := range connections {
 		for _, contact := range connection.RemoteAgents {
-			if isLinkedFederatedAgentContact(contact) {
+			if isLinkedFederatedAgentContact(contact) || isNodeFederatedAgentContact(contact) {
 				return true
 			}
 		}
@@ -1757,7 +1781,8 @@ func boundedFederatedAgentConnections(in []findAgentFederatedConnection) []findA
 				break
 			}
 			linked := isLinkedFederatedAgentContact(contact)
-			if (contact.AuthorizationMode != "" && !linked) ||
+			node := isNodeFederatedAgentContact(contact)
+			if (contact.AuthorizationMode != "" && !linked && !node) ||
 				(!linked && (!contact.Available || !contact.Accepting)) ||
 				len(contact.AgentID) == 0 || len(contact.AgentID) > maxFederatedAgentCacheLabelBytes ||
 				len(contact.DisplayName) > maxFederatedAgentCacheLabelBytes ||
@@ -1769,7 +1794,7 @@ func boundedFederatedAgentConnections(in []findAgentFederatedConnection) []findA
 			}
 			boundedContact := contact
 			boundedContact.Domains = nil
-			if linked {
+			if linked || node {
 				bounded.RemoteAgents = append(bounded.RemoteAgents, boundedContact)
 				contacts++
 				continue
@@ -1889,7 +1914,7 @@ func (s *Server) cachedFederatedAgentConnections(ctx context.Context, query stri
 		}
 		return nil, false
 	}
-	if hasLinkedFederatedAgentContacts(entry.connections) {
+	if hasDomainFreeFederatedContacts(entry.connections) {
 		delete(s.federatedAgentCache, cacheKey)
 		return nil, false
 	}
@@ -1902,7 +1927,7 @@ func (s *Server) cacheFederatedAgentConnections(ctx context.Context, query strin
 	connections = boundedFederatedAgentConnections(connections)
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if hasLinkedFederatedAgentContacts(connections) {
+	if hasDomainFreeFederatedContacts(connections) {
 		delete(s.federatedAgentCache, cacheKey)
 		return
 	}
@@ -2336,7 +2361,7 @@ func (s *Server) toolFindAgent(ctx context.Context, params map[string]any) (any,
 		remoteTruncated = remoteTruncated || connection.RemoteAgentsTruncated
 	}
 	cacheState := map[bool]string{true: "hit", false: "miss"}[cacheHit]
-	if hasLinkedFederatedAgentContacts(connections) {
+	if hasDomainFreeFederatedContacts(connections) {
 		cacheState = "live"
 	}
 	searched := []string{"local", "federated"}

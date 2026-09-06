@@ -923,11 +923,11 @@ func TestSageDirectoryReturnsMinimalExactLocalRecipientRoster(t *testing.T) {
 
 	_, priv, _ := ed25519.GenerateKey(nil)
 	s := NewServer(ts.URL, priv)
-	result, err := s.toolDirectory(context.Background(), nil)
+	result, err := s.toolDirectory(context.Background(), map[string]any{"scope": "local"})
 	require.NoError(t, err)
 	require.True(t, signed, "the local roster must use the signed caller identity")
-	require.False(t, federationRequested, "default directory scope must not probe federation")
-	require.Equal(t, 1, directoryRequests, "default directory lookup must remain one local request")
+	require.False(t, federationRequested, "explicit local directory scope must not probe federation")
+	require.Equal(t, 1, directoryRequests, "explicit local directory lookup must remain one local request")
 
 	out := result.(map[string]any)
 	require.Equal(t, "local", out["scope"])
@@ -976,7 +976,7 @@ func TestSageDirectoryReportsBoundedLocalProjectionAsIncomplete(t *testing.T) {
 	defer ts.Close()
 
 	_, priv, _ := ed25519.GenerateKey(nil)
-	result, err := NewServer(ts.URL, priv).toolDirectory(context.Background(), nil)
+	result, err := NewServer(ts.URL, priv).toolDirectory(context.Background(), map[string]any{"scope": "local"})
 	require.NoError(t, err)
 	out := result.(map[string]any)
 	require.Equal(t, false, out["complete"])
@@ -1017,7 +1017,7 @@ func TestSageDirectoryReturnsCallerAuthorizedFederatedUnionWithoutPresence(t *te
 
 	_, priv, _ := ed25519.GenerateKey(nil)
 	s := NewServer(ts.URL, priv)
-	result, err := s.toolDirectory(context.Background(), map[string]any{"scope": "all"})
+	result, err := s.toolDirectory(context.Background(), nil)
 	require.NoError(t, err)
 	out := result.(map[string]any)
 	require.Equal(t, false, out["complete"])

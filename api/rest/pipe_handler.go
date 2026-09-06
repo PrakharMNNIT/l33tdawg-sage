@@ -126,6 +126,9 @@ func (s *Server) callerCanReachFederatedPipeTarget(ctx context.Context, callerID
 			return false
 		}
 	}
+	if target.AuthorizationMode == federation.NodeMessageAuthorizationMode {
+		return target.LinkedRelation == nil && len(target.Domains) == 0
+	}
 	if target.AuthorizationMode != "" || target.LinkedRelation != nil {
 		return false
 	}
@@ -735,7 +738,7 @@ func (s *Server) handlePipeSend(w http.ResponseWriter, r *http.Request) {
 					fmt.Sprintf("no visible federated agent matches %q", qualifiedTarget))
 				return
 			}
-		} else if remoteTarget.AuthorizationMode != "" || remoteTarget.LinkedRelation != nil {
+		} else if (remoteTarget.AuthorizationMode != "" && remoteTarget.AuthorizationMode != federation.NodeMessageAuthorizationMode) || remoteTarget.LinkedRelation != nil {
 			writeProblem(w, http.StatusNotFound, "Unknown target",
 				fmt.Sprintf("no visible federated agent matches %q", qualifiedTarget))
 			return

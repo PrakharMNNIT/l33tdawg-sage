@@ -270,7 +270,9 @@ func (m *Manager) revalidateOutboundReceiptTarget(ctx context.Context, outbox *s
 	} else {
 		resolve := m.pipeTargetResolveFn
 		if resolve == nil {
-			resolve = m.resolveRemotePipeTargetLive
+			resolve = func(ctx context.Context, address string) (*RemotePipeTarget, error) {
+				return m.resolveRemotePipeTarget(ctx, address, false, outbox.AuthorizationMode)
+			}
 		}
 		target, err = resolve(ctx, address)
 	}

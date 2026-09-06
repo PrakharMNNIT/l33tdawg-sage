@@ -7567,3 +7567,33 @@ input[type="range"]::-moz-range-thumb {
     .v23-message-arrow { transform: rotate(90deg); }
     .v23-consent-actions { grid-template-columns: 1fr; }
 }
+
+/* Node membership stays visually separate from explicit memory sharing. */
+.fed-directory { margin: 1.5rem 0; padding: 1.5rem; border: 1px solid var(--border); border-radius: 16px; }
+.fed-directory-heading { display: flex; align-items: start; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
+.fed-directory-heading h3 { margin-top: 0; }
+.fed-directory-heading label, .fed-directory-sharing > label { display: grid; gap: .4rem; }
+.fed-directory input[type="search"] { min-width: 220px; }
+.fed-directory-nodes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; margin: 1.25rem 0; }
+.fed-directory-node { padding: 1rem; border: 1px solid var(--border); border-radius: 14px; background: var(--bg-secondary); min-width: 0; }
+.fed-directory-node header { display: flex; align-items: center; gap: .7rem; margin-bottom: 1rem; }
+.fed-directory-node header h4 { margin: 0; flex: 1; }
+.fed-directory-node-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 14%, transparent); }
+.fed-directory-agents { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .7rem; max-height: 440px; overflow: auto; }
+.fed-directory-agent { display: grid; gap: .4rem; padding: .85rem; border: 1px solid var(--border); border-radius: 16px; overflow-wrap: anywhere; }
+.fed-directory-agent small, .fed-directory-agent > span { font-size: .75rem; color: var(--text-muted); }
+.fed-directory-sharing { border-top: 1px solid var(--border); padding-top: 1rem; }
+.fed-directory-sharing summary { cursor: pointer; font-weight: 600; }
+.fed-directory-domains, .fed-directory-domain-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin: .8rem 0; }
+.fed-directory-domain { display: flex; gap: .45rem; align-items: center; border: 1px solid var(--border); border-radius: 20px; padding: .45rem .75rem; cursor: grab; overflow-wrap: anywhere; }
+.fed-directory-dropzones { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+.fed-directory-dropzone { display: grid; gap: .5rem; padding: 1.2rem; border: 1px dashed var(--accent); border-radius: 12px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.fed-directory-dropzone:hover, .fed-directory-dropzone:focus-visible { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.fed-directory-dropzone:disabled { opacity: .5; cursor: default; }
+@media (max-width: 720px) { .fed-directory-nodes, .fed-directory-dropzones { grid-template-columns: 1fr; } .fed-directory { padding: 1rem; } }
+
+.fed-directory p { line-height: 1.5; margin: .65rem 0 1rem; color: var(--text-dim); }
+.fed-directory-heading h3 { font-size: 1.2rem; margin-bottom: .4rem; }
+.fed-directory input[type="search"] { width: 100%; max-width: 100%; padding: .65rem .8rem; border: 1px solid var(--border-light); border-radius: 8px; background: var(--bg-elevated); color: var(--text); font: inherit; }
+.fed-directory input[type="search"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.fed-directory-node > .btn { margin-top: .75rem; }

@@ -1655,8 +1655,11 @@ most 100 local recipients and reports `complete=false` when capped; use
 only the minimal identity picker above; it does not expose roles, capability
 masks, memory counts, domain grants, key material, or other RBAC topology.
 
-Federated rows are not a peer roster. Current contacts come only from explicit
-active agent exports; manual shared domains do not expose their owner.
+On peers advertising `federated-node-messaging-v1`, trusted pairing exposes
+active ordinary agents as domain-free `node-messaging-v1` contacts. No Read or
+Copy grant or agent export is needed for discovery or messaging. Root credentials,
+ineligible registrations, and explicit messaging blocks remain protected. Legacy
+peers retain explicit-export contacts; manual shared domains do not expose their owner.
 Legacy linked-reader contacts use the additive
 `linked-message-directory-enumeration-v1` capability and contain only exact
 current relations already authorized for this caller. Each linked relation,
@@ -1670,11 +1673,13 @@ Directory membership is never online presence, reachability, delivery, claim,
 or read evidence. Only `sage_message_status` may report evidence for an exact
 message the caller sent.
 
-**Parameters:** `scope` is optional: `local` (default) performs one local
-metadata-only read and no federation network checks; `all` explicitly requests
-the authorized local/federated union and live peer revalidation. For
+**Parameters:** `scope` is optional: `all` (default) requests the authorized
+local/federated union and live peer revalidation. `local` performs one local
+metadata-only read without federation network checks. For
 `scope=all`, optional `peer_cursor` continues exactly one bounded federation
 page returned by the previous call. It is ignored for local scope.
+`peer_chain` selects one exact connected node. Entries in `agent_pages` carry
+`peer_chain` and `agent_cursor` for the next bounded recipient page on that node.
 
 **Returns:** `agents`, `total`, `scope`, `complete`, `warnings`, and a short
 routing reminder. When another federation page is available, warnings include

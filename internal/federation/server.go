@@ -487,6 +487,9 @@ func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
 		caps = append(caps, CapabilitySync)
 		caps = append(caps, CapabilityFederatedPipeline)
 		caps = append(caps, CapabilityFederatedPipelineContactLookup)
+		if m.postV23ForNextTx != nil && m.postV23ForNextTx() {
+			caps = append(caps, CapabilityNodeMessaging)
+		}
 	}
 	policy, err := m.getPeerRBACPolicyForAgreement(r.Context(), agreement)
 	if err != nil {
@@ -515,7 +518,11 @@ func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
 		effectivePolicy.Domains = mergePeerRBACReadDomains(effectivePolicy.Domains, derivedDomains)
 		peerRBACGrant = peerRBACGrantFromPolicy(&effectivePolicy)
 		if !clientRequestsPipeContactLookup(r) {
-			pipeContacts, err = m.buildPipeContactStatusGrant(r.Context(), peer, policy)
+			mode := ""
+			if m.postV23ForNextTx != nil && m.postV23ForNextTx() && clientHasCapability(r, CapabilityNodeMessaging) {
+				mode = NodeMessageAuthorizationMode
+			}
+			pipeContacts, err = m.buildPipeContactStatusGrant(r.Context(), peer, policy, mode)
 			if err != nil {
 				releaseSnapshot()
 				m.logger.Error().Err(err).Str("peer", peer.ChainID).Msg("federation status pipe contact projection failed")
@@ -649,8 +656,12 @@ func (m *Manager) handleQueryAvailability(w http.ResponseWriter, r *http.Request
 }
 
 func clientRequestsPipeContactLookup(r *http.Request) bool {
+	return clientHasCapability(r, CapabilityFederatedPipelineContactLookup)
+}
+
+func clientHasCapability(r *http.Request, requested string) bool {
 	for _, capability := range strings.Split(r.Header.Get(HeaderClientCapabilities), ",") {
-		if strings.TrimSpace(capability) == CapabilityFederatedPipelineContactLookup {
+		if strings.TrimSpace(capability) == requested {
 			return true
 		}
 	}
@@ -722,7 +733,16 @@ func (m *Manager) handlePipeContactLookup(w http.ResponseWriter, r *http.Request
 	}
 	req.Target = strings.TrimSpace(req.Target)
 	req.Name = strings.TrimSpace(req.Name)
-	if (req.Target == "") == (req.Name == "") || len(req.Target) > 512 || len(req.Name) > 512 {
+	if req.AuthorizationMode != "" && req.AuthorizationMode != NodeMessageAuthorizationMode {
+		httpError(w, http.StatusBadRequest, "unsupported contact authorization mode")
+		return
+	}
+	if req.List {
+		if req.AuthorizationMode != NodeMessageAuthorizationMode || req.Target != "" || req.Name != "" || (req.After != "" && !validNodeCursorShape(req.After)) {
+			httpError(w, http.StatusBadRequest, "invalid node directory page")
+			return
+		}
+	} else if req.After != "" || (req.Target == "") == (req.Name == "") || len(req.Target) > 512 || len(req.Name) > 512 {
 		httpError(w, http.StatusBadRequest, "provide exactly one valid contact selector")
 		return
 	}
@@ -817,6 +837,11 @@ func (m *Manager) handlePipeContactLookup(w http.ResponseWriter, r *http.Request
 	}
 	grant, total, err := m.buildPipeContactLookupGrant(r.Context(), peer, policy, req, prefetchedNameCandidateIDs)
 	if err != nil {
+		if errors.Is(err, errNodeContactCursor) {
+			releaseSnapshot()
+			httpError(w, http.StatusBadRequest, errNodeContactCursor.Error())
+			return
+		}
 		m.logger.Error().Err(err).Str("peer", peer.ChainID).Msg("federation pipe contact lookup projection failed")
 		releaseSnapshot()
 		httpError(w, http.StatusInternalServerError, "pipe contact lookup failed")
@@ -901,7 +926,7 @@ func boundedPipeContactLookupResponse(grant *PipeContactGrant, total int) (*Pipe
 			bounded.Contacts = candidate.Contacts
 		}
 	}
-	if total > 0 && len(bounded.Contacts) == 0 {
+	if len(grant.Contacts) > 0 && len(bounded.Contacts) == 0 {
 		return nil, fmt.Errorf("one pipe contact exceeds the lookup response limit")
 	}
 	return &PipeContactLookupResponse{
