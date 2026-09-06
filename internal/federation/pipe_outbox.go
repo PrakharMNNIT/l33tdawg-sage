@@ -483,7 +483,9 @@ func (m *Manager) buildPipelineEvent(ctx context.Context, ss *store.SQLiteStore,
 		} else {
 			resolve := m.pipeTargetResolveFn
 			if resolve == nil {
-				resolve = m.resolveRemotePipeTargetLive
+				resolve = func(ctx context.Context, address string) (*RemotePipeTarget, error) {
+					return m.resolveRemotePipeTarget(ctx, address, false, outbox.AuthorizationMode)
+				}
 			}
 			target, resolveErr = resolve(ctx, msg.ToAgent+"@"+msg.DestinationChainID)
 		}

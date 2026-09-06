@@ -1,5 +1,6 @@
 // CEREBRUM — Your SAGE Brain
 import { SSEClient } from './sse.js';
+import { FederationDirectory, stageFederationDomains } from './federation-directory.js';
 import { fetchStats, fetchMemoryAdoptionProgress, fetchMemoryAdoptionInventory, retryMemoryAdoption, assignMemoryAdoption, deprecateMemoryAdoption, fetchGraph, fetchMemories, deleteMemory, updateMemory, fetchHealth, fetchValidators, fetchScopes, fetchMcpConfig, checkAuth, login, recoverVault, lockSession, importMemories, importPreview, importConfirm, fetchCleanupSettings, saveCleanupSettings, runCleanup, fetchAgents, fetchAppV23Access, updateAppV23AgentPolicy, updateAppV26AgentDisplayName, putAppV23AccessGroup, deleteAppV23AccessGroup, fetchAppV23LinkedReaders, fetchAppV23LinkedReaderIdentities, checkAppV23LinkedReaderEligibility, mutateAppV23LinkedReader, fetchAppV23LinkedMessageConsent, fetchAppV23RemoteHostedMessageCandidates, putAppV23LinkedMessageConsent, fetchAgent, createAgent, updateAgent, removeAgent, downloadBundle, fetchTemplates, fetchRedeployStatus, startRedeploy, createPairingCode, rotateAgentKey, handoverRootCredential, fetchBootInstructions, saveBootInstructions, fetchLedgerStatus, enableLedger, changeLedgerPassphrase, disableLedger, fetchTags, fetchMemoryTags, setMemoryTags, fetchAutostart, setAutostart, checkForUpdate, applyUpdate, restartServer, fetchReranker, saveReranker, testReranker, detectReranker, fetchOnboarding, saveOnboarding,
 rerankerSetupStatus, rerankerSetupDownload, rerankerSetupStart, rerankerSetupStop, rerankerSetupInstallEngine, fetchTasks, updateTaskStatus, reorderTasks, createTask, assignTask, fetchUnregisteredAgents, mergeAgent, fetchRecallSettings, saveRecallSettings, fetchAgentDomains, reassignDomainOwnership, bulkUpdateMemories, fetchMemoryMode, saveMemoryMode, fetchPipeline, fetchPipelineStats, sendPipelineNote, fetchGovProposals, fetchGovProposalDetail, submitGovProposal, submitGovVote, fetchMemoryReanchorPlan, wizardCheckCloudflared, wizardInstallCloudflared, wizardStartLogin, wizardLoginStatus, wizardCreateTunnel, wizardMintToken, connectProvider, connectRemoteUrl, fetchUpdateStatus, selectEmbeddingProvider,
 embeddingsStatus, checkOllamaEmbed, installOllamaRuntime, startOllamaRuntime, pullEmbedModel, reembedMemories, reembedProgress, enableSemanticEmbeddings,
@@ -16229,7 +16230,7 @@ function GuestJoinWizard({ onExit, recoveryPeer }) {
         ${step === 'done' && html`<div class="fed-step fed-done">
             <div class="fed-done-check">✓</div>
             <h2>You're connected to ${(scan && scan.host_name) || 'the other SAGE'}</h2>
-            <p class="muted">Trust is established. Each computer now manages what it shares. Open this connection to choose existing domains for live Read or optional Copy; disconnecting always stops future access. Connection-bound Write is reserved but not active yet.</p>
+            <p class="muted">Your agents can discover and message each other automatically when both SAGEs support automatic node messaging. No memory domains are shared by connecting. Open the agent directory to check both sides, then optionally configure Read or Copy.</p>
             <button class="btn btn-primary" onClick=${onExit}>Done</button>
         </div>`}
 
@@ -16513,7 +16514,7 @@ function HostJoinWizard({ onExit }) {
             <div class="fed-done-check">✓</div>
             <h2>Connected to ${(view && view.guest_name) || 'the other SAGE'}</h2>
             <h3>Trust is established</h3>
-            <p class="muted">Permissions are separate from trust. Open this connection from Federation to choose which existing domains they may Read or Copy. They manage what they share back from their own computer; connection-bound Write is reserved but not active yet.</p>
+            <p class="muted">Your agents can discover and message each other automatically when both SAGEs support automatic node messaging. No memory domains are shared by connecting. Open the agent directory to check both sides, then optionally configure Read or Copy.</p>
             <button class="btn btn-primary" onClick=${onExit}>Done</button>
         </div>`}
 
@@ -16622,6 +16623,7 @@ function normalizeFedPipeContactGrant(value) {
         version: Number(grant.version || 0),
         agreementId: String(grant.agreement_id || grant.agreementId || ''),
         revision: String(grant.revision || ''),
+        next_cursor: String(grant.next_cursor || ''),
         paused: grant.paused === true,
         contacts,
     };
@@ -16667,6 +16669,7 @@ function fedFriendlyLocalAgentLabel(agent) {
 function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     const chain = conn.remote_chain_id;
     const peerName = conn.peer_name || 'Other SAGE';
+    const automaticNodeMessaging = connectionStatus ? (connectionStatus.capabilities || []).includes('federated-node-messaging-v1') : null;
     const localIsHost = conn.local_role === 'host';
     const roleKnown = conn.local_role === 'host' || conn.local_role === 'guest';
     const relationshipRole = localIsHost ? 'This SAGE created the original connection code' : (conn.local_role === 'guest' ? `${peerName} created the original connection code` : 'This older direct relationship needs its role restored');
@@ -16677,6 +16680,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
     const [remoteKnown, setRemoteKnown] = useState(false);
     const [remotePaused, setRemotePaused] = useState(false);
     const [alignmentPending, setAlignmentPending] = useState(false);
+	const [localNodeContacts, setLocalNodeContacts] = useState(null);
 	const [localPipeContacts, setLocalPipeContacts] = useState(null);
 	const [localPipeContactsKnown, setLocalPipeContactsKnown] = useState(false);
 	const [remotePipeContacts, setRemotePipeContacts] = useState(null);
@@ -16766,6 +16770,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
             else setSyncStatus(null);
 			if (pipeContactsResult.status === 'fulfilled') {
 				const result = pipeContactsResult.value || {};
+				setLocalNodeContacts(result.local_node_contacts ? normalizeFedPipeContactGrant(result.local_node_contacts) : null);
 				setLocalPipeContacts(normalizeFedPipeContactGrant(result.local_contacts));
 				setLocalPipeContactsKnown(true);
 				if (result.remote_known === true) {
@@ -16869,6 +16874,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
             }
 			if (pipeContactsResult.status === 'fulfilled') {
 				const result = pipeContactsResult.value || {};
+				setLocalNodeContacts(result.local_node_contacts ? normalizeFedPipeContactGrant(result.local_node_contacts) : null);
 				const targeted = pinnedAgentIDs.flatMap((agentID, index) => {
 					const targetedResult = targetedResults[index];
 					return targetedResult && targetedResult.status === 'fulfilled'
@@ -16999,11 +17005,11 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
         const enabledWorkRequests = localPipeContacts && Array.isArray(localPipeContacts.contacts)
             ? localPipeContacts.contacts.filter(contact => contact && contact.accepting === true).length
             : 0;
-        if (dirty && !localPipeContactsKnown && !await showConfirmation(
+        if (dirty && !automaticNodeMessaging && !localPipeContactsKnown && !await showConfirmation(
             'Agent work-request switches could not be loaded. Updating the shared domain list will reset any enabled switches to Off. You can turn unchanged agents back on after refreshing.',
             { title: 'Update shared domains?', confirmLabel: 'Update and reset', tone: 'primary' }
         )) return;
-        if (dirty && enabledWorkRequests > 0 && !await showConfirmation(
+        if (dirty && !automaticNodeMessaging && enabledWorkRequests > 0 && !await showConfirmation(
             `Updating the shared domain list resets ${enabledWorkRequests} enabled agent work-request ${enabledWorkRequests === 1 ? 'switch' : 'switches'} to Off. This prevents a changed domain-access scope from inheriting permission. You can turn unchanged agents back on after saving.`,
             { title: 'Update shared domains?', confirmLabel: 'Update and reset', tone: 'primary' }
         )) return;
@@ -17130,8 +17136,8 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 		if (!currentExport || currentExport.state !== 'active' || busy || pipeContactMutationRef.current) return;
 		const label = contact.display_name || contact.handle || 'this agent';
 		if (!await showConfirmation(
-			`Remove ${label} from this federation? ${peerName} will immediately lose its directory entry, Read access derived from this agent's owned domains, and its message route. Manual domain-only shares are unchanged.`,
-			{ title: 'Remove federated agent?', confirmLabel: 'Remove agent', tone: 'danger' }
+			`Stop sharing ${label}’s owned memory with ${peerName}? This removes the Read access granted by this export.${automaticNodeMessaging ? ' Automatic discovery and messaging remain available.' : ' This older peer also relies on the export for this agent’s messaging route.'} Other explicit domain grants still apply.`,
+			{ title: 'Stop sharing owned memory?', confirmLabel: 'Stop sharing', tone: 'danger' }
 		)) return;
 		pipeContactMutationRef.current = true;
 		setPipeContactBusy(contact.agent_id); setPipeContactErr('');
@@ -17148,7 +17154,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 				...current,
 				contacts: current.contacts.filter(item => item.agent_id !== contact.agent_id),
 			} : current);
-			showToast(`${label} removed from the federation`, 'success');
+			showToast(`${label}’s memory export stopped`, 'success');
 		} catch (e) {
 			setPipeContactErr(String(e.message || e));
 		} finally {
@@ -17220,11 +17226,6 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 				setPipeContactErr(`${selectedName} is no longer an active local agent. Refresh the connection and choose another agent.`);
 				return;
 			}
-			if (!appV23FederatedInboxEnabled(currentAgent.capabilities)) {
-				setPipeContactLookupStatus('');
-				setPipeContactPolicyBlock({ agentID, selectedName });
-				return;
-			}
 			let result = await fedPipeContactsGet(chain, false, agentID);
 			if (lookupGeneration !== pinnedLocalAgentGenerationRef.current) {
 				setPipeContactLookupStatus('Agent access changed while SAGE was checking. Choose the agent again.');
@@ -17240,7 +17241,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 				}
 				if (!await showConfirmation(
 					`Sharing ${selectedName} will add ${ownedDomains.length} owned ${ownedDomains.length === 1 ? 'domain' : 'domains'} to this connection.${dirty ? ' Your pending domain changes will be saved too.' : ''}`,
-					{ title: 'Share agent and domains?', confirmLabel: 'Share agent', tone: 'primary' }
+					{ title: 'Share owned memory?', confirmLabel: 'Share memory', tone: 'primary' }
 				)) return;
 				setPipeContactLookupStatus(`Exporting ${selectedName}'s ${ownedDomains.length} owned ${ownedDomains.length === 1 ? 'domain' : 'domains'}…`);
 				if (dirty) {
@@ -17285,7 +17286,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 			pinnedLocalAgentGenerationRef.current += 1;
 			setLocalPipeContacts(current => mergeFedPipeContactGrant(current, [{ agentID, grant: targeted }]));
 			setLocalPipeContactsKnown(true);
-			setPipeContactLookupStatus(`${selectedName} added. Work requests are Off until you enable them.${evictedSelection ? ' The oldest unenabled selection was hidden to keep background checks bounded.' : ''}`);
+			setPipeContactLookupStatus(`${selectedName}’s owned memory is now shared for live Read.${evictedSelection ? ' The oldest unenabled selection was hidden to keep background checks bounded.' : ''}`);
 		} catch (e) {
 			if (lookupGeneration !== pinnedLocalAgentGenerationRef.current) return;
 			setPipeContactLookupStatus('');
@@ -17306,8 +17307,10 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 			await navigator.clipboard.writeText(value);
 			setCopiedContact(contact.agent_id);
 			setTimeout(() => setCopiedContact(current => current === contact.agent_id ? '' : current), 1500);
+			return true;
 		} catch (e) {
 			setPipeContactErr('Could not copy the agent address.');
+			return false;
 		}
 	};
 
@@ -17432,7 +17435,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 
     return html`<div class="fed-permissions-panel">
         <div class="fed-permissions-intro">
-			<strong>${relationshipRole}.</strong> This trusted connection is its own federation group; neither side creates a matching local group. ${roleKnown ? `Each SAGE independently chooses which local agents join it, which manual domains it shares, and which copies it keeps.` : 'This older pairing has no trustworthy role binding, so outbound sharing stays locked until it is paired again.'}
+			<strong>${relationshipRole}.</strong> This trusted connection is its own federation group; neither side creates a matching local group. ${roleKnown ? `Agents can discover and message across upgraded nodes automatically. Each SAGE independently chooses which memory domains it shares and which copies it keeps.` : 'This older pairing has no trustworthy role binding, so outbound sharing stays locked until it is paired again.'}
         </div>
         ${conn.sharing_paused && html`<div class="fed-perm-pause-note">
             <strong>Sharing from this SAGE is paused.</strong> The saved domain choices below are preserved and take effect again when you resume.
@@ -17442,6 +17445,17 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
             <span><strong>Connection actions</strong><span class="muted">Permanent revocation requires the JOIN ceremony to reconnect.</span></span>
             <button class="btn btn-danger" disabled=${revokeBusy} onClick=${onRevoke}>${revokeBusy ? 'Revoking…' : 'Revoke trust…'}</button>
 		</div>
+
+		${roleKnown && html`<${FederationDirectory} key=${chain}
+            peerName=${peerName} local=${localNodeContacts} remote=${remotePipeContacts}
+            automatic=${automaticNodeMessaging}
+            copyAddress=${copyPipeContact} catalog=${catalog || {}} disabled=${busy || !draft}
+            stageDomains=${(domains, permission) => setDraft(current => stageFederationDomains(current, catalog || {}, domains, permission))}
+            loadMore=${async (side, cursor) => {
+                const page = await fedPipeContactsGet(chain, side === 'remote', '', { [side]: cursor });
+                if (side === 'remote' && !page.remote_known) throw new Error('Their agent directory is temporarily unavailable.');
+                return normalizeFedPipeContactGrant(side === 'local' ? page.local_node_contacts : page.remote_contacts);
+            }} />`}
 
 		${roleKnown && html`<section class="fed-perm-section">
 			<div class="fed-perm-section-head">
@@ -17483,8 +17497,8 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 		${roleKnown && html`<section class="fed-perm-section fed-agent-section">
 			<div class="fed-perm-section-head">
 				<div>
-					<h4>Federated agents</h4>
-					<p>Adding a local agent explicitly joins it to this federation. ${peerName}'s ordinary agents can read its owned domains by default and message it; Write remains blocked unless you configure a separate receiving rule.</p>
+					<h4>Agent-owned memory sharing</h4>
+					<p>Exporting an agent here explicitly grants ${peerName} live Read access to its owned domains, including future children. Agent discovery and messaging are handled separately above.</p>
 				</div>
 			</div>
 			${peerAgentCompatibility.observed && !peerAgentCompatibility.fullySupported && html`
@@ -17497,9 +17511,9 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 			<div class="fed-agent-columns">
 				<div class="fed-agent-column">
 					<h5>Agents on this SAGE</h5>
-					<p class="muted">Only agents you add here appear to ${peerName}. Local Access Groups do not cross this connection.</p>
+					<p class="muted">These are explicit memory exports. Removing an export stops its Read grant; automatic agent discovery and messaging remain available on upgraded nodes.</p>
 					<div class="fed-agent-picker">
-						<label for=${`fed-agent-picker-${chain}`}>Add a local agent</label>
+						<label for=${`fed-agent-picker-${chain}`}>Share an agent’s owned memory</label>
 						<select id=${`fed-agent-picker-${chain}`} value=${selectedLocalAgentID}
 							disabled=${busy || !!pipeContactBusy || pipeContactLookupBusy || localAgentDirectory === null || localAgentOptions.length === 0}
 							aria-busy=${pipeContactLookupBusy}
@@ -17513,29 +17527,29 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 					</div>
 					${localAgentDirectoryErr && html`<div class="fed-agent-directory-error muted" role="status">${localAgentDirectoryErr}</div>`}
 					${localPipeContacts === null && html`<div class="fed-agent-empty muted">Loading local agents…</div>`}
-					${localPipeContacts !== null && localAgentContacts.length === 0 && html`<div class="fed-agent-empty muted">No local agents have been explicitly added to this federation.</div>`}
+					${localPipeContacts !== null && localAgentContacts.length === 0 && html`<div class="fed-agent-empty muted">No agent-owned memory has been shared through this control.</div>`}
 					${localAgentContacts.map(contact => {
 						const domains = Array.isArray(contact.domains) ? contact.domains.map(item => item.domain).filter(Boolean) : [];
 						return html`<div class="fed-agent-row" key=${contact.agent_id}>
 							<div class="fed-agent-identity">
 								<strong>${contact.display_name || contact.handle || 'Local agent'}</strong>
 								${contact.handle && html`<code>${contact.handle}</code>`}
-								<span class="muted">${domains.length ? domains.slice(0, 3).join(', ') + (domains.length > 3 ? ` +${domains.length - 3}` : '') : 'Shared-domain access'}</span>
+								<span class="muted">${domains.length ? domains.slice(0, 3).join(', ') + (domains.length > 3 ? ` +${domains.length - 3}` : '') : 'No memory access implied'}</span>
 							</div>
 							<div class="fed-agent-remote-actions">
 								<span class=${contact.accepting ? 'on' : ''}>${contact.accepting ? 'Federated · messages on' : 'Federated · messages blocked by Agent RBAC'}</span>
 								<button class="btn btn-sm btn-danger"
 									disabled=${busy || !!pipeContactBusy}
-									onClick=${() => removeLocalAgentExport(contact)}>Remove…</button>
+									onClick=${() => removeLocalAgentExport(contact)}>Stop sharing…</button>
 							</div>
 						</div>`;
 					})}
 				</div>
 				<div class="fed-agent-column fed-agent-remote">
 					<h5>Agents on ${peerName}</h5>
-					<p class="muted">These are the shared-domain agents their SAGE makes visible. Copy a private routing address only when configuring an agent; CEREBRUM manages the connection.</p>
+					<p class="muted">Their agent directory is shown above. Memory permissions they grant to this SAGE remain separate.</p>
 					${!remotePipeKnown && html`<div class="fed-agent-empty muted">Their SAGE has not reported agent contacts yet.</div>`}
-					${remotePipeKnown && remoteAgentContacts.length === 0 && html`<div class="fed-agent-empty muted">They are not exposing any shared-domain agents to this connection.</div>`}
+					${remotePipeKnown && remoteAgentContacts.length === 0 && html`<div class="fed-agent-empty muted">No remote agent contacts have been reported.</div>`}
 					${remoteAgentContacts.map(contact => {
 						const domains = Array.isArray(contact.domains) ? contact.domains.map(item => item.domain).filter(Boolean) : [];
 						const ready = contact.available !== false && contact.accepting === true && !remotePipeContacts.paused;
@@ -17543,7 +17557,7 @@ function FedPermissionsPanel({ conn, connectionStatus, onRevoke, revokeBusy }) {
 							<div class="fed-agent-identity">
 								<strong>${contact.display_name || contact.handle || 'Remote agent'}</strong>
 								${contact.handle && html`<span class="fed-agent-handle muted">${contact.handle}</span>`}
-								<span class="muted">${domains.length ? domains.slice(0, 3).join(', ') + (domains.length > 3 ? ` +${domains.length - 3}` : '') : 'Shared-domain access'}</span>
+								<span class="muted">${domains.length ? domains.slice(0, 3).join(', ') + (domains.length > 3 ? ` +${domains.length - 3}` : '') : 'No memory access implied'}</span>
 							</div>
 							<div class="fed-agent-remote-actions">
 								<span class="fed-agent-readiness ${ready ? 'ready' : ''}">${ready ? 'Ready' : (remotePipeContacts.paused ? 'Paused' : (contact.available === false ? 'Unavailable' : 'Not accepting'))}</span>

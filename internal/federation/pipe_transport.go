@@ -206,7 +206,7 @@ func (m *Manager) authorizeInboundPipeContact(ctx context.Context, peer *peerIde
 	if err != nil {
 		return nil, err
 	}
-	grant, err := m.buildPipeContactGrantForCandidates(ctx, boundPeer, policy, agents, []string{event.TargetAgentID}, false, nil, true)
+	grant, err := m.buildPipeContactGrantForCandidates(ctx, boundPeer, policy, agents, []string{event.TargetAgentID}, false, nil, true, event.AuthorizationMode)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +442,7 @@ func (m *Manager) handlePipeEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch event.AuthorizationMode {
-	case "":
+	case "", NodeMessageAuthorizationMode:
 		if event.LinkedRelation != nil {
 			httpError(w, http.StatusBadRequest, "pipeline authorization binding is invalid")
 			return

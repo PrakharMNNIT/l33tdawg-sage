@@ -1189,7 +1189,7 @@ test('direct federation controls are symmetric after pairing', () => {
     assert.match(panel, /const showOutgoing = roleKnown/);
     assert.match(panel, /\$\{roleKnown && html`<section class="fed-perm-section fed-agent-section">/,
         'agent contact controls must not disappear merely because this SAGE scanned the first code');
-	assert.match(panel, /Each SAGE independently chooses which local agents join it/,
+	assert.match(panel, /Agents can discover and message across upgraded nodes automatically/,
 		'the ceremony role must not control ongoing pairwise membership');
 	assert.match(panel, /This trusted connection is its own federation group/,
 		'the pairwise relationship itself must be the group; no mirrored local group is required');
@@ -1209,10 +1209,10 @@ test('federation agent membership stays administrative and message RBAC remains 
     assert.match(apiSource, /connections\/\$\{encodeURIComponent\(chainId\)\}\/pipe-contacts/);
     assert.match(apiSource, /agent_id: agentId, contact_id: contactId, accepting: !!accepting/,
         'a toggle must carry the exact agent and contact revision instead of a display handle');
-    assert.match(panel, /<h4>Federated agents<\/h4>/);
-    assert.match(panel, /CEREBRUM manages the connection/,
+    assert.match(panel, /<h4>Agent-owned memory sharing<\/h4>/);
+    assert.match(panel, /<\$\{FederationDirectory}/,
         'CEREBRUM must remain the administrative surface, not become a second inbox');
-    assert.match(panel, /Work requests are Off until you enable them/);
+    assert.match(panel, /Agent discovery and messaging are handled separately above/);
     assert.match(panel, /messages blocked by Agent RBAC/,
         'message delivery must remain visibly governed separately from exported Read membership');
     assert.match(panel, /contact\.contact_id/,
@@ -1254,8 +1254,8 @@ test('federation agent membership stays administrative and message RBAC remains 
         'manual Refresh must retry the friendly agent directory');
     assert.match(panel, /fed-agent-lookup-status" role="status" aria-live="polite"/,
         'exact-agent access checks must be visibly announced');
-    assert.match(panel, /added\. Work requests are Off until you enable them/,
-        'successful exact-agent checks must announce both insertion and safe default-off consent');
+    assert.match(panel, /owned memory is now shared for live Read/,
+        'explicit memory exports must announce Read access separately from messaging');
     assert.match(panel, /pinnedLocalAgentGenerationRef/,
         'older polls must not overwrite an agent selected while they were in flight');
     assert.match(panel, /pinnedGeneration === pinnedLocalAgentGenerationRef\.current/,
@@ -1272,8 +1272,11 @@ test('federation agent membership stays administrative and message RBAC remains 
         'a stale poll must not mark a newer failed contact projection as known');
     assert.match(panel, /check access<\/option>/,
         'directory options must disclose that shared-domain eligibility is not known until selection');
-    assert.match(panel, /const currentDirectoryResponse = await fetchAgents\(\)[\s\S]*!appV23FederatedInboxEnabled\(currentAgent\.capabilities\)[\s\S]*setPipeContactPolicyBlock\(\{ agentID, selectedName \}\)[\s\S]*return;[\s\S]*fedPipeContactsGet\(chain, false, agentID\)/,
-        'the picker must refresh authoritative agent policy, then stop a current federation block before domain sharing or contact lookup');
+    assert.match(panel, /const currentDirectoryResponse = await fetchAgents[\s\S]*if \(!currentAgent\)[\s\S]*fedPipeContactsGet\(chain, false, agentID\)/,
+        'memory sharing must still resolve an active exact local identity');
+    const memoryPicker = panel.slice(panel.indexOf('const chooseLocalPipeContact'), panel.indexOf('const copyPipeContact'));
+    assert.doesNotMatch(memoryPicker, /!appV23FederatedInboxEnabled/,
+        'a messaging block must not force memory sharing to enable messages');
     assert.match(panel, /Open this agent’s inbox setting/,
         'a blocked inbox must remain actionable and deep-link to the exact agent policy');
     assert.match(panel, /#\/access\?agent=\$\{encodeURIComponent\(pipeContactPolicyBlock\.agentID\)\}&inbox=1/);
@@ -1304,7 +1307,7 @@ test('federation agent membership stays administrative and message RBAC remains 
         'remote refresh feedback must be visible and announced in its section');
     assert.match(panel, /\$\{syncSaveErr && html`<div class="fed-err fed-perm-error" role="alert">/,
         'remote copy-save feedback must remain visible beside the bottom Save controls');
-    assert.match(panel, /if \(dirty && !localPipeContactsKnown/,
+    assert.match(panel, /if \(dirty && !automaticNodeMessaging && !localPipeContactsKnown/,
         'an unavailable contact snapshot must conservatively warn before a domain save');
     assert.match(page, /Live Read, Copy, and agent work requests stop immediately/,
         'pause feedback must cover every suspended federation capability');
@@ -1583,9 +1586,9 @@ test('Sharing & Sync groups expose health and guarded operator controls', () => 
         'a final partial-setup error must survive the local projection reload');
 	assert.match(appSource, /For one other SAGE, use the direct relationship above instead/,
         'the direct relationship and group models must be visibly separate');
-	assert.match(appSource, /Each SAGE independently chooses which local agents join it/,
+	assert.match(appSource, /Agents can discover and message across upgraded nodes automatically/,
         'the ceremony role must not hide ordinary directional controls after trust is established');
-	assert.match(appSource, /Each SAGE independently chooses which local agents join it, which manual domains it shares/,
+	assert.match(appSource, /Each SAGE independently chooses which memory domains it shares/,
         'symmetric control means independent explicit grants, never an implied bilateral grant');
     assert.match(panel, /Select a trusted SAGE/,
         'adding a member must choose an established trust connection, not copy a key by hand');

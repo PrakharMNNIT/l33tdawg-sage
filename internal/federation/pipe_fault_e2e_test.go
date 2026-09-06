@@ -141,16 +141,9 @@ func configurePipeFaultFixture(t *testing.T, source, destination *testChain) pip
 		fixture.targetAgent, "target-agent", "active", 0, 10)
 	seedPipeContactOrdinaryAgent(t, destination.mgr, pipeSQLite(t, destination), destination.badger,
 		fixture.unrelatedAgent, "unrelated-agent", "active", 0, 20)
-	require.NoError(t, destination.badger.RegisterDomain("fault-gate", fixture.targetAgent, "", 10))
-	require.NoError(t, destination.badger.RegisterDomain("fault-unrelated", fixture.unrelatedAgent, "", 11))
-	_, err = destination.mgr.ReplacePeerRBACPolicy(ctx, source.chainID, []store.PeerRBACDomainPermission{
-		{Domain: "fault-gate.work", Read: true},
-		{Domain: "fault-unrelated.work", Read: true},
-	})
-	require.NoError(t, err)
-	exportPipeContactAgent(t, destination.mgr, source.chainID, fixture.targetAgent)
-	exportPipeContactAgent(t, destination.mgr, source.chainID, fixture.unrelatedAgent)
-	grant, err := destination.mgr.LocalPipeContacts(ctx, source.chainID)
+	// A trusted connection alone exposes ordinary messaging recipients. These
+	// end-to-end fault tests deliberately configure no Read/Copy or exports.
+	grant, err := destination.mgr.LocalNodeContacts(ctx, source.chainID, "")
 	require.NoError(t, err)
 	require.Len(t, grant.Contacts, 2)
 	contactID := func(agentID string) string {
@@ -165,6 +158,11 @@ func configurePipeFaultFixture(t *testing.T, source, destination *testChain) pip
 	fixture.unrelatedContact = contactID(fixture.unrelatedAgent)
 	fixture.target, err = source.mgr.ResolveRemotePipeTarget(ctx, fixture.targetAgent+"@"+destination.chainID)
 	require.NoError(t, err)
+	require.Equal(t, NodeMessageAuthorizationMode, fixture.target.AuthorizationMode)
+	require.Empty(t, fixture.target.Domains)
+	status, err := source.mgr.PeerStatus(ctx, destination.chainID)
+	require.NoError(t, err)
+	require.Empty(t, status.PeerRBACGrant.Domains, "message discovery must not grant memory access")
 	return fixture
 }
 
@@ -182,14 +180,16 @@ func enqueueFaultGateSend(t *testing.T, source, destination *testChain, fixture 
 		PipeID: "pipe-fault-" + source.chainID, FromAgent: fixture.sourceAgent, ToAgent: fixture.targetAgent,
 		DestinationChainID: destination.chainID, FederationPolicyEpoch: fixture.target.PolicyEpoch,
 		FederationAgreementID: fixture.target.AgreementID, FederationContactID: fixture.target.ContactID,
-		FederationContactRevision: fixture.target.ContactRevision, Intent: request.Intent, Payload: request.Payload,
+		FederationAuthorizationMode: fixture.target.AuthorizationMode,
+		FederationContactRevision:   fixture.target.ContactRevision, Intent: request.Intent, Payload: request.Payload,
 		Status: "pending", CreatedAt: now, ExpiresAt: now.Add(time.Hour),
 	}
 	outbox := &store.PipelineTransportOutbox{
 		EventID: PipelineProofEventID(source.chainID, "send", proof), PipeID: msg.PipeID,
 		RemoteChainID: destination.chainID, EventKind: "send", PolicyEpoch: msg.FederationPolicyEpoch,
 		AgreementID: msg.FederationAgreementID, ContactID: msg.FederationContactID,
-		ContactRevision: msg.FederationContactRevision, SourceAgentID: fixture.sourceAgent,
+		AuthorizationMode: fixture.target.AuthorizationMode,
+		ContactRevision:   msg.FederationContactRevision, SourceAgentID: fixture.sourceAgent,
 		TargetAgentID: fixture.targetAgent, Proof: proof, CreatedAt: now, ExpiresAt: msg.ExpiresAt,
 	}
 	require.NoError(t, pipeSQLite(t, source).InsertPipelineWithTransport(context.Background(), msg, outbox))
@@ -286,7 +286,8 @@ func exercisePipeDisconnectRestart(t *testing.T, source, destination *testChain,
 		EventID: PipelineProofEventID(destination.chainID, "result", resultProof), PipeID: imported.PipeID,
 		RemoteChainID: source.chainID, EventKind: "result", PolicyEpoch: imported.FederationPolicyEpoch,
 		AgreementID: imported.FederationAgreementID, ContactID: imported.FederationContactID,
-		ContactRevision: imported.FederationContactRevision, SourceAgentID: fixture.targetAgent,
+		AuthorizationMode: imported.FederationAuthorizationMode,
+		ContactRevision:   imported.FederationContactRevision, SourceAgentID: fixture.targetAgent,
 		TargetAgentID: fixture.sourceAgent, Proof: resultProof, CreatedAt: now,
 		ExpiresAt: now.Add(pipeEventResultLifetime),
 	}

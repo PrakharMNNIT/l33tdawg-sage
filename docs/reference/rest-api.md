@@ -2011,7 +2011,7 @@ vault-backed. A foreign request or result is never automatically journaled,
 embedded, indexed as memory, written to Badger/AppHash, or treated as trusted
 instructions (`internal/store/sqlite.go:4764-4837`,
 `internal/store/pipeline_transport.go:92-176`,
-	`shouldAutoJournalPipeline`, `api/rest/pipe_handler.go:2243-2252`).
+	`shouldAutoJournalPipeline`, `api/rest/pipe_handler.go:2246-2255`).
 
 ### `POST /v1/pipe/resolve`
 
@@ -2364,7 +2364,7 @@ transaction. Keyed sends use `SendLocalMessage` (`internal/store/messages.go:324
 unkeyed sends use `AdmitLocalMessage` (`internal/store/messages.go:403-439`). The route publishes
 the returned non-zero generation only after commit. A backend without that
 atomic canonical capability returns HTTP 501 before insertion
-(`handlePipeSend`, `api/rest/pipe_handler.go:645-1059`). Provider-only and
+(`handlePipeSend`, `api/rest/pipe_handler.go:648-1062`). Provider-only and
 federated rows do not allocate an exact-local wake sequence.
 
 **Response** (HTTP 201 fresh; HTTP 200 exact keyed replay):
@@ -2604,7 +2604,7 @@ HTTP 409 if already claimed.
 Submit a result for a claimed message. Purely local completion keeps the
 existing auto-journal summary. Federated completion does not journal and queues
 the result over the original agreement-bound return route
-(`handlePipeResult`, `api/rest/pipe_handler.go:1606-1908`).
+(`handlePipeResult`, `api/rest/pipe_handler.go:1609-1911`).
 
 **Request body:**
 

@@ -940,7 +940,9 @@ func (m *Manager) PeerStatusForPipeLookup(ctx context.Context, remoteChainID str
 // callers supply their request-time agreement/control binding separately so a
 // delayed response can never be relabeled with post-response policy state.
 func (m *Manager) fetchPeerStatus(ctx context.Context, agreement *store.CrossFedRecord) (*StatusResponse, error) {
-	return m.fetchPeerStatusWithHeaders(ctx, agreement, nil)
+	return m.fetchPeerStatusWithHeaders(ctx, agreement, http.Header{
+		HeaderClientCapabilities: {CapabilityNodeMessaging},
+	})
 }
 
 // fetchPeerStatusForPipeLookup asks a v11.13.1 peer to advertise capability
@@ -948,7 +950,7 @@ func (m *Manager) fetchPeerStatus(ctx context.Context, agreement *store.CrossFed
 // ignore the advisory header and return the v1-compatible snapshot instead.
 func (m *Manager) fetchPeerStatusForPipeLookup(ctx context.Context, agreement *store.CrossFedRecord) (*StatusResponse, error) {
 	compact, err := m.fetchPeerStatusWithHeaders(ctx, agreement, http.Header{
-		HeaderClientCapabilities: {CapabilityFederatedPipelineContactLookup},
+		HeaderClientCapabilities: {CapabilityFederatedPipelineContactLookup + "," + CapabilityNodeMessaging},
 	})
 	if !errors.Is(err, errPeerResponseLimit) {
 		return compact, err

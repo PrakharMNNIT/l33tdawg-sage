@@ -1121,10 +1121,12 @@ export function fedAgentExportSet(chainId, exportPolicy) { return fedPut(`/v1/da
 export function fedReaderRestrictionsGet(chainId) { return fedFetch(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/reader-restrictions`); }
 export function fedReaderRestrictionSet(chainId, restriction) { return fedPut(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/reader-restrictions`, restriction); }
 export function fedPause(chainId, paused) { return fedPut(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/pause`, { paused }); }
-export function fedPipeContactsGet(chainId, live = true, agentId = '') {
+export function fedPipeContactsGet(chainId, live = true, agentId = '', cursors = {}) {
     const query = new URLSearchParams();
     if (!live) query.set('live', '0');
     if (agentId) query.set('agent_id', agentId);
+    if (cursors.local) query.set('local_cursor', cursors.local);
+    if (cursors.remote) query.set('remote_cursor', cursors.remote);
     const suffix = query.size ? `?${query.toString()}` : '';
     return fedFetch(`/v1/dashboard/federation/connections/${encodeURIComponent(chainId)}/pipe-contacts${suffix}`);
 }

@@ -63,6 +63,27 @@ func hasFederatedPipelineContactLookupCapability(status *StatusResponse) bool {
 	return status != nil && slices.Contains(status.Capabilities, CapabilityFederatedPipelineContactLookup)
 }
 
+func nodeMessageMode(status *StatusResponse) string {
+	if status != nil && slices.Contains(status.Capabilities, CapabilityNodeMessaging) {
+		return NodeMessageAuthorizationMode
+	}
+	return ""
+}
+
+func validContactTargetMode(target *RemotePipeTarget) bool {
+	if target.LinkedRelation != nil {
+		return false
+	}
+	switch target.AuthorizationMode {
+	case "":
+		return len(target.Domains) > 0
+	case NodeMessageAuthorizationMode:
+		return len(target.Domains) == 0
+	default:
+		return false
+	}
+}
+
 func hasFederatedPipelineReceiptV2Capability(status *StatusResponse) bool {
 	return status != nil && slices.Contains(status.Capabilities, CapabilityFederatedPipelineReceiptsV2)
 }
@@ -72,8 +93,15 @@ func validateRemotePipeContactGrant(remoteChainID string, grant *PipeContactGran
 		!isPipeDigest(grant.Revision) || len(grant.Contacts) > maxPipeContactStatusContacts {
 		return fmt.Errorf("invalid pipe contact snapshot")
 	}
+	if grant.NextCursor != "" && !validNodeCursorShape(grant.NextCursor) {
+		return fmt.Errorf("invalid contact cursor")
+	}
 	seen := make(map[string]struct{}, len(grant.Contacts))
 	for _, contact := range grant.Contacts {
+		if (contact.AuthorizationMode != "" && contact.AuthorizationMode != NodeMessageAuthorizationMode) ||
+			(contact.AuthorizationMode == NodeMessageAuthorizationMode && (len(contact.Domains) != 0 || !isCanonicalAgentID(contact.AgentID))) {
+			return fmt.Errorf("invalid contact authorization mode")
+		}
 		if len(contact.DisplayName) > 512 || len(contact.RegisteredName) > 512 ||
 			len(contact.Provider) > 512 || len(contact.Handle) > 512 ||
 			len(contact.Domains) > store.MaxPeerRBACPolicyDomains {
@@ -214,6 +242,14 @@ func (m *Manager) lookupRemotePipeContacts(ctx context.Context, agreement *store
 	if err := validateRemotePipeContactGrant(agreement.RemoteChainID, out.Grant); err != nil {
 		return nil, err
 	}
+	for _, contact := range out.Grant.Contacts {
+		if contact.AuthorizationMode != req.AuthorizationMode {
+			return nil, fmt.Errorf("contact authorization mode was not negotiated")
+		}
+	}
+	if out.Grant.NextCursor != "" && (!req.List || out.Grant.NextCursor == req.After) {
+		return nil, fmt.Errorf("invalid contact continuation")
+	}
 	return &out, nil
 }
 
@@ -269,7 +305,7 @@ func (m *Manager) findRemotePipeContactsWithStatus(ctx context.Context, agreemen
 		return nil, ErrRemotePipePeerUnsupported
 	}
 	if hasFederatedPipelineContactLookupCapability(status) {
-		return m.lookupRemotePipeContacts(ctx, agreement, &PipeContactLookupRequest{Name: name, Limit: limit})
+		return m.lookupRemotePipeContacts(ctx, agreement, &PipeContactLookupRequest{Name: name, Limit: limit, AuthorizationMode: nodeMessageMode(status)})
 	}
 	if err := validateRemotePipeContactGrant(agreement.RemoteChainID, status.PipeContacts); err != nil {
 		return nil, err
@@ -321,7 +357,7 @@ func (m *Manager) ResolveRemotePipeTargetForCaller(
 ) (*RemotePipeTarget, error) {
 	if known, err := m.knownRemoteMessageTarget(ctx, callerAgentID, target); err != nil {
 		return nil, err
-	} else if known != nil && known.AuthorizationMode == "" {
+	} else if known != nil && (known.AuthorizationMode == "" || known.AuthorizationMode == NodeMessageAuthorizationMode) {
 		return known, nil
 	}
 	resolved, err := m.resolveRemotePipeTarget(ctx, target, true)
@@ -377,6 +413,7 @@ func (m *Manager) RememberRemotePipeContactForCaller(
 		ContactRevision: pipeContactAuthorizationRevision(grant, &contact),
 		PolicyEpoch:     control.PolicyEpoch, AgreementID: grant.AgreementID,
 		Address: contact.Address, Handle: contact.Handle, DisplayName: contact.DisplayName,
+		AuthorizationMode:      contact.AuthorizationMode,
 		ReceiptProtocolVersion: receiptProtocolVersion,
 		Domains:                append([]PipeContactDomain(nil), contact.Domains...),
 	}
@@ -418,7 +455,7 @@ func (m *Manager) rememberRemoteMessageTarget(
 			linkedMessageContactRevision(target.LinkedRelation) != target.ContactRevision {
 			return ErrFederatedPipeInvalid
 		}
-	} else if target.AuthorizationMode != "" || target.LinkedRelation != nil || len(target.Domains) == 0 {
+	} else if !validContactTargetMode(target) {
 		return ErrFederatedPipeInvalid
 	}
 	agreement, err := m.ActiveAgreement(target.ChainID)
@@ -535,7 +572,7 @@ func (m *Manager) knownRemoteMessageTarget(
 				return nil, ErrRemotePipeTargetNotFound
 			}
 		}
-	} else if target.AuthorizationMode != "" || target.LinkedRelation != nil || len(target.Domains) == 0 {
+	} else if !validContactTargetMode(&target) {
 		return nil, ErrFederatedPipeInvalid
 	}
 	return &target, nil
@@ -549,7 +586,7 @@ func (m *Manager) resolveRemotePipeTargetLive(ctx context.Context, target string
 	return m.resolveRemotePipeTarget(ctx, target, false)
 }
 
-func (m *Manager) resolveRemotePipeTarget(ctx context.Context, target string, allowCachedExact bool) (*RemotePipeTarget, error) {
+func (m *Manager) resolveRemotePipeTarget(ctx context.Context, target string, allowCachedExact bool, modes ...string) (*RemotePipeTarget, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, ErrRemotePipeTargetNotFound
@@ -609,7 +646,15 @@ func (m *Manager) resolveRemotePipeTarget(ctx context.Context, target string, al
 		}
 		grant := status.PipeContacts
 		if hasFederatedPipelineContactLookupCapability(status) {
-			lookup, lookupErr := m.lookupRemotePipeContacts(ctx, &agreement, &PipeContactLookupRequest{Target: target, Limit: maxPipeContactLookupResults})
+			mode := nodeMessageMode(status)
+			if len(modes) > 0 {
+				mode = modes[0]
+			}
+			if mode == NodeMessageAuthorizationMode && nodeMessageMode(status) == "" {
+				unsupportedPeers++
+				continue
+			}
+			lookup, lookupErr := m.lookupRemotePipeContacts(ctx, &agreement, &PipeContactLookupRequest{Target: target, Limit: maxPipeContactLookupResults, AuthorizationMode: mode})
 			if lookupErr != nil {
 				lookupErrors = append(lookupErrors, fmt.Errorf("%s: lookup pipe contact: %w", agreement.RemoteChainID, lookupErr))
 				continue
@@ -693,6 +738,7 @@ func (m *Manager) resolveRemotePipeTarget(ctx context.Context, target string, al
 		ContactRevision: pipeContactAuthorizationRevision(match.grant, &match.contact), PolicyEpoch: match.policyEpoch,
 		AgreementID: match.grant.AgreementID, Address: match.contact.Address,
 		Handle: match.contact.Handle, DisplayName: match.contact.DisplayName,
+		AuthorizationMode:      match.contact.AuthorizationMode,
 		ReceiptProtocolVersion: match.receiptProtocolVersion,
 		Domains:                append([]PipeContactDomain(nil), match.contact.Domains...),
 	}, nil

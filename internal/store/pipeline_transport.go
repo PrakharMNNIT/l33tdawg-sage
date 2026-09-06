@@ -172,7 +172,7 @@ func validatePipelineTransportOutbox(event *PipelineTransportOutbox) error {
 		return fmt.Errorf("unsupported federated pipeline receipt protocol version")
 	}
 	switch event.AuthorizationMode {
-	case "":
+	case "", "node-messaging-v1":
 		if len(event.LinkedRelation) != 0 {
 			return fmt.Errorf("ordinary pipeline transport cannot carry a linked relation")
 		}
@@ -257,7 +257,7 @@ func validatePipelineTransportDedup(dedup *PipelineTransportDedup) error {
 		return fmt.Errorf("unsupported federated pipeline dedup kind %q", dedup.EventKind)
 	}
 	switch dedup.AuthorizationMode {
-	case "":
+	case "", "node-messaging-v1":
 		if dedup.LinkedRelationDigest != "" {
 			return fmt.Errorf("ordinary pipeline dedup cannot carry a linked relation")
 		}
